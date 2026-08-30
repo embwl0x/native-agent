@@ -254,7 +254,7 @@ struct ChatRichContentTests {
     @Test func streamingBubbleStaysOnTheRawTextPath() throws {
         let row = try AppSourceScraping.appSource("ChatMessageListView.swift")
         let start = try #require(row.range(of: "private var renderedMessageText: some View"))
-        let end = try #require(row.range(of: "private var trimmedContent", range: start.upperBound..<row.endIndex))
+        let end = try #require(row.range(of: "private func proseText", range: start.upperBound..<row.endIndex))
         let body = String(row[start.lowerBound..<end.lowerBound])
 
         let streamingBranch = try #require(body.range(of: "isSessionStreaming"))

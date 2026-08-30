@@ -261,9 +261,11 @@ struct ContextBudgetScalingTableTests {
         let mid = ContextBudgetPolicy.resolve(windowTokens: 200_000, surface: "chat")
         #expect(mid.isDerived)
         #expect(mid.historyChars == 96_000)
-        #expect(mid.memoryRowChars == 4_736)   // 24,000/5 net of row markup
+        #expect(mid.memoryRowChars == 1_936)   // 24,000/12 net of row markup
         #expect(mid.memoryBlockChars == 24_000)
-        #expect(mid.recallRowLimit == 5)
+        // Exactly 200k QUALIFIES for wide recall (the `>=` boundary): the
+        // models we actually route to sit on this line, not above it.
+        #expect(mid.recallRowLimit == 12)
         #expect(mid.capsuleChars == 8_000)
         #expect(mid.packetChars == 29_702)
         #expect(mid.packetExpandedChars == 48_000)
@@ -276,15 +278,27 @@ struct ContextBudgetScalingTableTests {
         let wide = ContextBudgetPolicy.resolve(windowTokens: 1_048_576, surface: "chat")
         #expect(wide.isDerived)
         #expect(wide.historyChars == 96_000)      // ceiling
-        #expect(wide.recallRowLimit == 10)         // doubled above 200k
-        #expect(wide.memoryRowChars == 2_336)      // 24,000/10 net of row markup
-        #expect(wide.memoryBlockChars == 24_000)   // 10 full rows fit the ceiling
+        #expect(wide.recallRowLimit == 12)         // wide breadth at/above 200k
+        #expect(wide.memoryRowChars == 1_936)      // 24,000/12 net of row markup
+        #expect(wide.memoryBlockChars == 24_000)   // 12 full rows fit the ceiling
         #expect(wide.capsuleChars == 8_000)        // ceiling
         #expect(wide.packetChars == 32_000)
         #expect(wide.packetExpandedChars == 48_000)
         #expect(wide.packetPostMandatoryReserve == 40_000)
         #expect(wide.relevantChars == 24_000)
         #expect(wide.compactionSummaryCap == ChatCompactionDistiller.maxSummaryChars)
+    }
+
+    /// The wide-recall boundary is INCLUSIVE. A strict `>` put the whole 200k
+    /// tier — the models we actually route to — on the narrow limit, so the
+    /// wide band only ever applied to 1M windows.
+    @Test func wideRecallBoundaryIsInclusiveAt200k() {
+        #expect(ContextBudgetPolicy.resolve(windowTokens: 199_999, surface: "chat")
+            .recallRowLimit == ContextBudgetPolicy.baseRecallRowLimit)
+        #expect(ContextBudgetPolicy.resolve(windowTokens: 200_000, surface: "chat")
+            .recallRowLimit == ContextBudgetPolicy.wideRecallRowLimit)
+        #expect(ContextBudgetPolicy.resolve(windowTokens: 1_048_576, surface: "chat")
+            .recallRowLimit == ContextBudgetPolicy.wideRecallRowLimit)
     }
 
     /// Telegram and iOS scale from THEIR floors — they never inherit chat's.
@@ -429,7 +443,7 @@ struct ContextBudgetEvalHarnessTests {
         let floorRows = floorBlock.split(separator: "\n").filter { $0.hasPrefix("- ") }.count
         let wideRows = wideBlock.split(separator: "\n").filter { $0.hasPrefix("- ") }.count
         #expect(floorRows == 5)
-        #expect(wideRows == 10)                       // doubled recall breadth
+        #expect(wideRows == 12)                       // wide recall breadth
         #expect(wideBlock.count > floorBlock.count)   // strictly more content
         // Bounded: the aggregate block cap holds (allowing the header and the
         // one row that is always admitted).

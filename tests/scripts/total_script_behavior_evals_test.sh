@@ -243,6 +243,13 @@ if rg -q -i 'source absent' "$DOCTOR_OUT"; then
 else
   gap "scripts.organism_doctor.env" "unset iOS snapshot is not labelled 'source absent'"
 fi
+DOCTOR_UNCERTAIN_STATE="$(printf '%s' "$STATE_JSON" | jq '.organism.bodySchema += {providersAvailable:true, providersHealthy:false, providerPathBelief:{state:"uncertain"}, resourcePressure:"elevated", resourcePressureReading:{thermalPressure:"elevated",lowPowerMode:false}}')"
+DOCTOR_UNCERTAIN_RC="$(expect_failure doctor-uncertain env HOME="$DOCTOR_HOME" PATH="$DOCTOR_BIN:$PATH" FAKE_STATE_JSON="$DOCTOR_UNCERTAIN_STATE" NATIVE_AGENT_DATA_ROOT="$DOCTOR_DATA" NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT='' "$ROOT/script/organism_doctor.sh" --lenient)"
+if [[ "$DOCTOR_UNCERTAIN_RC" -eq 0 ]] && rg -q 'uncertain; health not established, not proof of an outage; availability=true' "$TMP/doctor-uncertain.out" && rg -q 'thermal=elevated lowPowerMode=false; not a RAM-usage reading' "$TMP/doctor-uncertain.out"; then
+  pass "scripts.organism_doctor" "provider uncertainty and thermal pressure retain their real evidence class"
+else
+  gap "scripts.organism_doctor" "provider uncertainty or thermal pressure is reported as a different failure"
+fi
 # ---------------------------------------------------------------------------
 # scripts.organism_watch
 # ---------------------------------------------------------------------------

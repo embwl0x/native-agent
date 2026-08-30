@@ -13,9 +13,9 @@ import Foundation
 //      learner never overrides it — learning is for the refs he never
 //      configured, not a second opinion on the ones he did.
 //   2. THIN EVIDENCE PRODUCES NO GUESS. Under three observed changes there is
-//      no interval, only noise; `learnedIntervalSeconds` returns nil and the
-//      caller falls back. A confident number from two samples is worse than
-//      no number, because it silently replaces a sane default.
+//      no change-rhythm interval. Sustained unchanged observations are still
+//      evidence, though: after a full day and enough samples the quiet span
+//      may back the poller off. Otherwise the caller falls back.
 //   3. CLAMPED AT BOTH ENDS. A pathologically chatty ref can't talk us into
 //      polling every 5 seconds (floor 15m) and a dormant one can't push the
 //      interval past a day (ceiling 24h) — beyond that "learned" is just a
@@ -205,6 +205,11 @@ public enum DeskCadenceLearner {
     public static let maxIntervalSeconds: Double = 86_400     // 24 hours
     /// Changes required before an interval is trusted at all.
     public static let minChangesForConfidence = 3
+    /// An unchanged ref cannot manufacture a change interval, but it can prove
+    /// that it is quiet. Require both a wall-clock span and repeated samples so
+    /// one old baseline or a stopped poller never masquerades as evidence.
+    public static let minStableObservationCount = 12
+    public static let minStableObservationSpanSeconds: TimeInterval = 24 * 60 * 60
 
     /// Fold one observation into a ref's stat. A CHANGE is a fingerprint that
     /// differs from the one stored; the very first fingerprint we ever see is
@@ -244,13 +249,34 @@ public enum DeskCadenceLearner {
         return clamp(ewma * pollFactor)
     }
 
+    /// A conservative interval derived from repeated evidence that a ref has
+    /// *not* changed. This closes the zero-change blind spot in which a tracked
+    /// item observed thousands of times remained "unknown" forever and pinned
+    /// its whole connector batch to the configured fast cadence.
+    ///
+    /// `lastChangeAt` is seeded at first observation and advanced on every real
+    /// change. Requiring a full quiet day therefore also makes a recently moved
+    /// ref return to the configured cadence before it is allowed to back off.
+    public static func stableQuietIntervalSeconds(
+        _ stat: DeskRefObservationStat,
+        now: Date
+    ) -> Double? {
+        guard stat.observations >= minStableObservationCount,
+              let lastChange = DeskClock.parseISO(stat.lastChangeAt) else { return nil }
+        let quietSpan = now.timeIntervalSince(lastChange)
+        guard quietSpan >= minStableObservationSpanSeconds else { return nil }
+        return clamp(quietSpan / 2)
+    }
+
     /// Learned interval widened by how long the ref has been QUIET: a ref that
     /// hasn't moved in a week doesn't deserve its busy-period cadence. Grows to
     /// half the quiet span (still capped at 24h) and collapses back to the
     /// learned interval the moment a change lands (quiet span → 0).
     public static func effectiveIntervalSeconds(_ stat: DeskRefObservationStat, now: Date) -> Double? {
-        guard let learned = learnedIntervalSeconds(stat) else { return nil }
         let quietSince = DeskClock.parseISO(stat.lastChangeAt).map { now.timeIntervalSince($0) } ?? 0
+        guard let learned = learnedIntervalSeconds(stat) else {
+            return stableQuietIntervalSeconds(stat, now: now)
+        }
         let backoff = min(max(0, quietSince) / 2, maxIntervalSeconds)
         return max(learned, backoff)
     }
@@ -381,6 +407,32 @@ public actor DeskCadenceStore {
             let updated = DeskCadenceLearner.record(base, fingerprint: fingerprint, at: now)
             next.refs[refKey] = updated
             return (next, updated)
+        }.value
+    }
+
+    /// Record a complete observation batch in one locked read-modify-write.
+    /// Connector refreshes commonly observe hundreds of refs at the same
+    /// instant; calling `recordObservation` for each one rewrites the entire
+    /// cadence file hundreds of times and turns refresh settlement into a
+    /// visible CPU/disk burst. A dictionary also makes duplicate ref keys
+    /// deterministic: the caller's final fingerprint for that key wins once.
+    @discardableResult
+    public func recordObservations(
+        _ fingerprintsByRef: [String: String],
+        at now: Date = Date()
+    ) async throws -> [String: DeskRefObservationStat] {
+        guard !fingerprintsByRef.isEmpty else { return [:] }
+        return try await updating { stats in
+            var next = stats
+            var committed: [String: DeskRefObservationStat] = [:]
+            committed.reserveCapacity(fingerprintsByRef.count)
+            for (refKey, fingerprint) in fingerprintsByRef {
+                let base = next.refs[refKey] ?? DeskRefObservationStat.seed(refKey: refKey, at: now)
+                let updated = DeskCadenceLearner.record(base, fingerprint: fingerprint, at: now)
+                next.refs[refKey] = updated
+                committed[refKey] = updated
+            }
+            return (next, committed)
         }.value
     }
 

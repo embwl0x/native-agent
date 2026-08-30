@@ -57,9 +57,17 @@ enum StatusActivityPresentation {
 struct StatusView: View {
     @Environment(AppModel.self) private var appModel
     private let loadsOnAppear: Bool
+    private let isRefreshing: Bool
+    private let refreshAction: (@MainActor () async -> Void)?
 
-    init(loadsOnAppear: Bool = true) {
+    init(
+        loadsOnAppear: Bool = true,
+        isRefreshing: Bool = false,
+        refreshAction: (@MainActor () async -> Void)? = nil
+    ) {
         self.loadsOnAppear = loadsOnAppear
+        self.isRefreshing = isRefreshing
+        self.refreshAction = refreshAction
     }
 
     var body: some View {
@@ -139,15 +147,25 @@ struct StatusView: View {
                 }
 
                 Button("Refresh", systemImage: "arrow.clockwise") {
-                    Task { await appModel.refreshForSidebarItem(.diagnostics) }
+                    Task { await refresh() }
                 }
+                .disabled(isRefreshing)
             }
             .padding()
         }
         .navigationTitle("Status")
         .task {
             guard loadsOnAppear else { return }
-            await appModel.refreshForSidebarItem(.diagnostics)
+            await refresh()
+        }
+    }
+
+    @MainActor
+    private func refresh() async {
+        if let refreshAction {
+            await refreshAction()
+        } else {
+            _ = await appModel.refreshForSidebarItem(.diagnostics)
         }
     }
 }

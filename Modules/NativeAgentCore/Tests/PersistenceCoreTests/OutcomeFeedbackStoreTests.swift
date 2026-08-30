@@ -108,6 +108,83 @@ struct OutcomeFeedbackStoreTests {
         #expect(rows.count == 1)
     }
 
+    @Test("adjacent user continuation records one payload-free exact reaction")
+    func adjacentContinuationIsExactAndPayloadFree() async throws {
+        let root = temporaryRoot("continuation")
+        try writeTranscript(root: root, sessionID: "session-a", messageID: "message-a", turnID: "turn-a")
+        let path = root.appendingPathComponent("chat/messages/session-a.jsonl")
+        let user: JSONValue = .object([
+            "id": .string("user-message-a"),
+            "sessionId": .string("session-a"),
+            "role": .string("user"),
+            "content": .string("private next message"),
+        ])
+        let handle = try FileHandle(forWritingTo: path)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((try user.serialize(pretty: false) + "\n").utf8))
+        try handle.close()
+        let store = OutcomeFeedbackStore(
+            dataRoot: root,
+            clock: { Date(timeIntervalSince1970: 1_800_000_000) },
+            makeEventID: { "continuation-a" }
+        )
+        let first = try #require(try await store.recordConversationContinuation(
+            sessionID: "session-a", reactionMessageID: "user-message-a"
+        ))
+        let replay = try #require(try await store.recordConversationContinuation(
+            sessionID: "session-a", reactionMessageID: "user-message-a"
+        ))
+        #expect(first == replay)
+        #expect(try await store.reactionEvidenceKeys() == Set([
+            OutcomeReactionEvidenceKey(
+                sessionID: "session-a", messageID: "message-a", turnID: "turn-a"
+            ),
+        ]))
+        let raw = try String(contentsOf: root.appendingPathComponent("context/feedback.jsonl"))
+        #expect(raw.contains(OutcomeFeedbackStore.continuationSchema))
+        #expect(raw.contains("conversation_continued"))
+        #expect(!raw.contains("private next message"))
+        #expect(!raw.contains("secret response body"))
+    }
+
+    @Test("interleaved turn cannot borrow another run's continuation")
+    func interleavedContinuationIsNotAttributed() async throws {
+        let root = temporaryRoot("interleaved-continuation")
+        try writeTranscript(
+            root: root,
+            sessionID: "session-a",
+            messageID: "message-a",
+            turnID: "turn-a"
+        )
+        let path = root.appendingPathComponent("chat/messages/session-a.jsonl")
+        var rows = try await SwiftNativePersistenceCore().readJSONL(path)
+        // Insert another assistant between the request and the target. The
+        // following user row is not structurally attributable to message-a.
+        rows.insert(.object([
+            "id": .string("other-assistant"),
+            "sessionId": .string("session-a"),
+            "runId": .string("other-run"),
+            "role": .string("assistant"),
+            "content": .string("overlapping response"),
+        ]), at: rows.count - 1)
+        rows.append(.object([
+            "id": .string("next-user"),
+            "sessionId": .string("session-a"),
+            "runId": .string("next-run"),
+            "role": .string("user"),
+            "content": .string("next turn"),
+        ]))
+        try Data((try rows.map { try $0.serialize(pretty: false) }.joined(separator: "\n") + "\n").utf8)
+            .write(to: path)
+
+        let result = try await OutcomeFeedbackStore(dataRoot: root)
+            .recordConversationContinuation(
+                sessionID: "session-a",
+                reactionMessageID: "next-user"
+            )
+        #expect(result == nil)
+    }
+
     @Test("v1 transition JSON remains observational under v2 schema")
     func oldTransitionDecodesObservational() throws {
         let raw = Data(#"{"domain":"github_command","operationId":"op","occurredAt":"2026-07-01T00:00:00Z","itemIdentity":"item","kind":"observe","beforeState":null,"afterState":"resolved","expectedNextEvidence":null,"outcome":"verified_success"}"#.utf8)
@@ -142,15 +219,25 @@ struct OutcomeFeedbackStoreTests {
             "surface": .string("chat"),
             "contextSelectionReceiptID": .string("selection-a"),
         ])
+        let runID = "run-a"
+        let request: JSONValue = .object([
+            "id": .string("request-a"),
+            "sessionId": .string(sessionID),
+            "runId": .string(runID),
+            "role": .string("user"),
+            "content": .string("request"),
+        ])
         let row: JSONValue = .object([
             "id": .string(messageID),
             "sessionId": .string(sessionID),
+            "runId": .string(runID),
             "role": .string("assistant"),
             "content": .string("secret response body"),
             "metadata": .object(["outcomeObservation": outcome]),
         ])
+        let requestLine = try request.serialize(pretty: false) + "\n"
         let line = try row.serialize(pretty: false) + "\n"
-        try Data((duplicate ? line + line : line).utf8).write(to: path)
+        try Data((requestLine + (duplicate ? line + line : line)).utf8).write(to: path)
     }
 }
 

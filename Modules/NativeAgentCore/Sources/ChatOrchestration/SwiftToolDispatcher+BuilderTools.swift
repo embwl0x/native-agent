@@ -493,8 +493,11 @@ extension SwiftToolDispatcher {
         startedAt: Date,
         dataRoot: URL
     ) -> JSONValue {
-        var pendingWrites: [(url: URL, content: String)] = []
-        var changedFiles: [String] = []
+        // One staged body per resolved path. Repeated sections (including
+        // symlink/path aliases) apply in order to the previous section's result,
+        // not to independent copies that would overwrite earlier changes.
+        var stagedFiles: [(url: URL, path: String, original: String, content: String)] = []
+        var stagedIndex: [String: Int] = [:]
 
         func failure(_ reason: String, detail: String? = nil, path: String? = nil) -> JSONValue {
             var auditEntry: [String: Any] = [
@@ -534,13 +537,21 @@ extension SwiftToolDispatcher {
             ) else {
                 return failure("context_patch_path_invalid_or_missing", path: filePatch.path)
             }
-            let original: String
-            do {
-                original = try String(contentsOf: url, encoding: .utf8)
-            } catch {
-                return failure("context_patch_read_failed", detail: String(describing: error), path: filePatch.path)
+            let index: Int
+            if let existing = stagedIndex[url.path] {
+                index = existing
+            } else {
+                let original: String
+                do {
+                    original = try String(contentsOf: url, encoding: .utf8)
+                } catch {
+                    return failure("context_patch_read_failed", detail: String(describing: error), path: filePatch.path)
+                }
+                index = stagedFiles.count
+                stagedIndex[url.path] = index
+                stagedFiles.append((url, filePatch.path, original, original))
             }
-            var updated = original
+            var updated = stagedFiles[index].content
             for hunk in filePatch.hunks {
                 let ranges = builderRanges(of: hunk.oldBlock, in: updated)
                 guard ranges.count == 1, let range = ranges.first else {
@@ -552,12 +563,13 @@ extension SwiftToolDispatcher {
                 }
                 updated.replaceSubrange(range, with: hunk.newBlock)
             }
-            if updated != original {
-                pendingWrites.append((url, updated))
-                changedFiles.append(filePatch.path)
-            }
+            stagedFiles[index].content = updated
         }
 
+        // Validate the entire patch before the first write; publish only net
+        // changes, once per file. This is not a cross-file atomic transaction.
+        let pendingWrites = stagedFiles.filter { $0.content != $0.original }
+        let changedFiles = pendingWrites.map(\.path)
         for write in pendingWrites {
             do {
                 try write.content.write(to: write.url, atomically: true, encoding: .utf8)
@@ -639,10 +651,93 @@ extension SwiftToolDispatcher {
                 withJSONObject: entry, options: [.prettyPrinted]
             )
             try data.write(to: auditURL)
-            return (auditURL, nil)
+            let pruneResult = pruneBuilderAuditsIfNeeded(in: auditDir, keeping: builderAuditRetentionLimit)
+            if pruneResult.removedCount > 0 {
+                NSLog("SwiftToolDispatcher.builder_audit: pruned %d older audit file(s)", pruneResult.removedCount)
+            }
+            if let pruneError = pruneResult.error {
+                NSLog("SwiftToolDispatcher.builder_audit: %@", pruneError)
+            }
+            return (auditURL, pruneResult.error)
         } catch {
             return (auditURL, String(describing: error))
         }
+    }
+
+    static let builderAuditRetentionLimit = 500
+
+    struct BuilderAuditPruneResult: Equatable {
+        var removedCount: Int
+        var error: String?
+    }
+
+    static func pruneBuilderAuditsIfNeeded(
+        in auditDir: URL,
+        keeping: Int = builderAuditRetentionLimit
+    ) -> BuilderAuditPruneResult {
+        guard keeping >= 0 else { return BuilderAuditPruneResult(removedCount: 0, error: nil) }
+        let fm = FileManager.default
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(
+                at: auditDir,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            return BuilderAuditPruneResult(
+                removedCount: 0,
+                error: "builder_audit prune could not enumerate receipts: \(error)"
+            )
+        }
+        var receipts: [(url: URL, modified: Date)] = []
+        receipts.reserveCapacity(entries.count)
+        for url in entries {
+            guard url.pathExtension == "json",
+                  UUID(uuidString: url.deletingPathExtension().lastPathComponent) != nil else { continue }
+            do {
+                let values = try url.resourceValues(
+                    forKeys: [.contentModificationDateKey, .isRegularFileKey]
+                )
+                guard values.isRegularFile == true else { continue }
+                receipts.append((url, values.contentModificationDate ?? .distantPast))
+            } catch {
+                return BuilderAuditPruneResult(
+                    removedCount: 0,
+                    error: "builder_audit prune could not inspect \(url.lastPathComponent): \(error)"
+                )
+            }
+        }
+        guard receipts.count > keeping else {
+            return BuilderAuditPruneResult(removedCount: 0, error: nil)
+        }
+        receipts.sort { lhs, rhs in
+            if lhs.modified != rhs.modified { return lhs.modified > rhs.modified }
+            return lhs.url.lastPathComponent > rhs.url.lastPathComponent
+        }
+        var removed = 0
+        for victim in receipts.dropFirst(keeping) {
+            do {
+                // F3 (2026-08-28): builder tools also drop `<runId>-*.log`
+                // sidecars (install_app's spawn log) next to the receipt. The
+                // prune only ever matched `<uuid>.json`, so the logs of pruned
+                // runs accumulated forever. Retire a receipt WITH its sidecars.
+                let runId = victim.url.deletingPathExtension().lastPathComponent
+                for sidecar in entries
+                where sidecar.lastPathComponent.hasPrefix("\(runId)-") {
+                    try fm.removeItem(at: sidecar)
+                    removed += 1
+                }
+                try fm.removeItem(at: victim.url)
+                removed += 1
+            } catch {
+                return BuilderAuditPruneResult(
+                    removedCount: removed,
+                    error: "builder_audit prune failed after removing \(removed) file(s): \(error)"
+                )
+            }
+        }
+        return BuilderAuditPruneResult(removedCount: removed, error: nil)
     }
 
     // U4 Wave B — Seatbelt/sandbox-exec wrapping for shell-class tools.

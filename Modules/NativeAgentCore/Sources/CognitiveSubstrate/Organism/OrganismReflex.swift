@@ -273,6 +273,15 @@ public struct OrganismReflexState: Codable, Sendable, Equatable {
     }
 
     public func reviewCandidates(limit: Int = 12) -> [OrganismReflexCandidate] {
+        Array(activeCandidates().prefix(max(0, limit)))
+    }
+
+    /// The complete bounded candidate set carried by runtime snapshots.
+    ///
+    /// This is deliberately distinct from `reviewCandidates`: snapshots feed
+    /// both operator review surfaces and the behavior posture, which needs to
+    /// retain approved low-risk biases even when the review queue is full.
+    public func activeCandidates(limit: Int = 64) -> [OrganismReflexCandidate] {
         Array(candidates.values.filter { $0.retiredAt == nil }.sorted {
             if $0.reviewRequired != $1.reviewRequired { return $0.reviewRequired && !$1.reviewRequired }
             if $0.trustClass != $1.trustClass { return trustRank($0.trustClass) > trustRank($1.trustClass) }

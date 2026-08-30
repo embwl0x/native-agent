@@ -1,0 +1,656 @@
+[
+ {
+  "id": "app.background.morningBrief.synthesisTimeout",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No behavioral timeout test found."
+ },
+ {
+  "id": "app.background.pollScheduler",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No test executes PollScheduler timing behavior."
+ },
+ {
+  "id": "app.background.scheduler.activityFeed",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No test directly executes scheduler activity-feed publication."
+ },
+ {
+  "id": "context.coordinator.refreshDiscoveredSources",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No test directly drives discovered-source refresh and asserts coordinator state."
+ },
+ {
+  "id": "core.persistence.DeskStore.reconcileTerminalParents",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No test directly executes terminal-parent reconciliation."
+ },
+ {
+  "id": "github.setting.contributorLoginGuard",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No test directly asserts the contributor-login setting guard."
+ },
+ {
+  "id": "github.setting.staleAfterHours",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No test directly asserts the stale-hours setting."
+ },
+ {
+  "id": "ios.knowledgegraph.searchDebounce",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No test plausibly exercises Knowledge Graph search debouncing."
+ },
+ {
+  "id": "ios.pairing.applyKVSPairingMaterialIfNeeded",
+  "verdict": "nothing_built",
+  "note": "No candidate test calls this behavior.",
+  "assertion": "No test executes KVS pairing-material application"
+ },
+ {
+  "id": "scripts.wake_hold_release",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No test found in the permitted search locations."
+ },
+ {
+  "id": "store.contextFts.writeOnly",
+  "verdict": "nothing_built",
+  "note": "",
+  "assertion": "No plausible behavioral test found."
+ },
+ {
+  "id": "api.ChatView.voiceInput",
+  "verdict": "unclear",
+  "note": "It never executes ChatView's toggle or starts and stops a listening session.",
+  "assertion": "Controller reports permission outcomes without claiming active listening."
+ },
+ {
+  "id": "api.CommandPalette.keyCatcherMonitor",
+  "verdict": "unclear",
+  "note": "No test installs, scopes, tears down, or drives the actual NSEvent monitor.",
+  "assertion": "Pure routing returns move-up for one scoped keyboard event."
+ },
+ {
+  "id": "appmodel.refreshAll",
+  "verdict": "unclear",
+  "note": "The test manually initializes pass state and never invokes refreshAll().",
+  "assertion": "Refresh helpers preserve prior values and surface accumulated lane failures."
+ },
+ {
+  "id": "chat.admission.llmCallContextBinding",
+  "verdict": "unclear",
+  "note": "The test binds TaskLocals itself; it never proves the production admission facade establishes that binding.",
+  "assertion": "A manually bound LLMCallContext is reused without rereading routing."
+ },
+ {
+  "id": "chat.engine.contextStageBudget",
+  "verdict": "unclear",
+  "note": "Registry parity only; it does not execute a turn and enforce budgets on emitted stage timings.",
+  "assertion": "Production stage names equal the frozen budget registry."
+ },
+ {
+  "id": "chat.tools.dispatch.sessionBypass",
+  "verdict": "unclear",
+  "note": "Asserts an adjacent no-session gate, not the full bypass surface.",
+  "assertion": "Missing-session dispatch remains unaffected by catalog failure."
+ },
+ {
+  "id": "chat.tools.sys10",
+  "verdict": "unclear",
+  "note": "Instrument reader is exercised, but the complete production emission surface is broader.",
+  "assertion": "Instrument summarizes persisted tool-dispatch evidence."
+ },
+ {
+  "id": "client.chat.fastModeServiceTier",
+  "verdict": "unclear",
+  "note": "No provider invocation proves chatStream forwards the resolved service tier.",
+  "assertion": "Resolver maps enabled Mac fast mode to priority and excludes Telegram."
+ },
+ {
+  "id": "client.chat.personaOverride",
+  "verdict": "unclear",
+  "note": "No provider invocation proves the client forwards the resolved persona.",
+  "assertion": "Picker normalization matches the resolved persona value."
+ },
+ {
+  "id": "client.chatStream.macTurnAdapter",
+  "verdict": "unclear",
+  "note": "The public chatStream Mac turn adapter is never constructed.",
+  "assertion": "MetaBox preserves explicit stream failure as terminal evidence."
+ },
+ {
+  "id": "client.cutoverSeams",
+  "verdict": "resolved-split",
+  "note": "Resolved 2026-08-26: the plural parent was retired from the canonical ledger and split into eight method-owned client.cutover.* rows; existing executing evidence is credited only to the child it actually exercises.",
+  "assertion": "Each trust, feedback, screen-capture, MacControl, and connector-registration API now carries its own coverage strength and silent-failure contract."
+ },
+ {
+  "id": "cognition.evalSamplers",
+  "verdict": "unclear",
+  "note": "It bypasses the cognition_eval.sh CLI surface, arguments, and output contract.",
+  "assertion": "Runtime harness records every sampler once and bounds repeated results."
+ },
+ {
+  "id": "desk.control.toolbar.refresh",
+  "verdict": "unclear",
+  "note": "Tests receipt presentation only; it never invokes the toolbar refresh route.",
+  "assertion": "Refresh receipts distinguish accepted and superseded generations."
+ },
+ {
+  "id": "desk.inbox.appModelMirror",
+  "verdict": "unclear",
+  "note": "Tests InboxLoadState directly without executing AppModel mirror synchronization.",
+  "assertion": "Load-state mirror rejects stale resolved cards."
+ },
+ {
+  "id": "desk.inbox.detailSheetActionPath",
+  "verdict": "unclear",
+  "note": "Exercises the shared flight and effect helpers, but not the mounted detail-to-client dispatch path.",
+  "assertion": "Detail action state drops duplicates and maps completion effects."
+ },
+ {
+  "id": "feed.chat.inboxStrip",
+  "verdict": "unclear",
+  "note": "The configured inbox reader is never invoked, so the feed behavior is not executed.",
+  "assertion": "Presentation retains prior items while exposing a supplied failure."
+ },
+ {
+  "id": "feeds.harness",
+  "verdict": "unclear",
+  "note": "Writer rollback is covered, but no feed test pairs a surviving stamp with produced output.",
+  "assertion": "Failed REM pass restores its weekly marker for retry."
+ },
+ {
+  "id": "feeds.turn_summaries.snapshot",
+  "verdict": "unclear",
+  "note": "This is a source-text conformance check, not an executed turn-summary route.",
+  "assertion": "Allowed and ignored summary kinds partition source-scraped emitter literals."
+ },
+ {
+  "id": "icloud.publishPairingSecret",
+  "verdict": "unclear",
+  "note": "Only presentation logic is executed; no pairing secret is published through either transport.",
+  "assertion": "Pairing publication presentation distinguishes KVS and CloudKit failures."
+ },
+ {
+  "id": "icloud.published.state",
+  "verdict": "unclear",
+  "note": "Only syncStatus transitions are exercised; available and lastSyncAt published state are not covered.",
+  "assertion": "Chat-send outcomes update syncStatus with honest transport state."
+ },
+ {
+  "id": "icloud.sendKVSChatProgress",
+  "verdict": "unclear",
+  "note": "The test never invokes sendKVSChatProgress or asserts a KVS write.",
+  "assertion": "Progress payload construction is bounded, ephemeral, and signed."
+ },
+ {
+  "id": "icloud.sendUnsignedResyncHint",
+  "verdict": "unclear",
+  "note": "The factory and receiver eligibility are tested, but the sending API is never executed.",
+  "assertion": "Unsigned recovery envelopes are bounded and action-free."
+ },
+ {
+  "id": "ios.activity.inlineApproval.decide",
+  "verdict": "unclear",
+  "note": "Covers the approval-card route, not the Activity inline decision execution.",
+  "assertion": "Approval verbs resolve to safe action identifiers."
+ },
+ {
+  "id": "ios.activity.inlineInbox.runAction",
+  "verdict": "unclear",
+  "note": "Begins after success and does not execute the inline action dispatcher.",
+  "assertion": "Successful inbox actions update only their target card."
+ },
+ {
+  "id": "ios.activity.inlineMemoryProposal.decide",
+  "verdict": "unclear",
+  "note": "Exercises presentation state only, not the inline decision action.",
+  "assertion": "Submitted decisions become duplicate-safe awaiting states."
+ },
+ {
+  "id": "ios.activity.inlineSelfImprovement",
+  "verdict": "unclear",
+  "note": "Static source inspection only.",
+  "assertion": "Source copy states self-improvement is Mac-only."
+ },
+ {
+  "id": "ios.activity.overflowButtons",
+  "verdict": "unclear",
+  "note": "Does not execute an overflow button or its route.",
+  "assertion": "Overflow visibility follows the item-count threshold."
+ },
+ {
+  "id": "ios.advanced.hostViews.freshStorePerPush",
+  "verdict": "unclear",
+  "note": "Navigation pushes are not executed; mounting evidence is source-text only.",
+  "assertion": "Store factory returns independent settings stores."
+ },
+ {
+  "id": "ios.advanced.runDetail.copyPrompt",
+  "verdict": "unclear",
+  "note": "The copy button is not executed; its mounting is source-text checked.",
+  "assertion": "Only meaningful prompts pass the copy gate."
+ },
+ {
+  "id": "ios.advanced.status.reflexApprove",
+  "verdict": "unclear",
+  "note": "Does not execute the Approve control or action route.",
+  "assertion": "Approval eligibility rejects unsafe reflex candidates."
+ },
+ {
+  "id": "ios.advanced.status.reflexRetire",
+  "verdict": "unclear",
+  "note": "Adjacent post-decision behavior; Retire is not executed.",
+  "assertion": "Finalized reflexes disappear from local presentation."
+ },
+ {
+  "id": "ios.app.bridgeNotificationScheduler.schedule",
+  "verdict": "unclear",
+  "note": "Source-text check only; scheduling and delivery never execute.",
+  "assertion": "Schedule source derives identity, deduplicates, and reports receipts"
+ },
+ {
+  "id": "ios.app.configureNotifications",
+  "verdict": "unclear",
+  "note": "Source-text check only; authorization and APNS registration do not execute.",
+  "assertion": "App source reconfigures notifications after pairing"
+ },
+ {
+  "id": "ios.app.foregroundRefresh",
+  "verdict": "unclear",
+  "note": "Source-body conformance only; no scene transition or refresh executes.",
+  "assertion": "Foreground-refresh source reaches the full snapshot loader"
+ },
+ {
+  "id": "ios.app.launchArgHooks",
+  "verdict": "unclear",
+  "note": "Parsers execute elsewhere, but the application hooks are only source-inspected.",
+  "assertion": "Launch-hook source contains independent one-shot guards"
+ },
+ {
+  "id": "ios.app.notificationDelegate",
+  "verdict": "unclear",
+  "note": "Source ordering plus helper tests; the delegate callback itself is not executed.",
+  "assertion": "Delegate source checks tap eligibility before persisting navigation intent"
+ },
+ {
+  "id": "ios.app.notificationEventGate.add",
+  "verdict": "unclear",
+  "note": "Adjacent identity coverage; no test calls the gate's add operation.",
+  "assertion": "Event-ID parsing accepts only canonical dedup identities"
+ },
+ {
+  "id": "ios.app.pairingSkipped",
+  "verdict": "unclear",
+  "note": "Executes presentation logic, not persisted setting mutation or app routing.",
+  "assertion": "Skip presentation distinguishes required, skipped, and paired states"
+ },
+ {
+  "id": "ios.app.refreshOnForeground",
+  "verdict": "unclear",
+  "note": "Source-text route check; no foreground lifecycle event executes.",
+  "assertion": "App source routes mount and activation through paired full refresh"
+ },
+ {
+  "id": "ios.bridge.foregroundPairingRedrain",
+  "verdict": "unclear",
+  "note": "Source-body ordering check; no foreground pairing event executes.",
+  "assertion": "Source places redrain after successful foreground pairing"
+ },
+ {
+  "id": "ios.bridge.kvsChatProgressChannel",
+  "verdict": "unclear",
+  "note": "Source-text conformance only.",
+  "assertion": "Progress-key source dispatches progress without draining"
+ },
+ {
+  "id": "ios.bridge.kvsDidChange",
+  "verdict": "unclear",
+  "note": "Source-body inspection only; no KVS notification executes.",
+  "assertion": "Source routes progress and drive KVS branches differently"
+ },
+ {
+  "id": "ios.bridge.processedMacReplyIDs",
+  "verdict": "unclear",
+  "note": "Inspects implementation text; it does not exercise persisted reply-ID recovery.",
+  "assertion": "Source preserves insertion order when persisting seen reply identifiers"
+ },
+ {
+  "id": "ios.chat.toolbar.speaker",
+  "verdict": "unclear",
+  "note": "Source-conformance only; it does not exercise the toolbar control.",
+  "assertion": "Source text contains the persisted playback gate."
+ },
+ {
+  "id": "ios.chrome.appEmptyState",
+  "verdict": "unclear",
+  "note": "Static source-conformance check only.",
+  "assertion": "Source copy distinguishes empty from unavailable states."
+ },
+ {
+  "id": "ios.content.toastBarInset",
+  "verdict": "unclear",
+  "note": "Static source inspection does not execute or measure the inset.",
+  "assertion": "Source text mounts toast bars in full-screen covers."
+ },
+ {
+  "id": "ios.macBridgeClient.reconnectLoop",
+  "verdict": "unclear",
+  "note": "The loop's generation and cancellation behavior is only source-inspected.",
+  "assertion": "Reconnect delay policy switches from rapid retry to bounded backoff"
+ },
+ {
+  "id": "ios.mactools.retryButton",
+  "verdict": "unclear",
+  "note": "Does not execute retry dispatch; wiring evidence is source-text only.",
+  "assertion": "Retry presentation identifies the captured original payload."
+ },
+ {
+  "id": "ios.mactools.runShortcut",
+  "verdict": "unclear",
+  "note": "Does not execute the shortcut action.",
+  "assertion": "Shortcut failure types receive distinct recovery copy."
+ },
+ {
+  "id": "ios.mactools.sendNotification",
+  "verdict": "unclear",
+  "note": "Presentation assertions and source inspection do not dispatch a notification.",
+  "assertion": "Notification outcomes receive explicit feedback."
+ },
+ {
+  "id": "ios.mactools.shortcutRunner",
+  "verdict": "unclear",
+  "note": "Only failure presentation is exercised, not shortcut execution.",
+  "assertion": "Shortcut failures receive distinct recovery states."
+ },
+ {
+  "id": "ios.memory.deleteConfirmation",
+  "verdict": "unclear",
+  "note": "Dialog action wiring is verified only by source inspection.",
+  "assertion": "Confirmation projection retains the originally swiped memory."
+ },
+ {
+  "id": "ios.more.powerUserSection",
+  "verdict": "unclear",
+  "note": "Static source inspection does not execute navigation.",
+  "assertion": "Source text connects rows to declared destinations."
+ },
+ {
+  "id": "ios.pairing.refreshFromKVS",
+  "verdict": "unclear",
+  "note": "Source-text ordering check; refreshFromKVS never executes.",
+  "assertion": "Settings source calls pairing refresh before snapshot refresh"
+ },
+ {
+  "id": "ios.pairing.skip",
+  "verdict": "unclear",
+  "note": "Static source inspection does not tap or execute Skip.",
+  "assertion": "Source contains skip persistence and transport reconfiguration."
+ },
+ {
+  "id": "ios.push.bridgeNotificationScheduler",
+  "verdict": "unclear",
+  "note": "Source-text conformance only; no notification is scheduled.",
+  "assertion": "Scheduler source names deduplication, fallback body, and receipt calls"
+ },
+ {
+  "id": "ios.push.notificationDelegate",
+  "verdict": "unclear",
+  "note": "Executes the helper, not the UNUserNotificationCenter delegate callback or navigation route.",
+  "assertion": "Delegate decision helper routes only default notification taps"
+ },
+ {
+  "id": "ios.runs.detail.copy",
+  "verdict": "unclear",
+  "note": "Source inspection does not execute the copy control.",
+  "assertion": "Source orders clipboard write before success feedback."
+ },
+ {
+  "id": "ios.settings.forceRefreshFromICloud",
+  "verdict": "unclear",
+  "note": "Static source inspection does not execute the refresh action.",
+  "assertion": "Source orders pairing and settings refreshes."
+ },
+ {
+  "id": "ios.shared.macSyncErrorBanner.mountCoverage",
+  "verdict": "unclear",
+  "note": "Pure source-conformance check.",
+  "assertion": "Source text mounts the banner on snapshot screens."
+ },
+ {
+  "id": "ios.sync.registerPushToken",
+  "verdict": "unclear",
+  "note": "Executes only the refusal path; no valid token is registered or transported.",
+  "assertion": "Blank push tokens fail before successful-registration state"
+ },
+ {
+  "id": "ios.voiceOutput.enabled",
+  "verdict": "unclear",
+  "note": "Source-body check only; disabled and enabled playback paths are not executed.",
+  "assertion": "Voice-output source guards playback with persisted enablement"
+ },
+ {
+  "id": "llm.adapter.codexCLI.binaryResolution",
+  "verdict": "unclear",
+  "note": "The injected runner captures environment only; no executable is actually resolved or launched.",
+  "assertion": "Codex dispatch receives an augmented deterministic PATH."
+ },
+ {
+  "id": "loop.sparkleScheduledUpdater",
+  "verdict": "unclear",
+  "note": "No test executes the scheduled updater loop.",
+  "assertion": "Evidence projection distinguishes fresh, stale, failed, and disabled cycles."
+ },
+ {
+  "id": "loop.wakeURLSessionReset",
+  "verdict": "unclear",
+  "note": "The URLSession reset operation itself is never executed or asserted.",
+  "assertion": "Wake throttle rearms after backward clock correction."
+ },
+ {
+  "id": "pairing.regenerateControl",
+  "verdict": "unclear",
+  "note": "The test never invokes the UI control or regenerates and publishes a secret.",
+  "assertion": "Pairing publication warnings persist across reconstructed presentation state."
+ },
+ {
+  "id": "public-api.SpotlightOverlayProbe.currentFrame",
+  "verdict": "unclear",
+  "note": "The test injects a result and never invokes currentFrame itself.",
+  "assertion": "Route serializes an injected probe outcome into HTTP geometry."
+ },
+ {
+  "id": "scripts.verify_release_artifact.requireFlags",
+  "verdict": "unclear",
+  "note": "Source grep covers only one flag, not verifier behavior.",
+  "assertion": "Release script text contains one required verifier flag."
+ },
+ {
+  "id": "shared.icloudConstants.driveFolders",
+  "verdict": "unclear",
+  "note": "Mostly source conformance; it never creates, writes, or scans the folders.",
+  "assertion": "Folder constants match literals referenced by source"
+ },
+ {
+  "id": "shared.icloudConstants.kvsKeys",
+  "verdict": "unclear",
+  "note": "Source scan only; no KVS write/read round trip executes.",
+  "assertion": "Production source does not spell shared KVS key literals"
+ },
+ {
+  "id": "shared.icloudConstants.macBundleID",
+  "verdict": "unclear",
+  "note": "Source-text conformance only; no bundle lookup or wake route executes.",
+  "assertion": "Release source contains the shared default bundle identifier"
+ },
+ {
+  "id": "shared.snapshotModels.decodeContracts",
+  "verdict": "unclear",
+  "note": "Executes the status codec, but does not cover the broader snapshot-model decode contracts.",
+  "assertion": "Snapshot status codec rejects wrong groups and tampered payloads"
+ },
+ {
+  "id": "store.snapshots/organism_living_status.json",
+  "verdict": "unclear",
+  "note": "Exercises organism_state.json and watchers, not organism_living_status.json output.",
+  "assertion": "Living Status refreshes from canonical persisted inputs."
+ },
+ {
+  "id": "telegram.api.migrateToChatId",
+  "verdict": "unclear",
+  "note": "Decodes and reports migration but does not execute a migrated request.",
+  "assertion": "Migration identifier survives typed response decoding and error rendering."
+ },
+ {
+  "id": "telegram.command.status.liveCard",
+  "verdict": "unclear",
+  "note": "Asserts absence of standalone output, not the live card's rendered status update.",
+  "assertion": "Live turn keeps status responsive without a standalone message."
+ },
+ {
+  "id": "telemetry.organism_debug/organism_reflex_review",
+  "verdict": "unclear",
+  "note": "Payload behavior executes, but route publication is only source-scraped.",
+  "assertion": "Receipt-backed review payload is attributable, bounded, and encodable."
+ },
+ {
+  "id": "tools.factory.bridgeToolDispatchClient",
+  "verdict": "unclear",
+  "note": "Injected baseTools bypasses the factory's default app-tool composition.",
+  "assertion": "Factory wrapper denies external MCP and forwards a native tool."
+ },
+ {
+  "id": "tools.macIntegrationNotifyGate",
+  "verdict": "unclear",
+  "note": "It compares lookup tables but never dispatches mac_notify through the permission gate.",
+  "assertion": "Static gate table maps mac_notify to notify_mac with write permission."
+ },
+ {
+  "id": "ui.Capabilities.nativeActionRunButton",
+  "verdict": "unclear",
+  "note": "Tests only approval eligibility; no native action is executed.",
+  "assertion": "Run gate fails closed when native-action approval metadata is missing."
+ },
+ {
+  "id": "ui.Capabilities.researchLab",
+  "verdict": "unclear",
+  "note": "Only projects constructed receipts; it never executes the Research Lab action.",
+  "assertion": "Synthetic research receipts project measured, refused, and failed states."
+ },
+ {
+  "id": "ui.Capabilities.workflowLifecycleButtons",
+  "verdict": "unclear",
+  "note": "Tests button eligibility and notices, but executes no workflow lifecycle transition.",
+  "assertion": "Lifecycle controls expose only eligible transitions for synthetic run states."
+ },
+ {
+  "id": "ui.Doctor.openOAuthLoginButton",
+  "verdict": "unclear",
+  "note": "Projects fabricated login receipts; it does not execute the OAuth login action.",
+  "assertion": "Presentation claims browser opening only from a confirming login receipt."
+ },
+ {
+  "id": "ui.Doctor.repairSafeIssuesButton",
+  "verdict": "unclear",
+  "note": "Tests eligibility and synthetic receipts, but never runs the repair action.",
+  "assertion": "Button eligibility admits only explicitly app-owned safe repairs."
+ },
+ {
+  "id": "ui.ProviderSettings.xaiOAuthButton",
+  "verdict": "unclear",
+  "note": "Tests credential isolation, but never invokes or routes the xAI OAuth button.",
+  "assertion": "xAI provider and X connector credentials use disjoint paths."
+ },
+ {
+  "id": "ui.SlimSettings.pairDeviceLink",
+  "verdict": "unclear",
+  "note": "Asserts destination constants only; it does not execute the navigation route.",
+  "assertion": "Link metadata names the typed Mac pairing destination."
+ },
+ {
+  "id": "ui.SlimSettings.telegramLink",
+  "verdict": "unclear",
+  "note": "Asserts link metadata and presentation, but does not execute navigation.",
+  "assertion": "Link metadata names Telegram settings and truthful configuration states."
+ },
+ {
+  "id": "ui.Telegram.actionButtons",
+  "verdict": "unclear",
+  "note": "Covers only Clear Logs, not the broader action-button set.",
+  "assertion": "Clear Logs removes mounted-root diagnostics and publishes a typed receipt."
+ },
+ {
+  "id": "ui.chat.contextFillBar.compactButton",
+  "verdict": "unclear",
+  "note": "It does not execute the mounted button or production compaction owner.",
+  "assertion": "Presentation gates visibility and invokes a fixture compact closure."
+ },
+ {
+  "id": "ui.chat.contextReceipt.emptyState",
+  "verdict": "unclear",
+  "note": "It does not execute the nil-context versus incomplete-context view outcomes.",
+  "assertion": "Test checks receipt identity, not both mounted empty-state branches."
+ },
+ {
+  "id": "ui.chat.contextReceipt.sections",
+  "verdict": "unclear",
+  "note": "No section contents, ordering, visibility, or mounted section route is exercised.",
+  "assertion": "Test checks shared truncation counts, not injected or selection sections."
+ },
+ {
+  "id": "ui.chat.conversationSettings.refreshCatalogButton",
+  "verdict": "unclear",
+  "note": "The mounted action and production catalog/provider reads are not executed.",
+  "assertion": "Source text connects the button to refresh calls and status state."
+ },
+ {
+  "id": "ui.chat.header.conversationSettingsToggle",
+  "verdict": "unclear",
+  "note": "The named test never changes the conversation-settings visibility state.",
+  "assertion": "Test asserts header title and metadata, not toggle or detail visibility."
+ },
+ {
+  "id": "ui.chat.nextGenActionChips",
+  "verdict": "unclear",
+  "note": "No chip action reaches a dispatcher or asserts a dry-run outcome.",
+  "assertion": "Presentation filters eligible actions and applies the global running gate."
+ },
+ {
+  "id": "ui.contextFlowObservatoryPanel",
+  "verdict": "unclear",
+  "note": "Exercises panel projection, not the mounted UI route.",
+  "assertion": "Presentation distinguishes unavailable, off, error, and missing-generation states."
+ },
+ {
+  "id": "ui.dreams.button.runDream",
+  "verdict": "unclear",
+  "note": "The test exercises availability presentation but never invokes the button action or AppModel runDreamPassForDreams route.",
+  "assertion": "Run Dream availability distinguishes disabled and unreadable diary gates."
+ },
+ {
+  "id": "ui.macControl.auditLogSheet",
+  "verdict": "unclear",
+  "note": "The audit sheet presentation and opening route are not exercised.",
+  "assertion": "Audit reader distinguishes valid, malformed, absent evidence."
+ },
+ {
+  "id": "ui.macControl.systemSettingsShortcuts",
+  "verdict": "unclear",
+  "note": "It does not execute Mac Control\u2019s visible shortcut controls.",
+  "assertion": "Shared permission builder returns bounded System Settings URLs."
+ },
+ {
+  "id": "ui.spotlight.commandPaletteFind",
+  "verdict": "unclear",
+  "note": "The test never executes the command-palette find operation.",
+  "assertion": "Presentation caps supplied entries and maps supplied failures."
+ }
+]

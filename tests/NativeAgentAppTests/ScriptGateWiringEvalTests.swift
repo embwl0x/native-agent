@@ -18,29 +18,26 @@ struct ScriptGateWiringEvalTests {
 
     // MARK: - scripts.test.orphanSuiteGuard
 
-    /// script/test.sh:79-85 refuses to run when a tests/scripts/*.sh suite is
-    /// never invoked by name. That guard is the only thing standing between a
-    /// new guard suite and permanent green — and it is itself unwatched.
+    /// The canonical checker requires actual command-shaped invocations;
+    /// comments and echoed paths cannot make an orphan look covered.
     static func orphanSuites(scriptsDirListing: [String], testShellSource: String) -> [String] {
-        scriptsDirListing.filter { !testShellSource.contains("tests/scripts/\($0)") }.sorted()
+        let commands = testShellSource.split(separator: "\n").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        return scriptsDirListing.filter { name in
+            !commands.contains { line in
+                line.hasPrefix("\"$ROOT/tests/scripts/\(name)\"")
+                    || line.hasPrefix("bash \"$ROOT/tests/scripts/\(name)\"")
+            }
+        }.sorted()
     }
-
-    /// Dated known gap (2026-08-23): agent_instrument_test.sh (1531 lines, 222
-    /// `check` assertions) is invoked by NOTHING in script/test.sh, so the
-    /// orphan guard FATALs at line 82 and the entire canonical gate aborts
-    /// before its first Swift shard. Fixing that is a production edit to
-    /// script/test.sh — reported, not made, by this fence. Anything NEW fails.
-    static let knownOrphanSuites: Set<String> = ["agent_instrument_test.sh"]
 
     @Test func everyGuardSuiteIsInvokedByTheCanonicalGate() throws {
         let suites = ScriptFenceEval.names(in: "tests/scripts", suffix: ".sh")
         let testShell = try ScriptFenceEval.text("script/test.sh")
         #expect(suites.count >= 10, "tests/scripts looks empty: \(suites.count) suites")
         let orphans = Self.orphanSuites(scriptsDirListing: suites, testShellSource: testShell)
-        let newOrphans = orphans.filter { !Self.knownOrphanSuites.contains($0) }
-        let burned = Self.knownOrphanSuites.filter { !orphans.contains($0) }
-        print("orphan-suite eval: \(suites.count) suites in tests/scripts, \(orphans.count) never invoked by script/test.sh (\(Self.knownOrphanSuites.count) known, \(newOrphans.count) NEW, \(burned.count) burned down) — \(orphans.joined(separator: ", "))")
-        #expect(newOrphans.isEmpty, Comment(rawValue: "NEW orphaned guard suite(s) — wire them into script/test.sh or they green forever: \(newOrphans.joined(separator: ", "))"))
+        #expect(orphans.isEmpty, Comment(rawValue: "Orphaned guard suite(s) — wire them into script/test.sh: \(orphans.joined(separator: ", "))"))
     }
 
     /// NEGATIVE CONTROL for the eval above: on a synthetic listing where one
@@ -55,16 +52,21 @@ struct ScriptGateWiringEvalTests {
         // And it must not manufacture orphans when everything is wired.
         let allWired = wired + "\n\"$ROOT/tests/scripts/beta_test.sh\"\n"
         #expect(Self.orphanSuites(scriptsDirListing: listing, testShellSource: allWired).isEmpty)
+        let commentOnly = wired + "\n# \"$ROOT/tests/scripts/beta_test.sh\"\necho \"tests/scripts/beta_test.sh\"\n"
+        #expect(Self.orphanSuites(scriptsDirListing: listing, testShellSource: commentOnly) == ["beta_test.sh"])
     }
 
-    /// The guard itself is the load-bearing part. If someone deletes the loop
-    /// from script/test.sh, the eval above still passes (0 orphans) while the
-    /// protection is gone — so pin the loop's existence separately.
+    /// Pin both the checker invocation and its executable behavior, rather
+    /// than the old inline loop's diagnostic text after owner extraction.
     @Test func canonicalGateStillCarriesTheOrphanGuardLoop() throws {
         let testShell = try ScriptFenceEval.text("script/test.sh")
-        #expect(testShell.contains("tests/scripts/*.sh"), "the orphan guard's glob is gone from script/test.sh")
-        #expect(testShell.contains("exists but is never invoked by script/test.sh"),
-                "the orphan guard's FATAL message is gone from script/test.sh")
+        #expect(testShell.split(separator: "\n").contains {
+            $0.trimmingCharacters(in: .whitespaces) == #""$ROOT/script/check_canonical_test_wiring.sh" "$ROOT" "${BASH_SOURCE[0]}""#
+        }, "canonical gate must invoke its script-wiring checker")
+        let result = try ScriptFenceEval.run(
+            ScriptFenceEval.repo.appendingPathComponent("tests/scripts/canonical_test_wiring_guards_test.sh").path,
+            [], environment: ScriptFenceEval.environment(stubDir: nil), timeout: 30)
+        #expect(!result.timedOut && result.status == 0, Comment(rawValue: result.combined))
     }
 
     // MARK: - scripts.test.nodeSuiteGlob / scripts.guardSuites.orphaned
@@ -282,7 +284,12 @@ struct ScriptGateWiringEvalTests {
     /// gate that the 2-minute check deliberately does not run. Every OTHER
     /// `script/check_*` gate in the canonical gate must also be in the always-on
     /// path, or a gate silently becomes release-only.
-    static let checkGatesExemptFromTheTwoMinuteCheck: Set<String> = ["script/check_tracked_privacy.sh"]
+    // Canonical command-wiring validates this larger gate's assembly, not the
+    // runtime smoke's health. Its real negative controls run above and in the
+    // canonical shell lane; the runtime smoke need not execute that lane.
+    static let checkGatesExemptFromTheTwoMinuteCheck: Set<String> = [
+        "script/check_tracked_privacy.sh", "script/check_canonical_test_wiring.sh",
+    ]
 
     @Test func everyCanonicalCheckGateIsReachableFromTheTwoMinuteCheck() throws {
         let testShell = try ScriptFenceEval.text("script/test.sh")

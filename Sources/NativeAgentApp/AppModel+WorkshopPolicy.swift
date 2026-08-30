@@ -186,10 +186,10 @@ extension AppModel {
     func createWorkshopTask(title: String, objective: String) async {
         do {
             _ = try await client.createWorkshopTask(title: title, objective: objective)
-            statusText = "Desk task created"
+            statusText = NewDeskTaskPresentation.successStatus
             await refreshAll()
         } catch {
-            statusText = "Desk task creation failed: \(error.localizedDescription)"
+            statusText = NewDeskTaskPresentation.failureStatus(error.localizedDescription)
         }
     }
 

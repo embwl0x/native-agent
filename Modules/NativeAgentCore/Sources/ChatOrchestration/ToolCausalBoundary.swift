@@ -12,6 +12,7 @@ public enum ToolCausalBoundary {
         case browser
         case macControl = "mac_control"
         case externalSend = "external_send"
+        case agentBridge = "agent_bridge"
     }
 
     public struct MotorReference: Sendable, Equatable {
@@ -111,6 +112,11 @@ public enum ToolCausalBoundary {
         // Binding them would manufacture a consequence that never happened.
         case "external_send", "slack_post_message", "agentmail_send":
             return (.externalSend, ["approvalId", "approval_id"])
+        // Builder messages settle asynchronously. The durable bridge job owns
+        // the returned message id, which is the exact key used by
+        // DelegationStatusProjector and the event-driven outcome loop.
+        case "codex_message", "claude_message", "omp_message":
+            return (.agentBridge, ["messageId", "message_id"])
         default:
             return nil
         }

@@ -10,9 +10,9 @@ usage() {
 usage: script/test.sh [--require-ios] [--release-receipt PATH]
 
 --require-ios           Fail instead of skipping when no iOS simulator is available.
---release-receipt PATH  Require one clean, stable Git revision and write a JSON
-                        receipt only after every canonical check passes. This
-                        mode implies --require-ios.
+--release-receipt PATH  Mark the current attempt incomplete, then publish a
+                        positive JSON receipt only after every check passes
+                        on one clean, stable Git revision. Implies --require-ios.
 USAGE
 }
 
@@ -20,13 +20,14 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --require-ios) REQUIRE_IOS=1 ;;
     --release-receipt)
-      [[ $# -ge 2 ]] || { usage; exit 2; }
+      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { usage; exit 2; }
       RELEASE_RECEIPT="$2"
       REQUIRE_IOS=1
       shift
       ;;
     --release-receipt=*)
       RELEASE_RECEIPT="${1#--release-receipt=}"
+      [[ -n "$RELEASE_RECEIPT" ]] || { usage; exit 2; }
       REQUIRE_IOS=1
       ;;
     -h|--help) usage; exit 0 ;;
@@ -37,6 +38,21 @@ done
 
 TEST_SOURCE_REVISION=""
 if [[ -n "$RELEASE_RECEIPT" ]]; then
+  # This path describes the CURRENT attempt. Preserve older proof for audit,
+  # but never leave it looking like this run passed after an early failure.
+  [[ ! -L "$RELEASE_RECEIPT" && ( ! -e "$RELEASE_RECEIPT" || -f "$RELEASE_RECEIPT" ) ]] \
+    || { echo "[test] FATAL: receipt destination must be a regular file" >&2; exit 1; }
+  mkdir -p "$(dirname "$RELEASE_RECEIPT")"
+  if [[ -f "$RELEASE_RECEIPT" ]]; then
+    receipt_previous="$(mktemp "$RELEASE_RECEIPT.previous.XXXXXX")"
+    cp -p "$RELEASE_RECEIPT" "$receipt_previous"
+    echo "[test] previous receipt preserved: $receipt_previous"
+  fi
+  receipt_pending="$(mktemp "$RELEASE_RECEIPT.pending.XXXXXX")"
+  printf '{"schema_version":1,"canonical_gate":"script/test.sh","result":"incomplete","ios_required":true,"ios_result":"not_run","started_at":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$receipt_pending"
+  chmod 0644 "$receipt_pending"
+  mv -f "$receipt_pending" "$RELEASE_RECEIPT"
   TEST_SOURCE_REVISION="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
   [[ "$TEST_SOURCE_REVISION" =~ ^[0-9A-Fa-f]{40}$ || "$TEST_SOURCE_REVISION" =~ ^[0-9A-Fa-f]{64}$ ]] \
     || { echo "[test] FATAL: a release receipt requires one exact Git object ID" >&2; exit 1; }
@@ -73,16 +89,10 @@ cleanup_test_data_root() {
 trap cleanup_test_data_root EXIT
 echo "[test] hermetic NATIVE_AGENT_DATA_ROOT=$NATIVE_AGENT_DATA_ROOT"
 
-# 2026-07-21 audit: every tests/scripts/*.sh suite MUST be invoked by this
-# script — an unwired guard test greens forever (the MiniLM resource-guard
-# suite sat orphaned this way until today). Fail the gate on any orphan.
-for suite in "$ROOT"/tests/scripts/*.sh; do
-  name="$(basename "$suite")"
-  if ! grep -q "tests/scripts/$name" "${BASH_SOURCE[0]}"; then
-    echo "[test] FATAL: $name exists but is never invoked by script/test.sh" >&2
-    exit 1
-  fi
-done
+# Every tests/scripts/*.sh suite must have a real command invocation below.
+# The checker deliberately ignores comments so documentation cannot make an
+# orphaned suite look wired into the canonical gate.
+"$ROOT/script/check_canonical_test_wiring.sh" "$ROOT" "${BASH_SOURCE[0]}"
 
 echo "[test] total script behavior evals"
 "$ROOT/tests/scripts/total_script_behavior_evals_test.sh"
@@ -98,6 +108,10 @@ echo "[test] release derived ContextFlow state guards"
 
 echo "[test] agent instrument eval suite"
 "$ROOT/tests/scripts/agent_instrument_test.sh"
+
+echo "[test] merge candidate integration helper"
+bash "$ROOT/script/tests/merge_candidate.test.sh"
+
 
 echo "[test] tool execution inventory states"
 "$ROOT/tests/scripts/tool_execution_inventory_test.sh"
@@ -132,9 +146,21 @@ echo "[test] release symbol archive + stripping guards"
 
 echo "[test] canonical test inventory"
 "$ROOT/tests/scripts/test_inventory_guards_test.sh"
+"$ROOT/tests/scripts/ios_test_result_guards_test.sh"
+"$ROOT/tests/scripts/evals_execution_receipts_guards_test.sh"
+"$ROOT/tests/scripts/canonical_receipt_attempt_guards_test.sh"
+
+echo "[test] canonical script-suite wiring guards"
+"$ROOT/tests/scripts/canonical_test_wiring_guards_test.sh"
+
+"$ROOT/tests/scripts/evals_changed_plan_guards_test.sh"
+
+"$ROOT/tests/scripts/evals_ledger_schema_guards_test.sh"
 
 echo "[test] build source inventory guard tests"
 "$ROOT/tests/scripts/build_source_inventory_guards_test.sh"
+
+"$ROOT/tests/scripts/development_build_pins_guards_test.sh"
 
 echo "[test] generated artifact cleanup guard tests"
 "$ROOT/tests/scripts/generated_artifact_cleanup_guards_test.sh"
@@ -176,8 +202,14 @@ fi
 # shellcheck source=lib/build_source_inventory.sh
 source "$ROOT/script/lib/build_source_inventory.sh"
 
+# A validation run must not silently change the dependency graph it certifies.
+# Dependency updates are explicit maintenance, never a build/test side effect.
+echo "[test] build ActivityWatch process-boundary probe once"
+swift build --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
+  --package-path "$ROOT/Modules/NativeAgentCore" --product activity-probe
+
 echo "[test] NativeAgentCore XCTest tests"
-swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentCore" --disable-swift-testing
+swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentCore" --disable-swift-testing
 
 echo "[test] NativeAgentCore Swift Testing shards"
 # Xcode 16/SwiftPM's swiftpm-testing-helper is brittle when this package's
@@ -226,7 +258,7 @@ for shard in "${CORE_SWIFT_TEST_SHARDS[@]}"; do
   if [[ "$core_shard_index" -gt 0 ]]; then
     core_shard_build_flag=(--skip-build)
   fi
-  swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
+  swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
     ${core_shard_build_flag[@]+"${core_shard_build_flag[@]}"} \
     --package-path "$ROOT/Modules/NativeAgentCore" \
     --disable-xctest --no-parallel --filter "^(${shard})\\."
@@ -239,13 +271,13 @@ if [[ "$CORE_TEST_SOURCE_DIGEST" != "$CORE_TEST_SOURCE_DIGEST_AFTER" ]]; then
 fi
 
 echo "[test] NativeAgentShared Swift tests"
-swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentShared"
+swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT/Modules/NativeAgentShared"
 
 echo "[test] NativeAgentApp Swift tests"
 # Testing the root package builds NativeAgentApp and runs NativeAgentAppTests in
 # one pass. Keep it serial to bound resource pressure from the app's broad test
 # target without repeating a separate root build first.
-swift test ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT" --no-parallel
+swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT" --no-parallel
 
 echo "[test] iOS NativeAgentMobile tests"
 # 2026-07-21 audit: the iOS suites (incl. ChatStoreMergeTests) had no runner.
@@ -281,6 +313,7 @@ cache_hit="$(
     -path "$ROOT/.git" -prune -o \
     -path "$ROOT/.build" -prune -o \
     -path "$ROOT/.swiftpm" -prune -o \
+    -path "$ROOT/.claude" -prune -o \
     -path "$ROOT/.hermes-*" -prune -o \
     \( -type d -name '__pycache__' -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) \
     -print -quit 2>/dev/null || true
@@ -299,6 +332,7 @@ working_py_hit="$(
     -path "$ROOT/.git" -prune -o \
     -path "$ROOT/.build" -prune -o \
     -path "$ROOT/.swiftpm" -prune -o \
+    -path "$ROOT/.claude" -prune -o \
     -path "$ROOT/.runtime" -prune -o \
     -path "$ROOT/.hermes-*" -prune -o \
     -path "$ROOT/build" -prune -o \
@@ -328,8 +362,8 @@ if [[ -n "$RELEASE_RECEIPT" ]]; then
   completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '{\n  "schema_version": 1,\n  "source_revision": "%s",\n  "source_dirty": false,\n  "canonical_gate": "script/test.sh",\n  "ios_required": true,\n  "ios_result": "passed",\n  "completed_at": "%s"\n}\n' \
     "$TEST_SOURCE_REVISION" "$completed_at" > "$receipt_tmp"
+  chmod 0644 "$receipt_tmp"
   mv -f "$receipt_tmp" "$RELEASE_RECEIPT"
-  chmod 0644 "$RELEASE_RECEIPT"
   echo "[test] release receipt: $RELEASE_RECEIPT"
 fi
 

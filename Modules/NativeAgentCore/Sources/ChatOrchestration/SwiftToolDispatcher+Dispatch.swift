@@ -40,7 +40,21 @@ extension SwiftToolDispatcher {
         return catalog(underscored) ? underscored : name
     }
 
-    public func dispatch(tool requestedTool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    public func dispatch(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
+        // The gated chat dispatcher already binds its transport-verified
+        // session in task-local context. Keep direct diagnostics fail-closed,
+        // but do not make a model repeat that internal routing field on every
+        // lazy tool call. LLMCallContext is the lower-authority compatibility
+        // seam for direct tool-loop dispatchers that bind no gate wrapper.
+        // An explicit non-empty input value remains authoritative only when
+        // neither canonical task-local owner is present.
+        var input = rawInput
+        let taskSession = [ChatToolSessionContext.verifiedSessionId, LLMCallContext.sessionId]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        if let taskSession {
+            input["__session_id"] = .string(taskSession)
+        }
         let tool = Self.canonicalToolName(requestedTool) { candidate in
             Self.builtInToolNames.contains(candidate)
                 || Self.fullMacAppToolNames.contains(candidate)

@@ -8,8 +8,10 @@
 // module shares one pool per memory.sqlite.
 //
 // Lifecycle (every add has a remove):
-//   - ADD: the first `pool(at:)` for a path opens the pool and ensures the
-//     kg_* schema (idempotent CREATE TABLE IF NOT EXISTS).
+//   - ADD: the first `pool(at:)` for a path opens the pool and completes the
+//     kg_* schema (idempotent IF NOT EXISTS) on that EXISTING file. The cache
+//     never creates the file itself, and since stable-failure #4 (Desk 751.7)
+//     nothing graph-side does — MemoryStorage owns store creation/migration.
 //   - REMOVE on file replace: every `pool(at:)` call re-stats the file; if the
 //     (device, inode) identity changed (atomic replace, restore-from-backup),
 //     the stale pool entry is dropped and a fresh pool is opened.
@@ -59,12 +61,13 @@ public actor KnowledgeGraphPoolCache {
         self.maxEntries = max(1, maxEntries)
     }
 
-    /// Return the cached pool for `url`, opening it (and ensuring the kg_*
+    /// Return the cached pool for `url`, opening it (and completing the kg_*
     /// schema) on first use, and transparently replacing it when the on-disk
     /// file's identity changes (atomic replace / restore). Throws
     /// `.databaseMissing` when the file does not exist — this cache never
-    /// CREATES a database file; the schema-ensure only runs against a file
-    /// some writer (MemoryStorage, the indexer's first write) already created.
+    /// CREATES a database file; store creation belongs to MemoryStorage's
+    /// migrator alone (stable-failure #4: a graph-created file carried no
+    /// migration ledger and bricked the next MemoryStorage init).
     public func pool(at url: URL) throws -> DatabasePool {
         let key = url.standardizedFileURL.path
         guard let identity = Self.fileIdentity(path: key) else {

@@ -101,9 +101,11 @@ extension AppModel {
     func setSkill(_ skill: SkillRecord, status: String) async {
         do {
             _ = try await client.updateSkill(id: skill.id, status: status)
-            Task.detached(priority: .utility) { await syncSkillPointerIndex() }
             statusText = "Skill \(status)"
             await refreshAll()
+        } catch let partial as SkillMutationRecallReconciliationError {
+            await refreshAll()
+            statusText = partial.localizedDescription
         } catch {
             statusText = "Skill update failed: \(error.localizedDescription)"
         }
@@ -113,9 +115,11 @@ extension AppModel {
     func deleteSkill(_ skill: SkillRecord) async {
         do {
             _ = try await client.deleteSkill(id: skill.id)
-            Task.detached(priority: .utility) { await syncSkillPointerIndex() }
             statusText = "Skill deleted"
             await refreshAll()
+        } catch let partial as SkillMutationRecallReconciliationError {
+            await refreshAll()
+            statusText = partial.localizedDescription
         } catch {
             statusText = "Skill delete failed: \(error.localizedDescription)"
         }
@@ -197,16 +201,20 @@ extension AppModel {
                 recordSkillManifestFailure(detail)
                 return .failed(detail: detail)
             }
-            Task.detached(priority: .utility) { await syncSkillPointerIndex() }
             let receipt = SkillReviewInstallReceipt(
                 requestedName: requestedName,
                 confirmedName: recovered.manifest.name,
                 confirmedState: recovered.registry.state.lowercased()
             )
             statusText = receipt.confirmedState == "active"
-                ? "Skill active and available to recall"
-                : "Skill installed and available to recall"
+                ? "Skill active"
+                : "Skill installed"
             return .installed(receipt)
+        } catch let partial as SkillMutationRecallReconciliationError {
+            await loadSkillManifests()
+            let detail = partial.localizedDescription
+            recordSkillManifestFailure(detail)
+            return .failed(detail: detail)
         } catch {
             let detail = "Install failed: \(error.localizedDescription)"
             recordSkillManifestFailure(detail)

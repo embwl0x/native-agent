@@ -161,7 +161,7 @@ enum SyncError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notSetup:         return "iCloud sync not initialized. Enable iCloud Drive and reconnect."
-        case .notSigned:        return "iCloud sync paused — pairing key not configured. Scan the QR code from Mac Settings → Pair iPhone / iPad."
+        case .notSigned:        return IOSPairingPresentation.notSignedSyncMessage
         case .timeout(let msg): return msg
         case .persistence(let msg): return msg
         case .busy(let msg):    return msg

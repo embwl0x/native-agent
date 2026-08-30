@@ -9,6 +9,56 @@ import Testing
 @Suite("Query embedding ticket bounded wait")
 struct QueryEmbeddingTicketWaitTests {
 
+    @Test func cancelledBeforeRegistrationDoesNotWaitOrConsumePublishedValue() async {
+        let ticket = ContextQueryEmbeddingTicket()
+        ticket.publish([3, 1], modelFingerprint: "published")
+        let waiter = Task {
+            while !Task.isCancelled { await Task.yield() }
+            return await ticket.value(waitingUpTo: 60_000_000_000)
+        }
+        waiter.cancel()
+        #expect(await waiter.value == nil)
+        #expect(ticket.pendingWaiterCount == 0)
+        #expect(ticket.valueIfReady?.values == [3, 1])
+        #expect(await ticket.value(waitingUpTo: 0)?.values == [3, 1])
+    }
+
+    @Test func cancellationReleasesOnlyItsRegisteredWaiter() async throws {
+        let ticket = ContextQueryEmbeddingTicket()
+        let cancelledWaiter = Task { await ticket.value(waitingUpTo: 60_000_000_000) }
+        let survivor = Task { await ticket.value(waitingUpTo: 60_000_000_000) }
+        defer { cancelledWaiter.cancel(); survivor.cancel() }
+        let registrationDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while ticket.pendingWaiterCount < 2, ContinuousClock.now < registrationDeadline {
+            await Task.yield()
+        }
+        try #require(ticket.pendingWaiterCount == 2)
+
+        cancelledWaiter.cancel()
+        // Cancellation is synchronous at the registration owner. This proves
+        // release without waiting for a timeout or publishing a rescue value.
+        #expect(ticket.pendingWaiterCount == 1)
+        #expect(await cancelledWaiter.value == nil)
+        #expect(ticket.valueIfReady == nil)
+
+        ticket.publish([0, 3], modelFingerprint: "survivor")
+        #expect(await survivor.value?.values == [0, 3])
+        #expect(ticket.pendingWaiterCount == 0)
+        #expect(ticket.valueIfReady?.modelFingerprint == "survivor")
+    }
+
+    @Test func immediateCancellationClosesTheRegistrationRace() async {
+        for _ in 0..<40 {
+            let ticket = ContextQueryEmbeddingTicket()
+            let waiter = Task { await ticket.value(waitingUpTo: 60_000_000_000) }
+            waiter.cancel()
+            #expect(await waiter.value == nil)
+            #expect(ticket.pendingWaiterCount == 0)
+            ticket.publish([1, 2], modelFingerprint: "after-cancel")
+            #expect(ticket.valueIfReady?.values == [1, 2])
+        }
+    }
+
     @Test func alreadyPublishedValueReturnsImmediately() async {
         let ticket = ContextQueryEmbeddingTicket()
         ticket.publish([1, 0, 0], modelFingerprint: "minilm-test")

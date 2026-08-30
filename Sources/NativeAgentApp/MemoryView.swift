@@ -516,10 +516,41 @@ private struct MemoryProposalReviewRow: View {
     }
 }
 
+/// A read-only path to the complete saved text. The list preview stays compact;
+/// opening this sheet does not pin, delete, or otherwise mutate the memory.
+struct MemoryFullTextView: View {
+    let text: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Saved memory")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            Divider()
+            ScrollView {
+                Text(text)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("memory.full-text.content")
+            }
+        }
+        .padding(20)
+        .frame(width: 560, height: 420)
+        .accessibilityIdentifier("memory.full-text.sheet")
+    }
+}
+
 private struct MemoryRowEditor: View {
     let memory: MemoryRecord
     @Environment(AppModel.self) private var appModel
     @State private var showingDeleteConfirmation = false
+    @State private var showingFullText = false
     @State private var isDeleting = false
     @State private var isPinning = false
     @State private var pinFeedback: MemoryRowEditorPinOutcome?
@@ -547,6 +578,9 @@ private struct MemoryRowEditor: View {
             provenanceLine
         }
         .padding(.vertical, 4)
+        .sheet(isPresented: $showingFullText) {
+            MemoryFullTextView(text: memory.text)
+        }
         .confirmationDialog(
             "Delete this memory?",
             isPresented: $showingDeleteConfirmation,
@@ -568,6 +602,11 @@ private struct MemoryRowEditor: View {
                 .font(.caption)
                 .foregroundStyle(memory.pinned == true ? .orange : .secondary)
             Spacer()
+            Button("Read", systemImage: "doc.text.magnifyingglass") {
+                showingFullText = true
+            }
+            .help("Read the full saved memory")
+            .accessibilityLabel("Read full memory")
             Button(
                 isPinning ? "Updating…" : (memory.pinned == true ? "Unpin" : "Pin"),
                 systemImage: isPinning ? "hourglass" : (memory.pinned == true ? "pin.slash" : "pin")
@@ -607,17 +646,13 @@ private struct MemoryRowEditor: View {
 
     @ViewBuilder
     private var provenanceLine: some View {
-        // Read-only: source · confidence · last-used relative time. ALWAYS shown.
+        // The record exposes saved/updated time, not last retrieval or usage.
         let source = memory.sourceRunId ?? "manual"
         let conf = String(format: "%.0f%%", memory.confidence * 100)
-        let when = relativeTimeString(memory.updatedAt ?? memory.createdAt)
-        Text("\(source) · conf \(conf) · used \(when)")
+        let when = MemoryRowTimestampPresentation.label(createdAt: memory.createdAt, updatedAt: memory.updatedAt)
+        Text("\(source) · conf \(conf) · \(when)")
             .font(.caption2)
             .foregroundStyle(.secondary)
-    }
-
-    private func relativeTimeString(_ iso: String) -> String {
-        UserDisplayFormatters.relativeISOTimestamp(iso, unitsStyle: .abbreviated, fallback: iso)
     }
 
     @MainActor
@@ -630,6 +665,23 @@ private struct MemoryRowEditor: View {
         if appModel.statusText.hasPrefix("Memory delete failed:") {
             appModel.systemToasts.push(error: appModel.statusText)
         }
+    }
+}
+
+enum MemoryRowTimestampPresentation {
+    static func label(createdAt: String, updatedAt: String?) -> String {
+        let updated = updatedAt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasUpdate = !updated.isEmpty
+        let timestamp = hasUpdate ? updated : createdAt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard UserDisplayFormatters.parseISOTimestamp(timestamp) != nil else {
+            return hasUpdate ? "update time unavailable" : "save time unavailable"
+        }
+        let relative = UserDisplayFormatters.relativeISOTimestamp(
+            timestamp,
+            unitsStyle: .abbreviated,
+            fallback: "time unavailable"
+        )
+        return "\(hasUpdate ? "updated" : "saved") \(relative)"
     }
 }
 

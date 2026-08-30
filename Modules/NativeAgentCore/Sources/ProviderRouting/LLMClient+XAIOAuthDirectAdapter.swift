@@ -184,6 +184,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                         } catch {
                             throw mapTransportError(error, fallback: self.transientNetworkError(error, operation: "streamMessages"))
                         }
+                        defer { bytes.task.cancel() }
                         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                         if status == 401, attempt == 0 { continue }
                         if status == 401 { throw LLMError.authRejected(

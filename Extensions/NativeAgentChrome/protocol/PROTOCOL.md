@@ -22,6 +22,12 @@ Responses echo `id` and `action`, set `ok`, and carry exactly one of `result`
 or `error`. Unsolicited extension events use `type: "event"` and have no
 request id. See `protocol-v1.schema.json` for the machine-readable envelope.
 
+Combined frame snapshots retain bounded in-flight invalidation evidence and
+recheck the active lease before publication. A frame mutation during capture
+returns `snapshot_stale`; a newer capture or navigation returns
+`snapshot_superseded`. Old captures cannot publish dead routes after a newer
+snapshot or user takeover.
+
 ## Actions
 
 | Action | Required payload | Result or behavior |
@@ -76,13 +82,43 @@ still-inactive agent-created tab. Tab closure emits
 Lease records live in `chrome.storage.session`, are validated against live tabs
 after an MV3 worker restart, and use one-shot Chrome alarms for expiry. The
 extension refuses a stale sequence or missing lease instead of guessing.
-Navigation uses `chrome.tabs.update` without an activation request. Snapshot,
+Page effects and renewal check `expiresAt` at use time, not only when Chrome's
+expiry alarm is delivered. A late alarm cannot extend an expired lease or
+allow renewal to resurrect it. Explicit release remains available after expiry
+for orderly cleanup, including preserving the tab with `closeCreatedTab: false`.
+Navigation uses `chrome.tabs.update` without an activation request. Its
+completion is bound to the current per-tab request and rechecks the
+existing active lease after each wait and before returning. A superseding
+navigation or takeover after dispatch returns `outcome_unknown` with no
+automatic retry. `requestedUrl` remains distinct from the observed final `url`
+so redirects remain supported; a complete tab observation is explicitly
+`verified: false`, not proof that the requested navigation's intended outcome
+was achieved. Navigation-settlement waits reread the exact tab after their
+settle interval and never verify a cached completion event.
+Snapshot,
 click, fill, type, select, keypress, checked-state, double-click, element waits,
 and scroll are handled by isolated content agents; navigation settlement and
 frame aggregation remain in the service worker. Stale
 snapshots, missing leases, and nodes that did not advertise the requested
 action fail closed. A fill/type message whose reply disappears after dispatch
 returns `outcome_unknown` and is never automatically retried.
+
+Typing accepts the requested text but executes for at most twenty seconds or
+the remaining lease lifetime, leaving time for its reply inside the host's
+thirty-second deadline. It checks the same field's identity, editability,
+visibility, lease expiry/revocation, and trusted user takeover before each
+character. Zero-delay typing yields every 32 code points. Cancellation releases
+the lease without closing the tab; release/yield events stop active page loops.
+
+A bounded type reply reports `completed`, `characterCount`,
+`requestedCharacterCount`, `remainingCharacterCount`, `stopReason`, and
+`elapsedMs`. Character counts and `nextCharacterIndex` are Unicode code-point
+positions; `nextUTF16Offset` is a safe offset into the original JavaScript
+string and never splits a surrogate pair. A partial receipt uses
+`partially_completed` and `fresh_snapshot_then_remaining_text_only`: observe a
+fresh snapshot before continuing only the untyped suffix. Never blindly resend
+the original full text. Counts acknowledge append effects, not verified final
+page state; the receipt keeps `page_acknowledged` distinct from verification.
 
 ## Structured page snapshot
 
@@ -177,6 +213,13 @@ user-sequence change invalidates them.
 
 The implementation caps node count (500), readable summary text (50,000
 characters), individual strings, aggregate node text, and frame count (64).
+The combined snapshot also fits within 1,000,000 actual UTF-8 JSON bytes,
+leaving room for the response envelope below the relay's 1,048,576-byte limit.
+If necessary, a prefix of nodes is retained with its exact routes and parent
+references, per-frame/summary counts are corrected, and truncation reports
+`encoded_size_limit`. Metadata alone that exceeds the budget returns an
+explicit `snapshot_metadata_too_large` error instead of dropping the transport;
+exact URL identity is never silently shortened to fit.
 The service worker walks every permitted Chrome frame, aggregates one bounded
 snapshot with frame/parent metadata, and routes opaque global node ids back to
 the owning frame. Each content agent recursively walks light DOM plus open

@@ -1,6 +1,7 @@
 import Foundation
 import CognitiveSubstrate
 import NativeAgentCore
+import NotificationInbox
 import PersistenceCore
 import ProviderRouting
 
@@ -25,14 +26,17 @@ import ProviderRouting
 // decision theater (and "approving" was already documented as executing
 // nothing: switching providers is the user's model-picker move). The honest
 // surface is the LIVE notifications inbox (notifications/inbox.jsonl — the one
-// the UI and iOS read), with append-only EVENT-LOG semantics:
-//   stage    → one "degraded" notice, unless the provider's LATEST vitals row
-//              is already an unrecovered degradation (disk-derived idempotency,
-//              restart-safe with no in-memory map — review BLOCKING #2)
-//   recovery → one "recovered" info notice; the degradation notice stays as
-//              historical truth. No status mutation, no orphaned state.
+// the UI and iOS read), with one active state per provider and archived event
+// history. A recovery cannot coexist with an unread degradation warning, while
+// disk-derived idempotency stays restart-safe with no in-memory association.
 
 extension NativeCognitionRuntime {
+    /// Bootstrap-owned restore. Snapshot age and row validity are enforced by
+    /// the sensor; a missing or stale file is a normal cold start.
+    func restoreProviderVitalsSnapshot() async {
+        _ = await providerVitalsSensor.restoreSnapshot(dataRoot: dataRoot, now: now())
+    }
+
     /// Termination-owned snapshot persistence (the ONLY disk write in the
     /// organ; never on the observe path). Called from applicationWillTerminate.
     func persistProviderVitalsSnapshot() async {
@@ -70,6 +74,7 @@ extension NativeCognitionRuntime {
 
     private func sweepProviderVitalsCards() async {
         defer { providerVitalsCardSweepInFlight = false }
+        await reconcileProviderVitalsNotices()
         let decisions = await providerVitalsSensor.evaluateCardDecisions(now: now())
         guard !decisions.isEmpty else { return }
         for decision in decisions {
@@ -88,34 +93,22 @@ extension NativeCognitionRuntime {
             .appendingPathComponent("inbox.jsonl")
     }
 
-    /// The provider's latest vitals inbox row, if any ("degraded" or
-    /// "recovered" — event-log semantics; the LATEST row is the live state).
-    ///
-    /// 2026-08-01 concurrency fix: takes NO lock of its own and THROWS on read
-    /// failure. Callers run it INSIDE `withFileLock(providerVitalsInboxPath)`
-    /// so the idempotency check and the append are one critical section —
-    /// previously two overlapping sweeps could both read "not degraded" and
-    /// both append, leaving a stale `degraded` card the recovery gate (which
-    /// only ever closes the LATEST row) can never clear. Swallowing a read
-    /// error into `[]` had the same effect on its own, so the error now aborts
-    /// the sweep rather than manufacturing a duplicate.
-    /// Mirrors the check-then-append-under-one-lock shape
-    /// `TriggerNotifierBinding.mirrorCardIntoRealInbox` uses.
-    private static func latestProviderVitalsNoticeKindLocked(
-        providerId: String,
-        inboxPath: URL,
-        persistence: SwiftNativePersistenceCore
-    ) async throws -> String? {
-        let rows = try await persistence.readJSONL(inboxPath)
-        for row in rows.reversed() {
-            guard case .object(let obj) = row,
-                  case .string(let source)? = obj["source"], source == "provider_vitals",
-                  case .string(let provider)? = obj["providerVitalsProvider"],
-                  provider == providerId,
-                  case .string(let kind)? = obj["providerVitalsKind"] else { continue }
-            return kind
+    /// Repairs rows from builds that kept every provider state active. The
+    /// newest state remains untouched; older active states become archived
+    /// history. Bootstrap runs this even when no new transition is due.
+    func reconcileProviderVitalsNotices() async {
+        do {
+            _ = try await LiveNotificationInbox(path: providerVitalsInboxPath)
+                .archiveSupersededActiveRows(
+                    source: "provider_vitals",
+                    groupField: "providerVitalsProvider",
+                    readAt: ISO8601DateFormatter().string(from: now())
+                )
+        } catch {
+            FileHandle.standardError.write(
+                Data("ProviderVitals: inbox reconciliation failed: \(error)\n".utf8)
+            )
         }
-        return nil
     }
 
     func stageProviderVitalsNotice(
@@ -150,10 +143,8 @@ extension NativeCognitionRuntime {
     }
 
     /// Append one vitals notice iff `gateOnLatestKind` accepts the provider's
-    /// latest on-disk vitals row. Read-gate and append run under ONE
-    /// `withFileLock(providerVitalsInboxPath)` (append with `takeLock: false`),
-    /// so overlapping sweeps serialize and a read failure aborts the write
-    /// instead of being read as "no prior notice".
+    /// latest on-disk state. Gate, retirement of the prior active state, and
+    /// append run as one canonical inbox transaction.
     private func appendProviderVitalsNotice(
         providerId: String,
         kind: String,
@@ -163,8 +154,9 @@ extension NativeCognitionRuntime {
         gateOnLatestKind: @escaping @Sendable (String?) -> Bool
     ) async {
         let stamp = ISO8601DateFormatter().string(from: now())
+        let cardID = "provider-vitals-\(kind)-\(providerId)-\(UUID().uuidString.lowercased())"
         let row: JSONValue = .object([
-            "id": .string("provider-vitals-\(kind)-\(providerId)-\(UUID().uuidString.lowercased())"),
+            "id": .string(cardID),
             "created_at": .string(stamp),
             "source": .string("provider_vitals"),
             "severity": .string(severity),
@@ -181,21 +173,18 @@ extension NativeCognitionRuntime {
             "providerVitalsProvider": .string(providerId),
             "providerVitalsKind": .string(kind),
         ])
-        let persistence = SwiftNativePersistenceCore()
-        let inboxPath = providerVitalsInboxPath
         do {
-            try await persistence.withFileLock(inboxPath) { () async throws -> Void in
-                let latest = try await Self.latestProviderVitalsNoticeKindLocked(
-                    providerId: providerId, inboxPath: inboxPath, persistence: persistence
+            _ = try await LiveNotificationInbox(path: providerVitalsInboxPath)
+                .appendReplacingActiveGroup(
+                    row,
+                    id: cardID,
+                    source: "provider_vitals",
+                    groupField: "providerVitalsProvider",
+                    groupValue: providerId,
+                    stateField: "providerVitalsKind",
+                    transitionAt: stamp,
+                    ifLatestStateAllows: gateOnLatestKind
                 )
-                guard gateOnLatestKind(latest) else { return }
-                try await appendJSONLCapped(
-                    row, to: inboxPath, using: persistence,
-                    maxLines: JSONLLineCaps.notificationInbox,
-                    logLabel: "ProviderVitals.inbox",
-                    takeLock: false
-                )
-            }
         } catch {
             // A read/lock/write failure ABORTS the notice — no card is better
             // than a duplicate `degraded` card the recovery gate can't clear.

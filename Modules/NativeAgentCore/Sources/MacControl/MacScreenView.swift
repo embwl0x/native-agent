@@ -381,10 +381,34 @@ public actor MacScreenViewStore {
     }
 
     private var latest: MacScreenViewSnapshot?
+    private var pendingCapture: UUID?
 
     public init() {}
 
+    /// Capture ownership is independent of the current usable snapshot. A
+    /// later-started capture or invalidation retires an older in-flight read.
+    public func beginCapture() -> UUID {
+        let ticket = UUID()
+        if !Task.isCancelled { pendingCapture = ticket }
+        return ticket
+    }
+
+    /// An abandoned read must not retire a newer read or erase the last
+    /// usable snapshot. Cancellation owns only its exact pending ticket.
+    public func cancelCapture(_ ticket: UUID) {
+        if pendingCapture == ticket { pendingCapture = nil }
+    }
+
+    public func record(_ snapshot: MacScreenViewSnapshot, captureTicket: UUID) -> Bool {
+        guard pendingCapture == captureTicket else { return false }
+        pendingCapture = nil
+        guard !Task.isCancelled else { return false }
+        latest = snapshot
+        return true
+    }
+
     public func record(_ snapshot: MacScreenViewSnapshot) {
+        pendingCapture = nil
         latest = snapshot
     }
 
@@ -412,10 +436,13 @@ public actor MacScreenViewStore {
     /// Forget the frozen scene because a physical user input or a completed
     /// motor action may have changed it. This is a safety invalidation, not a
     /// history deletion: the store intentionally owns only one live view.
-    public func invalidate() { latest = nil }
+    public func invalidate() {
+        pendingCapture = nil
+        latest = nil
+    }
 
     /// Test seam only: forget everything. Never called on a production path.
-    public func reset() { latest = nil }
+    public func reset() { invalidate() }
 }
 
 // MARK: - Geometry (THE CRUX)
@@ -1896,6 +1923,38 @@ public enum MacScreenViewResultRedaction {
 
 // MARK: - Production capture source (ScreenCaptureKit)
 
+#if canImport(CoreGraphics)
+/// Select in global logical points, never display pixels: neighbouring screens
+/// may have different scales, and a window's centre may sit in a desktop gap.
+enum MacScreenCaptureDisplaySelection {
+    static func selectedID(
+        displays: [(id: UInt32, bounds: CGRect)],
+        requested: MacAXFrame?,
+        mainDisplayID: UInt32
+    ) -> UInt32? {
+        let fallback = displays.first(where: { $0.id == mainDisplayID })?.id ?? displays.first?.id
+        guard let requested, requested.w > 0, requested.h > 0 else { return fallback }
+        let rect = CGRect(x: requested.x, y: requested.y, width: requested.w, height: requested.h)
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        if let hit = displays.first(where: { $0.bounds.contains(center) }) { return hit.id }
+
+        var best: (id: UInt32, area: CGFloat)?
+        for display in displays {
+            let overlap = display.bounds.intersection(rect)
+            guard !overlap.isNull, overlap.width > 0, overlap.height > 0 else { continue }
+            let area = overlap.width * overlap.height
+            if let previous = best {
+                let preferredTie = display.id == mainDisplayID
+                    || (previous.id != mainDisplayID && display.id < previous.id)
+                guard area > previous.area || (area == previous.area && preferredTie) else { continue }
+            }
+            best = (display.id, area)
+        }
+        return best?.id ?? fallback
+    }
+}
+#endif
+
 #if canImport(ScreenCaptureKit) && os(macOS)
 
 /// Live capture.
@@ -1929,25 +1988,20 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         } catch {
             return .failure(.captureFailed)
         }
-        // Pick the display the requested rect actually lives on (by its centre),
-        // falling back to the main display. A window dragged to a second
-        // monitor must not be "captured" from the primary one.
+        // Prefer the display containing the centre. If the centre lies in a
+        // desktop gap, retain the largest visible portion on a real display.
         let wanted = rect
         let displays = content.displays
         guard !displays.isEmpty else { return .failure(.noDisplay) }
         let mainID = CGMainDisplayID()
-        let display: SCDisplay = {
-            if let wanted {
-                let cx = wanted.x + wanted.w / 2
-                let cy = wanted.y + wanted.h / 2
-                if let hit = displays.first(where: {
-                    CGDisplayBounds($0.displayID).contains(CGPoint(x: cx, y: cy))
-                }) {
-                    return hit
-                }
-            }
-            return displays.first(where: { $0.displayID == mainID }) ?? displays[0]
-        }()
+        let selectedID = MacScreenCaptureDisplaySelection.selectedID(
+            displays: displays.map { (id: $0.displayID, bounds: CGDisplayBounds($0.displayID)) },
+            requested: wanted,
+            mainDisplayID: mainID
+        )
+        guard let display = displays.first(where: { $0.displayID == selectedID }) else {
+            return .failure(.noDisplay)
+        }
 
         let displayBounds = CGDisplayBounds(display.displayID)
         // Global (AX) points → this display's local points. Identical for the

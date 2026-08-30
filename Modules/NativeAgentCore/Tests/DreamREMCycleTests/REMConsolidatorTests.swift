@@ -33,6 +33,35 @@ private struct REMPersistedRunRow: Decodable {
     let error: String?
 }
 
+private final class REMHarnessFailOnceLLM: LLMClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCountStorage = 0
+    private let successPayload: String
+
+    init(successPayload: String) {
+        self.successPayload = successPayload
+    }
+
+    var callCount: Int {
+        lock.withLock { callCountStorage }
+    }
+
+    func complete(prompt: String, system: String?, model: String?) async throws -> String {
+        let call = lock.withLock {
+            callCountStorage += 1
+            return callCountStorage
+        }
+        if call == 1 {
+            throw NSError(
+                domain: "REMFeedHarness",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "intentional REM harness failure"]
+            )
+        }
+        return successPayload
+    }
+}
+
 /// Write <data>/dream_diary/<date>.md AND backdate its mtime so the
 /// 7-day mtime filter in REMConsolidator picks it up.
 private func writeDreamEntryWithMtime(
@@ -707,6 +736,140 @@ func REMConsolidator_persists_completed_skipped_and_disabled_run_reports_for_rel
 }
 
 @Test
+func REMFeedHarness_successPairsMarkerProposalPromotionAndCompletedReceipt() async throws {
+    let (dataRoot, personaRoot) = tempREMRoot()
+    defer { try? FileManager.default.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    try seedREMInputs(dataRoot: dataRoot, personaRoot: personaRoot)
+
+    let llm = MockLLMClient(scriptedResponses: [proposalsJSON(
+        target: "GROWTH.md",
+        proposals: [(
+            text: "Keep the steady lesson available next week.",
+            dates: ["2026-05-28", "2026-05-29"],
+            conf: 0.84
+        )]
+    )])
+    let consolidator = REMConsolidator(
+        dataRoot: dataRoot,
+        personaRoot: personaRoot,
+        llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true),
+        clock: { remTestNow }
+    )
+
+    let report = try await consolidator.runWeeklyREM()
+    #expect(report.proposalsGenerated == 1)
+    #expect(llm.callCount == 1)
+
+    // The weekly claim is useful only when a real output artifact survived.
+    let marker = dataRoot.appendingPathComponent("harness/last_weekly_rem_run")
+    let markerBody = try String(contentsOf: marker, encoding: .utf8)
+    let markerTimestamp = try #require(markerBody.split(separator: " ").first)
+    #expect(ISO8601DateFormatter().date(from: String(markerTimestamp)) != nil)
+
+    let store = REMProposalStore(dataRoot: dataRoot)
+    let pendingRows = store.loadAll()
+    #expect(pendingRows.count == 1)
+    let pending = try #require(pendingRows.first)
+    #expect(pending.status == "pending")
+    #expect(pending.targetDoc == "GROWTH.md")
+    #expect(pending.proposalText == "Keep the steady lesson available next week.")
+
+    let approved = try await store.applyApproval(proposalId: pending.id)
+    #expect(approved.status == "approved")
+    #expect(store.loadAll().map(\.status) == ["approved"])
+    let pins = REMPinsReader.read(dataRoot: dataRoot)
+    #expect(pins["GROWTH.md"]?.map(\.id) == [pending.id])
+    #expect(pins["GROWTH.md"]?.map(\.text) == [pending.proposalText])
+
+    let ledgerURL = dataRoot.appendingPathComponent("runs/runs.json")
+    let rows = try JSONDecoder().decode(
+        [REMPersistedRunRow].self,
+        from: Data(contentsOf: ledgerURL)
+    ).filter { $0.kind == "rem_weekly_consolidation" }
+    #expect(rows.count == 1)
+    let completed = try #require(rows.first)
+    #expect(completed.status == "completed")
+    #expect(completed.error == nil)
+    let payload = try JSONDecoder().decode(
+        REMRunReportPayload.self,
+        from: try #require(completed.output?.data(using: .utf8))
+    )
+    #expect(payload.schemaVersion == REMRunReportPayload.schema)
+    #expect(payload.outcome == .completed)
+    #expect(payload.reason == nil)
+    #expect(payload.report == report)
+}
+
+@Test
+func REMFeedHarness_failureRollsBackMarkerEmitsFailedReceiptAndAdmitsRetry() async throws {
+    let (dataRoot, personaRoot) = tempREMRoot()
+    defer { try? FileManager.default.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    try seedREMInputs(dataRoot: dataRoot, personaRoot: personaRoot)
+
+    let llm = REMHarnessFailOnceLLM(successPayload: proposalsJSON(
+        target: "GROWTH.md",
+        proposals: [(
+            text: "A failed pass must not suppress this retry.",
+            dates: ["2026-05-28", "2026-05-29"],
+            conf: 0.82
+        )]
+    ))
+    let consolidator = REMConsolidator(
+        dataRoot: dataRoot,
+        personaRoot: personaRoot,
+        llm: llm,
+        gate: DreamREMGatePolicy(remCycleEnabled: true),
+        clock: { remTestNow }
+    )
+    let marker = dataRoot.appendingPathComponent("harness/last_weekly_rem_run")
+    let store = REMProposalStore(dataRoot: dataRoot)
+
+    await #expect(throws: (any Error).self) {
+        _ = try await consolidator.runWeeklyREM()
+    }
+    #expect(llm.callCount == 1)
+    #expect(!FileManager.default.fileExists(atPath: marker.path))
+    #expect(store.loadAll().isEmpty)
+    #expect(REMPinsReader.read(dataRoot: dataRoot).isEmpty)
+
+    let ledgerURL = dataRoot.appendingPathComponent("runs/runs.json")
+    var rows = try JSONDecoder().decode(
+        [REMPersistedRunRow].self,
+        from: Data(contentsOf: ledgerURL)
+    ).filter { $0.kind == "rem_weekly_consolidation" }
+    #expect(rows.count == 1)
+    let failed = try #require(rows.first)
+    #expect(failed.status == "failed")
+    #expect(failed.error?.contains("intentional REM harness failure") == true)
+    let failedPayload = try JSONDecoder().decode(
+        REMRunReportPayload.self,
+        from: try #require(failed.output?.data(using: .utf8))
+    )
+    #expect(failedPayload.outcome == .failed)
+    #expect(failedPayload.reason == "execution_failed")
+    #expect(failedPayload.report == nil)
+
+    let retryReport = try await consolidator.runWeeklyREM()
+    #expect(llm.callCount == 2)
+    #expect(retryReport.proposalsGenerated == 1)
+    #expect(FileManager.default.fileExists(atPath: marker.path))
+    #expect(store.loadAll().count == 1)
+
+    rows = try JSONDecoder().decode(
+        [REMPersistedRunRow].self,
+        from: Data(contentsOf: ledgerURL)
+    ).filter { $0.kind == "rem_weekly_consolidation" }
+    #expect(rows.map(\.status) == ["completed", "failed"])
+    let retryPayload = try JSONDecoder().decode(
+        REMRunReportPayload.self,
+        from: try #require(rows.first?.output?.data(using: .utf8))
+    )
+    #expect(retryPayload.outcome == .completed)
+    #expect(retryPayload.report == retryReport)
+}
+
+@Test
 func REMConsolidator_evidence_date_floor_drops_thin_proposals() async throws {
     let (dataRoot, personaRoot) = tempREMRoot()
     // Design floor is 2 distinct evidence dates (see the constants block
@@ -746,4 +909,63 @@ func REMPinsReader_empty_index_yields_no_pins() async throws {
     #expect(idx.isEmpty)
     let pins = REMPinsReader.latest(idx)
     #expect(pins.isEmpty)
+}
+
+@Test
+func REMPinsReader_cachesByPathAndMtime_thenInvalidatesOnChangeRemovalAndCorruption() throws {
+    let (dataRoot, _) = tempREMRoot()
+    defer { try? FileManager.default.removeItem(at: dataRoot.deletingLastPathComponent()) }
+    let pinsURL = dataRoot.appendingPathComponent("rem_pins.json")
+    let firstMtime = Date(timeIntervalSince1970: 1_700_000_000)
+    let secondMtime = firstMtime.addingTimeInterval(1)
+    let corruptMtime = firstMtime.addingTimeInterval(2)
+    let repairedMtime = firstMtime.addingTimeInterval(3)
+
+    func writeIndex(text: String, mtime: Date) throws {
+        try """
+        {"GROWTH.md":[{"id":"pin","text":"\(text)","createdAt":"2026-08-27T00:00:00Z"}]}
+        """.write(to: pinsURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: mtime],
+            ofItemAtPath: pinsURL.path
+        )
+    }
+
+    REMPinsReader._resetCacheForTesting(dataRoot: dataRoot)
+    try writeIndex(text: "FIRST", mtime: firstMtime)
+    #expect(REMPinsReader.latest(REMPinsReader.read(dataRoot: dataRoot)).first?.text == "FIRST")
+    #expect(REMPinsReader._testCacheStats(dataRoot: dataRoot)
+        == REMPinsReader.CacheStats(decodeAttempts: 1, hits: 0))
+
+    // Unchanged file identity is the negative control: repeated turn reads do
+    // no second JSON decode.
+    #expect(REMPinsReader.latest(REMPinsReader.read(dataRoot: dataRoot)).first?.text == "FIRST")
+    #expect(REMPinsReader._testCacheStats(dataRoot: dataRoot)
+        == REMPinsReader.CacheStats(decodeAttempts: 1, hits: 1))
+
+    // Hold mtime fixed across a synthetic rewrite to prove mtime is the cache
+    // key, then change only mtime to prove the pending bytes become live.
+    try writeIndex(text: "SECOND", mtime: firstMtime)
+    #expect(REMPinsReader.latest(REMPinsReader.read(dataRoot: dataRoot)).first?.text == "FIRST")
+    try FileManager.default.setAttributes(
+        [.modificationDate: secondMtime],
+        ofItemAtPath: pinsURL.path
+    )
+    #expect(REMPinsReader.latest(REMPinsReader.read(dataRoot: dataRoot)).first?.text == "SECOND")
+    #expect(REMPinsReader._testCacheStats(dataRoot: dataRoot).decodeAttempts == 2)
+
+    try FileManager.default.removeItem(at: pinsURL)
+    #expect(REMPinsReader.read(dataRoot: dataRoot).isEmpty)
+
+    try "{not-json".write(to: pinsURL, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.modificationDate: corruptMtime],
+        ofItemAtPath: pinsURL.path
+    )
+    #expect(REMPinsReader.read(dataRoot: dataRoot).isEmpty)
+    #expect(REMPinsReader._testCacheStats(dataRoot: dataRoot).decodeAttempts == 3)
+
+    try writeIndex(text: "REPAIRED", mtime: repairedMtime)
+    #expect(REMPinsReader.latest(REMPinsReader.read(dataRoot: dataRoot)).first?.text == "REPAIRED")
+    #expect(REMPinsReader._testCacheStats(dataRoot: dataRoot).decodeAttempts == 4)
 }

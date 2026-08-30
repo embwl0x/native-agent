@@ -104,11 +104,11 @@ extension SwiftToolDispatcher {
         let statusFilter = jsonString(input["status"])
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .flatMap { $0.isEmpty ? nil : $0 }
-        let sessionFilter = jsonString(input["session_id"])
-            ?? jsonString(input["sessionId"])
-        let normalizedSessionFilter = sessionFilter
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .flatMap { $0.isEmpty ? nil : $0 }
+        // Normalize each alias before choosing one: a blank optional primary
+        // must not erase an explicit compatibility-alias filter.
+        let normalizedSessionFilter = ["session_id", "sessionId"]
+            .compactMap { jsonString(input[$0])?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
 
         let snapshot: TurnTraceRecentReader.Snapshot
         do {

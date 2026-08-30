@@ -50,6 +50,8 @@ targets:
       - path: Tests
     dependencies:
       - target: NativeAgentMobile
+      - package: NativeAgentShared
+        product: NativeAgentSharedTestSupport
     settings:
       GENERATE_INFOPLIST_FILE: YES
       PRODUCT_BUNDLE_IDENTIFIER: $(NATIVEAGENT_IOS_TEST_BUNDLE_ID)

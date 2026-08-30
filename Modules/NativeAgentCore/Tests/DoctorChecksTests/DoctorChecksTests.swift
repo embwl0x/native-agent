@@ -519,7 +519,11 @@ private struct InternallyFailingCheck: DoctorCheck {
     // op_log_health: the append-only feeds' compaction-blocked / unbounded-growth
     // surface (gpt-5.5 review 2026-08-02, finding 3).
     #expect(ids.contains("op_log_health"))
-    #expect(results.count == 9)
+    // oauth_token_expiry: two credentials sat expired for weeks with nothing
+    // reporting it (upgrade sweep C9-3, 2026-08-28). Read-only — see
+    // OAuthTokenExpiryCheckTests.
+    #expect(ids.contains("oauth_token_expiry"))
+    #expect(results.count == 10)
 }
 
 @Test func swiftNative_runAll_repair_dispatches_to_repairable_checks() async throws {

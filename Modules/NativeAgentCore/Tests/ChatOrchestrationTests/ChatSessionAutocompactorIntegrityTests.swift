@@ -7,6 +7,54 @@ import Testing
 
 @Suite("Chat transcript autocompaction integrity")
 struct ChatSessionAutocompactorIntegrityTests {
+    @Test("maintenance converges dormant sessions to the backup limit")
+    func dormantSessionBackupsConverge() async throws {
+        let fixture = try Fixture(name: "dormant-backup-retention")
+        let directory = fixture.root
+            .appendingPathComponent("chat/sessions", isDirectory: true)
+            .appendingPathComponent(fixture.sessionID, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for index in 0..<(ChatSessionAutocompactor.maximumCompactBackups + 2) {
+            try Data("backup-\(index)".utf8).write(
+                to: directory.appendingPathComponent(
+                    String(format: "messages.compact.20260829T1200%02dZ.test.jsonl", index)
+                )
+            )
+        }
+
+        let report = await ChatCompactionBackupRetention.enforce(dataRoot: fixture.root)
+
+        #expect(report.sessionsScanned == 1)
+        #expect(report.removed == 2)
+        #expect(report.failures == 0)
+        #expect(!report.truncated)
+        #expect(try fixture.backupFiles().count == ChatSessionAutocompactor.maximumCompactBackups)
+        #expect(try fixture.backupFiles().allSatisfy {
+            !$0.lastPathComponent.contains("120000Z")
+                && !$0.lastPathComponent.contains("120001Z")
+        })
+    }
+
+    @Test("compaction retains only the newest bounded recovery window")
+    func compactionBackupsAreBounded() async throws {
+        let fixture = try Fixture(name: "backup-retention")
+        let compactor = fixture.compactor()
+        for index in 0..<(ChatSessionAutocompactor.maximumCompactBackups + 3) {
+            var payload = Data()
+            payload.append(try row(role: "user", content: "context \(index) " + String(repeating: "x", count: 80)))
+            payload.append(try row(role: "assistant", content: "reply \(index) " + String(repeating: "y", count: 80)))
+            try payload.write(to: fixture.messagesURL)
+            _ = try await compactor.compactIfNeeded(
+                sessionId: fixture.sessionID,
+                model: "gpt-5.6",
+                surface: "chat",
+                runId: nil,
+                force: true
+            )
+        }
+        #expect(try fixture.backupFiles().count == ChatSessionAutocompactor.maximumCompactBackups)
+    }
+
     @Test("manual force bypasses automatic gates but keeps canonical safety path")
     func manualForceUsesCanonicalCompactor() async throws {
         let fixture = try Fixture(name: "manual-force")

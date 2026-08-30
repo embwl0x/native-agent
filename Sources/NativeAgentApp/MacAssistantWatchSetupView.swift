@@ -1,4 +1,36 @@
 import SwiftUI
+import Observation
+
+/// Appearance, manual refresh, and completed setup/probe actions can overlap.
+/// Only the newest requested inventory may replace the mounted readiness state.
+@MainActor @Observable
+final class MacAssistantWatchSetupReadState {
+    private(set) var loadState: MacAssistantWatchSetupLoadState = .loading
+    private(set) var isLoading = false
+    @ObservationIgnored private var generation: UInt64 = 0
+
+    @discardableResult
+    func reload(read: @MainActor () async throws -> MacAssistantStatusResponse) async -> Bool {
+        generation &+= 1
+        let request = generation
+        isLoading = true
+        defer {
+            if request == generation { isLoading = false }
+        }
+        do {
+            let status = try await read()
+            guard !Task.isCancelled, request == generation else { return false }
+            loadState = .current(status)
+            return true
+        } catch {
+            guard !Task.isCancelled, request == generation else { return false }
+            loadState = loadState.afterFailure(
+                "Couldn’t refresh Assistant Watch setup: \(error.localizedDescription)"
+            )
+            return false
+        }
+    }
+}
 
 struct MacAssistantWatchSetupView: View {
     typealias StatusReader = @MainActor () async throws -> MacAssistantStatusResponse
@@ -8,8 +40,10 @@ struct MacAssistantWatchSetupView: View {
     private let loadsOnAppear: Bool
 
     @Environment(AppModel.self) private var appModel
-    @State private var loadState: MacAssistantWatchSetupLoadState = .loading
-    @State private var isLoading = false
+    @State private var readState = MacAssistantWatchSetupReadState()
+
+    private var loadState: MacAssistantWatchSetupLoadState { readState.loadState }
+    private var isLoading: Bool { readState.isLoading }
 
     init(
         refreshToken: Int = 0,
@@ -163,20 +197,12 @@ struct MacAssistantWatchSetupView: View {
     }
 
     private func load() async {
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            let status: MacAssistantStatusResponse
+        await readState.reload {
             if let statusReader {
-                status = try await statusReader()
+                return try await statusReader()
             } else {
-                status = try await appModel.getMacAssistantStatus()
+                return try await appModel.getMacAssistantStatus()
             }
-            loadState = .current(status)
-        } catch {
-            loadState = loadState.afterFailure(
-                "Couldn’t refresh Assistant Watch setup: \(error.localizedDescription)"
-            )
         }
     }
 

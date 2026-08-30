@@ -92,6 +92,74 @@ struct SkillLifecycleChatToolTests {
         #expect(text.contains("state the outcome, verification, and remaining risk"))
     }
 
+    @Test(arguments: ["Research / Notes", "Plan .. Review", ".Morning Plan", "Plan.md"])
+    func registeredDisplayPunctuationResolvesOnlyToSafeCanonicalID(name: String) async throws {
+        let dataRoot = try root()
+        defer { try? FileManager.default.removeItem(at: dataRoot) }
+        let memory = SwiftNativeMemoryV2(
+            embedder: MockEmbeddingProvider(dimensions: 8), storage: InMemoryMemoryStorage()
+        )
+        let dispatcher = SwiftToolDispatcher(dataRoot: dataRoot, memoryV2: memory, allowProcessGlobalTools: false)
+        let content = "# Procedure\n\nUse when organizing orchard notes. Keep the observation date with each note."
+        let saved = try await dispatcher.dispatch(tool: "save_skill", input: [
+            "name": .string(name), "description": .string("Organize dated orchard notes."),
+            "content": .string(content),
+        ], surface: "chat")
+        guard case .object(let receipt) = saved, case .object(let skill)? = receipt["skill"],
+              case .string(let id)? = skill["id"] else {
+            Issue.record("missing saved canonical skill ID"); return
+        }
+        #expect(!id.contains("/") && !id.contains("..") && !id.hasPrefix("."))
+        #expect(receipt["recall_pointer"] == .string("reconciled"))
+        let listed = try await dispatcher.dispatch(tool: "list_skills", input: [:], surface: "chat")
+        guard case .array(let rows) = listed else { Issue.record("missing skill list"); return }
+        #expect(rows.contains { row in
+            guard case .object(let object) = row else { return false }
+            return object["id"] == .string(id) && object["name"] == .string(name)
+        })
+        let pointers = try await memory.listMemory(kind: "skill")
+        #expect(pointers.contains { $0.id == "skill-pointer:\(id)" && $0.text.contains("read_skill(\"\(id)\")") })
+        for handle in [name, id] {
+            let body = try await dispatcher.dispatch(tool: "read_skill", input: ["name": .string(handle)], surface: "chat")
+            #expect(body == .string(content))
+        }
+        for invalid in ["../\(id)", "unregistered/path", "unregistered..name", ".unregistered"] {
+            await #expect(throws: AutonomyGateError.self) {
+                _ = try await dispatcher.dispatch(tool: "read_skill", input: ["name": .string(invalid)], surface: "chat")
+            }
+        }
+    }
+
+    @Test func exactDisplayNameWinsBeforeLegacyMarkdownSuffixLookup() async throws {
+        let dataRoot = try root()
+        defer { try? FileManager.default.removeItem(at: dataRoot) }
+        let dispatcher = SwiftToolDispatcher(
+            dataRoot: dataRoot,
+            memoryV2: SwiftNativeMemoryV2(embedder: MockEmbeddingProvider(dimensions: 8), storage: InMemoryMemoryStorage()),
+            allowProcessGlobalTools: false
+        )
+        let bodies = [
+            "Notes": "# Notes\n\nUse when collecting ordinary orchard observations.",
+            "Notes.md": "# Markdown Notes\n\nUse when formatting orchard observations as Markdown.",
+        ]
+        for name in ["Notes", "Notes.md"] {
+            let body = try #require(bodies[name])
+            _ = try await dispatcher.dispatch(tool: "save_skill", input: [
+                "name": .string(name), "description": .string("Record orchard observations."),
+                "content": .string(body),
+            ], surface: "chat")
+        }
+        for (handle, expectedName) in [
+            ("Notes", "Notes"), ("Notes.md", "Notes.md"), ("notes-md", "Notes.md"),
+            // No exact registered Notes.md.md name: retain suffix compatibility.
+            ("Notes.md.md", "Notes.md"),
+        ] {
+            let result = try await dispatcher.dispatch(tool: "read_skill", input: ["name": .string(handle)], surface: "chat")
+            let expectedBody = try #require(bodies[expectedName])
+            #expect(result == .string(expectedBody))
+        }
+    }
+
     @Test func appOnlyCanonicalPersonaSkillIsListableAndReadable() async throws {
         let dataRoot = try root()
         defer { try? FileManager.default.removeItem(at: dataRoot) }

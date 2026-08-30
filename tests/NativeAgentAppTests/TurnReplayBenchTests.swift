@@ -1928,7 +1928,13 @@ struct TurnReplayBenchTests {
     /// The REAL-fixture lane. Skipped (never silently passed) without the env
     /// var, because the fixture holds real personal data and lives outside the
     /// repository.
-    @Test func realFixtureReplayHoldsEveryEnvelopeInvariant() async throws {
+    @Test(.enabled(
+        if: ProcessInfo.processInfo.environment["NATIVEAGENT_BENCH_FIXTURE"]?
+            .trimmingCharacters(in: .whitespaces).isEmpty == false
+            || ProcessInfo.processInfo.environment["NATIVEAGENT_RELEASE_GATE"] == "1",
+        "NATIVEAGENT_BENCH_FIXTURE unset — real-fixture replay skipped; synthetic replay remains enabled"
+    ))
+    func realFixtureReplayHoldsEveryEnvelopeInvariant() async throws {
         guard let path = ProcessInfo.processInfo.environment["NATIVEAGENT_BENCH_FIXTURE"],
               !path.trimmingCharacters(in: .whitespaces).isEmpty else {
             // Ordinary `swift test`: an explicit SKIP, not a "known issue" —
@@ -1940,7 +1946,6 @@ struct TurnReplayBenchTests {
                 Issue.record("RELEASE GATE: NATIVEAGENT_BENCH_FIXTURE is required — capture one with script/agent_bench_capture.swift before shipping")
                 return
             }
-            print("turn-replay bench: SKIPPED real-fixture lane (NATIVEAGENT_BENCH_FIXTURE unset; synthetic lane still ran)")
             return
         }
         let directory = URL(fileURLWithPath: path).standardizedFileURL

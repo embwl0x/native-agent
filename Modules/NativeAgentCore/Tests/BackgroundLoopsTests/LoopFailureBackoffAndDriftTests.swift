@@ -134,6 +134,17 @@ private struct WedgedLoop: LoopRunner {
     #expect(LoopTickOutcome.skipped(reason: "r") == .skipped(reason: "r", healthNeutral: false))
 }
 
+/// C5 added one-sided jitter to the HEALTHY periodic branch, so the exact
+/// cadence claims below need a deterministic draw. The two jitter consumers are
+/// distinguishable by the range they ask for: the backoff policy asks for its
+/// `jitterRange` (0.8...1.2, lower bound > 0) and wants a neutral 1.0
+/// multiplier; the healthy branch asks for `0...ceiling` and wants a zero
+/// addition so the pinned interval arithmetic stays exact. Jitter BOUNDS are
+/// pinned separately in `LoopJitterBoundsTests`.
+private let deterministicJitter: @Sendable (ClosedRange<Double>) -> Double = { range in
+    range.lowerBound == 0 ? 0 : 1.0
+}
+
 // MARK: - 2. failure backoff
 
 @Test func failurePath_backsOffExponentiallyAndResetsOnSuccess() async {
@@ -144,7 +155,7 @@ private struct WedgedLoop: LoopRunner {
     let sched = SwiftNativeLoopScheduler(
         clock: { clock.time() },
         failureBackoff: LoopFailureBackoffPolicy(baseDelay: 5, maxDelay: 300, multiplier: 2),
-        jitter: { _ in 1.0 }
+        jitter: deterministicJitter
     )
     let loop = AlwaysFailingLoop(loopId: "slackish", interval: 2, failureBackoffPolicy: nil)
     await sched.register(loop)
@@ -169,7 +180,7 @@ private struct WedgedLoop: LoopRunner {
 @Test func failureBackoff_neverShorterThanTheLoopsOwnInterval() async {
     // A 6h loop must not start ticking every 5s just because it failed.
     let clock = BackoffTestClock(Date(timeIntervalSince1970: 1_000_000))
-    let sched = SwiftNativeLoopScheduler(clock: { clock.time() }, jitter: { _ in 1.0 })
+    let sched = SwiftNativeLoopScheduler(clock: { clock.time() }, jitter: deterministicJitter)
     let loop = AlwaysFailingLoop(loopId: "sixhour", interval: 21_600, failureBackoffPolicy: nil)
     await sched.register(loop)
     await sched._testRunOneTick(loopId: loop.loopId)
@@ -210,7 +221,7 @@ private struct WedgedLoop: LoopRunner {
     // tick takes 25 minutes became a 6h25m loop — permanently, and across
     // restarts via the durable last-run stamp.
     let clock = BackoffTestClock(Date(timeIntervalSince1970: 1_000_000))
-    let sched = SwiftNativeLoopScheduler(clock: { clock.time() })
+    let sched = SwiftNativeLoopScheduler(clock: { clock.time() }, jitter: deterministicJitter)
     struct SixHourLoop: LoopRunner {
         let loopId = "sixhour"
         let interval: TimeInterval = 21_600
@@ -237,7 +248,9 @@ private struct WedgedLoop: LoopRunner {
     // Telegram's shape: 2s interval, ~25s long poll. Start-relative arithmetic
     // goes negative; the floor keeps it from becoming a busy spin.
     let clock = BackoffTestClock(Date(timeIntervalSince1970: 1_000_000))
-    let sched = SwiftNativeLoopScheduler(clock: { clock.time() }, minimumTickSpacing: 0.25)
+    let sched = SwiftNativeLoopScheduler(
+        clock: { clock.time() }, minimumTickSpacing: 0.25, jitter: deterministicJitter
+    )
     struct PollLoop: LoopRunner {
         let loopId = "poll"
         let interval: TimeInterval = 2

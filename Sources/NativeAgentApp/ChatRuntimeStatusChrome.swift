@@ -16,25 +16,52 @@ import CoreSpotlight
 import CloudKit
 #endif
 
+enum HealthCardPillStatus: Equatable {
+    case notChecked, unknown, healthy, warning, issue
+
+    static func make(overall: String?) -> Self {
+        guard let overall else { return .notChecked }
+        switch overall.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "ok": return .healthy
+        case "warn": return .warning
+        case "error": return .issue
+        default: return .unknown
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .notChecked: "Not checked"
+        case .unknown: "Unknown"
+        case .healthy: "Healthy"
+        case .warning: "Warning"
+        case .issue: "Issue"
+        }
+    }
+
+    var emoji: String {
+        switch self {
+        case .notChecked, .unknown: "○"
+        case .healthy: "🟢"
+        case .warning: "🟡"
+        case .issue: "🔴"
+        }
+    }
+}
+
 struct HealthCardPill: View {
     @Environment(AppModel.self) private var appModel
     @State private var showPopover = false
 
-    private var overall: String { appModel.healthCard?.overall ?? "unknown" }
-    private var pillColor: Color {
-        switch overall {
-        case "error": return .red
-        case "warn":  return .yellow
-        case "unknown": return .gray
-        default:       return .green
-        }
+    private var status: HealthCardPillStatus {
+        .make(overall: appModel.healthCard?.overall)
     }
-    private var pillEmoji: String {
-        switch overall {
-        case "error": return "🔴"
-        case "warn":  return "🟡"
-        case "unknown": return "○"
-        default:       return "🟢"
+    private var pillColor: Color {
+        switch status {
+        case .issue: .red
+        case .warning: .yellow
+        case .notChecked, .unknown: .gray
+        case .healthy: .green
         }
     }
 
@@ -43,9 +70,9 @@ struct HealthCardPill: View {
             showPopover.toggle()
         } label: {
             HStack(spacing: 4) {
-                Text(pillEmoji)
+                Text(status.emoji)
                     .font(.caption2)
-                Text(overall == "ok" ? "Healthy" : overall == "warn" ? "Warning" : overall == "unknown" ? "Checking" : "Issue")
+                Text(status.label)
                     .font(.caption2)
                     .foregroundStyle(pillColor)
             }
@@ -55,6 +82,8 @@ struct HealthCardPill: View {
             .overlay(Capsule().stroke(pillColor.opacity(0.4), lineWidth: 1))
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("System health: \(status.label)")
+        .accessibilityHint("Shows system health details")
         .popover(isPresented: $showPopover, arrowEdge: .trailing) {
             HealthCardPopover()
                 .frame(width: 320)
@@ -90,6 +119,7 @@ struct HealthCardPopover: View {
                 Spacer()
                 Button { dismiss() } label: { Image(systemName: "xmark.circle") }
                     .buttonStyle(.borderless)
+                    .accessibilityLabel("Close system health")
             }
             .padding(.bottom, 4)
 
@@ -106,6 +136,8 @@ struct HealthCardPopover: View {
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
+                                .textSelection(.enabled)
+                                .help(sub.detail)
                         }
                         Spacer()
                         if let fix = sub.fixAction {
@@ -295,6 +327,9 @@ struct WhatsRunningPanel: View {
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Running work: \(presentation.title)")
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+            .accessibilityHint(expanded ? "Collapses running work details" : "Shows running work details")
 
             if expanded {
                 VStack(spacing: 4) {
@@ -335,6 +370,7 @@ struct WhatsRunningPanel: View {
 struct WhatsRunningRow: View {
     @Environment(AppModel.self) private var appModel
     let item: WhatsRunningItem
+    @State private var isCancelling = false
 
     private var kindIcon: String {
         switch item.kind {
@@ -361,12 +397,21 @@ struct WhatsRunningRow: View {
                 Button {
                     Task { await cancelItem() }
                 } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.red)
+                    if isCancelling {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Image(systemName: "stop.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    }
                 }
                 .buttonStyle(.borderless)
-                .help("Cancel")
+                .disabled(isCancelling)
+                .help(item.cancelHint ?? "Cancel \(item.label)")
+                .accessibilityLabel(isCancelling
+                    ? "Cancelling \(item.label)"
+                    : (item.cancelHint ?? "Cancel \(item.label)"))
             }
         }
         .padding(.horizontal, 8)
@@ -376,6 +421,10 @@ struct WhatsRunningRow: View {
 
     @MainActor
     private func cancelItem() async {
+        guard !isCancelling else { return }
+        isCancelling = true
+        defer { isCancelling = false }
+
         // R22: source from AppModel's canonical `client`.
         let api = appModel.client
         do {
@@ -392,10 +441,12 @@ struct WhatsRunningRow: View {
                 // settlement decide canceled versus outcome-unknown.
                 appModel.stopChatStream(sessionId: item.id)
             default:
-                break
+                appModel.systemToasts.push(error: "\(item.label) cannot be cancelled from this panel.")
             }
         } catch {
-            // non-fatal — refresh state regardless
+            appModel.systemToasts.push(
+                error: "Could not cancel \(item.label): \(error.localizedDescription)"
+            )
         }
         await appModel.loadWhatsRunning()
     }
@@ -472,6 +523,11 @@ struct CapabilitiesChip: View {
         }
         .buttonStyle(.borderless)
         .help("Show what \(appModel.agentDisplayName) can do right now")
+        .accessibilityLabel(
+            "Capabilities: \(toolCount) tools, \(connectorCount) connectors, screen \(screenOn ? "on" : "off")"
+        )
+        .accessibilityValue(showingDetails ? "Details shown" : "Details hidden")
+        .accessibilityHint("Shows currently available tools, connectors, and screen access")
         .popover(isPresented: $showingDetails, arrowEdge: .bottom) {
             CapabilitiesChipDetail()
                 .frame(minWidth: 280, idealWidth: 320)

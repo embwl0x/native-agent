@@ -65,6 +65,70 @@ private func makeBodyReaderRoot() throws -> URL {
     #expect(empty.providersHealthy == nil)
 }
 
+@Test func organismBodyReaderAcceptsOnlyTheMatchingAppliedConsolidationReceipt() throws {
+    let root = try makeBodyReaderRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let memoryRoot = root.appendingPathComponent("memory", isDirectory: true)
+    let receiptsRoot = memoryRoot
+        .appendingPathComponent("consolidation/receipts", isDirectory: true)
+    try FileManager.default.createDirectory(at: receiptsRoot, withIntermediateDirectories: true)
+    try Data("sqlite-fixture".utf8).write(
+        to: memoryRoot.appendingPathComponent("memory.sqlite"))
+    try Data("""
+    {"status":"staged","createdAt":"2026-08-24T12:00:00Z","consolidationRunId":"run-current"}
+    """.utf8).write(to: memoryRoot.appendingPathComponent("hygiene_last_run.json"))
+    try Data("""
+    {"run_id":"run-current","status":"applied","at":"2026-08-24T12:05:00Z"}
+    """.utf8).write(to: receiptsRoot.appendingPathComponent("run-current.json"))
+
+    let read = NativeCognitionRuntime.makeOrganismBodyRead(
+        dataRoot: root,
+        // Keep fixture evidence on or before the reading time; the typed
+        // integrity DTO correctly discards future-dated evidence.
+        now: Date(timeIntervalSince1970: 2_000_000_000)
+    )
+
+    #expect(read.memoryIntegrityReading?.category == .healthy)
+    #expect(read.memoryHealthy == true)
+    #expect(read.memoryIntegrityReading?.evidence.count == 3)
+}
+
+@Test func organismBodyReaderFailsClosedForMismatchedFailedOrUnreadableConsolidationReceipts() throws {
+    let root = try makeBodyReaderRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let memoryRoot = root.appendingPathComponent("memory", isDirectory: true)
+    let receiptsRoot = memoryRoot
+        .appendingPathComponent("consolidation/receipts", isDirectory: true)
+    let hygienePath = memoryRoot.appendingPathComponent("hygiene_last_run.json")
+    let receiptPath = receiptsRoot.appendingPathComponent("run-current.json")
+    try FileManager.default.createDirectory(at: receiptsRoot, withIntermediateDirectories: true)
+    try Data("sqlite-fixture".utf8).write(
+        to: memoryRoot.appendingPathComponent("memory.sqlite"))
+    try Data("""
+    {"status":"staged","createdAt":"2026-08-24T12:00:00Z","consolidationRunId":"run-current"}
+    """.utf8).write(to: hygienePath)
+
+    try Data("""
+    {"run_id":"run-other","status":"applied","at":"2026-08-24T12:05:00Z"}
+    """.utf8).write(to: receiptPath)
+    let mismatched = NativeCognitionRuntime.makeOrganismBodyRead(dataRoot: root)
+    #expect(mismatched.memoryHealthy == false)
+
+    try Data("""
+    {"run_id":"run-current","status":"failed","at":"2026-08-24T12:05:00Z"}
+    """.utf8).write(to: receiptPath)
+    let failed = NativeCognitionRuntime.makeOrganismBodyRead(dataRoot: root)
+    #expect(failed.memoryHealthy == false)
+
+    try Data("not-json".utf8).write(to: receiptPath)
+    let unreadableReceipt = NativeCognitionRuntime.makeOrganismBodyRead(dataRoot: root)
+    #expect(unreadableReceipt.memoryHealthy == false)
+
+    try Data("not-json".utf8).write(to: hygienePath)
+    let unreadableHygiene = NativeCognitionRuntime.makeOrganismBodyRead(dataRoot: root)
+    #expect(unreadableHygiene.memoryHealthy == false)
+}
+
 @Test func organismBodyReaderDoesNotTreatMobileTokenFreshnessAsPeerContact() throws {
     let root = try makeBodyReaderRoot()
     defer { try? FileManager.default.removeItem(at: root) }

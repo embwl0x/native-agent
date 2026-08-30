@@ -82,7 +82,17 @@ struct FeedsReportsOnlyWave2WorkflowTests {
             Issue.record("reconciliation did not join the old run state to its durable terminal row")
             return
         }
-        let repeated = try await client.listWorkflowRuns()
+        // Re-enter recovery after the age gate, not just immediately (which
+        // skips the state and would conceal repeated terminal rewrites).
+        let repairedBytes = try Data(contentsOf: oldStatePath)
+        let oldModifiedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: oldModifiedAt], ofItemAtPath: oldStatePath.path)
+        let laterClient = SwiftNativeWorkflowOrchestrationClient(root: root, now: { "2026-08-25T12:00:00+00:00" }, uuid: { "wave2" })
+        let repeated = try await laterClient.listWorkflowRuns()
         #expect(repeated.count == 1)
+        #expect(try Data(contentsOf: oldStatePath) == repairedBytes)
+        // URL resource values were cached by the initial age assertion above.
+        let repeatedAttributes = try FileManager.default.attributesOfItem(atPath: oldStatePath.path)
+        #expect(repeatedAttributes[.modificationDate] as? Date == oldModifiedAt)
     }
 }

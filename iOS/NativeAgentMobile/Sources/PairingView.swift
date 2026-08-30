@@ -5,6 +5,19 @@
 //   2) Manual base64 HMAC paste as a fallback when KVS sync is delayed.
 import SwiftUI
 
+enum IOSPairingPresentation {
+    static let title = "Pair with the Mac app to get started."
+    static let iCloudReadyDetail = "NativeAgent connects to your Mac via iCloud. The Mac publishes a pairing key automatically. If this iPhone does not pick it up after a few seconds, open Mac Settings -> Pair iPhone / iPad, copy the key, and paste it below."
+    static let iCloudUnavailableDetail = "Sign into iCloud in Settings -> Apple Account to enable pairing."
+    static let manualSectionTitle = "Pairing key from Mac Settings"
+    static let manualSectionDetail = "NativeAgent for iPhone does not scan a QR code yet. To continue, copy the pairing key from the Mac app (Settings -> Pair iPhone / iPad) and paste it here."
+    static let manualFieldHint = "Paste the pairing key (base64, about 44 characters):"
+    static let manualLengthDetail = "Paste the base64 key from the Mac app, not a hex string. The key is usually about 44 characters."
+    static let missingKeyMessage = "Waiting on the pairing key from your Mac. Open Mac Settings -> Pair iPhone / iPad, then copy and paste the current key if it has not arrived through iCloud yet."
+    static let notSignedSyncMessage = "iCloud sync paused — pairing key not configured. Open Mac Settings -> Pair iPhone / iPad, then copy and paste the current key."
+    static let signatureRetryMessage = "Signature validation failed. Open Mac Settings -> Pair iPhone / iPad, then copy and paste the current key again."
+}
+
 enum ManualPairingKeyPaste {
     enum Verdict: Equatable {
         case verified
@@ -52,7 +65,7 @@ struct PairingView: View {
 
                     VStack(spacing: 8) {
                         GradientText(text: "NativeAgent Mobile", font: AppFont.display)
-                        Text("Pair with the Mac app to get started.")
+                        Text(IOSPairingPresentation.title)
                             .font(AppFont.body)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -73,7 +86,7 @@ struct PairingView: View {
                                 .foregroundStyle(.blue)
                             Text("iCloud detected")
                                 .font(.headline)
-                            Text("NativeAgent connects to your Mac via iCloud. The Mac publishes a pairing key automatically — this device should pick it up within a few seconds.")
+                            Text(IOSPairingPresentation.iCloudReadyDetail)
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
@@ -97,7 +110,7 @@ struct PairingView: View {
                             .disabled(!pairingStore.isICloudSigned)
                         }
                     } else {
-                        Text("Sign into iCloud in Settings → Apple Account to enable pairing.")
+                        Text(IOSPairingPresentation.iCloudUnavailableDetail)
                             .font(.callout)
                             .foregroundStyle(.orange)
                             .multilineTextAlignment(.center)
@@ -129,11 +142,11 @@ struct PairingView: View {
             Divider().padding(.horizontal, 48)
 
             VStack(alignment: .leading, spacing: 8) {
-                Label("Manual pairing key (fallback)", systemImage: "lock.icloud")
+                Label(IOSPairingPresentation.manualSectionTitle, systemImage: "lock.icloud")
                     .font(AppFont.section)
                     .padding(.horizontal, 32)
 
-                Text("Use this only if iCloud sync is delayed. Copy the pairing key from the Mac app (Settings → Pair iPhone) and paste it here.")
+                Text(IOSPairingPresentation.manualSectionDetail)
                     .font(AppFont.label)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 32)
@@ -160,7 +173,7 @@ struct PairingView: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Paste the pairing key (base64, ~44 chars):")
+                Text(IOSPairingPresentation.manualFieldHint)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 32)
@@ -174,7 +187,7 @@ struct PairingView: View {
                     .cornerRadius(8)
                     .padding(.horizontal, 32)
 
-                Text("Paste the base64 key from the Mac app (NOT hex). Length should be ~44 characters.")
+                Text(IOSPairingPresentation.manualLengthDetail)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 32)
@@ -192,7 +205,7 @@ struct PairingView: View {
 
     private func connectViaICloud() {
         guard pairingStore.isICloudSigned else {
-            errorMessage = "Waiting on the pairing key from your Mac. Make sure both devices are signed into the same iCloud account; the key arrives automatically via iCloud."
+            errorMessage = IOSPairingPresentation.missingKeyMessage
             return
         }
         pairingStore.applyICloudPairing()

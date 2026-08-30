@@ -249,9 +249,10 @@ extension MacSyncEngine {
             includeTranscripts: includeTranscripts,
             generation: generation
         ) else { return }
+        let coalescingDelay = chatSnapshotCoalescingDelay
         chatTranscriptSnapshotPublicationTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(for: .milliseconds(180))
+                try await coalescingDelay(.milliseconds(180))
             } catch {
                 return
             }

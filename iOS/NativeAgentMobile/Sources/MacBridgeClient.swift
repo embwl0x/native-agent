@@ -96,6 +96,9 @@ enum BridgeStatus: Equatable {
     case awaitingMacActivity
     case offline
     case macUnreachable
+    /// E8: this phone has no usable network path. Distinct from every other
+    /// case, all of which blame the Mac or iCloud for a local outage.
+    case deviceOffline
     case stale(minutesAgo: Int)
     case connecting
 
@@ -109,6 +112,8 @@ enum BridgeStatus: Equatable {
             return "iCloud unreachable"
         case .macUnreachable:
             return "Mac unreachable"
+        case .deviceOffline:
+            return "iPhone offline"
         case .stale(let minutesAgo):
             return "Last seen \(minutesAgo)m ago"
         case .connecting:
@@ -120,7 +125,7 @@ enum BridgeStatus: Equatable {
         switch self {
         case .online:
             return .green
-        case .offline, .macUnreachable:
+        case .offline, .macUnreachable, .deviceOffline:
             return .red
         case .awaitingMacActivity, .stale, .connecting:
             return .orange
@@ -135,6 +140,54 @@ enum MacBridgeReconnectPolicy {
     }
 }
 
+/// E8: the status chip used to be recomputed by a 5s timer that ran for the
+/// life of the process, including on a phone that had been idle and settled for
+/// hours. `bridgeStatusDecision` is a pure function of three ages, so the timer
+/// is only needed while one of those ages can still cross a boundary.
+enum MacBridgeStatusRefreshPolicy {
+    /// Cadence while a boundary is imminent (online → stale, connecting →
+    /// offline, offline → macUnreachable).
+    static let activeInterval: TimeInterval = 5
+    /// Cadence once the only thing still changing is the displayed minute count.
+    static let minuteCounterInterval: TimeInterval = 60
+
+    /// Seconds until the next recompute, or nil when nothing time-dependent
+    /// remains — the availability publisher and any Mac confirmation re-arm it.
+    static func refreshInterval(
+        now: Date,
+        lastSeenAt: Date?,
+        connectingStartedAt: Date?,
+        bridgeUnavailableSince: Date?,
+        isPaired: Bool,
+        recentLastSeenInterval: TimeInterval,
+        initialConnectingInterval: TimeInterval,
+        macUnreachableThreshold: TimeInterval
+    ) -> TimeInterval? {
+        if let connectingStartedAt,
+           now.timeIntervalSince(connectingStartedAt) <= initialConnectingInterval {
+            return activeInterval
+        }
+        // Paired + unavailable is still counting up to the .macUnreachable flip.
+        if isPaired, let bridgeUnavailableSince,
+           now.timeIntervalSince(bridgeUnavailableSince) < macUnreachableThreshold {
+            return activeInterval
+        }
+        if let lastSeenAt {
+            // Still recent: the online → stale boundary is imminent. Past it,
+            // only the "Nm ago" counter moves — once a minute while minutes
+            // are what the label shows, hourly once it reads in hours
+            // (review fix, 2026-08-28: a long-settled stale state kept a 60s
+            // wakeup forever; the label's own granularity is the honest tick).
+            let age = now.timeIntervalSince(lastSeenAt)
+            if age <= recentLastSeenInterval { return activeInterval }
+            return age < 3600 ? minuteCounterInterval : 3600
+        }
+        // Never seen, not connecting, already past the unreachable threshold:
+        // the projection is settled until an event changes an input.
+        return nil
+    }
+}
+
 @MainActor
 final class MacBridgeClient: ObservableObject {
     private let bridge: iCloudBridge
@@ -146,7 +199,19 @@ final class MacBridgeClient: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var reconnectGeneration = 0
     private var bridgeAvailabilityCancellable: AnyCancellable?
-    private var bridgeStatusPollCancellable: AnyCancellable?
+    private var networkPathCancellable: AnyCancellable?
+    private var statusRefreshTask: Task<Void, Never>?
+    private let pathObserver: NetworkPathObserver = .shared
+    /// E8: fired when the device's network path comes back, so the chat store
+    /// can auto-resume its durable queued sends.
+    var onNetworkPathRestored: (() -> Void)?
+    /// nil until NWPathMonitor reports; nil never paints an outage. Republished
+    /// here so views observing the client see the transition.
+    @Published private(set) var deviceIsOffline: Bool?
+    /// Banner copy for the offline case, or nil when there is nothing to say.
+    var offlineBannerMessage: String? {
+        NetworkPathObserver.offlineBannerMessage(isOffline: deviceIsOffline)
+    }
     var connectingStartedAt: Date?
     private var bridgeUnavailableSince: Date?
     /// F4: when paired and the bridge stays unavailable >30s, status flips to
@@ -163,11 +228,20 @@ final class MacBridgeClient: ObservableObject {
             .sink { [weak self] _ in
                 Task { @MainActor in self?.refreshBridgeStatus() }
             }
-        bridgeStatusPollCancellable = Timer.publish(every: 5, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                Task { @MainActor in self?.refreshBridgeStatus() }
+        // E8: replaces the unconditional 5s forever-timer. refreshBridgeStatus
+        // re-arms this with an interval derived from the current ages, and
+        // stops arming it entirely once the projection is settled.
+        networkPathCancellable = pathObserver.$isOffline
+            .sink { [weak self] offline in
+                Task { @MainActor in
+                    self?.deviceIsOffline = offline
+                    self?.refreshBridgeStatus()
+                }
             }
+        pathObserver.onPathRestored = { [weak self] in
+            self?.onNetworkPathRestored?()
+        }
+        pathObserver.start()
         refreshBridgeStatus()
     }
 
@@ -316,6 +390,30 @@ final class MacBridgeClient: ObservableObject {
         if bridgeStatus != next {
             bridgeStatus = next
         }
+        rescheduleStatusRefresh(now: now)
+    }
+
+    /// E8: arm exactly one recompute, at the cadence the current ages justify.
+    private func rescheduleStatusRefresh(now: Date) {
+        statusRefreshTask?.cancel()
+        guard let interval = MacBridgeStatusRefreshPolicy.refreshInterval(
+            now: now,
+            lastSeenAt: lastSeenAt,
+            connectingStartedAt: connectingStartedAt,
+            bridgeUnavailableSince: bridgeUnavailableSince,
+            isPaired: pairingStore?.isPaired == true,
+            recentLastSeenInterval: Self.recentLastSeenInterval,
+            initialConnectingInterval: Self.initialConnectingInterval,
+            macUnreachableThreshold: Self.macUnreachableThreshold
+        ) else {
+            statusRefreshTask = nil
+            return
+        }
+        statusRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.refreshBridgeStatus()
+        }
     }
 
     private func computedBridgeStatus(now: Date) -> BridgeStatus {
@@ -325,6 +423,9 @@ final class MacBridgeClient: ObservableObject {
         } else if bridgeUnavailableSince == nil {
             bridgeUnavailableSince = now
         }
+        // E8: a phone with no network path must say so rather than blaming the
+        // Mac. Only an observed outage overrides; an unknown path does not.
+        if deviceIsOffline == true { return .deviceOffline }
         return Self.bridgeStatusDecision(
             bridgeAvailable: bridgeAvailable,
             lastSeenAt: lastSeenAt,

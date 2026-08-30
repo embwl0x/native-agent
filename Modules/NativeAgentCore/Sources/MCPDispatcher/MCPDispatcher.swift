@@ -412,6 +412,7 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     let root: URL
     let persistence: any PersistenceCoreProtocol
     private let clock: @Sendable () -> Date
+    private let traceFailureLogger: @Sendable (String) -> Void
     /// Same-module accessor for the injected clock (`clock` is `private`, so
     /// file-scoped). `MCPSubprocess+LiveCache` stamps `createdAt` on the tools
     /// cache through this so tests can pin the timestamp.
@@ -446,11 +447,17 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
     public init(
         root: URL,
         persistence: (any PersistenceCoreProtocol)? = nil,
-        clock: @escaping @Sendable () -> Date = { Date() }
+        clock: @escaping @Sendable () -> Date = { Date() },
+        traceFailureLogger: @escaping @Sendable (String) -> Void = SwiftNativeMCPDispatcher.defaultTraceFailureLogger
     ) {
         self.root = root
         self.persistence = persistence ?? SwiftNativePersistenceCore()
         self.clock = clock
+        self.traceFailureLogger = traceFailureLogger
+    }
+
+    public nonisolated static func defaultTraceFailureLogger(_ message: String) {
+        NSLog("%@", message)
     }
 
     /// Test seam — invalidate the listServers cache so a fixture change
@@ -845,18 +852,17 @@ public actor SwiftNativeMCPDispatcher: MCPDispatcherProtocol {
             "createdAt": .string(Self.isoTimestamp(now)),
         ])
         let tracesURL = tracesPath
-        let work: @Sendable () async throws -> Void = { [persistence] in
-            try await persistence.appendJSONL(event, to: tracesURL)
-        }
         do {
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            try await persistence.withFileLock(tracesURL, work)
+            try await appendPathOwnedJSONL(
+                event,
+                to: tracesURL,
+                using: persistence,
+                logLabel: "MCPDispatcher.trace"
+            )
         } catch {
-            // Swallow — trace emission is best-effort, parity-only.
+            traceFailureLogger(
+                "MCPDispatcher: best-effort consent trace append failed (\(kind) \(title)): \(error)"
+            )
         }
     }
 

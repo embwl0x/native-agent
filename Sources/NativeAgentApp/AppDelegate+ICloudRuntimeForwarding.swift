@@ -723,7 +723,11 @@ extension AppDelegate {
             sessions.insert(entry, at: 0)
             let out = try ChatSessionIndexFile.serializedData(for: sessions)
             try out.write(to: sessionsPath, options: .atomic)
-            _ = try? ChatSessionRetention.enforce(dataRoot: root, now: Date())
+            ChatSessionRetention.enforceBestEffort(
+                dataRoot: root,
+                now: Date(),
+                context: "AppDelegate.upsertMobileChatSessionRow"
+            )
             return true
         }
         if changed {

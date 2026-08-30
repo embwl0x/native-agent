@@ -814,6 +814,42 @@ private func deltaEntity(
     #expect(decision == "carry")
 }
 
+@Test func githubLinkedIssueRefreshIsCadencedButUserDecisionsStayImmediate() {
+    let now = Date(timeIntervalSince1970: 1_787_999_400)
+    func issue(needsUser: Bool, fetchedAt: Date) -> JSONValue {
+        .object([
+            "key": .string("owner/repo#issue#42"),
+            "repository": .string("owner/repo"),
+            "number": .int(42),
+            "kind": .string("issue"),
+            "title": .string("Issue 42"),
+            "state": .string("open"),
+            "updatedAt": .string("2026-08-20T12:00:00Z"),
+            "url": .string("https://github.com/owner/repo/issues/42"),
+            "needsUser": .bool(needsUser),
+            "blocked": .bool(false),
+            "stale": .bool(false),
+            "detailFetchedAt": .string(DeskClock.nowISO(fetchedAt)),
+        ])
+    }
+
+    #expect(GitHubConnectorActions.testLinkedIssueCarryDecision(
+        prior: issue(needsUser: false, fetchedAt: now.addingTimeInterval(-5 * 60)),
+        staleHours: 72,
+        now: now
+    ) == "carry")
+    #expect(GitHubConnectorActions.testLinkedIssueCarryDecision(
+        prior: issue(needsUser: true, fetchedAt: now.addingTimeInterval(-5 * 60)),
+        staleHours: 72,
+        now: now
+    ) == "fetch")
+    #expect(GitHubConnectorActions.testLinkedIssueCarryDecision(
+        prior: issue(needsUser: false, fetchedAt: now.addingTimeInterval(-31 * 60)),
+        staleHours: 72,
+        now: now
+    ) == "fetch")
+}
+
 @Test func githubDeltaNeverCarriesObservationlessRow() {
     // No embedded observation → quietness cannot be proven → fetch (fail-open).
     var fields: [String: JSONValue] = [:]

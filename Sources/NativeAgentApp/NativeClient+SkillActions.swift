@@ -147,9 +147,28 @@ extension NativeClient {
     /// wave 32 W15: gated to the Swift impl (legacy update_skill status flip
     /// with the manifest state-machine fallback, all flocked) when .skills ON.
     func enableSkill(name: String) async throws {
-        let impl = makeSkillsClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
-        _ = try await impl.enableSkill(name: name)
-        return
+        let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        try await Self.enableSkill(
+            name: name, dataRoot: root, memory: nil,
+            personaRoot: dataRootOverride == nil ? PersonaRootResolver.resolve() : root.appendingPathComponent("persona")
+        )
+    }
+
+    static func enableSkill(
+        name: String, dataRoot: URL, memory: SwiftNativeMemoryV2?, personaRoot: URL
+    ) async throws {
+        let impl = makeSkillsClient(root: dataRoot)
+        let result = try await impl.enableSkill(name: name)
+        // The runtime branch returns an active canonical skill record. The
+        // manifest-only branch merely changes registration state; it does not
+        // install a body or establish recall readiness, and needs no memory
+        // owner. Do not mutate either branch a second time to reconcile it.
+        if case .object(let record) = result, record["status"] == .string("active") {
+            try await reconcileSkillEvolutionRecall(
+                memory: memory ?? SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot),
+                dataRoot: dataRoot, personaRoot: personaRoot
+            )
+        }
     }
 
     /// Disable a skill — routes to POST /v1/skills/{name}/disable (Task 1.4 endpoint).

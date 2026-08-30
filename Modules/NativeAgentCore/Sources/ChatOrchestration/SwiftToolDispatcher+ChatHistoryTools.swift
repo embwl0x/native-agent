@@ -26,9 +26,11 @@ private struct ChatHistorySearchHit: Sendable {
     var sessionCreatedAt: String?
     var role: String
     var timestamp: String
+    var timestampInstant: Date?
     var messageId: String?
     var messageIndex: Int
     var preview: String
+    var continuity: [JSONValue]
 }
 
 // MARK: - Chat history search tools
@@ -43,11 +45,17 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty chat-history search query")
         }
         let requestedLimit = optionalInt(input, "limit") ?? 8
-        let limit = max(1, min(requestedLimit, 25))
+        // A 25-snippet response regularly exceeded 18 KB in live turns and
+        // encouraged a second broad search before the model had digested the
+        // first one. Keep a compact page while preserving complete recall via
+        // offset pagination.
+        let offset = max(0, optionalInt(input, "offset") ?? 0)
         let mode = (jsonString(input["mode"]) ?? "hybrid")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let exactMode = mode == "exact"
+        let continuityMode = mode == "continuity"
+        let limit = max(1, min(requestedLimit, continuityMode ? 4 : 12))
         let roleFilter = jsonString(input["role"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -78,6 +86,12 @@ extension SwiftToolDispatcher {
             .appendingPathComponent("messages", isDirectory: true)
         let sessionMeta = readChatHistorySessionMetadata()
         let tokens = chatSearchTokens(query)
+        // Native messages carry fractional seconds while compaction rows and
+        // legacy transcripts can use whole seconds or another ISO time zone.
+        // Parse only admitted hits, once each, rather than in the comparator.
+        let fractionalTimestamp = ISO8601DateFormatter()
+        fractionalTimestamp.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let wholeTimestamp = ISO8601DateFormatter()
 
         func scan(_ messageFiles: [URL]) -> (hits: [ChatHistorySearchHit], sessions: Set<String>) {
             var hits: [ChatHistorySearchHit] = []
@@ -91,7 +105,8 @@ extension SwiftToolDispatcher {
                 }
                 let meta = sessionMeta[sessionId]
                 var messageIndex = 0
-                for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+                for rawLine in lines {
                     defer { messageIndex += 1 }
                     let trimmed = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty,
@@ -116,16 +131,24 @@ extension SwiftToolDispatcher {
                         exactMode: exactMode
                     )
                     guard score > 0 else { continue }
+                    let timestamp = jsonString(obj["createdAt"]) ?? jsonString(obj["timestamp"]) ?? ""
                     hits.append(ChatHistorySearchHit(
                         score: score,
                         sessionId: sessionId,
                         sessionTitle: meta?.title,
                         sessionCreatedAt: meta?.createdAt,
                         role: role,
-                        timestamp: jsonString(obj["createdAt"]) ?? jsonString(obj["timestamp"]) ?? "",
+                        timestamp: timestamp,
+                        timestampInstant: fractionalTimestamp.date(from: timestamp) ?? wholeTimestamp.date(from: timestamp),
                         messageId: jsonString(obj["id"]),
                         messageIndex: messageIndex,
-                        preview: chatHistoryPreview(content: content, query: query, tokens: tokens)
+                        preview: String(Self.chatHistoryDisplayEvidence(
+                            chatHistoryPreview(content: content, query: query, tokens: tokens),
+                            role: role, row: obj
+                        ).prefix(368)),
+                        continuity: continuityMode ? Self.continuityNeighbors(
+                            lines: lines, index: messageIndex, roleFilter: roleFilter
+                        ) : []
                     ))
                 }
             }
@@ -187,9 +210,20 @@ extension SwiftToolDispatcher {
         let searchedSessions = selected.sessions
         hits.sort {
             if $0.score != $1.score { return $0.score > $1.score }
-            return $0.timestamp > $1.timestamp
+            switch ($0.timestampInstant, $1.timestampInstant) {
+            case let (left?, right?) where left != right: return left > right
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: break
+            }
+            // Equal instants (or absent dates) still need repeatable paging.
+            // Within a transcript, canonical row order is the final recency
+            // evidence; different sessions get a stable identity tie-break.
+            if $0.sessionId != $1.sessionId { return $0.sessionId < $1.sessionId }
+            return $0.messageIndex > $1.messageIndex
         }
-        let out = hits.prefix(limit).map { hit -> JSONValue in
+        let page = hits.dropFirst(min(offset, hits.count)).prefix(limit)
+        let out = page.map { hit -> JSONValue in
             var obj: [String: JSONValue] = [
                 "session_id": .string(hit.sessionId),
                 "role": .string(hit.role),
@@ -201,6 +235,7 @@ extension SwiftToolDispatcher {
             if let title = hit.sessionTitle, !title.isEmpty { obj["session_title"] = .string(title) }
             if let created = hit.sessionCreatedAt, !created.isEmpty { obj["session_created_at"] = .string(created) }
             if let messageId = hit.messageId, !messageId.isEmpty { obj["message_id"] = .string(messageId) }
+            if continuityMode { obj["surrounding_messages"] = .array(hit.continuity) }
             return .object(obj)
         }
         var response: [String: JSONValue] = [
@@ -209,13 +244,19 @@ extension SwiftToolDispatcher {
             "tool": .string(invokedAs),
             "source": .string("chat_history_jsonl"),
             "query": .string(query),
-            "mode": .string(exactMode ? "exact" : "hybrid"),
+            "mode": .string(continuityMode ? "continuity" : (exactMode ? "exact" : "hybrid")),
             "scope": .string(scope),
             "phase": .string(phase),
             "searched_session_count": .int(Int64(searchedSessions.count)),
             "hit_count": .int(Int64(hits.count)),
+            "returned_count": .int(Int64(out.count)),
+            "offset": .int(Int64(offset)),
+            "has_more": .bool(offset + out.count < hits.count),
             "hits": .array(Array(out)),
         ]
+        if offset + out.count < hits.count {
+            response["next_offset"] = .int(Int64(offset + out.count))
+        }
         if let currentSessionId, !currentSessionId.isEmpty {
             response["current_session_id"] = .string(currentSessionId)
         }
@@ -223,6 +264,50 @@ extension SwiftToolDispatcher {
             response["fallback_skipped"] = .string(fallbackSkipped)
         }
         return .object(response)
+    }
+
+    /// Search relevance still uses the original content. Recorded provenance
+    /// is display-only, shared with ordinary history and compaction, and never
+    /// grants a bridge request or an interrupted answer additional authority.
+    private static func chatHistoryDisplayEvidence(
+        _ content: String, role: String, row: [String: JSONValue]
+    ) -> String {
+        let metadata: [String: JSONValue]?
+        if case .object(let value)? = row["metadata"] { metadata = value }
+        else { metadata = nil }
+        if case .string(let kind)? = metadata?["kind"], kind.lowercased() == "compaction_summary" {
+            return content
+        }
+        return ChatTranscriptEvidenceRendering.displayContent(
+            content,
+            originLabel: role == "user"
+                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(metadata?["origin"]) : nil,
+            incompleteReplyLabel: role == "assistant"
+                ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: row, metadata: metadata) : nil
+        )
+    }
+
+    /// Only the explicitly invoked history tool asks for this material. No
+    /// background digest, cross-session scan, or work reminder is injected.
+    private static func continuityNeighbors(
+        lines: [Substring], index: Int, roleFilter: String?
+    ) -> [JSONValue] {
+        guard lines.indices.contains(index) else { return [] }
+        return (max(0, index - 2)...min(lines.count - 1, index + 2)).compactMap { offset in
+            guard offset != index,
+                  let value = try? JSONValue.parse(Data(lines[offset].utf8)),
+                  case .object(let row) = value,
+                  case .string(let role)? = row["role"],
+                  ["user", "assistant"].contains(role),
+                  roleFilter == nil || roleFilter == role,
+                  case .string(let content)? = row["content"] ?? row["text"] else { return nil }
+            let display = chatHistoryDisplayEvidence(String(content.prefix(480)), role: role, row: row)
+            return .object([
+                "role": .string(role), "message_index": .int(Int64(offset)),
+                "excerpt": .string(String(display.prefix(480))),
+                "truncated": .bool(content.count > 480 || display.count > 480),
+            ])
+        }
     }
 
     private func readChatHistorySessionMetadata() -> [String: ChatHistorySessionMetadata] {

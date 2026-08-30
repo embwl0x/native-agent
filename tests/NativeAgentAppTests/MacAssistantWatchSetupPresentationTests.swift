@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 @testable import NativeAgentApp
 
 private func watchSetupResponse(
@@ -83,4 +84,43 @@ func macAssistantWatchSetupPresentationStates() {
     #expect(unavailable.badgeStatus == "failed")
     #expect(unavailable.response == nil)
     #expect(unavailable.diagnosticText?.contains("service unavailable") == true)
+}
+
+@MainActor
+@Test("an older setup check cannot replace readiness from a newer completed setup action")
+func watchSetupLatestReadOwnsReadiness() async {
+    let state = MacAssistantWatchSetupReadState()
+    var continuation: CheckedContinuation<MacAssistantStatusResponse, Never>?
+    let beforeSetup = Task { @MainActor in
+        await state.reload { await withCheckedContinuation { continuation = $0 } }
+    }
+    while continuation == nil { await Task.yield() }
+    let ready = watchSetupResponse(status: "ready", accessStatus: "ready", templateStatus: "ready")
+    #expect(await state.reload { ready })
+    continuation?.resume(returning: watchSetupResponse())
+    #expect(!(await beforeSetup.value))
+    #expect(state.loadState.response == ready)
+    #expect(state.loadState.isCurrent)
+    #expect(!state.isLoading)
+}
+
+@MainActor
+@Test("a failed setup refresh stays stale during retry and cancellation cannot invent a failure")
+func watchSetupRetryAndCancellationPreserveEvidence() async {
+    let state = MacAssistantWatchSetupReadState()
+    #expect(await state.reload { watchSetupResponse() })
+    #expect(!(await state.reload { throw NSError(domain: "WatchSetupTest", code: 1) }))
+    let stale = state.loadState
+    var continuation: CheckedContinuation<MacAssistantStatusResponse, any Error>?
+    let retry = Task { @MainActor in
+        await state.reload { try await withCheckedThrowingContinuation { continuation = $0 } }
+    }
+    while continuation == nil { await Task.yield() }
+    #expect(state.isLoading)
+    #expect(state.loadState == stale)
+    retry.cancel()
+    continuation?.resume(throwing: CancellationError())
+    #expect(!(await retry.value))
+    #expect(state.loadState == stale)
+    #expect(!state.isLoading)
 }

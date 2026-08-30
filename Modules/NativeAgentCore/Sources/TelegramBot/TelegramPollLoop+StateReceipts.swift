@@ -5,6 +5,7 @@ import PersistenceCore
 enum TelegramUpdateClaimPhase: String, Sendable, Equatable, Codable {
     case pending
     case processing
+    case queued
     case completed
     case outcomeUnknown = "outcome_unknown"
 }
@@ -13,6 +14,7 @@ struct TelegramUpdateClaim: Sendable, Equatable {
     let updateId: Int
     let update: TelegramUpdate
     let phase: TelegramUpdateClaimPhase
+    let queueAcknowledgementMessageId: Int?
     let claimedAt: String
     let updatedAt: String
 }
@@ -34,7 +36,9 @@ enum TelegramUpdateInboxError: Error, LocalizedError, Equatable {
 /// Telegram-owned durable admission state. A fetched update is written here
 /// before its upstream offset advances. Pending work can therefore survive a
 /// crash after acknowledgement; a prior-run `processing` claim is quarantined
-/// as outcome-unknown rather than replaying possibly-effecting work.
+/// as outcome-unknown rather than replaying possibly-effecting work. Queued
+/// claims also retain their acknowledgement message id so restart recovery
+/// reclaims the original controls instead of creating a shadow queue card.
 struct TelegramUpdateInbox: Sendable {
     let directory: URL
     private let persistence = SwiftNativePersistenceCore()
@@ -98,6 +102,7 @@ struct TelegramUpdateInbox: Sendable {
                 updateId: update.updateId,
                 update: update,
                 phase: .pending,
+                queueAcknowledgementMessageId: nil,
                 claimedAt: now,
                 updatedAt: now
             )
@@ -121,6 +126,9 @@ struct TelegramUpdateInbox: Sendable {
                 updateId: current.updateId,
                 update: current.update,
                 phase: phase,
+                queueAcknowledgementMessageId: phase == .queued
+                    ? current.queueAcknowledgementMessageId
+                    : nil,
                 claimedAt: current.claimedAt,
                 updatedAt: _tgNowString()
             )
@@ -130,15 +138,38 @@ struct TelegramUpdateInbox: Sendable {
         }
     }
 
-    /// Recovery reads the maintained index, then opens only pending or
-    /// processing claim files. Terminal retention never makes an idle Telegram
+    @discardableResult
+    func recordQueueAcknowledgement(
+        updateId: Int,
+        messageId: Int
+    ) async throws -> TelegramUpdateClaim {
+        let path = claimPath(updateId: updateId)
+        return try await persistence.withFileLock(path) {
+            let current = try decodeClaim(at: path, kind: .mutation)
+            guard current.phase == .queued else { return current }
+            let next = TelegramUpdateClaim(
+                updateId: current.updateId,
+                update: current.update,
+                phase: current.phase,
+                queueAcknowledgementMessageId: messageId,
+                claimedAt: current.claimedAt,
+                updatedAt: _tgNowString()
+            )
+            try await write(next, to: path)
+            try await upsertIndex(next)
+            return next
+        }
+    }
+
+    /// Recovery reads the maintained index, then opens only pending,
+    /// processing, or queued claim files. Terminal retention never makes an idle Telegram
     /// tick reread hundreds of historical update payloads.
     func recoverableClaims() async throws -> [TelegramUpdateClaim] {
         var index = try await loadIndex()
         var recovered: [TelegramUpdateClaim] = []
         var repairedIndex = false
         for entry in index.entries.values.sorted(by: { $0.updateId < $1.updateId })
-        where entry.phase == .pending || entry.phase == .processing {
+        where entry.phase == .pending || entry.phase == .processing || entry.phase == .queued {
             let claim = try decodeClaim(at: claimPath(updateId: entry.updateId), kind: .recovery)
             recovered.append(claim)
             if claim.phase != entry.phase {
@@ -164,6 +195,7 @@ struct TelegramUpdateInbox: Sendable {
             let path = claimPath(updateId: entry.updateId)
             try? FileManager.default.removeItem(at: path)
             if !FileManager.default.fileExists(atPath: path.path) {
+                try? FileManager.default.removeItem(at: path.appendingPathExtension("lock"))
                 index.entries.removeValue(forKey: entry.updateId)
                 changed = true
             }
@@ -207,6 +239,9 @@ struct TelegramUpdateInbox: Sendable {
             updateId: updateId,
             update: update,
             phase: phase,
+            queueAcknowledgementMessageId: Self.optionalInt(
+                object["queueAcknowledgementMessageId"]
+            ),
             claimedAt: claimedAt,
             updatedAt: updatedAt
         )
@@ -221,12 +256,23 @@ struct TelegramUpdateInbox: Sendable {
             "phase": .string(claim.phase.rawValue),
             "claimedAt": .string(claim.claimedAt),
             "updatedAt": .string(claim.updatedAt),
+            "queueAcknowledgementMessageId": claim.queueAcknowledgementMessageId
+                .map { .int(Int64($0)) } ?? .null,
             "update": updateValue,
         ])
         try await persistence.writeDataAtomicDurable(
             value.serializedData(pretty: true),
             to: path
         )
+    }
+
+    private static func optionalInt(_ value: JSONValue?) -> Int? {
+        switch value {
+        case .int(let raw)?: return Int(exactly: raw)
+        case .double(let raw)?: return Int(exactly: raw)
+        case .string(let raw)?: return Int(raw)
+        default: return nil
+        }
     }
 
     private func loadIndex() async throws -> InboxClaimIndex {
@@ -394,9 +440,12 @@ extension TelegramPollLoop {
         if let preview = _tgPreview(text) {
             row["textPreview"] = .string(preview)
         }
-        try? await SwiftNativePersistenceCore().appendJSONL(
+        try? await appendJSONLCapped(
             .object(row),
-            to: telegramDir.appendingPathComponent("blocked.jsonl")
+            to: telegramDir.appendingPathComponent("blocked.jsonl"),
+            using: SwiftNativePersistenceCore(),
+            maxLines: JSONLLineCaps.telegramBlocked,
+            logLabel: "TelegramPollLoop.blocked"
         )
     }
 

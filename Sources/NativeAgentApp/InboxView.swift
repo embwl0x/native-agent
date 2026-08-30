@@ -974,27 +974,55 @@ enum InboxLoadFailurePresentation {
 /// publishes replacement rows.
 @MainActor @Observable
 final class InboxLoadState {
+    enum ContentPresentation: Equatable {
+        case loading
+        case unavailable
+        case empty
+        case content
+    }
+
     private(set) var items: [InboxItemRecord]
     private(set) var errorText: String?
     private(set) var locallyResolvedIDs: Set<String> = []
+    private(set) var hasLoadedSnapshot = false
+    private(set) var isLoading = false
+    @ObservationIgnored private var refreshGeneration: UInt64 = 0
 
     init(items: [InboxItemRecord] = []) {
         self.items = items
+        hasLoadedSnapshot = !items.isEmpty
+    }
+
+    func contentPresentation(hasVisibleItems: Bool) -> ContentPresentation {
+        if hasVisibleItems { return .content }
+        if errorText != nil { return .unavailable }
+        return hasLoadedSnapshot ? .empty : .loading
     }
 
     @discardableResult
     func reload(
         read: @escaping @MainActor () async throws -> [InboxItemRecord]
     ) async -> Bool {
-        errorText = nil
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        let priorItems = items
+        isLoading = true
+        defer {
+            if refreshGeneration == generation { isLoading = false }
+        }
         do {
+            let loaded = try await read()
+            guard !Task.isCancelled, refreshGeneration == generation else { return false }
             _ = adopt(InboxAppModelMirror.successfulReload(
-                localItems: items,
-                reloadedItems: try await read(),
+                localItems: priorItems,
+                reloadedItems: loaded,
                 locallyResolvedIDs: locallyResolvedIDs
             ))
+            hasLoadedSnapshot = true
+            errorText = nil
             return true
         } catch {
+            guard !Task.isCancelled, refreshGeneration == generation else { return false }
             errorText = InboxLoadFailurePresentation.banner(
                 error: error,
                 retainedItemCount: items.count)
@@ -1038,7 +1066,6 @@ struct InboxView: View {
     @Environment(AppModel.self) private var appModel
 
     @State private var inboxLoadState = InboxLoadState()
-    @State private var isLoading = false
     @State private var showAll = false
     @State private var groupFilter: InboxRelatedGroup?
     // G12: defaults to the human lane. The operations feed is one click away,
@@ -1064,7 +1091,12 @@ struct InboxView: View {
                 Button { Task { await load() } } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .disabled(isLoading)
+                .disabled(inboxLoadState.isLoading)
+                .help("Refresh inbox")
+                .accessibilityLabel("Refresh inbox")
+                if inboxLoadState.isLoading {
+                    ProgressView().controlSize(.small)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -1110,7 +1142,21 @@ struct InboxView: View {
             // Lane-aware: an empty "For you" lane with a full System lane must
             // not render a blank List. It says which lane is empty and, when
             // the other one has something, points at it.
-            if displayItems.isEmpty && !isLoading {
+            switch inboxLoadState.contentPresentation(hasVisibleItems: !displayItems.isEmpty) {
+            case .loading:
+                ProgressView("Loading inbox")
+                    .frame(maxWidth: .infinity, minHeight: 200)
+            case .unavailable:
+                NativeEmptyState(
+                    title: "Inbox unavailable",
+                    detail: "This lane could not be checked. Retry to see what needs your attention.",
+                    systemImage: "exclamationmark.triangle",
+                    actionTitle: "Retry",
+                    actionImage: "arrow.clockwise",
+                    action: { Task { await load() } }
+                )
+                .frame(minHeight: 200)
+            case .empty:
                 NativeEmptyState(
                     title: lane == .forYou ? "Nothing for you right now" : "No system notices",
                     detail: emptyStateDetail,
@@ -1118,7 +1164,7 @@ struct InboxView: View {
                     actionTitle: nil, actionImage: nil, action: nil
                 )
                 .frame(minHeight: 200)
-            } else {
+            case .content:
                 List(displayItems) { item in
                     InboxListRow(
                         item: item,
@@ -1166,8 +1212,6 @@ struct InboxView: View {
     }
 
     func load() async {
-        isLoading = true
-        defer { isLoading = false }
         let loaded = await inboxLoadState.reload {
             try await client.getInboxItems(unreadOnly: false)
         }

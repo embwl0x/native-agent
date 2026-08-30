@@ -4,7 +4,140 @@ import NativeAgentCore
 import PersistenceCore
 @testable import MacControl
 
+// Paired structural/semantic rendering fixtures live in ChatOrchestrationTests;
+// these value cases pin the common identity matcher without any live input.
+
+@Test
+func supplementalIdentityRequiresUniqueCompatiblePathLabelAndGeometry() {
+    func existing(_ path: Int?, label: String = "Remove", x: Double = 0, kind: String = "button", physical: Bool = false) -> MacFourVerbs.ActTarget {
+        MacFourVerbs.ActTarget(
+            handle: path.map { "h\($0)" } ?? "", label: label, kind: kind, ordinal: nil,
+            enabled: true, frame: MacAXFrame(x: x, y: 0, w: 80, h: 30),
+            physicalOnly: physical, sourceAXPath: path.map { [$0] }
+        )
+    }
+    func candidate(_ path: Int?, label: String = "Remove", x: Double = 0, kind: String = "button", physical: Bool = false) -> MacFourVerbsSupplementalTarget {
+        MacFourVerbsSupplementalTarget(
+            label: MacScreenText(label), kind: kind, frame: MacAXFrame(x: x, y: 0, w: 80, h: 30),
+            provenance: .ax, physicalOnly: physical, sourceAXPath: path.map { [$0] }
+        )
+    }
+    let left = existing(1)
+    let right = existing(2, x: 200)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(candidate(2, x: 200), among: [left, right]) == 1)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(candidate(2), among: [left]) == nil,
+            "A different explicit AX path must not merge even when name and frame coincide")
+    #expect(MacFourVerbs.supplementalDuplicateIndex(candidate(1, label: "Save"), among: [left]) == nil)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(candidate(1, x: 200), among: [left]) == nil)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(candidate(1, kind: "text field"), among: [left]) == nil)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(candidate(nil, x: 200), among: [left, right]) == 1)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(candidate(nil), among: [left, existing(2)]) == nil,
+            "Ambiguous geometry must not silently choose the first equal label")
+    let region = existing(nil, label: "region 1", kind: "region", physical: true)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(
+        candidate(nil, label: "region 1", x: 200, kind: "region", physical: true), among: [region]
+    ) == 0)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(
+        candidate(nil, label: "region 2", kind: "region", physical: true), among: [region]
+    ) == nil, "Overlapping named pixel regions keep their own identities")
+}
 // MARK: - THE FOUR VERBS — screen · act · go · wait
+
+@Test func readoutZoomRevealsHiddenStatusWithoutMakingItAnActionTarget() throws {
+    let screen = MacScreenRender.Screen(appName: "Canvas", values: (0..<9).map {
+        MacScreenRender.Value(text: MacScreenText($0 == 8 ? "Last drag: 300ms moving" : "Counter \($0): 0"), provenance: .vision(1))
+    }, unclassifiedOmittedTargets: 2)
+    let overview = MacScreenRender.render(screen)
+    #expect(!overview.contains("Last drag"))
+    #expect(overview.contains("3 observed readouts not shown (screen part: hud, or name a readout)"))
+    #expect(!overview.contains("maxValues"))
+    let zoom = try #require(MacFourVerbs.zoom(screen, part: "Last drag", options: .default))
+    let text = MacScreenRender.render(zoom.screen, options: zoom.options)
+    #expect(text.contains("Last drag: 300ms moving"))
+    #expect(!text.contains("Counter 0"))
+    #expect(zoom.screen.controls.isEmpty && zoom.screen.contents.isEmpty)
+    #expect(zoom.screen.unclassifiedOmittedTargets == 2)
+    let hud = try #require(MacFourVerbs.zoom(screen, part: "hud", options: .default))
+    #expect(hud.screen.values.count == 9)
+    #expect(MacScreenRender.render(hud.screen, options: hud.options).contains("Last drag"))
+}
+
+@Test func readoutZoomDoesNotInventMissingSourceValues() throws {
+    let screen = MacScreenRender.Screen(appName: "Canvas", values: [
+        MacScreenRender.Value(text: MacScreenText("Hits: 2"), provenance: .vision(1))
+    ], totalValues: 4)
+    let zoom = try #require(MacFourVerbs.zoom(screen, part: "hud", options: .default))
+    #expect(zoom.screen.totalValues == 4)
+    let rendered = MacScreenRender.rendering(zoom.screen, options: zoom.options)
+    #expect(rendered.valuesDropped == 3)
+    #expect(rendered.text.contains("3 further values outside this observation"))
+    #expect(!rendered.text.contains("observed readouts not shown"))
+    let named = try #require(MacFourVerbs.zoom(screen, part: "Hits", options: .default))
+    #expect(named.screen.totalValues == 1)
+}
+
+@Test func controlZoomExposesBoundedControlsWithoutRenumberingOrHidingSourceOmissions() throws {
+    let controls = (1...70).map { (index: Int) in
+        MacScreenRender.Control(label: MacScreenText(index == 70 ? "Last action" : "Action \(index)"), kind: "button",
+            ordinal: index, provenance: .ax)
+    }
+    let screen = MacScreenRender.Screen(appName: "Many controls", controls: controls,
+        totalControls: 73, unlabeledControls: ["text": 2], unclassifiedOmittedTargets: 4)
+    let overview = MacScreenRender.render(screen)
+    #expect(overview.contains("screen part: controls, or name a control"))
+    #expect(!overview.contains("maxControls"))
+    for name in ["controls", "actions", "actionable controls", "button"] {
+        let zoom = try #require(MacFourVerbs.zoom(screen, part: name, options: .default))
+        #expect(zoom.options.maxControls == 60)
+        #expect(zoom.screen.controls.last?.ordinal == 70)
+        #expect(zoom.screen.unclassifiedOmittedTargets == 4)
+        let rendering = MacScreenRender.rendering(zoom.screen, options: zoom.options)
+        #expect(rendering.text.contains("button 60"))
+        #expect(!rendering.text.contains("button 61"))
+        #expect(rendering.text.contains("10 observed controls not shown"))
+        if name != "button" {
+            #expect(rendering.controlsDropped == 13)
+            #expect(rendering.text.contains("3 further controls outside this observation"))
+            #expect(zoom.screen.unlabeledControls["text"] == 2)
+        }
+    }
+    let named = try #require(MacFourVerbs.zoom(screen, part: "Last action", options: .default))
+    #expect(named.screen.controls.map(\.ordinal) == [70])
+    let empty = try #require(MacFourVerbs.zoom(MacScreenRender.Screen(appName: "Canvas"), part: "controls", options: .default))
+    #expect(empty.screen.controls.isEmpty)
+}
+
+@Test func agentDetailOmitsDuplicateReadoutsButKeepsInternalEvidenceAndReceipts() {
+    let values: JSONValue = .array([.string("Hits: 2")])
+    let reply = MacFourVerbsReply(ok: true, text: "Hits: 2", detail: [
+        "vision_value_text": values, "vision_effect_value_text": values,
+        "verification": .string("satisfied"), "operationId": .string("receipt"), "vision_compile_ms": .int(100)
+    ])
+    #expect(reply.detail["vision_effect_value_text"] == values)
+    #expect(reply.agentDetail["vision_value_text"] == nil && reply.agentDetail["vision_effect_value_text"] == nil)
+    #expect(reply.agentDetail["verification"] == .string("satisfied"))
+    #expect(reply.agentDetail["operationId"] == .string("receipt"))
+    #expect(reply.agentDetail["vision_compile_ms"] == .int(100))
+}
+
+@Test func rowFilenameFusionRequiresActualBoundedLineageAndCompatibleEvidence() {
+    let frame = MacAXFrame(x: 100, y: 200, w: 180, h: 20)
+    let filename = MacFourVerbs.ActTarget(handle: "file", label: "fixture.html", kind: "text",
+        ordinal: 1, enabled: true, frame: frame, sourceAXPath: [0, 2, 0, 1])
+    func row(_ path: [Int], label: String = "fixture.html", kind: String = "row", enabled: Bool = true,
+             x: Double = 100) -> MacFourVerbsSupplementalTarget {
+        MacFourVerbsSupplementalTarget(label: MacScreenText(label), kind: kind,
+            frame: MacAXFrame(x: x, y: 200, w: 500, h: 20), provenance: .ax,
+            sourceAXPath: path, enabled: enabled)
+    }
+    #expect(MacFourVerbs.supplementalDuplicateIndex(row([0, 2]), among: [filename]) == 0)
+    #expect(MacFourVerbs.supplementalDuplicateIndex(row([0, 2, 0], kind: "cell"), among: [filename]) == 0)
+    for unrelated in [row([0, 3]), row([0]), row([0, 2], label: "other.html"),
+                      row([0, 2], kind: "button"), row([0, 2], enabled: false), row([0, 2], x: 900)] {
+        #expect(MacFourVerbs.supplementalDuplicateIndex(unrelated, among: [filename]) == nil)
+    }
+    #expect(MacFourVerbs.supplementalDuplicateIndex(row([0, 2]), among: [filename, filename]) == nil)
+}
 //
 // Every test here drives the REAL `SwiftNativeMacControl` with the same three
 // synthetic seams `MacActClosedLoopTests` uses (they are `private` there, so
@@ -244,11 +377,41 @@ private final class _FVEventSink: MacEventSink, @unchecked Sendable {
     func post(scroll: MacScrollEvent) { lock.withLock { scrollEvents.append(scroll) } }
     func mice() -> [MacMouseEvent] { lock.withLock { mouseEvents } }
     func keys() -> [MacKeyEvent] { lock.withLock { keyEvents } }
+    func scrolls() -> [MacScrollEvent] { lock.withLock { scrollEvents } }
 }
 
 private struct _FVSupplementSource: MacFourVerbsSupplementalPerceptionSource {
     let supplement: MacFourVerbsSupplement
     func observe() async -> MacFourVerbsSupplement? { supplement }
+}
+
+private actor _FVHandRequestHost: MacFourVerbsHost {
+    let inner: any MacFourVerbsHost
+    private var requests: [[String: JSONValue]] = []
+    init(_ inner: any MacFourVerbsHost) { self.inner = inner }
+    func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
+        if action == "hand" { requests.append(body) }
+        return try await inner.dispatch(action: action, body: body)
+    }
+    func handRequests() -> [[String: JSONValue]] { requests }
+}
+
+private actor _FVSequencedSupplementSource: MacFourVerbsSupplementalPerceptionSource {
+    private let supplements: [MacFourVerbsSupplement]
+    private var index = 0
+
+    init(_ supplements: [MacFourVerbsSupplement]) {
+        self.supplements = supplements
+    }
+
+    func observe() -> MacFourVerbsSupplement? {
+        guard !supplements.isEmpty else { return nil }
+        let value = supplements[min(index, supplements.count - 1)]
+        index += 1
+        return value
+    }
+
+    func observationCount() -> Int { index }
 }
 
 // MARK: - The `go` and `wait` seams
@@ -282,12 +445,17 @@ private final class _FVClock: MacFourVerbsClock, @unchecked Sendable {
         return base.addingTimeInterval(elapsed)
     }
 
+    func monotonicSeconds() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return elapsed
+    }
+
     func sleep(seconds: Double) async {
         advance(seconds)
         await Task.yield()
     }
 
-    private func advance(_ seconds: Double) {
+    func advance(_ seconds: Double) {
         lock.lock(); elapsed += seconds; lock.unlock()
     }
 
@@ -437,6 +605,10 @@ private func _fvHarness(
         eventSink: eventSink,
         accessibilityActSource: actSource,
         effectObserverSource: effects,
+        // These fixtures own their visible evidence. A real desktop capture
+        // can change independently and must never settle a synthetic action.
+        screenCaptureSource: UnavailableMacScreenCaptureSource(),
+        screenViewStore: MacScreenViewStore(),
         lookFrameStore: MacLookFrameStore()
     )
     return _FVHarness(
@@ -514,6 +686,66 @@ func screen_zoomOnContent_keepsEveryRowSoOrdinalsNeverShift() async {
     let line = reply.text.split(separator: "\n").first { $0.contains("shot1.png") }
     #expect(line?.trimmingCharacters(in: .whitespaces).hasPrefix("4 ") == true,
             "shot1.png must still be row 4 under a zoom: \(reply.text)")
+}
+
+@Test
+func screen_zoomOnCanvas_keepsVisualWorldInsteadOfMatchingBrowserChrome() throws {
+    let visualRegion = MacScreenRender.Row(
+        label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
+        detail: [MacScreenText(
+            "yellow, high contrast, lower right, at 33%,37%, size 15%x20%, moving right",
+            redacted: .string(
+                "yellow, high contrast, lower right, at 33%,37%, size 15%x20%, moving right"
+            )
+        )],
+        provenance: .vision(0.35),
+        abstain: "physical region; semantic role uncertain"
+    )
+    let screen = MacScreenRender.Screen(
+        appName: "Browser",
+        windowTitle: MacScreenText("Visual Saliency Check", redacted: .string("Visual Saliency Check")),
+        isFront: true,
+        contents: [
+            MacScreenRender.Content(kind: .grid, rows: [visualRegion]),
+            MacScreenRender.Content(
+                kind: .canvas,
+                canvas: MacScreenRender.Canvas(
+                    description: "visual surface", width: 1200, height: 800,
+                    provenance: .vision(1)
+                )
+            ),
+        ],
+        controls: [
+            MacScreenRender.Control(
+                label: MacScreenText("Visual Saliency Check", redacted: .string("Visual Saliency Check")),
+                kind: "radio", provenance: .ax
+            ),
+            MacScreenRender.Control(
+                label: MacScreenText("Back", redacted: .string("Back")),
+                kind: "button", provenance: .ax
+            ),
+        ],
+        totalControls: 2,
+        values: [MacScreenRender.Value(
+            text: MacScreenText("Hits: 0", redacted: .string("Hits: 0")),
+            provenance: .vision(1)
+        )]
+    )
+
+    let zoom = try #require(MacFourVerbs.zoom(
+        screen,
+        part: "the open Visual Saliency Check canvas",
+        options: .default
+    ))
+    let rendered = MacScreenRender.render(zoom.screen, options: zoom.options)
+    #expect(rendered.contains("visual region 1"))
+    #expect(rendered.contains("CANVAS"))
+    #expect(rendered.contains("Hits: 0"))
+    #expect(rendered.contains("size 15%x20%"))
+    #expect(rendered.contains("moving right"))
+    #expect(!rendered.contains("Visual Saliency Check   radio"))
+    #expect(!rendered.contains("Back"))
+    #expect(zoom.note.contains("surrounding controls omitted"))
 }
 
 @Test
@@ -769,18 +1001,32 @@ func act_usesNumberedVisualRegionsPhysicallyButRefusesInventedSemantics() async 
         appName: "Finder",
         bundleIdentifier: "com.apple.finder",
         visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
-        contents: [MacScreenRender.Content(
-            kind: .grid,
-            rows: [MacScreenRender.Row(
-                label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
-                detail: [MacScreenText("unknown", redacted: .string("unknown"))],
-                provenance: .vision(0.35),
-                abstain: "physical region; semantic role uncertain"
-            )],
-            totalRows: 1
+        contents: [
+            MacScreenRender.Content(
+                kind: .grid,
+                rows: [MacScreenRender.Row(
+                    label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
+                    detail: [MacScreenText("unknown", redacted: .string("unknown"))],
+                    provenance: .vision(0.35),
+                    abstain: "physical region; semantic role uncertain"
+                )],
+                totalRows: 1
+            ),
+            MacScreenRender.Content(
+                kind: .canvas,
+                canvas: MacScreenRender.Canvas(
+                    description: "visual surface", width: 800, height: 600,
+                    provenance: .vision(1)
+                )
+            ),
+        ],
+        values: [MacScreenRender.Value(
+            text: MacScreenText("Hits: 1", redacted: .string("Hits: 1")),
+            provenance: .vision(1)
         )],
         targets: [MacFourVerbsSupplementalTarget(
             label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
+            aliases: ["round yellow object", "yellow object", "yellow object on the left"],
             kind: "visual region",
             frame: MacAXFrame(x: 300, y: 200, w: 80, h: 60),
             provenance: .vision(0.35),
@@ -801,6 +1047,633 @@ func act_usesNumberedVisualRegionsPhysicallyButRefusesInventedSemantics() async 
     #expect(sink.mice().contains { $0.phase == .down && $0.x == 340 && $0.y == 230 })
     #expect(sink.mice().contains { $0.phase == .up && $0.x == 340 && $0.y == 230 })
     #expect(harness.effects.installs() == 0, "pixel regions must stay on the physical hand")
+    #expect(clicked.text.contains("CANVAS"), "\(clicked.text)")
+    #expect(clicked.text.contains("Hits: 1"), "\(clicked.text)")
+    #expect(!clicked.text.contains("DO      "), "\(clicked.text)")
+
+    let natural = await harness.verbs.act(verb: "click", target: "yellow object")
+    #expect(natural.ok, "\(natural.text)")
+    #expect(natural.detail["matched"] == .string("\"visual region 1\""))
+    #expect(natural.text.hasPrefix("Clicked \"yellow object\"."), "\(natural.text)")
+
+    let positioned = await harness.verbs.act(
+        verb: "click", target: "yellow object on the left"
+    )
+    #expect(positioned.ok, "\(positioned.text)")
+    #expect(sink.mice().filter { $0.phase == .down }.last?.x == 340)
+    #expect(sink.mice().filter { $0.phase == .down }.last?.y == 230)
+
+    let sided = await harness.verbs.act(
+        verb: "click", target: "left side of yellow object"
+    )
+    #expect(sided.ok, "\(sided.text)")
+    #expect(sink.mice().filter { $0.phase == .down }.last?.x == 320)
+    #expect(sink.mice().filter { $0.phase == .down }.last?.y == 230)
+
+    let diagonal = await harness.verbs.act(
+        verb: "click", target: "upper-left corner of the yellow object"
+    )
+    #expect(diagonal.ok, "\(diagonal.text)")
+    #expect(sink.mice().filter { $0.phase == .down }.last?.x == 320)
+    #expect(sink.mice().filter { $0.phase == .down }.last?.y == 215)
+
+    let eventCount = sink.mice().count
+    let falseMotion = await harness.verbs.act(
+        verb: "click", target: "moving yellow object"
+    )
+    #expect(!falseMotion.ok)
+    #expect(falseMotion.detail["error"] == .string("no_match"))
+    #expect(sink.mice().count == eventCount, "an absent motion qualifier must act on nothing")
+}
+
+@Test func actTransientMenuUsesFreshGeometryAndRefusesClosedOrDisabledItems() async {
+    func menu(x: Double, enabled: Bool = true, present: Bool = true) -> MacFourVerbsSupplement {
+        MacFourVerbsSupplement(
+            appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+            controls: present ? [MacScreenRender.Control(label: MacScreenText("Inspect"),
+                                                       kind: "menu item", provenance: .ax)] : [],
+            targets: present ? [MacFourVerbsSupplementalTarget(
+                label: MacScreenText("Inspect"), kind: "menu item",
+                frame: MacAXFrame(x: x, y: 200, w: 100, h: 24), provenance: .ax, enabled: enabled
+            )] : []
+        )
+    }
+    let sink = _FVEventSink()
+    let harness = _fvHarness(eventSink: sink, supplementalSource: _FVSequencedSupplementSource([
+        menu(x: 100), menu(x: 300), menu(x: 300, present: false),
+    ]))
+    _ = await harness.verbs.screen(part: "menu")
+    let result = await harness.verbs.act(verb: "click", target: "Inspect")
+    #expect(result.ok, "\(result.text)")
+    #expect(sink.mice().contains { $0.phase == .down && $0.x == 350 && $0.y == 212 })
+    for next in [menu(x: 300, enabled: false), menu(x: 300, present: false)] {
+        let refusedSink = _FVEventSink()
+        let refused = _fvHarness(eventSink: refusedSink,
+                                supplementalSource: _FVSequencedSupplementSource([menu(x: 100), next]))
+        _ = await refused.verbs.screen(part: "menu")
+        let reply = await refused.verbs.act(verb: "click", target: "Inspect")
+        #expect(!reply.ok)
+        #expect(refusedSink.mice().isEmpty)
+    }
+}
+
+@Test
+func act_reobservesOneTransientMissForNumberedAndNaturalVisualTargets() async {
+    let sink = _FVEventSink()
+    let missing = MacFourVerbsSupplement(
+        appName: "Finder", bundleIdentifier: "com.apple.finder",
+        visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600)
+    )
+    let visible = MacFourVerbsSupplement(
+        appName: "Finder", bundleIdentifier: "com.apple.finder",
+        visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+        targets: [MacFourVerbsSupplementalTarget(
+            label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
+            aliases: ["round yellow object", "yellow object"],
+            kind: "visual region",
+            frame: MacAXFrame(x: 300, y: 200, w: 80, h: 60),
+            provenance: .vision(0.78),
+            physicalOnly: true
+        )]
+    )
+    let source = _FVSequencedSupplementSource([missing, visible, visible])
+    let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+
+    let reply = await harness.verbs.act(verb: "click", target: "visual region 1")
+
+    #expect(reply.ok, "\(reply.text)")
+    #expect(reply.detail["dynamic_reobserved"] == .bool(true))
+    #expect(sink.mice().contains { $0.phase == .down && $0.x == 340 && $0.y == 230 })
+
+    let naturalSource = _FVSequencedSupplementSource([missing, visible, visible])
+    let naturalHarness = _fvHarness(eventSink: sink, supplementalSource: naturalSource)
+    let natural = await naturalHarness.verbs.act(verb: "click", target: "yellow object")
+
+    #expect(natural.ok, "\(natural.text)")
+    #expect(natural.detail["dynamic_reobserved"] == .bool(true))
+    #expect(natural.text.hasPrefix("Clicked \"yellow object\"."), "\(natural.text)")
+}
+
+@Test
+func visualEffectEvidenceExcludesOrdinarySceneMotion() {
+    let detail: [String: JSONValue] = [
+        "vision_value_text": .array([
+            .string("yellow visual region 1 is left of blue visual region 2")
+        ]),
+        "vision_effect_value_text": .array([.string("Hits: 2")]),
+    ]
+
+    #expect(MacFourVerbs.visionValueTexts(detail) == ["hits: 2"])
+    #expect(MacFourVerbs.hasTemporalQualifier("moving yellow object"))
+    #expect(MacFourVerbs.hasTemporalQualifier("stationary square object"))
+    #expect(!MacFourVerbs.hasTemporalQualifier("yellow object"))
+}
+
+@Test func physicalClickAcquiresMotionWithBoundedFreshFramesAndStopsOnLostTarget() async {
+    func view(_ x: Double?, uncertain: Bool = true, duplicate: Bool = false) -> MacFourVerbsSupplement {
+        let target = x.map { value in
+            MacFourVerbsSupplementalTarget(
+                label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
+                aliases: ["yellow object"], kind: "visual region",
+                frame: MacAXFrame(x: value, y: 200, w: 40, h: 40),
+                provenance: .vision(0.8), physicalOnly: true, motionUncertain: uncertain
+            )
+        }
+        var targets = target.map { [$0] } ?? []
+        if duplicate {
+            targets.append(MacFourVerbsSupplementalTarget(
+                label: MacScreenText("visual region 2", redacted: .string("visual region 2")),
+                aliases: ["yellow object"], kind: "visual region",
+                frame: MacAXFrame(x: 600, y: 200, w: 40, h: 40),
+                provenance: .vision(0.8), physicalOnly: true
+            ))
+        }
+        return MacFourVerbsSupplement(
+            appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600), targets: targets
+        )
+    }
+    let sink = _FVEventSink()
+    let source = _FVSequencedSupplementSource([view(100), view(200), view(300, uncertain: false)])
+    let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+    let reply = await harness.verbs.act(verb: "click", target: "yellow object")
+    #expect(reply.ok, "\(reply.text)")
+    #expect(sink.mice().filter { $0.phase == .down }.map(\.x) == [320])
+    #expect(await source.observationCount() == 4, "initial + two acquisition frames + post-action proof")
+
+    let boundedSink = _FVEventSink()
+    let boundedSource = _FVSequencedSupplementSource([view(100), view(200), view(300), view(400)])
+    let bounded = _fvHarness(eventSink: boundedSink, supplementalSource: boundedSource)
+    let boundedReply = await bounded.verbs.act(verb: "click", target: "yellow object")
+    #expect(boundedReply.ok)
+    #expect(boundedSink.mice().filter { $0.phase == .down }.map(\.x) == [320])
+    #expect(await boundedSource.observationCount() == 4, "uncertain motion must not create an unbounded observation loop")
+
+    for next in [view(nil), view(200, duplicate: true)] {
+        let blockedSink = _FVEventSink()
+        let blockedSource = _FVSequencedSupplementSource([view(100), next])
+        let blocked = _fvHarness(eventSink: blockedSink, supplementalSource: blockedSource)
+        let result = await blocked.verbs.act(verb: "click", target: "yellow object")
+        #expect(!result.ok)
+        #expect(blockedSink.mice().isEmpty, "fresh loss or ambiguity must never use the original point")
+    }
+}
+
+@Test
+func physicalHoverDoesNotTreatAnAnimatedSceneAsEffectProof() async {
+    func frame(_ relation: String) -> MacFourVerbsSupplement {
+        MacFourVerbsSupplement(
+            appName: "Finder",
+            bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+            values: [MacScreenRender.Value(
+                text: MacScreenText(relation, redacted: .string(relation)),
+                provenance: .vision(0.7)
+            )],
+            targets: [MacFourVerbsSupplementalTarget(
+                label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
+                aliases: ["yellow object on the left"],
+                kind: "visual region",
+                frame: MacAXFrame(x: 300, y: 200, w: 80, h: 60),
+                provenance: .vision(0.8),
+                physicalOnly: true
+            )],
+            diagnostics: [
+                "vision_value_text": .array([.string(relation)]),
+                "vision_effect_value_text": .array([]),
+            ]
+        )
+    }
+    let sink = _FVEventSink()
+    let source = _FVSequencedSupplementSource([
+        frame("yellow object is left of blue object"),
+        frame("yellow object is right of blue object"),
+    ])
+    let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+
+    let reply = await harness.verbs.act(
+        verb: "hover", target: "yellow object on the left"
+    )
+
+    #expect(reply.ok, "\(reply.text)")
+    #expect(reply.detail["verification"] == .string("unverified"))
+    #expect(reply.detail["verification_evidence"] == nil)
+    #expect(reply.text.hasPrefix("Hovered over \"yellow object on the left\"."), "\(reply.text)")
+    #expect(reply.text.contains("This is the fresh screen afterward."), "\(reply.text)")
+    #expect(!reply.text.contains("changed after it"), "\(reply.text)")
+    #expect(sink.mice().contains { $0.phase == .move && $0.x == 340 && $0.y == 230 })
+}
+
+@Test func composedPhysicalActDefersOnlyDuplicateProofAndStillObservesItsOutcome() async {
+    for physicalOnly in [true, false] {
+        func frame(_ hits: Int) -> MacFourVerbsSupplement {
+            MacFourVerbsSupplement(
+                appName: "Finder", bundleIdentifier: "com.apple.finder",
+                visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+                targets: [MacFourVerbsSupplementalTarget(
+                    label: MacScreenText("target", redacted: .string("target")),
+                    kind: "visual region", frame: MacAXFrame(x: 300, y: 200, w: 40, h: 40),
+                    provenance: .vision(0.8), physicalOnly: physicalOnly
+                )],
+                diagnostics: ["vision_effect_value_text": .array([.string("Hits: \(hits)")])]
+            )
+        }
+        let source = _FVSequencedSupplementSource([frame(0), frame(1)])
+        let harness = _fvHarness()
+        let host = _FVHandRequestHost(harness.client)
+        let verbs = MacFourVerbs(host: host, clock: harness.clock, supplementalSource: source)
+        let reply = await verbs.act(verb: "click", target: "target")
+        #expect(reply.ok, "\(reply.text)")
+        let requests = await host.handRequests()
+        #expect(requests.count == 1)
+        #expect(requests.first?["defer_visual_verification"] == (physicalOnly ? .bool(true) : nil))
+        #expect(await source.observationCount() == 2, "caller must still own fresh before and after evidence")
+        #expect(reply.detail["verification"] == .string("satisfied"))
+        #expect(reply.detail["verification_evidence"] == .string("fresh_visible_value_change"))
+    }
+}
+
+@Test func naturalShapeNounsKeepExactAimAndSharedShapeAmbiguity() async {
+    let sink = _FVEventSink()
+    let source = _FVSupplementSource(supplement: MacFourVerbsSupplement(
+        appName: "Finder", bundleIdentifier: "com.apple.finder",
+        visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+        targets: [
+            MacFourVerbsSupplementalTarget(label: MacScreenText("visual region 1"),
+                aliases: ["square", "green square", "stationary green square", "green square at lower right"],
+                kind: "visual region", frame: MacAXFrame(x: 500, y: 400, w: 60, h: 60),
+                provenance: .vision(0.9), physicalOnly: true),
+            MacFourVerbsSupplementalTarget(label: MacScreenText("visual region 2"),
+                aliases: ["square", "blue square", "moving blue square"],
+                kind: "visual region", frame: MacAXFrame(x: 100, y: 200, w: 60, h: 60),
+                provenance: .vision(0.9), physicalOnly: true),
+        ]
+    ))
+    let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+    let ambiguous = await harness.verbs.act(verb: "hover", target: "square")
+    #expect(!ambiguous.ok && sink.mice().isEmpty)
+    let wrongMotion = await harness.verbs.act(verb: "hover", target: "stationary blue square")
+    #expect(!wrongMotion.ok && sink.mice().isEmpty)
+    for phrase in ["stationary green square", "green square at lower right"] {
+        let result = await harness.verbs.act(verb: "hover", target: phrase)
+        #expect(result.ok, "\(result.text)")
+    }
+    #expect(sink.mice().count == 2)
+    #expect(sink.mice().allSatisfy { $0.phase == .move && $0.x == 530 && $0.y == 430 })
+}
+
+@Test func shapeNounTemporalMissUsesBoundedFreshObservation() async {
+    func frame(stationary: Bool) -> MacFourVerbsSupplement {
+        MacFourVerbsSupplement(appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+            targets: [MacFourVerbsSupplementalTarget(label: MacScreenText("visual region 1"),
+                aliases: ["green square"] + (stationary ? ["stationary green square"] : []),
+                kind: "visual region", frame: MacAXFrame(x: 300, y: 200, w: 60, h: 60),
+                provenance: .vision(0.9), physicalOnly: true)])
+    }
+    for becomesKnown in [true, false] {
+        let sink = _FVEventSink()
+        let source = _FVSequencedSupplementSource([frame(stationary: false), frame(stationary: becomesKnown)])
+        let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+        let reply = await harness.verbs.act(verb: "hover", target: "stationary green square")
+        #expect(reply.ok == becomesKnown)
+        #expect(await source.observationCount() == 3)
+        #expect(sink.mice().count == (becomesKnown ? 1 : 0))
+        if becomesKnown { #expect(reply.detail["dynamic_reobserved"] == .bool(true)) }
+    }
+}
+
+@Test func temporalTargetCanAcquireThirdFrameWithoutDroppingQualifierOrAmbiguity() async {
+    func frame(_ count: Int) -> MacFourVerbsSupplement {
+        MacFourVerbsSupplement(appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+            targets: (0..<max(1, count)).map { index in
+                MacFourVerbsSupplementalTarget(label: MacScreenText("visual region \(index + 1)"),
+                    aliases: ["yellow circle"] + (count > 0 ? ["moving yellow circle"] : []),
+                    kind: "visual region", frame: MacAXFrame(x: Double(200 + index * 200), y: 200, w: 50, h: 50),
+                    provenance: .vision(0.9), physicalOnly: true, motionUncertain: count == 0)
+            })
+    }
+    for verb in ["click", "hover"] {
+        for finalCount in [0, 1, 2] {
+            let source = _FVSequencedSupplementSource([frame(0), frame(0), frame(finalCount)])
+            let sink = _FVEventSink()
+            let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+            let reply = await harness.verbs.act(verb: verb, target: "moving yellow circle")
+            #expect(reply.ok == (finalCount == 1), "\(reply.text)")
+            #expect(await source.observationCount() == (finalCount == 2 ? 3 : 4))
+            #expect(sink.mice().isEmpty == (finalCount != 1))
+            if finalCount == 2 { #expect(reply.detail["error"] == .string("ambiguous")) }
+        }
+    }
+    for verb in ["click", "hover"] {
+        let source = _FVSequencedSupplementSource([frame(0), frame(0), frame(0), frame(1)])
+        let sink = _FVEventSink()
+        let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+        let reply = await harness.verbs.act(verb: verb, target: "moving yellow circle")
+        #expect(reply.ok, "\(reply.text)")
+        #expect(await source.observationCount() == 5, "fourth confirmation plus mandatory post-action view")
+        #expect(!sink.mice().isEmpty)
+    }
+}
+
+@Test func temporalTurnConfirmationRequiresSameUniqueUncertainPhysicalIdentity() {
+    func target(_ label: String, uncertain: Bool = true) -> MacFourVerbs.ActTarget {
+        MacFourVerbs.ActTarget(handle: "", label: label, aliases: ["yellow circle"], kind: "visual region",
+            ordinal: nil, enabled: true, frame: MacAXFrame(x: 100, y: 200, w: 40, h: 40),
+            physicalOnly: true, motionUncertain: uncertain)
+    }
+    let old = target("visual region 1")
+    #expect(MacFourVerbs.canConfirmTemporalTurn("moving yellow circle", previous: [old], current: [old]))
+    #expect(!MacFourVerbs.canConfirmTemporalTurn("yellow circle", previous: [old], current: [old]))
+    #expect(!MacFourVerbs.canConfirmTemporalTurn("moving yellow circle", previous: [old], current: []))
+    #expect(!MacFourVerbs.canConfirmTemporalTurn("moving yellow circle", previous: [old], current: [target("visual region 2")]))
+    #expect(!MacFourVerbs.canConfirmTemporalTurn("moving yellow circle", previous: [old], current: [old, target("visual region 2")]))
+    #expect(!MacFourVerbs.canConfirmTemporalTurn("stationary yellow circle", previous: [old], current: [target("visual region 1", uncertain: false)]))
+}
+
+@Test func explicitRightButtonReachesNamedPointerActionsAndRejectsWrongUses() async {
+    let supplement = MacFourVerbsSupplement(appName: "Finder", bundleIdentifier: "com.apple.finder",
+        visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600), targets: [
+            MacFourVerbsSupplementalTarget(label: MacScreenText("orange circle"), kind: "visual region",
+                frame: MacAXFrame(x: 100, y: 200, w: 60, h: 60), provenance: .vision(0.9), physicalOnly: true),
+            MacFourVerbsSupplementalTarget(label: MacScreenText("green square"), kind: "visual region",
+                frame: MacAXFrame(x: 500, y: 200, w: 60, h: 60), provenance: .vision(0.9), physicalOnly: true),
+        ])
+    for verb in ["click", "open", "drag", "hold"] {
+        let sink = _FVEventSink()
+        let harness = _fvHarness(eventSink: sink, supplementalSource: _FVSupplementSource(supplement: supplement))
+        let reply = await harness.verbs.act(verb: verb, target: "orange circle", to: "green square",
+                                             seconds: 0, holding: verb == "hold" ? "w d" : nil, button: "right")
+        #expect(reply.ok, "\(reply.text)")
+        #expect(reply.detail["button"] == .string("right"))
+        #expect(!sink.mice().isEmpty && sink.mice().allSatisfy { $0.button == .right })
+        #expect(sink.mice().last?.phase == .up)
+        if verb == "hold" {
+            #expect(sink.keys().map(\.keyCode) == [13, 2, 2, 13])
+            #expect(sink.keys().map(\.down) == [true, true, false, false])
+        }
+        if verb == "drag" { #expect(sink.mice().contains { $0.phase == .drag && $0.x == 530 }) }
+    }
+    for (verb, target, button) in [("click", "orange circle", "middle"), ("key", "w", "right"),
+                                    ("type", "orange circle", "right"), ("hold", "key w", "right"),
+                                    ("hover", "orange circle", "right")] {
+        let sink = _FVEventSink()
+        let harness = _fvHarness(eventSink: sink, supplementalSource: _FVSupplementSource(supplement: supplement))
+        let reply = await harness.verbs.act(verb: verb, target: target, text: "test", button: button)
+        #expect(!reply.ok && reply.detail["error"] == .string("invalid_mouse_button_action"))
+        #expect(sink.mice().isEmpty && sink.keys().isEmpty)
+    }
+}
+
+@Test func keyboardHoldStillRejectsASecondHeldKeySetBeforeInput() async {
+    let sink = _FVEventSink()
+    let harness = _fvHarness(eventSink: sink)
+    let reply = await harness.verbs.act(verb: "hold", target: "key w", seconds: 0, holding: "d")
+    #expect(!reply.ok)
+    #expect(reply.detail["error"] == .string("nested_hold_not_supported"))
+    #expect(sink.keys().isEmpty && sink.mice().isEmpty)
+}
+
+@Test func automaticButtonPreservesOrdinaryHoverKeysAndSemanticActions() async {
+    let sink = _FVEventSink()
+    let supplement = MacFourVerbsSupplement(appName: "Finder", bundleIdentifier: "com.apple.finder",
+        visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600), targets: [
+            MacFourVerbsSupplementalTarget(label: MacScreenText("green square"), kind: "visual region",
+                frame: MacAXFrame(x: 500, y: 200, w: 60, h: 60), provenance: .vision(0.9), physicalOnly: true),
+        ])
+    let harness = _fvHarness(eventSink: sink, supplementalSource: _FVSupplementSource(supplement: supplement))
+    let hover = await harness.verbs.act(verb: "hover", target: "green square", seconds: 0, button: "auto")
+    #expect(hover.ok)
+    #expect(sink.mice().count == 1 && sink.mice().first?.phase == .move)
+    let key = await harness.verbs.act(verb: "key", target: "w", button: "auto")
+    #expect(key.ok && sink.keys().count == 2 && sink.keys().last?.down == false)
+    let semantic = await harness.verbs.act(verb: "click", target: "Back", button: "auto")
+    #expect(semantic.ok)
+    #expect(!harness.actSource.recordedCalls().isEmpty)
+    #expect(sink.mice().count == 1, "auto must not force semantic AX actions into physical clicks")
+}
+
+@Test func pointerLandingUsesIndependentObservedBoundsAndNeverSettlesClicks() async {
+    func frame(_ pointer: MacPointerPosition?, observedX: Double = 500,
+               physicalOnly: Bool = true) -> MacFourVerbsSupplement {
+        MacFourVerbsSupplement(appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600), pointer: pointer,
+            targets: [MacFourVerbsSupplementalTarget(label: MacScreenText("green square"),
+                kind: "visual region", frame: MacAXFrame(x: 500, y: 200, w: 60, h: 60),
+                observedFrame: MacAXFrame(x: observedX, y: 200, w: 60, h: 60),
+                provenance: .vision(0.9), physicalOnly: physicalOnly)])
+    }
+    for verb in ["hover", "move", "click"] {
+        for physicalOnly in [true, false] {
+            let source = _FVSequencedSupplementSource([
+                frame(MacPointerPosition(x: 10, y: 10), physicalOnly: physicalOnly),
+                frame(MacPointerPosition(x: 530, y: 230), physicalOnly: physicalOnly),
+            ])
+            let harness = _fvHarness(eventSink: _FVEventSink(), supplementalSource: source)
+            let reply = await harness.verbs.act(verb: verb, target: "green square", button: "auto")
+            #expect(reply.ok, "\(reply.text)")
+            #expect(reply.text.contains("POINTER: 66%,38%"))
+            if verb == "click" {
+                #expect(reply.detail["verification"] != .string("satisfied"))
+                if physicalOnly { #expect(reply.detail["verification"] == .string("unverified")) }
+                #expect(reply.detail["verification_evidence"] == nil)
+                #expect(reply.detail["pointer_on_target"] == nil)
+            } else {
+                #expect(reply.detail["verification"] == .string("satisfied"))
+                #expect(reply.detail["verification_evidence"] == .string("fresh_system_pointer_in_observed_target"))
+                #expect(reply.detail["verification_scope"] == .string("pointer_position_only"))
+            }
+        }
+    }
+    // A predicted motor frame is NOT where the object was seen. Nor can a
+    // missing cursor read turn into an invented successful landing at (0,0).
+    for pointer in [MacPointerPosition(x: 530, y: 230), nil] {
+        let source = _FVSequencedSupplementSource([frame(nil), frame(pointer, observedX: 300)])
+        let harness = _fvHarness(eventSink: _FVEventSink(), supplementalSource: source)
+        let reply = await harness.verbs.act(verb: "hover", target: "green square")
+        #expect(reply.ok && reply.detail["verification"] == .string("unverified"))
+        #expect(reply.detail["pointer_on_target"] == (pointer == nil ? .null : .bool(false)))
+    }
+}
+
+@Test func pointerScreenReportsOutsideSurfaceAndUnavailableWithoutGlobalCoordinates() async {
+    for pointer in [MacPointerPosition(x: -400, y: 200), nil] {
+        let supplement = MacFourVerbsSupplement(appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600), pointer: pointer)
+        let harness = _fvHarness(supplementalSource: _FVSupplementSource(supplement: supplement))
+        let reply = await harness.verbs.screen()
+        #expect(reply.text.contains(pointer == nil ? "POINTER: position unavailable." : "POINTER: outside the observed surface."))
+        #expect(!reply.text.contains("-400"))
+    }
+    #expect(MacPointerPosition(x: .nan, y: 0) == nil)
+    #expect(MacPointerPosition(x: 0, y: .infinity) == nil)
+}
+
+@Test func diagonalAimQualifiersPreserveIdentityAndRefuseCoveredQuadrants() {
+    let frame = MacAXFrame(x: 100, y: 200, w: 800, h: 600)
+    for (qualifier, x, y) in [
+        ("upper-left corner", 300.0, 350.0), ("top left", 300.0, 350.0),
+        ("upper right part", 700.0, 350.0), ("top-right corner", 700.0, 350.0),
+        ("lower-left side", 300.0, 650.0), ("bottom left", 300.0, 650.0),
+        ("lower-right corner", 700.0, 650.0), ("bottom right", 700.0, 650.0),
+    ] {
+        let phrase = "\(qualifier) of the upper-left-icon"
+        #expect(MacFourVerbs.stripWithinTargetAimQualifier(phrase) == "upper-left-icon")
+        let aim = MacFourVerbs.aimPoint(in: frame, describedBy: phrase)
+        #expect(aim.x == x && aim.y == y)
+        let target = MacFourVerbs.ActTarget(handle: "", label: "canvas", kind: "canvas",
+            ordinal: nil, enabled: true, frame: frame,
+            excludedFrames: [MacAXFrame(x: x - 10, y: y - 10, w: 20, h: 20)], regionOnly: true)
+        #expect(MacFourVerbs.safeAimPoint(for: target, in: frame, describedBy: phrase) == nil)
+        #expect(MacFourVerbs.safeAimPoint(for: target, in: frame, describedBy: "canvas") != nil)
+    }
+    #expect(MacFourVerbs.stripWithinTargetAimQualifier("upper-left-icon") == "upper-left-icon")
+    #expect(MacFourVerbs.stripWithinTargetAimQualifier("portrait of the upper-left-icon") == "portrait of the upper-left-icon")
+    let centered = MacFourVerbs.aimPoint(in: frame, describedBy: "centre of upper left control")
+    #expect(centered.x == 500 && centered.y == 500, "object name must not override explicit aim")
+}
+
+@Test func partiallyCoveredCanvasKeepsClearAimingWithoutReinterpretingExplicitPoints() async throws {
+    let frame = MacAXFrame(x: 0, y: 0, w: 800, h: 600)
+    let popup = MacAXFrame(x: 350, y: 250, w: 100, h: 100)
+    let center = try #require(MacPointerPosition(x: 400, y: 300))
+    let clear = try #require(MacRegionAim.point(in: frame, preferred: center, excluding: [popup], allowAlternate: true))
+    #expect(clear.isInside(frame) && !clear.isInside(popup))
+    #expect(MacRegionAim.point(in: frame, preferred: center, excluding: [popup], allowAlternate: false) == nil)
+    #expect(MacRegionAim.point(in: frame, preferred: center, excluding: [frame], allowAlternate: true) == nil)
+    #expect(!MacRegionAim.pathIsClear(from: MacPointerPosition(x: 200, y: 300)!,
+        to: MacPointerPosition(x: 600, y: 300)!, excluding: [popup]))
+    #expect(MacRegionAim.pathIsClear(from: MacPointerPosition(x: 200, y: 100)!,
+        to: MacPointerPosition(x: 600, y: 100)!, excluding: [popup]))
+    let target = MacFourVerbs.ActTarget(handle: "", label: "visual surface", kind: "canvas",
+        ordinal: nil, enabled: true, frame: frame, excludedFrames: [popup], regionOnly: true)
+    #expect(MacFourVerbs.safeAimPoint(for: target, in: frame, describedBy: "visual surface") != nil)
+    #expect(MacFourVerbs.safeAimPoint(for: target, in: frame, describedBy: "center of visual surface") == nil)
+    #expect(MacFourVerbs.safeAimPoint(for: target, in: frame, describedBy: "upper left visual surface")?.x == 200)
+
+    let source = _FVSupplementSource(supplement: MacFourVerbsSupplement(
+        appName: "Finder", bundleIdentifier: "com.apple.finder", visibleFrame: frame,
+        targets: [MacFourVerbsSupplementalTarget(label: MacScreenText("visual surface"), aliases: ["canvas", "viewport", "world"], kind: "canvas",
+            frame: frame, excludedFrames: [popup], provenance: .vision(1), regionOnly: true)]))
+    let sink = _FVEventSink()
+    let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+    for name in ["visual surface", "canvas", "viewport", "world"] {
+        let reply = await harness.verbs.act(verb: "scroll up", target: name)
+        #expect(reply.ok, "\(reply.text)")
+    }
+    #expect(!sink.mice().isEmpty)
+    #expect(sink.mice().allSatisfy { event in MacPointerPosition(x: event.x, y: event.y)?.isInside(popup) == false })
+    let click = await harness.verbs.act(verb: "click", target: "visual surface")
+    #expect(!click.ok && click.detail["error"] == .string("region_needs_inner_target"))
+}
+
+@Test func fineAndHorizontalScrollUseWheelMagnitudeWithoutPageKeySubstitution() async {
+    for kind in ["canvas", "web area"] {
+        let supplement = MacFourVerbsSupplement(appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+            targets: [MacFourVerbsSupplementalTarget(label: MacScreenText("surface"), kind: kind,
+                frame: MacAXFrame(x: 100, y: 100, w: 600, h: 400), provenance: .vision(1), regionOnly: true)])
+        for (direction, dx, dy) in [("up", 0, 1), ("down", 0, -1), ("left", 1, 0), ("right", -1, 0)] {
+            let sink = _FVEventSink()
+            let harness = _fvHarness(eventSink: sink, supplementalSource: _FVSupplementSource(supplement: supplement))
+            let reply = await harness.verbs.act(verb: "scroll \(direction)", target: "surface", scrollAmount: 1)
+            #expect(reply.ok, "\(reply.text)")
+            #expect(reply.detail["physical_route"] == .string("wheel"))
+            #expect(sink.scrolls().count == 1)
+            #expect(sink.scrolls().first?.deltaX == Int32(dx) && sink.scrolls().first?.deltaY == Int32(dy))
+            #expect(sink.keys().isEmpty)
+        }
+    }
+    let harness = _fvHarness()
+    for amount in [-1, 121] {
+        let reply = await harness.verbs.act(verb: "scroll up", target: "Back", scrollAmount: amount)
+        #expect(!reply.ok && reply.detail["error"] == .string("invalid_scroll_amount"))
+    }
+    let invalid = await harness.verbs.act(verb: "click", target: "Back", scrollAmount: 1)
+    #expect(!invalid.ok && invalid.detail["error"] == .string("invalid_scroll_amount"))
+    let ordinary = await harness.verbs.act(verb: "click", target: "Back", scrollAmount: 0)
+    #expect(ordinary.ok)
+}
+
+@Test
+func physicalHoverReobservesOneTransientNaturalTargetMiss() async {
+    let missing = MacFourVerbsSupplement(
+        appName: "Finder", bundleIdentifier: "com.apple.finder",
+        visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600)
+    )
+    let visible = MacFourVerbsSupplement(
+        appName: "Finder", bundleIdentifier: "com.apple.finder",
+        visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+        targets: [MacFourVerbsSupplementalTarget(
+            label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
+            aliases: ["moving yellow object", "yellow object"],
+            kind: "visual region",
+            frame: MacAXFrame(x: 300, y: 200, w: 80, h: 60),
+            provenance: .vision(0.8),
+            physicalOnly: true
+        )],
+        diagnostics: ["vision_effect_value_text": .array([])]
+    )
+    let sink = _FVEventSink()
+    let source = _FVSequencedSupplementSource([missing, visible, visible])
+    let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+
+    let reply = await harness.verbs.act(verb: "hover", target: "moving yellow object")
+
+    #expect(reply.ok, "\(reply.text)")
+    #expect(reply.detail["dynamic_reobserved"] == .bool(true))
+    #expect(harness.clock.seconds() == 0.06)
+    #expect(sink.mice().contains { $0.phase == .move && $0.x == 340 && $0.y == 230 })
+}
+
+@Test
+func physicalDragReobservesBothEndsWhenMovingDestinationDropsOut() async {
+    func supplement(includeDestination: Bool) -> MacFourVerbsSupplement {
+        var targets = [MacFourVerbsSupplementalTarget(
+            label: MacScreenText("visual region 1", redacted: .string("visual region 1")),
+            aliases: ["yellow object"],
+            kind: "visual region",
+            frame: MacAXFrame(x: 100, y: 120, w: 40, h: 40),
+            provenance: .vision(0.8),
+            physicalOnly: true
+        )]
+        if includeDestination {
+            targets.append(MacFourVerbsSupplementalTarget(
+                label: MacScreenText("visual region 2", redacted: .string("visual region 2")),
+                aliases: ["moving blue object"],
+                kind: "visual region",
+                frame: MacAXFrame(x: 400, y: 420, w: 80, h: 80),
+                provenance: .vision(0.8),
+                physicalOnly: true
+            ))
+        }
+        return MacFourVerbsSupplement(
+            appName: "Finder", bundleIdentifier: "com.apple.finder",
+            visibleFrame: MacAXFrame(x: 0, y: 0, w: 800, h: 600),
+            targets: targets,
+            diagnostics: ["vision_effect_value_text": .array([])]
+        )
+    }
+    let sink = _FVEventSink()
+    let source = _FVSequencedSupplementSource([
+        supplement(includeDestination: false),
+        supplement(includeDestination: true),
+        supplement(includeDestination: true),
+    ])
+    let harness = _fvHarness(eventSink: sink, supplementalSource: source)
+
+    let reply = await harness.verbs.act(
+        verb: "drag", target: "yellow object", to: "moving blue object", seconds: 0
+    )
+
+    #expect(reply.ok, "\(reply.text)")
+    #expect(reply.detail["dynamic_reobserved"] == .bool(true))
+    let down = sink.mice().first { $0.phase == .down }
+    let up = sink.mice().last { $0.phase == .up }
+    #expect(down?.x == 120 && down?.y == 140)
+    #expect(up?.x == 440 && up?.y == 460)
 }
 
 @Test
@@ -1055,6 +1928,150 @@ private final class _FVCounter: @unchecked Sendable {
 // MARK: - Pure: the resolution ladder
 
 @Test
+func duplicateControlNamesGetMatchingRenderedAddressesWithoutRenumberingUnnamedControls() async {
+    var elements = _fvElements()
+    var actElements = _fvActElements()
+    for (index, id) in [103, 104].enumerated() {
+        let frame = MacAXFrame(x: Double(30 + index * 40), y: 70, w: 20, h: 20)
+        elements[id] = _FVElement(attributes: MacAXAttributes(role: "AXButton", frame: frame, actions: ["AXPress"]), children: [])
+        elements[10]?.children.append(id)
+        actElements[[0, index + 3]] = _FVActElement(role: "AXButton", title: nil, frame: frame)
+    }
+    let harness = _fvHarness(elements: elements, actElements: actElements)
+    let before = await harness.verbs.screen()
+    #expect(before.text.contains("button 1"))
+    #expect(before.text.contains("button 2"))
+    #expect(!before.text.contains("button 3"))
+
+    harness.source.mutate { tree in
+        tree[100] = _FVElement(attributes: MacAXAttributes(role: "AXButton", title: "Remove", actions: ["AXPress"]), children: [])
+        tree[101] = _FVElement(attributes: MacAXAttributes(role: "AXButton", title: "REMOVE", actions: ["AXPress"]), children: [])
+    }
+    harness.actSource.mutate { tree in
+        tree[[0, 0]] = _FVActElement(role: "AXButton", title: "Remove")
+        tree[[0, 1]] = _FVActElement(role: "AXButton", title: "REMOVE")
+    }
+    let screen = await harness.verbs.screen()
+    for address in ["button 1", "button 2", "button 3", "button 4"] {
+        #expect(screen.text.contains(address), "Missing visible address \(address): \(screen.text)")
+    }
+    let ambiguous = await harness.verbs.act(verb: "click", target: "Remove")
+    #expect(!ambiguous.ok)
+    #expect(ambiguous.text.contains("button 3 \"Remove\""))
+    #expect(ambiguous.text.contains("button 4 \"REMOVE\""))
+    #expect(!harness.actSource.recordedCalls().contains { $0.hasPrefix("perform:") })
+
+    let named = await harness.verbs.act(verb: "click", target: "button 4")
+    #expect(named.ok, "\(named.text)")
+    #expect(harness.actSource.recordedCalls().contains("perform:AXPress:[0, 1]"))
+    for copiedAddress in ["button 4 REMOVE", "button 4 \"REMOVE\""] {
+        let copied = await harness.verbs.act(verb: "click", target: copiedAddress)
+        #expect(copied.ok, "\(copied.text)")
+        #expect(harness.actSource.recordedCalls().last { $0.hasPrefix("perform:") } == "perform:AXPress:[0, 1]")
+    }
+    let callsBeforeStale = harness.actSource.recordedCalls().filter { $0.hasPrefix("perform:") }.count
+    for staleAddress in ["button 4 Send", "button 99 Remove"] {
+        let stale = await harness.verbs.act(verb: "click", target: staleAddress)
+        #expect(!stale.ok)
+    }
+    #expect(harness.actSource.recordedCalls().filter { $0.hasPrefix("perform:") }.count == callsBeforeStale)
+    let unnamed = await harness.verbs.act(verb: "click", target: "button 1")
+    #expect(unnamed.ok, "\(unnamed.text)")
+    #expect(harness.actSource.recordedCalls().contains("perform:AXPress:[0, 3]"))
+
+    let missed = await harness.verbs.act(verb: "click", target: "Remove impossible")
+    // Even when a longer label is ambiguous, both recovery choices stay
+    // distinct and refer to the same fresh screen's published ordinals.
+    #expect(!missed.ok)
+    #expect(missed.text.contains("button 3"))
+    #expect(missed.text.contains("button 4"))
+}
+
+@Test
+func resolution_copiedLabeledOrdinalsPreserveLiteralNamesAndExactKinds() {
+    let targets: [MacFourVerbs.ActTarget] = [
+        .init(handle: "first", label: "Remove", kind: "button", ordinal: nil, roleOrdinal: 4, enabled: true),
+        .init(handle: "second", label: "Remove", kind: "button", ordinal: nil, roleOrdinal: 5, enabled: true),
+        .init(handle: "editor", label: "Notes", kind: "text area", ordinal: nil, roleOrdinal: 2, enabled: true),
+        .init(handle: "row", label: "Report", kind: "row", ordinal: 7, enabled: true),
+    ]
+    for (phrase, expected) in [("button 4 Remove", "first"), ("button 5 \"Remove\"", "second"),
+                               ("text area 2 Notes", "editor"), ("row 7 Report", "row")] {
+        guard case .hit(let hit) = MacFourVerbs.resolve(phrase, among: targets) else {
+            Issue.record("Copied address did not resolve: \(phrase)"); continue
+        }
+        #expect(hit.handle == expected)
+    }
+    for phrase in ["button 4 Notes", "button 2 Notes", "button 99 Remove"] {
+        guard case .none = MacFourVerbs.resolve(phrase, among: targets) else {
+            Issue.record("Inconsistent address must not fall back to another target: \(phrase)"); continue
+        }
+    }
+    let literal = MacFourVerbs.ActTarget(handle: "literal", label: "button 4 Remove", kind: "row", ordinal: 8, enabled: true)
+    guard case .hit(let hit) = MacFourVerbs.resolve("button 4 Remove", among: targets + [literal]) else {
+        Issue.record("An exact literal name must retain precedence"); return
+    }
+    #expect(hit.handle == "literal")
+}
+
+@Test
+func resolution_roleQualifierFiltersBeforeUniqueOrAmbiguousNameMatches() {
+    func target(_ handle: String, _ label: String, _ kind: String) -> MacFourVerbs.ActTarget {
+        .init(handle: handle, label: label, kind: kind, ordinal: nil, enabled: true)
+    }
+    let wrongRole = target("field", "Send", "text")
+    guard case .none = MacFourVerbs.resolve("Send button", among: [wrongRole]) else {
+        Issue.record("An explicit button request must not select the sole Send text field")
+        return
+    }
+    let sendButton = target("button", "Send message", "button")
+    for wrongRoles in [[wrongRole], [wrongRole, target("row", "Send", "row")]] {
+        guard case .hit(let hit) = MacFourVerbs.resolve("Send button", among: wrongRoles + [sendButton]) else {
+            Issue.record("Wrong-role exact names must not shadow the matching button")
+            return
+        }
+        #expect(hit.handle == "button")
+    }
+    guard case .ambiguous(let matches) = MacFourVerbs.resolve("Send button", among: [
+        wrongRole, sendButton, target("other-button", "Send later", "button"),
+    ]) else {
+        Issue.record("Two same-role matches must remain ambiguous")
+        return
+    }
+    #expect(Set(matches.map(\.handle)) == ["button", "other-button"])
+    guard case .hit(let textArea) = MacFourVerbs.resolve("Search text area", among: [
+        target("field", "Search", "text"), target("area", "Search", "text area"),
+    ]) else {
+        Issue.record("Multiword printed roles must qualify the entire name")
+        return
+    }
+    #expect(textArea.handle == "area")
+}
+
+@Test
+func resolution_roleQualifierPreservesLiteralLabelsAliasesAndOrdinals() {
+    for label in ["Send button", "Button Manager", "Search text area"] {
+        let literal = MacFourVerbs.ActTarget(handle: "literal", label: label, kind: "row", ordinal: 1, enabled: true)
+        guard case .hit(let hit) = MacFourVerbs.resolve(label, among: [literal]) else {
+            Issue.record("A literal label containing role words must stay addressable: \(label)")
+            return
+        }
+        #expect(hit.handle == "literal")
+    }
+    let focused = MacFourVerbs.ActTarget(
+        handle: "focus", label: nil, aliases: ["focused field"], kind: "text area", ordinal: nil,
+        roleOrdinal: 2, enabled: true
+    )
+    for phrase in ["focused field", "text area 2", "text area"] {
+        guard case .hit(let hit) = MacFourVerbs.resolve(phrase, among: [focused]) else {
+            Issue.record("Existing aliases, ordinals and bare kinds must stay addressable: \(phrase)")
+            return
+        }
+        #expect(hit.handle == "focus")
+    }
+}
+
+@Test
 func resolution_neverFallsBackToTheFirstMatch() {
     let targets = [
         MacFourVerbs.ActTarget(handle: "a", label: "shot1.png", kind: "row", ordinal: 1, enabled: true),
@@ -1102,7 +2119,7 @@ func resolution_cannotNameAWithheldLabel() {
 //
 // `act(repeat:interval:)` is a different code path from `act()`: it takes an
 // ATTENTION LEASE for the whole burst, loops re-perceiving each attempt, and
-// reports five repeat_* counters plus a verification verdict computed across
+// reports bounded repeat_* receipts plus a verification verdict computed across
 // every attempt. Before this section the whole path had zero tests — a grep for
 // `repeat:` / `BurstAttention` / `maximumActRepeats` across the test trees
 // returned nothing.
@@ -1181,13 +2198,26 @@ private struct _FVBurstHarness {
     let clock: _FVClock
 }
 
+private struct _FVElapsedHost: MacFourVerbsHost {
+    let base: any MacFourVerbsHost
+    let clock: _FVClock
+    let elapsedPerDispatch: Double
+
+    func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
+        let result = try await base.dispatch(action: action, body: body)
+        clock.advance(elapsedPerDispatch)
+        return result
+    }
+}
+
 /// The four-verb harness plus the two seams a BURST needs: a passive attention
 /// event source and a fused-view lane the attention lease can observe through.
 /// Both stores are fresh instances rather than the process-wide `.shared` ones,
 /// so a burst test cannot inherit — or leak — a lease across the suite.
 private func _fvBurstHarness(
     actElements: [[Int]: _FVActElement]? = nil,
-    vanishAfter: (path: [Int], presses: Int)? = nil
+    vanishAfter: (path: [Int], presses: Int)? = nil,
+    elapsedPerDispatch: Double = 0
 ) -> _FVBurstHarness {
     let source = _FVLookSource(elements: _fvElements(), rootID: 0)
     let actSource = _FVActSource(actElements ?? _fvActElements())
@@ -1210,8 +2240,9 @@ private func _fvBurstHarness(
         attentionEventSource: attentionSource,
         attentionStore: attentionStore
     )
+    let host = _FVElapsedHost(base: client, clock: clock, elapsedPerDispatch: elapsedPerDispatch)
     return _FVBurstHarness(
-        verbs: MacFourVerbs(host: client, clock: clock),
+        verbs: MacFourVerbs(host: host, clock: clock),
         actSource: actSource,
         attentionStore: attentionStore,
         attentionSource: attentionSource,
@@ -1302,16 +2333,14 @@ func actBurst_clampsTheRepeatCountByBothTheHardCapAndTheThirtySecondBudget() asy
     #expect(presses.count == MacFourVerbs.maximumActRepeats,
             "the cap must bound the ACTS, not just the number in the reply")
 
-    // KNOWN GAP, pinned rather than assumed: `requested` is clamped BEFORE it
-    // is recorded, so a 500-repeat ask is reported back as "12 requested" and
-    // `repeat_stopped_early` stays false. The safety behaviour is correct; the
-    // TELEMETRY loses the fact that the caller asked for 40x more than ran, so
-    // a runaway loop upstream is invisible in the counters. If this starts
-    // returning 500, the honesty gap is closed — re-rate ledger row
-    // `fourverbs.act.burst`.
-    #expect(_fvInt(reply.detail, "repeat_requested") == Int64(MacFourVerbs.maximumActRepeats),
-            "KNOWN GAP: the caller's true repeat ask is not carried into the reply")
-    #expect(_fvBool(reply.detail, "repeat_stopped_early") == false)
+    // The receipt retains both the caller's real ask and the accepted bounded
+    // count. A runaway upstream loop is visible without weakening the hard cap.
+    #expect(_fvInt(reply.detail, "repeat_requested_input") == 500)
+    #expect(_fvInt(reply.detail, "repeat_requested") == 500)
+    #expect(_fvInt(reply.detail, "repeat_accepted") == Int64(MacFourVerbs.maximumActRepeats))
+    #expect(_fvBool(reply.detail, "repeat_stopped_early") == true)
+    #expect(reply.text.hasPrefix("Completed 12/500 requested attempts."), "\(reply.text)")
+    #expect(reply.text.contains("12-attempt safety cap limited this burst before execution."), "\(reply.text)")
 
     // (b) THE INTERVAL IS ITSELF CLAMPED first, so a slow-looking request is
     // not automatically a short burst: 8s of pause becomes 2s, 30 / 2 = 15
@@ -1331,6 +2360,7 @@ func actBurst_clampsTheRepeatCountByBothTheHardCapAndTheThirtySecondBudget() asy
     let boundedPlanned = _fvInt(bounded.detail, "repeat_planned") ?? -1
     #expect(boundedPlanned == 2,
             "30s budget / (10s + 2s clamped pause) = 2 attempts, got \(boundedPlanned)")
+    #expect(_fvInt(bounded.detail, "repeat_accepted") == 12)
     let boundedPresses = expensive.actSource.recordedCalls().filter { $0 == "perform:AXPress:[1, 0]" }
     #expect(boundedPresses.count == 2, "the budget must bound the ACTS too")
     // …and THIS is the path where the bound is said out loud, because here the
@@ -1405,4 +2435,30 @@ func actBurst_reportsSatisfiedOnlyWhenEveryAttemptHadFreshVisibleProof() async t
     #expect(single.detail["repeat_completed"] == nil)
     #expect(await harness.attentionStore.status(now: Date()) == nil,
             "a repeat:1 act must not take an attention lease at all")
+}
+
+@Test
+func actBurst_stopsLaunchingAttemptsWhenRealPerceptionTimeExhaustsTheRuntimeBound() async throws {
+    // Planning sees no hold or pause cost here, so all twelve attempts are
+    // accepted. Slow owner dispatches advance only the monotonic clock: the runtime
+    // boundary must notice that real owner work, stop before another click,
+    // and report the shortfall without pretending a completed effect failed.
+    let harness = _fvBurstHarness(elapsedPerDispatch: 8)
+    let reply = await harness.verbs.act(verb: "click", target: "report.pdf", repeat: 12)
+
+    let planned = try #require(_fvInt(reply.detail, "repeat_planned"))
+    let completed = try #require(_fvInt(reply.detail, "repeat_completed"))
+    #expect(planned == 12)
+    #expect(completed > 0 && completed < planned)
+    #expect(_fvBool(reply.detail, "repeat_runtime_limited") == true)
+    #expect(_fvBool(reply.detail, "repeat_stopped_early") == true)
+    #expect(reply.text.contains("30-second runtime boundary stopped the burst before another attempt."),
+            "\(reply.text)")
+    #expect(!reply.ok)
+
+    let presses = harness.actSource.recordedCalls().filter { $0 == "perform:AXPress:[1, 0]" }
+    #expect(presses.count == completed,
+            "the receipt must equal the effects actually emitted: \(harness.actSource.recordedCalls())")
+    #expect(await harness.attentionStore.status(now: Date()) == nil,
+            "runtime exhaustion must still release an owned attention lease")
 }

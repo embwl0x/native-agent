@@ -280,6 +280,30 @@ public actor OrganismKernel {
             }
     }
 
+    public func prediction(
+        ofKind kind: OrganismPredictionKind,
+        sourceOrgan: String,
+        correlationID: String
+    ) -> OrganismPrediction? {
+        guard configuration.enabled else { return nil }
+        let id = OrganismPredictiveBody.predictionID(
+            kind: kind,
+            sourceOrgan: sourceOrgan,
+            correlationID: correlationID
+        )
+        return predictionLedger.predictions[id]
+    }
+
+    /// Pure cumulative capability read for body projections that must survive
+    /// a restart before their transient lifecycle sensor has been restored.
+    public func capabilityBelief(ofKind kind: OrganismPredictionKind) -> OrganismCapabilityBelief? {
+        guard configuration.enabled else { return nil }
+        return OrganismCapabilitySelfModel.beliefs(
+            ledger: predictionLedger,
+            at: dependencies.now()
+        ).first { $0.kind == kind }
+    }
+
     /// Pure deadline read for event-driven repair. No timer is owned by the
     /// kernel and no state is changed beyond ordinary analytic settlement.
     public func residualRepairOpportunity() async -> OrganismResidualRepairOpportunity {
@@ -371,7 +395,7 @@ public actor OrganismKernel {
             predictionSummary: configuration.enabled ? predictionLedger.summary() : .empty,
             dreamRepairSummary: configuration.enabled ? dreamRepairState.summary() : .empty,
             reflexSummary: configuration.enabled ? reflexState.summary() : .empty,
-            reflexCandidates: configuration.enabled ? reflexState.reviewCandidates() : [],
+            reflexCandidates: configuration.enabled ? reflexState.activeCandidates() : [],
             reflexReviewReceipts: configuration.enabled ? reflexState.recentReviewReceipts() : [],
             residualRepairOpportunity: residualRepair,
             capabilityBeliefs: capabilityBeliefs,
@@ -415,7 +439,7 @@ public actor OrganismKernel {
                 predictionSummary: frozen.predictionLedger.summary(),
                 dreamRepairSummary: frozen.dreamRepairState.summary(),
                 reflexSummary: frozen.reflexState.summary(),
-                reflexCandidates: frozen.reflexState.reviewCandidates(),
+                reflexCandidates: frozen.reflexState.activeCandidates(),
                 reflexReviewReceipts: frozen.reflexState.recentReviewReceipts(),
                 residualRepairOpportunity: OrganismResidualRepair.opportunity(
                     ledger: frozen.predictionLedger,

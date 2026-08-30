@@ -30,10 +30,14 @@ enum MobileDeskEmptyStatePresentation: Equatable {
     case unavailable(String)
     case empty
 
-    static func state(isRefreshing: Bool, syncError: String?) -> MobileDeskEmptyStatePresentation {
-        if isRefreshing { return .loading }
-        if let syncError = syncError?.trimmingCharacters(in: .whitespacesAndNewlines), !syncError.isEmpty {
-            return .unavailable(syncError)
+    static func state(
+        hasAttemptedLoad: Bool,
+        isRefreshing: Bool,
+        loadError: String?
+    ) -> MobileDeskEmptyStatePresentation {
+        if !hasAttemptedLoad || isRefreshing { return .loading }
+        if let loadError = loadError?.trimmingCharacters(in: .whitespacesAndNewlines), !loadError.isEmpty {
+            return .unavailable(loadError)
         }
         return .empty
     }
@@ -46,7 +50,9 @@ struct MobileDeskView: View {
     @State private var selectedItem: MobileDeskItem?
     @State private var showingNewItem = false
     @State private var errorMessage: String?
-    @State private var isRefreshingDesk = true
+    @State private var isRefreshingDesk = false
+    @State private var hasAttemptedDeskLoad = false
+    @State private var deskLoadError: String?
 
     private var waitingOnYou: [MobileDeskItem] {
         sync.deskItems.filter { MobileDeskSectionPresentation.section(for: $0) == .waitingOnYou }
@@ -79,8 +85,9 @@ struct MobileDeskView: View {
             }
             if sync.deskItems.isEmpty {
                 switch MobileDeskEmptyStatePresentation.state(
+                    hasAttemptedLoad: hasAttemptedDeskLoad,
                     isRefreshing: isRefreshingDesk,
-                    syncError: sync.syncError
+                    loadError: deskLoadError
                 ) {
                 case .loading:
                     ProgressView("Loading Desk…")
@@ -92,7 +99,14 @@ struct MobileDeskView: View {
                         title: "Desk is unavailable",
                         systemImage: "icloud.slash",
                         kind: .unavailable,
-                        description: error
+                        description: error,
+                        action: (
+                            title: "Try Again",
+                            systemImage: "arrow.clockwise",
+                            handler: {
+                                Task { await refreshDesk() }
+                            }
+                        )
                     )
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -125,6 +139,11 @@ struct MobileDeskView: View {
         }
         .refreshable { await refreshDesk() }
         .task { await refreshDesk() }
+        .onChange(of: sync.deskItems) { _, items in
+            guard !items.isEmpty else { return }
+            hasAttemptedDeskLoad = true
+            deskLoadError = nil
+        }
         .sheet(item: $selectedItem) { item in
             MobileDeskItemDetail(item: item, errorMessage: $errorMessage)
         }
@@ -142,9 +161,12 @@ struct MobileDeskView: View {
     }
 
     private func refreshDesk() async {
+        guard !isRefreshingDesk else { return }
         isRefreshingDesk = true
-        await sync.refreshDeskSnapshot()
-        isRefreshingDesk = false
+        defer { isRefreshingDesk = false }
+        let loaded = await sync.refreshDeskSnapshot()
+        hasAttemptedDeskLoad = true
+        deskLoadError = loaded ? nil : "Desk is still syncing from the Mac. Try again in a moment."
     }
 
     @ViewBuilder
@@ -357,14 +379,24 @@ private struct NewMobileDeskItemSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") { Task { await save() } }
+                    Button { Task { await save() } } label: {
+                        if isSaving {
+                            ProgressView()
+                                .controlSize(.small)
+                                .accessibilityHidden(true)
+                        } else {
+                            Text("Add")
+                        }
+                    }
                         .disabled(isSaving || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || project.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityLabel(isSaving ? "Adding Desk item" : "Add Desk item")
                 }
             }
         }
     }
 
     private func save() async {
+        guard !isSaving else { return }
         isSaving = true
         defer { isSaving = false }
         do {

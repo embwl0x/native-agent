@@ -3,6 +3,21 @@ import Testing
 @testable import VisionPerception
 
 // MARK: - Layer-level pins
+
+@Test func fixedColorDistancePreservesSquaredRGBReduction() {
+    let values: [Double] = [0, 0.001, 0.03125, 0.1, 0.125, 0.5, 0.99, 1]
+    for r in values {
+        for g in values {
+            for b in values {
+                let color = SIMD3(r, g, b)
+                for reference in [SIMD3<Double>(0, 0, 0), SIMD3<Double>(0.53125, 0.5, 0.25), SIMD3<Double>(1, 1, 1)] {
+                    let delta = color - reference
+                    #expect(VisionColorRegionLayer.distanceSquared(color, reference) == (delta * delta).sum())
+                }
+            }
+        }
+    }
+}
 //
 // The scene tests prove the pipeline on pixels. These pin the DECISIONS that
 // the spikes' measurements bought, where a scene would be a slow and indirect
@@ -49,6 +64,49 @@ private func box(_ text: String, _ x: Double, _ y: Double, _ w: Double, _ h: Dou
     #expect(decision.reason.contains("no tiny text"))
 }
 
+@Test func foregroundTinyTextDoesNotTriggerRefinementButRemainsForRedaction() throws {
+    let ordinary = (0..<4).map { box("World \($0)", 10, Double($0) * 30, 100, 20) }
+    let covered = (0..<8).map { box("Dialog \($0)", 400, Double($0) * 10, 100, 6) }
+    let result = try VisionTextLayer.recognize(
+        image: Scene.mainScene().image,
+        using: VisionStaticTextRecognizer(boxes: ordinary + covered, tileOnlyBoxes: []),
+        config: VisionTextLayerConfig(sparseRecoveryMaxBoxes: 3),
+        ignoredForRefinement: [VisionRect(x: 390, y: 0, w: 130, h: 100)]
+    )
+    #expect(!result.tiled)
+    #expect(result.boxes.count == ordinary.count + covered.count,
+        "whole-frame text remains available to the redactor before compiler exclusion")
+    #expect(result.tilingReason.contains("foreground-covered text ignored"))
+}
+
+@Test func foregroundTextCannotSuppressSparseWorldTextRecovery() throws {
+    let title = box("World", 20, 20, 100, 24)
+    let covered = (0..<5).map { box("Dialog \($0)", 400, Double($0) * 30, 100, 18) }
+    let recovered = box("Hits: 2", 20, 55, 80, 18)
+    let result = try VisionTextLayer.recognize(
+        image: Scene.mainScene().image,
+        using: VisionStaticTextRecognizer(boxes: [title] + covered, tileOnlyBoxes: [recovered]),
+        config: VisionTextLayerConfig(sparseRecoveryMaxBoxes: 3),
+        ignoredForRefinement: [VisionRect(x: 390, y: 0, w: 130, h: 160)]
+    )
+    #expect(result.tiled)
+    #expect(result.tilingReason.contains("sparse text recovery"))
+    #expect(result.tilingReason.contains("1 local region(s)"))
+    #expect(result.boxes.contains { $0.text == "Hits: 2" })
+}
+
+@Test func visibleTinyTextStillGetsRefinedBesideAnExcludedOverlay() throws {
+    let tiny = (0..<4).map { box("World \($0)", 10, Double($0) * 10, 80, 6) }
+    let result = try VisionTextLayer.recognize(
+        image: Scene.mainScene().image,
+        using: VisionStaticTextRecognizer(boxes: tiny, tileOnlyBoxes: [box("Recovered", 10, 70, 70, 6)]),
+        ignoredForRefinement: [VisionRect(x: 390, y: 0, w: 130, h: 100)]
+    )
+    #expect(result.tiled)
+    #expect(result.tilingReason.contains("tiny text"))
+    #expect(result.boxes.contains { $0.text == "Recovered" })
+}
+
 @Test func tilingFiresOnGenuinelyTinyText() {
     let boxes = (0..<20).map { box("x", 10, Double($0) * 12, 40, 7) }
     let decision = VisionTextLayer.tilingDecision(boxes: boxes, imageHeight: 1440)
@@ -86,6 +144,32 @@ private func box(_ text: String, _ x: Double, _ y: Double, _ w: Double, _ h: Dou
     #expect(merged.first { $0.text == "Send" }?.confidence == 0.95)
 }
 
+@Test func deterministicOCRReadingOrderSurvivesEveryNearTiePermutation() {
+    let boxes = [box("A", 20, 0, 5, 5), box("B", 10, 0.6, 5, 5), box("C", 0, 1.2, 5, 5)]
+    let permutations = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
+    for indexes in permutations {
+        let ordered = VisionTextLayer.dedupe(indexes.map { boxes[$0] })
+        #expect(ordered.map(\.text) == ["B", "A", "C"])
+        #expect(ordered.count == boxes.count)
+    }
+    let sameRow = [box("Z", 0, 0, 5, 5), box("A", 0.6, 0.4, 5, 5), box("B", 1.2, 0.8, 5, 5)]
+    for indexes in permutations {
+        #expect(VisionTextLayer.dedupe(indexes.map { sameRow[$0] }).map(\.text) == ["A", "Z", "B"])
+    }
+}
+
+@Test func deterministicOCRDuplicateWinnerPreservesHigherConfidence() {
+    let first = VisionTextBox(text: "Send", rect: VisionRect(x: 10, y: 10, w: 40, h: 16), confidence: 0.8)
+    let shifted = VisionTextBox(text: "Send", rect: VisionRect(x: 10.5, y: 10.5, w: 40, h: 16), confidence: 0.8, source: "tile")
+    let stronger = VisionTextBox(text: "Send", rect: shifted.rect, confidence: 0.95, source: "tile")
+    #expect(VisionTextLayer.dedupe([first, shifted]) == [first])
+    #expect(VisionTextLayer.dedupe([shifted, first]) == [first])
+    #expect(VisionTextLayer.dedupe([first, stronger]) == [stronger])
+    #expect(VisionTextLayer.dedupe([stronger, first]) == [stronger])
+    let exactTile = VisionTextBox(text: first.text, rect: first.rect, confidence: first.confidence, source: "tile")
+    #expect(VisionTextLayer.dedupe([first, exactTile]) == VisionTextLayer.dedupe([exactTile, first]))
+}
+
 @Test func conditionalTilingRunsTheExtraPassOnlyWhenItShould() throws {
     let image = Scene.mainScene().image
     let tiny = (0..<12).map { box("t", 10, Double($0) * 10, 20, 6) }
@@ -107,6 +191,36 @@ private func box(_ text: String, _ x: Double, _ y: Double, _ w: Double, _ h: Dou
 }
 
 // MARK: Element layer (b) — Y-BAND clustering
+
+@Test func connectedColorComponentsDistinguishRoundFromSquareWithoutChangingBounds() throws {
+    let background = SIMD3<Double>(1, 1, 1)
+    let foreground = SIMD3<Double>(1, 0, 0)
+    func shape(for occupied: Set<Int>) throws -> String {
+        let samples = (0..<144).map { occupied.contains($0) ? foreground : background }
+        let grid = VisionPixelGrid(
+            columns: 12,
+            rows: 12,
+            stepX: 10,
+            stepY: 10,
+            imageSize: VisionSize(width: 120, height: 120),
+            samples: samples
+        )
+        let result = VisionColorRegionLayer.candidates(grid: grid)
+        return try #require(result.candidates.first?.visualShape)
+    }
+    func indexes(_ rows: [[Int]]) -> Set<Int> {
+        Set(rows.enumerated().flatMap { offset, columns in
+            columns.map { (offset + 3) * 12 + $0 }
+        })
+    }
+
+    let square = indexes(Array(repeating: Array(3...7), count: 5))
+    let round = indexes([
+        Array(4...6), Array(3...7), Array(3...7), Array(3...7), Array(4...6),
+    ])
+    #expect(try shape(for: square) == "square")
+    #expect(try shape(for: round) == "round")
+}
 
 @Test func rowsAreFormedByYBandsNotByColumns() {
     // The close-out's exact failure: a right-hand VALUE COLUMN shares a left-x

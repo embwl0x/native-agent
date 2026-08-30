@@ -134,6 +134,44 @@ private struct CoordinatorMirrorProvider: ContextRequiredDocumentMirrorProviding
     func requiredDocumentMirrors() async throws -> [RequiredDocumentMirror] { [mirror] }
 }
 
+private actor CoordinatorRefreshingMirrorProvider:
+    ContextRequiredDocumentMirrorProviding,
+    ContextSourceRegistrationRefreshing
+{
+    let mirrors: [RequiredDocumentMirror]
+    private var registrations: [ContextSourceRegistration] = []
+    private var refreshes = 0
+    private var ownedRegistrationOwners: Set<String> = []
+    private var cancelRefresh = false
+
+    init(mirrors: [RequiredDocumentMirror]) {
+        self.mirrors = mirrors
+    }
+
+    func replaceRegistrations(_ registrations: [ContextSourceRegistration]) {
+        self.registrations = registrations
+        ownedRegistrationOwners.formUnion(registrations.map(\.descriptor.owner))
+    }
+
+    func requiredDocumentMirrors() async throws -> [RequiredDocumentMirror] { mirrors }
+
+    func refreshCount() -> Int { refreshes }
+
+    func setRefreshCancellation(_ cancelled: Bool) { cancelRefresh = cancelled }
+
+    func refreshContextSources(in registry: ContextSourceRegistry) async throws {
+        refreshes += 1
+        if cancelRefresh { throw CancellationError() }
+        let registrations = self.registrations
+        for root in Set(registrations.map(\.allowedRoot)) {
+            try await registry.addAllowedRoot(root)
+        }
+        for owner in ownedRegistrationOwners.sorted() {
+            try await registry.replaceOwned(owner: owner, with: registrations)
+        }
+    }
+}
+
 private struct CoordinatorProjectionProvider: ContextCompiledProjectionProvider {
     let sources: [ContextCompiledSource]
 
@@ -153,15 +191,18 @@ private enum CoordinatorInjectedProjectionError: Error {
 private actor CoordinatorControllableProjectionProvider: ContextCompiledProjectionProvider {
     nonisolated let projectionIdentifier: String
     nonisolated let invalidationNamespaces: Set<String>
+    nonisolated let invalidationSourceURL: URL?
     private var shouldFailNext = false
     private var calls = 0
 
     init(
         identifier: String = "coordinator.controllable",
-        namespaces: Set<String> = []
+        namespaces: Set<String> = [],
+        sourceURL: URL? = nil
     ) {
         projectionIdentifier = identifier
         invalidationNamespaces = namespaces
+        invalidationSourceURL = sourceURL
     }
 
     func failNextProjection() {
@@ -187,6 +228,68 @@ private actor CoordinatorControllableProjectionProvider: ContextCompiledProjecti
 
 @Suite(.serialized)
 struct ContextFlowCoordinatorTests {
+    // EVAL FENCE: core.context
+    // Ledger row: context.coordinator.refreshDiscoveredSources
+    @Test
+    func startRefreshesDiscoveredRegistrationsBeforePublishingTheGeneration() async throws {
+        let fixture = try await makeFixture(mode: .shadow, body: "# Core\nStable identity.")
+        defer { fixture.cleanup() }
+        let personaRoot = fixture.root.appendingPathComponent("persona", isDirectory: true)
+        let owner = "fixture.discovered"
+        let staleFile = personaRoot.appendingPathComponent("STALE.md")
+        let currentFile = personaRoot.appendingPathComponent("CURRENT.md")
+        try "# Discovered\nRetired registration.".write(
+            to: staleFile,
+            atomically: true,
+            encoding: .utf8
+        )
+        try "# Discovered\nRefreshed registration reaches the generation.".write(
+            to: currentFile,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        func registration(file: URL, locator: String) -> ContextSourceRegistration {
+            let descriptor = ContextSourceDescriptor(
+                id: ContextStableID.source(owner: owner, locator: locator),
+                owner: owner,
+                kind: .project,
+                canonicalLocator: file.path,
+                authority: .external,
+                privacy: .localPrivate,
+                permittedSurfaces: [.chat, .bridge],
+                injectionPolicy: .adaptive
+            )
+            return ContextSourceRegistration(
+                descriptor: descriptor,
+                fileURL: file,
+                allowedRoot: personaRoot
+            )
+        }
+
+        let stale = registration(file: staleFile, locator: "discovered/STALE.md")
+        let current = registration(file: currentFile, locator: "discovered/CURRENT.md")
+        try await fixture.registry.register(stale)
+        await fixture.refreshingMirrorProvider.replaceRegistrations([current])
+
+        #expect(await fixture.registry.registration(for: stale.descriptor.id) != nil)
+        #expect(await fixture.registry.registration(for: current.descriptor.id) == nil)
+
+        await fixture.coordinator.start()
+
+        #expect(await fixture.registry.registration(for: stale.descriptor.id) == nil)
+        #expect(await fixture.registry.registration(for: current.descriptor.id) == current)
+        let health = await fixture.coordinator.health()
+        #expect(health.registeredSourceCount == 2)
+        #expect(health.lastError == nil)
+
+        let lease = try await fixture.coordinator.acquireSnapshot()
+        defer { lease.release() }
+        let entries = lease.snapshot.hotEntries + lease.snapshot.warmEntries
+        #expect(entries.contains { $0.text.contains("Refreshed registration reaches") })
+        #expect(entries.allSatisfy { !$0.text.contains("Retired registration") })
+    }
+
     @Test
     func projectionInvalidationRebuildsOnlyTheOwningDerivedView() async throws {
         let memory = CoordinatorControllableProjectionProvider(
@@ -224,6 +327,204 @@ struct ContextFlowCoordinatorTests {
         ))
         #expect(await memory.invocationCount() == 2)
         #expect(await residentWork.invocationCount() == 2)
+    }
+
+    @Test
+    func memoryInvalidationIgnoresCandidateRootWithoutRefreshingLiveSources() async throws {
+        let livePath = URL(fileURLWithPath: "/fixture/live/memory/memory.sqlite")
+        let memory = CoordinatorControllableProjectionProvider(
+            identifier: "memory", namespaces: ["memory-v2"], sourceURL: livePath
+        )
+        let fixture = try await makeFixture(
+            mode: .shadow, body: "# Core\nOne continuous mind.", projectionProviders: [memory]
+        )
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+        let initialHealth = await fixture.coordinator.health()
+        #expect(await memory.invocationCount() == 1)
+        #expect(await fixture.refreshingMirrorProvider.refreshCount() == 1)
+
+        let center = DerivedStateInvalidationCenter(coalescingNanoseconds: 60_000_000_000)
+        await center.install(fixture.coordinator)
+        let candidate = DerivedSourceChange(
+            namespace: "memory-v2", stableID: "backed-up-row", operation: .removed,
+            canonicalLocator: "/fixture/live/memory/consolidation/candidates/run/memory/memory.sqlite",
+            reason: "candidate-only consolidation"
+        )
+        await center.publish(candidate)
+        await center.flush()
+        #expect(await memory.invocationCount() == 1)
+        #expect(await fixture.refreshingMirrorProvider.refreshCount() == 1)
+        #expect(await fixture.coordinator.health().lastReconciledAt == initialHealth.lastReconciledAt)
+
+        // A later candidate event with the same row ID cannot swallow the
+        // live event in the coalescer. The actual live owner still runs once.
+        await center.publish(DerivedSourceChange(
+            namespace: "memory-v2", stableID: "backed-up-row", operation: .changed,
+            canonicalLocator: "/fixture/live/memory/../memory/memory.sqlite", reason: "live write"
+        ))
+        await center.publish(candidate)
+        await center.flush()
+        #expect(await memory.invocationCount() == 2)
+        #expect(await fixture.refreshingMirrorProvider.refreshCount() == 1)
+
+        await fixture.coordinator.sourceDidChange(DerivedSourceChange(
+            namespace: "memory-v2", stableID: "legacy", operation: .reconcile,
+            reason: "legacy unlocated write"
+        ))
+        #expect(await memory.invocationCount() == 3)
+        await fixture.coordinator.sourceDidChange(DerivedSourceChange(
+            namespace: "persona-picker", stableID: "chat", operation: .reconcile,
+            reason: "ordinary full refresh"
+        ))
+        #expect(await memory.invocationCount() == 4)
+        #expect(await fixture.refreshingMirrorProvider.refreshCount() == 2)
+        await center.install(nil)
+    }
+
+    @Test
+    func fullDirectInvalidationRefreshesSourcesOnceAndRebuildsEveryProjection() async throws {
+        let memory = CoordinatorControllableProjectionProvider(
+            identifier: "memory",
+            namespaces: ["memory-v2"]
+        )
+        let residentWork = CoordinatorControllableProjectionProvider(
+            identifier: "resident-work",
+            namespaces: ["resident-work"]
+        )
+        let fixture = try await makeFixture(
+            mode: .shadow,
+            body: "# Core\nOne mind.",
+            projectionProviders: [memory, residentWork]
+        )
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+        #expect(await fixture.refreshingMirrorProvider.refreshCount() == 1)
+
+        await fixture.coordinator.sourceDidChange(DerivedSourceChange(
+            namespace: "persona-picker",
+            stableID: "chat",
+            operation: .reconcile,
+            reason: "picker changed"
+        ))
+        #expect(await fixture.refreshingMirrorProvider.refreshCount() == 2)
+        #expect(await memory.invocationCount() == 2)
+        #expect(await residentWork.invocationCount() == 2)
+
+        // An unlocatable source change also requests the complete registry.
+        await fixture.coordinator.sourceDidChange(DerivedSourceChange(
+            namespace: "persona",
+            stableID: "not-registered",
+            operation: .changed,
+            reason: "unlocatable change"
+        ))
+        #expect(await fixture.refreshingMirrorProvider.refreshCount() == 3)
+        #expect(await memory.invocationCount() == 3)
+        #expect(await residentWork.invocationCount() == 3)
+        #expect(await fixture.coordinator.health().lastError == nil)
+    }
+
+    @Test
+    func retiredDiscoveredSourcesLeaveTheGenerationWithoutRemovingOtherOwners() async throws {
+        let projected = compiledSource(
+            id: "projected", owner: "fixture.projected", locator: "projected/item",
+            kind: .memory, body: "Projected memory remains.",
+            authority: .external, policy: .adaptive
+        )
+        let fixture = try await makeFixture(
+            mode: .shadow, body: "# Core\nStable identity.", projectedSources: [projected]
+        )
+        defer { fixture.cleanup() }
+        let root = fixture.sourceFile.deletingLastPathComponent()
+        let file = root.appendingPathComponent("RETIRED.md")
+        try "# Retired\nThis source is no longer admitted.".write(
+            to: file, atomically: true, encoding: .utf8
+        )
+        let owner = "fixture.discovered"
+        let sourceID = ContextStableID.source(owner: owner, locator: "retired")
+        let registration = ContextSourceRegistration(
+            descriptor: ContextSourceDescriptor(
+                id: sourceID, owner: owner, kind: .project, canonicalLocator: file.path,
+                authority: .external, privacy: .localPrivate,
+                permittedSurfaces: [.chat], injectionPolicy: .adaptive
+            ),
+            fileURL: file, allowedRoot: root
+        )
+        await fixture.refreshingMirrorProvider.replaceRegistrations([registration])
+        await fixture.coordinator.start()
+        let oldLease = try await fixture.coordinator.acquireSnapshot()
+        defer { oldLease.release() }
+        #expect(try await fixture.store.loadActiveGeneration()?.sources.contains {
+            $0.descriptor.id == sourceID
+        } == true)
+
+        await fixture.refreshingMirrorProvider.replaceRegistrations([])
+        await fixture.coordinator.reconcileAfterWake()
+
+        let active = try #require(try await fixture.store.loadActiveGeneration())
+        #expect(!active.sources.contains { $0.descriptor.id == sourceID })
+        #expect(active.sources.contains { $0.descriptor.id == fixture.sourceID })
+        #expect(active.sources.contains { $0.descriptor.id == projected.descriptor.id })
+        // Retirement affects derived availability, not canonical file bytes or
+        // an already-frozen generation lease.
+        #expect(FileManager.default.fileExists(atPath: file.path))
+        #expect((oldLease.snapshot.hotEntries + oldLease.snapshot.warmEntries).contains {
+            $0.text.contains("no longer admitted")
+        })
+        #expect(await fixture.coordinator.health().lastError == nil)
+    }
+
+    @Test
+    func emptyAuthoritativeInventoryRetiresPersistedSourcesAfterRestart() async throws {
+        let fixture = try await makeFixture(mode: .shadow, body: "# Core\nRetired persona source.")
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+        await fixture.coordinator.stop()
+        #expect(try await fixture.store.loadActiveGeneration()?.sources.count == 1)
+
+        let registry = try ContextSourceRegistry()
+        try await registry.replaceOwned(owner: "persona", with: [])
+        let restarted = ContextFlowCoordinator(
+            mode: .shadow, store: fixture.store, arena: try ContextArena(budget: .mib32),
+            registry: registry,
+            compiler: ContextMarkdownCompiler(embeddingProvider: CoordinatorEmbeddingProvider()),
+            mirrorProvider: CoordinatorMirrorProvider(mirror: fixture.mirror)
+        )
+        await restarted.start()
+        let active = try #require(try await fixture.store.loadActiveGeneration())
+        #expect(active.sources.isEmpty)
+        #expect(active.atoms.isEmpty)
+        #expect(await restarted.health().lastError == nil)
+        await restarted.stop()
+    }
+
+    @Test
+    func cancelledDiscoveryDoesNotReportCompletionAndRemainsRetryable() async throws {
+        let fixture = try await makeFixture(mode: .shadow, body: "# Core\nInitial source.")
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+        let initialGeneration = await fixture.coordinator.health().activeArenaGenerationID
+        try "# Core\nRepaired source.".write(
+            to: fixture.sourceFile, atomically: true, encoding: .utf8
+        )
+        let changes = [DerivedSourceChange(
+            namespace: "persona-picker", stableID: "chat", operation: .reconcile,
+            reason: "picker changed"
+        )]
+        // A collaborator can throw CancellationError even when this parent
+        // task has not been canceled. Health must stay honest, but cannot be
+        // used as evidence that this request completed.
+        await fixture.refreshingMirrorProvider.setRefreshCancellation(true)
+        #expect(!Task.isCancelled)
+        #expect(await fixture.coordinator.reconcileSourceChanges(changes) == false)
+        #expect(await fixture.coordinator.health().lastError == nil)
+        #expect(await fixture.coordinator.health().activeArenaGenerationID == initialGeneration)
+
+        await fixture.refreshingMirrorProvider.setRefreshCancellation(false)
+        #expect(await fixture.coordinator.reconcileSourceChanges(changes) == true)
+        #expect(await fixture.coordinator.health().activeArenaGenerationID != initialGeneration)
+        let active = try #require(try await fixture.store.loadActiveGeneration())
+        #expect(active.atoms.contains { $0.draft.body.contains("Repaired source") })
     }
 
     @Test
@@ -652,6 +953,311 @@ struct ContextFlowCoordinatorTests {
     }
 
     @Test
+    func generationDerivedSetsReuseOneComputationAndIsolatePrivacyKeys() async throws {
+        let correction = compiledSource(
+            id: "cached-correction",
+            owner: "nativeagent.memory-v2",
+            locator: "memory-v2/records/cached-correction",
+            kind: .correction,
+            body: "A cached eligibility walk must retain this explicit correction.",
+            authority: .explicitCorrection,
+            policy: .adaptive
+        )
+        let fixture = try await makeFixture(
+            mode: .active,
+            body: "# Core\nStable identity.",
+            projectedSources: [correction]
+        )
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+        let correctionID = try #require(correction.atoms.first?.id)
+        let privateRequest = ContextTurnRequest(
+            surface: .chat,
+            origin: .localAuthenticated,
+            userMessage: "Retain the correction.",
+            personaIDHint: "Agent",
+            allowedPrivacy: [.localPrivate]
+        )
+
+        let first = try await fixture.coordinator.prepareFrozenTurn(privateRequest)
+        #expect(first.need.mandatoryAtomIDs == [correctionID])
+        let afterFirst = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(afterFirst.computationCount == 1)
+        #expect(afterFirst.hitCount == 0)
+        #expect(afterFirst.entryCount == 1)
+
+        let second = try await fixture.coordinator.prepareFrozenTurn(privateRequest)
+        #expect(second.packet.receipt.selectedAtomIDs == first.packet.receipt.selectedAtomIDs)
+        let afterHit = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(afterHit.computationCount == 1)
+        #expect(afterHit.hitCount == 1)
+        #expect(afterHit.entryCount == 1)
+
+        let publicRequest = ContextTurnRequest(
+            surface: .chat,
+            origin: .localAuthenticated,
+            userMessage: "Retain only public context.",
+            personaIDHint: "Agent",
+            allowedPrivacy: [.publicSafe]
+        )
+        let publicOnly = try await fixture.coordinator.prepareFrozenTurn(publicRequest)
+        #expect(!publicOnly.need.authorization.allowedSourceIDs.contains(correction.descriptor.id))
+        #expect(!publicOnly.need.mandatoryAtomIDs.contains(correctionID))
+        _ = try await fixture.coordinator.prepareFrozenTurn(publicRequest)
+        let isolated = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(isolated.computationCount == 2)
+        #expect(isolated.hitCount == 2)
+        #expect(isolated.entryCount == 2)
+        print(
+            "[turn-speed-a4] four preparations performed "
+                + "\(isolated.computationCount) generation-derived computations "
+                + "and \(isolated.hitCount) cache hits"
+        )
+
+        await fixture.coordinator.stop()
+        let stopped = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(stopped.entryCount == 0)
+        #expect(stopped.invalidationCount == 1)
+    }
+
+    @Test
+    func generationDerivedSetsIsolateSurfaceEligibilityAndPrecoverage() async throws {
+        let chatSource = compiledSource(
+            id: "surface-chat",
+            owner: "nativeagent.persona",
+            locator: "persona/Agent/surfaces/chat.md",
+            kind: .identity,
+            body: "Chat-only guidance must be precovered only on chat.",
+            authority: .identity,
+            policy: .always,
+            permittedSurfaces: [.chat]
+        )
+        let bridgeSource = compiledSource(
+            id: "surface-bridge",
+            owner: "nativeagent.persona",
+            locator: "persona/Agent/surfaces/bridge.md",
+            kind: .identity,
+            body: "Bridge-only guidance must be precovered only on bridge.",
+            authority: .identity,
+            policy: .always,
+            permittedSurfaces: [.bridge]
+        )
+        let fixture = try await makeFixture(
+            mode: .active,
+            body: "# Core\nStable identity.",
+            projectedSources: [chatSource, bridgeSource],
+            mirrorSurfaceVariants: [
+                ContextSurfaceVariant(rawValue: "chat"),
+                ContextSurfaceVariant(rawValue: "bridge"),
+            ]
+        )
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+
+        func request(_ surface: ContextSurface) -> ContextTurnRequest {
+            ContextTurnRequest(
+                surface: surface,
+                origin: .localAuthenticated,
+                userMessage: "Select this surface's guidance.",
+                personaIDHint: "Agent",
+                allowedPrivacy: [.localPrivate]
+            )
+        }
+
+        let chat = try await fixture.coordinator.prepareFrozenTurn(request(.chat))
+        #expect(chat.need.authorization.allowedSourceIDs.contains(chatSource.descriptor.id))
+        #expect(!chat.need.authorization.allowedSourceIDs.contains(bridgeSource.descriptor.id))
+        #expect(chat.need.precoveredSourceIDs.contains(chatSource.descriptor.id))
+        #expect(!chat.need.precoveredSourceIDs.contains(bridgeSource.descriptor.id))
+
+        let bridge = try await fixture.coordinator.prepareFrozenTurn(request(.bridge))
+        #expect(bridge.need.authorization.allowedSourceIDs.contains(bridgeSource.descriptor.id))
+        #expect(!bridge.need.authorization.allowedSourceIDs.contains(chatSource.descriptor.id))
+        #expect(bridge.need.precoveredSourceIDs.contains(bridgeSource.descriptor.id))
+        #expect(!bridge.need.precoveredSourceIDs.contains(chatSource.descriptor.id))
+
+        _ = try await fixture.coordinator.prepareFrozenTurn(request(.chat))
+        _ = try await fixture.coordinator.prepareFrozenTurn(request(.bridge))
+        let metrics = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(metrics.computationCount == 2)
+        #expect(metrics.hitCount == 2)
+        #expect(metrics.entryCount == 2)
+    }
+
+    @Test
+    func generationDerivedSetsIsolatePersonaSourcesAndScopeDigests() async throws {
+        let agentSource = compiledSource(
+            id: "persona-agent",
+            owner: "nativeagent.persona",
+            locator: "persona/Agent/GROWTH.md",
+            kind: .relationship,
+            body: "Agent-specific growth context.",
+            authority: .identity,
+            policy: .adaptive
+        )
+        let secondarySource = compiledSource(
+            id: "persona-secondary",
+            owner: "nativeagent.persona",
+            locator: "persona/Secondary/GROWTH.md",
+            kind: .relationship,
+            body: "Secondary-specific growth context.",
+            authority: .identity,
+            policy: .adaptive
+        )
+        let agentScopeDigest = ContextStableID.digest(parts: ["agent"])
+        let agentScopedMemory = compiledSource(
+            id: "memory-agent-scope",
+            owner: "nativeagent.memory-v2",
+            locator: "memory-v2/personas/\(agentScopeDigest)/record",
+            kind: .memory,
+            body: "A digest-scoped fixture that must trip only for Agent.",
+            authority: .canonical,
+            policy: .adaptive
+        )
+        let fixture = try await makeFixture(
+            mode: .active,
+            body: "# Core\nStable identity.",
+            projectedSources: [agentSource, secondarySource, agentScopedMemory],
+            additionalMirrorPersonaIDs: [ContextPersonaID(rawValue: "Secondary")]
+        )
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+
+        func request(_ persona: String) -> ContextTurnRequest {
+            ContextTurnRequest(
+                surface: .chat,
+                origin: .localAuthenticated,
+                userMessage: "Select this persona's source set.",
+                personaIDHint: persona,
+                allowedPrivacy: [.localPrivate]
+            )
+        }
+
+        let secondary = try await fixture.coordinator.prepareTurn(request("Secondary"))
+        #expect(secondary.need.authorization.allowedSourceIDs.contains(secondarySource.descriptor.id))
+        #expect(!secondary.need.authorization.allowedSourceIDs.contains(agentSource.descriptor.id))
+        #expect(fixture.diagnostics.memoryVocabularyDrift.isEmpty)
+
+        let agent = try await fixture.coordinator.prepareTurn(request("Agent"))
+        #expect(agent.need.authorization.allowedSourceIDs.contains(agentSource.descriptor.id))
+        #expect(!agent.need.authorization.allowedSourceIDs.contains(secondarySource.descriptor.id))
+        let drift = fixture.diagnostics.memoryVocabularyDrift
+        #expect(drift.count == 1)
+        let driftLine = try #require(drift.first)
+        #expect(driftLine.contains(agentScopeDigest))
+
+        _ = try await fixture.coordinator.prepareFrozenTurn(request("Secondary"))
+        _ = try await fixture.coordinator.prepareFrozenTurn(request("Agent"))
+        let metrics = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(metrics.computationCount == 2)
+        #expect(metrics.hitCount == 2)
+        #expect(metrics.entryCount == 2)
+    }
+
+    @Test
+    func generationDerivedCacheKeySeparatesEveryBehaviorDimension() {
+        typealias Key = ContextFlowCoordinator.GenerationDerivedCacheKey
+        func key(
+            generationID: Int64 = 7,
+            generationFingerprint: String = "generation-a",
+            surface: String = "chat",
+            personaID: String = "Agent",
+            mirrorFingerprint: String = "mirror-a",
+            kernelPersonaID: String = "Agent",
+            kernelSurface: String = "chat",
+            kernelFingerprint: String = "kernel-a",
+            includedDocuments: [String] = ["SOUL.md", "VOICE.md"],
+            privacy: [String] = ["local_private"]
+        ) -> Key {
+            Key(
+                generationID: generationID,
+                generationSourceFingerprint: generationFingerprint,
+                surface: surface,
+                personaID: personaID,
+                mirrorSourceFingerprint: mirrorFingerprint,
+                kernelPersonaID: kernelPersonaID,
+                kernelSurface: kernelSurface,
+                kernelSourceFingerprint: kernelFingerprint,
+                stableIncludedDocumentIDs: includedDocuments,
+                allowedPrivacy: privacy
+            )
+        }
+        let baseline = key()
+        let variants = [
+            key(generationID: 8),
+            key(generationFingerprint: "generation-b"),
+            key(surface: "bridge"),
+            key(personaID: "Secondary"),
+            key(mirrorFingerprint: "mirror-b"),
+            key(kernelPersonaID: "Secondary"),
+            key(kernelSurface: "bridge"),
+            key(kernelFingerprint: "kernel-b"),
+            key(includedDocuments: ["SOUL.md"]),
+            key(privacy: ["public_safe"]),
+        ]
+
+        #expect(Set([baseline] + variants).count == variants.count + 1)
+    }
+
+    @Test
+    func generationChangeClearsDerivedSetsBeforeTheNextTurn() async throws {
+        let fixture = try await makeFixture(mode: .active, body: "# Core\nStable identity.")
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+        let request = ContextTurnRequest(
+            surface: .chat,
+            origin: .localAuthenticated,
+            userMessage: "Read the current generation.",
+            personaIDHint: "Agent",
+            allowedPrivacy: [.localPrivate]
+        )
+
+        let first = try await fixture.coordinator.prepareFrozenTurn(request)
+        #expect(first.generation.generation.id == 1)
+        #expect(first.need.authorization.allowedSourceIDs.contains(fixture.sourceID))
+        let primed = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(primed.computationCount == 1)
+        #expect(primed.entryCount == 1)
+
+        let bridgeOnlyDescriptor = ContextSourceDescriptor(
+            id: fixture.sourceID,
+            owner: "persona",
+            kind: .persona,
+            canonicalLocator: fixture.sourceFile.path,
+            authority: .identity,
+            privacy: .localPrivate,
+            permittedSurfaces: [.bridge],
+            injectionPolicy: .always
+        )
+        try await fixture.registry.replace(ContextSourceRegistration(
+            descriptor: bridgeOnlyDescriptor,
+            fileURL: fixture.sourceFile,
+            allowedRoot: fixture.sourceFile.deletingLastPathComponent(),
+            requiredPersonaDocument: .soul,
+            personaID: ContextPersonaID(rawValue: "Agent")
+        ))
+        await fixture.coordinator.sourceDidChange(DerivedSourceChange(
+            namespace: "persona",
+            stableID: fixture.sourceID.rawValue,
+            operation: .changed,
+            canonicalLocator: fixture.sourceFile.path,
+            reason: "cache invalidation negative control"
+        ))
+
+        let afterPublication = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(afterPublication.invalidationCount == 1)
+        #expect(afterPublication.entryCount == 0)
+        let second = try await fixture.coordinator.prepareFrozenTurn(request)
+        #expect(second.generation.generation.id == 2)
+        #expect(!second.need.authorization.allowedSourceIDs.contains(fixture.sourceID))
+        let recomputed = await fixture.coordinator.generationDerivedCacheMetrics()
+        #expect(recomputed.computationCount == 2)
+        #expect(recomputed.hitCount == 0)
+        #expect(recomputed.invalidationCount == 1)
+        #expect(recomputed.entryCount == 1)
+    }
+
+    @Test
     func largeAdaptiveRelationshipDoesNotDisplaceProtectedCorrection() async throws {
         let relationship = compiledSource(
             id: "relationship",
@@ -892,7 +1498,7 @@ struct ContextFlowCoordinatorTests {
     /// NativeMemoryContextProjectionTests.personaScopeUsesRecordPersonaVocabularyOnly.
     @Test
     func slotIDScopedMemorySourceTripsTheVocabularyDriftAlarm() async throws {
-        let slotScope = ContextStableID.digest(parts: ["agent"])
+        let slotScope = ContextStableID.digest(parts: ["secondary"])
         let agentScope = ContextStableID.digest(parts: ["nativeagent"])
         // Production never emits this shape — the fixture hand-mints it.
         let slotScopedMemory = compiledSource(
@@ -920,7 +1526,7 @@ struct ContextFlowCoordinatorTests {
             mode: .active,
             body: "# Core\nStable identity.",
             projectedSources: [slotScopedMemory],
-            mirrorPersonaID: ContextPersonaID(rawValue: "Agent")
+            mirrorPersonaID: ContextPersonaID(rawValue: "Secondary")
         )
         defer { drifted.cleanup() }
         await drifted.coordinator.start()
@@ -928,7 +1534,7 @@ struct ContextFlowCoordinatorTests {
             surface: .chat,
             origin: .localAuthenticated,
             userMessage: "memory",
-            personaIDHint: "Agent"
+            personaIDHint: "Secondary"
         ))
         #expect(admitted.need.authorization.allowedSourceIDs.contains(slotScopedMemory.descriptor.id))
         #expect(drifted.diagnostics.memoryVocabularyDrift.count == 1)
@@ -939,7 +1545,7 @@ struct ContextFlowCoordinatorTests {
             mode: .active,
             body: "# Core\nStable identity.",
             projectedSources: [liveShapedMemory],
-            mirrorPersonaID: ContextPersonaID(rawValue: "Agent")
+            mirrorPersonaID: ContextPersonaID(rawValue: "Secondary")
         )
         defer { live.cleanup() }
         await live.coordinator.start()
@@ -947,7 +1553,7 @@ struct ContextFlowCoordinatorTests {
             surface: .chat,
             origin: .localAuthenticated,
             userMessage: "memory",
-            personaIDHint: "Agent"
+            personaIDHint: "Secondary"
         ))
         #expect(healthy.need.authorization.allowedSourceIDs.contains(liveShapedMemory.descriptor.id))
         #expect(live.diagnostics.memoryVocabularyDrift.isEmpty)
@@ -958,7 +1564,7 @@ struct ContextFlowCoordinatorTests {
     /// never one line per source or per atom.
     @Test
     func vocabularyDriftLogsOncePerTurnNamingSlotAndPrefix() async throws {
-        let slotScope = ContextStableID.digest(parts: ["agent"])
+        let slotScope = ContextStableID.digest(parts: ["secondary"])
         let agentScope = ContextStableID.digest(parts: ["nativeagent"])
         let sources = [
             compiledSource(
@@ -995,7 +1601,7 @@ struct ContextFlowCoordinatorTests {
             mode: .active,
             body: "# Core\nStable identity.",
             projectedSources: sources,
-            mirrorPersonaID: ContextPersonaID(rawValue: "Agent")
+            mirrorPersonaID: ContextPersonaID(rawValue: "Secondary")
         )
         defer { fixture.cleanup() }
         await fixture.coordinator.start()
@@ -1004,14 +1610,14 @@ struct ContextFlowCoordinatorTests {
             surface: .chat,
             origin: .localAuthenticated,
             userMessage: "memory",
-            personaIDHint: "Agent"
+            personaIDHint: "Secondary"
         ))
 
         let logged = fixture.diagnostics.memoryVocabularyDrift
         #expect(logged.count == 1)
         let line = try #require(logged.first)
         #expect(line.contains("ERROR"))
-        #expect(line.contains("\"Agent\""))
+        #expect(line.contains("\"Secondary\""))
         #expect(line.contains("memory-v2/personas/\(slotScope)/"))
         // 2 of the 3 memory sources drifted — the agent-name one is not drift.
         #expect(line.contains("2 live memory source(s)"))
@@ -1021,7 +1627,7 @@ struct ContextFlowCoordinatorTests {
             surface: .chat,
             origin: .localAuthenticated,
             userMessage: "memory again",
-            personaIDHint: "Agent"
+            personaIDHint: "Secondary"
         ))
         #expect(fixture.diagnostics.memoryVocabularyDrift.count == 2)
     }
@@ -1071,7 +1677,7 @@ struct ContextFlowCoordinatorTests {
             mode: .active,
             body: "# Core\nStable identity.",
             projectedSources: [agentMemory, sharedMemory],
-            mirrorPersonaID: ContextPersonaID(rawValue: "Agent")
+            mirrorPersonaID: ContextPersonaID(rawValue: "Secondary")
         )
         defer { custom.cleanup() }
         await custom.coordinator.start()
@@ -1079,7 +1685,7 @@ struct ContextFlowCoordinatorTests {
             surface: .chat,
             origin: .localAuthenticated,
             userMessage: "memory",
-            personaIDHint: "Agent"
+            personaIDHint: "Secondary"
         ))
         #expect(custom.diagnostics.memoryVocabularyDrift.isEmpty)
     }
@@ -1097,7 +1703,7 @@ struct ContextFlowCoordinatorTests {
     @Test
     func residentPersonaAdmitsAgentNameScopedMemorySources() async throws {
         let agentScope = ContextStableID.digest(parts: ["nativeagent"])
-        let customScope = ContextStableID.digest(parts: ["agent"])
+        let customScope = ContextStableID.digest(parts: ["secondary"])
         let agentMemory = compiledSource(
             id: "agent-memory",
             owner: "nativeagent.memory-v2",
@@ -1159,7 +1765,7 @@ struct ContextFlowCoordinatorTests {
             mode: .active,
             body: "# Core\nStable identity.",
             projectedSources: [agentMemory],
-            mirrorPersonaID: ContextPersonaID(rawValue: "Agent")
+            mirrorPersonaID: ContextPersonaID(rawValue: "Secondary")
         )
         defer { fixture.cleanup() }
         await fixture.coordinator.start()
@@ -1168,7 +1774,7 @@ struct ContextFlowCoordinatorTests {
             surface: .chat,
             origin: .localAuthenticated,
             userMessage: "what does User drink after lunch?",
-            personaIDHint: "Agent"
+            personaIDHint: "Secondary"
         ))
 
         #expect(prepared.need.authorization.allowedSourceIDs.contains(agentMemory.descriptor.id))
@@ -2633,6 +3239,7 @@ struct ContextFlowCoordinatorTests {
         let arena: ContextArena
         let registry: ContextSourceRegistry
         let mirror: RequiredDocumentMirror
+        let refreshingMirrorProvider: CoordinatorRefreshingMirrorProvider
         let coordinator: ContextFlowCoordinator
         let diagnostics: CoordinatorDiagnosticLog
 
@@ -2649,7 +3256,9 @@ struct ContextFlowCoordinatorTests {
         projectedSources: [ContextCompiledSource] = [],
         compiler: (any ContextMarkdownCompiling)? = nil,
         projectionProviders: [any ContextCompiledProjectionProvider]? = nil,
-        mirrorPersonaID: ContextPersonaID = ContextPersonaID(rawValue: "Agent")
+        mirrorPersonaID: ContextPersonaID = ContextPersonaID(rawValue: "Agent"),
+        additionalMirrorPersonaIDs: [ContextPersonaID] = [],
+        mirrorSurfaceVariants: [ContextSurfaceVariant] = [ContextSurfaceVariant(rawValue: "chat")]
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ContextFlowCoordinatorTests-\(UUID().uuidString)", isDirectory: true)
@@ -2704,22 +3313,28 @@ struct ContextFlowCoordinatorTests {
             tokenCount: 8
         )
         let mirrorFingerprint = "mirror-fingerprint"
-        let kernel = try StablePromptKernel(
-            key: StablePromptKernelKey(
-                personaID: mirrorPersonaID,
-                surfaceVariant: ContextSurfaceVariant(rawValue: "chat"),
-                sourceFingerprint: mirrorFingerprint
-            ),
-            renderedPrompt: "# SOUL\n\(body)",
-            includedDocumentIDs: [requiredDocument.id],
-            tokenCount: 8
-        )
-        let mirror = try RequiredDocumentMirror(
-            personaID: mirrorPersonaID,
-            sourceFingerprint: mirrorFingerprint,
-            documents: [requiredDocument],
-            kernels: [kernel]
-        )
+        let mirrorPersonaIDs = [mirrorPersonaID] + additionalMirrorPersonaIDs
+        let mirrors = try mirrorPersonaIDs.map { personaID in
+            let kernels = try mirrorSurfaceVariants.map { surface in
+                try StablePromptKernel(
+                    key: StablePromptKernelKey(
+                        personaID: personaID,
+                        surfaceVariant: surface,
+                        sourceFingerprint: mirrorFingerprint
+                    ),
+                    renderedPrompt: "# SOUL\n\(body)",
+                    includedDocumentIDs: [requiredDocument.id],
+                    tokenCount: 8
+                )
+            }
+            return try RequiredDocumentMirror(
+                personaID: personaID,
+                sourceFingerprint: mirrorFingerprint,
+                documents: [requiredDocument],
+                kernels: kernels
+            )
+        }
+        let mirror = mirrors[0]
         let arena = try ContextArena(budget: .mib32)
         let store = try ContextSQLiteStore(dataRoot: root)
         let sourceCompiler: any ContextMarkdownCompiling = compiler
@@ -2727,13 +3342,14 @@ struct ContextFlowCoordinatorTests {
         let sourceProjectionProviders: [any ContextCompiledProjectionProvider] = projectionProviders
             ?? [CoordinatorProjectionProvider(sources: projectedSources)]
         let diagnostics = CoordinatorDiagnosticLog()
+        let refreshingMirrorProvider = CoordinatorRefreshingMirrorProvider(mirrors: mirrors)
         let coordinator = ContextFlowCoordinator(
             mode: mode,
             store: store,
             arena: arena,
             registry: registry,
             compiler: sourceCompiler,
-            mirrorProvider: CoordinatorMirrorProvider(mirror: mirror),
+            mirrorProvider: refreshingMirrorProvider,
             compiledProjectionProviders: sourceProjectionProviders,
             diagnostics: { [diagnostics] message in diagnostics.record(message) }
         )
@@ -2745,6 +3361,7 @@ struct ContextFlowCoordinatorTests {
             arena: arena,
             registry: registry,
             mirror: mirror,
+            refreshingMirrorProvider: refreshingMirrorProvider,
             coordinator: coordinator,
             diagnostics: diagnostics
         )
@@ -2757,7 +3374,8 @@ struct ContextFlowCoordinatorTests {
         kind: ContextAtomKind,
         body: String,
         authority: ContextAuthority,
-        policy: ContextInjectionPolicy
+        policy: ContextInjectionPolicy,
+        permittedSurfaces: Set<ContextSurface> = [.chat, .bridge]
     ) -> ContextCompiledSource {
         let sourceID = ContextStableID.source(owner: owner, locator: locator)
         let sourceHash = ContextStableID.digest(parts: [body])
@@ -2768,7 +3386,7 @@ struct ContextFlowCoordinatorTests {
             canonicalLocator: locator,
             authority: authority,
             privacy: .localPrivate,
-            permittedSurfaces: [.chat, .bridge],
+            permittedSurfaces: permittedSurfaces,
             injectionPolicy: policy
         )
         let atom = ContextAtomDraft(
@@ -2788,7 +3406,7 @@ struct ContextFlowCoordinatorTests {
             confidence: 1,
             freshness: ContextFreshness(updatedAt: Date(timeIntervalSince1970: 1_000)),
             privacy: .localPrivate,
-            permittedSurfaces: [.chat, .bridge],
+            permittedSurfaces: permittedSurfaces,
             injectionPolicy: policy,
             contentRole: kind == .correction ? .memory : .fact
         )

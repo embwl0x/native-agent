@@ -378,6 +378,20 @@ public actor SwiftNativeSecurityCenter {
             reasons.append("system permission changes require explicit approval")
         }
 
+        // Full Mac is authority selected by the trusted operator; it is not an
+        // authentication mechanism for an inbound sender. An origin that the
+        // canonical surface owner did not admit must never inherit that local
+        // authority, even when the requested tool is classified below high
+        // risk. Authenticated/allowlisted remote origins remain fully open
+        // inside Full Mac because their assessment is trusted.
+        if decision != .block,
+           fullMac,
+           originAssessment.isRemote,
+           !originAssessment.trusted {
+            decision = .block
+            reasons.append("untrusted remote origin cannot use Full Mac authority")
+        }
+
         if decision != .block,
            profile.risk >= .high,
            originAssessment.isRemote,
@@ -619,13 +633,98 @@ public actor SwiftNativeSecurityCenter {
         // M6 (2026-07-09): this ledger appended forever. Rotate through the
         // shared capped-append so the newest 20k receipts survive and the file
         // cannot grow without bound.
-        try await appendJSONLCapped(
-            envelope.toJSONValue(),
-            to: auditReceiptsPath,
-            using: persistence,
-            maxLines: JSONLLineCaps.securityAudit,
-            logLabel: "SecurityCenter.audit",
-            trimWhenBytesExceed: JSONLLineCaps.securityAuditTrimTriggerBytes
+        //
+        // F5 (2026-08-28): the archive check and the capped append run under
+        // ONE acquisition of the audit-file lock so a concurrent trim cannot
+        // interleave between "worth archiving" and the copy.
+        let path = auditReceiptsPath
+        let event = envelope.toJSONValue()
+        let now = clock()
+        let persistence = self.persistence
+        try await persistence.withFileLock(path) {
+            try await appendJSONLCapped(
+                event,
+                to: path,
+                using: persistence,
+                maxLines: JSONLLineCaps.securityAudit,
+                logLabel: "SecurityCenter.audit",
+                takeLock: false,
+                trimWhenBytesExceed: JSONLLineCaps.securityAuditTrimTriggerBytes,
+                beforePotentialLineCap: {
+                    try Self.archivePreTrimAuditIfNeeded(path: path, now: now)
+                }
+            )
+        }
+    }
+
+    /// F5 (2026-08-28): one-time archive before the FIRST trim that could
+    /// drop audit rows. The 32→16 MiB trigger change makes the byte-triggered
+    /// trim actually fire on a ledger that historically grew unbounded
+    /// (23 MiB / 33k rows on the live root); the newest-20k trim would
+    /// silently drop the oldest ~13k receipts. Copy the pre-trim file to a
+    /// sibling `audit-archive-<date>.jsonl` first — once, ever: any existing
+    /// `audit-archive-*.jsonl` means the deliberate one-shot already happened.
+    ///
+    /// Review fix (gpt-5.5, HIGH): gating on bytes alone left a side door —
+    /// stride appends (PersistenceCore F2) enforce the ROW cap with no byte
+    /// gate, so a compact over-cap file UNDER the byte trigger gets rows
+    /// dropped with no archive taken. The gate is therefore
+    /// `bytes >= trigger OR rows > cap` — the union of both conditions under
+    /// which any trim path can drop rows. The row count is one bounded read
+    /// (< trigger bytes by construction) and only happens while no archive
+    /// exists; the exists-check runs first so the read stops forever after
+    /// the one-shot.
+    ///
+    /// The archive is a different filename in the same `security/` dir, so
+    /// the trim (which only rewrites `audit.jsonl`) never touches it. A
+    /// failed copy throws rather than letting the trim proceed and lose
+    /// history silently. Caller holds the audit-file lock.
+    private static func archivePreTrimAuditIfNeeded(path: URL, now: Date) throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path.path) else { return }
+        let dir = path.deletingLastPathComponent()
+        let completionMarker = dir.appendingPathComponent(
+            ".audit-pretrim-archive-complete-v1"
+        )
+        guard !fm.fileExists(atPath: completionMarker.path) else { return }
+        let existing = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        if existing.contains(where: {
+            $0.hasPrefix("audit-archive-") && $0.hasSuffix(".jsonl")
+        }) {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                Data("completed\n".utf8),
+                to: completionMarker
+            )
+            return
+        }
+        let attributes = try? fm.attributesOfItem(atPath: path.path)
+        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        var shouldArchive = size >= JSONLLineCaps.securityAuditTrimTriggerBytes
+        if !shouldArchive {
+            // An unreadable file must abort the trim like a failed copy does —
+            // returning here would let the row-cap trim drop history with no
+            // archive (2026-08-28 audit).
+            let data = try Data(contentsOf: path)
+            var rows = 0
+            data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+                for byte in buffer where byte == 0x0A { rows += 1 }
+            }
+            // This runs before the pending append. Exactly `cap` existing rows
+            // become `cap + 1`, so equality is already a trim boundary.
+            shouldArchive = rows >= JSONLLineCaps.securityAudit
+        }
+        guard shouldArchive else { return }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        let destination = dir.appendingPathComponent(
+            "audit-archive-\(formatter.string(from: now)).jsonl"
+        )
+        try fm.copyItem(at: path, to: destination)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(
+            Data("completed\n".utf8),
+            to: completionMarker
         )
     }
 

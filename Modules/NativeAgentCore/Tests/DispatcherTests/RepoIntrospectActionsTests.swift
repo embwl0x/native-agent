@@ -205,6 +205,50 @@ private func makeCleanGitRepo(
 
 // MARK: - grep
 
+@Test(arguments: ["rg", "grep"], ["--help", "--files", "-n", "--ordinary-flag", "-e", "--(help|files)", "not-present"])
+func grepDispatchTreatsLeadingDashPatternsAsRegexData(engine: String, pattern: String) async throws {
+    let executable = try #require(which(engine))
+    let sb = makeRepoSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("options.txt")
+    let content = "use --help\nuse --files\nuse -n\nuse --ordinary-flag\nuse -e\n"
+    try content.write(to: file, atomically: true, encoding: .utf8)
+    let http = _FakeDispatcherHTTP()
+    let dispatcher = SwiftNativeDispatcher(
+        http: http,
+        ledger: DispatchLedger(ledgerPath: sb.appendingPathComponent("traces/events.jsonl")),
+        localActions: .fileSystemDefault
+    )
+    let context = DispatchContext(
+        repoRoot: sb.path, cwd: sb.path, surface: "chat", sessionId: "grep-options",
+        persona: "", activeProvider: "", extra: [:]
+    )
+    let result = try await FileSystemActions.$grepExecutableResolver.withValue({ name in
+        name == engine ? executable : nil
+    }) {
+        try await dispatcher.dispatch(
+            tool: "grep", input: ["pattern": .string(pattern), "path": .string(file.path)],
+            ctx: context, dryRun: false
+        )
+    }
+    #expect(result.ok && result.executed)
+    let output = try #require(result.output?.value)
+    let obj = try #require(robj(output))
+    let expectedCount = pattern == "not-present" ? 0 : (pattern == "--(help|files)" ? 2 : 1)
+    #expect(rint(obj["matches"]) == expectedCount)
+    #expect(rstr(obj["pattern"]) == pattern)
+    if expectedCount == 0 {
+        #expect(rstr(obj["output"]) == "")
+    } else if expectedCount == 2 {
+        #expect(rstr(obj["output"])?.contains("use --help") == true)
+        #expect(rstr(obj["output"])?.contains("use --files") == true)
+    } else {
+        #expect(rstr(obj["output"])?.contains("use \(pattern)") == true)
+    }
+    #expect(try String(contentsOf: file, encoding: .utf8) == content)
+    #expect(await http.invocations.isEmpty)
+}
+
 @Test func grepFindsMatchesAndReportsCount() throws {
     let sb = makeRepoSandbox()
     try "alpha\nbravo needle\ncharlie\nneedle again\n".write(

@@ -10,13 +10,27 @@ import WorkshopExecution
 private actor DelayedEmbeddingGate {
     private var delay: Duration = .zero
     private var calls = 0
+    private var blocked = false
+    private var blockedCalls: [CheckedContinuation<Void, Never>] = []
 
     func setDelay(_ delay: Duration) {
         self.delay = delay
     }
 
+    func setBlocked(_ blocked: Bool) {
+        self.blocked = blocked
+        if !blocked {
+            let pending = blockedCalls
+            blockedCalls.removeAll()
+            for continuation in pending { continuation.resume() }
+        }
+    }
+
     func embed(_ texts: [String], dimensions: Int) async -> [[Float]] {
         calls += 1
+        if blocked {
+            await withCheckedContinuation { blockedCalls.append($0) }
+        }
         if delay > .zero { try? await Task.sleep(for: delay) }
         return texts.map { text in
             var vector = [Float](repeating: 0, count: dimensions)
@@ -36,6 +50,68 @@ private struct DelayedEmbeddingProvider: EmbeddingProvider {
 
     func embed(_ texts: [String]) async throws -> [[Float]] {
         await gate.embed(texts, dimensions: dimensions)
+    }
+}
+
+/// Models a backend change between the admission snapshot and prediction
+/// completion without changing real configuration or borrowing the live model.
+private final class EpochChangingEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
+    let dimensions = 8
+    let modelId = "epoch-fence-test"
+    private let lock = NSLock()
+    private var mismatched = false
+    private var calls = 0
+
+    var embeddingEpoch: MemoryEmbeddingEpoch { epoch("admitted") }
+    var callCount: Int { lock.withLock { calls } }
+    func setMismatched(_ value: Bool) { lock.withLock { mismatched = value } }
+
+    private func epoch(_ name: String) -> MemoryEmbeddingEpoch {
+        MemoryEmbeddingEpoch(
+            backend: "test", modelID: name, modelArtifactDigest: name,
+            tokenizerArtifactDigest: "fixture", preprocessing: "fixture",
+            pooling: "fixture", normalization: "fixture", dimensions: dimensions,
+            maximumSequenceLength: 32
+        )
+    }
+
+    func embed(_ texts: [String]) async throws -> [[Float]] {
+        try await embedWithEpoch(texts).vectors
+    }
+
+    func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
+        let mismatch = lock.withLock {
+            calls += 1
+            return mismatched
+        }
+        return MemoryEmbeddingBatch(
+            epoch: mismatch ? epoch("changed-during-prediction") : embeddingEpoch,
+            vectors: texts.map { _ in [1, 0, 0, 0, 0, 0, 0, 0] }
+        )
+    }
+}
+
+private final class StartupPicker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var firstRead = true
+    private let buildSelection: String
+    private let defaults: SendableUserDefaults
+
+    init(buildSelection: String, defaults: UserDefaults) {
+        self.buildSelection = buildSelection
+        self.defaults = SendableUserDefaults(value: defaults)
+    }
+
+    func read() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        if firstRead {
+            firstRead = false
+            // A picker edge at the provider's actual capture point, after
+            // runtime initialization but before asynchronous compilation.
+            defaults.value.set(buildSelection, forKey: "chatPersona")
+        }
+        return defaults.value.string(forKey: "chatPersona")
     }
 }
 
@@ -74,9 +150,118 @@ private struct ContextFlowConfigurationFixture {
 
 @Suite("NativeContextFlow production configuration")
 struct NativeContextFlowRuntimeTests {
+    @Test("startup acknowledges the published selection, including an ABA picker change", arguments: [false, true])
+    func personaPickerStartupUsesPublishedSelection(aba: Bool) async throws {
+        let fixture = try ContextFlowConfigurationFixture()
+        defer { fixture.cleanUp() }
+        let root = fixture.dataRoot.appendingPathComponent("persona/canonical", isDirectory: true)
+        for name in ["", "Alpha", "Beta"] {
+            let directory = name.isEmpty ? root : root.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data("# SOUL\n\(name.isEmpty ? "canonical" : name) identity".utf8)
+                .write(to: directory.appendingPathComponent("SOUL.md"))
+        }
+        fixture.defaults.set("Alpha", forKey: "chatPersona")
+        let builtSelection = aba ? "Beta" : "Alpha"
+        let finalSelection = aba ? "Alpha" : "Beta"
+        let picker = StartupPicker(buildSelection: builtSelection, defaults: fixture.defaults)
+        let gate = DelayedEmbeddingGate()
+        await gate.setBlocked(true)
+        let runtime = NativeContextFlowRuntime(
+            dataRoot: fixture.dataRoot,
+            configurationOverride: NativeContextFlowConfiguration(mode: .active, budget: .mib32),
+            memoryOverride: SwiftNativeMemoryV2(
+                embedder: DelayedEmbeddingProvider(gate: gate), storage: InMemoryMemoryStorage()
+            ),
+            defaultsOverride: SendableUserDefaults(value: fixture.defaults),
+            personaOverride: { picker.read() }
+        )
+        let startup = Task { await runtime.start() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while await gate.callCount() == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let reachedCompilation = await gate.callCount() > 0
+        // The provider has captured its selection; the publication is still
+        // blocked. ABA began at Alpha, captured Beta, and now returns to Alpha.
+        fixture.defaults.set(finalSelection, forKey: "chatPersona")
+        await gate.setBlocked(false)
+        await startup.value
+        guard reachedCompilation else {
+            await runtime.stop()
+            Issue.record("Startup never reached the controlled compilation boundary")
+            return
+        }
+        let published = try await runtime.prepareFrozenContextTurn(ContextTurnRequest(
+            surface: .chat, origin: .localAuthenticated,
+            userMessage: "Read the published identity", personaIDHint: builtSelection
+        ))
+        #expect(published.kernel.requestedPersonaOverride == builtSelection)
+        #expect(published.kernel.renderedPrompt.contains("\(builtSelection) identity"))
+        let live = try await runtime.prepareContextTurn(ContextTurnRequest(
+            surface: .chat, origin: .localAuthenticated,
+            userMessage: "Use the selected identity", personaIDHint: finalSelection
+        ))
+        #expect(live.kernel.requestedPersonaOverride == finalSelection)
+        #expect(live.kernel.renderedPrompt.contains("\(finalSelection) identity"))
+        let revision = await runtime.frozenContextRevision()
+        await runtime.personaPickerDidChange()
+        #expect(await runtime.frozenContextRevision() == revision)
+        await runtime.stop()
+    }
+
+    @Test("failed startup with a default picker is not an acknowledged nil publication")
+    func personaPickerFailedStartupDefaultRecovers() async throws {
+        let fixture = try ContextFlowConfigurationFixture()
+        defer { fixture.cleanUp() }
+        let root = fixture.dataRoot.appendingPathComponent("persona/canonical", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let soul = root.appendingPathComponent("SOUL.md")
+        try Data([0xFF, 0xFE, 0xFD]).write(to: soul)
+        let runtime = NativeContextFlowRuntime(
+            dataRoot: fixture.dataRoot,
+            configurationOverride: NativeContextFlowConfiguration(mode: .active, budget: .mib32),
+            memoryOverride: SwiftNativeMemoryV2(
+                embedder: DelayedEmbeddingProvider(gate: DelayedEmbeddingGate()),
+                storage: InMemoryMemoryStorage()
+            ),
+            defaultsOverride: SendableUserDefaults(value: fixture.defaults)
+        )
+        await runtime.start()
+        #expect(await runtime.frozenContextRevision() == nil)
+        try Data("# SOUL\nrepaired canonical identity".utf8).write(to: soul)
+        let recovered = try await runtime.prepareContextTurn(ContextTurnRequest(
+            surface: .chat, origin: .localAuthenticated, userMessage: "Use the default identity"
+        ))
+        #expect(recovered.kernel.requestedPersonaOverride == nil)
+        #expect(recovered.kernel.renderedPrompt.contains("repaired canonical identity"))
+        await runtime.stop()
+    }
+
+    @Test("published picker metadata preserves prompt semantics and accounts its bytes")
+    func personaPickerKernelReceiptPreservesPrompt() throws {
+        let key = try StablePromptKernelKey(
+            personaID: ContextPersonaID(rawValue: "canonical"),
+            surfaceVariant: ContextSurfaceVariant(rawValue: "chat"), sourceFingerprint: "same-source"
+        )
+        let defaultKernel = try StablePromptKernel(
+            key: key, renderedPrompt: "same prompt", includedDocumentIDs: [], tokenCount: 2
+        )
+        let selectedKernel = try StablePromptKernel(
+            key: key, renderedPrompt: "same prompt", includedDocumentIDs: [], tokenCount: 2,
+            requestedPersonaOverride: "Álpha"
+        )
+        #expect(defaultKernel.requestedPersonaOverride == nil)
+        #expect(defaultKernel.key == selectedKernel.key)
+        #expect(defaultKernel.renderedPrompt == selectedKernel.renderedPrompt)
+        #expect(defaultKernel.tokenCount == selectedKernel.tokenCount)
+        #expect(defaultKernel != selectedKernel)
+        #expect(selectedKernel.logicalByteCount - defaultKernel.logicalByteCount == "Álpha".utf8.count)
+    }
+
     // EVAL FENCE: core.context
     // Ledger row: app.personaContextFlowProvider
-    @Test("persona picker rebuilds the live ContextFlow kernel before the next chat turn")
+    @Test("pending persona selection leaves frozen reads unchanged and rebuilds the next live turn")
     func personaPickerRebuildsPreparedTurnKernel() async throws {
         let fixture = try ContextFlowConfigurationFixture()
         defer { fixture.cleanUp() }
@@ -120,11 +305,25 @@ struct NativeContextFlowRuntimeTests {
             userMessage: "Which identity is selected?",
             personaIDHint: "Alpha"
         ))
+        let initialRevision = try #require(await runtime.frozenContextRevision())
+        let store = try ContextSQLiteStore(dataRoot: fixture.dataRoot)
+        let initialStoreGeneration = try #require(try await store.activeGeneration()?.id)
         // This is the same synchronous preference write AppModel's picker
         // setter performs before its asynchronous UI notification. Do not
         // send the notification here: the next real prepare must fence itself
         // against the changed canonical picker value.
         fixture.defaults.set("Beta", forKey: "chatPersona")
+        let frozen = try await runtime.prepareFrozenContextTurn(ContextTurnRequest(
+            surface: .chat,
+            origin: .localAuthenticated,
+            userMessage: "Read the already-published identity without changing it.",
+            personaIDHint: "Alpha"
+        ))
+        #expect(frozen.mirror.personaID.rawValue == "Alpha")
+        #expect(frozen.kernel.renderedPrompt.contains("alpha identity"))
+        #expect(await runtime.frozenContextRevision() == initialRevision)
+        #expect(try await store.activeGeneration()?.id == initialStoreGeneration)
+
         let beta = try await runtime.prepareContextTurn(ContextTurnRequest(
             surface: .chat,
             origin: .localAuthenticated,
@@ -138,6 +337,67 @@ struct NativeContextFlowRuntimeTests {
         #expect(beta.kernel.renderedPrompt.contains("beta identity"))
         #expect(!beta.kernel.renderedPrompt.contains("alpha identity"))
         #expect(beta.packet.receipt.mandatoryCoverage == 1)
+        #expect(await runtime.frozenContextRevision() != initialRevision)
+        await runtime.stop()
+    }
+
+    @Test("a failed or canceled persona picker rebuild retains the last good generation and retries", arguments: [false, true])
+    func personaPickerFailureRetainsGenerationAndRetries(cancelRebuild: Bool) async throws {
+        let fixture = try ContextFlowConfigurationFixture()
+        defer { fixture.cleanUp() }
+        let root = fixture.dataRoot
+            .appendingPathComponent("persona", isDirectory: true)
+            .appendingPathComponent("canonical", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "# SOUL\ncanonical identity".write(
+            to: root.appendingPathComponent("SOUL.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let betaRoot = root.appendingPathComponent("Beta", isDirectory: true)
+        try FileManager.default.createDirectory(at: betaRoot, withIntermediateDirectories: true)
+        let betaSoul = betaRoot.appendingPathComponent("SOUL.md")
+        try Data("# SOUL\nbeta identity".utf8).write(to: betaSoul)
+        fixture.defaults.set("canonical", forKey: "chatPersona")
+
+        let runtime = NativeContextFlowRuntime(
+            dataRoot: fixture.dataRoot,
+            configurationOverride: NativeContextFlowConfiguration(mode: .active, budget: .mib32),
+            memoryOverride: SwiftNativeMemoryV2(
+                embedder: DelayedEmbeddingProvider(gate: DelayedEmbeddingGate()),
+                storage: InMemoryMemoryStorage()
+            ),
+            defaultsOverride: SendableUserDefaults(value: fixture.defaults)
+        )
+        await runtime.start()
+        let initialGeneration = try #require(await runtime.health()?.activeArenaGenerationID)
+
+        fixture.defaults.set("Beta", forKey: "chatPersona")
+        if cancelRebuild {
+            let canceledPicker = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                await runtime.personaPickerDidChange()
+            }
+            await canceledPicker.value
+        } else {
+            try Data([0xFF, 0xFE, 0xFD]).write(to: betaSoul)
+            await runtime.personaPickerDidChange()
+        }
+        let failedHealth = try #require(await runtime.health())
+        #expect(failedHealth.activeArenaGenerationID == initialGeneration)
+        #expect((failedHealth.lastError != nil) == !cancelRebuild)
+
+        try Data("# SOUL\nbeta identity repaired".utf8).write(to: betaSoul)
+        await runtime.personaPickerDidChange()
+        let recovered = try await runtime.prepareContextTurn(ContextTurnRequest(
+            surface: .chat,
+            origin: .localAuthenticated,
+            userMessage: "Which identity is selected?",
+            personaIDHint: "Beta"
+        ))
+        #expect(recovered.mirror.personaID.rawValue == "Beta")
+        #expect(recovered.kernel.renderedPrompt.contains("beta identity repaired"))
+        #expect(await runtime.health()?.lastError == nil)
         await runtime.stop()
     }
     @Test("resident work re-enters relevant turns on evidence and restart without model settlement")
@@ -364,6 +624,85 @@ struct NativeContextFlowRuntimeTests {
 
         await runtime.stop()
         fixture.cleanUp()
+    }
+
+    @Test("a changed embedding epoch cannot poison the admitted query cache")
+    func semanticQueryRejectsMismatchedCompletionAndRetries() async throws {
+        let fixture = try ContextFlowConfigurationFixture()
+        defer { fixture.cleanUp() }
+        let provider = EpochChangingEmbeddingProvider()
+        let runtime = NativeContextFlowRuntime(
+            dataRoot: fixture.dataRoot,
+            configurationOverride: NativeContextFlowConfiguration(mode: .active, budget: .mib32),
+            memoryOverride: SwiftNativeMemoryV2(embedder: provider, storage: InMemoryMemoryStorage())
+        )
+        await runtime.start()
+        let callsBefore = provider.callCount
+        provider.setMismatched(true)
+        let first = await runtime.beginQueryEmbedding("remember the violet planter")
+        guard let first else {
+            await runtime.stop()
+            Issue.record("semantic query fixture did not admit a ticket")
+            return
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while provider.callCount == callsBefore, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        // The first call already captured a mismatched batch. Later attempts
+        // now return the admitted epoch, like switching the backend back.
+        provider.setMismatched(false)
+        var retry: ContextQueryEmbeddingTicket?
+        repeat {
+            retry = await runtime.beginQueryEmbedding("remember the violet planter")
+            if retry !== first { break }
+            await Task.yield()
+        } while ContinuousClock.now < deadline
+        let result = await retry?.value(waitingUpTo: 5_000_000_000)
+        let cached = await runtime.beginQueryEmbedding("remember the violet planter")
+        let finalCallCount = provider.callCount
+        await runtime.stop()
+
+        #expect(first.valueIfReady == nil)
+        #expect(retry !== first)
+        #expect(result?.modelFingerprint == provider.embeddingEpoch.rawValue)
+        #expect(cached?.valueIfReady == result)
+        #expect(finalCallCount == callsBefore + 2)
+    }
+
+    @Test("semantic query admission shares duplicate tickets and bounds unfinished work")
+    func semanticQueryAdmissionBoundsInflightWork() async throws {
+        let fixture = try ContextFlowConfigurationFixture()
+        defer { fixture.cleanUp() }
+        let gate = DelayedEmbeddingGate()
+        let runtime = NativeContextFlowRuntime(
+            dataRoot: fixture.dataRoot,
+            configurationOverride: NativeContextFlowConfiguration(mode: .active, budget: .mib32),
+            memoryOverride: SwiftNativeMemoryV2(
+                embedder: DelayedEmbeddingProvider(gate: gate), storage: InMemoryMemoryStorage()
+            )
+        )
+        await runtime.start()
+        await gate.setBlocked(true)
+        var tickets: [ContextQueryEmbeddingTicket] = []
+        for index in 0..<NativeContextFlowRuntime.maximumConcurrentSemanticQueries {
+            if let ticket = await runtime.beginQueryEmbedding("bounded query \(index)") {
+                tickets.append(ticket)
+            }
+        }
+        #expect(tickets.count == NativeContextFlowRuntime.maximumConcurrentSemanticQueries)
+        let duplicate = await runtime.beginQueryEmbedding(" BOUNDED  query 0 ")
+        #expect(duplicate === tickets.first)
+        #expect(await runtime.beginQueryEmbedding("overflow query") == nil)
+
+        await gate.setBlocked(false)
+        for ticket in tickets {
+            #expect(await ticket.value(waitingUpTo: 5_000_000_000) != nil)
+        }
+        // Completion releases capacity; overflow is not cached as failure.
+        #expect(await runtime.beginQueryEmbedding("overflow query") != nil)
+        await runtime.stop()
+        #expect(await runtime.beginQueryEmbedding("after stop") == nil)
     }
 
     @Test("bridge state exposes bounded ContextFlow health")

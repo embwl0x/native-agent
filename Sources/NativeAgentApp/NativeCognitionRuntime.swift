@@ -130,10 +130,11 @@ struct CognitiveEvaluationSamplerOutcome: Sendable, Equatable {
 
 /// The exact provenance of the installed-physiology recorder decision. A
 /// missing report is not evidence that installed collection was meant to be
-/// active: alternate roots and test processes are deliberately excluded.
+/// active: normal app use, alternate roots, and test processes are deliberately
+/// excluded unless a diagnostic/eval caller opts in.
 enum InstalledPhysiologySoakEnablement: Sendable, Equatable {
-    /// The real installed root is collecting elapsed evidence.
-    case installedElapsed
+    /// Routine app launches must not continuously run an evaluation recorder.
+    case disabledByDefault
     /// An injected root must never write into the user's installed evidence feed.
     case disabledNonDefaultDataRoot
     /// Test processes must not create evidence that could be mistaken for an
@@ -149,9 +150,10 @@ enum InstalledPhysiologySoakEnablement: Sendable, Equatable {
 
     var createsInstalledRecorder: Bool {
         switch self {
-        case .installedElapsed, .forcedEnabled:
+        case .forcedEnabled:
             true
-        case .disabledNonDefaultDataRoot,
+        case .disabledByDefault,
+             .disabledNonDefaultDataRoot,
              .disabledTestProcess,
              .forcedDisabled,
              .injectedEvidence:
@@ -367,6 +369,9 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     /// with the door open.
     var bootstrapTask: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
     var bootstrapFailure: String?  // internal for actor extensions (move-only Wave C)
+    /// One process-local subscription to the canonical ApprovalInbox owner.
+    /// It turns durable request/resolution edges into correlated body evidence.
+    var approvalLifecycleObservationTask: Task<Void, Never>?
     /// Provider picker authority can fail independently of cognitive-state
     /// restore. It closes only the provider-backed reflection lane and is
     /// cleared after a later checked routing refresh succeeds.
@@ -399,10 +404,13 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     let physiologySoakEnablement: InstalledPhysiologySoakEnablement  // internal for actor extensions (move-only Wave C)
     var pendingPhysiologySubmissions = 0  // internal for actor extensions (move-only Wave C)
     var physiologySubmissionGeneration: UInt64 = 0  // internal for actor extensions (move-only Wave C)
-    /// Off-path submissions form one serial tail. Separate unstructured tasks
-    /// can reach an actor in scheduler order rather than source order, which
-    /// would let an assistant completion overtake its user ingress and corrupt
-    /// retry/chat-latency accounting.
+    /// One worker preserves ingress/completion order without retaining an
+    /// unbounded chain of tasks before the recorder's own bounded buffer.
+    var physiologySubmissionQueue: [PhysiologySubmission] = []
+    var pendingPhysiologySubmissionLoss: UInt64 = 0
+    // Match the recorder's 256-row burst envelope; this is observation only,
+    // never backpressure on cognition or chat admission.
+    static let maximumPendingPhysiologySubmissions = InstalledPhysiologySoakRecorder.maximumPendingRecords
     var physiologySubmissionTail: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
     let physiologySubmissionDrainDeadlineSeconds: TimeInterval  // internal for actor extensions (move-only Wave C)
     var physiologySubmissionDrainTimeoutCount: UInt64 = 0  // internal for actor extensions (move-only Wave C)
@@ -469,6 +477,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     var pursuitRefreshInFlight = false  // internal for actor extensions (move-only Wave C)
     var pursuitRefreshQueued = false  // internal for actor extensions (move-only Wave C)
     var pursuitObservationTask: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
+    var pursuitRefreshTask: Task<Void, Never>?
     let pursuitStateLoader: @Sendable () async throws -> DeskState  // internal for actor extensions (move-only Wave C)
     private static let bodyLineRefreshInterval: TimeInterval = 20 * 60
     var organismContinuityRestored = false  // internal for actor extensions (move-only Wave C)
@@ -666,7 +675,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         )
         let testProcess = ProcessInfo.processInfo.processName.lowercased().contains("xctest")
             || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
-        let automaticSoakEnablement = Self.resolveInstalledPhysiologySoakEnablement(
+        let defaultSoakEnablement = Self.resolveInstalledPhysiologySoakEnablement(
             dataRoot: dataRoot,
             isTestProcess: testProcess
         )
@@ -676,7 +685,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         } else if let installedPhysiologySoakEnabled {
             soakEnablement = installedPhysiologySoakEnabled ? .forcedEnabled : .forcedDisabled
         } else {
-            soakEnablement = automaticSoakEnablement
+            soakEnablement = defaultSoakEnablement
         }
         self.physiologySoakEnablement = soakEnablement
         self.physiologySoakRecorder = physiologySoakRecorderOverride
@@ -690,6 +699,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
 
     deinit {
         pursuitObservationTask?.cancel()
+        pursuitRefreshTask?.cancel()
         organismPersistenceDrainTask?.cancel()
     }
 
@@ -703,9 +713,9 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         ).createsInstalledRecorder
     }
 
-    /// Keep the default-root and test-process exclusions in the same owner
-    /// that constructs the recorder. The result is intentionally typed so
-    /// diagnostics/evals cannot turn an excluded recorder into a silent zero.
+    /// Installed physiology collection is an explicit diagnostic/eval mode.
+    /// Keep default-root and test-process exclusion provenance typed so a
+    /// missing report cannot be mistaken for a healthy zero-observation run.
     nonisolated static func resolveInstalledPhysiologySoakEnablement(
         dataRoot: URL,
         isTestProcess: Bool
@@ -713,7 +723,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL else {
             return .disabledNonDefaultDataRoot
         }
-        return isTestProcess ? .disabledTestProcess : .installedElapsed
+        return isTestProcess ? .disabledTestProcess : .disabledByDefault
     }
 
     /// Read the configured user name from `<dataRoot>/memory/profile.json`
@@ -751,8 +761,12 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             )
         }
         await restoreOrganismContinuityIfAvailable()
+        await restoreProviderVitalsSnapshot()
+        await startApprovalLifecycleObservationIfNeeded()
+        await reconcilePendingApprovalExpectationsAtBootstrap()
         await recoverPendingOrganismReflexReviewIfNeeded()
         await restoreProviderLifecycleEvidence()
+        await reconcileProviderVitalsNotices()
         // The only awaited Desk replay is launch/bootstrap work, performed in
         // a detached task so its synchronous JSONL parse never occupies this
         // actor. All later turns consume the resident projection.
@@ -1154,11 +1168,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         // successful (.live, non-empty) injection updates the cache. Trusted
         // teammate bridges may receive a read-only non-live projection, but it
         // never replaces the last real capsule or consumes the Body-line window.
-        let requestTurnKind = CognitiveTurnKind.inferred(fromSignals: [
-            request.surface,
-            request.sessionId ?? "",
-            request.userMessage,
-        ])
+        let requestTurnKind = request.resolvedTurnKind
         if requestTurnKind == .live {
             lastInjectedCapsule = (capsule, request.userMessage)
             // Mark the body line as surfaced only after a real (.inject) capsule
@@ -1416,6 +1426,14 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         // Review round 2 (LOW): latch shutdown so a delayed wake re-anchor
         // cannot resurrect the deadline timers this flush is about to cancel.
         isFlushedForTermination = true
+        // Pursuit reads are advisory background work, not part of the final
+        // persistence barrier. Quiesce their owner and reject any late result.
+        pursuitProjectionGeneration &+= 1
+        pursuitRefreshQueued = false
+        pursuitObservationTask?.cancel()
+        pursuitObservationTask = nil
+        pursuitRefreshTask?.cancel()
+        pursuitRefreshTask = nil
         residualDeadline.invalidate()
         cognitionDeadline.invalidate()
         // G-H2: quiesce the two remaining unstructured re-arm sources. A

@@ -146,7 +146,7 @@ final class UpdateController: NSObject {
         case failed(lastCompletedAt: Date, failedAt: Date)
     }
 
-    private static let persistedNoticeKey = "NativeAgent.updateNotice.v1"
+    static let persistedNoticeKey = "NativeAgent.updateNotice.v1"
     static let scheduledCheckActivatedAtKey = "NativeAgent.updateScheduleActivatedAt.v1"
     static let scheduledCheckCompletedAtKey = "NativeAgent.updateLastScheduledCheckAt.v1"
     static let scheduledCheckFailureAtKey = "NativeAgent.updateLastScheduledFailureAt.v1"
@@ -157,24 +157,48 @@ final class UpdateController: NSObject {
 
     private var updaterController: SPUStandardUpdaterController?
     private let unavailability: Unavailability?
+    private let info: [String: Any]
+    private let preferences: UserDefaults
+    private let now: @MainActor () -> Date
 
-    override init() {
-        let unavailability = Self.resolveUnavailability(
-            info: Bundle.main.infoDictionary ?? [:]
+    typealias UpdaterFactory = @MainActor (
+        _ startingUpdater: Bool,
+        _ updaterDelegate: UpdateController
+    ) -> SPUStandardUpdaterController?
+
+    override convenience init() {
+        self.init(
+            info: Bundle.main.infoDictionary ?? [:],
+            preferences: .standard,
+            now: { Date() }
         )
+    }
+
+    init(
+        info: [String: Any],
+        preferences: UserDefaults,
+        now: @escaping @MainActor () -> Date,
+        updaterFactory: UpdaterFactory = { startingUpdater, updaterDelegate in
+            SPUStandardUpdaterController(
+                startingUpdater: startingUpdater,
+                updaterDelegate: updaterDelegate,
+                userDriverDelegate: nil
+            )
+        }
+    ) {
+        let unavailability = Self.resolveUnavailability(info: info)
         self.unavailability = unavailability
+        self.info = info
+        self.preferences = preferences
+        self.now = now
         self.updaterController = nil
         super.init()
-        restorePersistedNotice(info: Bundle.main.infoDictionary ?? [:])
+        restorePersistedNotice()
         // Created after super.init so the controller can carry `self` as the
         // updater delegate (found/not-found mirror into `status`).
         if unavailability == nil {
-            activateScheduledCheckEvidence(info: Bundle.main.infoDictionary ?? [:])
-            updaterController = SPUStandardUpdaterController(
-                startingUpdater: true,
-                updaterDelegate: self,
-                userDriverDelegate: nil
-            )
+            activateScheduledCheckEvidence()
+            updaterController = updaterFactory(true, self)
         }
     }
 
@@ -288,7 +312,6 @@ final class UpdateController: NSObject {
 
     private func presentUnavailableExplanation() {
         let reason = unavailability ?? .notConfigured
-        let info = Bundle.main.infoDictionary ?? [:]
         let presentation = UpdateUnavailableAlertPresentation.make(reason: reason, info: info)
 
         let alert = NSAlert()
@@ -393,67 +416,69 @@ final class UpdateController: NSObject {
         ) == .orderedDescending
     }
 
-    private func restorePersistedNotice(info: [String: Any]) {
-        let defaults = UserDefaults.standard
-        guard let data = defaults.data(forKey: Self.persistedNoticeKey),
+    private func restorePersistedNotice() {
+        guard let data = preferences.data(forKey: Self.persistedNoticeKey),
               let version = Self.restoredNoticeVersion(data: data, info: info) else {
             // Corrupt, stale, installed, or feed-mismatched display state has
             // no authority and must not linger indefinitely.
-            defaults.removeObject(forKey: Self.persistedNoticeKey)
+            preferences.removeObject(forKey: Self.persistedNoticeKey)
             status.availableVersion = nil
             return
         }
         status.availableVersion = version
     }
 
+    func handleFoundUpdate(displayVersion: String) {
+        setAvailableVersion(displayVersion)
+    }
+
+    func handleNoUpdate() {
+        setAvailableVersion(nil)
+    }
+
     private func setAvailableVersion(_ version: String?) {
-        let info = Bundle.main.infoDictionary ?? [:]
-        let defaults = UserDefaults.standard
         guard let version,
               let data = Self.persistedNoticeData(
                 availableVersion: version,
                 info: info
               ) else {
-            defaults.removeObject(forKey: Self.persistedNoticeKey)
+            preferences.removeObject(forKey: Self.persistedNoticeKey)
             status.availableVersion = nil
             return
         }
-        defaults.set(data, forKey: Self.persistedNoticeKey)
+        preferences.set(data, forKey: Self.persistedNoticeKey)
         status.availableVersion = version
     }
 
     /// Marks the start of the first expected scheduled-check window for this
     /// exact installed build/feed. A changed build or feed cannot inherit an
     /// old receipt and falsely look healthy.
-    private func activateScheduledCheckEvidence(info: [String: Any]) {
+    private func activateScheduledCheckEvidence() {
         guard let context = Self.scheduledCheckContext(info: info) else { return }
-        let defaults = UserDefaults.standard
-        guard defaults.string(forKey: Self.scheduledCheckContextKey) != context
-                || defaults.object(forKey: Self.scheduledCheckActivatedAtKey) == nil
+        guard preferences.string(forKey: Self.scheduledCheckContextKey) != context
+                || preferences.object(forKey: Self.scheduledCheckActivatedAtKey) == nil
         else { return }
 
-        defaults.set(context, forKey: Self.scheduledCheckContextKey)
-        defaults.set(Date(), forKey: Self.scheduledCheckActivatedAtKey)
-        defaults.removeObject(forKey: Self.scheduledCheckCompletedAtKey)
-        defaults.removeObject(forKey: Self.scheduledCheckFailureAtKey)
+        preferences.set(context, forKey: Self.scheduledCheckContextKey)
+        preferences.set(now(), forKey: Self.scheduledCheckActivatedAtKey)
+        preferences.removeObject(forKey: Self.scheduledCheckCompletedAtKey)
+        preferences.removeObject(forKey: Self.scheduledCheckFailureAtKey)
     }
 
     /// Sparkle tells its delegate which cycles were background-scheduled. This
     /// is intentionally not called by `checkForUpdates()`, so a manual click
     /// cannot mask a silent scheduler failure.
-    private func recordScheduledCheckCompletion(error: Error?) {
-        let info = Bundle.main.infoDictionary ?? [:]
-        activateScheduledCheckEvidence(info: info)
+    func handleScheduledCheckCompletion(error: Error?) {
+        activateScheduledCheckEvidence()
         guard let context = Self.scheduledCheckContext(info: info) else { return }
-        let defaults = UserDefaults.standard
-        guard defaults.string(forKey: Self.scheduledCheckContextKey) == context else { return }
+        guard preferences.string(forKey: Self.scheduledCheckContextKey) == context else { return }
 
-        let completedAt = Date()
-        defaults.set(completedAt, forKey: Self.scheduledCheckCompletedAtKey)
+        let completedAt = now()
+        preferences.set(completedAt, forKey: Self.scheduledCheckCompletedAtKey)
         if error == nil {
-            defaults.removeObject(forKey: Self.scheduledCheckFailureAtKey)
+            preferences.removeObject(forKey: Self.scheduledCheckFailureAtKey)
         } else {
-            defaults.set(completedAt, forKey: Self.scheduledCheckFailureAtKey)
+            preferences.set(completedAt, forKey: Self.scheduledCheckFailureAtKey)
         }
     }
 
@@ -471,11 +496,11 @@ final class UpdateController: NSObject {
 // no async hop that could reorder against a subsequent check.
 extension UpdateController: SPUUpdaterDelegate {
     func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
-        setAvailableVersion(item.displayVersionString)
+        handleFoundUpdate(displayVersion: item.displayVersionString)
     }
 
     func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
-        setAvailableVersion(nil)
+        handleNoUpdate()
     }
 
     func updater(
@@ -484,6 +509,6 @@ extension UpdateController: SPUUpdaterDelegate {
         error: Error?
     ) {
         guard updateCheck == .updatesInBackground else { return }
-        recordScheduledCheckCompletion(error: error)
+        handleScheduledCheckCompletion(error: error)
     }
 }

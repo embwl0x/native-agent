@@ -42,10 +42,10 @@ public actor TelegramExponentialBackoff {
     private var nextAttemptAt: Date?
 
     /// Defaults are the poll-loop curve from the u5-reliability plan:
-    /// 1s → 60s cap, doubling, ±20% jitter, reset on success.
+    /// 1s → 300s cap, doubling, ±20% jitter, reset on success.
     public init(
         baseDelay: TimeInterval = 1,
-        maxDelay: TimeInterval = 60,
+        maxDelay: TimeInterval = 300,
         multiplier: Double = 2,
         jitterRange: ClosedRange<Double> = 0.8...1.2,
         now: @escaping @Sendable () -> Date = { Date() },

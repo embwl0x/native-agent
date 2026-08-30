@@ -5,7 +5,7 @@ import Testing
 @testable import NativeAgentApp
 
 private actor PursuitProjectionLoaderProbe {
-    private let state: DeskState
+    private var state: DeskState
     private var blockAfterFirst = false
     private var blockedContinuation: CheckedContinuation<Void, Never>?
     private(set) var callCount = 0
@@ -18,6 +18,8 @@ private actor PursuitProjectionLoaderProbe {
         blockAfterFirst = true
     }
 
+    func replaceState(_ state: DeskState) { self.state = state }
+
     func load() async throws -> DeskState {
         callCount += 1
         if blockAfterFirst, callCount > 1 {
@@ -29,6 +31,7 @@ private actor PursuitProjectionLoaderProbe {
     }
 
     func release() {
+        blockAfterFirst = false
         blockedContinuation?.resume()
         blockedContinuation = nil
     }
@@ -36,6 +39,60 @@ private actor PursuitProjectionLoaderProbe {
 
 @Suite("Native cognition attention projection", .serialized)
 struct NativeCognitionAttentionProjectionTests {
+    @Test func terminationRejectsLatePursuitProjectionAndQueuedReload() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("attention-termination-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let why = "preserve the final attention snapshot"
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        _ = try await store.openPursuit(
+            project: "attention", title: "termination projection proof",
+            pursuit: Pursuit(
+                why: why,
+                evidence: PromotionDossier(citations: [
+                    .feltSalience(dates: ["2026-07-13", "2026-07-14"]),
+                ]),
+                doneLooksLike: "the late result stays inert",
+                abandonCondition: "stop after the proof"
+            )
+        )
+        let probe = PursuitProjectionLoaderProbe(state: try await store.liveState())
+        let runtime = NativeCognitionRuntime(
+            dataRoot: root,
+            configurationOverride: CognitiveConfiguration(),
+            pursuitStateLoaderOverride: { try await probe.load() }
+        )
+        await runtime.bootstrap()
+        #expect(await runtime.attentionSignals(at: Date())?.activeTask == why)
+        await probe.replaceState(DeskState(items: [], generatedTs: ""))
+        await probe.blockSubsequentLoads()
+        let refresh = Task { await runtime.startPursuitRefresh(waitForCompletion: true) }
+        for _ in 0..<1000 {
+            if await probe.callCount >= 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await probe.callCount == 2)
+        await runtime.startPursuitRefresh(waitForCompletion: false)
+        #expect(await runtime.pursuitRefreshQueued)
+
+        // The canonical read deliberately ignores cancellation until released.
+        // Flush must not wait on it, and its late empty result cannot replace
+        // the final attention projection or restart the queued replay.
+        await runtime.flushForTermination()
+        let terminalAttention = await runtime.attentionSignals(at: Date())
+        #expect(await runtime.pursuitObservationTask == nil)
+        #expect(await runtime.pursuitRefreshTask == nil)
+        #expect(await runtime.pursuitRefreshQueued == false)
+        await probe.release()
+        await refresh.value
+        #expect(await runtime.attentionSignals(at: Date())?.activeTask == terminalAttention?.activeTask)
+        await runtime.startPursuitRefresh(waitForCompletion: true)
+        await runtime.startPursuitObservationIfNeeded()
+        #expect(await probe.callCount == 2)
+        #expect(await runtime.pursuitObservationTask == nil)
+    }
+
     @Test func deskReplayAfterInvalidationNeverBlocksTurnAttention() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("attention-projection-\(UUID().uuidString)", isDirectory: true)

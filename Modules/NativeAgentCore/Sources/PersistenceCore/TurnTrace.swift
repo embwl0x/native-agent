@@ -172,6 +172,22 @@ public struct TurnTraceEvent: Sendable, Equatable {
         )
     }
 
+    private init(
+        canonicalTurnId: String,
+        ts: Date,
+        canonicalKind: String,
+        canonicalSessionId: String?,
+        canonicalSurface: String?,
+        boundedPayload: JSONValue
+    ) {
+        self.turnId = canonicalTurnId
+        self.ts = ts
+        self.kind = canonicalKind
+        self.sessionId = canonicalSessionId
+        self.surface = canonicalSurface
+        self.payload = boundedPayload
+    }
+
     /// Bound every string leaf of a JSONValue tree to `maxPayloadStringChars`,
     /// then enforce a hard serialized byte ceiling over the whole payload.
     /// Oversized payloads retain stable lifecycle fields plus a bounded JSON
@@ -397,6 +413,64 @@ public struct TurnTraceEvent: Sendable, Equatable {
         )
     }
 
+    /// Decode a physical persisted row without repeating the expensive payload
+    /// serialization proof that the writer already completed. The fast path is
+    /// admitted only when the physical row is within the canonical byte cap,
+    /// every envelope field is already canonical, and no payload string leaf
+    /// needs clipping. A hand-edited, legacy, or oversized row falls back to
+    /// `init(jsonRow:)`, preserving the replay lane's defense-in-depth contract.
+    public init?(persistedJSONRow value: JSONValue, physicalByteCount: Int) {
+        guard case .object(let obj) = value,
+              case .string(let turnId)? = obj["turnId"],
+              case .string(let kind)? = obj["kind"],
+              case .string(let tsString)? = obj["ts"],
+              let ts = Self.parseISO8601(tsString)
+        else { return nil }
+        let sessionId: String? = if case .string(let value)? = obj["sessionId"] {
+            value
+        } else {
+            nil
+        }
+        let surface: String? = if case .string(let value)? = obj["surface"] {
+            value
+        } else {
+            nil
+        }
+        let payload = obj["payload"] ?? .object([:])
+        let envelopeIsCanonical = Self.boundEnvelopeString(turnId) == turnId
+            && Self.boundEnvelopeString(kind) == kind
+            && sessionId.map(Self.boundEnvelopeString) == sessionId
+            && surface.map(Self.boundEnvelopeString) == surface
+        guard physicalByteCount > 0,
+              physicalByteCount <= Self.maxPayloadBytes,
+              envelopeIsCanonical,
+              !Self.hasOversizedStringLeaf(payload) else {
+            self.init(jsonRow: value)
+            return
+        }
+        self.init(
+            canonicalTurnId: turnId,
+            ts: ts,
+            canonicalKind: kind,
+            canonicalSessionId: sessionId,
+            canonicalSurface: surface,
+            boundedPayload: payload
+        )
+    }
+
+    private static func hasOversizedStringLeaf(_ value: JSONValue) -> Bool {
+        switch value {
+        case .string(let string):
+            return string.count > maxPayloadStringChars
+        case .array(let values):
+            return values.contains(where: hasOversizedStringLeaf)
+        case .object(let values):
+            return values.values.contains(where: hasOversizedStringLeaf)
+        case .null, .bool, .int, .double:
+            return false
+        }
+    }
+
     /// Parse a persisted ts: fractional-seconds ISO8601 (the current write
     /// format) with a plain-seconds fallback for rows persisted before the
     /// sub-second fix. Per-call formatters — ISO8601DateFormatter is not
@@ -455,9 +529,14 @@ public actor TurnTraceBus {
     public struct Subscription: Sendable {
         public let id: UUID
         public let stream: AsyncStream<TurnTraceEvent>
-        init(id: UUID, stream: AsyncStream<TurnTraceEvent>) {
+        /// Event-driven loss signal for this exact sink. Values are cumulative
+        /// and emitted only when the count changes, so diagnostics never need
+        /// a timer just to discover a terminal burst overflow.
+        public let dropCounts: AsyncStream<Int>
+        init(id: UUID, stream: AsyncStream<TurnTraceEvent>, dropCounts: AsyncStream<Int>) {
             self.id = id
             self.stream = stream
+            self.dropCounts = dropCounts
         }
     }
 
@@ -471,6 +550,7 @@ public actor TurnTraceBus {
 
     private struct Sink {
         let continuation: AsyncStream<TurnTraceEvent>.Continuation
+        let dropContinuation: AsyncStream<Int>.Continuation
         let capacity: Int
         var inFlight: Int
         var drops: Int
@@ -513,13 +593,22 @@ public actor TurnTraceBus {
         let (stream, continuation) = AsyncStream<TurnTraceEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(cap)
         )
-        sinks[id] = Sink(continuation: continuation, capacity: cap, inFlight: 0, drops: 0)
+        let (dropCounts, dropContinuation) = AsyncStream<Int>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        sinks[id] = Sink(
+            continuation: continuation,
+            dropContinuation: dropContinuation,
+            capacity: cap,
+            inFlight: 0,
+            drops: 0
+        )
         continuation.onTermination = { [weak self] _ in
             // Consumer went away (cancel / break out of for-await). Detached so
             // we never await from the termination callback.
             Task { [weak self] in await self?.removeSink(id) }
         }
-        return Subscription(id: id, stream: stream)
+        return Subscription(id: id, stream: stream, dropCounts: dropCounts)
     }
 
     public func unsubscribe(_ id: UUID) {
@@ -529,6 +618,7 @@ public actor TurnTraceBus {
     private func removeSink(_ id: UUID) {
         if let sink = sinks.removeValue(forKey: id) {
             sink.continuation.finish()
+            sink.dropContinuation.finish()
         }
     }
 
@@ -783,6 +873,7 @@ public actor TurnTraceBus {
                 sink.inFlight = min(sink.inFlight + 1, sink.capacity)
             case .dropped:
                 sink.drops += 1
+                sink.dropContinuation.yield(sink.drops)
             case .terminated:
                 sink.continuation.finish()
             @unknown default:

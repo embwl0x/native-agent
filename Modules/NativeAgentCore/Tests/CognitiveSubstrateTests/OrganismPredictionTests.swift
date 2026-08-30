@@ -65,12 +65,20 @@ private func predictionSignal(
         metadata: metadata
     ))
     let settled = await kernel.snapshot()
+    let state = try #require(await kernel.exportPersistentState())
 
     #expect(pending.predictionSummary.pendingCount == 1)
     #expect(pending.predictionSummary.satisfiedCount == 0)
     #expect(settled.predictionSummary.pendingCount == 0)
     #expect(settled.predictionSummary.satisfiedCount == 1)
     #expect(settled.predictionSummary.bodyConfidence.providerPath > OrganismBodyConfidence.neutral.providerPath)
+    #expect(state.predictionLedger.outcomeCountsByKind?[OrganismPredictionKind.providerCompletion.rawValue]
+        == OrganismPredictionOutcomeCounts(
+            satisfied: 1,
+            violated: 0,
+            expired: 0,
+            lastEvidenceAt: date.addingTimeInterval(2)
+        ))
 }
 
 @Test func unrelatedProviderOutcomeCannotSettleAnotherCall() async throws {

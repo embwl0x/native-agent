@@ -1,7 +1,22 @@
 (() => {
   const MAX_AGGREGATE_NODE_TEXT = 200_000;
+  // Leave ten seconds of the host's thirty-second request deadline for the
+  // content reply, extension receipt, and native-messaging transport.
+  const MAX_TYPING_DURATION_MS = 20_000;
+  const TYPE_YIELD_EVERY = 32;
   const snapshots = new Map();
+  const typingRuns = new Set();
+  const waitingRuns = new Set();
   let domGeneration = 0;
+
+  for (const kind of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+    window.addEventListener(kind, (event) => {
+      if (event.isTrusted !== true) return;
+      snapshots.clear();
+      for (const run of typingRuns) run.stopReason = "user_takeover";
+      for (const run of waitingRuns) run.stopReason = "user_takeover";
+    }, { capture: true, passive: true });
+  }
 
   new MutationObserver(() => {
     domGeneration += 1;
@@ -21,6 +36,18 @@
     if (!message?.type?.startsWith("nativeagent.page.")) return false;
     try {
       switch (message.type) {
+        case "nativeagent.page.lease.invalidated":
+          for (const run of typingRuns) {
+            if (run.leaseId === message.leaseId) run.stopReason = "lease_revoked";
+          }
+          for (const run of waitingRuns) {
+            if (run.leaseId === message.leaseId) run.stopReason = "lease_revoked";
+          }
+          for (const [id, snapshot] of snapshots) {
+            if (snapshot.leaseId === message.leaseId) snapshots.delete(id);
+          }
+          sendResponse({ ok: true, result: { invalidated: true } });
+          break;
         case "nativeagent.page.snapshot":
           sendResponse({ ok: true, result: createSnapshot(message) });
           break;
@@ -178,7 +205,7 @@
       },
     };
     snapshots.clear();
-    snapshots.set(snapshotId, { domGeneration, elementByNodeId, actionNodeIds });
+    snapshots.set(snapshotId, { leaseId: message.leaseId, domGeneration, elementByNodeId, actionNodeIds });
     return snapshot;
   }
 
@@ -193,9 +220,16 @@
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "fill");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
     focusWithoutActivation(element);
-    replaceEditableValue(element, message.value);
-    dispatchEditableEvent(element, "input", message.value);
-    dispatchEditableEvent(element, "change", message.value);
+    const contentEditable = element.isContentEditable;
+    try {
+      replaceEditableValue(element, message.value);
+      dispatchEditableEvent(element, "input", message.value);
+      dispatchEditableEvent(element, "change", message.value);
+      const observed = String((contentEditable ? element.textContent : element.value) ?? "");
+      if (!element.isConnected || observed !== message.value) throw new Error("fill_readback_mismatch");
+    } catch {
+      throw pageError("action_outcome_unknown", "Fill was dispatched but its immediate value could not be confirmed. Observe before retrying; do not blindly repeat the fill.");
+    }
     return {
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
@@ -206,30 +240,81 @@
 
   async function typeIntoNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "type");
-    if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    focusWithoutActivation(element);
+    const snapshot = requireSnapshot(message.snapshotId);
+    const identity = editableIdentity(element);
+    const parent = composedParent(element);
+    const characters = Array.from(message.text);
+    const startedAt = performance.now();
+    const leaseExpiresAt = message.leaseExpiresAtMs;
+    const run = { leaseId: snapshot.leaseId, stopReason: null };
     let typedCount = 0;
-    for (const character of [...message.text]) {
-      if (!element.isConnected) {
-        throw pageError(
-          typedCount > 0 ? "action_outcome_unknown" : "node_stale",
-          typedCount > 0
-            ? "The editable node was replaced after typing began; the partial outcome is unknown."
-            : "The snapshot node is no longer attached.",
-        );
-      }
-      appendEditableValue(element, character);
-      dispatchEditableEvent(element, "input", character);
-      typedCount += 1;
-      if (message.delayMs > 0) await delay(message.delayMs);
+    let nextUTF16Offset = 0;
+    let appendInFlight = false;
+    function currentStopReason() {
+      if (run.stopReason) return run.stopReason;
+      if (!Number.isFinite(leaseExpiresAt) || message.leaseId !== snapshot.leaseId) return "lease_unavailable";
+      if (Date.now() >= leaseExpiresAt) return "lease_expired";
+      if (performance.now() - startedAt >= MAX_TYPING_DURATION_MS) return "execution_deadline";
+      if (!element.isConnected) return "target_detached";
+      if (composedParent(element) !== parent || editableIdentity(element) !== identity) return "target_changed";
+      if (!isEditable(element)) return "target_not_editable";
+      if (!isVisible(element)) return "target_not_visible";
+      return null;
     }
-    dispatchEditableEvent(element, "change", message.text);
+    typingRuns.add(run);
+    try {
+      run.stopReason = currentStopReason();
+      if (!run.stopReason && characters.length > 0) focusWithoutActivation(element);
+      for (const character of characters) {
+        run.stopReason = currentStopReason();
+        if (run.stopReason) break;
+        appendInFlight = true;
+        appendEditableValue(element, character);
+        typedCount += 1;
+        nextUTF16Offset += character.length;
+        appendInFlight = false;
+        dispatchEditableEvent(element, "input", character);
+        if (typedCount < characters.length && (message.delayMs > 0 || typedCount % TYPE_YIELD_EVERY === 0)) {
+          const remaining = Math.min(
+            MAX_TYPING_DURATION_MS - (performance.now() - startedAt),
+            leaseExpiresAt - Date.now(),
+          );
+          await delay(Math.max(0, Math.min(message.delayMs ?? 0, remaining)));
+        }
+      }
+      run.stopReason = currentStopReason();
+      if (typedCount > 0 && !run.stopReason) dispatchEditableEvent(element, "change", null);
+    } catch (error) {
+      if (appendInFlight) {
+        throw pageError("action_outcome_unknown", "The editable value setter failed after dispatch; observe before retrying.");
+      }
+      if (typedCount === 0) throw error;
+      run.stopReason = "page_event_failed";
+    } finally {
+      typingRuns.delete(run);
+    }
+    const completed = typedCount === characters.length && run.stopReason === null;
     return {
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
-      typed: true,
+      typed: completed,
+      completed,
       characterCount: typedCount,
+      requestedCharacterCount: characters.length,
+      remainingCharacterCount: characters.length - typedCount,
+      characterUnit: "unicode_code_point",
+      nextCharacterIndex: typedCount,
+      nextUTF16Offset,
+      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      stopReason: completed ? null : run.stopReason,
     };
+  }
+
+  function editableIdentity(element) {
+    return JSON.stringify([
+      element.tagName, element.type ?? "", Boolean(element.isContentEditable),
+      ...["id", "name", "role", "aria-label", "aria-labelledby"].map((name) => element.getAttribute(name)),
+    ]);
   }
 
   function selectNode(message) {
@@ -245,14 +330,26 @@
     if (!element.multiple && message.values.length !== 1) {
       throw pageError("invalid_selection", "A single-select node requires exactly one option value.");
     }
-    for (const option of options) option.selected = requested.has(String(option.value));
-    dispatchEditableEvent(element, "input", null);
-    dispatchEditableEvent(element, "change", null);
+    let values;
+    try {
+      for (const option of options) option.selected = requested.has(String(option.value));
+      dispatchEditableEvent(element, "input", null);
+      dispatchEditableEvent(element, "change", null);
+      // Event handlers may replace the options collection, not only change
+      // the originally observed option objects.
+      values = Array.from(element.options ?? [])
+        .filter((option) => option.selected).map((option) => String(option.value));
+      const observed = new Set(values);
+      if (!element.isConnected || observed.size !== requested.size
+        || [...requested].some((value) => !observed.has(value))) throw new Error("selection_readback_mismatch");
+    } catch {
+      throw pageError("action_outcome_unknown", "Selection was dispatched but its immediate state could not be confirmed. Observe before retrying; do not blindly repeat the selection.");
+    }
     return {
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
       selected: true,
-      values: options.filter((option) => option.selected).map((option) => String(option.value)),
+      values,
     };
   }
 
@@ -313,25 +410,30 @@
 
   async function waitForNodeState(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "wait");
-    const deadline = Date.now() + message.timeoutMs;
-    while (true) {
-      if (nodeMatchesState(element, message.state)) {
-        return {
-          snapshotId: message.snapshotId,
-          nodeId: message.nodeId,
-          state: message.state,
-          matched: true,
-        };
+    const snapshot = requireSnapshot(message.snapshotId);
+    const deadline = performance.now() + message.timeoutMs;
+    const run = { leaseId: snapshot.leaseId, stopReason: null };
+    waitingRuns.add(run);
+    try {
+      while (true) {
+        if (!run.stopReason && (!Number.isFinite(message.leaseExpiresAtMs) || message.leaseId !== snapshot.leaseId)) {
+          run.stopReason = "lease_unavailable";
+        }
+        if (!run.stopReason && Date.now() >= message.leaseExpiresAtMs) run.stopReason = "lease_expired";
+        if (run.stopReason) throw pageError(run.stopReason, `The node wait stopped: ${run.stopReason}.`);
+        const matched = nodeMatchesState(element, message.state);
+        if (matched || performance.now() >= deadline) {
+          return {
+            snapshotId: message.snapshotId,
+            nodeId: message.nodeId,
+            state: message.state,
+            matched,
+          };
+        }
+        await delay(Math.min(50, Math.max(1, deadline - performance.now())));
       }
-      if (Date.now() >= deadline) {
-        return {
-          snapshotId: message.snapshotId,
-          nodeId: message.nodeId,
-          state: message.state,
-          matched: false,
-        };
-      }
-      await delay(Math.min(50, Math.max(1, deadline - Date.now())));
+    } finally {
+      waitingRuns.delete(run);
     }
   }
 
@@ -440,6 +542,7 @@
   }
 
   function isEditable(element) {
+    if (element.disabled || element.readOnly || element.getAttribute("aria-disabled") === "true") return false;
     const tag = element.tagName.toLowerCase();
     if (tag === "textarea" || element.isContentEditable) return true;
     if (tag !== "input" || isPasswordField(element)) return false;

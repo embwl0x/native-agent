@@ -253,6 +253,18 @@ struct MCPHubView: View {
 
     private func serverRow(_ server: MCPServerRecord) -> some View {
         let isSelected = server.id == appModel.selectedMCPServerId
+        let toolCount = MCPHubServerCountPresentation.resolve(
+            isSelected: isSelected,
+            isCurrent: appModel.mcpToolReadState == .current,
+            visibleCount: appModel.mcpTools.count,
+            reportedCount: server.toolCount
+        )
+        let resourceCount = MCPHubServerCountPresentation.resolve(
+            isSelected: isSelected,
+            isCurrent: appModel.mcpResourceReadState == .current,
+            visibleCount: appModel.mcpResources.count,
+            reportedCount: server.resourceCount
+        )
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(server.name)
@@ -264,8 +276,10 @@ struct MCPHubView: View {
             }
 
             HStack(spacing: 12) {
-                Label("\(server.toolCount ?? 0) tools", systemImage: "wrench.and.screwdriver")
-                Label("\(server.resourceCount ?? 0) resources", systemImage: "doc.on.doc")
+                Label(toolCount.label(noun: "tool"), systemImage: "wrench.and.screwdriver")
+                    .help(toolCount.help)
+                Label(resourceCount.label(noun: "resource"), systemImage: "doc.on.doc")
+                    .help(resourceCount.help)
                 Label(server.transport ?? "transport?", systemImage: "bolt.horizontal")
                 if let risk = server.riskClass, !risk.isEmpty {
                     Label("risk: \(risk)", systemImage: "exclamationmark.shield")

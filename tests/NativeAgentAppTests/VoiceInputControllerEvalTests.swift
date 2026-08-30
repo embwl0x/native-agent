@@ -28,6 +28,25 @@ private final class VoiceRecognitionDriverProbe: VoiceInputRecognitionDriving {
 @MainActor
 @Suite("Voice input controller lifecycle", .serialized)
 struct VoiceInputControllerEvalTests {
+    @Test("mounted voice controllers keep native speech resources cold until native capture")
+    func nativeSpeechResourcesAreLazy() async {
+        let driver = VoiceRecognitionDriverProbe()
+        let controller = VoiceInputController(
+            permissionRequest: { .granted },
+            recognitionDriver: driver
+        )
+
+        #expect(!controller._nativeResourcesPreparedForTesting)
+        #expect(await controller.requestPermission())
+        #expect(!controller._nativeResourcesPreparedForTesting)
+
+        // A non-native driver also has no reason to initialize Speech or an
+        // AVAudioEngine; production reaches that allocation only after the
+        // user starts the built-in microphone path.
+        controller.startListening()
+        #expect(!controller._nativeResourcesPreparedForTesting)
+    }
+
     @Test("a final recognition result resolves one stop before its timeout")
     func finalResultWinsAndLeavesTheControllerIdle() async {
         let driver = VoiceRecognitionDriverProbe()

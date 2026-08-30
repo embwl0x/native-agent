@@ -551,6 +551,45 @@ private func makeToolJSON(
     #expect(body == Data("PRESERVE_ME".utf8))
 }
 
+@Test func quarantine_registry_write_failure_restores_body_and_cleans_staging() async throws {
+    for hasPriorBody in [false, true] {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "quarantine-rollback"
+        let activeDir = root.appendingPathComponent("tools/active/\(id)", isDirectory: true)
+        let quarantineRoot = root.appendingPathComponent("tools/quarantine", isDirectory: true)
+        let quarantineDir = quarantineRoot.appendingPathComponent(id, isDirectory: true)
+        try FileManager.default.createDirectory(at: activeDir, withIntermediateDirectories: true)
+        try Data("NEW_BODY".utf8).write(to: activeDir.appendingPathComponent("body.txt"))
+        if hasPriorBody {
+            try FileManager.default.createDirectory(at: quarantineDir, withIntermediateDirectories: true)
+            try Data("OLD_BODY".utf8).write(to: quarantineDir.appendingPathComponent("body.txt"))
+        }
+        try seedRegistry([
+            makeToolJSON(id: id, extras: ["activePath": .string(activeDir.path)])
+        ], root: root)
+        let registryPath = root.appendingPathComponent("tools/registry.json")
+        let registryBefore = try Data(contentsOf: registryPath)
+        let registry = SwiftNativeToolRegistry(
+            root: root,
+            persistence: SlowPersistenceCore(readDelayMillis: 0, failWrites: true)
+        )
+        await #expect(throws: PersistenceCoreError.ioFailure("injected registry write failure")) {
+            _ = try await registry.quarantine(id: id, reason: "rollback proof")
+        }
+        #expect(try Data(contentsOf: registryPath) == registryBefore)
+        #expect(try Data(contentsOf: activeDir.appendingPathComponent("body.txt")) == Data("NEW_BODY".utf8))
+        if hasPriorBody {
+            #expect(try Data(contentsOf: quarantineDir.appendingPathComponent("body.txt")) == Data("OLD_BODY".utf8))
+        } else {
+            #expect(!FileManager.default.fileExists(atPath: quarantineDir.path))
+        }
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: quarantineRoot.path)
+            .filter { $0.hasPrefix(".incoming-") || $0.hasPrefix(".backup-") }
+        #expect(leftovers.isEmpty)
+    }
+}
+
 /// Finding #6 — active record without activePath must hard-throw rather
 /// than fall through to proposalPath and quarantine the wrong bytes.
 @Test func quarantine_active_record_missing_activePath_throws_invalidState() async throws {
@@ -699,15 +738,18 @@ private func makeToolJSON(
 private final class SlowPersistenceCore: @unchecked Sendable, PersistenceCoreProtocol {
     private let inner: SwiftNativePersistenceCore
     private let readDelayNanos: UInt64
-    init(readDelayMillis: UInt64 = 30) {
+    private let failWrites: Bool
+    init(readDelayMillis: UInt64 = 30, failWrites: Bool = false) {
         self.inner = SwiftNativePersistenceCore()
         self.readDelayNanos = readDelayMillis * 1_000_000
+        self.failWrites = failWrites
     }
     func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue {
         try? await Task.sleep(nanoseconds: readDelayNanos)
         return await inner.readJSON(path, defaultValue: defaultValue)
     }
     func writeJSON(_ value: JSONValue, to path: URL) async throws {
+        if failWrites { throw PersistenceCoreError.ioFailure("injected registry write failure") }
         try await inner.writeJSON(value, to: path)
     }
     func appendJSONL(_ record: JSONValue, to path: URL) async throws {

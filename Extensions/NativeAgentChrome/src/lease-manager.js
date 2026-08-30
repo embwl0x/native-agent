@@ -128,7 +128,7 @@ export class TabLeaseManager {
   }
 
   async renewLocked(payload) {
-    const lease = this.requireLease(payload.leaseId);
+    const lease = this.requireActiveLease(payload.leaseId);
     this.requireSequence(lease, payload.expectedUserSequence);
     const nowMs = this.now();
     const durationMs = payload.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
@@ -220,9 +220,20 @@ export class TabLeaseManager {
   }
 
   requireForPageAction(payload) {
-    const lease = this.requireLease(payload.leaseId);
+    const lease = this.requireActiveLease(payload.leaseId);
     if (payload.expectedUserSequence !== undefined) {
       this.requireSequence(lease, payload.expectedUserSequence);
+    }
+    return lease;
+  }
+
+  requireActiveLease(leaseId) {
+    const lease = this.requireLease(leaseId);
+    // Chrome alarms can be delivered late after suspension or load. Their
+    // cleanup schedule must not extend the lease's effect-time lifetime.
+    const expiresAt = Date.parse(lease.expiresAt);
+    if (!Number.isFinite(expiresAt) || expiresAt <= this.now()) {
+      throw new ProtocolError("lease_expired", "The tab lease has expired; release it and acquire a fresh lease before acting.");
     }
     return lease;
   }

@@ -41,6 +41,23 @@ import Skills
 import Connectors
 import Browser
 
+/// Visible snapshot samplers can be triggered by their retained poll and by a
+/// user action at the same time. Requests may still perform concurrently, but
+/// only the newest request may publish UI state, preventing a slower old error
+/// from replacing a newer successful snapshot.
+struct LatestSnapshotRefreshGate: Equatable {
+    private(set) var latestGeneration: UInt64 = 0
+
+    mutating func begin() -> UInt64 {
+        latestGeneration &+= 1
+        return latestGeneration
+    }
+
+    func isCurrent(_ generation: UInt64) -> Bool {
+        generation == latestGeneration
+    }
+}
+
 @MainActor
 extension AppModel {
     func fetchEmbeddingsStatus() async throws -> EmbeddingsStatus {
@@ -75,12 +92,15 @@ extension AppModel {
     // PATCH-2026-05-08: wave3-health-card Feature A — load health card
     @MainActor
     func loadHealthCard(includeApprovals: Bool = true) async {
+        let healthGeneration = healthCardRefreshGate.begin()
         // Fix 10: catch and log decode/network errors instead of silently swallowing them
+        let nextHealthCard: HealthCard
         do {
-            setHealthCardIfMeaningfullyChanged(try await client.getHealthCard())
+            nextHealthCard = try await client.getHealthCard()
         } catch {
+            guard !Task.isCancelled else { return }
             print("[NativeAgent] loadHealthCard failed: \(error)")
-            setHealthCardIfMeaningfullyChanged(HealthCard(
+            nextHealthCard = HealthCard(
                 overall: "error",
                 subsystems: [
                     HealthCardSubsystem(
@@ -92,12 +112,17 @@ extension AppModel {
                     )
                 ],
                 createdAt: nil
-            ))
+            )
+        }
+        guard !Task.isCancelled else { return }
+        if healthCardRefreshGate.isCurrent(healthGeneration) {
+            setHealthCardIfMeaningfullyChanged(nextHealthCard)
         }
         if includeApprovals {
             do {
                 approvals = try await client.getApprovals()
             } catch {
+                guard !Task.isCancelled else { return }
                 // FIX: previously only print()'d, leaving stale approvals on
                 // screen. Clear the list and surface the failure so the UI
                 // doesn't show outdated/phantom approvals.
@@ -122,6 +147,7 @@ extension AppModel {
     // PATCH-2026-05-08: wave3-whats-running Feature B — load what's running
     @MainActor
     func loadWhatsRunning() async {
+        let refreshGeneration = whatsRunningRefreshGate.begin()
         // Fix 10: catch and log instead of silently swallowing
         // Render-cost audit F14 (wave 2). This is the 10 s `chat-whats-running`
         // poll (`ChatRuntimeStatusChrome.swift:70-77`), so on an idle system it
@@ -158,10 +184,14 @@ extension AppModel {
         }
         do {
             let fetched = try await client.getWhatsRunning()
+            guard !Task.isCancelled else { return }
+            guard whatsRunningRefreshGate.isCurrent(refreshGeneration) else { return }
             if whatsRunning != fetched { whatsRunning = fetched }
             storeStatus(failedEndpoints: [])
         } catch {
+            guard !Task.isCancelled else { return }
             print("[NativeAgent] loadWhatsRunning failed: \(error)")
+            guard whatsRunningRefreshGate.isCurrent(refreshGeneration) else { return }
             storeStatus(failedEndpoints: ["running work"])
         }
     }

@@ -172,6 +172,20 @@ actor SwiftNativeAPNSSender {
     /// serializes access, so concurrent sends can never double-mint.
     private var cachedProviderToken: CachedProviderToken?
 
+    /// C3: after Apple rejects a push with `TooManyProviderTokenUpdates`, hold
+    /// re-mints for this long — Apple's remedy is to stop updating the token
+    /// and keep using the current one, not to sign a fresh JWT (which makes
+    /// the rejection worse).
+    static let providerTokenUpdateBackoff: TimeInterval = 10 * 60
+
+    /// Absolute reuse ceiling while a hold is active: never serve a token old
+    /// enough to cross Apple's 60-min hard expiry mid-flight.
+    static let providerTokenHardCap: TimeInterval = 58 * 60
+
+    /// End of the current re-mint hold, set by `noteRejection`, cleared by the
+    /// next successful mint.
+    private var providerTokenHoldUntil: Date?
+
     /// Injected clock — real path uses `Date()`; tests drive expiry directly.
     private let now: () -> Date
 
@@ -204,9 +218,17 @@ actor SwiftNativeAPNSSender {
         if let cached = cachedProviderToken,
            cached.keyId == keyId,
            cached.teamId == teamId,
-           current >= cached.issuedAt,
-           current.timeIntervalSince(cached.issuedAt) < Self.providerTokenTTL {
-            return cached.jwt
+           current >= cached.issuedAt {
+            let age = current.timeIntervalSince(cached.issuedAt)
+            if age < Self.providerTokenTTL {
+                return cached.jwt
+            }
+            // C3: during a `TooManyProviderTokenUpdates` hold, keep serving
+            // the cached token past its normal TTL instead of re-minting,
+            // but never past the hard cap.
+            if let hold = providerTokenHoldUntil, current < hold, age < Self.providerTokenHardCap {
+                return cached.jwt
+            }
         }
         let jwt = try sign(keyId, teamId, keyPath, current)
         cachedProviderToken = CachedProviderToken(
@@ -215,7 +237,26 @@ actor SwiftNativeAPNSSender {
             jwt: jwt,
             issuedAt: current
         )
+        providerTokenHoldUntil = nil
         return jwt
+    }
+
+    /// Class-specific APNs rejection handling (C3). `TooManyProviderTokenUpdates`
+    /// means the provider JWT was re-signed too often — the fix is to back off
+    /// on minting and respect the cached token, so start a re-mint hold. Every
+    /// other reason keeps its existing behavior.
+    func noteRejection(reason: String?) {
+        guard reason == "TooManyProviderTokenUpdates" else { return }
+        providerTokenHoldUntil = now().addingTimeInterval(Self.providerTokenUpdateBackoff)
+    }
+
+    /// Parses the `reason` field from an APNs error response body,
+    /// e.g. `{"reason":"BadDeviceToken"}`.
+    static func rejectionReason(fromResponseBody data: Data) -> String? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let reason = obj["reason"] as? String,
+              !reason.isEmpty else { return nil }
+        return reason
     }
 
     func sendNotification(
@@ -307,6 +348,8 @@ actor SwiftNativeAPNSSender {
             let status = (response as? HTTPURLResponse)?.statusCode
             let responseText = String(data: data, encoding: .utf8) ?? ""
             let ok = status.map { (200..<300).contains($0) } ?? false
+            let reason = ok ? nil : Self.rejectionReason(fromResponseBody: data)
+            noteRejection(reason: reason)
             receipt = SwiftNativeAPNSReceipt(
                 apnsId: apnsId,
                 createdAt: createdAt,
@@ -320,7 +363,10 @@ actor SwiftNativeAPNSSender {
                 tokenAgeSeconds: tokenAgeSeconds,
                 environment: target.environment,
                 topic: target.topic,
-                error: ok ? nil : (responseText.isEmpty ? "APNS returned HTTP \(status ?? 0)." : responseText)
+                error: ok ? nil : (
+                    reason.map { "APNS rejected: \($0) (HTTP \(status ?? 0))." }
+                        ?? (responseText.isEmpty ? "APNS returned HTTP \(status ?? 0)." : responseText)
+                )
             )
         } catch {
             receipt = SwiftNativeAPNSReceipt(
@@ -348,8 +394,23 @@ actor SwiftNativeAPNSSender {
         let path = dataRoot
             .appendingPathComponent("mobile_push", isDirectory: true)
             .appendingPathComponent("receipts.jsonl")
-        try? await persistence.withFileLock(path) {
-            try await persistence.appendJSONL(receipt.toJSON(), to: path)
+        // C8 (2026-08-28): enrolled in the path-owned cap registry. A bare
+        // `appendJSONL` here grew the delivery ledger forever — and since F2
+        // moved enforcement to the byte writer, it now THROWS rather than
+        // silently growing. Route through the sanctioned capped append.
+        do {
+            try await persistence.withFileLock(path) {
+                try await appendPathOwnedJSONL(
+                    receipt.toJSON(),
+                    to: path,
+                    using: persistence,
+                    logLabel: "SwiftNativeAPNS",
+                    takeLock: false
+                )
+            }
+        } catch {
+            FileHandle.standardError.write(Data(
+                "SwiftNativeAPNS: receipt append failed: \(error)\n".utf8))
         }
     }
 

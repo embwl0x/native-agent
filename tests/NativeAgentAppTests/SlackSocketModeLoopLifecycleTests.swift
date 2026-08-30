@@ -484,7 +484,220 @@ func slackLoop_safetyPollIntervalIsFarCoarserThanTheOldBareInterval() {
     #expect(loop.historySafetyPollInterval >= 10 * 60)
 }
 
+@Test
+func slackSessionClosure_shortDisconnectIsFailureButLongDisconnectIsCompleted() {
+    let short = SlackSocketModeLoop.classifySessionClosure(
+        .disconnect(reason: "warning"),
+        sessionDuration: 2,
+        recyclePlanned: false,
+        recycleInterval: 3_600
+    )
+    guard case .failed(let shortError) = short else {
+        Issue.record("short disconnect should engage failure backoff, got \(short)")
+        return
+    }
+    #expect(shortError.contains("2s"))
+
+    let long = SlackSocketModeLoop.classifySessionClosure(
+        .disconnect(reason: "warning"),
+        sessionDuration: SlackSocketModeLoop.shortLivedSessionFloor,
+        recyclePlanned: false,
+        recycleInterval: 3_600
+    )
+    #expect(long == .completed(result: "Slack socket disconnected after 30s (warning)"))
+}
+
+@Test
+func slackSessionClosure_plannedRecycleStaysCompleted() {
+    let outcome = SlackSocketModeLoop.classifySessionClosure(
+        .disconnect(reason: "refresh_requested"),
+        sessionDuration: 1,
+        recyclePlanned: true,
+        recycleInterval: 3_600
+    )
+    #expect(outcome == .completed(result: "Slack socket session recycled after 3600s"))
+}
+
+/// A receive loop that returns with no `disconnect` frame is still a session
+/// that ended. Before C1 it booked `.completed` at ANY duration, so a socket
+/// that died in a second reported success, backoff never engaged, and the loop
+/// reconnected at its bare interval forever.
+@Test
+func slackReceiveLoopReturn_shortSessionIsFailureAndLongSessionIsCompleted() {
+    let short = SlackSocketModeLoop.classifyReceiveLoopReturn(
+        sessionDuration: 1,
+        recyclePlanned: false,
+        recycleInterval: 3_600
+    )
+    guard case .failed(let shortError) = short else {
+        Issue.record("a 1s receive-loop return must engage failure backoff, got \(short)")
+        return
+    }
+    #expect(shortError.contains("1s"))
+
+    let atFloor = SlackSocketModeLoop.classifyReceiveLoopReturn(
+        sessionDuration: SlackSocketModeLoop.shortLivedSessionFloor,
+        recyclePlanned: false,
+        recycleInterval: 3_600
+    )
+    #expect(atFloor == .completed(result: "Slack socket receive loop ended after 30s"))
+
+    // The planned recycle is the one long-session shape that is success by
+    // construction, and it must stay success even at a tiny duration.
+    let recycled = SlackSocketModeLoop.classifyReceiveLoopReturn(
+        sessionDuration: 1,
+        recyclePlanned: true,
+        recycleInterval: 3_600
+    )
+    #expect(recycled == .completed(result: "Slack socket session recycled after 3600s"))
+}
+
+/// Disconnect handling is reason-aware: a reason that a fast reconnect makes
+/// worse is a failure at ANY duration, so the loop backs off instead of
+/// hammering a disabled app or piling on more sockets.
+@Test
+func slackSessionClosure_fatalReasonsFailEvenOnALongSession() {
+    for reason in ["link_disabled", "too_many_connections", "LINK_DISABLED"] {
+        let outcome = SlackSocketModeLoop.classifySessionClosure(
+            .disconnect(reason: reason),
+            sessionDuration: 3_000,
+            recyclePlanned: false,
+            recycleInterval: 3_600
+        )
+        guard case .failed(let error) = outcome else {
+            Issue.record("\(reason) must be a failure at any duration, got \(outcome)")
+            continue
+        }
+        #expect(error.contains(reason))
+        #expect(SlackSocketModeLoop.disconnectDisposition(forReason: reason) == .fatal)
+    }
+
+    // Routine rotation reasons keep the duration-based rule.
+    for reason in ["refresh_requested", "warning", "disconnect"] {
+        #expect(SlackSocketModeLoop.disconnectDisposition(forReason: reason) == .routine)
+        let long = SlackSocketModeLoop.classifySessionClosure(
+            .disconnect(reason: reason),
+            sessionDuration: 3_000,
+            recyclePlanned: false,
+            recycleInterval: 3_600
+        )
+        #expect(long == .completed(result: "Slack socket disconnected after 3000s (\(reason))"))
+    }
+}
+
+/// The base reconnect spacing IS the loop interval: a tick is one socket
+/// session. 2s meant 30 reconnects a minute against a socket that kept dying.
+@Test
+func slackLoop_baseReconnectIntervalIsNoLongerTwoSeconds() {
+    let loop = SlackSocketModeLoop(
+        config: makeConfig(),
+        chatHandler: { _ in SlackSocketModeReply(text: "") }
+    )
+    #expect(loop.interval == SlackSocketModeLoop.defaultReconnectInterval)
+    #expect(SlackSocketModeLoop.defaultReconnectInterval == 15)
+    #expect(loop.sessionRecycleInterval > loop.interval)
+}
+
+/// A fatal disconnect that races the planned recycle must still fail the
+/// tick — a recycle claim must never suppress backoff on a broken socket.
+@Test
+func slackFatalDisconnectDuringPlannedRecycleStillFails() {
+    let outcome = SlackSocketModeLoop.classifySessionClosure(
+        .disconnect(reason: "link_disabled"),
+        sessionDuration: 3600,
+        recyclePlanned: true,
+        recycleInterval: 3600
+    )
+    guard case .failed = outcome else {
+        Issue.record("fatal disconnect during recycle classified as \(outcome)")
+        return
+    }
+    // A routine closure during a planned recycle keeps the recycle verdict.
+    let routine = SlackSocketModeLoop.classifySessionClosure(
+        .disconnect(reason: "refresh_requested"),
+        sessionDuration: 3600,
+        recyclePlanned: true,
+        recycleInterval: 3600
+    )
+    guard case .completed = routine else {
+        Issue.record("routine recycle closure classified as \(routine)")
+        return
+    }
+}
+
 // MARK: - helpers
+
+@Test
+func slackInFlightHandlers_completionEventEndsGraceAndRemovesSubscription() async {
+    let handlers = SlackInFlightHandlers()
+    let id = UUID()
+    let (work, release) = AsyncStream<Void>.makeStream()
+    let worker = Task {
+        for await _ in work {}
+        await handlers.finish(id)
+    }
+    await handlers.register(worker, id: id)
+    let waiter = Task { await handlers.waitForCompletion(timeout: 30) }
+    let registrationDeadline = Date().addingTimeInterval(5)
+    while await handlers.completionWaiterCount == 0, Date() < registrationDeadline { await Task.yield() }
+    #expect(await handlers.completionWaiterCount == 1)
+    release.finish()
+    #expect(await waiter.value)
+    await worker.value
+    #expect(await handlers.completionWaiterCount == 0)
+    #expect(await handlers.count == 0)
+    // Finishing before registration/observation cannot leave a stale waiter.
+    #expect(await handlers.waitForCompletion(timeout: 30))
+}
+
+@Test
+func slackInFlightHandlers_cancelledGraceRemovesSubscriptionWithoutCancellingWork() async {
+    let handlers = SlackInFlightHandlers()
+    let id = UUID()
+    let (work, release) = AsyncStream<Void>.makeStream()
+    let worker = Task {
+        for await _ in work {}
+        await handlers.finish(id)
+    }
+    await handlers.register(worker, id: id)
+    let waiter = Task { await handlers.waitForCompletion(timeout: 30) }
+    let registrationDeadline = Date().addingTimeInterval(5)
+    while await handlers.completionWaiterCount == 0, Date() < registrationDeadline { await Task.yield() }
+    #expect(await handlers.completionWaiterCount == 1)
+    waiter.cancel()
+    #expect(await waiter.value == false)
+    #expect(await handlers.completionWaiterCount == 0)
+    #expect(await handlers.count == 1)
+    #expect(!worker.isCancelled)
+    release.finish()
+    await worker.value
+    // A task cancelled before subscription also returns without a waiter.
+    let cancelled = Task { await handlers.waitForCompletion(timeout: 30) }
+    cancelled.cancel()
+    _ = await cancelled.value
+    #expect(await handlers.completionWaiterCount == 0)
+}
+
+@Test
+func slackInFlightHandlers_singleDeadlineEndsGraceWithoutReleasingOwnedWork() async {
+    let handlers = SlackInFlightHandlers()
+    let id = UUID()
+    let (work, release) = AsyncStream<Void>.makeStream()
+    let worker = Task {
+        for await _ in work {}
+        await handlers.finish(id)
+    }
+    await handlers.register(worker, id: id)
+    #expect(await handlers.waitForCompletion(timeout: 0.01) == false)
+    #expect(await handlers.completionWaiterCount == 0)
+    #expect(await handlers.count == 1)
+    #expect(!worker.isCancelled)
+    // The existing stop owner, not expiry of a grace, cancels work.
+    #expect(await handlers.cancelAndWaitAll() == 0)
+    #expect(worker.isCancelled)
+    release.finish()
+    await worker.value
+}
 
 private actor SlackTestSignal {
     private var fired = false

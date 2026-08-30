@@ -171,6 +171,113 @@ struct MacChatTranscriptSearchTests {
         #expect(list.contains(".accessibilityAddTraits(.isSelected)"))
     }
 
+    @Test @MainActor func sustainedStreamingPublishesBeforeQuietAndKeepsMatchesNavigable() async throws {
+        let controller = MacChatTranscriptSearchController()
+        controller.replaceSource(messages: [
+            message("older", content: "needle first"),
+            message("newer", content: "needle second"),
+            message("tail", role: "assistant", content: ""),
+        ], sessionID: "stream")
+        controller.setQuery("needle")
+        try await waitUntil { controller.totalMatchCount == 2 }
+
+        var publishedDuringStream = false
+        for tick in 0..<40 {
+            controller.replaceLastMessage(
+                message("tail", role: "assistant", content: "needle streaming \(tick)"),
+                ordinal: 2, sessionID: "stream"
+            )
+            #expect(controller.canNavigate)
+            try await Task.sleep(for: .milliseconds(20))
+            publishedDuringStream = publishedDuringStream || controller.totalMatchCount == 3
+        }
+        #expect(publishedDuringStream, "Search must publish while tokens are still arriving, not only after silence.")
+        controller.replaceLastMessage(
+            message("tail", role: "assistant", content: "final nonmatching text"),
+            ordinal: 2, sessionID: "stream"
+        )
+        try await waitUntil { controller.totalMatchCount == 2 && controller.phase == .results }
+    }
+
+    @Test @MainActor func sourceRefreshesStaySequentialAndPreserveNavigationDuringTheScan() async throws {
+        let scan = ControlledTranscriptScan()
+        let controller = MacChatTranscriptSearchController { query, documents in
+            await scan.search(query, documents: documents)
+        }
+        controller.replaceSource(messages: [
+            message("older", content: "needle first"),
+            message("newer", content: "needle second"),
+        ], sessionID: "stream")
+        controller.setQuery("needle")
+        try await scan.waitForRequests(1)
+        await scan.complete(0)
+        try await waitUntil { controller.totalMatchCount == 2 }
+
+        controller.replaceLastMessage(message("tail", content: "needle first tail"), ordinal: 2, sessionID: "stream")
+        try await scan.waitForRequests(2)
+        #expect(controller.canNavigate)
+        _ = controller.selectPrevious()
+        #expect(controller.selectedMessageID == "older")
+        controller.replaceLastMessage(message("tail", content: "nonmatching tail"), ordinal: 2, sessionID: "stream")
+        await scan.complete(1)
+        try await waitUntil { controller.totalMatchCount == 3 }
+        #expect(controller.selectedMessageID == "older", "Publication must preserve navigation performed during the scan.")
+
+        try await scan.waitForRequests(3)
+        controller.replaceLastMessage(message("tail", content: "needle final tail"), ordinal: 2, sessionID: "stream")
+        await scan.complete(2)
+        try await waitUntil { controller.totalMatchCount == 2 }
+        try await scan.waitForRequests(4)
+        await scan.complete(3)
+        try await waitUntil { controller.totalMatchCount == 3 }
+        #expect(controller.selectedMessageID == "older")
+        let maximumConcurrent = await scan.maximumConcurrent
+        #expect(maximumConcurrent == 1)
+    }
+
+    @Test @MainActor func changedQueryAndSessionRejectLateScansAndStillDebounceTyping() async throws {
+        let scan = ControlledTranscriptScan()
+        let controller = MacChatTranscriptSearchController { query, documents in
+            await scan.search(query, documents: documents)
+        }
+        controller.replaceSource(messages: [
+            message("needle", content: "needle"), message("other", content: "other"),
+        ], sessionID: "first")
+        controller.setQuery("n")
+        controller.setQuery("ne")
+        controller.setQuery("needle")
+        try await scan.waitForRequests(1)
+        let firstQuery = await scan.query(at: 0)
+        #expect(firstQuery == "needle")
+
+        controller.setQuery("other")
+        #expect(!controller.canNavigate)
+        #expect(controller.phase == .searching)
+        try await scan.waitForRequests(2)
+        await scan.complete(1)
+        try await waitUntil { controller.selectedMessageID == "other" }
+        await scan.complete(0) // Deliberately ignores cancellation, like a late worker.
+        await Task.yield()
+        #expect(controller.selectedMessageID == "other")
+
+        controller.setQuery("needle")
+        try await scan.waitForRequests(3)
+        controller.reset(for: "second")
+        await scan.complete(2)
+        await Task.yield()
+        #expect(controller.phase == .idle)
+        #expect(controller.results.isEmpty)
+        #expect(controller.query.isEmpty)
+    }
+
+    @MainActor private func waitUntil(_ predicate: () -> Bool) async throws {
+        for _ in 0..<200 {
+            if predicate() { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(predicate(), "Timed out waiting for search publication")
+    }
+
     @Test func searchIsKeyboardNativeAndAccessible() throws {
         let commands = try AppSourceScraping.appSource("ChatFocusedCommands.swift")
         let search = try AppSourceScraping.appSource("MacChatTranscriptSearch.swift")
@@ -216,5 +323,40 @@ struct MacChatTranscriptSearchTests {
             range = match.upperBound..<haystack.endIndex
         }
         return count
+    }
+}
+
+/// Holds exact controller scans at the async boundary so publication races are
+/// exercised without depending on transcript size or machine scan speed.
+private actor ControlledTranscriptScan {
+    private struct Request {
+        let query: String
+        let documents: [MacChatTranscriptSearchDocument]
+        var continuation: CheckedContinuation<MacChatTranscriptSearchResponse?, Never>?
+    }
+    private var requests: [Request] = []
+    private(set) var maximumConcurrent = 0
+
+    func search(_ query: String, documents: [MacChatTranscriptSearchDocument]) async -> MacChatTranscriptSearchResponse? {
+        await withCheckedContinuation { continuation in
+            requests.append(Request(query: query, documents: documents, continuation: continuation))
+            maximumConcurrent = max(maximumConcurrent, requests.filter { $0.continuation != nil }.count)
+        }
+    }
+
+    func query(at index: Int) -> String { requests[index].query }
+
+    func complete(_ index: Int) {
+        let request = requests[index]
+        requests[index].continuation = nil
+        request.continuation?.resume(returning: MacChatTranscriptSearch.search(query: request.query, documents: request.documents))
+    }
+
+    func waitForRequests(_ expected: Int) async throws {
+        for _ in 0..<200 {
+            if requests.count >= expected { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(requests.count >= expected, "Timed out waiting for a controller scan")
     }
 }

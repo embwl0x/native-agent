@@ -1,140 +1,140 @@
 [
-  {
-    "name": "total-surface-closure-2026-08-24",
-    "surfaceIDsFile": "total-coverage-surface-ids.json",
-    "excludeSurfaceIDs": [
-      {
-        "fence": "feeds",
-        "id": "feeds.turn_traces.busSubscriberDrops"
-      }
-    ],
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "reports-only",
-        "ref": "tests/NativeAgentAppTests/TotalSurfaceContractEvalTests.swift — STRUCTURAL FLOOR ONLY: frozen 641-ID campaign; validates every row retains an observation/assertion contract, a valid tier/cost, a resolvable production owner, UI/CLI primitives, but does not claim the proposed behavior executed"
-      },
-      {
-        "tier": "smoke",
-        "strength": "incidental",
-        "ref": "script/evals.sh --full — complete Swift suites, live read-only instrument, required iOS simulator suite, and strict installed-app accessibility walk through one command; generic gate participation is not row-specific proof"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-closure-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Executed production behavior: BuilderAndMCPBoundaryEvalTests, TurnContractCompletionEvalTests, TelegramCompletenessRegistryLifecycleEvalTests, GitHubCredentialReadinessAndRedactionEvalTests, MacSemanticTargetModelEvalTests, MacBrowserBehaviorWave2EvalTests, RuntimeBridgeBehaviorEvalTests, BridgeRuntimeWave2EvalTests, ChatReceiptStateMachineEvalTests, DeskMindCanonicalBehaviorEvalTests, MindBehaviorWave2EvalTests, Activity/Context/Slack/X BehaviorWave2EvalTests, IOSBehaviorWave3EvalTests, and tests/scripts/total_script_behavior_evals_test.sh; frozen list contains only the exact rows those evaluators exercise"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-wave1-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-wave1-2026-08-24-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Executed production behavior: IOSBehaviorWave3EvalTests, IOSChatBehaviorWave2EvalTests, IOSSyncTransportBoundaryEvalTests, BridgeRuntimeWave3PersistenceEvalTests, BridgeBehaviorWave2EvalTests, AppRuntimesBehaviorWave2EvalTests, MacAppBehaviorWave2EvalTests, FeedCoverageEvaluatorTests, FeedAndBackgroundWave1ContractTests, FeedsReportsOnlyWave2 tests, connector Wave1/Wave2 evals, SettingsBehaviorWave1EvalTests, CoreTailBehaviorEvalTests, CognitiveAblationBehaviorEvalTests, ContextFlowCoordinatorTests, ActivityBehaviorWave2EvalTests, AppChatReportOnlyTruthSeamsTests, AppChatReportsOnlyWave3BehaviorTests, MindReportsOnlyBehaviorWave1EvalTests, MindBehaviorWave2EvalTests, KnowledgeGraphSweepActionEvalTests, DeskReportsOnlyWave1EvalTests, DeskRunsDiagnosticsLifecycleTests, BackgroundReportsOnlyWave3EvalTests, WorkshopPumpTests, organism script behavior tests, and existing direct persistence behavior suites; frozen list includes only independently reviewed rows whose exact behavior contracts execute"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-wave4-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-wave4-2026-08-24-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Independently reviewed executed behavior: SettingsReportsOnlyWave4EvalTests, AppChatReportsOnlyWave4LifecycleTests, BridgeLifecycleWave4EvalTests, FeedsReportsOnlyWave4ClaudeTests, IOSBehaviorWave3EvalTests memory evidence case, DeskReportsOnlyWave4EvalTests, ActionChannelTests, AppRuntimesReportsOnlyWave4EvalTests, MindReportsOnlyBehaviorWave1EvalTests, MindBehaviorWave2EvalTests, and CognitionBackgroundOutcomeTests; frozen list contains only exact canonical action, persistence, lifecycle, and visible-outcome contracts"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-wave5-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-wave5-2026-08-24-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Independently reviewed executed behavior: ActivityProductionBoundaryTests, CoreCLISubprocessTests, ContextFlowCoordinatorTests, ContextFlowStoreTests, ChatOrchestrationClientTests, ChatOrchestrationTurnEngineTests, CoreTailBehaviorEvalTests, EvalFactoryRootFuseTests, OutcomeTissueV2Tests, TelegramAPIResponseTests, TelegramBotTests, CapabilityCatalogWritesTests, IOSBehaviorWave3EvalTests, FeedCoverageEvaluatorTests, WatchdogStatusDisplayTests, TurnReplayBenchTests, and executable script fixtures; frozen list contains only exact production, persistence, lifecycle, adverse-state, and reporting contracts"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-wave6-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-wave6-2026-08-24-surface-ids.json",
-    "excludeSurfaceIDs": [
-      {
-        "fence": "feeds",
-        "id": "feeds.turn_traces.busSubscriberDrops"
-      }
-    ],
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Independently reviewed executed behavior: AppRuntimesBehaviorWave2EvalTests, AppChatToolDispatcherTests, AutonomyGuardBridgeCharacterizationTests, NativeContextFlowRuntimeTests, NativeContextFlowRuntimeLifecycleTests, ContextFlowFallbackReaderTests, FluidContextToolDispatchTests, CoreCLISubprocessTests, NativeDiagnosticObserverTests, IOSBehaviorWave3EvalTests, organism doctor process fixtures, and existing signed inbound iOS bridge behavior suites; frozen list contains only exact runtime, store, process, permission, backpressure, and failure-state contracts"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-wave7-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-wave7-2026-08-24-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Independently reviewed executed behavior: CoreCLISubprocessTests, ChatOrchestrationTurnEngineTests, SessionHistoryTests, TelegramTurnControlsTests, SubstrateAffectFieldWave7EvalTests, CoreMacControlWave7OutcomeTests, OrganismObservatoryMountedEvalTests, NativeContextFlowRuntimeTests, and canonical agent-instrument fixtures; frozen list contains only real subprocess, turn assembly, mounted control, durable store, runtime reconciliation, and production trace-schema contracts"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-wave8-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-wave8-2026-08-24-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Independently reviewed executed behavior: mounted app-chat and Desk controls, credential-rooted chat/swarm factories, required transcript failure notices, signer and trust-policy authority matrices, exact DeskSweep subprocess contracts, runtime context-pressure/provenance flows, durable persistence replacement, bounded Telegram claim recovery, hermetic decodable voice conversion, and organism settle/reset relaunch behavior; frozen list contains only exact production action, store, process, lifecycle, failure, and restart contracts"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-wave9-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-wave9-2026-08-24-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Executed production behavior for concrete Settings, iOS, CloudKit, scheduler, and Activity Capture ledger IDs; each row is backed by its real action, transport, store, presentation, adverse-state, or relaunch owner"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-wave10-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-wave10-2026-08-24-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Executed Desk production behavior for concrete reloader, lane-count, empty-state, effective-action, run-availability, and toolbar-refresh ledger IDs"
-      }
-    ]
-  },
-  {
-    "name": "executed-behavior-conveyor-2026-08-24",
-    "surfaceIDsFile": "behavior-coverage-conveyor-2026-08-24-surface-ids.json",
-    "coverage": [
-      {
-        "tier": "test",
-        "strength": "asserts",
-        "ref": "Concrete one-ID implementation conveyor: each listed row is integrated directly after its production behavior and executable eval are built"
-      }
-    ]
-  }
+ {
+  "name": "total-surface-closure-2026-08-24",
+  "surfaceIDsFile": "total-coverage-surface-ids.json",
+  "excludeSurfaceIDs": [
+   {
+    "fence": "feeds",
+    "id": "feeds.turn_traces.busSubscriberDrops"
+   }
+  ],
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "tests/NativeAgentAppTests/TotalSurfaceContractEvalTests.swift \u2014 STRUCTURAL FLOOR ONLY: frozen 640-ID campaign after the authorized substrate.runReplay retirement; validates every remaining row retains an observation/assertion contract, a valid tier/cost, a resolvable production owner, UI/CLI primitives, but does not claim the proposed behavior executed"
+   },
+   {
+    "tier": "smoke",
+    "strength": "incidental",
+    "ref": "script/evals.sh --full \u2014 complete Swift suites, live read-only instrument, required iOS simulator suite, and strict installed-app accessibility walk through one command; generic gate participation is not row-specific proof"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-closure-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "asserts",
+    "ref": "Executed production behavior: BuilderAndMCPBoundaryEvalTests, TurnContractCompletionEvalTests, TelegramCompletenessRegistryLifecycleEvalTests, GitHubCredentialReadinessAndRedactionEvalTests, MacSemanticTargetModelEvalTests, MacBrowserBehaviorWave2EvalTests, RuntimeBridgeBehaviorEvalTests, BridgeRuntimeWave2EvalTests, ChatReceiptStateMachineEvalTests, DeskMindCanonicalBehaviorEvalTests, MindBehaviorWave2EvalTests, Activity/Context/Slack/X BehaviorWave2EvalTests, IOSBehaviorWave3EvalTests, and tests/scripts/total_script_behavior_evals_test.sh; frozen list contains only the exact rows those evaluators exercise"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-wave1-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-wave1-2026-08-24-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Executed production behavior: IOSBehaviorWave3EvalTests, IOSChatBehaviorWave2EvalTests, IOSSyncTransportBoundaryEvalTests, BridgeRuntimeWave3PersistenceEvalTests, BridgeBehaviorWave2EvalTests, AppRuntimesBehaviorWave2EvalTests, MacAppBehaviorWave2EvalTests, FeedCoverageEvaluatorTests, FeedAndBackgroundWave1ContractTests, FeedsReportsOnlyWave2 tests, connector Wave1/Wave2 evals, SettingsBehaviorWave1EvalTests, CoreTailBehaviorEvalTests, CognitiveAblationBehaviorEvalTests, ContextFlowCoordinatorTests, ActivityBehaviorWave2EvalTests, AppChatReportOnlyTruthSeamsTests, AppChatReportsOnlyWave3BehaviorTests, MindReportsOnlyBehaviorWave1EvalTests, MindBehaviorWave2EvalTests, KnowledgeGraphSweepActionEvalTests, DeskReportsOnlyWave1EvalTests, DeskRunsDiagnosticsLifecycleTests, BackgroundReportsOnlyWave3EvalTests, WorkshopPumpTests, organism script behavior tests, and existing direct persistence behavior suites; frozen list includes only independently reviewed rows whose exact behavior contracts execute"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-wave4-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-wave4-2026-08-24-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Independently reviewed executed behavior: SettingsReportsOnlyWave4EvalTests, AppChatReportsOnlyWave4LifecycleTests, BridgeLifecycleWave4EvalTests, FeedsReportsOnlyWave4ClaudeTests, IOSBehaviorWave3EvalTests memory evidence case, DeskReportsOnlyWave4EvalTests, ActionChannelTests, AppRuntimesReportsOnlyWave4EvalTests, MindReportsOnlyBehaviorWave1EvalTests, MindBehaviorWave2EvalTests, and CognitionBackgroundOutcomeTests; frozen list contains only exact canonical action, persistence, lifecycle, and visible-outcome contracts"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-wave5-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-wave5-2026-08-24-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Independently reviewed executed behavior: ActivityProductionBoundaryTests, CoreCLISubprocessTests, ContextFlowCoordinatorTests, ContextFlowStoreTests, ChatOrchestrationClientTests, ChatOrchestrationTurnEngineTests, CoreTailBehaviorEvalTests, EvalFactoryRootFuseTests, OutcomeTissueV2Tests, TelegramAPIResponseTests, TelegramBotTests, CapabilityCatalogWritesTests, IOSBehaviorWave3EvalTests, FeedCoverageEvaluatorTests, WatchdogStatusDisplayTests, TurnReplayBenchTests, and executable script fixtures; frozen list contains only exact production, persistence, lifecycle, adverse-state, and reporting contracts"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-wave6-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-wave6-2026-08-24-surface-ids.json",
+  "excludeSurfaceIDs": [
+   {
+    "fence": "feeds",
+    "id": "feeds.turn_traces.busSubscriberDrops"
+   }
+  ],
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Independently reviewed executed behavior: AppRuntimesBehaviorWave2EvalTests, AppChatToolDispatcherTests, AutonomyGuardBridgeCharacterizationTests, NativeContextFlowRuntimeTests, NativeContextFlowRuntimeLifecycleTests, ContextFlowFallbackReaderTests, FluidContextToolDispatchTests, CoreCLISubprocessTests, NativeDiagnosticObserverTests, IOSBehaviorWave3EvalTests, organism doctor process fixtures, and existing signed inbound iOS bridge behavior suites; frozen list contains only exact runtime, store, process, permission, backpressure, and failure-state contracts"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-wave7-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-wave7-2026-08-24-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Independently reviewed executed behavior: CoreCLISubprocessTests, ChatOrchestrationTurnEngineTests, SessionHistoryTests, TelegramTurnControlsTests, SubstrateAffectFieldWave7EvalTests, CoreMacControlWave7OutcomeTests, OrganismObservatoryMountedEvalTests, NativeContextFlowRuntimeTests, and canonical agent-instrument fixtures; frozen list contains only real subprocess, turn assembly, mounted control, durable store, runtime reconciliation, and production trace-schema contracts"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-wave8-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-wave8-2026-08-24-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Independently reviewed executed behavior: mounted app-chat and Desk controls, credential-rooted chat/swarm factories, required transcript failure notices, signer and trust-policy authority matrices, exact DeskSweep subprocess contracts, runtime context-pressure/provenance flows, durable persistence replacement, bounded Telegram claim recovery, hermetic decodable voice conversion, and organism settle/reset relaunch behavior; frozen list contains only exact production action, store, process, lifecycle, failure, and restart contracts"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-wave9-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-wave9-2026-08-24-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Executed production behavior for concrete Settings, iOS, CloudKit, scheduler, and Activity Capture ledger IDs; each row is backed by its real action, transport, store, presentation, adverse-state, or relaunch owner"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-wave10-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-wave10-2026-08-24-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Executed Desk production behavior for concrete reloader, lane-count, empty-state, effective-action, run-availability, and toolbar-refresh ledger IDs"
+   }
+  ]
+ },
+ {
+  "name": "executed-behavior-conveyor-2026-08-24",
+  "surfaceIDsFile": "behavior-coverage-conveyor-2026-08-24-surface-ids.json",
+  "coverage": [
+   {
+    "tier": "test",
+    "strength": "reports-only",
+    "ref": "Concrete one-ID implementation conveyor: each listed row is integrated directly after its production behavior and executable eval are built"
+   }
+  ]
+ }
 ]

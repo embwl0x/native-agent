@@ -4,6 +4,7 @@ import Foundation
 import NativeAgentCore
 import BackgroundLoops
 import MemoryV2
+import NotificationInbox
 import PersistenceCore
 
 // MARK: - BackgroundLoopsManager
@@ -54,10 +55,21 @@ public actor BackgroundLoopsManager {
         },
         replacementLoop: @escaping @Sendable (String) -> (any LoopRunner)? = { id in
             switch id {
+            // C8: config removed → fall back to the visible placeholder, not
+            // to nil. Returning nil UNREGISTERS the lane, which is the exact
+            // silent disappearance the placeholder exists to prevent.
             case "telegram_poll":
                 return BackgroundLoopsAssembly.makeTelegramPollLoopIfConfigured()
+                    ?? BackgroundLoopsAssembly.unconfiguredLanePlaceholder(
+                        loopId: "telegram_poll",
+                        reason: BackgroundLoopsAssembly.telegramUnconfiguredReason
+                    )
             case "slack_socket_mode":
                 return BackgroundLoopsAssembly.makeSlackSocketModeLoopIfConfigured()
+                    ?? BackgroundLoopsAssembly.unconfiguredLanePlaceholder(
+                        loopId: "slack_socket_mode",
+                        reason: BackgroundLoopsAssembly.slackUnconfiguredReason
+                    )
             case "doctor_auto_run":
                 return BackgroundLoopsAssembly.makeAutoDoctorLoop()
             default:
@@ -95,6 +107,13 @@ public actor BackgroundLoopsManager {
         await coreManager.setFailureTransitionPush { loopId, error in
             await BackgroundLoopsManager.fileLoopFailureNotice(
                 dataRoot: PersistenceCore.defaultDataRoot(), loopId: loopId, error: error)
+        }
+        await coreManager.setFailureRecoveryPush { loopId, healthyAt in
+            await BackgroundLoopsManager.resolveLoopFailureNotice(
+                dataRoot: PersistenceCore.defaultDataRoot(),
+                loopId: loopId,
+                healthyAt: healthyAt
+            )
         }
         let didStart = await coreManager.start(loops: loops)
         guard didStart else { return }
@@ -193,7 +212,9 @@ public actor BackgroundLoopsManager {
                         }
                         return false
                     }()
-                    if signatureMatches,
+                    let wasAutomaticallyResolved = obj["resolved_reason"]
+                        == .string("loop_recovered")
+                    if signatureMatches, !wasAutomaticallyResolved,
                        case .string(let oldStatus)? = obj["status"],
                        oldStatus != "unread",
                        case .object(var newObj) = card {
@@ -229,6 +250,38 @@ public actor BackgroundLoopsManager {
         }
     }
 
+    /// A real healthy tick retires the matching failure card. Automatic
+    /// resolution is marked so a later recurrence of the same error resurfaces;
+    /// a user-dismissed/archived card keeps the user's sticky decision.
+    @discardableResult
+    nonisolated static func resolveLoopFailureNotice(
+        dataRoot: URL,
+        loopId: String,
+        healthyAt: Date,
+        now: Date = Date()
+    ) async -> Bool {
+        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        let stamp = ISO8601DateFormatter().string(from: now)
+        do {
+            _ = try await inbox.archiveActive(
+                ids: ["loop-failure:\(loopId)"],
+                readAt: stamp,
+                createdNoLaterThan: healthyAt,
+                metadata: [
+                    "resolved_reason": .string("loop_recovered"),
+                    "resolved_at": .string(stamp),
+                    "resolved_health_at": .string(ISO8601DateFormatter().string(from: healthyAt)),
+                ]
+            )
+            return true
+        } catch {
+            FileHandle.standardError.write(Data(
+                "BackgroundLoopsManager: loop-failure recovery failed for \(loopId): \(error)\n".utf8
+            ))
+            return false
+        }
+    }
+
     public func stop() async {
         await coreManager.stop()
     }
@@ -245,8 +298,8 @@ public actor BackgroundLoopsManager {
         await coreManager.uptimeSeconds(now: now)
     }
 
-    /// One-tick trigger for NSBackgroundActivityScheduler hand-offs. Core
-    /// coalesces this request with an in-flight periodic tick of the same id.
+    /// Explicit one-tick trigger. Core coalesces this request with an in-flight
+    /// periodic tick of the same id; manual execution may start the manifest.
     @discardableResult
     public func runTickOnce(loopId: String) async -> LoopTickOutcome {
         if !(await coreManager.isRunning(loopId: loopId)) {
@@ -259,12 +312,11 @@ public actor BackgroundLoopsManager {
     /// `runTickOnce`, this never force-runs an early weekly loop; Core reads the
     /// same durable cadence that drives its periodic registration and then
     /// coalesces any race through the same per-loop execution gate.
+    /// Launch owns automatic startup. An early/late OS callback must not
+    /// assemble a new manifest or restart a manager that teardown stopped.
     @discardableResult
     public func runTickIfDue(loopId: String) async -> LoopTickOutcome {
-        if !(await coreManager.isRunning(loopId: loopId)) {
-            await start(loops: assembleLoops())
-        }
-        return await coreManager.runTickIfDue(loopId: loopId)
+        await coreManager.runTickIfDue(loopId: loopId)
     }
 
     /// Loop ids this facade can rebuild in place. Everything else is bound to

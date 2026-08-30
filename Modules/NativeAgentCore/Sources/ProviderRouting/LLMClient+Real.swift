@@ -118,7 +118,7 @@ extension LLMAdapter {
     /// Tripwire row: an image attachment hit a non-vision adapter and got
     /// dropped at the default-flatten chokepoint. Mirrors `memory.commit`
     /// trace shape (id/kind/title/status/payload/createdAt) and writes via
-    /// `appendJSONLCapped` to `<dataRoot>/traces/events.jsonl`.
+    /// the path-owned appender to `<dataRoot>/traces/events.jsonl`.
     private static func emitVisionUnsupportedTrace(
         provider: String,
         model: String,
@@ -147,7 +147,7 @@ extension LLMAdapter {
         ])
         let persistence = SwiftNativePersistenceCore()
         do {
-            try await appendJSONLCapped(
+            try await appendPathOwnedJSONL(
                 row, to: tracesPath, using: persistence,
                 logLabel: "LLMAdapter.visionUnsupported"
             )

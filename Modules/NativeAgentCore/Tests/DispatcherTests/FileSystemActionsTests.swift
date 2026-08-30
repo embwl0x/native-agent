@@ -66,6 +66,138 @@ private func fsCanonicalDispatchResponse(tool: String) -> Data {
 
 // MARK: - read_file
 
+@Test(arguments: ["1e100", "-1e100"], ["read_file", "file_excerpt", "list_dir", "grep"])
+func nativeNumericInputRejectsFiniteJSONOutsideIntegerRange(number: String, tool: String) async throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("number.txt")
+    try "unchanged\n".write(to: file, atomically: true, encoding: .utf8)
+    let field = ["read_file": "max_bytes", "file_excerpt": "max_lines", "list_dir": "max_entries", "grep": "max_results"][tool]!
+    let decoded = try JSONValue.parse(Data("{\"\(field)\":\(number)}".utf8))
+    var input = try #require(okObj(decoded))
+    guard case .double(let value)? = input[field] else {
+        Issue.record("finite extreme fixture must reach the Double conversion")
+        return
+    }
+    #expect(value.isFinite)
+    input["path"] = .string(tool == "list_dir" ? sb.path : file.path)
+    input["pattern"] = .string("unchanged")
+    let http = _FakeDispatcherHTTP()
+    let dispatcher = SwiftNativeDispatcher(
+        http: http, ledger: DispatchLedger(ledgerPath: sb.appendingPathComponent("traces/events.jsonl")),
+        localActions: .fileSystemDefault
+    )
+    let context = DispatchContext(
+        repoRoot: sb.path, cwd: sb.path, surface: "chat", sessionId: "numeric-input",
+        persona: "", activeProvider: "", extra: [:]
+    )
+    let result = try await dispatcher.dispatch(tool: tool, input: input, ctx: context, dryRun: false)
+    #expect(!result.ok && result.executed)
+    #expect(result.error?.code == "bad_input")
+    #expect(try String(contentsOf: file, encoding: .utf8) == "unchanged\n")
+    #expect(await http.invocations.isEmpty)
+}
+
+@Test func nativeNumericInputPreservesTruncationDefaultsAndIntegerBoundaries() {
+    #expect(FileSystemActions.safeInt(nil, default: 80) == 80)
+    #expect(FileSystemActions.safeInt(.null, default: 80) == 80)
+    #expect(FileSystemActions.safeInt(.string(""), default: 80) == 80)
+    #expect(FileSystemActions.safeInt(.string("42"), default: 80) == 42)
+    #expect(FileSystemActions.safeInt(.double(42.9), default: 80) == 42)
+    #expect(FileSystemActions.safeInt(.double(-42.9), default: 80) == -42)
+    #expect(FileSystemActions.safeInt(.int(Int64.max), default: 80) == Int.max)
+    #expect(FileSystemActions.safeInt(.int(Int64.min), default: 80) == Int.min)
+    #expect(FileSystemActions.safeInt(.double(Double(Int.min)), default: 80) == Int.min)
+    #expect(FileSystemActions.safeInt(.double(Double(Int.max).nextDown), default: 80) == Int(Double(Int.max).nextDown))
+    // Double(Int.max) rounds UP to 2^63, so <= Double(Int.max) is not safe.
+    #expect(FileSystemActions.safeInt(.double(Double(Int.max)), default: 80) == nil)
+    #expect(FileSystemActions.safeInt(.double(Double(Int.min).nextDown), default: 80) == nil)
+    #expect(FileSystemActions.safeInt(.double(.infinity), default: 80) == nil)
+    #expect(FileSystemActions.safeInt(.double(.nan), default: 80) == nil)
+    #expect(FileSystemActions.safeInt(.string("not-a-number"), default: 80) == nil)
+}
+
+@Test(arguments: [JSONValue.double(2.9), .int(2), .string("2"), .null, .string("")])
+func nativeNumericInputReadFilePreservesOrdinaryWindows(value: JSONValue) throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("window.txt")
+    try "abcde".write(to: file, atomically: true, encoding: .utf8)
+    let result = FileSystemActions.readFile(["path": .string(file.path), "max_bytes": value], ctx(sb))
+    let output = try #require(okObj(result))
+    let usesDefault = value == .null || value == .string("")
+    #expect(bool(output["ok"]) == true)
+    #expect(str(output["content"]) == (usesDefault ? "abcde" : "ab"))
+    #expect(bool(output["truncated"]) == !usesDefault)
+}
+
+private final class RegularFileReadRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [Int] = []
+    func record(_ count: Int) { lock.withLock { counts.append(count) } }
+    var snapshot: [Int] { lock.withLock { counts } }
+}
+
+@Test(arguments: [0, 17, 200_000, 500_000])
+func readFileLargeSparseFileReadsOnlyTheRequestedWindow(requested: Int) throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("large.txt")
+    let fileSize = 64 * 1024 * 1024
+    #expect(FileManager.default.createFile(atPath: file.path, contents: Data(repeating: 0x61, count: connectorReadFileDefaultMaxBytes)))
+    let writer = try FileHandle(forWritingTo: file)
+    try writer.truncate(atOffset: UInt64(fileSize))
+    try writer.close()
+    let requests = RegularFileReadRequests()
+    let result = FileSystemActions.$regularFileReadObserver.withValue({ requests.record($0) }) {
+        FileSystemActions.readFile([
+            "path": .string(file.path), "max_bytes": .int(Int64(requested)),
+        ], ctx(sb))
+    }
+    let object = try #require(okObj(result))
+    let expectedLimit = min(requested, connectorReadFileDefaultMaxBytes)
+    #expect(requests.snapshot == [expectedLimit], "the physical read must not materialize the 64 MiB file")
+    #expect(bool(object["ok"]) == true)
+    #expect(int(object["bytes"]) == fileSize)
+    #expect(int(object["returned_bytes"]) == expectedLimit)
+    #expect(bool(object["truncated"]) == true)
+    #expect(str(object["content"]) == FileSystemActions.truncate(String(repeating: "a", count: expectedLimit)))
+}
+
+@Test(arguments: [-1, 0, 3, 99])
+func readFileBoundedWindowPreservesBinaryReplacementAndEmptyReads(requested: Int) throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("binary.txt")
+    let bytes = Data([0x41, 0xFF, 0xC3, 0xA9, 0xE2, 0x82, 0xAC])
+    try bytes.write(to: file)
+    let result = FileSystemActions.readFile([
+        "path": .string(file.path), "max_bytes": .int(Int64(requested)),
+    ], ctx(sb))
+    let object = try #require(okObj(result))
+    let returned = min(max(0, requested), bytes.count)
+    #expect(int(object["bytes"]) == bytes.count)
+    #expect(int(object["returned_bytes"]) == returned)
+    #expect(bool(object["truncated"]) == (returned < bytes.count))
+    #expect(str(object["content"]) == String(decoding: bytes.prefix(returned), as: UTF8.self))
+}
+
+@Test func readFileNonregularEOFBehaviorRemainsAvailableInFullMode() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let requests = RegularFileReadRequests()
+    let result = FileSystemActions.$regularFileReadObserver.withValue({ requests.record($0) }) {
+        FileSystemActions.readFile(["path": .string("/dev/null")], ctx(sb, fileAccess: ["mode": .string("full")]))
+    }
+    let object = try #require(okObj(result))
+    #expect(requests.snapshot.isEmpty)
+    #expect(bool(object["ok"]) == true)
+    #expect(int(object["bytes"]) == 0)
+    #expect(int(object["returned_bytes"]) == 0)
+    #expect(bool(object["truncated"]) == false)
+    #expect(str(object["content"]) == "")
+}
+
 @Test func readFileReturnsContentAndBytes() throws {
     let sb = makeSandbox()
     let file = sb.appendingPathComponent("hello.txt")
@@ -226,6 +358,52 @@ private func fsCanonicalDispatchResponse(tool: String) -> Data {
 
 // MARK: - file_excerpt
 
+@Test(arguments: ["\n", "\r\n", "\r", "\u{000B}", "\u{000C}", "\u{001C}", "\u{001D}", "\u{001E}", "\u{0085}", "\u{2028}", "\u{2029}"])
+func fileExcerptDispatchHonorsUniversalNewlines(separator: String) async throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("newlines.txt")
+    let unicodeLine = "e\u{0301} 👨‍👩‍👧‍👦"
+    let content = ["first", unicodeLine, "third", "fourth", ""].joined(separator: separator)
+    try content.write(to: file, atomically: true, encoding: .utf8)
+    let http = _FakeDispatcherHTTP()
+    let ledger = DispatchLedger(ledgerPath: sb.appendingPathComponent("traces/events.jsonl"))
+    let dispatcher = SwiftNativeDispatcher(http: http, ledger: ledger, localActions: .fileExcerptReadOnly)
+    let context = DispatchContext(
+        repoRoot: sb.path, cwd: sb.path, surface: "chat", sessionId: "newline-fixture",
+        persona: "", activeProvider: "", extra: [:]
+    )
+    let result = try await dispatcher.dispatch(
+        tool: "file_excerpt",
+        input: ["path": .string(file.path), "start_line": .int(2), "max_lines": .int(2)],
+        ctx: context, dryRun: false
+    )
+    #expect(result.ok && result.executed)
+    let output = try #require(result.output?.value)
+    let obj = try #require(okObj(output))
+    #expect(str(obj["excerpt"]) == "2: \(unicodeLine)\n3: third")
+    #expect(int(obj["start_line"]) == 2)
+    #expect(int(obj["end_line"]) == 3)
+    #expect(int(obj["total_lines"]) == 4)
+    #expect(bool(obj["truncated"]) == true)
+    #expect(try String(contentsOf: file, encoding: .utf8) == content)
+    #expect(await http.invocations.isEmpty)
+}
+
+@Test func fileExcerptMixedNewlinesPreserveBlankLinesAndNonSeparatorScalars() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("mixed.txt")
+    try "\r\nfirst\r\r\nsecond\u{2028}third\u{0085}last\u{001F}kept\u{0000}\n"
+        .write(to: file, atomically: true, encoding: .utf8)
+    let output = FileSystemActions.fileExcerpt(["path": .string(file.path)], ctx(sb))
+    let obj = try #require(okObj(output))
+    #expect(str(obj["excerpt"]) == "1: \n2: first\n3: \n4: second\n5: third\n6: last\u{001F}kept\u{0000}")
+    #expect(int(obj["total_lines"]) == 6)
+    #expect(int(obj["end_line"]) == 6)
+    #expect(bool(obj["truncated"]) == false)
+}
+
 @Test func fileExcerptNumbersLinesAndWindows() throws {
     let sb = makeSandbox()
     let file = sb.appendingPathComponent("lines.txt")
@@ -269,6 +447,126 @@ private func fsCanonicalDispatchResponse(tool: String) -> Data {
 }
 
 // MARK: - write_file
+
+private final class ConcurrentAppendFixture: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var opened = 0
+    private var timedOut = false
+    private var results: [JSONValue] = []
+
+    func awaitBothHandles() {
+        condition.lock()
+        defer { condition.unlock() }
+        opened += 1
+        condition.broadcast()
+        let deadline = Date().addingTimeInterval(5)
+        while opened < 2 {
+            if !condition.wait(until: deadline) { timedOut = true; break }
+        }
+    }
+
+    func record(_ result: JSONValue) {
+        condition.lock()
+        results.append(result)
+        condition.unlock()
+    }
+
+    var snapshot: (results: [JSONValue], timedOut: Bool) {
+        condition.lock()
+        defer { condition.unlock() }
+        return (results, timedOut)
+    }
+}
+
+@Test(arguments: [false, true])
+func writeFileConcurrentAppendsRetainBothPayloads(existing: Bool) throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("append.txt")
+    let baseline = sb.appendingPathComponent("baseline.txt")
+    try Data().write(to: baseline)
+    if existing {
+        try Data("prefix\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+    let fixture = ConcurrentAppendFixture()
+    let done = DispatchGroup()
+    let payloadSize = 512 * 1024
+    for token in ["A", "B"] {
+        done.enter()
+        Thread.detachNewThread {
+            defer { done.leave() }
+            let result = FileSystemActions.$appendHandleOpened.withValue({ fixture.awaitBothHandles() }) {
+                FileSystemActions.writeFile([
+                    "path": .string(file.path),
+                    "content": .string(String(repeating: token, count: payloadSize)),
+                    "append": .bool(true),
+                ], ctx(sb))
+            }
+            fixture.record(result)
+        }
+    }
+    try #require(done.wait(timeout: .now() + 10) == .success)
+    let snapshot = fixture.snapshot
+    #expect(!snapshot.timedOut)
+    #expect(snapshot.results.count == 2)
+    for result in snapshot.results {
+        let output = try #require(okObj(result))
+        #expect(bool(output["ok"]) == true)
+        #expect(int(output["bytes_written"]) == payloadSize)
+    }
+    let bytes = try Data(contentsOf: file)
+    #expect(bytes.count == payloadSize * 2 + (existing ? 7 : 0))
+    #expect(bytes.filter { $0 == 0x41 }.count == payloadSize)
+    #expect(bytes.filter { $0 == 0x42 }.count == payloadSize)
+    if existing { #expect(bytes.starts(with: Data("prefix\n".utf8))) }
+    let baselineMode = try #require(FileManager.default.attributesOfItem(atPath: baseline.path)[.posixPermissions] as? Int)
+    let expectedMode = existing ? 0o600 : baselineMode
+    #expect(try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int == expectedMode)
+}
+
+@Test(arguments: ["", "é 🌙\n"])
+func writeFileNativeDispatchAppendCreatesAndExtends(content: String) async throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let file = sb.appendingPathComponent("nested/append.txt")
+    let http = _FakeDispatcherHTTP()
+    let dispatcher = SwiftNativeDispatcher(
+        http: http, ledger: DispatchLedger(ledgerPath: sb.appendingPathComponent("traces/events.jsonl")),
+        localActions: .fileSystemDefault,
+        autonomyResolver: { _ in "auto" }
+    )
+    let context = DispatchContext(
+        repoRoot: sb.path, cwd: sb.path, surface: "chat", sessionId: "append-fixture",
+        persona: "", activeProvider: "", extra: [:]
+    )
+    for _ in 0..<2 {
+        let result = try await dispatcher.dispatch(
+            tool: "write_file", input: ["path": .string(file.path), "content": .string(content), "append": .bool(true)],
+            ctx: context, dryRun: false
+        )
+        #expect(result.ok && result.executed)
+        let raw = try #require(result.output?.value)
+        let output = try #require(okObj(raw))
+        #expect(int(output["bytes_written"]) == content.utf8.count)
+        #expect(bool(output["append"]) == true)
+        #expect(output["before_content"] == nil && output["after_content"] == nil)
+    }
+    #expect(try String(contentsOf: file, encoding: .utf8) == content + content)
+    #expect(await http.invocations.isEmpty)
+}
+
+@Test func writeFileAppendOpenFailureReturnsErrorWithoutMutation() throws {
+    let sb = makeSandbox()
+    defer { try? FileManager.default.removeItem(at: sb) }
+    let result = FileSystemActions.writeFile([
+        "path": .string(sb.path), "content": .string("must not land"), "append": .bool(true),
+    ], ctx(sb))
+    let output = try #require(okObj(result))
+    #expect(bool(output["ok"]) == false)
+    #expect(output["bytes_written"] == nil)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: sb.path).isEmpty)
+}
 
 @Test func writeFileOverwriteAndReportBytes() throws {
     let sb = makeSandbox()

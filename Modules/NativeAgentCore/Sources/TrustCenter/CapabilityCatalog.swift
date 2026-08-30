@@ -984,15 +984,11 @@ public actor SwiftNativeCatalogWrites {
             "createdAt": .string(SwiftNativeManifestSigner.isoTimestamp(clock())),
         ])
         let tracesURL = tracesPath
-        let persistenceLocal = persistence
-        let work: @Sendable () async throws -> Void = {
-            try await persistenceLocal.appendJSONL(event, to: tracesURL)
-        }
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
-        try await persistence.withFileLock(tracesURL, work)
+        try await appendPathOwnedJSONL(
+            event,
+            to: tracesURL,
+            using: persistence,
+            logLabel: "CapabilityCatalog.trace"
+        )
     }
 }

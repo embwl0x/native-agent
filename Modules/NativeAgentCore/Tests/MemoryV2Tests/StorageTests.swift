@@ -209,6 +209,34 @@ struct MemoryStorageTests {
         #expect(events.contains(ProjectionHookEvent(target: "knowledgeGraph", memoryId: "old-fact", deleted: true)))
     }
 
+    @Test func asynchronousProjectionHooksPreserveCanonicalMutationOrder() async throws {
+        let store = try MemoryStorage()
+        let recorder = OrderedProjectionHookRecorder()
+        await store.attachSpotlightHook { memory, deleted in
+            // Make the older live projection slower than the newer delete. An
+            // unsequenced pair of Tasks completes in the wrong order.
+            if !deleted {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            await recorder.record(memoryID: memory.id, deleted: deleted)
+        }
+
+        _ = try await store.insertMemory(StoredMemory(
+            id: "ordered-projection",
+            content: "a fact that is immediately corrected"
+        ))
+        _ = try await store.updateMemory(
+            id: "ordered-projection",
+            patch: MemoryPatch(lifecycle: MemoryLifecycle.corrected)
+        )
+        await store.flushProjectionHooks()
+
+        #expect(await recorder.events() == [
+            ProjectionHookEvent(target: "ordered", memoryId: "ordered-projection", deleted: false),
+            ProjectionHookEvent(target: "ordered", memoryId: "ordered-projection", deleted: true),
+        ])
+    }
+
     @Test func archiveEmitsProjectionDeleteHooks() async throws {
         let store = try MemoryStorage()
         let recorder = ProjectionHookRecorder()
@@ -317,6 +345,38 @@ struct MemoryStorageTests {
         #expect(ids.contains { $0.hasPrefix("skill-pointer:") })
     }
 
+    @Test func skillHintSlotCapIsAThirdOfTopKNotHalf() async throws {
+        // B3 pin (2026-08-28 audit): the crowding test above passes under the
+        // old (k+1)/2 formula too, so the k/3 cap needs its own discriminating
+        // counts — topK 9 admits 3 hints (old formula admitted 5), topK 3
+        // admits 1 (old admitted 2). Hints outscore facts so the cap, not the
+        // ranking, is what holds them back.
+        let store = try MemoryStorage()
+        for index in 1...6 {
+            _ = try await store.insertMemory(StoredMemory(
+                id: "skill-pointer:\(index)",
+                content: "Skill discovery hint \(index)",
+                embedding: [1, 0],
+                metadata: .object(["kind": .string("skill")])
+            ))
+        }
+        for index in 1...8 {
+            _ = try await store.insertMemory(StoredMemory(
+                id: "fact-\(index)",
+                content: "Ordinary durable fact number \(index)",
+                embedding: [0.9, 0.1],
+                metadata: .object(["kind": .string("general")])
+            ))
+        }
+
+        let nine = try await store.recall(embedding: [1, 0], topK: 9)
+        #expect(nine.count == 9)
+        #expect(nine.map(\.memory.id).filter { $0.hasPrefix("skill-pointer:") }.count == 3)
+
+        let three = try await store.recall(embedding: [1, 0], topK: 3)
+        #expect(three.map(\.memory.id).filter { $0.hasPrefix("skill-pointer:") }.count == 1)
+    }
+
     @Test func proposeAcceptLandsInMemories() async throws {
         let store = try MemoryStorage()
         let p = StoredProposal(content: "Agent uses dry sharp voice", source: "dream")
@@ -381,6 +441,34 @@ struct MemoryStorageTests {
         #expect(try await store.acceptProposal(id: overConf.id).confidence == 1.0)
     }
 
+    /// B6: the ordinary delete path writes tombstones with NO embedding, and
+    /// `tombstoneMatch` selects `embedding IS NOT NULL` — so those tombstones
+    /// block only their own exact hash and are invisible to the semantic gate.
+    /// The backfill fills the missing key; the 0.92 threshold is untouched.
+    @Test func tombstoneEmbeddingBackfillMakesLegacyTombstonesVisibleToTheGate() async throws {
+        let store = try MemoryStorage()
+        let embedder = MockEmbeddingProvider(dimensions: 384)
+        let claim = "the user lives in Atlantis"
+
+        // Written the way every real deletion writes it: content, no vector.
+        try await store.addTombstone(content: claim, reason: "deleted")
+        let vector = try #require(try await embedder.embed([claim]).first)
+        #expect(try await store.matchesTombstone(embedding: vector) == false)
+
+        let filled = try await store.backfillTombstoneEmbeddings(using: embedder)
+        #expect(filled == 1)
+        // Same claim now matches itself (cosine 1.0), far above the threshold.
+        #expect(try await store.matchesTombstone(embedding: vector) == true)
+        // An unrelated claim still walks in — the gate got sight, not teeth.
+        let other = try #require(try await embedder.embed(["the user owns a canoe"]).first)
+        #expect(try await store.matchesTombstone(embedding: other) == false)
+
+        // Idempotent: a second pass finds nothing left to fill.
+        #expect(try await store.backfillTombstoneEmbeddings(using: embedder) == 0)
+        // And it never overwrites an embedding a real write already set.
+        #expect(try await store.matchesTombstone(embedding: vector) == true)
+    }
+
     @Test func semanticTombstoneGateBlocksParaphraseAdmitsContradiction() async throws {
         // Wave1 T-lane. Controlled vectors: tombstone at [1,0,0].
         let store = try MemoryStorage()
@@ -407,6 +495,34 @@ struct MemoryStorageTests {
         #expect(rejected.contains(where: { $0.id == p.id }))
         let mems = try await store.listMemories()
         #expect(!mems.contains(where: { $0.id == p.id }))
+    }
+
+    @Test(arguments: [false, true])
+    func proposalAdmissionRechecksExactTombstoneWithoutTombstoneEmbedding(proposalHasEmbedding: Bool) async throws {
+        let store = try MemoryStorage()
+        let content = "The orchard gate opens at dusk."
+        let proposal = StoredProposal(content: content, embedding: proposalHasEmbedding ? [1, 0, 0] : nil)
+        _ = try await store.insertProposal(proposal)
+        // The earlier caller check passes, then forgetting commits before
+        // the canonical acceptance transaction. No sleeps or concurrent race.
+        #expect(!(try await store.isTombstoned(content: content)))
+        try await store.addTombstone(content: content, reason: "forgotten")
+        do {
+            _ = try await store.acceptProposal(id: proposal.id)
+            Issue.record("exact tombstone must veto canonical admission")
+        } catch MemoryStorageError.tombstoned(let id) {
+            #expect(id == proposal.id)
+        }
+        let rejected = try #require(try await store.listProposals(status: "rejected").first { $0.id == proposal.id })
+        #expect(rejected.resolvedAt != nil)
+        #expect(rejected.rejectionReason == "tombstoned: exact match to a rejected claim")
+        #expect(try await store.listMemories().isEmpty)
+
+        let independent = StoredProposal(content: "The orchard fence is painted blue.")
+        _ = try await store.insertProposal(independent)
+        let accepted = try await store.acceptProposal(id: independent.id)
+        #expect(accepted.content == independent.content)
+        #expect(try await store.listMemories().map(\.id) == [accepted.id])
     }
 
     @Test func storeGateFiresThroughProtocolExistential() async throws {
@@ -599,6 +715,31 @@ struct MemoryStorageTests {
         // ...and the merge must not clobber sibling metadata keys.
         #expect(again.first?.tags == ["persona-feedback"])
     }
+
+    @Test func metadataMergePreservesCanonicalSiblingKeysInsideStorageTransaction() async throws {
+        let store = try MemoryStorage()
+        let original = StoredMemory(
+            id: "metadata-merge-1",
+            content: "User prefers concise release notes.",
+            metadata: .object([
+                "kind": .string("preference"),
+                "canonical_owner_note": .string("keep-me"),
+            ])
+        )
+        _ = try await store.insertMemory(original)
+
+        let updated = try #require(try await store.updateMemory(
+            id: original.id,
+            patch: MemoryPatch(metadataMerge: ["pinned": .bool(true)])
+        ))
+        guard case .object(let metadata)? = updated.metadata else {
+            Issue.record("expected merged metadata object")
+            return
+        }
+        #expect(metadata["pinned"] == .bool(true))
+        #expect(metadata["kind"] == .string("preference"))
+        #expect(metadata["canonical_owner_note"] == .string("keep-me"))
+    }
 }
 
 private struct ProjectionHookEvent: Equatable, Sendable {
@@ -622,4 +763,18 @@ private final class ProjectionHookRecorder: @unchecked Sendable {
         defer { lock.unlock() }
         return stored
     }
+}
+
+private actor OrderedProjectionHookRecorder {
+    private var stored: [ProjectionHookEvent] = []
+
+    func record(memoryID: String, deleted: Bool) {
+        stored.append(ProjectionHookEvent(
+            target: "ordered",
+            memoryId: memoryID,
+            deleted: deleted
+        ))
+    }
+
+    func events() -> [ProjectionHookEvent] { stored }
 }

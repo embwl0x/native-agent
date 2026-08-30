@@ -1,7 +1,9 @@
 import Foundation
+import PersistenceCore
 import Testing
 @testable import NativeAgentApp
 import MemoryV2
+import NativeAgentCore
 
 private func memoryRowPinRoot() throws -> URL {
     let root = FileManager.default.temporaryDirectory
@@ -12,6 +14,45 @@ private func memoryRowPinRoot() throws -> URL {
 
 @Suite("Memory row pin control")
 struct MemoryRowPinEvalTests {
+    @Test func pinMergesMetadataAndCompletesCanonicalProjectionBeforeSuccess() async throws {
+        let root = try memoryRowPinRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(dataRoot: root)
+        let metadata: JSONValue = .object([
+            "kind": .string("note"),
+            "source_history": .array([.string("orchard-observation")]),
+            "recall_count": .int(3),
+        ])
+        _ = try await storage.insertMemory(StoredMemory(id: "pin-target", content: "The orchard gate opens at dusk.", metadata: metadata))
+        let recorder = MemoryPinProjectionRecorder()
+        await storage.attachKnowledgeGraphHook { row, deleted in
+            guard !deleted, case .object(let values)? = row.metadata,
+                  case .bool(let pinned)? = values["pinned"] else { return }
+            await recorder.record(pinned)
+        }
+        let memory = SwiftNativeMemoryV2(embedder: MockEmbeddingProvider(), storage: MemoryStorageBridge(storage: storage))
+        let client = NativeClient(baseURL: "", dataRootOverride: root)
+        for pinned in [true, false] {
+            let response = try await client.updateMemory(id: "pin-target", pinned: pinned, memory: memory)
+            #expect(response["status"] as? String == "ok")
+            let row = try #require(try await storage.memory(id: "pin-target"))
+            #expect(row.metadata == .object([
+                "kind": .string("note"), "source_history": .array([.string("orchard-observation")]),
+                "recall_count": .int(3), "pinned": .bool(pinned),
+            ]))
+            #expect(await recorder.values.last == pinned)
+        }
+        #expect(await recorder.values == [true, false])
+        _ = try await memory.deleteMemoryIfPresent(id: "pin-target")
+        do {
+            _ = try await client.updateMemory(id: "pin-target", pinned: true, memory: memory)
+            Issue.record("pinning a deleted row must not return success")
+        } catch {
+            #expect((error as NSError).code == 404)
+        }
+        #expect(await recorder.values == [true, false])
+    }
+
     // app.mind / ui.memory.row.pin
     @Test("pin and unpin mutate the exact clone-backed row returned to the Memory view")
     func pinRoundTripsThroughTheCanonicalMemoryStore() async throws {
@@ -63,4 +104,9 @@ struct MemoryRowPinEvalTests {
         let durable = try await storage.memory(id: "present-row")
         #expect(durable?.metadata == nil)
     }
+}
+
+private actor MemoryPinProjectionRecorder {
+    private(set) var values: [Bool] = []
+    func record(_ value: Bool) { values.append(value) }
 }

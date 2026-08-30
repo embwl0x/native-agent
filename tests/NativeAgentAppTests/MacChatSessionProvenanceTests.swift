@@ -6,6 +6,50 @@ import NativeAgentShared
 /// 658.14 — session provenance and active-work navigation.
 @Suite("Mac chat session provenance")
 struct MacChatSessionProvenanceTests {
+    @Test("plain bridge messages inherit the advertised active chat session")
+    func bridgeMessageSessionResolution() {
+        #expect(ClaudeBridge.bridgeMessageSessionID(
+            requested: nil,
+            active: "active-session"
+        ) == "active-session")
+        #expect(ClaudeBridge.bridgeMessageSessionID(
+            requested: " explicit-session ",
+            active: "active-session"
+        ) == "explicit-session")
+        #expect(ClaudeBridge.bridgeMessageSessionID(
+            requested: "  ",
+            active: " active-session "
+        ) == "active-session")
+        #expect(ClaudeBridge.bridgeMessageSessionID(requested: nil, active: nil) == nil)
+    }
+
+    @Test("bridge state and default messages prefer the selected live chat")
+    func bridgeActiveSessionResolution() {
+        let rows: [[String: Any]] = [
+            [
+                "id": "newest-telegram",
+                "updatedAt": "2026-08-29T12:36:40Z",
+                "archived": false,
+            ],
+            [
+                "id": "selected-app-chat",
+                "updatedAt": "2026-08-28T21:49:06Z",
+                "archived": false,
+            ],
+        ]
+        let selected = ClaudeBridge.bridgeActiveSession(
+            preferred: "selected-app-chat",
+            rows: rows
+        )
+        #expect(selected.id == "selected-app-chat")
+
+        let fallback = ClaudeBridge.bridgeActiveSession(
+            preferred: "missing-or-archived",
+            rows: rows
+        )
+        #expect(fallback.id == "newest-telegram")
+    }
+
 
     // MARK: - Provenance projection
 

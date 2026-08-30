@@ -2008,6 +2008,65 @@ struct WorkshopExecutorPassCancellationSuite {
         #expect(events.filter { $0 == "step_completed|step-1|succeeded" }.count == 1)
         #expect(events.filter { $0 == "completed" }.count == 1)
     }
+
+    @Test(.timeLimit(.minutes(1)))
+    func cancelledApprovalContinuationRequeuesWithoutRepeatingApprovedStep() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "approval-cancel-success-boundary"
+        let plan = """
+        [
+          {"id":"step-1","description":"approved effect","tool_or_action":"test.approved","args":{},"autonomy":"needs_approval"},
+          {"id":"step-2","description":"continuation","tool_or_action":"test.next","args":{},"autonomy":"auto"}
+        ]
+        """
+        try await seedWorkshopExecution(
+            root: root, id: id, title: "resume", objective: "continue once", planJSON: plan
+        )
+        let calls = Counter()
+        let approvals = Counter()
+        let cancellation = ParentCancellationControl()
+        let executor = WorkshopExecutorLoop(
+            root: root,
+            toolDispatch: { tool, _ in
+                await calls.bump(tool)
+                if tool == "test.approved" { await cancellation.cancelParent() }
+                return .object(["status": .string("succeeded"), "tool": .string(tool)])
+            },
+            stageApproval: { _ in
+                await approvals.bump()
+                return "approval-once"
+            },
+            maxActive: 1,
+            stepTimeoutInterval: 60
+        )
+        await executor.drainOnce()
+        #expect(await readWorkshopExecution(root: root, id: id)?.status == "blocked_on_approval")
+
+        let resume = Task {
+            await cancellation.waitUntilArmed()
+            return try await executor.resumeAfterApproval(
+                executionId: id, stepId: "step-1", approved: true, approvalId: "approval-once"
+            )
+        }
+        await cancellation.arm { resume.cancel() }
+        do {
+            _ = try await resume.value
+            Issue.record("expected parent cancellation after approved step committed")
+        } catch is CancellationError {
+            // The task cancellation is surfaced, but its claim must be free.
+        }
+        let interrupted = await readWorkshopExecution(root: root, id: id)
+        #expect(interrupted?.status == "queued")
+        #expect(interrupted?.currentStepId == "")
+
+        await executor.drainOnce()
+        #expect(await readWorkshopExecution(root: root, id: id)?.status == "completed")
+        let (_, labels) = await calls.snapshot()
+        let (approvalCount, _) = await approvals.snapshot()
+        #expect(labels == ["test.approved", "test.next"])
+        #expect(approvalCount == 1)
+    }
 }
 
 // MARK: - Startup orphan reclaim (crash/restart slot-leak fix, 2026-06-15)
@@ -2249,6 +2308,47 @@ struct WorkshopExecutorApprovalTimeoutSuite {
     }
 
     /// Still within the deadline → left blocked (no premature kill).
+    @Test func timeoutSweepDoesNotExpireNewApprovalAfterResumeReblocks() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "approval-timeout-aba"
+        let clock = Date()
+        var oldBlock = blockedStepRecord
+        if case .object(var fields) = oldBlock {
+            fields["executed_at"] = .string(SwiftNativeWorkshopRunner.isoTimestamp(clock.addingTimeInterval(-7200)))
+            oldBlock = .object(fields)
+        }
+        let oldRecord = try await seedWorkshopExecution(
+            root: root, id: id, title: "t", objective: "t", planJSON: gatedPlan,
+            trustRequired: "send_approval", status: "blocked_on_approval", stepsCompleted: [oldBlock]
+        )
+        var nextRecord = oldRecord
+        nextRecord.currentStepId = "step-2"
+        nextRecord.updatedAt = SwiftNativeWorkshopRunner.isoTimestamp(clock)
+        nextRecord.stepsCompleted.append(.object([
+            "step_id": .string("step-2"), "status": .string("blocked_on_approval"),
+            "approval_id": .string("appr-2"), "executed_at": .string(nextRecord.updatedAt),
+        ]))
+        let replacement = nextRecord.toJSON()
+        let recordPath = root.appendingPathComponent("workshop/executions/\(id)/execution.json")
+        let executor = WorkshopExecutorLoop(root: root, approvalTimeoutInterval: 3600, now: { clock })
+        await executor._setBeforeApprovalTimeoutClaimForTesting {
+            // Deterministically land the resumed step's next approval after
+            // the sweep ages step-1, but before it locks the terminal mutation.
+            let persistence = SwiftNativePersistenceCore()
+            try? await persistence.withFileLock(recordPath) {
+                try await persistence.writeJSON(replacement, to: recordPath)
+            }
+        }
+        await executor.drainOnce()
+        let latest = await readWorkshopExecution(root: root, id: id)
+        #expect(latest?.status == "blocked_on_approval")
+        #expect(latest?.currentStepId == "step-2")
+        #expect(latest?.stepsCompleted == nextRecord.stepsCompleted)
+        #expect(try await !rawTimelineHasErrorPrefix(root: root, id: id, prefix: "approval_timeout_exceeded_"))
+    }
+
+    /// Still within the deadline → left blocked (no premature kill).
     @Test func blockedWorkshopExecutionWithinDeadlineSurvives() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2382,5 +2482,116 @@ struct WorkshopExecutorApprovalTimeoutSuite {
         #expect(completed.status == "completed")
         let (llmCount, _) = await llmRuns.snapshot()
         #expect(llmCount == 1)   // the step actually ran
+    }
+
+    @Test func mismatchedPersistedExecutionIdentityCannotBeClaimedOrMutated() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directoryID = "identity-slot"
+        let record = try await seedWorkshopExecution(
+            root: root,
+            id: directoryID,
+            title: "identity",
+            objective: "must not run",
+            planJSON: fixturePlanSingleStep
+        )
+        guard case .object(var mismatched) = record.toJSON() else {
+            Issue.record("seeded execution was not an object")
+            return
+        }
+        mismatched["id"] = .string("different-execution")
+        let recordPath = ExecutionRecordFile.canonicalPath(
+            in: root.appendingPathComponent(
+                "workshop/executions/\(directoryID)",
+                isDirectory: true
+            )
+        )
+        try await SwiftNativePersistenceCore().writeJSON(
+            .object(mismatched),
+            to: recordPath
+        )
+
+        let dispatches = Counter()
+        let executor = WorkshopExecutorLoop(
+            root: root,
+            llmStep: { _ in
+                await dispatches.bump()
+                return ("m", "should not run")
+            }
+        )
+        await executor.drainOnce()
+        let (dispatchCount, _) = await dispatches.snapshot()
+        #expect(dispatchCount == 0)
+
+        let runner = SwiftNativeWorkshopRunner(
+            executorAvailable: true,
+            root: root
+        )
+        #expect(await runner.getWorkshopExecution(directoryID) == nil)
+        #expect(await runner.listAll().isEmpty)
+        await #expect(throws: WorkshopExecutionError.self) {
+            _ = try await runner.cancel(executionId: directoryID)
+        }
+        #expect(await runner.getWorkshopExecution("../outside") == nil)
+        #expect(!SwiftNativeWorkshopRunner.isSafeExecutionID("../outside"))
+
+        guard case .object(let unchanged) = await SwiftNativePersistenceCore()
+            .readJSON(recordPath, defaultValue: .null) else {
+            Issue.record("mismatched record disappeared")
+            return
+        }
+        #expect(unchanged["id"] == .string("different-execution"))
+        #expect(unchanged["status"] == .string("queued"))
+    }
+}
+
+@Suite("WorkshopExecutorLoop: tool failure envelopes")
+struct WorkshopExecutorToolEnvelopeSuite {
+    @Test func explicitToolFailureStopsPlanAndPreservesExactEvidence() async throws {
+        let fixtures: [(name: String, output: JSONValue, status: String, calls: Int)] = [
+            ("denied", .object(["status": .string("denied"), "reason": .string("permission_denied")]), "failed", 1),
+            ("error", .object(["status": .string("error"), "error": .string("unavailable")]), "failed", 1),
+            ("false", .object(["ok": .bool(false), "error": .null]), "failed", 1),
+            ("exit", .object(["status": .string("ok"), "exit_code": .int(7)]), "failed", 1),
+            ("rejected", .object(["status": .string("rejected")]), "failed", 1),
+            ("success", .object(["status": .string("ok"), "error": .null]), "completed", 2),
+        ]
+        let plan = """
+        [
+          {"id":"step-1","description":"first","tool_or_action":"test.first","args":{},"autonomy":"auto"},
+          {"id":"step-2","description":"must wait for first","tool_or_action":"test.second","args":{},"autonomy":"auto"}
+        ]
+        """
+        for fixture in fixtures {
+            let root = try makeTempRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let id = "tool-envelope-\(fixture.name)"
+            try await seedWorkshopExecution(
+                root: root, id: id, title: "envelope", objective: "preserve truth", planJSON: plan
+            )
+            let calls = Counter()
+            let executor = WorkshopExecutorLoop(
+                root: root,
+                toolDispatch: { tool, _ in
+                    await calls.bump(tool)
+                    return tool == "test.first" ? fixture.output
+                        : .object(["status": .string("succeeded")])
+                }
+            )
+            await executor.drainOnce()
+            let final = await readWorkshopExecution(root: root, id: id)
+            let (callCount, _) = await calls.snapshot()
+            #expect(final?.status == fixture.status, "fixture \(fixture.name)")
+            #expect(callCount == fixture.calls, "fixture \(fixture.name)")
+            guard case .object(let first)? = final?.stepsCompleted.first else {
+                Issue.record("missing first outcome for \(fixture.name)")
+                continue
+            }
+            #expect(first["output"] == fixture.output)
+            if fixture.status == "failed" {
+                #expect(first["status"] == .string("failed"))
+                #expect(first["error"] != .string(""))
+            }
+        }
     }
 }

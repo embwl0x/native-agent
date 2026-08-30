@@ -289,7 +289,12 @@ struct ContentView: View {
                 )
                 .task(id: "\(selectionRaw)|\(skillsToolsSectionRaw)") {
                     let item = activeContentItem
-                    if item.normalized == .activity {
+                    if item.normalized == .diagnostics {
+                        // Doctor owns its report; Status and Runs share the
+                        // DiagnosticsView snapshot owner. Avoid racing a second
+                        // navigation-level read against those mounted surfaces.
+                        return
+                    } else if item.normalized == .activity {
                         // Activity's five queue rows must distinguish an
                         // empty, fully-read set from a failed backing read.
                         // Its complete refresh records that receipt; the
@@ -936,36 +941,6 @@ enum MemoryViewTab: String, CaseIterable, Identifiable {
         case .pending: return "tray"
         case .tombstones: return "xmark.bin"
         }
-    }
-}
-
-
-struct PrivacyCategoryRow: View {
-    var category: PrivacyCategory
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: category.exportable ? "square.and.arrow.up" : "lock.fill")
-                .foregroundStyle(category.exportable ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack {
-                    Text(category.title)
-                        .font(.subheadline.weight(.semibold))
-                    StatusBadge(text: category.exportable ? "Exportable" : "Protected", status: category.exportable ? "ok" : "warn")
-                }
-                Text(category.contains)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(category.path)
-                    .font(NativeAgentFont.mono)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
-        }
-        .textSelection(.enabled)
     }
 }
 

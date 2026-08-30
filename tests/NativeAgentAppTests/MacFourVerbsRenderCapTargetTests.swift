@@ -315,41 +315,54 @@ func liveSemanticScreenTracksVisualRegions() async throws {
     let first = try percept(x: 20)
     let second = try percept(x: 28)
     let relocated = try percept(x: 150)
-    let firstRow = try #require(first.rows.first(where: VisionPercept.isPhysicalRegionCandidate))
-    let secondRow = try #require(second.rows.first(where: VisionPercept.isPhysicalRegionCandidate))
-    let relocatedRow = try #require(relocated.rows.first(where: VisionPercept.isPhysicalRegionCandidate))
+    let firstRow = try #require(first.rows.first {
+        VisionPercept.isPhysicalRegionCandidate($0, frameSize: first.frameSize)
+    })
+    let secondRow = try #require(second.rows.first {
+        VisionPercept.isPhysicalRegionCandidate($0, frameSize: second.frameSize)
+    })
+    let relocatedRow = try #require(relocated.rows.first {
+        VisionPercept.isPhysicalRegionCandidate($0, frameSize: relocated.frameSize)
+    })
     let scene = SwiftToolDispatcherFourVerbLiveScene()
+    let firstCapture = Date(timeIntervalSince1970: 1_000)
 
     let firstIDs = await scene.identify(
         rows: first.rows,
         frameSize: first.frameSize,
         origin: (100, 200),
         logicalSize: (1_000, 600),
-        sceneKey: "fixture"
+        sceneKey: "fixture",
+        capturedAt: firstCapture,
+        now: firstCapture
     )
     let secondIDs = await scene.identify(
         rows: second.rows,
         frameSize: second.frameSize,
         origin: (100, 200),
         logicalSize: (1_000, 600),
-        sceneKey: "fixture"
+        sceneKey: "fixture",
+        capturedAt: firstCapture.addingTimeInterval(0.1),
+        now: firstCapture.addingTimeInterval(0.1)
     )
     let relocatedIDs = await scene.identify(
         rows: relocated.rows,
         frameSize: relocated.frameSize,
         origin: (100, 200),
         logicalSize: (1_000, 600),
-        sceneKey: "fixture"
+        sceneKey: "fixture",
+        capturedAt: firstCapture.addingTimeInterval(0.2),
+        now: firstCapture.addingTimeInterval(0.2)
     )
 
-    let firstIdentity = try #require(firstIDs[firstRow.rect])
-    let secondIdentity = try #require(secondIDs[secondRow.rect])
-    let relocatedIdentity = try #require(relocatedIDs[relocatedRow.rect])
+    let firstIdentity = try #require(firstIDs.identities[firstRow.rect])
+    let secondIdentity = try #require(secondIDs.identities[secondRow.rect])
+    let relocatedIdentity = try #require(relocatedIDs.identities[relocatedRow.rect])
     #expect(secondIdentity.id == firstIdentity.id)
-    #expect(secondIdentity.motion == "moving right")
+    #expect(secondIdentity.motion?.hasPrefix("moving right") == true)
     #expect(relocatedIdentity.id == firstIdentity.id,
             "the same distinctive object may relocate after a successful action")
-    #expect(relocatedIdentity.motion == "moving right")
+    #expect(relocatedIdentity.motion == "repositioned")
 }
 
 @Test("every redacted canvas string remains readable when one visual row claims the band")

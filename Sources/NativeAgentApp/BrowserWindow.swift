@@ -32,11 +32,38 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Senda
     // HTTP response was seen — didFinish must NOT fabricate a 200 (404/500 pages
     // load "successfully" and would persist receipts claiming success).
     private var lastHTTPStatus: Int?
+    /// A rejected top-level redirect is carried into WebKit's failure callback
+    /// so callers receive the exact policy reason instead of a generic cancel.
+    var rejectedScheme: String?
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         // Reset per navigation so a prior page's status can't leak into a
         // navigation that never produces an HTTP response.
         lastHTTPStatus = nil
+    }
+
+    @MainActor
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
+    ) {
+        // The explicit entry URL is checked by every route, but redirects are
+        // new navigation actions. Keep subframes compatible with the web while
+        // refusing a top-level hop into file:, data:, javascript:, or another
+        // local/custom scheme before it becomes capture authority.
+        guard navigationAction.targetFrame?.isMainFrame != false else {
+            decisionHandler(.allow)
+            return
+        }
+        let scheme = navigationAction.request.url?.scheme?.lowercased() ?? ""
+        if scheme == "http" || scheme == "https"
+            || (scheme == "about" && onFinish == nil) {
+            decisionHandler(.allow)
+            return
+        }
+        rejectedScheme = scheme.isEmpty ? "unknown" : scheme
+        decisionHandler(.cancel)
     }
 
     @MainActor
@@ -55,23 +82,43 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Senda
         guard navigation === expectedNavigation else { return }
         let url = webView.url?.absoluteString ?? ""
         let title = webView.title ?? ""
-        onFinish?(.success(NavResult(url: url, title: title, httpStatus: lastHTTPStatus)))
+        let scheme = webView.url?.scheme?.lowercased() ?? ""
+        if scheme == "http" || scheme == "https" {
+            onFinish?(.success(NavResult(url: url, title: title, httpStatus: lastHTTPStatus)))
+        } else {
+            onFinish?(.failure(BrowserError.unsafeScheme(scheme.isEmpty ? "unknown" : scheme)))
+        }
         onFinish = nil
         expectedNavigation = nil
+        rejectedScheme = nil
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         guard navigation === expectedNavigation else { return }
-        onFinish?(.failure(error))
+        finishFailure(error)
+    }
+
+    private func finishFailure(_ error: Error) {
+        // WebKit may reject some restricted schemes before delivering the
+        // navigation-action policy callback. Recover the exact destination
+        // from its failure metadata so the caller still receives the perimeter
+        // reason instead of an opaque WebKit error.
+        let failingURL = (error as NSError).userInfo[NSURLErrorFailingURLErrorKey] as? URL
+        let failingScheme = failingURL?.scheme?.lowercased()
+        let unsafeFailingScheme = failingScheme.flatMap { scheme in
+            scheme == "http" || scheme == "https" ? nil : scheme
+        }
+        let failure: Error = (rejectedScheme ?? unsafeFailingScheme)
+            .map(BrowserError.unsafeScheme) ?? error
+        onFinish?(.failure(failure))
         onFinish = nil
         expectedNavigation = nil
+        rejectedScheme = nil
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         guard navigation === expectedNavigation else { return }
-        onFinish?(.failure(error))
-        onFinish = nil
-        expectedNavigation = nil
+        finishFailure(error)
     }
 }
 
@@ -307,6 +354,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
                     self.activeNavigationID = nil
                     finish(.failure(BrowserError.timeout))
                 }
+                navDelegate.rejectedScheme = nil
                 navDelegate.onFinish = { [weak self] result in
                     timeoutTask.cancel()
                     self?.activeNavigationID = nil
@@ -384,7 +432,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
     // containing quotes, backslashes, or other JS metacharacters cannot inject
     // arbitrary JavaScript.  JSONSerialization produces a properly escaped JS
     // string literal including the surrounding double-quotes.
-    private func jsStringLiteral(_ s: String) -> String {
+    private static func jsStringLiteral(_ s: String) -> String {
         // A JavaScript string literal is a JSON *fragment*, not an object or
         // array.  Without `.fragmentsAllowed`, Foundation raises an Objective-C
         // exception for every ordinary selector/text input before the Swift
@@ -403,24 +451,56 @@ final class BrowserWindowController: NSObject, ObservableObject {
 
     func click(selector: String) async throws {
         // N9 fix: use JSON-encoded selector literal to prevent JS injection.
-        let jsSel = jsStringLiteral(selector)
+        let jsSel = Self.jsStringLiteral(selector)
         _ = try await runJS("document.querySelector(\(jsSel)).click()")
     }
 
     func fill(selector: String, text: String) async throws {
+        do {
+            _ = try await runJS(Self.fillScript(selector: selector, text: text))
+        } catch {
+            throw Self.fillFailure(error)
+        }
+    }
+
+    /// WebKit's localized description hides the script's outcome explanation.
+    /// Keep that bounded detail for the caller, without reclassifying transport
+    /// failures or cancellation as a DOM rejection.
+    static func fillFailure(_ error: Error) -> Error {
+        let failure = error as NSError
+        guard failure.domain == WKError.errorDomain,
+              failure.code == WKError.Code.javaScriptExceptionOccurred.rawValue,
+              let message = failure.userInfo["WKJavaScriptExceptionMessage"] as? String,
+              !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return error }
+        return BrowserError.fillFailed(String(message.prefix(1024)))
+    }
+
+    /// The exact script sent to WebKit is also exercised by headless JS
+    /// fixtures. Success means this immediate DOM readback matched, not that
+    /// a framework persisted the edit or a later page update cannot undo it.
+    static func fillScript(selector: String, text: String) -> String {
         // N9 fix: use JSON-encoded selector and text literals to prevent JS injection.
         let jsSel = jsStringLiteral(selector)
         let jsText = jsStringLiteral(text)
-        let js = """
+        return """
         (function(){
           var el = document.querySelector(\(jsSel));
           if(!el) throw new Error('Element not found: ' + \(jsSel));
-          el.value = \(jsText);
+          var editableContent = el.isContentEditable === true;
+          if(!editableContent && !('value' in el)) {
+            throw new Error('Element has no fillable value or editable content');
+          }
+          var requested = \(jsText);
+          if(editableContent) el.textContent = requested;
+          else el.value = requested;
           el.dispatchEvent(new Event('input', {bubbles:true}));
           el.dispatchEvent(new Event('change', {bubbles:true}));
+          var observed = editableContent ? el.textContent : el.value;
+          if(observed !== requested) {
+            throw new Error('Fill outcome mismatch after input/change events; the page did not retain the requested text. Do not blindly retry.');
+          }
         })()
         """
-        _ = try await runJS(js)
     }
 
     func readText() async throws -> String {
@@ -849,6 +929,7 @@ enum BrowserError: LocalizedError {
     case notReady
     case screenshotFailed
     case badRequest(String)
+    case fillFailed(String)
     /// C7 fix: returned when navigate is called while another navigation is in progress.
     case busy
     case timeout
@@ -860,6 +941,7 @@ enum BrowserError: LocalizedError {
         case .notReady: return "Browser window is not ready"
         case .screenshotFailed: return "Failed to capture screenshot"
         case .badRequest(let msg): return "Bad request: \(msg)"
+        case .fillFailed(let detail): return "Browser fill failed: \(detail)"
         case .busy: return "Browser is busy with another navigation — try again shortly"
         case .timeout: return "Browser navigation timed out"
         case .unsafeScheme(let scheme): return "Current page scheme '\(scheme)' is not allowed; only http/https are permitted"

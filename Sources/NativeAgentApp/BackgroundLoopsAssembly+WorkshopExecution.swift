@@ -90,16 +90,9 @@ extension BackgroundLoopsAssembly {
                     dataRoot: dataRoot,
                     allowProcessGlobalTools: usesLiveAppBody
                 ))
-            let client = makeChatOrchestrationClient(
+            let client = makeNativeAgentAppChatOrchestrationClient(
                 tools: restricted,
-                dataRoot: dataRoot,
-                cognitiveObserver: cognition,
-                cognitiveContextProvider: cognition,
-                providerLifecycleObserver: cognition,
-                contextFlow: usesLiveAppBody ? NativeContextFlowRuntime.shared : nil,
-                memoryAtomTranslator: usesLiveAppBody
-                    ? NativeContextFlowRuntime.memoryRecordAtomID(forRecordID:)
-                    : nil
+                dataRoot: dataRoot
             )
             let response = try await client.runEphemeralToolTurn(
                 message: prompt,
@@ -434,7 +427,7 @@ private struct WorkshopExecutorDrainRunner: EventDeadlineLoopRunner {
     func physiologyEvents() -> AsyncStream<Void> {
         EventDeadlinePhysiology.storeAndFileEvents(paths: [
             dataRoot.appendingPathComponent("workshop/executions", isDirectory: true),
-        ])
+        ], loopId: loopId)
     }
 
     func nextMeaningfulDeadline(after now: Date) async -> Date? {

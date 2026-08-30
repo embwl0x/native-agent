@@ -239,6 +239,60 @@ private func observation(
     #expect(parsed["slack_socket_mode"]?.count == 1)
 }
 
+@Test func receipts_parser_counts_coalesced_occurrences() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("DoctorLoopHealthOccurrences-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let file = dir.appendingPathComponent("background_loop_failures.jsonl")
+    try """
+    {"kind":"background_loop.failure","loopId":"github_tracking","status":"failed","error":"timeout after 120s","createdAt":"2026-07-16T07:52:13Z","firstAt":"2026-07-16T07:52:13Z","lastAt":"2026-07-16T07:54:13Z","occurrences":3,"id":"1"}
+    """.write(to: file, atomically: true, encoding: .utf8)
+
+    let parsed = DoctorLoopHealth.recentFailureDates(receiptsFile: file)
+    #expect(parsed["github_tracking"]?.count == 3)
+}
+
+/// C4: receipts coalesce, so a loop that fails every tick now leaves ONE row
+/// carrying `occurrences` instead of N rows. If Doctor kept counting ROWS, that
+/// loop would drop from persistently-failing (red) to a single blip (yellow)
+/// and persistent-failure detection would die silently. This runs the real
+/// path — coalesced file on disk → recentFailureDates → evaluate — and pins the
+/// red verdict, with a control proving the assertion can still see yellow.
+@Test func doctor_flags_persistent_failure_from_a_single_coalesced_receipt() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("DoctorCoalescedPersistence-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let stamp = ISO8601DateFormatter()
+    let firstAt = stamp.string(from: now.addingTimeInterval(-1_200))
+    let lastAt = stamp.string(from: now.addingTimeInterval(-60))
+    let obs = observation(lastRun: now.addingTimeInterval(-60), lastError: "timeout after 120s")
+
+    func verdict(occurrences: Int) throws -> LoopHealthVerdict {
+        let file = dir.appendingPathComponent("failures-\(occurrences).jsonl")
+        try """
+        {"kind":"background_loop.failure","loopId":"github_tracking","status":"failed","error":"timeout after 120s","firstAt":"\(firstAt)","lastAt":"\(lastAt)","occurrences":\(occurrences),"id":"1"}
+        """.write(to: file, atomically: true, encoding: .utf8)
+        let dates = DoctorLoopHealth.recentFailureDates(receiptsFile: file)
+        return DoctorLoopHealth.evaluate(
+            observations: [obs], recentFailureDates: dates, now: now
+        )[0]
+    }
+
+    // One row, occurrences ≥ threshold → still persistently failing.
+    let coalesced = try verdict(occurrences: DoctorLoopHealth.persistentFailureThreshold + 1)
+    #expect(coalesced.level == .fail)
+    #expect(coalesced.detail.contains("Failing persistently"))
+
+    // Control: the same single row without a streak behind it stays a blip, so
+    // the assertion above is not passing for free.
+    let single = try verdict(occurrences: 1)
+    #expect(single.level == .warn)
+}
+
 @Test func receipts_parser_missing_file_is_empty_not_crash() {
     let missing = FileManager.default.temporaryDirectory
         .appendingPathComponent("nonexistent-\(UUID().uuidString).jsonl")

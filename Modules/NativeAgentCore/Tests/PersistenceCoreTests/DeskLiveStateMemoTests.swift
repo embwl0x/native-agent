@@ -114,7 +114,8 @@ struct DeskLiveStateMemoTests {
             handle: DeskClock.newHandle(),
             body: .createItem(
                 alias: "99", kind: .plan, project: "p", title: "smuggled",
-                parent: nil, summary: nil, origin: .owner, pursuit: nil
+                parent: nil, summary: nil, assignee: nil, laneOf: nil,
+                origin: .owner, pursuit: nil
             )
         )
         let line = try foreign.toJSON().serialize(pretty: false) + "\n"

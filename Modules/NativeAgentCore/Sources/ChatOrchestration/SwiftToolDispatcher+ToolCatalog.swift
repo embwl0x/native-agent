@@ -327,6 +327,17 @@ extension SwiftToolDispatcher {
             .subtracting(fourVerbToolNames)
     }
 
+    /// Tools such as `mac_focus_app` remain in the internal dispatcher for
+    /// diagnostics and compatibility, but the conversational model uses the
+    /// four native verbs instead. Every capability projection must pass
+    /// through this boundary so an internal/UI name is never advertised as a
+    /// callable model tool without a schema.
+    public static func modelVisibleCatalogToolNames(
+        _ availableToolNames: Set<String>
+    ) -> Set<String> {
+        availableToolNames.subtracting(legacyMacModelToolNames)
+    }
+
     static func normalModelToolNames(activeTools: Set<String>) -> Set<String> {
         alwaysOnCoreNames.union(activeTools.subtracting(legacyMacModelToolNames))
     }

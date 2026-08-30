@@ -224,6 +224,79 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     #expect(box.value?.environment?["LANG"] == "en_US")
 }
 
+@Test func codex_adapter_realRunnerResolvesFakeCodexFromInjectedPATHAndPreservesInvocation() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("codex-path-boundary-\(UUID().uuidString)", isDirectory: true)
+    let bin = root.appendingPathComponent("bin", isDirectory: true)
+    let capture = root.appendingPathComponent("invocation.txt")
+    let fakeCodex = bin.appendingPathComponent("codex")
+    try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let script = #"""
+    #!/bin/sh
+    {
+      printf 'path=%s\n' "$PATH"
+      printf 'argv0=%s\n' "$0"
+      for arg in "$@"; do printf 'arg=%s\n' "$arg"; done
+      printf '%s\n' 'stdin:'
+      while IFS= read -r line || [ -n "$line" ]; do printf '%s\n' "$line"; done
+    } > "$NATIVE_AGENT_CODEX_CAPTURE"
+    printf '%s' 'fake-codex-response'
+    """#
+    try script.write(to: fakeCodex, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: fakeCodex.path
+    )
+
+    let environment = [
+        "PATH": bin.path,
+        "NATIVE_AGENT_CODEX_CAPTURE": capture.path,
+        "LANG": "C",
+    ]
+    let adapter = CodexAdapter(
+        codexBin: "codex",
+        timeout: 5,
+        processEnvironmentOverride: environment
+    )
+    let output = try await adapter.complete(
+        prompt: "boundary prompt",
+        system: "boundary system",
+        model: "gpt-5.6-sol"
+    )
+
+    #expect(output == "fake-codex-response")
+    let invocation = try String(contentsOf: capture, encoding: .utf8)
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map(String.init)
+    #expect(invocation == [
+        "path=\(bin.path)",
+        "argv0=\(fakeCodex.path)",
+        "arg=-m",
+        "arg=gpt-5.6-sol",
+        "arg=--system",
+        "arg=boundary system",
+        "stdin:",
+        "boundary prompt",
+        "",
+    ])
+
+    // Negative control: the explicit PATH is the whole search boundary. A
+    // missing name must fail rather than borrowing a real Codex installation
+    // from the developer machine, and it must not touch the prior capture.
+    let beforeMissingProbe = try Data(contentsOf: capture)
+    let missing = CodexAdapter(
+        codexBin: "codex-not-present",
+        timeout: 5,
+        processEnvironmentOverride: environment
+    )
+    await #expect(throws: LLMError.self) {
+        _ = try await missing.complete(prompt: "must not run", system: nil, model: "gpt-5.6-sol")
+    }
+    #expect(try Data(contentsOf: capture) == beforeMissingProbe)
+}
+
 @Test func codex_adapter_forwardsGPT56ReasoningAndFastControls() async throws {
     final class Box: @unchecked Sendable { var value: CodexProcessInvocation? }
     let box = Box()

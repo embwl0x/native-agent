@@ -553,6 +553,19 @@ extension GitHubConnectorActions {
             freshKeys: Set(freshKeys)
         ).map(\.key).sorted()
     }
+
+    static func testLinkedIssueCarryDecision(
+        prior: JSONValue,
+        staleHours: Int,
+        now: Date
+    ) -> String {
+        guard let entity = TrackingEntity.fromJSON(prior) else { return "invalid" }
+        return GitHubProjectTracker.carriedForwardLinkedIssue(
+            prior: entity,
+            staleHours: staleHours,
+            now: now
+        ) == nil ? "fetch" : "carry"
+    }
 }
 
 private struct TrackedRepository: Sendable, Equatable {
@@ -1000,10 +1013,26 @@ private enum GitHubProjectTracker {
 
     static func refresh(dataRoot: URL, force: Bool) async throws -> TrackingSnapshot {
         let config = try loadConfig(dataRoot: dataRoot)
-        if !force, let prior = try? await loadSnapshot(dataRoot: dataRoot),
-           let refreshed = DeskClock.parseISO(prior.refreshedAt),
-           Date().timeIntervalSince(refreshed) < Double(config.refreshIntervalMinutes * 60) { return prior }
         let previous = try? await loadSnapshot(dataRoot: dataRoot)
+        if !force, let previous,
+           let refreshed = DeskClock.parseISO(previous.refreshedAt),
+           Date().timeIntervalSince(refreshed) < Double(config.refreshIntervalMinutes * 60) {
+            return previous
+        }
+        return try await GitHubConnectorActions.withResolvedToken(dataRoot: dataRoot) {
+            try await refreshWithResolvedToken(
+                dataRoot: dataRoot,
+                config: config,
+                previous: previous
+            )
+        }
+    }
+
+    private static func refreshWithResolvedToken(
+        dataRoot: URL,
+        config: TrackingConfig,
+        previous: TrackingSnapshot?
+    ) async throws -> TrackingSnapshot {
         var previousReviewThreads: [String: [GitHubCommandReviewThreadEvidence]] = Dictionary(
             uniqueKeysWithValues: (previous?.entities ?? []).compactMap { entity -> (String, [GitHubCommandReviewThreadEvidence])? in
                 guard let threads = entity.commandObservation?.reviewThreads else { return nil }
@@ -1347,6 +1376,15 @@ private enum GitHubProjectTracker {
             }
             for number in linkedNumbers.sorted() {
                 if budget.isExhausted { break }
+                let key = "\(repo.fullName.lowercased())#issue#\(number)"
+                if let carried = carriedForwardLinkedIssue(
+                    prior: priorByKey[key],
+                    staleHours: config.staleAfterHours
+                ) {
+                    entities.append(carried)
+                    carriedForward += 1
+                    continue
+                }
                 guard let row = try await GitHubConnectorActions.call(
                     path: "repos/\(repo.fullName)/issues/\(number)",
                     dataRoot: dataRoot
@@ -1574,17 +1612,46 @@ private enum GitHubProjectTracker {
     /// instead of thundering the whole tracked set on one tick.
     static let carryAgeFloorSeconds: TimeInterval = 45 * 60
     static let carryAgeJitterSeconds: TimeInterval = 30 * 60
+    static let linkedIssueOpenRefreshFloorSeconds: TimeInterval = 15 * 60
+    static let linkedIssueOpenRefreshJitterSeconds: TimeInterval = 15 * 60
+    static let linkedIssueClosedRefreshFloorSeconds: TimeInterval = 60 * 60
+    static let linkedIssueClosedRefreshJitterSeconds: TimeInterval = 60 * 60
 
     /// Stable across launches (unlike hashValue's per-process SipHash seed):
     /// FNV-1a over the key's UTF-8, reduced into the jitter window.
     fileprivate static func carryAgeAllowance(forKey key: String) -> TimeInterval {
+        carryAgeFloorSeconds + stableJitter(forKey: key, window: carryAgeJitterSeconds)
+    }
+
+    private static func stableJitter(forKey key: String, window: TimeInterval) -> TimeInterval {
         var hash: UInt64 = 0xcbf29ce484222325
         for byte in key.utf8 {
             hash ^= UInt64(byte)
             hash = hash &* 0x100000001b3
         }
-        let jitter = TimeInterval(hash % UInt64(carryAgeJitterSeconds))
-        return carryAgeFloorSeconds + jitter
+        return TimeInterval(hash % max(1, UInt64(window)))
+    }
+
+    fileprivate static func carriedForwardLinkedIssue(
+        prior: TrackingEntity?,
+        staleHours: Int,
+        now: Date = Date()
+    ) -> TrackingEntity? {
+        guard let prior,
+              prior.kind == "issue",
+              !prior.needsUser,
+              let stampRaw = prior.detailFetchedAt,
+              let stamp = DeskClock.parseISO(stampRaw)
+        else { return nil }
+        let floor = prior.state == "open"
+            ? linkedIssueOpenRefreshFloorSeconds
+            : linkedIssueClosedRefreshFloorSeconds
+        let jitter = prior.state == "open"
+            ? linkedIssueOpenRefreshJitterSeconds
+            : linkedIssueClosedRefreshJitterSeconds
+        guard now.timeIntervalSince(stamp) < floor + stableJitter(forKey: prior.key, window: jitter)
+        else { return nil }
+        return refreshingLocalStaleness(of: prior, staleHours: staleHours)
     }
 
     fileprivate static func carriedForwardEntity(
@@ -1645,9 +1712,15 @@ private enum GitHubProjectTracker {
               let stamp = DeskClock.parseISO(stampRaw),
               now.timeIntervalSince(stamp) < carryAgeAllowance(forKey: prior.key)
         else { return nil }
-        // Remote state is confirmed unchanged this refresh; only the local
-        // staleness window advances with wall-clock. Re-derive it so a carried
-        // entity is indistinguishable from a re-fetch of the same unchanged PR.
+        return refreshingLocalStaleness(of: prior, staleHours: staleHours)
+    }
+
+    /// A carried remote row still has one wall-clock-derived field. Refresh it
+    /// locally so cadence savings never freeze the transition into staleness.
+    private static func refreshingLocalStaleness(
+        of prior: TrackingEntity,
+        staleHours: Int
+    ) -> TrackingEntity {
         let freshStale = isStale(prior.updatedAt, hours: staleHours) && prior.state == "open"
         if freshStale == prior.stale { return prior }
         let refreshedObservation: GitHubCommandObservation? = prior.commandObservation.map { obs in
@@ -1819,16 +1892,13 @@ private enum GitHubProjectTracker {
         }
 
         let cadenceStore = DeskCadenceStore(dataRoot: dataRoot)
-        for observation in observations {
-            do {
-                _ = try await cadenceStore.recordObservation(
-                    refKey: observation.refKey,
-                    fingerprint: observation.fingerprint,
-                    at: now
-                )
-            } catch {
-                NSLog("[desk-observe] cadence record failed for \(observation.refKey): \(error)")
-            }
+        let fingerprintsByRef = observations.reduce(into: [String: String]()) {
+            $0[$1.refKey] = $1.fingerprint
+        }
+        do {
+            _ = try await cadenceStore.recordObservations(fingerprintsByRef, at: now)
+        } catch {
+            NSLog("[desk-observe] cadence batch record failed: \(error)")
         }
 
         do {
@@ -1863,7 +1933,8 @@ private enum GitHubProjectTracker {
 
 private extension GitHubConnectorActions {
     static func authenticatedLogin(dataRoot: URL) async throws -> String {
-        let user = try await validateStoredToken(dataRoot: dataRoot)
+        let token = try await requestToken(explicitToken: nil, dataRoot: dataRoot)
+        let user = try await validateToken(token)
         guard let login = user["login"] as? String, !login.isEmpty else {
             throw GitHubConnectorError.invalidResponse("authenticated GitHub user did not include a login")
         }
@@ -2052,7 +2123,8 @@ private func issueEntity(_ row: [String: Any], repo: String, staleHours: Int, ac
         author: (row["user"] as? [String: Any])?["login"] as? String, reviewState: nil, checks: nil, mergeable: nil,
         needsUser: observation?.humanDecision != nil, blocked: false,
         stale: isStale(updated, hours: staleHours) && state == "open",
-        commandObservation: observation
+        commandObservation: observation,
+        detailFetchedAt: DeskClock.nowISO()
     )
 }
 
@@ -2093,6 +2165,6 @@ private func deskSummary(_ entity: TrackingEntity) -> String {
 }
 
 private func isStale(_ timestamp: String, hours: Int) -> Bool {
-    guard let date = ISO8601DateFormatter().date(from: timestamp) else { return false }
+    guard let date = DeskClock.parseISO(timestamp) else { return false }
     return Date().timeIntervalSince(date) >= Double(hours * 3_600)
 }

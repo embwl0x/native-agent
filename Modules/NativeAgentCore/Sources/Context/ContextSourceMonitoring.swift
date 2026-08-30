@@ -39,6 +39,7 @@ public enum ContextSourceRegistryError: Error, Equatable, Sendable {
 public actor ContextSourceRegistry {
     private var allowedRoots: Set<URL>
     private var registrations: [ContextSourceID: ContextSourceRegistration] = [:]
+    private var authoritativeOwners: Set<String> = []
 
     public init(allowedRoots: [URL] = []) throws {
         self.allowedRoots = try Set(allowedRoots.map(Self.canonicalFileURL))
@@ -81,6 +82,22 @@ public actor ContextSourceRegistry {
         for (id, registration) in normalized {
             registrations[id] = registration
         }
+        authoritativeOwners.insert(owner)
+    }
+
+    /// Only `replaceOwned` declares a complete inventory. Ordinary individual
+    /// registrations must not retire unrelated stored or projected sources.
+    /// Empty inventories are retained so a removed owner's last source can be
+    /// retired even when discovery starts against a persisted generation.
+    public func authoritativeSourceIDsByOwner() -> [String: Set<ContextSourceID>] {
+        var result = Dictionary(uniqueKeysWithValues: authoritativeOwners.map {
+            ($0, Set<ContextSourceID>())
+        })
+        for registration in registrations.values where
+            authoritativeOwners.contains(registration.descriptor.owner) {
+            result[registration.descriptor.owner, default: []].insert(registration.descriptor.id)
+        }
+        return result
     }
 
     public func remove(_ sourceID: ContextSourceID) -> ContextSourceRegistration? {

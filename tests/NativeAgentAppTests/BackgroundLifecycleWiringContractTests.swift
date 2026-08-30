@@ -39,9 +39,19 @@ private struct WiringProbeLoop: LoopRunner {
     func tickOutcome() async -> LoopTickOutcome { .completed(result: nil) }
 }
 
-private actor AssembleCounter {
-    private(set) var calls = 0
-    func bump() { calls += 1 }
+private final class AssembleCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var calls: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+    func bump() {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+    }
 }
 
 private final class RestartOwnerProbe: @unchecked Sendable {
@@ -321,38 +331,44 @@ struct BackgroundLifecycleWiringContractTests {
         #expect(probe.snapshot() == (spawns: 1, terminations: 1))
     }
 
-    // MARK: - wake auto-assembly
+    // MARK: - wake lifecycle ownership
 
-    @Test("an OS wake for an unregistered loop assembles the manifest and reports a distinguishable outcome")
+    @Test("OS wakes never assemble the manifest and unknown running-loop IDs report failure")
     func wakeForUnknownLoopDoesNotSilentlySucceed() async {
-        // NSBackgroundActivityScheduler hands `runTickIfDue(loopId:)` an id from
-        // its own table. If that id is not in the manifest the facade still
-        // starts everything — and the OS gets a completion. The dangerous shape
-        // is a `.completed` for work that never ran.
+        // Launch owns manifest assembly. Early and late OS callbacks must not
+        // start the runtime; an unknown ID while running must not claim success.
         let core = BackgroundLoops.BackgroundLoopsManager()
         let counter = AssembleCounter()
         let facade = BackgroundLoopsManager(
             coreManager: core,
             assembleLoops: {
-                Task { await counter.bump() }
+                counter.bump()
                 return [WiringProbeLoop(loopId: "wake_probe_loop")]
             },
             runAutoDoctorAtLaunch: { false },
             runHeartbeatAtLaunch: { false }
         )
 
-        let unknown = await facade.runTickIfDue(loopId: "no_such_loop")
-        if case .completed = unknown {
-            Issue.record("a wake for an unregistered loop reported .completed — the OS is told work happened that never ran")
-        }
-        // The side effect IS the documented behavior: the manifest gets started.
-        #expect(await core.registered() == ["wake_probe_loop"])
+        let inactive = LoopTickOutcome.skipped(
+            reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true
+        )
+        #expect(await facade.runTickIfDue(loopId: "no_such_loop") == inactive)
+        #expect(await core.registered().isEmpty)
+        #expect(!(await facade.isRunning()))
+        #expect(counter.calls == 0)
 
-        // A wake for a registered id still runs it.
-        let known = await facade.runTickIfDue(loopId: "wake_probe_loop")
-        if case .failed(let error) = known {
-            Issue.record("a wake for a registered loop failed: \(error)")
-        }
+        await facade.start()
+        #expect(await core.registered() == ["wake_probe_loop"])
+        #expect(counter.calls == 1)
+        #expect(await facade.runTickIfDue(loopId: "no_such_loop")
+            == .failed(error: "loop not registered: no_such_loop"))
+
+        // A registered loop keeps its cadence; a wake cannot force an early tick.
+        #expect(await facade.runTickIfDue(loopId: "wake_probe_loop") == inactive)
         await facade.stop()
+        #expect(await facade.runTickIfDue(loopId: "wake_probe_loop") == inactive)
+        #expect(await facade.runTickIfDue(loopId: "no_such_loop") == inactive)
+        #expect(!(await facade.isRunning()))
+        #expect(counter.calls == 1)
     }
 }

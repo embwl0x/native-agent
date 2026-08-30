@@ -22,6 +22,7 @@ enum UserDisplayFormatters {
     // both are produced by NativeAgent's durable stores.
     private static let fractionalISO = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let plainISO = Date.ISO8601FormatStyle()
+    private static let timestampParseCache = TimestampParseCache(capacity: 2_048)
 
     /// Convert an ISO-8601 timestamp (with or without fractional seconds) to
     /// a relative phrase like "5 weeks ago" / "in 3 hours". On parse failure
@@ -42,7 +43,9 @@ enum UserDisplayFormatters {
     static func parseISOTimestamp(_ iso: String) -> Date? {
         let trimmed = iso.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-        return (try? fractionalISO.parse(trimmed)) ?? (try? plainISO.parse(trimmed))
+        return timestampParseCache.value(for: trimmed) {
+            (try? fractionalISO.parse(trimmed)) ?? (try? plainISO.parse(trimmed))
+        }
     }
 
     /// Timestamp used under a chat bubble. Kept here with the canonical wire
@@ -315,6 +318,54 @@ enum UserDisplayFormatters {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.contains("_") else { return trimmed }
         return trimmed.replacingOccurrences(of: "_", with: " ")
+    }
+}
+
+/// ISO timestamps are immutable wire values and recur throughout lists and
+/// status chrome. Keep both successful and failed parses in a small FIFO so a
+/// SwiftUI redraw does not rebuild the same Date over and over. The lock keeps
+/// the shared formatter helper safe for background projections too.
+private final class TimestampParseCache: @unchecked Sendable {
+    private enum Entry {
+        case date(Date)
+        case invalid
+
+        var date: Date? {
+            if case .date(let date) = self { return date }
+            return nil
+        }
+    }
+
+    private let capacity: Int
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+    private var order: [String] = []
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+    }
+
+    func value(for key: String, load: () -> Date?) -> Date? {
+        lock.lock()
+        if let entry = entries[key] {
+            lock.unlock()
+            return entry.date
+        }
+        lock.unlock()
+
+        let loaded = load()
+        lock.lock()
+        if let raced = entries[key] {
+            lock.unlock()
+            return raced.date
+        }
+        entries[key] = loaded.map(Entry.date) ?? .invalid
+        order.append(key)
+        if order.count > capacity {
+            entries.removeValue(forKey: order.removeFirst())
+        }
+        lock.unlock()
+        return loaded
     }
 }
 

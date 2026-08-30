@@ -107,6 +107,22 @@ enum TrustGuardrailSummary {
     }
 
     private static func autonomyRow(policy: TrustPolicy) -> TrustGuardrailRow {
+        // The saved baseline is not the effective routine-tool posture while
+        // Full Mac is active. Reuse the expiry presentation's canonical gate
+        // verdict; a selected mode alone must not claim active autonomy.
+        switch FullMacExpiry.state(policy) {
+        case .active, .never:
+            return TrustGuardrailRow(
+                id: "autonomy",
+                title: "Before it changes something",
+                value: "Full Mac autonomy active",
+                detail: "Routine actions can run without asking on this Mac and trusted remote surfaces, including outside your workspaces. External sends, explicit tool blocks, and protected system actions keep their own checks.",
+                systemImage: "hand.raised",
+                tone: .danger
+            )
+        case .off, .expired, .unreadable:
+            break
+        }
         let value: String
         let detail: String
         let tone: TrustGuardrailTone

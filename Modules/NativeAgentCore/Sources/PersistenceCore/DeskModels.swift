@@ -88,6 +88,57 @@ public enum DeskOrigin: String, Sendable, CaseIterable, Equatable {
 // MARK: - Clock (mirror of TaskLedgerClock — Desk stays self-contained)
 
 public enum DeskClock {
+    private final class FormatterCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private let timestampWriter: DateFormatter
+        private let fractionalReader: ISO8601DateFormatter
+        private let plainReader: ISO8601DateFormatter
+        private let dayFormatter: DateFormatter
+
+        init() {
+            let writer = DateFormatter()
+            writer.locale = Locale(identifier: "en_US_POSIX")
+            writer.timeZone = TimeZone(identifier: "UTC")
+            writer.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'+00:00'"
+            timestampWriter = writer
+
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            fractionalReader = fractional
+
+            let plain = ISO8601DateFormatter()
+            plain.formatOptions = [.withInternetDateTime]
+            plainReader = plain
+
+            let day = DateFormatter()
+            day.locale = Locale(identifier: "en_US_POSIX")
+            day.timeZone = TimeZone(identifier: "UTC")
+            day.dateFormat = "yyyy-MM-dd"
+            dayFormatter = day
+        }
+
+        func timestamp(from date: Date) -> String {
+            lock.lock(); defer { lock.unlock() }
+            return timestampWriter.string(from: date)
+        }
+
+        func date(from timestamp: String) -> Date? {
+            lock.lock(); defer { lock.unlock() }
+            return fractionalReader.date(from: timestamp) ?? plainReader.date(from: timestamp)
+        }
+
+        func day(from date: Date) -> String {
+            lock.lock(); defer { lock.unlock() }
+            return dayFormatter.string(from: date)
+        }
+
+        func parsesDay(_ value: String) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return dayFormatter.date(from: value) != nil
+        }
+    }
+
+    private static let formatters = FormatterCache()
     // DateFormatter's SSSSSS only resolves to the millisecond (the trailing
     // three digits are always zeros), so two "now" stamps in the same
     // millisecond come out byte-identical — which lets the updatedAt CAS in
@@ -143,22 +194,13 @@ public enum DeskClock {
     /// TaskLedgerClock.nowISO so Desk timestamps sort lexicographically and
     /// align with the other Swift-native event feeds.
     public static func nowISO(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS'+00:00'"
-        return f.string(from: date)
+        formatters.timestamp(from: date)
     }
 
     /// Parse an ISO-8601 timestamp produced by `nowISO`. Tolerant of both the
     /// microsecond `+00:00` form and a bare-seconds fallback.
     public static func parseISO(_ s: String) -> Date? {
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFraction.date(from: s) { return d }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: s)
+        formatters.date(from: s)
     }
 
     /// True when `s` parses as a calendar date — either a bare `yyyy-MM-dd` day
@@ -168,11 +210,7 @@ public enum DeskClock {
     public static func isParseableDate(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return false }
-        let day = DateFormatter()
-        day.locale = Locale(identifier: "en_US_POSIX")
-        day.timeZone = TimeZone(identifier: "UTC")
-        day.dateFormat = "yyyy-MM-dd"
-        if day.date(from: t) != nil { return true }
+        if formatters.parsesDay(t) { return true }
         return parseISO(t) != nil
     }
 
@@ -181,11 +219,7 @@ public enum DeskClock {
     /// bare day vs its midnight ISO form. nil for an unparseable string.
     public static func normalizedDay(_ s: String) -> String? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        let day = DateFormatter()
-        day.locale = Locale(identifier: "en_US_POSIX")
-        day.timeZone = TimeZone(identifier: "UTC")
-        day.dateFormat = "yyyy-MM-dd"
-        if day.date(from: t) != nil { return t }   // already a bare UTC day
+        if formatters.parsesDay(t) { return t }   // already a bare UTC day
         if let d = parseISO(t) { return dayStamp(d) }
         return nil
     }
@@ -208,11 +242,7 @@ public enum DeskClock {
 
     /// The `yyyy-MM-dd` UTC day for a timestamp — the reservation/day bucket.
     public static func dayStamp(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
+        formatters.day(from: date)
     }
 
     /// New stable item handle.
@@ -917,6 +947,38 @@ public struct Pursuit: Sendable, Equatable {
 
 // MARK: - Item (a derived row — never serialized as a mutation, only state.json)
 
+/// Explicit progress reported by the agent. The Desk never derives a value:
+/// callers must provide a positive total and a completed count inside it.
+public struct DeskProgress: Sendable, Equatable {
+    public let done: Int
+    public let total: Int
+    public let note: String?
+
+    public init?(done: Int, total: Int, note: String? = nil) {
+        guard done >= 0, total > 0, done <= total else { return nil }
+        self.done = done
+        self.total = total
+        let trimmed = note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.note = trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    public func toJSON() -> JSONValue {
+        var object: [String: JSONValue] = [
+            "done": .int(Int64(done)),
+            "total": .int(Int64(total)),
+        ]
+        if let note { object["note"] = .string(note) }
+        return .object(object)
+    }
+
+    public static func fromJSON(_ value: JSONValue) -> DeskProgress? {
+        guard case .object(let object) = value,
+              let done = jsonInt(object, "done"),
+              let total = jsonInt(object, "total") else { return nil }
+        return DeskProgress(done: done, total: total, note: jsonString(object, "note"))
+    }
+}
+
 public struct DeskItem: Sendable, Equatable {
     public var handle: String           // stable
     public var alias: String            // view number "2" / "2.1" — stable, never renumbered
@@ -926,6 +988,11 @@ public struct DeskItem: Sendable, Equatable {
     public var project: String
     public var title: String
     public var summary: String?
+    /// Delegation display metadata only. Neither field changes hierarchy,
+    /// scheduling, admission, or ownership semantics.
+    public var assignee: String?
+    public var laneOf: String?
+    public var progress: DeskProgress?
     public var refs: [DeskRef]
     public var cadence: Cadence
     public var notify: NotifyPolicy
@@ -980,6 +1047,9 @@ public struct DeskItem: Sendable, Equatable {
         project: String,
         title: String,
         summary: String? = nil,
+        assignee: String? = nil,
+        laneOf: String? = nil,
+        progress: DeskProgress? = nil,
         refs: [DeskRef] = [],
         cadence: Cadence = Cadence(),
         notify: NotifyPolicy = NotifyPolicy(),
@@ -1004,6 +1074,9 @@ public struct DeskItem: Sendable, Equatable {
         self.project = project
         self.title = title
         self.summary = summary
+        self.assignee = assignee
+        self.laneOf = laneOf
+        self.progress = progress
         self.refs = refs
         self.cadence = cadence
         self.notify = notify
@@ -1042,6 +1115,9 @@ public struct DeskItem: Sendable, Equatable {
         ]
         if let parent, !parent.isEmpty { obj["parent"] = .string(parent) }
         if let summary, !summary.isEmpty { obj["summary"] = .string(summary) }
+        if let assignee, !assignee.isEmpty { obj["assignee"] = .string(assignee) }
+        if let laneOf, !laneOf.isEmpty { obj["laneOf"] = .string(laneOf) }
+        if let progress { obj["progress"] = progress.toJSON() }
         if !refs.isEmpty { obj["refs"] = .array(refs.map { $0.toJSON() }) }
         if !notes.isEmpty { obj["notes"] = .array(notes.map { $0.toJSON() }) }
         if let closedAt, !closedAt.isEmpty { obj["closedAt"] = .string(closedAt) }
@@ -1131,7 +1207,11 @@ public struct DeskItem: Sendable, Equatable {
         return DeskItem(
             handle: handle, alias: alias, parent: jsonString(obj, "parent"),
             kind: kind, status: status, project: project, title: title,
-            summary: jsonString(obj, "summary"), refs: refs,
+            summary: jsonString(obj, "summary"),
+            assignee: jsonString(obj, "assignee"),
+            laneOf: jsonString(obj, "laneOf"),
+            progress: obj["progress"].flatMap { DeskProgress.fromJSON($0) },
+            refs: refs,
             cadence: obj["cadence"].map { Cadence.fromJSON($0) } ?? Cadence(),
             notify: obj["notify"].map { NotifyPolicy.fromJSON($0) } ?? NotifyPolicy(),
             notes: notes, openedAt: openedAt, updatedAt: updatedAt,
@@ -1228,14 +1308,21 @@ public struct ArchiveRecord: Sendable, Equatable {
 /// or — for create — the newly assigned handle). Tolerant decode: an unknown
 /// `op` token yields nil and is skipped by the rebuild.
 public enum DeskOpBody: Sendable, Equatable {
-    case createItem(alias: String, kind: DeskKind, project: String, title: String, parent: String?, summary: String?, origin: DeskOrigin, pursuit: Pursuit?)
+    case createItem(alias: String, kind: DeskKind, project: String, title: String, parent: String?, summary: String?, assignee: String?, laneOf: String?, origin: DeskOrigin, pursuit: Pursuit?)
     /// Agent self-pursuit creation under a DEDICATED op token (H2, 2026-07-11
     /// review). A pre-Workshop binary sharing the ops flock decodes an unknown
     /// token to nil and SKIPS it — so an old writer can never see a pursuit as
     /// an ordinary user project, mutate it past the cap, or drop its fields on
     /// reserialize. origin is implicitly .agent, kind implicitly .project.
     case openPursuit(alias: String, project: String, title: String, summary: String?, pursuit: Pursuit, notify: NotifyPolicy)
-    case setStatus(status: DeskStatus, blockedReason: String?, waitingOn: String?)
+    case setStatus(
+        status: DeskStatus,
+        blockedReason: String?,
+        waitingOn: String?,
+        progress: DeskProgress?,
+        assignee: String?,
+        laneOf: String?
+    )
     case updateTitle(title: String?, summary: String?)
     case addRef(ref: DeskRef)
     case updateRef(refId: String, cachedFields: [String: JSONValue])
@@ -1311,13 +1398,15 @@ public struct DeskOp: Sendable, Equatable {
         ]
         func put(_ k: String, _ v: String?) { if let v, !v.isEmpty { obj[k] = .string(v) } }
         switch body {
-        case let .createItem(alias, kind, project, title, parent, summary, origin, pursuit):
+        case let .createItem(alias, kind, project, title, parent, summary, assignee, laneOf, origin, pursuit):
             obj["alias"] = .string(alias)
             obj["kind"] = .string(kind.rawValue)
             obj["project"] = .string(project)
             obj["title"] = .string(title)
             put("parent", parent)
             put("summary", summary)
+            put("assignee", assignee)
+            put("laneOf", laneOf)
             // M10: origin OMITTED when .owner so a pre-origin create op re-serializes
             // BYTE-IDENTICAL; pursuit emitted only for an origin=agent create.
             if origin != .owner { obj["origin"] = .string(origin.rawValue) }
@@ -1329,10 +1418,13 @@ public struct DeskOp: Sendable, Equatable {
             put("summary", summary)
             obj["pursuit"] = pursuit.toJSON()
             if notify != NotifyPolicy() { obj["notify"] = notify.toJSON() }
-        case let .setStatus(status, blockedReason, waitingOn):
+        case let .setStatus(status, blockedReason, waitingOn, progress, assignee, laneOf):
             obj["status"] = .string(status.rawValue)
             put("blockedReason", blockedReason)
             put("waitingOn", waitingOn)
+            if let progress { obj["progress"] = progress.toJSON() }
+            put("assignee", assignee)
+            put("laneOf", laneOf)
         case let .updateTitle(title, summary):
             put("title", title)
             put("summary", summary)
@@ -1409,6 +1501,7 @@ public struct DeskOp: Sendable, Equatable {
             // M10: origin decodes OPTIONAL defaulting .owner; pursuit optional.
             body = .createItem(alias: alias, kind: kind, project: project, title: title,
                                parent: jsonString(obj, "parent"), summary: jsonString(obj, "summary"),
+                               assignee: jsonString(obj, "assignee"), laneOf: jsonString(obj, "laneOf"),
                                origin: jsonString(obj, "origin").flatMap(DeskOrigin.decodePersisted) ?? .owner,
                                pursuit: obj["pursuit"].map { Pursuit.fromJSON($0) })
         case "open_pursuit":
@@ -1426,7 +1519,14 @@ public struct DeskOp: Sendable, Equatable {
             )
         case "set_status":
             guard let statusRaw = jsonString(obj, "status"), let status = DeskStatus(rawValue: statusRaw) else { return nil }
-            body = .setStatus(status: status, blockedReason: jsonString(obj, "blockedReason"), waitingOn: jsonString(obj, "waitingOn"))
+            body = .setStatus(
+                status: status,
+                blockedReason: jsonString(obj, "blockedReason"),
+                waitingOn: jsonString(obj, "waitingOn"),
+                progress: obj["progress"].flatMap { DeskProgress.fromJSON($0) },
+                assignee: jsonString(obj, "assignee"),
+                laneOf: jsonString(obj, "laneOf")
+            )
         case "update_title":
             body = .updateTitle(title: jsonString(obj, "title"), summary: jsonString(obj, "summary"))
         case "add_ref":

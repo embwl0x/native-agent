@@ -155,13 +155,15 @@ public final class OpenRouterAdapter: LLMAdapter {
                             message: "connection refused: \(endpoint.host ?? "openrouter")"
                         ))
                     }
+                    defer { bytes.task.cancel() }
                     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                     if !(200..<300).contains(status) {
-                        let errorBody = await Self.drainErrorBody(bytes, maxBytes: 4096, timeout: 2.0)
+                        let errorBody = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
                         if status == 404 {
                             _ = await OpenRouterModelCatalog.models(
                                 dataRoot: dataRoot, session: session, refresh: true
                             )
+                            try Task.checkCancellation()
                             throw LLMError.modelUnavailable(provider: "openrouter", model: model)
                         }
                         try throwIfChatCompletionsError(
@@ -256,6 +258,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openrouter")")))
                     return
                 }
+                defer { bytes.task.cancel() }
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if !(200..<300).contains(status) {
                     // F3-M4: mirror the non-streaming path's unified mapping
@@ -266,27 +269,24 @@ public final class OpenRouterAdapter: LLMAdapter {
                     // any other 4xx → .invalidResponse. Drain a bounded slice of
                     // the error body so 429/5xx messages carry the provider cause.
                     // gpt-5.5 review (round 3): the drain is time-bounded and the
-                    // status mapper ALWAYS runs afterward — a stalled or failed
-                    // error-body read must never re-terminalize a retryable
+                    // status mapper runs afterward unless the turn was cancelled
+                    // — a stalled or failed error-body read must never re-terminalize a retryable
                     // 429/5xx (the mapper works fine with a partial or empty
                     // body; the body is diagnostic garnish, not the verdict).
-                    let body = await Self.drainErrorBody(
-                        bytes, maxBytes: 4096, timeout: 2.0
-                    )
-                    if status == 404 {
-                        let root = self.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-                        _ = await OpenRouterModelCatalog.models(
-                            dataRoot: root,
-                            session: session,
-                            refresh: true
-                        )
-                        continuation.finish(throwing: LLMError.modelUnavailable(
-                            provider: "openrouter",
-                            model: model
-                        ))
-                        return
-                    }
                     do {
+                        let body = try await ProviderErrorBodyDrain.read(
+                            bytes, maxBytes: 4096, timeout: 2.0
+                        )
+                        if status == 404 {
+                            let root = self.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                            _ = await OpenRouterModelCatalog.models(
+                                dataRoot: root,
+                                session: session,
+                                refresh: true
+                            )
+                            try Task.checkCancellation()
+                            throw LLMError.modelUnavailable(provider: "openrouter", model: model)
+                        }
                         try throwIfChatCompletionsError(
                             status: status, data: body, mapping: Self.statusMapping, response: response
                         )
@@ -342,34 +342,6 @@ public final class OpenRouterAdapter: LLMAdapter {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
-    }
-
-    /// R-M1: shared status→error mapping for the OpenRouter Chat Completions
-    /// path. 5xx is unified to `.transient` (was `.underlying`).
-    /// Best-effort, time-bounded error-body drain (gpt-5.5 review, round 3).
-    /// Returns whatever bytes arrived within `timeout` (up to `maxBytes`) — a
-    /// stalled or failing body stream yields the partial body rather than
-    /// blocking retry classification or surfacing a drain error as the verdict.
-    private static func drainErrorBody(
-        _ bytes: URLSession.AsyncBytes, maxBytes: Int, timeout: TimeInterval
-    ) async -> Data {
-        let drain = Task {
-            var body = Data()
-            do {
-                for try await byte in bytes {
-                    if body.count >= maxBytes { break }
-                    body.append(byte)
-                }
-            } catch {}
-            return body
-        }
-        let watchdog = Task {
-            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            drain.cancel()
-        }
-        let result = await drain.value
-        watchdog.cancel()
-        return result
     }
 
     private static let statusMapping = ChatCompletionsStatusMapping(

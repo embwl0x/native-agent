@@ -96,16 +96,21 @@ let isoNoFraction: ISO8601DateFormatter = {
 func parseTimestamp(_ raw: String) -> Date? {
     var s = raw.trimmingCharacters(in: .whitespaces)
     if s.isEmpty { return nil }
-    // Strip a fractional-seconds run of any digit width.
+    // Normalize fractional width for the base formatter without losing it:
+    // dropping milliseconds turns valid short lifecycle intervals negative
+    // relative to their separately stamped duration counters.
+    var fractionalSeconds: TimeInterval = 0
     if let dot = s.firstIndex(of: ".") {
         var end = s.index(after: dot)
         while end < s.endIndex, s[end].isNumber { end = s.index(after: end) }
+        guard let fraction = Double("0" + s[dot..<end]), fraction >= 0, fraction < 1 else { return nil }
+        fractionalSeconds = fraction
         s.removeSubrange(dot..<end)
     }
     if s.contains(" ") && !s.contains("T") { s = s.replacingOccurrences(of: " ", with: "T") }
-    if let d = isoNoFraction.date(from: s) { return d }
+    if let d = isoNoFraction.date(from: s) { return d.addingTimeInterval(fractionalSeconds) }
     // Naive local-time form with no zone designator.
-    if let d = isoNoFraction.date(from: s + "Z") { return d }
+    if let d = isoNoFraction.date(from: s + "Z") { return d.addingTimeInterval(fractionalSeconds) }
     return nil
 }
 
@@ -629,6 +634,16 @@ guard fm.fileExists(atPath: resolvedDataRoot, isDirectory: &isDir), isDir.boolVa
     fail("data root is not a directory: \(resolvedDataRoot)")
 }
 
+/// Machine-global readers are allowed only for the repo's live data root or
+/// the app-support install root. Fixture roots stay hermetic.
+let dataRootIsInstallRoot: Bool = {
+    let real = [
+        absolutize("./data"),
+        absolutize("~/Library/Application Support/NativeAgent"),
+    ]
+    return real.contains(resolvedDataRoot)
+}()
+
 /// POSIX realpath(3) — the ONLY resolver that tells the truth on macOS.
 /// Neither `NSString.resolvingSymlinksInPath` nor `URL.resolvingSymlinksInPath()`
 /// gets you `/private/var/...`: both deliberately STRIP a leading `/private`
@@ -697,6 +712,35 @@ defer { try? fm.removeItem(atPath: workDir) }
 
 let now = nowOverride ?? Date()
 let windowStart = now.addingTimeInterval(-Double(days) * 86400)
+/// When available, provider/tool health describes the currently installed
+/// executable rather than folding failures from earlier builds into its score.
+/// The full retained history remains visible elsewhere in the report.
+let installedBuildEpoch: Date? = {
+    guard !machineStateDisabled, dataRootIsInstallRoot else { return nil }
+    let bundles = [
+        absolutize("/Applications/NativeAgent.app"),
+        absolutize("~/Applications/NativeAgent.app"),
+    ]
+    for bundle in bundles where fm.fileExists(atPath: bundle) {
+        let infoPath = (bundle as NSString).appendingPathComponent("Contents/Info.plist")
+        guard let infoData = fm.contents(atPath: infoPath),
+              let info = try? PropertyListSerialization.propertyList(
+                  from: infoData, format: nil
+              ) as? [String: Any],
+              let executable = info["CFBundleExecutable"] as? String
+        else { continue }
+        let executablePath = (bundle as NSString)
+            .appendingPathComponent("Contents/MacOS/\(executable)")
+        if let modified = (try? fm.attributesOfItem(atPath: executablePath)[.modificationDate]) as? Date {
+            return modified
+        }
+    }
+    return nil
+}()
+let runtimeEvidenceStart = max(windowStart, installedBuildEpoch ?? windowStart)
+let runtimeEvidenceLabel = installedBuildEpoch.map {
+    "current installed build since \(stamp($0))"
+} ?? "\(days)d window"
 // Lane liveness needs history behind the window to answer "days since last non-zero".
 let lookbackDays = days + 30
 let lookbackStart = now.addingTimeInterval(-Double(lookbackDays) * 86400)
@@ -876,7 +920,8 @@ var modelCountsFromSnapshots: [String: Int] = [:]
 // ── Turn speed: one record per turnId, assembled from five row kinds ─────────
 //
 //   turn.accepted   → the turn started (lifecycle milestone)
-//   turn.terminal   → payload.turnElapsedMs = the ONLY true end-to-end number
+//   paired turn.accepted → turn.terminal timestamps = lifecycle wall clock
+//   turn.terminal.payload.turnElapsedMs = engine clock; may exclude prebuilt context
 //   context.summary → payload.totalMs + payload.stageMs.* = assembly breakdown
 //   llm.call        → payload.durationMs / ttftMs = model time
 //   tool.dispatch   → payload.durationMs on phase="end" = tool time
@@ -887,7 +932,9 @@ struct TurnRecord {
     var surface = "(unlabeled)"
     var day = ""
     var startedAt: Date?
-    var elapsedMs: Double?
+    var terminalPayloadMs: Double?
+    var lifecycleElapsedMs: Double?
+    var elapsedMs: Double? { lifecycleElapsedMs ?? terminalPayloadMs }
     var assemblyMs: Double?
     var modelMs: Double = 0
     var modelCalls = 0
@@ -1060,6 +1107,45 @@ func rawJSONStringValue(_ line: Data, forKey key: String) -> String? {
     }
 }
 
+/// Cheap byte-level read of one `"key": 123` INTEGER out of a raw JSONL line,
+/// the numeric sibling of `rawJSONStringValue` above. Same contract: hot-path
+/// only, conservative (nil for anything that is not a plain non-negative
+/// integer literal), used for keys with a single unambiguous spelling on the
+/// line (`chunks` appears only inside a `stream.tick` payload).
+func rawJSONIntValue(_ line: Data, forKey key: String) -> Int? {
+    let needle = bytes("\"" + key + "\"")
+    guard !needle.isEmpty, line.count > needle.count else { return nil }
+    return line.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int? in
+        let b = raw.bindMemory(to: UInt8.self)
+        let limit = b.count - needle.count
+        var i = 0
+        var start = -1
+        while i <= limit {
+            if b[i] == needle[0] {
+                var j = 1
+                while j < needle.count && b[i + j] == needle[j] { j += 1 }
+                if j == needle.count { start = i + needle.count; break }
+            }
+            i += 1
+        }
+        guard start >= 0 else { return nil }
+        var k = start
+        while k < b.count, b[k] == 0x20 || b[k] == 0x09 { k += 1 }
+        guard k < b.count, b[k] == 0x3A else { return nil }          // ':'
+        k += 1
+        while k < b.count, b[k] == 0x20 || b[k] == 0x09 { k += 1 }
+        var value = 0
+        var digits = 0
+        while k < b.count, b[k] >= 0x30, b[k] <= 0x39 {              // '0'-'9'
+            if digits >= 15 { return nil }                           // bounded, never a blob
+            value = value * 10 + Int(b[k] - 0x30)
+            digits += 1
+            k += 1
+        }
+        return digits > 0 ? value : nil
+    }
+}
+
 /// The DECLARED turn-trace kind vocabulary: every kind the codebase can put on
 /// the turn-trace bus, with the emitter that puts it there.
 ///
@@ -1157,7 +1243,9 @@ struct TurnLifecycle {
     var llmWithTtft = 0
     var ticks = 0
     var lastTick: Date?
+    var lastTickChunks: Int?
     var tickGaps: [Double] = []
+    var interRoundGaps: [Double] = []
     var lateCompletion = 0
     var attentionAdmissionMs: Double?
 }
@@ -1175,7 +1263,7 @@ var traceStageNames: [String: Int] = [:]
 var traceStageRowsWindow = 0
 var turnFailedReasons: [String: Int] = [:]
 var turnFailedRowsWindow = 0
-var motorActionLastPhase: [String: (phase: String, ts: Date)] = [:]
+var motorActionLastPhase: [String: (phase: String, domain: String, ts: Date)] = [:]
 var motorPhaseCounts: [String: Int] = [:]
 var motorRowsWindow = 0
 var motorUndeclaredPhases: [String: Int] = [:]
@@ -1218,8 +1306,11 @@ let traceDayOpenGuard = true
 
 /// NAMED BOUNDS for the streaming lane. These are asserted envelopes, not
 /// measurements: `stream.tick` is the largest consumer of the feed's retention
-/// budget, so a tick storm silently evicts the small load-bearing kinds, and a
-/// long gap mid-response is what "she froze" looks like in the data.
+/// budget, so a tick storm silently evicts the small load-bearing kinds. The
+/// gap bound applies to INTRA-ROUND gaps only — ticks within one provider
+/// stream. It grades chunk-delivery evenness, nothing more: the ticker is
+/// chunk-gated (it fires only when a chunk arrives), so a zero-chunk freeze
+/// emits no tick at all and is structurally invisible to this metric.
 let streamTickPerTurnCeiling = 2000
 let streamTickGapCeilingMs = 5000.0
 
@@ -1292,14 +1383,39 @@ if turnTracesPresent {
                 traceKindUnscannable += 1
             }
             // `stream.tick` cadence, window only, on the cheap path.
+            //
+            // ROUND ATTRIBUTION: the emitter's ticker state (`lastTickNs`,
+            // `chunkIndex`) is local to ONE streamTurn call, and the tool loop
+            // calls streamTurn once PER provider round (ChatOrchestration+
+            // Streaming.swift:321-326, :467-477). So a turn's ticks span
+            // several streams, and the wall gap between the last tick of round
+            // N and the first tick of round N+1 is tool dispatch + next-round
+            // TTFT — NOT streaming cadence. The boundary is visible in the
+            // payload itself: the first tick of every stream fires on its
+            // first chunk (`lastTickNs` starts at 0), so `chunks` is 1 there,
+            // while WITHIN a stream `chunks` strictly increases between ticks.
+            // A non-increasing `chunks` therefore marks a new round, and that
+            // gap is bucketed separately instead of poisoning the cadence p95.
+            // An unreadable `chunks` (old rows without the field) falls back
+            // to the old single-bucket behaviour rather than guessing.
             if scannedKind == "stream.tick", let t = scannedTS, t >= windowStart,
                let tid = rawJSONStringValue(line, forKey: "turnId") {
+                let chunks = rawJSONIntValue(line, forKey: "chunks")
                 touchLifecycle(tid, rawJSONStringValue(line, forKey: "surface")) { r in
                     r.ticks += 1
-                    if let last = r.lastTick, r.tickGaps.count < tickGapCapPerTurn {
-                        r.tickGaps.append(max(0, t.timeIntervalSince(last) * 1000))
+                    if let last = r.lastTick {
+                        let gapMs = max(0, t.timeIntervalSince(last) * 1000)
+                        let newRound = (chunks ?? Int.max) <= (r.lastTickChunks ?? 0)
+                        if newRound {
+                            if r.interRoundGaps.count < tickGapCapPerTurn {
+                                r.interRoundGaps.append(gapMs)
+                            }
+                        } else if r.tickGaps.count < tickGapCapPerTurn {
+                            r.tickGaps.append(gapMs)
+                        }
                     }
                     r.lastTick = t
+                    r.lastTickChunks = chunks
                 }
             }
             // The low-volume kinds whose PAYLOAD carries the evidence.
@@ -1355,7 +1471,11 @@ if turnTracesPresent {
                         }
                         if let id = payload["actionIdentity"] as? String {
                             if let prev = motorActionLastPhase[id], prev.ts > t { break }
-                            motorActionLastPhase[id] = (phase, t)
+                            motorActionLastPhase[id] = (
+                                phase,
+                                (payload["domain"] as? String) ?? "(no domain field)",
+                                t
+                            )
                         }
                     default:
                         break
@@ -1397,7 +1517,7 @@ if turnTracesPresent {
                 case "turn.terminal":
                     turnRowsSeen += 1
                     touchTurn(tid, ts, rowSurface) { r in
-                        if let e = (payload["turnElapsedMs"] as? NSNumber)?.doubleValue { r.elapsedMs = e }
+                        if let e = (payload["turnElapsedMs"] as? NSNumber)?.doubleValue { r.terminalPayloadMs = e }
                         if let s = payload["status"] as? String { r.status = s }
                     }
                     touchLifecycle(tid, rowSurface) { r in
@@ -1658,7 +1778,7 @@ if eventsPresent, let stream = LineStream(path: eventsPath) {
             toolDispatchRowsTotal += 1
             let ts = (obj["createdAt"] as? String).flatMap(parseTimestamp)
             if let ts { toolDispatchNewest = newer(toolDispatchNewest, ts) }
-            guard let ts, ts >= windowStart else { return }
+            guard let ts, ts >= runtimeEvidenceStart else { return }
             toolDispatchInWindow += 1
             let receipt = (payload["receipt"] as? [String: Any]) ?? [:]
             // The tool's name is the row title; the receipt's `target` is the
@@ -2244,7 +2364,17 @@ if organismPresent,
         bodySchemaPresent = true
         for (k, v) in body {
             if let n = v as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() { bodySchema[k] = n.boolValue }
-            else if let s = v as? String { bodySchema[k] = (s == "true" || s == "healthy" || s == "available") }
+            else if let s = v as? String {
+                let normalized = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                // BodySchema.resourcePressure is an enum, not a health boolean.
+                // Only nominal is the healthy state; elevated/high/critical
+                // intentionally surface as pressure. Treating every unknown
+                // string as false previously made a nominal live organism look
+                // unhealthy in every report.
+                bodySchema[k] = k == "resourcePressure"
+                    ? normalized == "nominal"
+                    : ["true", "healthy", "available"].contains(normalized)
+            }
         }
     }
     if let ledger = obj["predictionLedger"] as? [String: Any] {
@@ -2279,6 +2409,12 @@ if organismPresent,
 // because it remains parseable.
 let organismWatchRowCeiling = 10_000
 let organismWatchPath = rootPath("cognition/organism_watch.jsonl")
+let organismWatchRunMarkerPath = organismWatchPath + ".lock"
+var organismWatchMarkerIsDirectory = ObjCBool(false)
+let organismWatchRunActive = fm.fileExists(
+    atPath: organismWatchRunMarkerPath,
+    isDirectory: &organismWatchMarkerIsDirectory
+) && organismWatchMarkerIsDirectory.boolValue
 let organismWatchPresent = sources.register(
     "cognition/organism_watch.jsonl", organismWatchPath,
     note: "streamed read-only; newest valid `at` is sampler freshness"
@@ -2320,17 +2456,36 @@ if organismWatchPresent, let stream = LineStream(path: organismWatchPath) {
         }
     }
     sources.setRows("cognition/organism_watch.jsonl", organismWatchRows)
-    settleJSONLSource(
-        "cognition/organism_watch.jsonl",
-        lines: organismWatchRows,
-        malformed: organismWatchMalformed
-    )
+    if organismWatchRunActive {
+        settleJSONLSource(
+            "cognition/organism_watch.jsonl",
+            lines: organismWatchRows,
+            malformed: organismWatchMalformed
+        )
+    } else {
+        // Historical observation residue remains honestly parse-graded, but it
+        // is not a current resident lane and therefore cannot raise a live
+        // source-failure lead.
+        sources.setParse(
+            "cognition/organism_watch.jsonl",
+            lines: organismWatchRows,
+            malformed: organismWatchMalformed
+        )
+        if malformedRatioTooHigh(lines: organismWatchRows, malformed: organismWatchMalformed) {
+            sources.markUnreadable(
+                "cognition/organism_watch.jsonl",
+                "historical/inactive sampler has \(organismWatchMalformed) malformed row(s)"
+            )
+        }
+    }
 } else if organismWatchPresent {
     let reason = "present but could not open for streamed read"
     sources.markUnreadable("cognition/organism_watch.jsonl", reason)
-    addLead(rank: 3, "Source `cognition/organism_watch.jsonl` is UNREADABLE — \(reason)",
-            evidence: "The sampler timeline exists but its rows could not be opened read-only. Its freshness is unknown, not zero.",
-            action: "Repair file permissions or ownership, then rerun the instrument; do not infer organism activity from an unreadable sampler.")
+    if organismWatchRunActive {
+        addLead(rank: 3, "Source `cognition/organism_watch.jsonl` is UNREADABLE — \(reason)",
+                evidence: "The active sampler timeline exists but its rows could not be opened read-only. Its freshness is unknown, not zero.",
+                action: "Repair file permissions or ownership, then rerun the instrument; do not infer organism activity from an unreadable sampler.")
+    }
 }
 
 // Dream diary — one file per night
@@ -2891,14 +3046,6 @@ func topCounts(_ d: [String: Int], _ n: Int = 4) -> String {
 /// default. A fixture/synthetic root must stay hermetic: the same rule the app
 /// uses for process-global tools (`allowProcessGlobalTools: dataRoot ==
 /// default`). Every organ that reaches outside the data root gates on this.
-let dataRootIsInstallRoot: Bool = {
-    let real = [
-        absolutize("./data"),
-        absolutize("~/Library/Application Support/NativeAgent"),
-    ]
-    return real.contains(resolvedDataRoot)
-}()
-
 let bridgeConfigRoot: String? = {
     if bridgeConfigDisabled { return nil }
     if let a = bridgeConfigRootArg { return absolutize(a) }
@@ -2957,6 +3104,8 @@ struct BridgeLane {
     var deliveriesInWindow = 0
     var deliveryStatuses: [String: Int] = [:]
     var deliveryNewest: Date?
+    var terminalFailedUnread = 0
+    var terminalFailedOldest: Date?
     var undeliveredOver24h = 0
     var undeliveredAcknowledged = 0   // pre-horizon rows covered by the triage ledger
     var undeliveredOldest: Date?
@@ -3011,7 +3160,8 @@ func readBridgeLane(_ name: String, dirName: String, inboxFile: String,
     var isD: ObjCBool = false
     lane.dirPresent = fm.fileExists(atPath: dir, isDirectory: &isD) && isD.boolValue
 
-    // Deliveries FIRST: the inbox's undelivered backlog is defined against them.
+    // Read reply deliveries first as a compatibility fallback for old inbox
+    // rows that predate explicit consumption stamps.
     let deliveryLabel = "bridge/\(name)/\(deliveryFile)"
     lane.deliveries = organJSONL(deliveryLabel, (dir as NSString).appendingPathComponent(deliveryFile),
                                  note: "streamed read-only (outside the data root)") { obj in
@@ -3049,12 +3199,32 @@ func readBridgeLane(_ name: String, dirName: String, inboxFile: String,
         let ts = ((obj["createdAt"] as? String) ?? (obj["created_at"] as? String)).flatMap(parseTimestamp)
         if let ts { lane.inboxNewest = newer(lane.inboxNewest, ts) }
         if let ts, ts >= windowStart { lane.inboxInWindow += 1 }
-        // Undelivered backlog: a message with no delivery receipt at all, more
-        // than 24h old. Only computable when the delivery feed READ — otherwise
-        // every message would look undelivered, which is the silent-zero bug
-        // wearing a different hat.
-        guard lane.deliveries.didRead, let id = obj["messageId"] as? String ?? obj["id"] as? String,
-              !delivered.contains(id), let ts, hoursSince(ts) > 24 else { return }
+        // An inbound bridge message is handed to its agent when the INBOX row
+        // is consumed/read. reply-deliveries.jsonl describes a later, optional
+        // outbound reply and cannot be the primary consumption receipt: using
+        // it made acknowledged fire-and-forget messages look abandoned. Keep a
+        // matching reply receipt only as a compatibility proof for older rows.
+        let consumedAt = ((obj["consumedAt"] as? String) ?? (obj["readAt"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let consumed = read || !(consumedAt ?? "").isEmpty
+        // A dead-letter is neither consumed nor still waiting: delivery
+        // terminally failed and the durable brief remains unread for review.
+        // Keep that actionable class separate so it cannot masquerade as a
+        // wedged inbox consumer.
+        let deliveryStatus = (obj["deliveryStatus"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !read, deliveryStatus == "dead_letter" {
+            lane.terminalFailedUnread += 1
+            let terminalAt = (obj["deliveryTerminalAt"] as? String).flatMap(parseTimestamp) ?? ts
+            if let terminalAt,
+               lane.terminalFailedOldest == nil || terminalAt < lane.terminalFailedOldest! {
+                lane.terminalFailedOldest = terminalAt
+            }
+            return
+        }
+        guard let id = obj["messageId"] as? String ?? obj["id"] as? String,
+              !consumed, !delivered.contains(id), let ts, hoursSince(ts) > 24 else { return }
         if let hz = acknowledgmentHorizon("bridge.undelivered"), ts < hz {
             lane.undeliveredAcknowledged += 1
             return
@@ -3805,8 +3975,11 @@ let providerSafeKeys: Set<String> = ["auth_mode", "default_model"]
 /// it is a pin no turn can ever consume.
 let canonicalProviderSurfaces: Set<String> = [
     "chat", "ios", "telegram", "slack", "workshop", "autonomy", "swarms", "dream", "rem", "training",
-    "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction", "self_improvement",
+    "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction", "self_improvement", "desk",
 ]
+/// Persisted compatibility keys that shipped previously but no current route
+/// consumes. They are historical state to drain, not unknown surface drift.
+let retiredProviderSurfaces: Set<String> = ["cognition_cue"]
 
 // ── SYS-09: providers / routing ─────────────────────────────────────────────
 // Blueprint § Providers & Routing. Three files decide which model answers a
@@ -3935,7 +4108,8 @@ for (surface, var pin) in surfacePins {
 /// Ties on surface name so two runs over the same bytes name the same surface.
 let pinDrifts: [(surface: String, pinned: String, observed: String, calls: Int)] =
     surfacePins.values.compactMap { pin in
-        guard pin.calls > 0, let pinned = pin.model, !pin.observedModels.isEmpty else { return nil }
+        guard !retiredProviderSurfaces.contains(pin.surface),
+              pin.calls > 0, let pinned = pin.model, !pin.observedModels.isEmpty else { return nil }
         guard pin.observedModels[pinned] == nil else { return nil }
         let top = pin.observedModels.sorted {
             $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value
@@ -3948,7 +4122,8 @@ let pinDrifts: [(surface: String, pinned: String, observed: String, calls: Int)]
 /// the SYS-09 cell gates on the feed rather than on the emptiness.
 let unresolvedProviderPins: [(surface: String, provider: String)] = surfacePins.values
     .compactMap { pin in
-        guard let p = pin.provider, !pin.providerConfigured else { return nil }
+        guard !retiredProviderSurfaces.contains(pin.surface),
+              let p = pin.provider, !pin.providerConfigured else { return nil }
         return (surface: pin.surface, provider: p)
     }.sorted { $0.surface == $1.surface ? $0.provider < $1.provider : $0.surface < $1.surface }
 
@@ -3956,7 +4131,10 @@ let unresolvedProviderPins: [(surface: String, provider: String)] = surfacePins.
 /// named as orphan pins rather than folded into the healthy pin count: such a
 /// row can look configured forever while no provider dispatch reads it.
 let unservedProviderPins = surfacePins.keys
-    .filter { !canonicalProviderSurfaces.contains($0) }
+    .filter { !canonicalProviderSurfaces.contains($0) && !retiredProviderSurfaces.contains($0) }
+    .sorted()
+let retiredProviderPins = surfacePins.keys
+    .filter { retiredProviderSurfaces.contains($0) }
     .sorted()
 
 var openrouterModelCount: Int?
@@ -4422,6 +4600,23 @@ var chatOutcomeObservationsInvalid = 0
 var chatOutcomeStateCounts: [String: [String: Int]] = Dictionary(
     uniqueKeysWithValues: chatOutcomeDimensions.map { ($0, [:]) }
 )
+let outcomeReactionKey: (String, String, String) -> String = { sessionID, messageID, turnID in
+    [sessionID, messageID, turnID].joined(separator: "\u{1F}")
+}
+var chatStructuredReactionKeys: Set<String> = []
+let chatFeedbackFeed = organJSONL(
+    "context/feedback.jsonl",
+    rootPath("context/feedback.jsonl")
+) { object in
+    guard let schema = object["schema"] as? String,
+          schema == "response.feedback.v2" || schema == "response.reaction.v2",
+          let sessionID = object["sessionId"] as? String,
+          let messageID = object["messageId"] as? String,
+          let turnID = object["turnId"] as? String else { return }
+    chatStructuredReactionKeys.insert(outcomeReactionKey(sessionID, messageID, turnID))
+}
+var chatCanonicalContinuationKeys: Set<String> = []
+var chatValidOutcomeObservations: [(states: [String: String], reactionKey: String?)] = []
 let chatMessagesDir = rootPath("chat/messages")
 var chatMessagesIsDirectory: ObjCBool = false
 let chatMessagesPathExists = fm.fileExists(
@@ -4461,12 +4656,40 @@ if chatMessagesPopulationReadable {
         let p = (chatMessagesDir as NSString).appendingPathComponent(filename)
         guard let stream = LineStream(path: p) else { continue }
         chatMessageFilesOpened += 1
+        var priorRows: [[String: Any]] = []
         stream.forEachLine { line in
             guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
                 chatMessageRowsMalformed += 1
                 return
             }
             chatMessageRowsRead += 1
+            // Read-side compatibility for outcomes written before structured
+            // continuation receipts existed. This is the same strict
+            // transcript adjacency contract as OutcomeDimensionStatePopulationReader:
+            // request(user) -> anchored assistant(same run) -> next user.
+            if (obj["role"] as? String) == "user", priorRows.count >= 2 {
+                let assistant = priorRows[priorRows.count - 1]
+                let request = priorRows[priorRows.count - 2]
+                if (assistant["role"] as? String) == "assistant",
+                   (request["role"] as? String) == "user",
+                   let requestRunID = request["runId"] as? String,
+                   (assistant["runId"] as? String) == requestRunID,
+                   (request["sessionId"] as? String) == sessionID,
+                   (assistant["sessionId"] as? String) == sessionID,
+                   (obj["sessionId"] as? String) == sessionID,
+                   let metadata = assistant["metadata"] as? [String: Any],
+                   let outcome = metadata["outcomeObservation"] as? [String: Any],
+                   let messageID = assistant["id"] as? String,
+                   let turnID = outcome["turnID"] as? String,
+                   (outcome["messageID"] as? String) == messageID,
+                   (outcome["sessionID"] as? String) == sessionID {
+                    chatCanonicalContinuationKeys.insert(
+                        outcomeReactionKey(sessionID, messageID, turnID)
+                    )
+                }
+            }
+            priorRows.append(obj)
+            if priorRows.count > 2 { priorRows.removeFirst(priorRows.count - 2) }
             guard let ts = ((obj["createdAt"] as? String) ?? (obj["ts"] as? String))
                     .flatMap(parseTimestamp), ts >= windowStart else { return }
             // The message's OWN source wins; the session's index source is the
@@ -4495,13 +4718,40 @@ if chatMessagesPopulationReadable {
                     chatOutcomeObservationsInvalid += 1
                     break
                 }
-                for dimension in chatOutcomeDimensions {
-                    if let state = states[dimension] as? String {
-                        chatOutcomeStateCounts[dimension, default: [:]][state, default: 0] += 1
-                    }
-                }
+                let closedStates = Dictionary(uniqueKeysWithValues: chatOutcomeDimensions.compactMap {
+                    dimension -> (String, String)? in
+                    guard let state = states[dimension] as? String else { return nil }
+                    return (dimension, state)
+                })
+                let reactionKey: String? = {
+                    guard let messageID = obj["id"] as? String,
+                          let rowSessionID = obj["sessionId"] as? String,
+                          rowSessionID == sessionID,
+                          let turnID = outcome["turnID"] as? String,
+                          (outcome["messageID"] as? String) == messageID,
+                          (outcome["sessionID"] as? String) == sessionID else { return nil }
+                    return outcomeReactionKey(sessionID, messageID, turnID)
+                }()
+                chatValidOutcomeObservations.append((closedStates, reactionKey))
             default: break
             }
+        }
+    }
+}
+
+// Outcome observations are initial snapshots. Reaction is intentionally
+// promoted later by exact structured feedback or strict transcript adjacency;
+// counting only the embedded snapshot falsely reports a permanently dark lane.
+for observation in chatValidOutcomeObservations {
+    let promoted = observation.reactionKey.map {
+        chatStructuredReactionKeys.contains($0) || chatCanonicalContinuationKeys.contains($0)
+    } ?? false
+    for dimension in chatOutcomeDimensions {
+        let state = dimension == "reaction" && promoted
+            ? "observed"
+            : observation.states[dimension]
+        if let state {
+            chatOutcomeStateCounts[dimension, default: [:]][state, default: 0] += 1
         }
     }
 }
@@ -4962,6 +5212,8 @@ let workflowRunStatePresent = sources.register(workflowRunStateLabel, workflowRu
 var workflowRunStateFeed: FeedState = .absent
 var workflowRunStateStatuses: [String: Int] = [:]
 var workflowStaleNonTerminalStates: [String] = []
+var workflowOldApprovalWaits: [String] = []
+var workflowOldPersistedAttempts: [String] = []
 if workflowRunStatePresent {
     var runStateIsDirectory = ObjCBool(false)
     if fm.fileExists(atPath: workflowRunStatePath, isDirectory: &runStateIsDirectory), !runStateIsDirectory.boolValue {
@@ -4987,10 +5239,20 @@ if workflowRunStatePresent {
                 workflowRunStateStatuses[status, default: 0] += 1
                 let modified = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
                 if !terminalStates.contains(status), let modified, now.timeIntervalSince(modified) > 60 * 60 {
-                    workflowStaleNonTerminalStates.append((state["id"] as? String) ?? (entry as NSString).deletingPathExtension)
+                    let id = (state["id"] as? String) ?? (entry as NSString).deletingPathExtension
+                    if let attempt = state["activeStepAttempt"] as? [String: Any], !attempt.isEmpty {
+                        workflowOldPersistedAttempts.append(id)
+                    } else if status == "waiting_approval",
+                              state["activeStepAttempt"] == nil || state["activeStepAttempt"] is NSNull {
+                        workflowOldApprovalWaits.append(id)
+                    } else {
+                        workflowStaleNonTerminalStates.append(id)
+                    }
                 }
             }
             workflowStaleNonTerminalStates.sort()
+            workflowOldApprovalWaits.sort()
+            workflowOldPersistedAttempts.sort()
             sources.setRows(workflowRunStateLabel, parsed)
             if let condemned = condemnUnparseableFamily(workflowRunStateLabel, total: parsed + malformed, unparseable: malformed) {
                 workflowRunStateFeed = condemned
@@ -5278,6 +5540,8 @@ let activityRareKinds = activityKinds.filter { $0.value <= 2 }.keys.sorted()
 
 // ── W3-C: builder_audit/ — one permanent file per builder-tool call ─────────
 var builderAuditFiles = 0
+var builderAuditReceiptFiles = 0
+var builderAuditSidecarFiles = 0
 var builderAuditBytes: Int64 = 0
 var builderAuditOldest: Date?
 var builderAuditNewest: Date?
@@ -5296,7 +5560,13 @@ if builderAuditPresent {
             let full = (builderAuditRoot as NSString).appendingPathComponent(f)
             let attrs = (try? fm.attributesOfItem(atPath: full)) ?? [:]
             builderAuditFiles += 1
-            builderAuditBytes += Int64((attrs[.size] as? Int64) ?? 0)
+            let stem = (f as NSString).deletingPathExtension
+            if (f as NSString).pathExtension == "json", UUID(uuidString: stem) != nil {
+                builderAuditReceiptFiles += 1
+            } else {
+                builderAuditSidecarFiles += 1
+            }
+            builderAuditBytes += (attrs[.size] as? NSNumber)?.int64Value ?? 0
             if let m = attrs[.modificationDate] as? Date {
                 builderAuditNewest = newer(builderAuditNewest, m)
                 if builderAuditOldest == nil || m < builderAuditOldest! { builderAuditOldest = m }
@@ -5309,9 +5579,7 @@ if builderAuditPresent {
 /// Named ceilings. These are BOUNDS this report asserts, not measurements — a
 /// directory with no rotation crosses them and says so, instead of growing to
 /// the 1 GB disk-hygiene tripwire in silence.
-let builderAuditFileCeiling = 2000
-let builderAuditByteCeiling: Int64 = 32 << 20
-let builderAuditAgeCeilingDays = 30.0
+let builderAuditReceiptCeiling = 500
 
 // ── W3-D: surface ERROR feeds — "failing, not idle" ─────────────────────────
 // Generalized rule: a surface whose ERROR feed is live while its RECEIPT/state
@@ -5328,12 +5596,45 @@ struct SurfaceErrorFeed {
     var receiptNewest: Date?
     var receiptRows = 0
     var receiptState: FeedState = .absent
-    var lineCap: Int
+    var errorBytes: Int64 = 0
+    var lineCap: Int?
+    var byteCap: Int64?
 }
 var surfaceErrorFeeds: [SurfaceErrorFeed] = []
 
-func readSurfaceErrorFeed(_ name: String, errorsRel: String, receiptsRel: String, lineCap: Int) {
-    var f = SurfaceErrorFeed(name: name, lineCap: lineCap)
+// Slack's canonical runtime state is the current liveness owner. A bounded
+// historical error ledger must not overrule a fresh connected heartbeat.
+var slackRuntimeConnected: Bool?
+var slackRuntimeUpdatedAt: Date?
+let slackRuntimeStaleAfter: TimeInterval = 90
+let (slackRuntimeObj, slackRuntimeFeed) = organJSONObject(
+    "slack/state.json", rootPath("slack/state.json"),
+    note: "read-only connection flag + updatedAt heartbeat; error text is never copied out"
+)
+if let slackRuntimeObj {
+    slackRuntimeConnected = slackRuntimeObj["connected"] as? Bool
+    slackRuntimeUpdatedAt = (slackRuntimeObj["updatedAt"] as? String).flatMap(parseTimestamp)
+    sources.setRows("slack/state.json", 1)
+}
+let slackRuntimeIsCurrentConnected: Bool = {
+    guard slackRuntimeFeed.didRead,
+          slackRuntimeConnected == true,
+          let updated = slackRuntimeUpdatedAt,
+          updated <= now else { return false }
+    return now.timeIntervalSince(updated) <= slackRuntimeStaleAfter
+}()
+
+func readSurfaceErrorFeed(
+    _ name: String,
+    errorsRel: String,
+    receiptsRel: String,
+    lineCap: Int? = nil,
+    byteCap: Int64? = nil
+) {
+    var f = SurfaceErrorFeed(name: name, lineCap: lineCap, byteCap: byteCap)
+    if let attrs = try? fm.attributesOfItem(atPath: rootPath(errorsRel)) {
+        f.errorBytes = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+    }
     f.errorState = organJSONL(errorsRel, rootPath(errorsRel)) { obj in
         f.errorRows += 1
         let ts = ((obj["ts"] as? String) ?? (obj["createdAt"] as? String)
@@ -5359,9 +5660,10 @@ func readSurfaceErrorFeed(_ name: String, errorsRel: String, receiptsRel: String
     }
     surfaceErrorFeeds.append(f)
 }
-// Caps from PersistenceCore.swift JSONLLineCaps (slackReceipts = 5000).
+// TelegramErrorLog rotates the live file at 5 MiB and keeps one `.1` backup;
+// it has no line cap. Slack's JSONL owner uses the shared 5,000-line policy.
 readSurfaceErrorFeed("telegram", errorsRel: "telegram/errors.jsonl",
-                     receiptsRel: "telegram/receipts.jsonl", lineCap: 5000)
+                     receiptsRel: "telegram/receipts.jsonl", byteCap: 5 * 1024 * 1024)
 readSurfaceErrorFeed("slack", errorsRel: "slack/errors.jsonl",
                      receiptsRel: "slack/receipts.jsonl", lineCap: 5000)
 
@@ -5561,13 +5863,19 @@ if let telegramOffsetObj {
     }
     telegramOffsetModified = (try? fm.attributesOfItem(atPath: rootPath("telegram/last_offset.json")))?[.modificationDate] as? Date
 }
-var telegramInboxFiles = 0
-var telegramInboxOldest: Date?
+var telegramInboxClaimFiles = 0
+var telegramInboxLockFiles = 0
+var telegramInboxPending = 0
+var telegramInboxProcessing = 0
+var telegramInboxCompleted = 0
+var telegramInboxOutcomeUnknown = 0
+var telegramInboxOtherPhases = 0
+var telegramInboxWorkOldest: Date?
 let telegramInboxRoot = rootPath("telegram/update_inbox")
 let telegramInboxLabel = "telegram/update_inbox/"
 let telegramInboxPresent = sources.register(telegramInboxLabel, telegramInboxRoot,
-                                            note: "file count + oldest mtime only; update CONTENTS "
-                                                + "(User's messages) are never opened")
+                                            note: "claim/lock metadata plus claims_index phase counts; "
+                                                + "retained update payload files are never opened")
 noAutoClaimLabels.insert(telegramInboxLabel)
 var telegramInboxState: FeedState = .absent
 if telegramInboxPresent {
@@ -5575,20 +5883,54 @@ if telegramInboxPresent {
     telegramInboxState = state
     if state.didRead {
         for f in entries where !f.hasPrefix(".") {
-            telegramInboxFiles += 1
-            let full = (telegramInboxRoot as NSString).appendingPathComponent(f)
-            if let m = (try? fm.attributesOfItem(atPath: full))?[.modificationDate] as? Date,
-               telegramInboxOldest == nil || m < telegramInboxOldest! {
-                telegramInboxOldest = m
+            if f.hasSuffix(".json.lock") { telegramInboxLockFiles += 1 }
+            if f.hasSuffix(".json"), f != "claims_index.json",
+               Int(String(f.dropLast(".json".count))) != nil {
+                telegramInboxClaimFiles += 1
             }
             claimFeedFamily(normalizeRelativePath("telegram/update_inbox/\(f)"), by: telegramInboxLabel)
         }
-        sources.setRows(telegramInboxLabel, telegramInboxFiles)
+        sources.setRows(telegramInboxLabel, telegramInboxClaimFiles)
     }
+}
+let telegramInboxIndexPath = rootPath("telegram/update_inbox/claims_index.json")
+let (telegramInboxIndexObj, telegramInboxIndexFeed) = organJSONObject(
+    "telegram/update_inbox/claims_index.json", telegramInboxIndexPath,
+    note: "phase/index metadata only; retained Telegram update payloads are never opened"
+)
+if let telegramInboxIndexObj,
+   let entries = telegramInboxIndexObj["entries"] as? [String: Any] {
+    var validEntries = 0
+    for (rawID, value) in entries {
+        guard let id = Int(rawID),
+              let entry = value as? [String: Any],
+              (entry["updateId"] as? NSNumber)?.intValue == id,
+              let phase = entry["phase"] as? String else {
+            telegramInboxOtherPhases += 1
+            continue
+        }
+        validEntries += 1
+        switch phase {
+        case "pending": telegramInboxPending += 1
+        case "processing": telegramInboxProcessing += 1
+        case "completed": telegramInboxCompleted += 1
+        case "outcome_unknown": telegramInboxOutcomeUnknown += 1
+        default: telegramInboxOtherPhases += 1
+        }
+        if phase == "pending" || phase == "processing" {
+            let claimPath = (telegramInboxRoot as NSString).appendingPathComponent("\(id).json")
+            if let modified = (try? fm.attributesOfItem(atPath: claimPath))?[.modificationDate] as? Date,
+               telegramInboxWorkOldest == nil || modified < telegramInboxWorkOldest! {
+                telegramInboxWorkOldest = modified
+            }
+        }
+    }
+    sources.setRows("telegram/update_inbox/claims_index.json", validEntries)
 }
 /// A drained inbox holds only what arrived recently. Anything older than this is
 /// a message the loop took in and never finished with.
 let telegramInboxDrainAgeDays = 1.0
+let telegramInboxTerminalRetention = 256
 
 // ── W3-F: doctor/latest.json — what self-healing believes ───────────────────
 // `SelfHealingHook.swift:213` reads "healthy = no check has status fail" from
@@ -5677,9 +6019,14 @@ if oauthPresent {
         _ = condemnUnparseableFamily(oauthLabel, total: oauthTokenFiles.count, unparseable: oauthUnparseable)
     }
 }
-/// A token nobody refreshed degrades every connector to failure — silently,
-/// because the connector reports its own error, not "the token is stale".
-let oauthStaleAgeDays = 30.0
+func oauthExpiryDate(_ raw: String?) -> Date? {
+    guard let raw else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let epoch = Double(trimmed), epoch.isFinite, epoch > 0 {
+        return Date(timeIntervalSince1970: epoch)
+    }
+    return parseTimestamp(trimmed)
+}
 
 // ── W3-H: mac_control/operations.json vs the dispatch trace ─────────────────
 // The operation store is 231 KB of ONE JSON object with no rotation, and the
@@ -5687,6 +6034,8 @@ let oauthStaleAgeDays = 30.0
 // here. A divergence between what dispatch recorded and what the operation store
 // recorded is therefore undetectable — which is what this compares.
 var macOperationCount = 0
+var macOperationsInWindow = 0
+var macOperationsInRuntimeEvidence = 0
 var macOperationStatuses: [String: Int] = [:]
 var macOperationNewest: Date?
 var macOperationBytes: Int64 = 0
@@ -5705,10 +6054,17 @@ if let macOperationsObj {
     }
     macOperationCount = rows.count
     for r in rows {
-        macOperationStatuses[(r["status"] as? String) ?? "(no status field)", default: 0] += 1
-        if let ts = ((r["updatedAt"] as? String) ?? (r["createdAt"] as? String)
-                     ?? (r["at"] as? String)).flatMap(parseTimestamp) {
+        macOperationStatuses[
+            (r["status"] as? String) ?? (r["state"] as? String)
+                ?? (r["outcomeCode"] as? String) ?? "(no status field)",
+            default: 0
+        ] += 1
+        if let ts = ((r["terminalAt"] as? String) ?? (r["updatedAt"] as? String)
+                     ?? (r["startedAt"] as? String) ?? (r["acceptedAt"] as? String)
+                     ?? (r["createdAt"] as? String) ?? (r["at"] as? String)).flatMap(parseTimestamp) {
             macOperationNewest = newer(macOperationNewest, ts)
+            if ts >= windowStart { macOperationsInWindow += 1 }
+            if ts >= runtimeEvidenceStart { macOperationsInRuntimeEvidence += 1 }
         }
     }
     sources.setRows("mac_control/operations.json", macOperationCount)
@@ -6483,11 +6839,27 @@ func humanBytes(_ b: Int64) -> String {
 // MARK: - Turn-speed derivation
 // ─────────────────────────────────────────────────────────────────────────────
 
+for id in Array(turns.keys) {
+    if let accepted = lifecycles[id]?.accepted, let terminal = lifecycles[id]?.terminal,
+       terminal > accepted {
+        turns[id]?.lifecycleElapsedMs = (terminal.timeIntervalSince(accepted) * 1000).rounded()
+    }
+}
 let completedTurns = turns.values.filter { $0.elapsedMs != nil }
+/// Performance and lifecycle diagnostics must describe the executable that is
+/// actually installed. A retained seven-day trace can legitimately straddle
+/// several fixes; treating old-build rows as current regressions made repaired
+/// latency clocks keep resurfacing until the window aged out. Synthetic roots
+/// and machines without an inspectable bundle retain the ordinary window.
+let turnEvidenceTurns = completedTurns.filter {
+    guard installedBuildEpoch != nil else { return true }
+    return ($0.startedAt ?? .distantPast) >= runtimeEvidenceStart
+}
+let excludedEarlierBuildTurns = completedTurns.count - turnEvidenceTurns.count
 var turnsBySurface: [String: [TurnRecord]] = [:]
-for t in completedTurns { turnsBySurface[t.surface, default: []].append(t) }
+for t in turnEvidenceTurns { turnsBySurface[t.surface, default: []].append(t) }
 var turnsByDay: [String: [TurnRecord]] = [:]
-for t in completedTurns where !t.day.isEmpty { turnsByDay[t.day, default: []].append(t) }
+for t in turnEvidenceTurns where !t.day.isEmpty { turnsByDay[t.day, default: []].append(t) }
 
 /// Stages whose every in-window sample is zero. Reported as DARK — the number
 /// is not "0 ms of work", it is "this stage's clock is not being written".
@@ -7198,36 +7570,49 @@ line()
 if !organismWatchPresent {
     line("**source absent** — `cognition/organism_watch.jsonl` is not present. This is not zero organism activity; the passive sampler has no evidence to report.")
 } else if sources.isUnreadable("cognition/organism_watch.jsonl") {
-    line("**source unreadable** — `cognition/organism_watch.jsonl` could not provide a trustworthy sampler age. No organism-activity count is inferred.")
+    line(organismWatchRunActive
+        ? "**source unreadable** — the explicitly active `cognition/organism_watch.jsonl` could not provide a trustworthy sampler age. No organism-activity count is inferred."
+        : "**historical / inactive source unreadable** — no active-run marker exists, so this is retained observation residue rather than a current lane failure.")
 } else if organismWatchRows == 0 {
-    line("**EMPTY sampler** — file present with 0 rows. No sample can establish either quiet activity or a healthy watch lane.")
+    line(organismWatchRunActive
+        ? "**EMPTY active sampler** — file present with 0 rows while the explicit run marker exists."
+        : "**HISTORICAL / INACTIVE empty sampler** — file present with 0 rows and no active-run marker.")
 } else {
     line("- retained rows: **\(organismWatchRows) / \(organismWatchRowCeiling)** default writer cap · malformed: \(organismWatchMalformed)")
-    if organismWatchRows > organismWatchRowCeiling {
+    line("- run marker: " + (organismWatchRunActive
+        ? "**active** (`organism_watch.jsonl.lock/` exists)"
+        : "**absent — historical/inactive observation file**, not a failed resident lane"))
+    if organismWatchRows > organismWatchRowCeiling, organismWatchRunActive {
         addLead(rank: 6, "`cognition/organism_watch.jsonl` exceeds its \(organismWatchRowCeiling)-row retention bound",
                 evidence: "The passive sampler holds \(organismWatchRows) rows; `organism_watch.sh` defaults to retaining at most \(organismWatchRowCeiling).",
                 action: "Check whether the watch was started with an intentional larger cap. Otherwise its compaction path is not running and the timeline will grow without bound.")
     }
     if organismWatchTimestampless > 0 || organismWatchFutureStamped > 0 {
         line("- **freshness indeterminate** — \(organismWatchTimestampless) row(s) lack a parseable `at`; \(organismWatchFutureStamped) row(s) are more than 5 minutes in the future. These rows do not prove the sampler is live.")
-        addLead(rank: 5, "`cognition/organism_watch.jsonl` has timestamp-invalid sampler rows",
-                evidence: "\(organismWatchTimestampless) row(s) have no parseable `at`; \(organismWatchFutureStamped) have future timestamps. The newest trustworthy sample is \(organismWatchNewest.map(stamp) ?? "none").",
-                action: "Repair the sampler's wall clock or writer schema before using this file for liveness; an invalid timestamp must not mask a dormant observer.")
+        if organismWatchRunActive {
+            addLead(rank: 5, "`cognition/organism_watch.jsonl` has timestamp-invalid sampler rows",
+                    evidence: "\(organismWatchTimestampless) row(s) have no parseable `at`; \(organismWatchFutureStamped) have future timestamps. The newest trustworthy sample is \(organismWatchNewest.map(stamp) ?? "none").",
+                    action: "Repair the active sampler's wall clock or writer schema before using this file for liveness; an invalid timestamp must not mask a dormant observer.")
+        }
     } else if let newest = organismWatchNewest {
         let ageHours = max(0, now.timeIntervalSince(newest) / 3600)
-        if organismWatchRowsInWindow == 0 {
+        if !organismWatchRunActive {
+            line("- **HISTORICAL / INACTIVE sampler** — newest valid sample `\(stamp(newest))` (\(fmt(ageHours, 1))h ago); no active-run marker exists.")
+        } else if organismWatchRowsInWindow == 0 {
             line("- **DORMANT sampler** — newest valid sample `\(stamp(newest))` (\(fmt(ageHours, 1))h ago); 0 rows inside the \(days)d window.")
             addLead(rank: 4, "`cognition/organism_watch.jsonl` is DORMANT — newest sample \(fmt(ageHours, 1))h ago",
                     evidence: "\(organismWatchRows) validly dated sampler row(s); newest `at` is \(stamp(newest)), outside the \(days)-day window that starts \(stamp(windowStart)).",
-                    action: "The watch is passive and should not fabricate activity. Restart it only if continuing observation is intended; otherwise retire the lane rather than treating an old file as live evidence.")
+                    action: "An active-run marker exists but no current sample arrived. Inspect the explicitly started watch process or clear a stale marker after confirming no writer is running.")
         } else {
-            line("- **LIVE sampler** — newest valid sample `\(stamp(newest))` (\(fmt(ageHours, 1))h ago); \(organismWatchRowsInWindow) row(s) in window: \(organismWatchSuccessfulRowsInWindow) reachable, \(organismWatchUnreachableRowsInWindow) bridge-unreachable.")
+            line("- **ACTIVE sampler** — newest valid sample `\(stamp(newest))` (\(fmt(ageHours, 1))h ago); \(organismWatchRowsInWindow) row(s) in window: \(organismWatchSuccessfulRowsInWindow) reachable, \(organismWatchUnreachableRowsInWindow) bridge-unreachable.")
         }
     } else {
         line("- **freshness indeterminate** — \(organismWatchRows) JSON row(s), but none contains a parseable non-future `at`. The sampler cannot be called dormant or live.")
-        addLead(rank: 5, "`cognition/organism_watch.jsonl` has no trustworthy sample timestamp",
-                evidence: "The file carries \(organismWatchRows) JSON row(s), but no valid `at` value survives timestamp validation.",
-                action: "Repair the row schema before interpreting this sampler. A present file with undated rows is not evidence of organism activity.")
+        if organismWatchRunActive {
+            addLead(rank: 5, "`cognition/organism_watch.jsonl` has no trustworthy sample timestamp",
+                    evidence: "The active sampler file carries \(organismWatchRows) JSON row(s), but no valid `at` value survives timestamp validation.",
+                    action: "Repair the row schema before interpreting this active sampler. A present file with undated rows is not evidence of organism activity.")
+        }
     }
 }
 line()
@@ -7731,7 +8116,7 @@ if !workflowRegistryFeed.didRead && !workflowRunsFeed.didRead && !workflowRunSta
     if workflowRunStateFeed.didRead {
         stateReading = "\(workflowRunStateStatuses.values.reduce(0, +)) state file(s)"
             + (workflowRunStateStatuses.isEmpty ? "" : " (\(topCounts(workflowRunStateStatuses, 8)))")
-            + (workflowStaleNonTerminalStates.isEmpty ? "" : "; **\(workflowStaleNonTerminalStates.count) stale non-terminal**")
+            + "; unchanged >1h: \(workflowOldApprovalWaits.count) approval wait(s), \(workflowOldPersistedAttempts.count) persisted attempt(s), \(workflowStaleNonTerminalStates.count) other non-terminal"
     } else {
         stateReading = workflowRunStateFeed.blockedLabel ?? "source absent"
     }
@@ -7745,10 +8130,19 @@ if !workflowRegistryFeed.didRead && !workflowRunsFeed.didRead && !workflowRunSta
                 action: "Keep these workflows non-runnable until `WorkflowExecutionPreflight` gains the matching executor, or retire the stale rows.")
     }
     if !workflowStaleNonTerminalStates.isEmpty {
-        line("- stale non-terminal ids: \(workflowStaleNonTerminalStates.prefix(12).map { "`\(mdCode($0))`" }.joined(separator: ", "))")
-        addLead(rank: 8, "\(workflowStaleNonTerminalStates.count) workflow run state(s) exceeded the 1h drain window",
+        line("- other non-terminal state ids unchanged >1h: \(workflowStaleNonTerminalStates.prefix(12).map { "`\(mdCode($0))`" }.joined(separator: ", "))")
+        addLead(rank: 8, "\(workflowStaleNonTerminalStates.count) non-terminal workflow state(s) unchanged for >1h; attempt status unknown",
                 evidence: "`workflows/run_state/`: \(workflowStaleNonTerminalStates.prefix(12).joined(separator: ", ")).",
-                action: "Inspect the persisted attempt before resuming; a post-dispatch state must be reconciled or explicitly canceled, never blindly replayed.")
+                action: "File age alone does not prove in-flight work or a missed deadline. Inspect canonical run and approval records before any resume; never infer resend eligibility from this report.")
+    }
+    if !workflowOldApprovalWaits.isEmpty {
+        line("- approval wait ids unchanged >1h, no persisted active attempt: \(workflowOldApprovalWaits.prefix(12).map { "`\(mdCode($0))`" }.joined(separator: ", ")). Historical approval waits are not evidence of in-flight dispatch or a missed drain deadline; review through the approval owner, not by resending work.")
+    }
+    if !workflowOldPersistedAttempts.isEmpty {
+        line("- persisted attempt ids unchanged >1h: \(workflowOldPersistedAttempts.prefix(12).map { "`\(mdCode($0))`" }.joined(separator: ", "))")
+        addLead(rank: 8, "\(workflowOldPersistedAttempts.count) workflow persisted attempt(s) unchanged for >1h; outcome requires reconciliation",
+                evidence: "`workflows/run_state/`: \(workflowOldPersistedAttempts.prefix(12).joined(separator: ", ")). A persisted attempt is dispatch-intent evidence, not proof the owner is still running or an effect occurred.",
+                action: "Inspect the exact attempt, terminal receipts, and owner identity before resuming; reconcile or explicitly cancel unknown outcomes, never blindly replay them.")
     }
     line()
 }
@@ -7871,19 +8265,26 @@ line("## (f) Turn speed — end-to-end latency and where it goes")
 line()
 if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceDir) {
     // section skipped: absent or unreadable, rendered by the helper
-} else if completedTurns.isEmpty {
-    line("**source absent** — `turn_traces/` produced no `turn.terminal` row carrying `turnElapsedMs`")
-    line("inside the \(days)-day window, so end-to-end turn latency is unmeasured. This is not \"0 ms\";")
+} else if turnEvidenceTurns.isEmpty {
+    line("**source absent** — `turn_traces/` produced neither a positive paired accepted→terminal interval nor a terminal payload clock")
+    line("inside the \(runtimeEvidenceLabel), so current end-to-end turn latency is unmeasured. This is not \"0 ms\";")
     line("\(turnRowsSeen) timing row(s) of other kinds were seen.")
+    if excludedEarlierBuildTurns > 0 {
+        line("\(excludedEarlierBuildTurns) completed turn(s) from earlier installed builds remain in the retained \(days)-day history and are intentionally excluded from current-build diagnosis.")
+    }
     line()
 } else {
-    let allElapsed = completedTurns.compactMap { $0.elapsedMs }.sorted()
-    line("Ground truth is `turn.terminal.payload.turnElapsedMs` — accepted-to-terminal wall clock, the")
-    line("only number that includes everything. The breakdown below is built from the three clocks that")
-    line("ARE stamped per turn; what they do not explain is reported as **unattributed**, never")
-    line("redistributed into a named bucket.")
+    let allElapsed = turnEvidenceTurns.compactMap { $0.elapsedMs }.sorted()
+    let pairedCount = turnEvidenceTurns.filter { $0.lifecycleElapsedMs != nil }.count
+    line("End-to-end timing uses paired `turn.accepted`→`turn.terminal` timestamps (**\(pairedCount)/\(turnEvidenceTurns.count)** turns).")
+    line("`turn.terminal.payload.turnElapsedMs` is a distinct engine clock: structured tool-loop turns can exclude prebuilt context assembly.")
+    line("Where a positive lifecycle interval is unavailable, latency statistics retain the payload clock as a **scope unknown fallback**, not accepted-to-terminal proof.")
+    line("Assembly, provider, and tool durations are observations, not proven disjoint buckets; no percentage partition is inferred from their sum.")
     line()
-    line("- turns with a terminal row in window: **\(completedTurns.count)**")
+    line("- turns in diagnostic cohort (\(runtimeEvidenceLabel)): **\(turnEvidenceTurns.count)**")
+    if excludedEarlierBuildTurns > 0 {
+        line("- earlier-build turns excluded from current diagnosis: **\(excludedEarlierBuildTurns)**")
+    }
     line("- all surfaces: p50 **\(fmt(percentile(allElapsed, 0.5) / 1000, 2)) s**, "
          + "p95 **\(fmt(percentile(allElapsed, 0.95) / 1000, 2)) s**, "
          + "max \(fmt((allElapsed.last ?? 0) / 1000, 2)) s")
@@ -7911,63 +8312,42 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
 
     line("### Where the time goes")
     line()
-    let attributable = completedTurns.filter { ($0.elapsedMs ?? 0) > 0 }
+    let attributable = turnEvidenceTurns.filter { ($0.elapsedMs ?? 0) > 0 }
     if attributable.isEmpty {
-        line("**source absent** — no turn has a positive `turnElapsedMs`.")
+        line("**source absent** — no turn has a positive lifecycle or payload clock.")
         line()
     } else {
-        let totalElapsed = attributable.compactMap { $0.elapsedMs }.reduce(0, +)
+        let paired = attributable.filter { $0.lifecycleElapsedMs != nil }
+        let totalElapsed = paired.compactMap { $0.lifecycleElapsedMs }.reduce(0, +)
+        let totalPayload = attributable.compactMap { $0.terminalPayloadMs }.reduce(0, +)
         let totalModel = attributable.map { $0.modelMs }.reduce(0, +)
         let totalTool = attributable.map { $0.toolMs }.reduce(0, +)
         let totalAsm = attributable.compactMap { $0.assemblyMs }.reduce(0, +)
         let asmCoverage = attributable.filter { $0.assemblyMs != nil }.count
-        // A turn is "coherent" when its stamped work fits inside its own terminal
-        // clock. Only those can carry a share — on the rest the terminal row
-        // closes before the attributed work finishes, so a percentage of it would
-        // be arithmetic on two different definitions of "the turn".
-        let coherent = attributable.filter {
-            ($0.modelMs + $0.toolMs + ($0.assemblyMs ?? 0)) <= ($0.elapsedMs ?? 0)
+        // Compare only known lifecycle scopes. A sum exceeding wall clock does
+        // not establish overlap, late work, or a broken terminal milestone.
+        let exceeding = paired.filter {
+            ($0.modelMs + $0.toolMs + ($0.assemblyMs ?? 0)) > ($0.lifecycleElapsedMs ?? 0)
         }
-        let overlapping = attributable.count - coherent.count
         line("| bucket | total s | mean s/turn | measured from |")
         line("|---|---|---|---|")
         func meanS(_ total: Double) -> String { fmt(total / Double(attributable.count) / 1000, 2) }
         line("| context / prompt assembly | \(fmt(totalAsm / 1000, 1)) | \(meanS(totalAsm)) | `context.summary.totalMs` (present on \(asmCoverage)/\(attributable.count) turns) |")
         line("| model (provider round trips) | \(fmt(totalModel / 1000, 1)) | \(meanS(totalModel)) | sum of `llm.call.durationMs` |")
         line("| tools | \(fmt(totalTool / 1000, 1)) | \(meanS(totalTool)) | sum of `tool.dispatch.durationMs` (phase=end) |")
-        line("| **end-to-end** | \(fmt(totalElapsed / 1000, 1)) | \(meanS(totalElapsed)) | `turn.terminal.turnElapsedMs` |")
-        line()
-        if overlapping > 0 {
-            line("**These buckets do NOT partition the end-to-end clock, and are not rendered as if they did.**")
-            line("On **\(overlapping) of \(attributable.count)** turns the stamped model+tool+assembly work is *longer*")
-            line("than the turn's own `turnElapsedMs` — the terminal row closes while work attributed to that")
-            line("`turnId` is still being stamped (tool loops continuing past the terminal milestone, and")
-            line("concurrent dispatch inside one turn). Summing them into a percentage would be arithmetic")
-            line("across two different definitions of \"the turn\", so the report gives absolute totals instead.")
-            line()
-            addLead(rank: 16, "\(overlapping) of \(attributable.count) turns stamp more work than their own turnElapsedMs",
-                    evidence: "Window totals: end-to-end \(fmt(totalElapsed / 1000, 0)) s, but summed `llm.call` "
-                        + "\(fmt(totalModel / 1000, 0)) s + `tool.dispatch` \(fmt(totalTool / 1000, 0)) s across the same turnIds.",
-                    action: "`turn.terminal` is not the envelope for every surface — either it fires before the tool "
-                        + "loop drains, or a turnId outlives its terminal row. Until that is settled, no per-turn "
-                        + "latency budget built on turnElapsedMs is trustworthy.")
+        if !paired.isEmpty {
+            line("| **paired accepted→terminal** | \(fmt(totalElapsed / 1000, 3)) | \(fmt(totalElapsed / Double(paired.count) / 1000, 3)) | lifecycle timestamps, \(paired.count)/\(attributable.count) turns; \(fmt(totalElapsed, 0)) ms total |")
+        } else {
+            line("| paired accepted→terminal | source absent | source absent | no positive paired lifecycle interval |")
         }
-        if !coherent.isEmpty {
-            let ce = coherent.compactMap { $0.elapsedMs }.reduce(0, +)
-            let cm = coherent.map { $0.modelMs }.reduce(0, +)
-            let ct = coherent.map { $0.toolMs }.reduce(0, +)
-            let ca = coherent.compactMap { $0.assemblyMs }.reduce(0, +)
-            func cpct(_ v: Double) -> String { ce > 0 ? fmt(v / ce * 100, 1) + "%" : "n/a" }
-            line("On the **\(coherent.count)** turn(s) whose stamped work DOES fit inside their terminal clock, the")
-            line("split is meaningful:")
-            line()
-            line("| bucket | share of end-to-end |")
-            line("|---|---|")
-            line("| context / prompt assembly | \(cpct(ca)) |")
-            line("| model | \(cpct(cm)) |")
-            line("| tools | \(cpct(ct)) |")
-            line("| unattributed (scheduling, UI render, gaps) | \(cpct(max(0, ce - cm - ct - ca))) |")
-            line()
+        line("| terminal payload clock (not additive) | \(fmt(totalPayload / 1000, 3)) | \(meanS(totalPayload)) | `turn.terminal.turnElapsedMs`; may exclude prebuilt assembly, scope unknown without producer context |")
+        line()
+        if !exceeding.isEmpty {
+            let sum = exceeding.map { $0.modelMs + $0.toolMs + ($0.assemblyMs ?? 0) }.reduce(0, +)
+            let wall = exceeding.compactMap { $0.lifecycleElapsedMs }.reduce(0, +)
+            addLead(rank: 16, "\(exceeding.count) turns need timing-scope attribution before duration sums can be partitioned",
+                    evidence: "On those turns: paired lifecycle \(fmt(wall, 0)) ms; model+tool+assembly sum \(fmt(sum, 0)) ms; excess \(fmt(sum - wall, 0)) ms.",
+                    action: "Inspect producer interval boundaries and event ordering. A duration sum alone cannot prove post-terminal work, concurrent execution, or a broken terminal clock.")
         }
         let ttfts = attributable.compactMap { $0.firstTtftMs }.sorted()
         if !ttfts.isEmpty {
@@ -8061,19 +8441,20 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
         }
     }
 
-    // Slow-surface lead, from end-to-end rather than from provider time alone.
+    // Slow-surface lead uses the preferred available clock, labeling fallback
+    // scope instead of silently promoting an engine timer to end-to-end proof.
     for (surface, rows) in turnsBySurface where rows.count >= 5 {
         let e = rows.compactMap { $0.elapsedMs }.sorted()
         guard !e.isEmpty else { continue }
         let p95 = percentile(e, 0.95)
         if p95 > 120_000 {
-            addLead(rank: 19, "Surface `\(mdCode(surface))` end-to-end p95 is \(fmt(p95 / 1000, 1)) s",
-                    evidence: "\(e.count) turn.terminal rows on `\(mdCode(surface))` in the \(days)d window; p95 turnElapsedMs = \(fmt(p95, 0)).",
+            addLead(rank: 19, "Surface `\(mdCode(surface))` observed turn-clock p95 is \(fmt(p95 / 1000, 1)) s",
+                    evidence: "\(e.count) timed turns on `\(mdCode(surface))` in the \(days)d window; p95 = \(fmt(p95, 0)) ms. Paired lifecycle is preferred; unpaired payload clocks have unknown scope.",
                     action: "Two minutes is past the point a companion feels present. Check the tool-call count per turn "
-                        + "on this surface first — it dominates the unattributed bucket.")
+                        + "and the producer timing boundaries before assigning the delay to a subsystem.")
         }
     }
-    let failedTurns = completedTurns.filter { $0.status != nil && $0.status != "completed" }
+    let failedTurns = turnEvidenceTurns.filter { $0.status != nil && $0.status != "completed" }
     if !failedTurns.isEmpty {
         let byStatus = Dictionary(grouping: failedTurns, by: { $0.status ?? "?" }).mapValues { $0.count }
         line("- non-completed terminal statuses in window: " + byStatus.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
@@ -8260,6 +8641,8 @@ let brJobs = bridgeLanes.reduce(0) { $0 + $1.jobsTotal }
 let brJobsWindow = bridgeLanes.reduce(0) { $0 + $1.jobsInWindow }
 let brDelivered = bridgeLanes.reduce(0) { $0 + $1.deliveriesInWindow }
 let brUndelivered = bridgeLanes.reduce(0) { $0 + $1.undeliveredOver24h }
+let brTerminalFailed = bridgeLanes.reduce(0) { $0 + $1.terminalFailedUnread }
+let brTerminalFailedOldest = bridgeLanes.compactMap(\.terminalFailedOldest).min()
 let brHeld = bridgeLanes.reduce(0) { $0 + $1.jobsHeldUnreleased }
 let brAcked = bridgeLanes.reduce(0) { $0 + $1.undeliveredAcknowledged }
 let brHoldResidue = bridgeLanes.reduce(0) { $0 + $1.jobsSettledHoldResidue }
@@ -8283,10 +8666,12 @@ do {
         "jobs \(days)d: **\(brJobsWindow)** of \(brJobs) on disk\(brCapped ? " (capped)" : "")")
     let deliveredCell = sysCell(sysBridgeDeliveryLabels,
         "**\(brDelivered)**" + (brDeliveryMix.isEmpty ? "" : " (\(topCounts(brDeliveryMix, 3)))"))
-    // The undelivered backlog needs BOTH sides: with no receipt feed every
-    // message looks undelivered, and with no inbox there is nothing to match.
-    let undeliveredCell = bridgeLanes.contains { $0.deliveries.didRead && $0.inbox.didRead }
+    // Consumption truth lives on the inbox row. Reply deliveries are a legacy
+    // fallback, not a prerequisite for measuring an inbox backlog.
+    let undeliveredCell = bridgeLanes.contains { $0.inbox.didRead }
         ? "**\(brUndelivered)**" : "source absent"
+    let terminalFailedCell = bridgeLanes.contains { $0.inbox.didRead }
+        ? "**\(brTerminalFailed)**" : "source absent"
     let heldCell = sysCell(sysBridgeJobLabels, "**\(brHeld)**")
     let staleHBCell = sysCell(sysBridgeJobLabels, "**\(brStaleHB)**")
     // Preserved replies render ONLY when some lane has an undelivered/
@@ -8302,7 +8687,8 @@ do {
     let reading = sysBlockedReading(sysBridgeStatus, sysBridgeLabels) ?? [
         jobsCell, " · ",
         "delivered in window: ", deliveredCell,
-        " · undelivered >24h: ", undeliveredCell, " · held-unreleased: ", heldCell, " · ",
+        " · terminal failed: ", terminalFailedCell,
+        " · unconsumed >24h: ", undeliveredCell, " · held-unreleased: ", heldCell, " · ",
         "stale-heartbeat: ", staleHBCell,
         preservedCell,
         (brAcked > 0 ? " · \(brAcked) acknowledged (triage ledger: docs/eval_acknowledgments.json)" : ""),
@@ -8317,7 +8703,11 @@ do {
                                    : "bridge config root not read on this data root"
     case .partial: sev = .absentExpected; why = "some bridge feeds missing on this root"
     case .measured:
-        if brUndelivered > 0 { sev = .failureStreak; why = "\(brUndelivered) message(s) undelivered >24h" }
+        if brTerminalFailed > 0 {
+            sev = .failureStreak
+            why = "\(brTerminalFailed) unread message(s) terminally failed delivery"
+        }
+        else if brUndelivered > 0 { sev = .failureStreak; why = "\(brUndelivered) message(s) unconsumed >24h" }
         // (An unreadable undelivered/ directory is a registered, unreadable
         // feed, so the organ already reads `.unreadable` above — it never
         // reaches this branch as a measured organ.)
@@ -8606,19 +8996,29 @@ do {
 let sysWorkshopLabels = ["workshop/receipts.jsonl", "workshop/background_lease.json",
                          "workshop/executions/*/execution.json", "workshop/reservation_claims/*.claim"]
 let sysWorkshopStatus = sysStatus(sysWorkshopLabels)
-/// A Workshop lease older than this has stopped being renewed by the pump. The
-/// pump's own cadence is roughly two-hourly on the live root, so 12h is six
-/// missed renewals — comfortably past noise, well short of "it never runs".
-let workshopLeaseStaleHours = 12.0
+// BackgroundWorkLease stores consumed windows, not a heartbeat. The pump is
+// event/deadline-driven with daily missed-event recovery; only its canonical
+// recorded tick can supply activity evidence. Two daily intervals is a review
+// threshold, not proof that the process stopped or a session failed.
+let workshopPumpReviewHours = 48.0
+let workshopPumpTick = loopLastRun["workshop_pump"]
+let workshopPumpTickAgeHours = workshopPumpTick.map { hoursSince($0) }
 let sysLeaseAgeHours = leaseAcquiredAt.map { hoursSince($0) }
 /// The lease cell, composed separately: a present-but-unstamped lease is a
 /// distinct fact from an absent one, and neither may render as an age of 0.
 let sysLeaseCell: String = {
     guard leaseObj != nil else { return "source absent" }
+    if let claims = leaseObj?["claims"] as? [Any], claims.isEmpty,
+       leaseObj?["window"] == nil, leaseAcquiredAt == nil {
+        return "no consumed windows retained (empty claim history; not a heartbeat)"
+    }
     let holder = mdCode((leaseObj?["holder"] as? String) ?? "(none)")
     let age = sysLeaseAgeHours.map { ", acquired \(fmt(max($0, 0), 1))h ago" } ?? ", **no `acquiredAt`**"
-    return "holder `\(holder)`" + age + ", \(leaseClaims) claim(s)"
+    return "holder `\(holder)`" + age + ", \(leaseClaims) claim(s) (consumed-window history; not a heartbeat)"
 }()
+let workshopPumpCell = workshopPumpTick.map {
+    "last recorded tick \(stamp($0)) (\(fmt(max(hoursSince($0), 0), 1))h ago); not proof of session success or continuous uptime"
+} ?? "tick unavailable (\(loopStateFeed.blockedLabel ?? "no parseable workshop_pump timestamp")); activity unknown"
 do {
     let executionCell = sysCell("workshop/executions/*/execution.json", [
         "**\(executionsTotal)**",
@@ -8638,6 +9038,7 @@ do {
         "executions: ", executionCell,
         " · receipts: ", receiptCell,
         " · lease: ", sysLeaseCell,
+        " · pump: ", workshopPumpCell,
         " · reservation claims: ", claimCell
     ].joined()
     var sev = SysSeverity.healthy
@@ -8651,10 +9052,8 @@ do {
             sev = .failureStreak; why = "\(executionsUnparseable) execution record(s) will not parse"
         } else if reservationsUnparseable > 0 {
             sev = .failureStreak; why = "\(reservationsUnparseable) reservation claim(s) will not parse"
-        } else if let h = sysLeaseAgeHours, h > workshopLeaseStaleHours {
-            sev = .stale; why = "background lease last acquired \(fmt(h, 1))h ago"
-        } else if sysLeaseAgeHours == nil {
-            sev = .stale; why = "background lease carries no `acquiredAt`"
+        } else if let h = workshopPumpTickAgeHours, h > workshopPumpReviewHours {
+            sev = .stale; why = "last recorded pump tick \(fmt(h, 1))h ago; current activity unknown"
         }
     }
     sysRows.append(SysRow(id: "SYS-06", organ: "Workshop (executions, receipts, background lease)",
@@ -8817,6 +9216,10 @@ do {
         ? "**0**"
         : "**\(unservedProviderPins.count)** (" + unservedProviderPins.prefix(3)
             .map { "`\(mdCode($0))`" }.joined(separator: ", ") + ")")
+    let retiredCell = sysCell(["providers/surfaces.json", "providers/active.json"], retiredProviderPins.isEmpty
+        ? "**0**"
+        : "**\(retiredProviderPins.count)** (" + retiredProviderPins.prefix(3)
+            .map { "`\(mdCode($0))`" }.joined(separator: ", ") + ")")
     let statusCell = sysCell("llm/provider_status.json", [
         providerStatusStatus.map { "`\(mdCode($0))`" } ?? "**no `status` field**",
         (providerStatusDetail.map { " (\(mdText($0)))" } ?? ""),
@@ -8827,6 +9230,7 @@ do {
         " · provider registry: ", registryCell,
         " · pins unresolvable: ", unresolvedCell,
         " · pins on unknown surfaces: ", unservedCell,
+        " · retired compatibility pins: ", retiredCell,
         " · pin-vs-observed drift: ", driftCell,
         " · substitutions in window: ", substitutionCell,
         " · non-`ok` llm.call rows in window: ", rejectionCell,
@@ -8946,7 +9350,7 @@ do {
         return "p50 \(fmt(percentile(s, 0.5), 1))h, p95 \(fmt(percentile(s, 0.95), 1))h over \(s.count)"
     }()
     let reading = sysBlockedReading(sysToolStatus, sysToolLabels) ?? [
-        "dispatches in window: ", dispatchCell,
+        "dispatches in \(runtimeEvidenceLabel): ", dispatchCell,
         " · worst failing: ", worstCell,
         " · ", envelopeCell,
         " · preloads in window: ", preloadCell,
@@ -8986,7 +9390,7 @@ do {
         }
     } else if toolDispatchInWindow == 0, toolDispatchRowsTotal > 0 {
         sev = .stale
-        why = "no tool dispatch in the \(days)d window"
+        why = "no tool dispatch in the \(runtimeEvidenceLabel)"
             + (toolDispatchNewest.map { " (newest \(stamp($0)))" } ?? "")
     }
     sysRows.append(SysRow(id: "SYS-10", organ: "Tools (dispatch outcomes, registry, gate refusals)",
@@ -9596,8 +10000,8 @@ if bridgeConfigRoot == nil {
     line("No lane number is reported. This is not a zero.")
     line()
 } else {
-    line("| lane | dir | inbox (window/total, unread) | delivered (window) | undelivered >24h | jobs (window/total) | held-unreleased | stale-heartbeat | preserved (undelivered/) |")
-    line("|---|---|---|---|---|---|---|---|---|")
+    line("| lane | dir | inbox (window/total, unread) | delivered (window) | terminal failed | unconsumed >24h | jobs (window/total) | held-unreleased | stale-heartbeat | preserved (undelivered/) |")
+    line("|---|---|---|---|---|---|---|---|---|---|")
     for l in bridgeLanes {
         // No `undelivered/` directory means nothing was ever preserved on this
         // lane (the bridge creates it on first preserve) — a dash, not a zero
@@ -9615,10 +10019,10 @@ if bridgeConfigRoot == nil {
             ?? "\(l.inboxInWindow)/\(l.inboxRows), \(l.inboxUnread) unread"
         let delCell = l.deliveries.blockedLabel
             ?? "\(l.deliveriesInWindow)" + (l.deliveryStatuses.isEmpty ? "" : " (\(topCounts(l.deliveryStatuses, 2)))")
-        // Undelivered is computable ONLY when the delivery feed read — with an
-        // empty receipt set every message looks undelivered.
-        let undCell = l.deliveries.didRead ? "\(l.undeliveredOver24h)"
+        let undCell = l.inbox.didRead ? "\(l.undeliveredOver24h)"
             + (l.undeliveredOldest.map { ", oldest \(stamp($0))" } ?? "") : "not computable"
+        let terminalCell = l.inbox.didRead ? "\(l.terminalFailedUnread)"
+            + (l.terminalFailedOldest.map { ", oldest \(stamp($0))" } ?? "") : "not computable"
         // `jobsPresent` only says the directory exists. A directory that exists
         // and could not be listed — or whose files will not parse — is
         // UNREADABLE here, and prints its reason instead of a job count.
@@ -9626,7 +10030,7 @@ if bridgeConfigRoot == nil {
             ?? ("\(l.jobsInWindow)/\(l.jobsTotal)\(l.jobsCapped ? " (capped at \(wakeJobFileCap))" : "")"
               + (l.jobStates.isEmpty ? "" : " (\(topCounts(l.jobStates, 2)))"))
         line("| `\(mdCode(l.name))` | `\(mdCode((l.dirPath as NSString).abbreviatingWithTildeInPath))` | "
-             + "\(mdComposed(inboxCell)) | \(mdComposed(delCell)) | \(mdComposed(undCell)) | "
+             + "\(mdComposed(inboxCell)) | \(mdComposed(delCell)) | \(mdComposed(terminalCell)) | \(mdComposed(undCell)) | "
              + "\(mdComposed(jobsCell)) | \(l.jobs.didRead ? String(l.jobsHeldUnreleased) : "—") | "
              + "\(l.jobs.didRead ? String(l.jobsStaleHeartbeat) : "—") | \(mdComposed(preservedCell)) |")
     }
@@ -9740,10 +10144,16 @@ if sysProviderStatus == .unreadable {
             + ". These persisted keys are not in the canonical picker vocabulary and cannot route a turn.")
         line()
     }
+    if !retiredProviderPins.isEmpty {
+        line("- **Retired compatibility pins (not failures):** " + retiredProviderPins
+            .map { "`\(mdCode($0))`" }.joined(separator: ", ")
+            + ". These keys are recognized historical residue and no longer route a turn.")
+        line()
+    }
 }
 
 // ── per-tool detail ──
-line("### SYS-10 detail — per tool, dispatch outcomes in window")
+line("### SYS-10 detail — per tool, dispatch outcomes in \(runtimeEvidenceLabel)")
 line()
 if sysToolStatus == .unreadable {
     line("**source unreadable** — see the matrix row above; no per-tool number is derived.")
@@ -9753,7 +10163,7 @@ if sysToolStatus == .unreadable {
     line("exists to count. This is not a zero.")
     line()
 } else if toolStats.isEmpty {
-    line("`traces/events.jsonl` READ and carries **no `tool.dispatch` row inside the \(days)-day window**")
+    line("`traces/events.jsonl` READ and carries **no `tool.dispatch` row inside the \(runtimeEvidenceLabel)**")
     line((toolDispatchNewest.map { "(newest dispatch anywhere in the feed: \(stamp($0)))." }
           ?? "(and none anywhere in the feed)."))
     line("That is a measured zero, not an absent source — the distinction the rest of this report keeps.")
@@ -9969,18 +10379,26 @@ if sources.isUnreadable("trust/policy.json") {
 // the finding, and inventing a threshold breach from an unread feed is the
 // silent zero this instrument exists to catch.
 if sysBridgeStatus == .measured || sysBridgeStatus == .partial {
+    if brTerminalFailed > 0 {
+        let lanes = bridgeLanes.filter { $0.terminalFailedUnread > 0 }
+        addLead(rank: 5, "\(brTerminalFailed) bridge message(s) terminally failed delivery",
+                evidence: "Unread bridge inbox rows carrying the durable `deliveryStatus=dead_letter` projection: "
+                    + lanes.map { "`\(mdCode($0.name))`×\($0.terminalFailedUnread)" }.joined(separator: ", ")
+                    + (brTerminalFailedOldest.map { "; oldest failure \(stamp($0))" } ?? "") + ".",
+                action: "These messages are no longer queued and will not replay automatically. Review the retained brief, then resend as new work or mark it read.")
+    }
     if brUndelivered > 0 {
         let worstLane = bridgeLanes.filter { $0.undeliveredOver24h > 0 }
             .sorted { $0.undeliveredOver24h == $1.undeliveredOver24h ? $0.name < $1.name : $0.undeliveredOver24h > $1.undeliveredOver24h }.first
-        addLead(rank: 6, "\(brUndelivered) bridge message(s) have sat undelivered for over 24h",
-                evidence: "Bridge inbox rows with no matching receipt in the lane's delivery feed and a "
+        addLead(rank: 6, "\(brUndelivered) bridge message(s) have sat unconsumed for over 24h",
+                evidence: "Bridge inbox rows with neither an explicit read/consumed stamp nor a legacy matching reply receipt, and a "
                     + "`createdAt` older than 24h: \(brUndelivered) across \(bridgeLanes.filter { $0.undeliveredOver24h > 0 }.count) lane(s)"
                     + (worstLane.map { ", worst `\(mdCode($0.name))` (\($0.undeliveredOver24h)"
                         + ($0.undeliveredOldest.map { o in ", oldest \(stamp(o))" } ?? "") + ")" } ?? "")
-                    + ". Counted only for lanes whose delivery feed READ — see [(h) SYS-01 detail](#sec-h).",
-                action: "A message with no receipt was never handed to its agent. Check the lane's delivery "
-                    + "loop is running and that the receipt writer stamps `messageId`; a backlog this old "
-                    + "means the sender believes it was delivered and nobody read it.")
+                    + ". Counted only from inbox lanes that READ — see [(h) SYS-01 detail](#sec-h).",
+                action: "A message with no consumption stamp was never handed to its agent. Check the lane's inbox "
+                    + "consumer and its read/consumed writeback; a backlog this old means the sender believes it "
+                    + "was delivered and nobody read it.")
     }
     if brHeld > 0 {
         let heldLanes = bridgeLanes.filter { $0.jobsHeldUnreleased > 0 }
@@ -10099,7 +10517,7 @@ if sysToolStatus == .measured || sysToolStatus == .partial {
                 action: "Do not promote or remove anything by hand. Reconcile through the ToolExecution owner so signed registry state and artifact directories commit together.")
     }
     for r in sysToolBroken.prefix(3) {
-        addLead(rank: 8, "Tool `\(mdCode(r.name))` failed \(r.stat.failed)× against \(r.stat.ok) success(es) in window",
+        addLead(rank: 8, "Tool `\(mdCode(r.name))` failed \(r.stat.failed)× against \(r.stat.ok) success(es) in \(runtimeEvidenceLabel)",
                 evidence: "`traces/events.jsonl` `tool.dispatch` rows for `\(mdCode(r.name))`: "
                     + "\(r.stat.total) dispatch(es), \(r.stat.failed) failed"
                     + (r.stat.errorClasses.isEmpty ? "" : " (\(mdComposed(topCounts(r.stat.errorClasses, 2))))")
@@ -10191,23 +10609,13 @@ if sysSecurityStatus == .measured || sysSecurityStatus == .partial {
                     + "like a policy denial from inside the app.")
     }
 }
-if (sysWorkshopStatus == .measured || sysWorkshopStatus == .partial), leaseObj != nil {
-    if let h = sysLeaseAgeHours, h > workshopLeaseStaleHours {
-        addLead(rank: 14, "Workshop background lease last acquired \(fmt(h, 1))h ago",
-                evidence: "`workshop/background_lease.json`: `acquiredAt` "
-                    + (leaseAcquiredAt.map { stamp($0) } ?? "unknown")
-                    + ", holder `\(mdCode((leaseObj?["holder"] as? String) ?? "(none)"))`, "
-                    + "\(leaseClaims) claim(s) recorded, against a \(fmt(workshopLeaseStaleHours, 0))h bound.",
-                action: "The lease is renewed each time the Workshop pump takes a window. A lease going cold "
-                    + "means the pump is not cycling — no execution advances, and the receipt counts above "
-                    + "will keep looking calm because nothing is being attempted.")
-    } else if sysLeaseAgeHours == nil {
-        addLead(rank: 14, "Workshop background lease has no `acquiredAt` — its age is unknowable",
-                evidence: "`workshop/background_lease.json` parsed, holder "
-                    + "`\(mdCode((leaseObj?["holder"] as? String) ?? "(none)"))`, \(leaseClaims) claim(s), "
-                    + "but no parseable `acquiredAt`.",
-                action: "Stamp the lease on acquisition. An unstamped lease cannot be told apart from a "
-                    + "permanently held one, which is exactly the failure it is supposed to prevent.")
+if sysWorkshopStatus == .measured || sysWorkshopStatus == .partial {
+    if let h = workshopPumpTickAgeHours, h > workshopPumpReviewHours {
+        addLead(rank: 14, "Workshop pump last recorded tick \(fmt(h, 1))h ago; current activity unknown",
+                evidence: "`logs/background_loop_state.json`: `workshop_pump` "
+                    + (workshopPumpTick.map { stamp($0) } ?? "unknown")
+                    + ", beyond the \(fmt(workshopPumpReviewHours, 0))h review threshold (two daily integrity intervals).",
+                action: "Inspect canonical loop status and failure evidence. The pump is event/deadline-driven; its consumed-window lease is historical spend evidence, not a heartbeat. This timestamp alone proves neither stopped execution nor continuous uptime.")
     }
 }
 
@@ -10442,10 +10850,16 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     // ── lifecycle pairing ──
     let windowTurns = lifecycles.filter { $0.value.terminal != nil || $0.value.accepted != nil }
     let terminalTurns = lifecycles.filter { $0.value.terminal != nil }
-    let okTurns = terminalTurns.filter { ($0.value.terminalStatus ?? "") == "completed"
-                                         || ($0.value.terminalStatus ?? "") == "ok" }
+    // Only an accepted turn belongs to a user-visible lifecycle envelope.
+    // Background/ephemeral terminal rows do not own a surface handoff, so
+    // comparing all terminals to outputEnqueued manufactured hundreds of
+    // false delivery gaps on the live feed.
+    let okTurns = terminalTurns.filter {
+        $0.value.accepted != nil
+            && (($0.value.terminalStatus ?? "") == "completed"
+                || ($0.value.terminalStatus ?? "") == "ok")
+    }
     let missingReady = terminalTurns.filter { $0.value.readyRows == 0 }
-    let duplicateReady = terminalTurns.filter { $0.value.readyRows > 1 }
     let negativeReady = lifecycles.filter {
         guard let a = $0.value.accepted, let r = $0.value.readyFirst else { return false }
         return r < a
@@ -10474,14 +10888,14 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
         // escaping it would print the backticks it is meant to render.
         line("| \(name) | \(checked) | \(violations) | \(verdict) |")
     }
-    pairRow("every terminal turn carries exactly one `context.ready`",
-            checked: terminalTurns.count, violations: missingReady.count + duplicateReady.count)
+    pairRow("every terminal turn carries ≥1 `context.ready`",
+            checked: terminalTurns.count, violations: missingReady.count)
     pairRow("`turn.accepted` → `context.ready` elapsed is non-negative",
             checked: lifecycles.filter { $0.value.accepted != nil && $0.value.readyFirst != nil }.count,
             violations: negativeReady.count)
     pairRow("`context.ready` precedes `provider.requestStarted`",
             checked: bothReadyAndRequest.count, violations: readyAfterRequest.count)
-    pairRow("every ok-terminal turn carries ≥1 `surface.outputEnqueued`",
+    pairRow("every accepted ok-terminal turn carries ≥1 `surface.outputEnqueued`",
             checked: okTurns.count, violations: missingEnqueued.count)
     line()
     let readySpreads = lifecycles.values.compactMap { r -> Double? in
@@ -10499,11 +10913,11 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     line("- `context.attention.late-completion`: **\(lateCompletionRows)** row(s) in window "
          + "(the 250 ms attention-abandon latch's only receipt)")
     line()
-    if missingReady.count + duplicateReady.count > 0 {
-        addLead(rank: 5, "\(missingReady.count + duplicateReady.count) terminal turn(s) do not carry exactly one `context.ready`",
-                evidence: "\(missingReady.count) terminal turn(s) with NO `context.ready` and "
-                    + "\(duplicateReady.count) with more than one, out of \(terminalTurns.count) terminal turns "
-                    + "in the \(days)d window.",
+    if !missingReady.isEmpty {
+        addLead(rank: 5, "\(missingReady.count) terminal turn(s) carry no `context.ready`",
+                evidence: "\(missingReady.count) of \(terminalTurns.count) terminal turns have no `context.ready` "
+                    + "in the \(days)d window. Multiple rows are valid when a provider/tool loop rebuilds context; "
+                    + "the earliest row remains the assembly boundary used for ordering.",
                 action: "`context.ready` is the assembly→provider boundary stamp. Without it the assembly gap is "
                     + "unmeasurable and lands in the unattributed bucket of the turn-speed section.")
     }
@@ -10515,7 +10929,7 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
                     + "stamping from the wrong clock. Both make every assembly number above wrong.")
     }
     if missingEnqueued.count > 0 {
-        addLead(rank: 5, "\(missingEnqueued.count) ok-terminal turn(s) have no `surface.outputEnqueued`",
+        addLead(rank: 5, "\(missingEnqueued.count) accepted ok-terminal turn(s) have no `surface.outputEnqueued`",
                 evidence: "\(missingEnqueued.count) of \(okTurns.count) turns that reached a successful terminal "
                     + "carry no enqueue milestone — the last stamp before the UI.",
                 action: "Either the surface stopped stamping the handoff, or those turns produced no output while "
@@ -10536,6 +10950,7 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     let tickTurns = lifecycles.filter { $0.value.ticks > 0 }
     let tickCounts = tickTurns.values.map { Double($0.ticks) }.sorted()
     let allGaps = tickTurns.values.flatMap { $0.tickGaps }.sorted()
+    let interRoundGaps = tickTurns.values.flatMap { $0.interRoundGaps }.sorted()
     let tickRows = traceKindWindow["stream.tick"] ?? 0
     let windowRowsAllKinds = traceKindWindow.values.reduce(0, +)
     line("### `stream.tick` — the feed's own budget share")
@@ -10549,13 +10964,19 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
              + "\(fmt(percentile(tickCounts, 0.95), 0)) · max \(Int(tickCounts.last ?? 0)) "
              + "over \(tickTurns.count) turn(s)")
         if allGaps.isEmpty {
-            line("- inter-tick gap: **no turn has two ticks** — cadence not measurable, not zero")
+            line("- intra-round inter-tick gap: **no round has two ticks** — cadence not measurable, not zero")
         } else {
-            line("- inter-tick gap: p50 \(fmt(percentile(allGaps, 0.5), 0)) ms · p95 "
+            line("- intra-round inter-tick gap: p50 \(fmt(percentile(allGaps, 0.5), 0)) ms · p95 "
                  + "\(fmt(percentile(allGaps, 0.95), 0)) ms · max \(fmt(allGaps.last ?? 0, 0)) ms")
         }
+        if !interRoundGaps.isEmpty {
+            line("- inter-round gap (tool dispatch + next-round TTFT, NOT streaming cadence): "
+                 + "\(interRoundGaps.count) boundary interval(s) · p50 \(fmt(percentile(interRoundGaps, 0.5), 0)) ms · p95 "
+                 + "\(fmt(percentile(interRoundGaps, 0.95), 0)) ms · max \(fmt(interRoundGaps.last ?? 0, 0)) ms")
+        }
         line("- named bounds: **\(streamTickPerTurnCeiling) ticks/turn** and **"
-             + "\(Int(streamTickGapCeilingMs)) ms** p95 inter-tick gap")
+             + "\(Int(streamTickGapCeilingMs)) ms** p95 intra-round inter-tick gap "
+             + "(the ticker is chunk-gated — a zero-chunk freeze emits no tick and is invisible here)")
         if (tickCounts.last ?? 0) > Double(streamTickPerTurnCeiling) {
             addLead(rank: 9, "A turn emitted \(Int(tickCounts.last ?? 0)) `stream.tick` rows — over the \(streamTickPerTurnCeiling) ceiling",
                     evidence: "`stream.tick` is \(fmt(sharePct, 1))% of the trace feed in this window "
@@ -10564,11 +10985,13 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
                         + "evicts them first, which is a silent loss of the rows that matter most.")
         }
         if !allGaps.isEmpty, percentile(allGaps, 0.95) > streamTickGapCeilingMs {
-            addLead(rank: 9, "Streaming cadence p95 inter-tick gap is \(fmt(percentile(allGaps, 0.95), 0)) ms — over the \(Int(streamTickGapCeilingMs)) ms bound",
-                    evidence: "\(allGaps.count) inter-tick interval(s) across \(tickTurns.count) turn(s) in the "
-                        + "\(days)d window.",
-                    action: "A stall mid-response reads to User as \"she froze\". Nothing else grades tick cadence, "
-                        + "so this is the only place a streaming stall is visible after the fact.")
+            addLead(rank: 9, "Streaming cadence p95 intra-round inter-tick gap is \(fmt(percentile(allGaps, 0.95), 0)) ms — over the \(Int(streamTickGapCeilingMs)) ms bound",
+                    evidence: "\(allGaps.count) intra-round inter-tick interval(s) across \(tickTurns.count) turn(s) "
+                        + "in the \(days)d window (provider-round boundaries excluded — "
+                        + "\(interRoundGaps.count) dispatch/TTFT interval(s) reported separately).",
+                    action: "Chunk delivery WITHIN a provider stream is uneven. Scope honestly: the ticker is "
+                        + "chunk-gated, so a zero-chunk freeze (\"she froze\") emits no tick and is NOT visible "
+                        + "here — that shape lands in TTFT and the turn-speed section, not this metric.")
         }
     }
     line()
@@ -10581,10 +11004,18 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
     line("| `context.stage` names | \(traceStageRowsWindow == 0 ? "**no row in window**" : "\(traceStageRowsWindow) row(s): " + topCounts(traceStageNames, 6)) |")
     line("| `turn.failed` reasons | \(turnFailedRowsWindow == 0 ? "**no row in window**" : "\(turnFailedRowsWindow) row(s): " + topCounts(turnFailedReasons, 4)) |")
     line("| `motor.state` phases | \(motorRowsWindow == 0 ? "**no row in window**" : "\(motorRowsWindow) row(s) over \(motorActionLastPhase.count) action(s): " + topCounts(motorPhaseCounts, 5)) |")
-    let halfOpenMotor = motorActionLastPhase.filter { !motorTerminalPhases.contains($0.value.phase) }
+    let intentionalGithubWaits = motorActionLastPhase.filter {
+        $0.value.domain == "github_command"
+            && ($0.value.phase == "waiting_external" || $0.value.phase == "ready")
+    }
+    let halfOpenMotor = motorActionLastPhase.filter {
+        !motorTerminalPhases.contains($0.value.phase)
+            && !intentionalGithubWaits.keys.contains($0.key)
+    }
     var halfOpenPhases: [String: Int] = [:]
     for (_, v) in halfOpenMotor { halfOpenPhases[v.phase, default: 0] += 1 }
     line("| `motor.state` half-open actions | \(motorActionLastPhase.isEmpty ? "**no action in window**" : "\(halfOpenMotor.count) of \(motorActionLastPhase.count) never reached a terminal phase") |")
+    line("| `motor.state` intentional GitHub waits | **\(intentionalGithubWaits.count)** `github_command` action(s) in `ready`/`waiting_external` (watcher-owned, not abandoned) |")
     line("| `memory.commit` two feeds | turn_traces **\(memoryCommitTraceRows)** vs traces/events.jsonl **\(memoryCommitEventRows)** row(s) in window |")
     line("| `turn.plan` two feeds | turn_traces **\(turnPlanTraceRows)** (payload fields: \(turnPlanTraceFieldCounts.isEmpty ? "—" : turnPlanTraceFieldCounts.sorted().map(String.init).joined(separator: "/"))) vs events **\(turnPlanEventRows)** (payload fields: \(turnPlanEventFieldCounts.isEmpty ? "—" : turnPlanEventFieldCounts.sorted().map(String.init).joined(separator: "/"))) |")
     line("| `turn.plan` policy outcomes | \(turnPlanEventRows == 0 ? "**no row in window**" : topCounts(turnPlanPolicyOutcomes, 4) + (turnPlanNullPolicy > 0 ? ", \(turnPlanNullPolicy) row(s) with a null decision" : "")) |")
@@ -10599,7 +11030,8 @@ if skipFeedSection(turnTracesPresent, "the turn-trace kind vocabulary", "turn_tr
                     + "(\(topCounts(halfOpenPhases, 3)))"
                     + (oldest.map { "; oldest \(stamp($0))" } ?? "") + ".",
                 action: "Terminal phases are `succeeded/failed/cancelled/expired` (MotorActionReadModel.swift:24 — "
-                    + "`blocked` is deliberately NOT terminal). A lane stuck in one phase forever looks identical "
+                    + "`blocked` is deliberately NOT terminal). GitHub Command `ready`/`waiting_external` rows are "
+                    + "watcher-owned long-lived state and are excluded. A different lane stuck in one phase forever looks identical "
                     + "to a quiet system from every other section.")
     }
     if !motorUndeclaredPhases.isEmpty {
@@ -10677,7 +11109,8 @@ if let blocked = chatSessionsDirState.blockedLabel {
     let staleFlags = cancelledFlags.filter { $0.age > cancelledFlagMaxAgeDays }
     line("- `cancelled.flag` files: **\(cancelledFlags.count)**, "
          + (cancelledFlags.isEmpty ? "none" : "oldest \(fmt(cancelledFlags.map { $0.age }.max() ?? 0, 1))d")
-         + " — a flag is a transient; **\(staleFlags.count)** older than \(Int(cancelledFlagMaxAgeDays))d")
+         + " — **\(staleFlags.count)** cleanup residue older than \(Int(cancelledFlagMaxAgeDays))d; "
+         + "turn acceptance clears the session flag before execution")
     if maxGenerations > compactGenerationCeiling {
         addLead(rank: 10, "One chat session holds \(maxGenerations) compaction generations — over the \(compactGenerationCeiling) bound",
                 evidence: "`chat/sessions/*/messages.compact.*.jsonl`: \(compactGenerationsBySession.values.reduce(0, +)) "
@@ -10691,13 +11124,6 @@ if let blocked = chatSessionsDirState.blockedLabel {
                     .joined(separator: ", ") + ". Compaction that does not shrink is compaction that cost storage.",
                 action: "Check the autocompactor's output for those sessions. A compact file larger than its "
                     + "source is the wrong-value failure of the whole compaction lane.")
-    }
-    if !staleFlags.isEmpty {
-        addLead(rank: 8, "\(staleFlags.count) `cancelled.flag` file(s) have outlived their turn",
-                evidence: "Oldest \(fmt(staleFlags.map { $0.age }.max() ?? 0, 1))d. The flag is a transient signal, "
-                    + "not state.",
-                action: "A stale flag on a reused session id cancels a LIVE turn with no trace. Sweep them, or "
-                    + "make the flag carry the turn id it belongs to.")
     }
 }
 if sessionStateOrphans.count > sessionStateOrphanCeiling {
@@ -10743,30 +11169,25 @@ if skipFeedSection(sources.isPresent("activity/events.jsonl"), "the activity eve
 }
 
 // builder_audit
-line("### `builder_audit/` — one permanent file per builder-tool call")
+line("### `builder_audit/` — bounded builder receipts and their sidecars")
 line()
 if let blocked = builderAuditState.blockedLabel {
     line("- **\(mdText(blocked))**")
 } else if !builderAuditPresent {
     line("- **source absent** — `\(mdCode(builderAuditRoot))` is not in this data root. Not a zero.")
 } else {
-    line("- files: **\(builderAuditFiles)** / \(builderAuditFileCeiling) bound · bytes "
-         + "**\(humanBytes(builderAuditBytes))** / \(humanBytes(builderAuditByteCeiling)) bound")
-    line("- oldest: \(builderAuditOldest.map { "\(stamp($0)) (\(ageDaysText($0)))" } ?? "—") "
-         + "/ \(Int(builderAuditAgeCeilingDays))d bound · newest: \(builderAuditNewest.map { stamp($0) } ?? "—")")
-    let overFiles = builderAuditFiles > builderAuditFileCeiling
-    let overBytes = builderAuditBytes > builderAuditByteCeiling
-    let overAge = (builderAuditOldest.map { daysSince($0) } ?? 0) > builderAuditAgeCeilingDays
-    if overFiles || overBytes || overAge {
-        addLead(rank: 9, "`builder_audit/` has no retention: \(builderAuditFiles) file(s), \(humanBytes(builderAuditBytes))",
-                evidence: "Bounds crossed: "
-                    + [overFiles ? "file count > \(builderAuditFileCeiling)" : nil,
-                       overBytes ? "bytes > \(humanBytes(builderAuditByteCeiling))" : nil,
-                       overAge ? "oldest > \(Int(builderAuditAgeCeilingDays))d" : nil]
-                        .compactMap { $0 }.joined(separator: ", ")
-                    + ". Every builder-tool invocation leaves a permanent file.",
-                action: "Add rotation. The only bound today is the 1 GB single-file / 2 GB total disk-hygiene "
-                    + "tripwire, which is a brick wall, not a policy.")
+    line("- receipts: **\(builderAuditReceiptFiles) / \(builderAuditReceiptCeiling)** writer-retention bound · "
+         + "sidecars: **\(builderAuditSidecarFiles)** · total **\(builderAuditFiles)** file(s), "
+         + "**\(humanBytes(builderAuditBytes))**")
+    line("- oldest retained artifact: \(builderAuditOldest.map { "\(stamp($0)) (\(ageDaysText($0)))" } ?? "—") "
+         + "· newest: \(builderAuditNewest.map { stamp($0) } ?? "—")")
+    if builderAuditReceiptFiles > builderAuditReceiptCeiling {
+        addLead(rank: 7, "`builder_audit/` holds \(builderAuditReceiptFiles) receipts — over its \(builderAuditReceiptCeiling)-receipt writer bound",
+                evidence: "The writer prunes UUID-named JSON receipts to \(builderAuditReceiptCeiling) and removes "
+                    + "their matching sidecars. The directory currently has \(builderAuditSidecarFiles) sidecar(s) "
+                    + "and \(humanBytes(builderAuditBytes)) total.",
+                action: "Inspect the shared builder audit writer: a count over 500 means pruning stopped or a "
+                    + "writer bypassed the retained path.")
     }
 }
 line()
@@ -10782,19 +11203,32 @@ for f in surfaceErrorFeeds.sorted(by: { $0.name < $1.name }) {
              + "\(f.receiptNewest.map { stamp($0) } ?? "—") | not measured |")
         continue
     }
-    let atCap = f.errorRows >= f.lineCap
+    let atLineCap = f.lineCap.map { f.errorRows >= $0 } ?? false
+    let atByteCap = f.byteCap.map { f.errorBytes >= $0 } ?? false
+    let atCap = atLineCap || atByteCap
+    let capSuffix: String = {
+        if let cap = f.lineCap, atLineCap { return " (**line cap \(cap)**)" }
+        if let cap = f.byteCap { return " (**\(humanBytes(f.errorBytes)) / \(humanBytes(cap)) byte cap**)" }
+        return ""
+    }()
     let receiptsStale = f.receiptState.didRead
         ? ((f.receiptNewest.map { $0 < windowStart } ?? true) ? "receipts stale" : "receipts live")
         : "receipts \(f.receiptState.blockedLabel ?? "unknown")"
-    let reading = f.errorRowsInWindow > 0 && receiptsStale == "receipts stale"
-        ? "**FAILING, NOT IDLE**" : (atCap ? "**AT LINE CAP**" : "ok")
-    line("| \(mdText(f.name)) | \(f.errorRows)\(atCap ? " (**cap \(f.lineCap)**)" : "") | \(f.errorRowsInWindow) | "
+    let currentStateOverridesHistory = f.name == "slack" && slackRuntimeIsCurrentConnected
+    let reading = currentStateOverridesHistory
+        ? "**CURRENTLY CONNECTED** (historical errors retained)"
+        : (f.errorRowsInWindow > 0 && receiptsStale == "receipts stale"
+            ? "**FAILING, NOT IDLE**" : (atCap ? "**AT RETENTION CAP**" : "ok"))
+    line("| \(mdText(f.name)) | \(f.errorRows)\(capSuffix) | \(f.errorRowsInWindow) | "
          + "\(f.errorNewest.map { stamp($0) } ?? "—") | \(topCounts(f.codes, 3)) | "
          + "\(f.receiptNewest.map { stamp($0) } ?? "—") | \(reading) |")
-    if f.errorRowsInWindow > 0, f.receiptState.didRead, (f.receiptNewest.map { $0 < windowStart } ?? true) {
+    if f.errorRowsInWindow > 0, f.receiptState.didRead,
+       (f.receiptNewest.map { $0 < windowStart } ?? true), !currentStateOverridesHistory {
         addLead(rank: 4, "`\(mdCode(f.name))` is FAILING, not idle — \(f.errorRowsInWindow) error(s) in window, receipts stale",
                 evidence: "`\(mdCode(f.name))/errors.jsonl`: \(f.errorRows) row(s)"
-                    + (atCap ? " — **at its \(f.lineCap)-row cap**" : "") + ", \(f.errorRowsInWindow) inside the "
+                    + (atLineCap ? " — **at its \(f.lineCap!)-row cap**" : "")
+                    + (atByteCap ? " — **at its \(humanBytes(f.byteCap!)) byte cap**" : "")
+                    + ", \(f.errorRowsInWindow) inside the "
                     + "\(days)d window, newest \(f.errorNewest.map { stamp($0) } ?? "—"); top codes "
                     + "\(topCounts(f.codes, 3)). Its receipt feed's newest row is "
                     + "\(f.receiptNewest.map { stamp($0) } ?? "none at all") — outside the window.",
@@ -10802,8 +11236,11 @@ for f in surfaceErrorFeeds.sorted(by: { $0.name < $1.name }) {
                     + "succeeding is the shape a self-bricked poll loop makes.")
     }
     if atCap {
-        addLead(rank: 6, "`\(mdCode(f.name))/errors.jsonl` is AT its \(f.lineCap)-row cap",
-                evidence: "\(f.errorRows) row(s) retained, cap \(f.lineCap). At the cap the feed is a rolling "
+        let capDescription = atLineCap
+            ? "\(f.lineCap!)-row cap"
+            : "\(humanBytes(f.byteCap!)) byte cap"
+        addLead(rank: 6, "`\(mdCode(f.name))/errors.jsonl` is AT its \(capDescription)",
+                evidence: "\(f.errorRows) row(s), \(humanBytes(f.errorBytes)) retained. At the cap the feed is a rolling "
                     + "window: the oldest errors — including the first one, which is usually the cause — are gone.",
                 action: "Read the error codes before the tail rolls off: \(topCounts(f.codes, 4)).")
     }
@@ -10914,13 +11351,11 @@ if let blocked = disabledShadowState.blockedLabel {
     } else {
         line("- live-reader guard: **0** non-shadow readers resolve under `disabled/`.")
     }
-    if !liveShadows.isEmpty {
-        addLead(rank: 5, "`disabled/` contains \(liveShadows.count) file(s) that shadow a live operational path",
-                evidence: "\(disabledShadowArtifacts.count) metadata-only file(s) across "
-                    + "\(Set(disabledShadowArtifacts.map(\.snapshot)).count) snapshot(s); newest \(newest.map { stamp($0) } ?? "—").",
-                action: "Keep these files out of live monitoring and manual diagnosis. A disabled snapshot must be "
-                    + "named as a fossil before anyone treats its timestamp or contents as current state.")
-    }
+    // Resembling a live path is why this inventory exists, but it is not itself
+    // a defect: the tree is explicitly disabled and excluded from every live
+    // reader. Only the reader-guard violation above is actionable. Raising a
+    // lead merely because inert fossils exist made safely quarantined data the
+    // report's top problem.
 }
 line()
 
@@ -10948,15 +11383,26 @@ if let blocked = telegramInboxState.blockedLabel {
     line("- `update_inbox/`: **\(mdText(blocked))**")
 } else if !telegramInboxPresent {
     line("- `update_inbox/`: **source absent**")
+} else if !telegramInboxIndexFeed.didRead {
+    line("- `update_inbox/`: **\(telegramInboxClaimFiles)** claim file(s) + **\(telegramInboxLockFiles)** lock sidecar(s); "
+         + "claim index \(mdText(telegramInboxIndexFeed.blockedLabel ?? "not readable")) — pending work cannot be distinguished from retained terminal claims")
 } else {
-    let oldestAge = telegramInboxOldest.map { daysSince($0) } ?? 0
-    line("- `update_inbox/`: **\(telegramInboxFiles)** file(s), oldest "
-         + (telegramInboxOldest.map { "\(stamp($0)) (\(fmt(oldestAge, 1))d)" } ?? "—")
-         + " — a drained inbox holds nothing older than \(Int(telegramInboxDrainAgeDays))d")
-    if telegramInboxFiles > 0, oldestAge > telegramInboxDrainAgeDays {
-        addLead(rank: 5, "`telegram/update_inbox/` is not draining — \(telegramInboxFiles) file(s), oldest \(fmt(oldestAge, 1))d",
-                evidence: "The inbox holds an update taken in \(fmt(oldestAge, 1)) day(s) ago and never finished "
-                    + "with. \(telegramInboxFiles) file(s) present.",
+    let workCount = telegramInboxPending + telegramInboxProcessing
+    let oldestWorkAge = telegramInboxWorkOldest.map { daysSince($0) }
+    line("- `update_inbox/`: **\(telegramInboxClaimFiles)** claim file(s) + **\(telegramInboxLockFiles)** lock sidecar(s); "
+         + "pending **\(telegramInboxPending)** · processing **\(telegramInboxProcessing)** · completed retained "
+         + "**\(telegramInboxCompleted) / \(telegramInboxTerminalRetention)** · outcome-unknown retained "
+         + "**\(telegramInboxOutcomeUnknown)**"
+         + (telegramInboxOtherPhases > 0 ? " · **\(telegramInboxOtherPhases) malformed/unknown index row(s)**" : ""))
+    line("- drain reading: " + (workCount == 0
+        ? "**idle** — terminal claim retention is intentional and is not queued work"
+        : "**\(workCount) active claim(s)**, oldest "
+            + (telegramInboxWorkOldest.map { "\(stamp($0)) (\(fmt(oldestWorkAge ?? 0, 1))d)" } ?? "has no claim-file mtime")))
+    if workCount > 0, let oldestWorkAge, oldestWorkAge > telegramInboxDrainAgeDays {
+        addLead(rank: 5, "`telegram/update_inbox/` is not draining — \(workCount) pending/processing claim(s), oldest \(fmt(oldestWorkAge, 1))d",
+                evidence: "The claim index contains \(telegramInboxPending) pending and \(telegramInboxProcessing) "
+                    + "processing update(s); the oldest active claim file is \(fmt(oldestWorkAge, 1)) day(s) old. "
+                    + "The \(telegramInboxCompleted + telegramInboxOutcomeUnknown) terminal rows are bounded retention, not queued work.",
                 action: "A message that arrives and is never drained is a message User sent and she never saw. "
                     + "Nothing else in any tier counts these files.")
     }
@@ -11017,14 +11463,21 @@ if let blocked = oauthState.blockedLabel {
              + "\(mdText(t.expiresAt ?? "—")) | \(mdText(t.scope ?? "—")) |")
     }
     line()
-    let stale = oauthTokenFiles.filter { ($0.modified.map { daysSince($0) } ?? 0) > oauthStaleAgeDays }
-    if !stale.isEmpty {
-        addLead(rank: 6, "\(stale.count) OAuth token file(s) have not been refreshed in \(Int(oauthStaleAgeDays))+ days",
-                evidence: "Shape only: " + stale.sorted(by: { $0.id < $1.id }).prefix(4)
-                    .map { "`\(mdCode($0.id))` \($0.modified.map { ageDaysText($0) } ?? "—")" }.joined(separator: ", ")
-                    + ". No token material was read.",
-                action: "A token that expires without refresh degrades every connector to failure — and the "
-                    + "connector reports its own error, not \"the token is stale\".")
+    // File age is not credential expiry: Slack bot/app tokens and several
+    // provider credentials are intentionally long-lived and may be healthy for
+    // months without rewriting their file. Raise only from an explicit,
+    // parseable expires_at authority.
+    let expired = oauthTokenFiles.compactMap { token -> (OAuthTokenFile, Date)? in
+        guard let expiry = oauthExpiryDate(token.expiresAt), expiry <= now else { return nil }
+        return (token, expiry)
+    }
+    if !expired.isEmpty {
+        addLead(rank: 6, "\(expired.count) OAuth token file(s) carry an expired `expires_at`",
+                evidence: "Shape only: " + expired.sorted(by: { $0.0.id < $1.0.id }).prefix(4)
+                    .map { "`\(mdCode($0.0.id))` expired \(stamp($0.1))" }.joined(separator: ", ")
+                    + ". Files without explicit expiry are not classified from mtime. No token material was read.",
+                action: "Refresh or reconnect the affected provider before relying on it. Long-lived credentials "
+                    + "without `expires_at` are not presumed stale merely because their file is old.")
     }
 }
 line()
@@ -11045,16 +11498,18 @@ if skipFeedSection(sources.isPresent("mac_control/operations.json"), "the mac-co
         line("- `mac.*` dispatches in window: **not comparable — `traces/events.jsonl` did not read**. "
              + "This is not \"0 dispatches\".")
     } else {
-        line("- `mac.*` rows in `traces/events.jsonl` (window): **\(macToolDispatchInWindow)** — the leads about "
+        line("- `mac.*` rows in `traces/events.jsonl` (\(runtimeEvidenceLabel)): **\(macToolDispatchInWindow)** — the leads about "
              + "`mac.act`/`mac_view` come from THERE, never from this store")
-        let hi = max(macOperationCount, macToolDispatchInWindow)
-        let lo = min(macOperationCount, macToolDispatchInWindow)
+        line("- Mac-control operations in \(runtimeEvidenceLabel): **\(macOperationsInRuntimeEvidence)** "
+             + "(\(macOperationsInWindow) in the full \(days)d window)")
+        let hi = max(macOperationsInRuntimeEvidence, macToolDispatchInWindow)
+        let lo = min(macOperationsInRuntimeEvidence, macToolDispatchInWindow)
         if hi > 0, lo == 0 || Double(hi) / Double(max(lo, 1)) > 4.0 {
-            addLead(rank: 7, "The mac-control operation store and the dispatch trace disagree (\(macOperationCount) vs \(macToolDispatchInWindow))",
-                    evidence: "`mac_control/operations.json` holds \(macOperationCount) operation(s); "
+            addLead(rank: 7, "The mac-control operation store and the dispatch trace disagree (\(macOperationsInRuntimeEvidence) vs \(macToolDispatchInWindow))",
+                    evidence: "`mac_control/operations.json` carries \(macOperationsInRuntimeEvidence) operation(s) in the "
+                        + "\(runtimeEvidenceLabel); "
                         + "`traces/events.jsonl` carries \(macToolDispatchInWindow) `mac.*` dispatch row(s) in the "
-                        + "\(days)d window. (The store is not window-scoped, so an order-of-magnitude gap is the "
-                        + "signal, not a small one.)",
+                        + "same cohort. (The store retains \(macOperationCount) total; older rows are excluded.)",
                     action: "Two records of the same action that disagree means one of them stopped being written. "
                         + "Nothing reads the operation store, so only the trace side would have been noticed.")
         }
@@ -11163,10 +11618,10 @@ if turnTracesUnreadable {
 }
 if turnTracesUnreadable {
     health.append("[turn p95](#sec-f) **source unreadable**")
-} else if completedTurns.isEmpty {
+} else if turnEvidenceTurns.isEmpty {
     health.append("[turn p95](#sec-f) **source absent**")
 } else {
-    let e = completedTurns.compactMap { $0.elapsedMs }.sorted()
+    let e = turnEvidenceTurns.compactMap { $0.elapsedMs }.sorted()
     health.append("[turn p95](#sec-f) **\(fmt(percentile(e, 0.95) / 1000, 1)) s** over \(e.count) turns")
 }
 if sources.isUnreadable("traces/events.jsonl") {

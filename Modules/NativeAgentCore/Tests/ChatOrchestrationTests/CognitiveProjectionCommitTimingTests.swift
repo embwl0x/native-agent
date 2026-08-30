@@ -257,6 +257,46 @@ private func makeClientPCT(
 
 // MARK: - Tests
 
+@Test(arguments: [
+    "What changed in the report from codex?",
+    "Explain verification ping messages.",
+])
+func projectionRequest_admittedTurnClassSurvivesTopicMarkers(message: String) async throws {
+    let root = try makeTempRootPCT("workload-class")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = makeClientPCT(
+        root: root, llm: ScriptedMessagesLLMPCT(responses: []),
+        tools: MockToolDispatchClient(), cognition: CommitCountingCognitionPCT()
+    )
+    let request = await client.cognitiveTurnProjectionRequest(
+        surface: "chat", userMessage: message, sessionId: "codex-health-discussion"
+    )
+    #expect(request.turnKind == .live)
+    #expect(request.resolvedTurnKind == .live)
+    #expect(request.resolvedTurnKind == SwiftNativeChatOrchestrationClient.cognitiveMessageTurnKind(
+        role: "user", source: "chat", redactedContent: message, origin: nil
+    ))
+
+    // The same text delivered by the authenticated diagnostic lane retains
+    // its existing debug/verification class; prose alone cannot select it.
+    let bridge = await ChatPersistenceContext.$originProvenance.withValue(
+        ChatMessageOrigin(surface: "codex-bridge", agent: "codex")
+    ) {
+        await client.cognitiveTurnProjectionRequest(
+            surface: "chat", userMessage: message, sessionId: "shared-session"
+        )
+    }
+    #expect(bridge.turnKind == (message.contains("verification") ? .verification : .debug))
+    let untrusted = await ChatPersistenceContext.$originProvenance.withValue(
+        ChatMessageOrigin(surface: "untrusted", agent: "codex")
+    ) {
+        await client.cognitiveTurnProjectionRequest(
+            surface: "chat", userMessage: message, sessionId: "shared-session"
+        )
+    }
+    #expect(untrusted.turnKind == .live)
+}
+
 @Test
 func projectionCommit_providerFailure_doesNotConsumeTheWindow() async throws {
     let root = try makeTempRootPCT("provider-fail")

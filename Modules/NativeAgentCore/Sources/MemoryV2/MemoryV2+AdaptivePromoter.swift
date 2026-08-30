@@ -31,6 +31,33 @@ public protocol AdaptiveFactExtractor: Sendable {
     func extract(userMessage: String, assistantMessage: String) async -> [AdaptiveCandidate]
 }
 
+public enum MemorySemanticExtractionStatus: String, Sendable {
+    case unavailable, disabled, emptyInput, succeeded, failed, timedOut, unreported, skipped
+}
+
+/// Payload-free evidence, not a claim that an extracted candidate is true.
+public struct AdaptiveExtractionReport: Sendable {
+    public let candidates: [AdaptiveCandidate]
+    public let semanticStatus: MemorySemanticExtractionStatus
+    public let semanticCandidateCount: Int
+
+    public init(candidates: [AdaptiveCandidate], semanticStatus: MemorySemanticExtractionStatus,
+                semanticCandidateCount: Int = 0) {
+        self.candidates = candidates
+        self.semanticStatus = semanticStatus
+        self.semanticCandidateCount = max(0, semanticCandidateCount)
+    }
+}
+
+public protocol AdaptiveFactExtractionReporting: AdaptiveFactExtractor {
+    func extractWithReport(userMessage: String, assistantMessage: String) async -> AdaptiveExtractionReport
+}
+
+public struct AdaptiveMemoryObservation: Sendable {
+    public let proposals: [ProposalRecord]
+    public let extraction: AdaptiveExtractionReport
+}
+
 /// Rule-based extractor. Matches a small set of high-precision patterns
 /// over the *user* utterance — the assistant message is intentionally
 /// ignored because models routinely echo facts that the user never
@@ -200,20 +227,35 @@ public actor AdaptiveMemoryPromoter {
         assistantMessage: String,
         sessionId: String
     ) async -> [ProposalRecord] {
-        guard let memory else { return [] }
+        await observeTurnWithReport(userMessage: userMessage, assistantMessage: assistantMessage,
+                                    sessionId: sessionId).proposals
+    }
+
+    public func observeTurnWithReport(
+        userMessage: String, assistantMessage: String, sessionId: String
+    ) async -> AdaptiveMemoryObservation {
+        let skipped = AdaptiveMemoryObservation(proposals: [], extraction: .init(
+            candidates: [], semanticStatus: .skipped
+        ))
+        guard let memory else { return skipped }
         // 2026-08-14 proposal-hygiene fix: on bridge sessions the "user" seat
         // is another AGENT (claude/codex/wake runners), machine-tagged with
         // the "[from: <sender>, via bridge]" prefix that ClaudeBridge/
         // codex-bridge affix at their single entry points. Extracting "user
         // ..." facts from agent shop-talk minted proposals like "user is a
         // language model" about the human. Agent-seat turns never extract.
-        if Self.isAgentSeatUserMessage(userMessage) { return [] }
-        let candidates = await extractor.extract(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage
-        )
+        if Self.isAgentSeatUserMessage(userMessage) { return skipped }
+        let extraction: AdaptiveExtractionReport
+        if let reporting = extractor as? any AdaptiveFactExtractionReporting {
+            extraction = await reporting.extractWithReport(userMessage: userMessage, assistantMessage: assistantMessage)
+        } else {
+            extraction = AdaptiveExtractionReport(
+                candidates: await extractor.extract(userMessage: userMessage, assistantMessage: assistantMessage),
+                semanticStatus: .unreported
+            )
+        }
         var staged: [ProposalRecord] = []
-        for cand in candidates where cand.score >= threshold {
+        for cand in extraction.candidates where cand.score >= threshold {
             do {
                 if try await memory.isRejected(content: cand.content) { continue }
                 let proposal = try await memory.propose(
@@ -241,7 +283,7 @@ public actor AdaptiveMemoryPromoter {
                 continue
             }
         }
-        return staged
+        return AdaptiveMemoryObservation(proposals: staged, extraction: extraction)
     }
 
     /// One-shot backfill for pending proposals that satisfy the same narrow

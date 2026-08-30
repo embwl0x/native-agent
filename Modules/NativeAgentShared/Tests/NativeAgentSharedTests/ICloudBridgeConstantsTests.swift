@@ -570,7 +570,9 @@ struct MobileSnapshotGroupManifestTests {
                 owner[name] = group
             }
         }
-        #expect(owner.count == 24, "manifest size changed — confirm every consumer was updated (was 24)")
+        // 24 → 23 on 2026-08-28: command_palette.json retired (E8 audit) —
+        // Mac writer deleted, retired-file sweep in place, no iOS reader.
+        #expect(owner.count == 23, "manifest size changed — confirm every consumer was updated (was 23)")
         // groups(containingAny:) must resolve each filename to exactly its owner.
         for (name, group) in owner {
             #expect(NAMobileSnapshotGroup.groups(containingAny: [name]) == [group])
@@ -594,11 +596,12 @@ struct MobileSnapshotGroupManifestTests {
         #expect(orphans.isEmpty, "iOS loads snapshot files no group bundles: \(orphans)")
 
         // The other direction is a payload-waste ratchet, not a correctness
-        // bug: the Mac compresses and ships these on every sync. Exactly one
-        // is currently unread (2026-08-23); a NEW one fails here.
+        // bug: the Mac compresses and ships these on every sync. E8 retired
+        // command_palette.json (the last unread one, 2026-08-28); any NEW
+        // bundled-but-never-read file fails here.
         let unread = carried.subtracting(loaded).sorted()
         #expect(
-            unread == ["command_palette.json"],
+            unread.isEmpty,
             "the set of Mac-bundled-but-never-read snapshots changed: \(unread)"
         )
     }

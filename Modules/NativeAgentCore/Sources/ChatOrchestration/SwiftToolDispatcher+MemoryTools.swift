@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
@@ -45,21 +46,46 @@ extension SwiftToolDispatcher {
             if let id = memoryHitId(hit) {
                 d["id"] = .string(id)
             }
+            let temporal = memoryHitTemporalData(hit)
+            if !temporal.isEmpty {
+                d["temporal"] = .object(temporal)
+                d["temporal_note"] = .string(
+                    "Recorded validity dates are not a current-status check; observed_at is when evidence was observed.")
+            }
             // U3 wave-1 item 1: surface the full memory text (sentence-
             // safe capped at memoryRecallContentCap upstream) — returning
             // only the 200-char preview was the read-side truncation
             // Agent felt. Ranking and row selection are unchanged.
             if let content = hit.content {
+                let fullCharacterCount = memoryHitFullContentCharacterCount(hit, content: content)
+                let upstreamTruncated = fullCharacterCount > Int64(content.count)
                 if !budgetSpent, content.count <= remainingBudget {
                     d["content"] = .string(content)
                     remainingBudget -= content.count
+                    if upstreamTruncated {
+                        d["content_truncated"] = .bool(true)
+                        d["full_content_chars"] = .int(fullCharacterCount)
+                        d["content_note"] = .string(
+                            "Excerpt only — the stored memory exceeds the per-result content limit. "
+                            + "A narrower query or lower k does not remove that limit.")
+                    }
                 } else {
                     budgetSpent = true
+                    d["content_truncated"] = .bool(true)
+                    d["full_content_chars"] = .int(fullCharacterCount)
                     d["content_note"] = .string(
                         "content omitted — total recall content budget "
                         + "(\(recallContentBudgetChars) chars) spent on higher-ranked hits; "
-                        + "preview only. Narrow the query or lower k for full text.")
+                        + (upstreamTruncated
+                            ? "preview only. Narrow the query or lower k for the bounded excerpt, not the full stored memory."
+                            : "preview only. Narrow the query or lower k for full text."))
                 }
+            }
+            if d["content_truncated"] == .bool(true), let id = memoryHitId(hit) {
+                d["read_more"] = .object([
+                    "tool": .string("recall_memory"), "memory_id": .string(id),
+                    "offset": .int(0), "max_characters": .int(Int64(memoryRecallContentCap)),
+                ])
             }
             return .object(d)
         }
@@ -74,11 +100,54 @@ extension SwiftToolDispatcher {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    private static func memoryHitFullContentCharacterCount(_ hit: MemoryRecallHit, content: String) -> Int64 {
+        guard case .object(let extras)? = hit.extras,
+              case .int(let count)? = extras["full_content_chars"],
+              count >= Int64(content.count) else { return Int64(content.count) }
+        return count
+    }
+
+    /// Keep meaningful canonical dates without restoring storage timestamp,
+    /// session, or retrieval-backend noise. Never forward arbitrary extras or
+    /// truncate an invalid date into something that looks authoritative.
+    private static func memoryHitTemporalData(_ hit: MemoryRecallHit) -> [String: JSONValue] {
+        guard case .object(let extras)? = hit.extras else { return [:] }
+        var temporal: [String: JSONValue] = [:]
+        for key in ["valid_from", "valid_to", "observed_at"] {
+            guard case .string(let value)? = extras[key],
+                  value.utf8.count <= 64,
+                  MemoryRecallScoring.parseTimestamp(value) != nil else { continue }
+            temporal[key] = .string(value)
+        }
+        return temporal
+    }
+
 
     func impl_recall_memory(
         input: [String: JSONValue],
         surface: String = "chat"
     ) async throws -> JSONValue {
+        // Strict structured bindings may populate unused optionals with null
+        // or empty strings. Those are absence, not a second requested mode.
+        let supplied = input.filter { _, value in
+            if value == .null { return false }
+            if case .string(let text) = value {
+                return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            return true
+        }
+        if let rawID = supplied["memory_id"] {
+            guard case .string(let id) = rawID,
+                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  supplied["query"] == nil, supplied["k"] == nil, supplied["limit"] == nil else {
+                throw AutonomyGateError.toolDenied(reason: "Use either query search or memory_id paging, not both.")
+            }
+            return try await readMemoryPage(id: id, input: supplied, surface: surface)
+        }
+        guard supplied["offset"] == nil, supplied["max_characters"] == nil,
+              supplied["expected_content_sha256"] == nil else {
+            throw AutonomyGateError.toolDenied(reason: "offset, max_characters, and expected_content_sha256 require memory_id.")
+        }
         let query = try requireString(input, "query")
         let k = optionalInt(input, "k") ?? optionalInt(input, "limit") ?? 5
         // Review blocker (2026-06-10): k had no ceiling — clamp to
@@ -98,30 +167,33 @@ extension SwiftToolDispatcher {
             hits = response.hits
             disclosureFilteredCount = response.disclosureFilteredCount
         } catch {
+            try Task.checkCancellation()
             // Keep the KG fallback usable, but never describe a MemoryV2 outage
             // as an ordinary successful empty recall. The model can answer from
             // fallback evidence while remaining honest about degraded memory.
+            let fallback = try await knowledgeGraphRecallFallback(query: query, k: cappedK, surface: surface)
             return .object([
                 "status": .string("degraded"),
                 "memory_available": .bool(false),
                 "fallback_source": .string("knowledge_graph"),
-                "error": .string("semantic_memory_unavailable"),
-                "hits": .array(try await knowledgeGraphRecallFallback(query: query, k: cappedK)),
+                "error": .string(fallback.canonicalUnavailable ? "canonical_memory_unavailable" : "semantic_memory_unavailable"),
+                "hits": .array(fallback.hits),
             ])
         }
         let arr: [JSONValue]
         if hits.isEmpty, disclosureFilteredCount == 0 {
-            // Swift-native cutover memory parity: the Swift memory table can be empty
-            // after cutover while the native KG already contains useful long-
-            // term facts. Preserve `recall_memory` as Agent's broad recall
-            // surface by falling back to KG entity summaries only when
-            // semantic memories return no hits. The disclosureFilteredCount
-            // guard is load-bearing (gpt-5.5, 2026-07-20): KG facts are
-            // indexed FROM memory records and the KG read path has no
-            // disclosure check — falling back on a filtered-empty result
-            // would leak denied local_private content to restricted surfaces
-            // through the side door.
-            arr = try await knowledgeGraphRecallFallback(query: query, k: cappedK)
+            // KG is a candidate source, never an alternate authority. Storage
+            // can exclude retired records before disclosureFilteredCount is
+            // computed, so even this zero-count path must recheck each record.
+            let fallback = try await knowledgeGraphRecallFallback(query: query, k: cappedK, surface: surface)
+            if fallback.canonicalUnavailable {
+                return .object([
+                    "status": .string("degraded"), "memory_available": .bool(false),
+                    "fallback_source": .string("knowledge_graph"),
+                    "error": .string("canonical_memory_unavailable"), "hits": .array([]),
+                ])
+            }
+            arr = fallback.hits
         } else {
             // Review blocker (2026-06-10): per-result-set content budget —
             // see recallHitsJSON / recallContentBudgetChars.
@@ -133,6 +205,93 @@ extension SwiftToolDispatcher {
             "disclosure_filtered_count": .int(Int64(disclosureFilteredCount)),
             "hits": .array(arr),
         ])
+    }
+
+    private func readMemoryPage(id: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        func integer(_ key: String, default fallback: Int) throws -> Int {
+            guard let raw = input[key] else { return fallback }
+            let value: Int?
+            switch raw {
+            case .int(let number): value = Int(exactly: number)
+            case .double(let number): value = Int(exactly: number)
+            default: value = nil
+            }
+            guard let value else {
+                throw AutonomyGateError.toolDenied(reason: "\(key) must be a representable integer.")
+            }
+            return value
+        }
+        let offset = try integer("offset", default: 0)
+        let requested = try integer("max_characters", default: memoryRecallContentCap)
+        guard offset >= 0, requested > 0 else {
+            throw AutonomyGateError.toolDenied(reason: "offset must be nonnegative and max_characters must be positive.")
+        }
+        let expectedHash: String?
+        if let raw = input["expected_content_sha256"] {
+            guard case .string(let value) = raw, value.utf8.count == 64,
+                  value.lowercased().utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                throw AutonomyGateError.toolDenied(reason: "expected_content_sha256 must be a 64-character hexadecimal hash from a previous page.")
+            }
+            expectedHash = value.lowercased()
+        } else {
+            expectedHash = nil
+        }
+        guard let record = try await memoryV2.readMemoryRecord(
+            id: id, persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID), surface: surface
+        ) else {
+            // Missing, retired, tombstoned and disallowed IDs are indistinguishable.
+            // Never query KG as an alternate way around this exact-record gate.
+            return .object(["status": .string("not_found")])
+        }
+        let text = MemoryTextClip.memoryDisplayText(record.text, kind: record.memoryKind)
+        let contentHash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        // Eligibility was checked before exposing any version information.
+        // The hash describes exactly the normalized display text whose
+        // Character offsets are paged, not storage bookkeeping timestamps.
+        if let expectedHash, expectedHash != contentHash {
+            return .object([
+                "status": .string("record_changed"), "id": .string(record.id),
+                "content_sha256": .string(contentHash), "restart_at": .int(0),
+                "note": .string("The memory text changed. Discard earlier pages and restart at offset 0; do not combine versions."),
+            ])
+        }
+        let fullCount = text.count
+        let start = min(offset, fullCount)
+        let content = String(text.dropFirst(start).prefix(min(requested, memoryRecallContentCap)))
+        let next = start + content.count
+        var result: [String: JSONValue] = [
+            "status": .string("ok"), "id": .string(record.id),
+            "content_sha256": .string(contentHash),
+            "content": .string(content), "offset": .int(Int64(start)),
+            "full_content_chars": .int(Int64(fullCount)),
+            "content_truncated": .bool(start > 0 || next < fullCount),
+            "next_offset": next < fullCount ? .int(Int64(next)) : .null,
+        ]
+        if next < fullCount {
+            result["read_more"] = .object([
+                "tool": .string("recall_memory"), "memory_id": .string(record.id),
+                "offset": .int(Int64(next)), "max_characters": .int(Int64(min(requested, memoryRecallContentCap))),
+                "expected_content_sha256": .string(contentHash),
+            ])
+        }
+        if offset > 0, expectedHash == nil {
+            result["consistency_note"] = .string("This continuation was not version-verified. Compare content_sha256 with earlier pages before combining them; use read_more to keep subsequent pages bound to this version.")
+        }
+        let temporal = memoryTemporalData(record)
+        if !temporal.isEmpty {
+            result["temporal"] = .object(temporal)
+            result["temporal_note"] = .string("Recorded validity dates are not a current-status check; observed_at is when evidence was observed.")
+        }
+        return .object(result)
+    }
+
+    private func memoryTemporalData(_ record: MemoryRecord) -> [String: JSONValue] {
+        let extras: [String: JSONValue] = [
+            "valid_from": record.validFrom.map(JSONValue.string) ?? .null,
+            "valid_to": record.validTo.map(JSONValue.string) ?? .null,
+            "observed_at": record.observedAt.map(JSONValue.string) ?? .null,
+        ]
+        return Self.memoryHitTemporalData(MemoryRecallHit(score: 0, preview: "", extras: .object(extras)))
     }
 
     /// commit_memory — Agent's long-term memory WRITE path. Daemon parity for
@@ -183,6 +342,24 @@ extension SwiftToolDispatcher {
         if !tags.isEmpty {
             meta["tags"] = .array(tags.map { .string($0) })
         }
+        if let rawTopics = input["context_topics"] {
+            guard kind.lowercased() == "correction", case .array(let values) = rawTopics,
+                  !values.isEmpty, values.count <= 8 else {
+                throw AutonomyGateError.toolDenied(reason: "context_topics requires a correction and 1–8 topic phrases")
+            }
+            var topics: [JSONValue] = []
+            for value in values {
+                guard case .string(let raw) = value else {
+                    throw AutonomyGateError.toolDenied(reason: "context_topics must contain strings")
+                }
+                let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !topic.isEmpty, topic.count <= 120 else {
+                    throw AutonomyGateError.toolDenied(reason: "context_topics must contain nonempty phrases of at most 120 characters")
+                }
+                topics.append(.string(topic))
+            }
+            meta["context_topics"] = .array(topics)
+        }
 
         let record: MemoryRecord
         do {
@@ -219,27 +396,40 @@ extension SwiftToolDispatcher {
             .trimmingCharacters(in: .whitespacesAndNewlines), !corrects.isEmpty {
             let reason = optionalString(input, "correction_reason")?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            do {
-                let marked = try await memoryV2.markCorrected(
-                    id: corrects,
-                    by: record.id,
-                    reason: (reason?.isEmpty == false) ? reason : nil
-                )
-                correctionField = .object([
-                    "corrected_id": .string(corrects),
-                    "applied": .bool(marked),
-                    "note": .string(marked
-                        ? "Old memory marked corrected; it no longer surfaces in recall."
-                        : "No active memory with that id was eligible to correct (unknown id, or already corrected/deleted). The new fact was still saved."),
-                ])
-            } catch {
-                // A storage failure is NOT the same as an ineligible id —
-                // report it as what it is, never as a benign miss.
+            if corrects == record.id {
                 correctionField = .object([
                     "corrected_id": .string(corrects),
                     "applied": .bool(false),
-                    "note": .string("Correction write failed (\(error)). The new fact was still saved; retry the correction."),
+                    "note": .string("The saved text resolved to the same existing memory. No self-correction was applied; this call did not retire that record."),
                 ])
+            } else {
+                do {
+                    let marked = try await memoryV2.markCorrected(
+                        id: corrects,
+                        by: record.id,
+                        reason: (reason?.isEmpty == false) ? reason : nil
+                    )
+                    if marked {
+                        await FluidContextToolScope.current?.recordAppliedMemoryCorrection(
+                            recordID: corrects, replacementID: record.id
+                        )
+                    }
+                    correctionField = .object([
+                        "corrected_id": .string(corrects),
+                        "applied": .bool(marked),
+                        "note": .string(marked
+                            ? "Old memory marked corrected; it no longer surfaces in recall."
+                            : "Correction was not applied: the old memory or its replacement was missing or no longer active and recall-eligible. The save completed before this check; no correction lineage was written."),
+                    ])
+                } catch {
+                    // A storage failure is NOT the same as an ineligible id —
+                    // report it as what it is, never as a benign miss.
+                    correctionField = .object([
+                        "corrected_id": .string(corrects),
+                        "applied": .bool(false),
+                        "note": .string("Correction write failed (\(error)). The new fact was still saved; retry the correction."),
+                    ])
+                }
             }
         }
 
@@ -288,9 +478,7 @@ extension SwiftToolDispatcher {
         ])
         let persistence = SwiftNativePersistenceCore()
         do {
-            // Same 5000-line cap discipline as ChatToolDispatchTrace — a new
-            // uncapped writer would regrow the feed W-G just bounded.
-            try await appendJSONLCapped(
+            try await appendPathOwnedJSONL(
                 row, to: tracesPath, using: persistence,
                 logLabel: "SwiftToolDispatcher.memoryCommit"
             )
@@ -302,7 +490,9 @@ extension SwiftToolDispatcher {
     }
 
 
-    private func knowledgeGraphRecallFallback(query: String, k: Int) async throws -> [JSONValue] {
+    private func knowledgeGraphRecallFallback(
+        query: String, k: Int, surface: String
+    ) async throws -> (hits: [JSONValue], canonicalUnavailable: Bool) {
         let reader = SwiftNativeKnowledgeGraphReader(
             graphPath: knowledgeGraphPath,
             flushURL: nil
@@ -315,65 +505,53 @@ extension SwiftToolDispatcher {
                 "recall fallback did not receive a results array"
             )
         }
-        return Array(results.prefix(max(0, k))).enumerated().map { rank, item in
-            guard case .object(let ent) = item else { return .object([:]) }
-            let name = jsonString(ent["name"]) ?? "unknown"
-            let type = jsonString(ent["type"]) ?? "entity"
-            let summary = jsonString(ent["summary"]) ?? ""
-            let mentions = jsonInt(ent["mention_count"]) ?? 0
-            let preview = kgRecallPreview(
-                name: name,
-                type: type,
-                summary: summary,
-                factKind: jsonString(ent["fact_kind"])
-            )
-            var d: [String: JSONValue] = [
-                "preview": .string(String(preview.prefix(300))),
-                "score": .double(max(0.1, 0.72 - Double(rank) * 0.03)),
-                "kg_entity_name": .string(name),
-                "kg_entity_type": .string(type),
-                "kg_rank": .int(Int64(rank + 1)),
-                "mention_count": .int(Int64(mentions)),
-            ]
-            if let id = ent["id"] { d["kg_entity_id"] = id }
-            return .object(d)
+        var hits: [MemoryRecallHit] = []
+        var ranks: [Int] = []
+        var seen: Set<String> = []
+        // Preserve the existing candidate bound; no scan or extra ranking.
+        for (rank, item) in results.prefix(max(0, k)).enumerated() {
+            try Task.checkCancellation()
+            // Aggregate entities' last_memory_id is not complete provenance.
+            // Unlinked legacy graph prose remains available via search_kg, not
+            // as a way around canonical memory disclosure or retirement.
+            guard case .object(let entity) = item,
+                  jsonString(entity["type"])?.lowercased() == "fact",
+                  let id = jsonString(entity["memory_id"])?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !id.isEmpty, id.utf8.count <= 512, seen.insert(id).inserted else { continue }
+            let record: MemoryRecord?
+            do {
+                record = try await memoryV2.readMemoryRecord(
+                    id: id, persona: memoryRecallPersonaFilter(ChatTurnRuntimeContext.current?.personaID),
+                    surface: surface
+                )
+            } catch {
+                try Task.checkCancellation()
+                // Without the canonical owner, no graph summary can establish
+                // current eligibility. Discard partial evidence on this failure.
+                return ([], true)
+            }
+            guard let record else { continue }
+            let text = MemoryTextClip.memoryDisplayText(record.text, kind: record.memoryKind)
+            var extras = memoryTemporalData(record)
+            extras["id"] = .string(record.id)
+            extras["full_content_chars"] = .int(Int64(text.count))
+            hits.append(MemoryRecallHit(
+                score: 0, preview: MemoryTextClip.sentenceClip(text, cap: 300),
+                content: MemoryTextClip.sentenceClip(text, cap: memoryRecallContentCap),
+                extras: .object(extras)
+            ))
+            ranks.append(rank + 1)
         }
-    }
-
-    private func kgRecallPreview(
-        name: String,
-        type: String,
-        summary: String,
-        factKind: String?
-    ) -> String {
-        let cleanSummary = cleanKGMemorySummary(summary, kind: factKind)
-        guard type.lowercased() == "fact" else {
-            if cleanSummary.isEmpty { return "\(type): \(name)" }
-            return "\(type): \(name) - \(cleanSummary)"
+        let rendered = zip(Self.recallHitsJSON(hits), ranks).map { value, rank -> JSONValue in
+            guard case .object(var object) = value else { return value }
+            // KG order is not a semantic similarity score. Do not fabricate one.
+            object.removeValue(forKey: "score")
+            object["kg_rank"] = .int(Int64(rank))
+            object["retrieval_source"] = .string("knowledge_graph_candidate_canonical_memory")
+            return .object(object)
         }
-
-        let cleanName = cleanKGMemorySummary(name, kind: factKind)
-        let body = cleanSummary.isEmpty ? cleanName : cleanSummary
-        let label = (factKind?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? factKind!
-            : "fact"
-        return body.isEmpty ? "fact: \(name)" : "\(label): \(body)"
+        return (rendered, false)
     }
 
-    private func cleanKGMemorySummary(_ text: String, kind: String?) -> String {
-        var cleaned = text
-            .replacingOccurrences(
-                of: #"(?i)^(?:Memory fact|Mentioned in memory)\s*:\s*"#,
-                with: "",
-                options: .regularExpression
-            )
-            .replacingOccurrences(
-                of: #"(?i)^(?:Fact|Decision|Preference|Identity|Relationship|Goal|Project|Operational|Milestone|Schedule)\s*:\s*"#,
-                with: "",
-                options: .regularExpression
-            )
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        cleaned = MemoryTextClip.memoryDisplayText(cleaned, kind: kind)
-        return cleaned
-    }
 }

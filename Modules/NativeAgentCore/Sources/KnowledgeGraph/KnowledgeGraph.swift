@@ -483,6 +483,56 @@ public struct KnowledgeGraphStore: Sendable {
     /// guaranteed stable; we therefore decorate with the original index and use
     /// it as a deterministic tie-breaker to match Python's stable behavior.
     public func searchEntities(_ q: String) -> [JSONValue] {
+        searchEntities(q, now: Date())
+    }
+
+    /// Maximum score a perfectly fresh entity can earn from `last_seen`.
+    /// Deliberately equal to the popularity term's ceiling (`min(10,
+    /// mention_count) * 0.03`), which is the smallest existing signal in this
+    /// ranker: recency can break a tie between two comparable matches and can
+    /// never outweigh a single name-token overlap (2.0) let alone an exact name
+    /// hit (6.0). A dominance flip was explicitly out of scope for B5.
+    static let recencyMaximumScore = 0.30
+
+    /// Bounded recency bonus in [0, `recencyMaximumScore`] from an entity's
+    /// `last_seen` timestamp. Bucketed rather than continuous so the score stays
+    /// a stable, explainable number: two entities seen the same week rank
+    /// identically no matter which hour the search runs.
+    ///
+    /// Absent, empty, unparseable, or future `last_seen` values score 0 — a row
+    /// that cannot prove it is recent does not get to claim it. That is also
+    /// what keeps this change inert for the JSON-import and fixture stores,
+    /// whose entities carry no `last_seen` at all.
+    static func recencyScore(lastSeen: String?, now: Date) -> Double {
+        guard let raw = lastSeen?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let seen = parseGraphTimestamp(raw) else { return 0 }
+        let ageDays = now.timeIntervalSince(seen) / 86_400
+        guard ageDays >= 0 else { return 0 }
+        switch ageDays {
+        case ..<7: return recencyMaximumScore
+        case ..<30: return recencyMaximumScore * 2.0 / 3.0
+        case ..<90: return recencyMaximumScore / 3.0
+        case ..<365: return recencyMaximumScore / 6.0
+        default: return 0
+        }
+    }
+
+    /// The indexer writes ISO-8601 with fractional seconds; JSON imports and
+    /// hand-built fixtures carry the plain internet-date-time form. Accept both
+    /// and treat everything else as "no usable timestamp" (score 0).
+    private static func parseGraphTimestamp(_ raw: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFraction.date(from: raw) { return d }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: raw)
+    }
+
+    /// `now`-injectable form. Production calls the zero-argument overload; tests
+    /// pin the clock so the recency buckets are deterministic.
+    public func searchEntities(_ q: String, now: Date) -> [JSONValue] {
         // Python: `q_lower = q.lower().strip()` — str.strip() removes ALL
         // leading/trailing whitespace incl. newlines/tabs, so we must use
         // .whitespacesAndNewlines (NOT .whitespaces, which excludes \n/\r — a
@@ -548,6 +598,13 @@ public struct KnowledgeGraphStore: Sendable {
                 score += Double(overlap.count) / Double(max(qTokens.count, 1))
             }
             score += Double(mentions) * 0.03
+            // B5 (2026-08-28): the only consultation of `last_seen` in this
+            // ranker. Bounded at the popularity term's ceiling — a tiebreak
+            // weight, not a re-ranking axis. Divergence from the retired Python
+            // ranker is intentional and scoped to this line.
+            score += Self.recencyScore(
+                lastSeen: ent["last_seen"]?.pythonStrOrEmpty, now: now
+            )
 
             scored.append((score, idx, .object(ent)))
         }

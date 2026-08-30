@@ -160,10 +160,91 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private var publicationInProgress = false
     private var publicationWaiters: [CheckedContinuation<Void, Never>] = []
     private var degradedSourceIDs: Set<ContextSourceID> = []
+    /// Per-generation derivations whose inputs are immutable for a complete
+    /// mirror/kernel/surface/privacy behavior key. This keeps repeated turns
+    /// from walking every source and atom merely to rebuild the same authority
+    /// sets. Turn-local feedback and all live-only side effects stay outside.
+    private var generationDerivedCache: [GenerationDerivedCacheKey: GenerationDerivedTurnState] = [:]
+    private var generationDerivedCacheHitCount = 0
+    private var generationDerivedComputationCount = 0
+    private var generationDerivedInvalidationCount = 0
     /// Error-level diagnostic sink. Injected so tests can prove the dead-lane
     /// alarm actually fires; production keeps NSLog (Console.app / the app's
     /// log stream), matching the provenance-MISS line added in 218fb021.
     private let diagnostics: @Sendable (String) -> Void
+
+    struct GenerationDerivedCacheKey: Hashable, Sendable {
+        let generationID: Int64
+        let generationSourceFingerprint: String
+        let surface: String
+        let personaID: String
+        let mirrorSourceFingerprint: String
+        let kernelPersonaID: String
+        let kernelSurface: String
+        let kernelSourceFingerprint: String
+        let stableIncludedDocumentIDs: [String]
+        let allowedPrivacy: [String]
+
+        init(
+            generationID: Int64,
+            generationSourceFingerprint: String,
+            surface: String,
+            personaID: String,
+            mirrorSourceFingerprint: String,
+            kernelPersonaID: String,
+            kernelSurface: String,
+            kernelSourceFingerprint: String,
+            stableIncludedDocumentIDs: [String],
+            allowedPrivacy: [String]
+        ) {
+            self.generationID = generationID
+            self.generationSourceFingerprint = generationSourceFingerprint
+            self.surface = surface
+            self.personaID = personaID
+            self.mirrorSourceFingerprint = mirrorSourceFingerprint
+            self.kernelPersonaID = kernelPersonaID
+            self.kernelSurface = kernelSurface
+            self.kernelSourceFingerprint = kernelSourceFingerprint
+            self.stableIncludedDocumentIDs = stableIncludedDocumentIDs
+            self.allowedPrivacy = allowedPrivacy
+        }
+
+        init(
+            generation: ContextStoredGeneration,
+            request: ContextTurnRequest,
+            mirror: RequiredDocumentMirror,
+            kernel: StablePromptKernel
+        ) {
+            self.init(
+                generationID: generation.generation.id,
+                generationSourceFingerprint: generation.generation.sourceFingerprint,
+                surface: request.surface.rawValue,
+                personaID: mirror.personaID.rawValue,
+                mirrorSourceFingerprint: mirror.sourceFingerprint,
+                kernelPersonaID: kernel.key.personaID.rawValue,
+                kernelSurface: kernel.key.surfaceVariant.rawValue,
+                kernelSourceFingerprint: kernel.key.sourceFingerprint,
+                stableIncludedDocumentIDs: kernel.includedDocumentIDs.map(\.rawValue),
+                allowedPrivacy: request.allowedPrivacy.map(\.rawValue).sorted()
+            )
+        }
+    }
+
+    struct GenerationDerivedCacheMetrics: Equatable, Sendable {
+        let hitCount: Int
+        let computationCount: Int
+        let invalidationCount: Int
+        let entryCount: Int
+    }
+
+    private struct GenerationDerivedTurnState: Sendable {
+        let allowedSourceIDs: Set<ContextSourceID>
+        let precoveredSourceIDs: Set<ContextSourceID>
+        let userPrecoverage: GeneratedUserPrecoverageOutcome
+        let protectedCorrectionAtomIDs: Set<ContextAtomID>
+        let memoryPersonaPrefix: String
+        let slotScopedMemorySourceCount: Int
+    }
 
     public init(
         mode: ContextFlowMode = .shadow,
@@ -213,6 +294,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         monitor = nil
         started = false
         activeStoredGeneration = nil
+        invalidateGenerationDerivedCache()
     }
 
     public func reconcileAfterWake() async {
@@ -223,31 +305,39 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     public func sourceDidChange(_ changes: [DerivedSourceChange]) async {
-        guard mode != .off, !changes.isEmpty else { return }
+        _ = await reconcileSourceChanges(changes)
+    }
+
+    /// Request-scoped completion for callers that fence a foreground choice
+    /// on publication. Health is not a completion receipt: cancellation keeps
+    /// health unchanged, and another request may publish while this one fails.
+    public func reconcileSourceChanges(_ changes: [DerivedSourceChange]) async -> Bool {
+        guard mode != .off, !changes.isEmpty, !Task.isCancelled else { return false }
         let semanticChanges = changes.filter(\.semantic)
-        let changedNamespaces = Set(semanticChanges.map(\.namespace))
         let invalidatedProjectionIDs = Set(compiledProjectionProviders.compactMap { provider in
-            provider.invalidationNamespaces.isDisjoint(with: changedNamespaces)
-                ? nil
-                : provider.projectionIdentifier
+            semanticChanges.contains(where: provider.isInvalidated)
+                ? provider.projectionIdentifier
+                : nil
         })
         let projectionNamespaces = Set(compiledProjectionProviders.flatMap(\.invalidationNamespaces))
         let registrationChanges = semanticChanges.filter {
             !projectionNamespaces.contains($0.namespace)
         }
+        // An unrelated candidate database must not refresh discovery, acquire
+        // a publication request ID, or supersede pending live-owner demand.
+        guard !registrationChanges.isEmpty || !invalidatedProjectionIDs.isEmpty else { return true }
 
         // Projection-owned invalidations do not reread every other compiled
         // source. A Workshop status edge must not rescan/embed MemoryV2, and a
         // memory write must not replay Desk. Both remain background rebuilds.
         if registrationChanges.isEmpty, !invalidatedProjectionIDs.isEmpty {
-            await reconcile(
+            return await reconcile(
                 registrations: [],
                 reason: "compiled_projection_invalidation",
                 compiledProjectionIdentifiers: invalidatedProjectionIDs
             )
-            return
         }
-        await refreshDiscoveredSources()
+        guard await refreshDiscoveredSources() else { return false }
         let all = await registry.allRegistrations()
         let byID = Dictionary(uniqueKeysWithValues: all.map { ($0.descriptor.id.rawValue, $0) })
         var selected: [ContextSourceRegistration] = []
@@ -266,16 +356,27 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 requiresFullReconciliation = true
             }
         }
+        let completed: Bool
         if requiresFullReconciliation {
-            await reconcileAll(reason: "direct_invalidation")
+            // Discovery already refreshed this request's complete registry.
+            // Reusing that snapshot avoids a second persona/catalog read pass
+            // while still rebuilding every compiled projection on a full edge.
+            completed = await reconcile(
+                registrations: all,
+                reason: "direct_invalidation",
+                compiledProjectionIdentifiers: Set(
+                    compiledProjectionProviders.map(\.projectionIdentifier)
+                )
+            )
         } else {
-            await reconcile(
+            completed = await reconcile(
                 registrations: Self.unique(selected),
                 reason: "direct_invalidation",
                 compiledProjectionIdentifiers: invalidatedProjectionIDs
             )
         }
         await refreshWatchedDirectories()
+        return completed && !Task.isCancelled
     }
 
     public func applyMemoryPressure(_ pressure: ContextArenaPressure) async throws -> ContextArenaTrimReceipt {
@@ -337,6 +438,115 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         )
     }
 
+    /// Deterministic operation-count evidence for the generation-derived turn
+    /// cache. Kept internal so tests can prove reuse without timing the host.
+    func generationDerivedCacheMetrics() -> GenerationDerivedCacheMetrics {
+        GenerationDerivedCacheMetrics(
+            hitCount: generationDerivedCacheHitCount,
+            computationCount: generationDerivedComputationCount,
+            invalidationCount: generationDerivedInvalidationCount,
+            entryCount: generationDerivedCache.count
+        )
+    }
+
+    private func generationDerivedTurnState(
+        generation: ContextStoredGeneration,
+        request: ContextTurnRequest,
+        mirror: RequiredDocumentMirror,
+        kernel: StablePromptKernel
+    ) -> GenerationDerivedTurnState {
+        let key = GenerationDerivedCacheKey(
+            generation: generation,
+            request: request,
+            mirror: mirror,
+            kernel: kernel
+        )
+        if let cached = generationDerivedCache[key] {
+            generationDerivedCacheHitCount += 1
+            return cached
+        }
+
+        generationDerivedComputationCount += 1
+        let personaPrefix = "persona/\(mirror.personaID.rawValue)/"
+        let normalizedPersonaID = mirror.personaID.rawValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let memoryPersonaPrefix = "memory-v2/personas/\(ContextStableID.digest(parts: [normalizedPersonaID]))/"
+        var selectedSources: [ContextStoredSource] = []
+        selectedSources.reserveCapacity(generation.sources.count)
+        var slotScopedMemorySourceCount = 0
+        for source in generation.sources {
+            if source.descriptor.owner == "nativeagent.memory-v2",
+               source.descriptor.canonicalLocator.hasPrefix(memoryPersonaPrefix) {
+                slotScopedMemorySourceCount += 1
+            }
+            if source.descriptor.permittedSurfaces.contains(request.surface),
+               request.allowedPrivacy.contains(source.descriptor.privacy),
+               source.descriptor.owner != "nativeagent.persona"
+                    || source.descriptor.canonicalLocator.hasPrefix(personaPrefix) {
+                // Appending in generation order preserves the exact input order
+                // used by the precoverage derivation before this cache existed.
+                selectedSources.append(source)
+            }
+        }
+
+        let allowedSourceIDs = Set(selectedSources.map(\.descriptor.id))
+        let precoveredDocumentNames = Set(kernel.includedDocumentIDs.map {
+            String($0.rawValue.dropLast(3))
+        })
+        let surfaceSuffix = "/surfaces/\(request.surface.rawValue).md"
+        var precoveredSourceIDs = Set(selectedSources.lazy.filter { source in
+            guard source.descriptor.owner == "nativeagent.persona" else { return false }
+            let locator = source.descriptor.canonicalLocator
+            if locator.hasSuffix(surfaceSuffix) { return true }
+            let documentName = locator.split(separator: "/").last.map(String.init)?
+                .replacingOccurrences(of: ".md", with: "")
+            return documentName.map(precoveredDocumentNames.contains) ?? false
+        }.map(\.descriptor.id))
+        let userPrecoverage = Self.generatedUserProjectionOutcome(
+            mirror: mirror,
+            kernel: kernel,
+            selectedSources: selectedSources,
+            generation: generation
+        )
+        precoveredSourceIDs.formUnion(userPrecoverage.precoveredSourceIDs)
+
+        let protectedCorrectionAtomIDs = Set(generation.atoms.lazy.filter { atom in
+            atom.validToGeneration == nil
+                && atom.draft.kind == .correction
+                && atom.draft.authority == .explicitCorrection
+                && allowedSourceIDs.contains(atom.draft.sourceID)
+                && request.allowedPrivacy.contains(atom.draft.privacy)
+                && atom.draft.permittedSurfaces.contains(request.surface)
+        }.map(\.draft.id))
+        let derived = GenerationDerivedTurnState(
+            allowedSourceIDs: allowedSourceIDs,
+            precoveredSourceIDs: precoveredSourceIDs,
+            userPrecoverage: userPrecoverage,
+            protectedCorrectionAtomIDs: protectedCorrectionAtomIDs,
+            memoryPersonaPrefix: memoryPersonaPrefix,
+            slotScopedMemorySourceCount: slotScopedMemorySourceCount
+        )
+        generationDerivedCache[key] = derived
+        return derived
+    }
+
+    private func invalidateGenerationDerivedCache() {
+        guard !generationDerivedCache.isEmpty else { return }
+        generationDerivedCache.removeAll(keepingCapacity: true)
+        generationDerivedInvalidationCount += 1
+    }
+
+    private func activateStoredGeneration(_ stored: ContextStoredGeneration) {
+        if let activeStoredGeneration,
+           activeStoredGeneration.generation.id != stored.generation.id
+                || activeStoredGeneration.generation.sourceFingerprint
+                    != stored.generation.sourceFingerprint {
+            invalidateGenerationDerivedCache()
+        }
+        activeStoredGeneration = stored
+    }
+
     private func prepareTurn(
         _ request: ContextTurnRequest,
         policy: TurnPreparationPolicy
@@ -366,11 +576,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 )
             }
 
-            let personaPrefix = "persona/\(mirror.personaID.rawValue)/"
-            let normalizedPersonaID = mirror.personaID.rawValue
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            let memoryPersonaPrefix = "memory-v2/personas/\(ContextStableID.digest(parts: [normalizedPersonaID]))/"
             // MEMORY IS SHARED ACROSS PERSONA SLOTS — there is deliberately no
             // persona clause in the selection filter below.
             //
@@ -403,12 +608,12 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             // .permits(surface:personaID:), already surface- and persona-aware
             // — NOT a storage-level persona filter here. Do not reintroduce a
             // slot-id scope gate in this filter.
-            let selectedSources = generation.sources.filter { source in
-                source.descriptor.permittedSurfaces.contains(request.surface)
-                    && request.allowedPrivacy.contains(source.descriptor.privacy)
-                    && (source.descriptor.owner != "nativeagent.persona"
-                        || source.descriptor.canonicalLocator.hasPrefix(personaPrefix))
-            }
+            let generationDerived = generationDerivedTurnState(
+                generation: generation,
+                request: request,
+                mirror: mirror,
+                kernel: kernel
+            )
             // Vocabulary-drift alarm (2026-07-24), replacing the memory-scope
             // starvation alarm this batch shipped a few hours earlier. Under
             // the shared-store policy no persona slot can starve, so that alarm
@@ -428,35 +633,18 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             // collide. That overlap is itself worth a look, so it is not
             // special-cased away.
             if policy.recordsSideEffects {
-                let slotScopedMemorySources = generation.sources.filter {
-                    $0.descriptor.owner == "nativeagent.memory-v2"
-                        && $0.descriptor.canonicalLocator.hasPrefix(memoryPersonaPrefix)
-                }
-                if !slotScopedMemorySources.isEmpty {
+                if generationDerived.slotScopedMemorySourceCount > 0 {
                     diagnostics(
                         "[context-flow] ERROR memory-scope vocabulary drift: "
-                        + "\(slotScopedMemorySources.count) live memory source(s) are scoped by "
+                        + "\(generationDerived.slotScopedMemorySourceCount) live memory source(s) are scoped by "
                         + "persona SLOT id \"\(mirror.personaID.rawValue)\" (prefix "
-                        + "\(memoryPersonaPrefix)). MemoryV2 record persona ids are AGENT NAMES; "
+                        + "\(generationDerived.memoryPersonaPrefix)). MemoryV2 record persona ids are AGENT NAMES; "
                         + "a slot-id-scoped record means the two vocabularies merged. Memory is "
                         + "deliberately shared across persona slots — re-review that decision "
                         + "before shipping a per-slot memory shard."
                     )
                 }
             }
-            let allowedSourceIDs = Set(selectedSources.map(\.descriptor.id))
-            let precoveredDocumentNames = Set(kernel.includedDocumentIDs.map {
-                String($0.rawValue.dropLast(3))
-            })
-            let surfaceSuffix = "/surfaces/\(request.surface.rawValue).md"
-            var precoveredSourceIDs = Set(selectedSources.lazy.filter { source in
-                guard source.descriptor.owner == "nativeagent.persona" else { return false }
-                let locator = source.descriptor.canonicalLocator
-                if locator.hasSuffix(surfaceSuffix) { return true }
-                let documentName = locator.split(separator: "/").last.map(String.init)?
-                    .replacingOccurrences(of: ".md", with: "")
-                return documentName.map(precoveredDocumentNames.contains) ?? false
-            }.map(\.descriptor.id))
             // SCOPE, stated once so it stops being re-discovered: precoverage
             // decides whether the USER.md CONTEXT SOURCE's atoms enter this
             // packet. It does not edit the persona-document lane.
@@ -473,15 +661,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             // `persona.docChars` counts the mirror's documents, NOT the bytes
             // sent; `system.stableChars` is what ships. A successful precoverage
             // leaves both unchanged by design — that is not evidence it failed.
-            let userPrecoverage = Self.generatedUserProjectionOutcome(
-                mirror: mirror,
-                kernel: kernel,
-                selectedSources: selectedSources,
-                generation: generation
-            )
-            precoveredSourceIDs.formUnion(userPrecoverage.precoveredSourceIDs)
             if policy.recordsSideEffects,
-               let line = precoverageReporter.message(for: userPrecoverage) {
+               let line = precoverageReporter.message(for: generationDerived.userPrecoverage) {
                 diagnostics(line)
             }
             let feedback = feedbackSnapshot(for: generation)
@@ -495,14 +676,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     state.temporaryActivation
                 )
             }
-            let protectedCorrectionAtomIDs = Set(generation.atoms.lazy.filter { atom in
-                atom.validToGeneration == nil
-                    && atom.draft.kind == .correction
-                    && atom.draft.authority == .explicitCorrection
-                    && allowedSourceIDs.contains(atom.draft.sourceID)
-                    && request.allowedPrivacy.contains(atom.draft.privacy)
-                    && atom.draft.permittedSurfaces.contains(request.surface)
-            }.map(\.draft.id))
             let makeNeed: (Int) -> NeedSignal = { characterBudget in
                 NeedSignal(
                     message: request.userMessage,
@@ -511,7 +684,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     authorization: ContextSelectionAuthorization(
                         allowedOrigins: [request.origin],
                         allowedPrivacy: request.allowedPrivacy,
-                        allowedSourceIDs: allowedSourceIDs,
+                        allowedSourceIDs: generationDerived.allowedSourceIDs,
                         permissionLabels: request.permissionLabels
                     ),
                     sessionID: request.sessionID,
@@ -525,8 +698,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     feedbackUtilityOverrides: feedbackByAtom.mapValues(\.utility),
                     feedbackDecayOverrides: feedbackByAtom.mapValues(\.decay),
                     workingAtomIDs: request.workingAtomIDs,
-                    precoveredSourceIDs: precoveredSourceIDs,
-                    mandatoryAtomIDs: protectedCorrectionAtomIDs,
+                    precoveredSourceIDs: generationDerived.precoveredSourceIDs,
+                    mandatoryAtomIDs: Set(generation.atoms.lazy.filter {
+                        generationDerived.protectedCorrectionAtomIDs.contains($0.draft.id)
+                            && ContextCorrectionScope.applies(
+                                $0.draft, message: request.userMessage, recentTurns: request.recentTurns
+                            )
+                    }.map(\.draft.id)),
                     queryEmbedding: request.queryEmbedding,
                     queryEmbeddingModelFingerprint: request.queryEmbeddingModelFingerprint,
                     availableGenerationID: generation.generation.id,
@@ -1392,7 +1570,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     }
 
     private func reconcile(dirtyDirectories: Set<URL>) async {
-        await refreshDiscoveredSources()
+        guard await refreshDiscoveredSources() else { return }
         guard !Task.isCancelled else { return }
         var affected: [ContextSourceRegistration] = []
         for directory in dirtyDirectories.sorted(by: { $0.path < $1.path }) {
@@ -1408,10 +1586,10 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         await refreshWatchedDirectories()
     }
 
-    private func reconcileAll(reason: String) async {
-        await refreshDiscoveredSources()
-        guard !Task.isCancelled else { return }
-        await reconcile(
+    @discardableResult
+    private func reconcileAll(reason: String) async -> Bool {
+        guard await refreshDiscoveredSources(), !Task.isCancelled else { return false }
+        return await reconcile(
             registrations: await registry.allRegistrations(),
             reason: reason,
             compiledProjectionIdentifiers: Set(
@@ -1420,12 +1598,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         )
     }
 
+    @discardableResult
     private func reconcile(
         registrations: [ContextSourceRegistration],
         reason: String,
         compiledProjectionIdentifiers: Set<String>
-    ) async {
-        guard mode != .off, !Task.isCancelled else { return }
+    ) async -> Bool {
+        guard mode != .off, !Task.isCancelled else { return false }
         nextReconciliationRequestID &+= 1
         let requestID = nextReconciliationRequestID
         for registration in registrations {
@@ -1453,12 +1632,25 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         do {
             let active = try await store.loadActiveGeneration()
             let previousBySource = Self.previousCompiledSources(active)
+            let authoritativeSources = await registry.authoritativeSourceIDsByOwner()
             var changedSources: [ContextCompiledSource] = []
-            var removedSourceIDs = Set<ContextSourceID>()
+            // Discovery can remove a registration before this loop sees it.
+            // Retire only sources whose owner explicitly supplied a complete
+            // inventory, including empty inventories after restart.
+            var removedSourceIDs = Set(previousBySource.compactMap { sourceID, source in
+                guard let currentIDs = authoritativeSources[source.descriptor.owner],
+                      !currentIDs.contains(sourceID) else { return nil as ContextSourceID? }
+                return sourceID
+            })
             var successfulSources: [ContextSourceID: ContextCompiledSource] = [:]
 
             for registration in batch.registrations {
                 let sourceID = registration.descriptor.id
+                if let currentIDs = authoritativeSources[registration.descriptor.owner],
+                   !currentIDs.contains(sourceID) {
+                    // A retry may still carry this now-retired registration.
+                    continue
+                }
                 guard FileManager.default.fileExists(atPath: registration.fileURL.path) else {
                     if previousBySource[sourceID] != nil {
                         removedSourceIDs.insert(sourceID)
@@ -1507,7 +1699,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 }
             }
 
-            await commit(ReconciliationCandidate(
+            return await commit(ReconciliationCandidate(
                 batch: batch,
                 changedSources: changedSources,
                 removedSourceIDs: removedSourceIDs,
@@ -1517,14 +1709,15 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         } catch is CancellationError {
             // Cancellation is control flow, not source degradation. Demand
             // stays pending and the next owner edge will retry it.
-            return
+            return false
         } catch {
             await commitFailure(error, compileFailures: compileFailures, for: batch)
+            return false
         }
     }
 
-    private func commit(_ candidate: ReconciliationCandidate) async {
-        guard await beginPublication(for: candidate.batch.requestID) else { return }
+    private func commit(_ candidate: ReconciliationCandidate) async -> Bool {
+        guard await beginPublication(for: candidate.batch.requestID) else { return false }
         defer { finishPublication() }
 
         do {
@@ -1564,7 +1757,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 await pruneStoreIfDue()
                 lastReconciledAt = Date()
                 acknowledge(candidate.batch)
-                return
+                return false
             }
 
             guard let stored = try await store.loadActiveGeneration() else {
@@ -1584,19 +1777,21 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             switch outcome {
             case nil, .published, .rehydrated:
                 lastError = nil
-                activeStoredGeneration = stored
+                activateStoredGeneration(stored)
             case .retainedLastGood(let failure, _):
                 throw ContextFlowCoordinatorError.arenaPublicationFailed(String(describing: failure))
             }
             lastReconciledAt = Date()
             acknowledge(candidate.batch)
             await pruneStoreIfDue()
+            return !Task.isCancelled
         } catch is CancellationError {
             // A cancelled caller must not mint an orange health incident or a
             // durable degradation receipt. Pending demand remains retryable.
-            return
+            return false
         } catch {
             recordReconciliationFailure(error)
+            return false
         }
     }
 
@@ -1649,7 +1844,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 publicationWaiters.append(continuation)
             }
         }
-        guard requestID == nextReconciliationRequestID else { return false }
+        guard requestID == nextReconciliationRequestID, !Task.isCancelled else { return false }
         publicationInProgress = true
         return true
     }
@@ -1695,16 +1890,22 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         await monitor?.setDirectories(await registry.watchedDirectories())
     }
 
-    private func refreshDiscoveredSources() async {
+    /// Refresh failure must stop this reconciliation request. Continuing with
+    /// the prior registry can publish a healthy-looking old persona generation
+    /// for a new picker value and cause the app-side ordering fence to consider
+    /// that value reconciled. The last good generation remains active instead.
+    private func refreshDiscoveredSources() async -> Bool {
         guard let refresher = mirrorProvider as? any ContextSourceRegistrationRefreshing else {
-            return
+            return true
         }
         do {
             try await refresher.refreshContextSources(in: registry)
+            return true
         } catch is CancellationError {
-            return
+            return false
         } catch {
             lastError = String(describing: error)
+            return false
         }
     }
 

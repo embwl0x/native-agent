@@ -53,6 +53,31 @@ public struct VisionSaliencyConfig: Sendable, Equatable {
 }
 
 public enum VisionSaliencyLayer {
+    /// Attention bounds are deliberately soft. A glow, shadow, or focus halo
+    /// can make the saliency box several times larger than the precise colour
+    /// region at its centre, leaving their IoU below the ordinary overlap
+    /// threshold even though both layers saw the same physical object.
+    ///
+    /// Accept tight, centre-aligned containment as corroboration, but cap the
+    /// area ratio so a broad panel cannot swallow a distinct control merely
+    /// because the control happens to sit inside it.
+    static func corroborates(
+        _ salient: VisionRect,
+        _ candidate: VisionRect,
+        matchIoU: Double
+    ) -> Bool {
+        if salient.iou(candidate) >= matchIoU { return true }
+        let smaller = salient.area <= candidate.area ? salient : candidate
+        let larger = salient.area <= candidate.area ? candidate : salient
+        guard smaller.area > 0,
+              larger.area / smaller.area <= 9,
+              smaller.coverage(by: larger) >= 0.8 else { return false }
+        let dx = abs(salient.centerX - candidate.centerX)
+        let dy = abs(salient.centerY - candidate.centerY)
+        return dx <= max(smaller.w, 1) * 0.5
+            && dy <= max(smaller.h, 1) * 0.5
+    }
+
     /// Rank existing candidates and add the ones only saliency saw.
     public static func fold(
         salient: [(rect: VisionRect, score: Double)],
@@ -66,7 +91,7 @@ public enum VisionSaliencyLayer {
 
         var ranked = candidates.map { candidate -> VisionCandidate in
             let best = salient
-                .filter { $0.rect.iou(candidate.rect) >= config.matchIoU }
+                .filter { corroborates($0.rect, candidate.rect, matchIoU: config.matchIoU) }
                 .map(\.score)
                 .max()
             guard let best else { return candidate }
@@ -79,7 +104,9 @@ public enum VisionSaliencyLayer {
             let areaFraction = region.rect.area / frameArea
             guard areaFraction >= config.minAreaFraction,
                   areaFraction <= config.maxAreaFraction else { continue }
-            let covered = ranked.contains { $0.rect.iou(region.rect) >= config.matchIoU }
+            let covered = ranked.contains {
+                corroborates(region.rect, $0.rect, matchIoU: config.matchIoU)
+            }
             if covered { continue }
             // Saliency bounds are BLOBBY — the attention map is coarse and the
             // box is a heat-region, not an edge. 0.35 is the honest number and

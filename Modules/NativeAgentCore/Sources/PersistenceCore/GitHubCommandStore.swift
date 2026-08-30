@@ -671,10 +671,36 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     }
 
     public func liveState() async throws -> GitHubCommandState {
-        let feed = try await readFeedUnlocked()
-        let state = try replay(base: feed.base, feed.ops)
-        try Self.validate(state)
-        return state
+        let key = Self.memoKey(opsPath)
+        let stamp = Self.feedStamp(opsPath: opsPath, basePath: basePath)
+        return try await Self.sharedLiveStateMemo.value(key: key, stamp: stamp) {
+            let feed = try await readFeedUnlocked()
+            let state = try replay(base: feed.base, feed.ops)
+            try Self.validate(state)
+            return GitHubCommandLiveStateMemo.LoadResult(
+                state: state,
+                stamp: Self.feedStamp(opsPath: opsPath, basePath: basePath)
+            )
+        }
+    }
+
+    /// Process-wide replay memo. The canonical feed remains authoritative;
+    /// stat-strength identities only skip duplicate decode/reduce work while
+    /// both files are unchanged. The actor also coalesces simultaneous launch
+    /// readers, which otherwise replayed the same ~1 MB feed in parallel.
+    static let sharedLiveStateMemo = GitHubCommandLiveStateMemo()
+
+    static func memoKey(_ opsPath: URL) -> String {
+        opsPath.resolvingSymlinksInPath().path
+    }
+
+    static func feedStamp(
+        opsPath: URL,
+        basePath: URL
+    ) -> GitHubCommandLiveStateMemo.FeedStamp? {
+        guard let ops = GitHubCommandLiveStateMemo.fileStamp(opsPath),
+              let base = GitHubCommandLiveStateMemo.fileStamp(basePath) else { return nil }
+        return GitHubCommandLiveStateMemo.FeedStamp(ops: ops, base: base)
     }
 
     /// Shared motor-tissue projection. GitHub Command keeps sole ownership of
@@ -688,6 +714,31 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     /// transition sinks use this overload so publishing a state change never
     /// rereads or replays the append-only feed a second time.
     public static func motorActionReadModel(item: GitHubCommandItem) -> MotorActionReadModel {
+        let semantics = motorSemantics(item: item)
+        return MotorActionReadModel(
+            domain: "github_command",
+            actionIdentity: CausalTransitionEvidence.opaqueIdentity(item.itemId),
+            phase: semantics.phase,
+            domainState: semantics.domainState,
+            verification: semantics.verification,
+            expectedNextEvidence: semantics.expectedEvidence,
+            updatedAt: item.motorUpdatedAt ?? item.createdAt
+        )
+    }
+
+    private struct MotorSemantics: Equatable {
+        let phase: MotorActionPhase
+        let domainState: String
+        let verification: MotorVerificationState
+        let expectedEvidence: String?
+    }
+
+    /// The reducer's small, non-identifying motor projection. Feed replay uses
+    /// this value directly to decide whether `motorUpdatedAt` moved; hashing an
+    /// unchanged item identity and these four fields after every operation was
+    /// pure repeat work. Opaque identity remains at the external read/evidence
+    /// boundary in `motorActionReadModel` and `motorSemanticFingerprint`.
+    private static func motorSemantics(item: GitHubCommandItem) -> MotorSemantics {
         let phase: MotorActionPhase
         let verification: MotorVerificationState
         let expectedEvidence: String?
@@ -740,14 +791,11 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 expectedEvidence = nil
             }
         }
-        return MotorActionReadModel(
-            domain: "github_command",
-            actionIdentity: CausalTransitionEvidence.opaqueIdentity(item.itemId),
+        return MotorSemantics(
             phase: phase,
             domainState: item.state.name.rawValue,
             verification: verification,
-            expectedNextEvidence: expectedEvidence,
-            updatedAt: item.motorUpdatedAt ?? item.createdAt
+            expectedEvidence: expectedEvidence
         )
     }
 
@@ -914,7 +962,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     public func observe(_ observations: [GitHubCommandObservation]) async throws -> [GitHubCommandItem] {
         guard !observations.isEmpty else { return [] }
         try observations.forEach(Self.validate)
-        return try await persistence.withFileLock(opsPath) {
+        let committed = try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedLocked()
             let newOps = observations.map {
                 GitHubCommandOp(
@@ -926,7 +974,6 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
             let state = try replay(base: feed.base, feed.ops + newOps)
             try Self.validate(state)
             try await persistence.appendJSONLDurable(try newOps.map(Self.json), to: opsPath)
-            changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
             try await persistence.writeJSON(try Self.json(state), to: statePath)
             try await compactIfNeededUnlocked(
                 base: feed.base,
@@ -936,8 +983,20 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 // ops are now in the file too, so carry them (finding 2).
                 integrity: feed.integrity.appendingRows(newOps.count)
             )
-            return observations.compactMap { state.item($0.itemId) }
+            return (
+                items: observations.compactMap { state.item($0.itemId) },
+                state: state,
+                stamp: Self.feedStamp(opsPath: opsPath, basePath: basePath)
+            )
         }
+        // The writer already owns the exact reduced state for the final feed
+        // stamp. Publish it before waking readers so the physiology/runtime
+        // reaction does not immediately decode and replay the same ~1 MB feed.
+        await Self.sharedLiveStateMemo.prime(
+            key: Self.memoKey(opsPath), stamp: committed.stamp, state: committed.state
+        )
+        changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
+        return committed.items
     }
 
     /// Reserves one deterministic bridge id for an actionable event. Replaying
@@ -1633,13 +1692,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 byId[itemId] = item
             }
             if var current = byId[affectedItemId] {
-                let beforeFingerprint = before.map {
-                    Self.motorSemanticFingerprint(Self.motorActionReadModel(item: $0))
-                }
-                let afterFingerprint = Self.motorSemanticFingerprint(
-                    Self.motorActionReadModel(item: current)
-                )
-                if beforeFingerprint != afterFingerprint {
+                let beforeSemantics = before.map { Self.motorSemantics(item: $0) }
+                let afterSemantics = Self.motorSemantics(item: current)
+                if beforeSemantics != afterSemantics {
                     current.motorUpdatedAt = op.at
                 } else {
                     current.motorUpdatedAt = before?.motorUpdatedAt ?? current.motorUpdatedAt
@@ -2020,5 +2075,127 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
 
     private static func decode<T: Decodable>(_ value: JSONValue) throws -> T {
         try JSONDecoder().decode(T.self, from: value.serializedData(pretty: false))
+    }
+}
+
+// MARK: - liveState replay memo
+
+actor GitHubCommandLiveStateMemo {
+    enum FileStamp: Sendable, Equatable {
+        case absent
+        case present(device: Int32, inode: UInt64, size: Int64, seconds: Int, nanoseconds: Int)
+    }
+
+    struct FeedStamp: Sendable, Equatable {
+        let ops: FileStamp
+        let base: FileStamp
+    }
+
+    struct LoadResult: Sendable {
+        let state: GitHubCommandState
+        let stamp: FeedStamp?
+    }
+
+    static let maxEntries = 8
+
+    private struct Entry: Sendable {
+        let stamp: FeedStamp
+        let state: GitHubCommandState
+    }
+
+    private struct Pending: Sendable {
+        let stamp: FeedStamp
+        let task: Task<LoadResult, any Error>
+    }
+
+    private var entries: [String: Entry] = [:]
+    private var order: [String] = []
+    private var pending: [String: Pending] = [:]
+    private var counters: [String: (hits: Int, misses: Int, coalesced: Int)] = [:]
+
+    static func fileStamp(_ url: URL) -> FileStamp? {
+        var info = stat()
+        if stat(url.path, &info) == 0 {
+            return .present(
+                device: info.st_dev,
+                inode: info.st_ino,
+                size: Int64(info.st_size),
+                seconds: info.st_mtimespec.tv_sec,
+                nanoseconds: info.st_mtimespec.tv_nsec
+            )
+        }
+        return errno == ENOENT ? .absent : nil
+    }
+
+    func value(
+        key: String,
+        stamp: FeedStamp?,
+        loader: @escaping @Sendable () async throws -> LoadResult
+    ) async throws -> GitHubCommandState {
+        guard let stamp else { return try await loader().state }
+        if let entry = entries[key], entry.stamp == stamp {
+            note(key, hit: 1)
+            return entry.state
+        }
+        if let existing = pending[key], existing.stamp == stamp {
+            note(key, coalesced: 1)
+            return try await existing.task.value.state
+        }
+
+        note(key, miss: 1)
+        let task = Task { try await loader() }
+        pending[key] = Pending(stamp: stamp, task: task)
+        do {
+            let result = try await task.value
+            if result.stamp == stamp { store(key: key, stamp: stamp, state: result.state) }
+            if pending[key]?.stamp == stamp { pending[key] = nil }
+            return result.state
+        } catch {
+            if pending[key]?.stamp == stamp { pending[key] = nil }
+            throw error
+        }
+    }
+
+    private func store(key: String, stamp: FeedStamp, state: GitHubCommandState) {
+        if entries[key] == nil {
+            order.append(key)
+            while order.count > Self.maxEntries, let oldest = order.first {
+                order.removeFirst()
+                entries[oldest] = nil
+            }
+        }
+        entries[key] = Entry(stamp: stamp, state: state)
+    }
+
+    /// Seed a projection a writer just committed. The caller supplies the
+    /// post-write stamp, so a concurrent/out-of-process mutation still misses
+    /// this entry and falls back to the canonical feed.
+    func prime(key: String, stamp: FeedStamp?, state: GitHubCommandState) {
+        guard let stamp else { return }
+        store(key: key, stamp: stamp, state: state)
+    }
+
+    private func note(_ key: String, hit: Int = 0, miss: Int = 0, coalesced: Int = 0) {
+        if counters[key] == nil, counters.count >= Self.maxEntries * 4 {
+            counters.removeAll()
+        }
+        var value = counters[key] ?? (0, 0, 0)
+        value.hits += hit
+        value.misses += miss
+        value.coalesced += coalesced
+        counters[key] = value
+    }
+
+    func forget(key: String) {
+        entries[key] = nil
+        order.removeAll { $0 == key }
+        pending[key]?.task.cancel()
+        pending[key] = nil
+        counters[key] = nil
+    }
+
+    func _testStats(key: String) -> (hits: Int, misses: Int, coalesced: Int, entries: Int) {
+        let value = counters[key] ?? (0, 0, 0)
+        return (value.hits, value.misses, value.coalesced, entries.count)
     }
 }

@@ -86,23 +86,21 @@ struct SlackConnectorPreflightTests {
         try SlackConnectorActions.requireConfiguredToken(dataRoot: secondOnly)
     }
 
-    // TWO-VOCABULARY PIN. Connectors+Auth.swift:229 (hasUsableToken) accepts
-    // `access_token` OR `oauth_token` OR `token`; this loader accepts ONLY
-    // `access_token`. A file the Connectors pane calls "connected" is
-    // therefore unusable here. This test pins the asymmetry so a change to
-    // EITHER side is a red test rather than a silent `invalid_auth` in an
-    // envelope nobody reads.
+    // AUTH-TRUTH PIN. Connectors+Auth.swift (hasUsableToken) accepts
+    // `access_token`, `oauth_token`, or `token`; the delivery boundary must
+    // accept the same saved credential vocabulary so "connected" cannot mean
+    // locally unusable.
     @Test
-    func tokenOnlyFileIsUnusableHereEvenThoughTheAuthLayerCallsItUsable() async throws {
-        let root = slackTempRoot()
-        try writeTokenFile(
-            ["token": "xoxb-" + String(repeating: "c", count: 24)],
-            to: oauthTokensPath(root)
-        )
-        let error = await capturedNSError("`token` is not `access_token`") {
+    func deliveryAcceptsEveryCredentialKeyTheAuthLayerCallsUsable() throws {
+        for key in ["access_token", "oauth_token", "token"] {
+            let root = slackTempRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try writeTokenFile(
+                [key: "xoxb-" + String(repeating: "c", count: 24)],
+                to: oauthTokensPath(root)
+            )
             try SlackConnectorActions.requireConfiguredToken(dataRoot: root)
         }
-        #expect(error?.code == -401)
     }
 
     // SlackConnectorActions.swift:72 postMessage — an IRREVERSIBLE external
@@ -209,6 +207,26 @@ struct SlackConnectorPreflightTests {
             ])
         }
         #expect(emptyFile?.code == -400)
+    }
+
+    @Test
+    func uploadFileUsesTheCallersCredentialStoreBeforeAnyNetworkDispatch() async throws {
+        let root = slackTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("completion.txt")
+        try Data("done".utf8).write(to: file)
+
+        let error = await capturedNSError("custom store has no Slack credential") {
+            _ = try await SlackConnectorActions.uploadFile(
+                input: [
+                    "channel": .string("C123"),
+                    "file_path": .string(file.path),
+                ],
+                dataRoot: root
+            )
+        }
+        #expect(error?.domain == "NativeAgentSlack")
+        #expect(error?.code == -401)
     }
 
     // SlackConnectorActions.swift:214 listUnreads is a registered action that

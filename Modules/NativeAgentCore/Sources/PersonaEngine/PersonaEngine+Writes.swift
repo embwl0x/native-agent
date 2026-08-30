@@ -162,9 +162,22 @@ extension SwiftNativePersonaEngine {
             // existing = self.personality() — normalize(read(profile.json)).
             // Read raw under the lock so we merge over the latest on-disk state.
             var existingRaw: [String: Any] = [:]
-            if let data = try? Data(contentsOf: profileURL),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                existingRaw = obj
+            if FileManager.default.fileExists(atPath: profileURL.path) {
+                do {
+                    let data = try Data(contentsOf: profileURL)
+                    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        throw PersonaWriteError.ioFailure(
+                            "Cannot update profile.json because its top-level value is not an object."
+                        )
+                    }
+                    existingRaw = object
+                } catch let error as PersonaWriteError {
+                    throw error
+                } catch {
+                    throw PersonaWriteError.ioFailure(
+                        "Cannot update unreadable profile.json: \(error.localizedDescription)"
+                    )
+                }
             }
             // Normalize the existing raw to the canonical dict (= self.personality()).
             let existing = PersonaCompiler.normalize(raw: existingRaw, defaults: .defaults)

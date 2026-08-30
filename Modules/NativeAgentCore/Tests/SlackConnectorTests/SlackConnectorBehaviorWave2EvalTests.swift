@@ -42,6 +42,27 @@ struct SlackConnectorBehaviorWave2EvalTests {
         ]))
     }
 
+    @Test("Slack receipt redaction removes signed upload credentials by field identity")
+    func redactsSignedUploadURLFromPartialResponses() {
+        let signed = "https://files.slack.com/upload/v1/secret?sig=credential"
+        let result = SlackConnectorActions.redactReceipt(.object([
+            "ok": .bool(false),
+            "error": .string("missing_file_id"),
+            "response": .object([
+                "upload_url": .string(signed),
+                "detail": .string("ordinary evidence"),
+            ]),
+        ]))
+        guard case .object(let root) = result,
+              case .object(let response)? = root["response"] else {
+            Issue.record("expected nested receipt object")
+            return
+        }
+        #expect(response["upload_url"] == .string("[REDACTED_SLACK_UPLOAD_URL]"))
+        #expect(response["detail"] == .string("ordinary evidence"))
+        #expect(!rendered(result).contains(signed))
+    }
+
     @Test("Slack external-upload URLs are HTTPS Slack hosts, never arbitrary destinations")
     func externalUploadURLMustBeTrustedSlackHTTPS() {
         #expect(SlackConnectorActions.trustedExternalUploadURL(

@@ -1,8 +1,8 @@
 // PATCH-2026-05-07: ios-parity AdvancedView — Status / Runs log (read-only)
 // PATCH-2026-05-07: mac-control-ui-1 Added Mac Tools section to AdvancedView
 // PATCH-2026-05-10: sidebar-flatten — More menu rebuilt as a flat list of
-// single-purpose destinations.  Memory + Skills came out (now primary bottom
-// tabs). Added Personality / Connectors / Trust / Providers /
+// single-purpose destinations. Memory became a primary bottom tab. Added
+// Personality / Connectors / Trust / Providers /
 // Connection to the "Manage" section so core Mac surfaces stay reachable on
 // iOS through one consistent overflow without nesting duplicate hubs.
 // PATCH-2026-06-07: mac-integration-tab-ios — Mac Integration row added to
@@ -81,9 +81,9 @@ struct AdvancedView: View {
                 // ── Manage — everything the Mac sidebar promotes to primary ──
                 Section {
                     NavigationLink {
-                        MobileDeskView()
+                        SkillsToolsView(embedInNavigationStack: false)
                     } label: {
-                        Label("Desk", systemImage: "rectangle.3.group")
+                        Label("Skills & Tools", systemImage: "puzzlepiece.extension")
                     }
                     NavigationLink {
                         PersonalityDetailHostView()
@@ -460,22 +460,47 @@ enum OrganismStatusPresentation {
 final class AdvancedStore: ObservableObject {
     @Published var health: RuntimeHealth?
     @Published var runs: [RunRecord] = []
-    @Published var isLoading = false
+    @Published private(set) var healthLoadError: String?
     @Published private(set) var runsLoadError: String?
+    private var healthRefreshInFlight = false
+    private var runsRefreshInFlight = false
 
     func refreshHealth() async {
-        isLoading = true
-        await iCloudSyncEngine.shared.refreshHealthSnapshot()
-        health = iCloudSyncEngine.shared.health
-        isLoading = false
+        guard !healthRefreshInFlight else { return }
+        healthRefreshInFlight = true
+        defer { healthRefreshInFlight = false }
+        let engine = iCloudSyncEngine.shared
+        let outcome = await engine.refreshHealthSnapshot()
+        health = engine.health
+        switch outcome {
+        case .refreshed:
+            healthLoadError = nil
+        case .partial:
+            healthLoadError = "Some Health snapshots are still downloading from iCloud."
+        case .unavailable:
+            healthLoadError = "Health snapshot is still downloading from iCloud. Try again in a moment."
+        case .superseded:
+            healthLoadError = "Health refresh was superseded by a sync reconfiguration. Try again."
+        }
     }
 
     func refreshRuns() async {
-        isLoading = true
-        await iCloudSyncEngine.shared.refreshRunsSnapshot()
-        runs = iCloudSyncEngine.shared.runs
-        runsLoadError = runs.isEmpty ? iCloudSyncEngine.shared.syncError : nil
-        isLoading = false
+        guard !runsRefreshInFlight else { return }
+        runsRefreshInFlight = true
+        defer { runsRefreshInFlight = false }
+        let engine = iCloudSyncEngine.shared
+        let outcome = await engine.refreshRunsSnapshot()
+        runs = engine.runs
+        switch outcome {
+        case .refreshed:
+            runsLoadError = nil
+        case .unavailable:
+            runsLoadError = "Runs snapshot is still downloading from iCloud. Try again in a moment."
+        case .superseded:
+            runsLoadError = "Runs refresh was superseded by a sync reconfiguration. Try again."
+        case .partial:
+            runsLoadError = "Some Runs data is still downloading from iCloud."
+        }
     }
 
     func applySyncedRuns(_ next: [RunRecord]) {
@@ -630,6 +655,11 @@ struct StatusDetailView: View {
             Section("Mac") {
                 switch MacHealthPresentation.snapshot(for: store.health) {
                 case .available(let health):
+                    if let healthLoadError = store.healthLoadError {
+                        Label(healthLoadError, systemImage: "exclamationmark.triangle")
+                            .font(AppFont.label)
+                            .foregroundStyle(.orange)
+                    }
                     StatCard(
                         label: "App",
                         value: health.app,
@@ -655,7 +685,7 @@ struct StatusDetailView: View {
                 case .unavailable:
                     Label(MacHealthPresentation.unavailableTitle, systemImage: "questionmark.circle")
                         .foregroundStyle(.secondary)
-                    Text(MacHealthPresentation.unavailableDetail)
+                    Text(store.healthLoadError ?? MacHealthPresentation.unavailableDetail)
                         .font(AppFont.label)
                         .foregroundStyle(.secondary)
                 }

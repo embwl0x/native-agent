@@ -71,6 +71,18 @@ hermeticity rule (real install root only, plus a kill switch): **SYS-01** reads
 installed app bundle's `Info.plist` and the app's preferences domain
 (`--no-machine-state`). On a fixture root both correctly read `source absent`.
 
+Current-state precedence is explicit in the report. A fresh connected
+`slack/state.json` heartbeat outranks historical Slack error rows; Telegram's
+`update_inbox/claims_index.json` separates pending/processing work from the
+intentional newest-256 terminal-claim retention set. Provider routing recognizes
+`desk` as canonical and `cognition_cue` as retired compatibility state. Turn
+lifecycle grading requires at least one `context.ready` and uses the earliest
+one for initial provider ordering, because tool/provider rounds may rebuild
+context legitimately. GitHub Command `ready`/`waiting_external` motor rows are
+watcher-owned waits rather than abandoned actions. The passive organism-watch
+timeline is historical/inactive unless its writer lock directory proves an
+explicit run is currently active.
+
 **SYS-14 is the one organ the data root persists nothing for.** That is a
 finding, not a hole in the reader: `UpdateController` keeps its notice in
 `UserDefaults` and the publish-honesty flag (`NativeAgentUpdateFeedPublished`)

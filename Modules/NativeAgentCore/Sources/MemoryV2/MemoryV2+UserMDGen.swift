@@ -58,6 +58,12 @@ public actor UserMDGenerator {
     /// Single in-flight trailing-edge timer task; nil when none scheduled.
     /// Lifecycle: set in `scheduleTrailingEdge`, cleared in `flushPending`.
     private var pendingTask: Task<Void, Never>?
+    /// Deterministic contention seam; nil in production.
+    private var beforeProjectionLockForTesting: (@Sendable () async -> Void)?
+
+    internal func _testSetBeforeProjectionLock(_ hook: (@Sendable () async -> Void)?) {
+        beforeProjectionLockForTesting = hook
+    }
 
     public init(
         storage: MemoryStorage,
@@ -211,17 +217,24 @@ public actor UserMDGenerator {
         let parent = target.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
 
-        let memories = try await storage.listMemories(persona: projectionPersona, status: "active", limit: nil)
-        let now = nowProvider()
-        let body = Self.renderBody(memories: memories, now: now)
-
+        await beforeProjectionLockForTesting?()
         let core = SwiftNativePersistenceCore()
-        try await core.withFileLock(target) { [body, target] in
+        let generatedAt = try await core.withFileLock(target) { [storage, nowProvider, target] in
+            // Read canonical memory only after owning the projection lock.
+            // Otherwise a waiter can publish an old snapshot after a newer
+            // regeneration won this non-FIFO lock and already wrote new facts.
+            // listMemories is database-only and never acquires the USER lock.
+            let memories = try await storage.listMemories(
+                persona: projectionPersona, status: "active", limit: nil
+            )
+            let now = nowProvider()
+            let body = Self.renderBody(memories: memories, now: now)
             let preamble = try Self.loadPreambleForRegeneration(at: target)
             let payload = Self.assemble(preamble: preamble, body: body)
-            try Self.atomicReplace(payload, at: target)
+            try Self.atomicReplaceIfChanged(payload, at: target)
+            return now
         }
-        lastRegen = now
+        lastRegen = generatedAt
         return target
     }
 
@@ -229,8 +242,16 @@ public actor UserMDGenerator {
     /// the same temp-fsync + rename + parent-directory-fsync contract used by
     /// canonical chat/session state; a successful regeneration must survive a
     /// power loss, not merely a process crash.
-    private static func atomicReplace(_ payload: String, at target: URL) throws {
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(payload.utf8), to: target)
+    private static func atomicReplaceIfChanged(_ payload: String, at target: URL) throws {
+        let bytes = Data(payload.utf8)
+        // Launch reconciliation is intentionally allowed to call regenerate,
+        // but an identical derived projection must not manufacture a file
+        // change. Replacing unchanged USER.md wakes ContextFlow, persona file
+        // watchers, and backup/sync surfaces even though canonical memory did
+        // not move. Compare under the same file lock that protects the write;
+        // unreadable/damaged documents have already failed closed above.
+        if (try? Data(contentsOf: target)) == bytes { return }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: target)
     }
 
     // MARK: - Rendering

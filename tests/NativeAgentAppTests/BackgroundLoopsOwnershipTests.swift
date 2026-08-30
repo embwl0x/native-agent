@@ -84,6 +84,10 @@ struct BackgroundLoopsOwnershipTests {
             assembleLoops: { [loop] },
             runHeartbeatAtLaunch: { false }
         )
+        #expect(await facade.runTickIfDue(loopId: loop.loopId)
+            == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true))
+        #expect(!(await core.isRunning()))
+        #expect(await core.registered().isEmpty)
         await facade.start()
 
         #expect(
@@ -93,6 +97,54 @@ struct BackgroundLoopsOwnershipTests {
         #expect(await counter.value == 0)
         #expect(await facade.runTickOnce(loopId: loop.loopId) == .completed(result: nil))
         #expect(await counter.value == 1)
+        await facade.stop()
+        #expect(await facade.runTickIfDue(loopId: loop.loopId)
+            == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true))
+        #expect(!(await core.isRunning()))
+        #expect(await counter.value == 1)
+        #expect(await facade.runTickOnce(loopId: loop.loopId) == .completed(result: nil))
+        #expect(await counter.value == 2)
+        await facade.stop()
+    }
+
+    @Test("an early cold OS wake preserves durable overdue work for launch")
+    func coldWakePreservesOverdueLaunchEligibility() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("loop-state.json")
+        let now = Date(timeIntervalSince1970: 10_000_000)
+        let previous = SwiftNativeLoopScheduler(
+            clock: { now.addingTimeInterval(-2 * 86_400) }, loopStatePath: path,
+            durableFlushWindow: 0
+        )
+        let counter = OwnershipTickCounter()
+        let loop = OwnershipTestLoop("overdue_cold_wake") { await counter.bump() }
+        await previous.register(loop)
+        await previous.stop()
+        let originalState = try Data(contentsOf: path)
+
+        let scheduler = SwiftNativeLoopScheduler(
+            clock: { now }, loopStatePath: path, startupStagger: 3_600,
+            durableFlushWindow: 0
+        )
+        let core = BackgroundLoops.BackgroundLoopsManager(scheduler: scheduler, clock: { now })
+        let facade = BackgroundLoopsManager(
+            coreManager: core, assembleLoops: { [loop] },
+            runAutoDoctorAtLaunch: { false }, runHeartbeatAtLaunch: { false }
+        )
+        #expect(await facade.runTickIfDue(loopId: loop.loopId)
+            == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true))
+        #expect(!(await core.isRunning()))
+        #expect(try Data(contentsOf: path) == originalState)
+        #expect(await counter.value == 0)
+
+        await facade.start()
+        #expect(await scheduler.isDue(loopId: loop.loopId) == true)
+        #expect(await core.status().first { $0.name == loop.loopId }?.nextRun != nil)
+        #expect(await facade.runTickIfDue(loopId: loop.loopId) == .completed(result: nil))
+        #expect(await counter.value == 1)
+        #expect(await scheduler.isDue(loopId: loop.loopId) == false)
         await facade.stop()
     }
 

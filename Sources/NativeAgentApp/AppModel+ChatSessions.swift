@@ -1073,11 +1073,25 @@ extension AppModel {
     @MainActor
     func applyLoadedChatMessages(_ disk: [ChatMessage], for sessionId: String) {
         var loaded = disk
-        if let tail = chatMessagesBySession[sessionId]?.last,
+        if let local = chatMessagesBySession[sessionId],
+           let tail = local.last,
            tail.id.hasPrefix(Self.syntheticErrorIDPrefix),
-           !disk.contains(where: { $0.id == tail.id }),
-           !isCompletedAssistant(disk.last) {
-            loaded.append(tail)
+           !disk.contains(where: { $0.id == tail.id }) {
+            if tail.metadata?.syntheticUserRowPersisted == false {
+                // A pre-provider failure has a local-only user row as well as
+                // its notice. Reuse retry's exact predecessor-ID proof: an old
+                // completed reply is not a newer turn, while any canonical
+                // conversation advance must supersede this unsent pair.
+                if let snapshot = MacChatRetrySnapshot.capture(
+                    target: tail, messages: local, sessionId: sessionId, isSyntheticNotice: true
+                ), snapshot.matchesCanonical(disk),
+                   let user = local.first(where: { $0.id == snapshot.priorUserMessageId }) {
+                    loaded.append(user)
+                    loaded.append(tail)
+                }
+            } else if !isCompletedAssistant(disk.last) {
+                loaded.append(tail)
+            }
         }
         guard chatMessagesBySession[sessionId] != loaded else { return }
         chatMessagesBySession[sessionId] = loaded
@@ -1111,6 +1125,7 @@ extension AppModel {
         chatSelectionGeneration += 1
         let generation = chatSelectionGeneration
         let hasCachedTranscript = chatMessagesBySession[requestedId] != nil
+        let lifecycleAtLoadStart = chatTurnLifecycle(for: requestedId)
 
         if hasCachedTranscript {
             commitChatSessionSelection(
@@ -1126,9 +1141,15 @@ extension AppModel {
             if hasCachedTranscript {
                 guard activeChatSessionId == requestedId else { return }
             }
+            // A turn can start AND settle during this load, leaving no active
+            // stream for commitChatSessionSelection's guard to see. Its retained
+            // lifecycle is the existing evidence that the local rows/receipt
+            // advanced. Still honor selection, but do not roll those rows back.
+            let currentLifecycle = chatTurnLifecycle(for: requestedId)
+            let turnAdvanced = currentLifecycle != nil && currentLifecycle != lifecycleAtLoadStart
             commitChatSessionSelection(
                 requestedId,
-                snapshot: snapshot,
+                snapshot: turnAdvanced ? nil : snapshot,
                 persistSelection: persistSelection
             )
         } catch {
@@ -1150,7 +1171,7 @@ extension AppModel {
             let isStreamingThisSession = streamingSessions.contains(requestedId)
             let inMemoryEmpty = (chatMessagesBySession[requestedId] ?? []).isEmpty
             if !isStreamingThisSession || inMemoryEmpty {
-                setChatMessages(snapshot.messages, for: requestedId)
+                applyLoadedChatMessages(snapshot.messages, for: requestedId)
             }
             setLatestContextReceipt(snapshot.receipt, for: requestedId)
         }

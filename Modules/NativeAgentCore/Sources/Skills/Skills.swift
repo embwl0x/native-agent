@@ -291,6 +291,7 @@ public enum SkillsError: Error, Equatable, Sendable {
     case unknownSkill(String)
     case stateNotAllowed(name: String, state: String, requirement: String)
     case invalidSkillBody(String)
+    case invalidRegistry(String)
     case historyUnavailable(String)
     case unknownVersion(String)
 }
@@ -522,8 +523,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     public func updateSkill(body: JSONValue) async throws -> JSONValue {
         let skillId = SkillMutation.unquote(SkillMutation.string(body, "id")).trimmingCharacters(in: .whitespacesAndNewlines)
         let result = try await withRegistryLock { () throws -> JSONValue in
-            let raw = await self.persistence.readJSON(self.registryPath, defaultValue: .array([]))
-            var skills: [JSONValue] = { if case .array(let a) = raw { return a } else { return [] } }()
+            var skills = try self.loadRegistryForMutation()
             for index in skills.indices {
                 guard case .object(var skill) = skills[index] else { continue }
                 let sid = SkillMutation.pyStr(skill["id"] ?? .null)
@@ -563,8 +563,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         // there, signalling the manifest fallback.
         let legacy: (result: JSONValue, displayName: String)? = try await withRegistryLock {
             () throws -> (JSONValue, String)? in
-            let raw = await self.persistence.readJSON(self.registryPath, defaultValue: .array([]))
-            let skills: [JSONValue] = { if case .array(let a) = raw { return a } else { return [] } }()
+            let skills = try self.loadRegistryForMutation()
             var kept: [JSONValue] = []
             var removed: JSONValue? = nil
             for skill in skills {
@@ -700,25 +699,30 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         }
 
         return try await withRegistryLock { () throws -> JSONValue in
-            let raw = await self.persistence.readJSON(self.registryPath, defaultValue: .array([]))
-            var skills: [JSONValue] = { if case .array(let a) = raw { return a } else { return [] } }()
+            var skills = try self.loadRegistryForMutation()
             let now = SkillMutation.nowISO(self.now)
+            let existingIds = Set(skills.map { SkillMutation.pyStr($0.objectValue?["id"] ?? .null) })
             // case-insensitive name dedup (Python: next(... lower() == name.lower()))
             if let idx = skills.firstIndex(where: {
                 SkillMutation.pyStrTruthyOr($0.objectValue?["name"], "").lowercased() == name.lowercased()
             }), case .object(var existing) = skills[idx] {
-                try await self.recordSkillVersion(.object(existing), reason: "before-create-update")
                 // Normalize early/hand-authored registry rows that predate the
                 // canonical writer and have no id. `str(null)` used to produce
                 // a literal "None.md", disconnecting the manifest name from
-                // the body read path. The skill name is already deduplicated,
-                // so its canonical slug is the safe repair id.
+                // the body read path. A deduplicated NAME may still slugify
+                // to another row's ID, so repair uses the same allocation as
+                // a new skill. An existing explicit id remains unchanged.
                 let existingId = SkillMutation.pyTruthyStrOptional(existing["id"])
-                let skillId = existingId ?? SkillMutation.slugify(
-                    SkillMutation.pyStrTruthyOr(existing["name"], name)
+                let skillId = existingId ?? SkillMutation.availableID(
+                    for: SkillMutation.pyStrTruthyOr(existing["name"], name), existingIDs: existingIds
                 )
                 let bodyPath = self.skillBodiesDir.appendingPathComponent("\(skillId).md")
                 existing["id"] = .string(skillId)
+                // Version under the allocated identity, not a name-derived
+                // slug that may belong to another skill. Keep the prior body
+                // path until this before-image has been captured.
+                try await self.recordSkillVersion(.object(existing), reason: "before-create-update")
+                existing["bodyPath"] = .string(bodyPath.path)
                 existing["description"] = .string(description)
                 existing["triggers"] = .array(triggers.map { .string($0) })
                 existing["updatedAt"] = .string(now)
@@ -734,13 +738,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 try? await self.recordSkillVersion(updated, reason: "created-update")
                 return updated
             }
-            var skillId = SkillMutation.slugify(name)
-            // Python: existing_ids = {str(skill.get("id")) for skill in skills}
-            // — bare str() (a null id → "None"), NOT the `or ""` truthiness.
-            let existingIds = Set(skills.map { SkillMutation.pyStr($0.objectValue?["id"] ?? .null) })
-            if existingIds.contains(skillId) {
-                skillId = "\(skillId)-\(String(UUID().uuidString.lowercased().prefix(8)))"
-            }
+            let skillId = SkillMutation.availableID(for: name, existingIDs: existingIds)
             let bodyPath = self.skillBodiesDir.appendingPathComponent("\(skillId).md")
             try await self.writeBody(content, to: bodyPath)
             // body.get("status") or ("draft" if autoCreated else "active")
@@ -812,8 +810,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         let capturedSkill = recordedSkill
         let capturedBody = restoredBody
         return try await withRegistryLock {
-            let raw = await self.persistence.readJSON(self.registryPath, defaultValue: .array([]))
-            var skills: [JSONValue] = { if case .array(let rows) = raw { return rows } else { return [] } }()
+            var skills = try self.loadRegistryForMutation()
             guard let index = skills.firstIndex(where: {
                 let object = $0.objectValue
                 return SkillMutation.pyStr(object?["id"] ?? .null) == skillId
@@ -903,6 +900,29 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             throw error
         } catch {
             throw SkillsError.historyUnavailable("Skill history is unreadable; mutation was refused.")
+        }
+    }
+
+    /// Mutation reads distinguish a genuinely absent registry (fresh install)
+    /// from an existing registry whose bytes or root shape are unusable. The
+    /// tolerant read path is appropriate for display, but using its empty
+    /// fallback inside a read-modify-write can replace every registered skill
+    /// after one malformed/truncated read.
+    private func loadRegistryForMutation() throws -> [JSONValue] {
+        guard FileManager.default.fileExists(atPath: registryPath.path) else { return [] }
+        do {
+            guard case .array(let rows) = try JSONValue.parse(Data(contentsOf: registryPath)) else {
+                throw SkillsError.invalidRegistry(
+                    "Skill registry is not a JSON array; mutation was refused."
+                )
+            }
+            return rows
+        } catch let error as SkillsError {
+            throw error
+        } catch {
+            throw SkillsError.invalidRegistry(
+                "Skill registry is unreadable; mutation was refused."
+            )
         }
     }
 
@@ -1079,6 +1099,21 @@ enum SkillMutation {
         case .bool(let b): return b ? 1 : 0
         default: return nil
         }
+    }
+
+    /// Allocate only a newly assigned identity; callers preserve explicit ids.
+    /// Runs inside the canonical registry lock for both creation and legacy
+    /// missing-id repair, before either path writes a body.
+    static func availableID(for name: String, existingIDs: Set<String>) -> String {
+        let base = slugify(name)
+        // Legacy explicit IDs retain their spelling, but readers match IDs
+        // case-insensitively and normal Mac volumes share case-only paths.
+        let occupied = Set(existingIDs.map { $0.lowercased() })
+        var candidate = base
+        while occupied.contains(candidate.lowercased()) {
+            candidate = "\(base)-\(String(UUID().uuidString.lowercased().prefix(8)))"
+        }
+        return candidate
     }
 
     /// `slugify` mirror: lowercase, replace every run of

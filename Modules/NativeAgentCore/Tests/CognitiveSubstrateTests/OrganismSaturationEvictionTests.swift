@@ -198,11 +198,10 @@ func overduePendingPredictionsCannotStarveOutLiveExpectations() {
     )
 }
 
-/// The ordering envelope itself: the retained ledger is a prefix of the code's
-/// own (status-rank desc, lastUpdatedAt desc, id asc) ordering — no lower-ranked
-/// row may be kept while a higher-ranked one is dropped.
+/// Pending expectations remain first-class, while terminal history is a recent
+/// sample rather than a status-ranked failure museum.
 @Test
-func predictionEvictionRetainsAStatusRankedPrefixNotAnArbitrarySubset() {
+func predictionEvictionKeepsPendingThenRecentTerminalEvidenceRegardlessOfOutcome() {
     let limits = OrganismPersistenceLimits()
     var predictions: [String: OrganismPrediction] = [:]
     let statuses: [OrganismPredictionStatus] = [.pending, .violated, .satisfied, .expired]
@@ -226,22 +225,42 @@ func predictionEvictionRetainsAStatusRankedPrefixNotAnArbitrarySubset() {
     let kept = state.decayed(at: evictionNow, limits: limits).predictionLedger.predictions
     #expect(kept.count == limits.maximumPersistedPredictions)
 
-    func rank(_ status: OrganismPredictionStatus) -> Int {
-        switch status {
-        case .pending: return 4
-        case .violated: return 3
-        case .satisfied: return 2
-        case .expired: return 1
+    let pendingIDs = Set(predictions.values.filter { $0.status == .pending }.map(\.id))
+    #expect(pendingIDs.isSubset(of: Set(kept.keys)))
+    let retainedTerminal = kept.values.filter { $0.status != .pending }
+    let newestTerminalIDs = Set(predictions.values
+        .filter { $0.status != .pending }
+        .sorted {
+            if $0.lastUpdatedAt != $1.lastUpdatedAt { return $0.lastUpdatedAt > $1.lastUpdatedAt }
+            if $0.uncertainty != $1.uncertainty { return $0.uncertainty > $1.uncertainty }
+            return $0.id < $1.id
         }
+        .prefix(retainedTerminal.count)
+        .map(\.id))
+    #expect(Set(retainedTerminal.map(\.id)) == newestTerminalIDs)
+    #expect(retainedTerminal.contains { $0.status == .satisfied })
+    #expect(retainedTerminal.contains { $0.status == .violated })
+}
+
+@Test
+func terminalPredictionRetentionCannotLetOneCapabilityCrowdOutTheOthers() {
+    let predictions = (0..<90).map { index in
+        OrganismPrediction(
+            id: "provider-\(index)", kind: .providerCompletion, sourceOrgan: "provider",
+            createdAt: evictionNow, dueAt: evictionNow, status: .violated,
+            lastUpdatedAt: evictionNow.addingTimeInterval(Double(index))
+        )
+    } + (0..<10).map { index in
+        OrganismPrediction(
+            id: "tool-\(index)", kind: .toolCompletion, sourceOrgan: "tool",
+            createdAt: evictionNow, dueAt: evictionNow, status: .satisfied,
+            lastUpdatedAt: evictionNow.addingTimeInterval(Double(index))
+        )
     }
-    let evicted = predictions.values.filter { kept[$0.id] == nil }
-    #expect(!evicted.isEmpty)
-    let lowestKeptRank = kept.values.map { rank($0.status) }.min() ?? 0
-    let highestEvictedRank = evicted.map { rank($0.status) }.max() ?? 0
-    #expect(
-        lowestKeptRank >= highestEvictedRank,
-        "kept a rank-\(lowestKeptRank) row while evicting a rank-\(highestEvictedRank) row"
-    )
+
+    let kept = OrganismPredictionRetention.bounded(predictions, maximum: 20)
+    #expect(kept.filter { $0.kind == .providerCompletion }.count == 10)
+    #expect(kept.filter { $0.kind == .toolCompletion }.count == 10)
 }
 
 // MARK: - Reflex candidates + receipts

@@ -363,7 +363,11 @@ public enum DeskObservationEvaluator {
     /// `materialFingerprint` so the item-local notion stays available on its own.
     public static func verdictFingerprint(_ item: DeskItem, in state: DeskState) -> String {
         let openChildren = state.items.filter { !$0.status.isTerminal && $0.parent == item.handle }.count
-        return "\(materialFingerprint(item))\u{1F}children:\(openChildren)"
+        return verdictFingerprint(item, openChildCount: openChildren)
+    }
+
+    private static func verdictFingerprint(_ item: DeskItem, openChildCount: Int) -> String {
+        "\(materialFingerprint(item))\u{1F}children:\(openChildCount)"
     }
 
     /// Chronological max of ISO stamps. String `.max()` is wrong the moment two
@@ -419,6 +423,11 @@ public enum DeskObservationEvaluator {
             guard let parent = item.parent else { continue }
             openChildCount[parent, default: 0] += 1
         }
+        // This evaluator stamps every item and makes several handle lookups.
+        // Build those indexes once: filtering/copying the full board for every
+        // fingerprint made connector settlement quadratic in board size.
+        let sortedItems = state.items.sorted { $0.handle < $1.handle }
+        let itemByHandle = Dictionary(uniqueKeysWithValues: state.items.map { ($0.handle, $0) })
 
         var autoResolves: [DeskAutoResolve] = []
         var drifts: [DeskDrift] = []
@@ -427,7 +436,7 @@ public enum DeskObservationEvaluator {
         var fullyObserved: Set<String> = []
         var observedStamp: [String: String] = [:]
 
-        for item in state.items.sorted(by: { $0.handle < $1.handle }) {
+        for item in sortedItems {
             let keys = trackedKeys(item)
             guard !keys.isEmpty else { continue }
             // Only reconcile against refs we actually observed this pass. An
@@ -542,7 +551,9 @@ public enum DeskObservationEvaluator {
                 refKeys: keys,
                 evidence: evidence,
                 observedAt: observedAt,
-                materialFingerprint: verdictFingerprint(item, in: state)
+                materialFingerprint: verdictFingerprint(
+                    item, openChildCount: openChildCount[item.handle] ?? 0
+                )
             ))
         }
 
@@ -555,7 +566,7 @@ public enum DeskObservationEvaluator {
         // a wall clock read inside a pure function.
         let resolveStamp = latestStamp(autoResolves.map(\.observedAt))
         if !resolving.isEmpty {
-            for item in state.items.sorted(by: { $0.handle < $1.handle })
+            for item in sortedItems
             where !item.status.isTerminal && item.status == .blocked {
                 let freed = item.blockedOn.filter { resolving.contains($0) }.sorted()
                 guard !freed.isEmpty else { continue }
@@ -584,7 +595,7 @@ public enum DeskObservationEvaluator {
         let flagged = Set(drifts.map(\.handle))
         var clears: [DeskDriftClear] = []
         for handle in fullyObserved.subtracting(flagged).sorted() {
-            guard let item = state.items.first(where: { $0.handle == handle }),
+            guard let item = itemByHandle[handle],
                   let last = item.notes.last,
                   let kind = driftKind(inNote: last.text) else { continue }
             clears.append(DeskDriftClear(
@@ -599,7 +610,12 @@ public enum DeskObservationEvaluator {
         // than at each of the seven construction sites — a missed site would be
         // a silently unguarded write.
         var fingerprints: [String: String] = [:]
-        for item in state.items { fingerprints[item.handle] = verdictFingerprint(item, in: state) }
+        fingerprints.reserveCapacity(state.items.count)
+        for item in state.items {
+            fingerprints[item.handle] = verdictFingerprint(
+                item, openChildCount: openChildCount[item.handle] ?? 0
+            )
+        }
 
         return DeskObservationVerdict(
             autoResolves: autoResolves.sorted { $0.handle < $1.handle },

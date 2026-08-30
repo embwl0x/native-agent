@@ -610,6 +610,24 @@ extension NativeClient {
             row["runtimeDetail"] = .string("Socket Mode runtime state could not be read safely.")
             row["runtimeUpdatedAt"] = .null
         }
+        do {
+            if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
+               recovery.pendingCount > 0 {
+                if recovery.isAtCapacity {
+                    row["runtimeStatus"] = .string("intake_paused")
+                    row["runtimeDetail"] = .string("\(recovery.pendingCount) pending replies; new message intake is paused. \(recovery.unknownCount) need recovery. Ask Agent to inspect Slack delivery recovery before any manual retry; nothing is automatically discarded or resent.")
+                } else if recovery.unknownCount > 0 {
+                    row["runtimeStatus"] = .string("recovery_required")
+                    row["runtimeDetail"] = .string("\(recovery.unknownCount) replies have an unknown outcome (\(recovery.pendingCount) pending). Ask Agent to inspect Slack delivery recovery before any manual retry; automatic resend is paused.")
+                } else {
+                    let detail = connectorString(row["runtimeDetail"]) ?? ""
+                    row["runtimeDetail"] = .string("\(detail) \(recovery.pendingCount) accepted replies are pending delivery.")
+                }
+            }
+        } catch {
+            row["runtimeStatus"] = .string("recovery_unavailable")
+            row["runtimeDetail"] = .string("Slack delivery recovery state cannot be read safely. New message intake may be paused; ask Agent to inspect it before retrying.")
+        }
     }
 
     /// Registry connector id → (client-id env var, OAuth-flow canonical id,

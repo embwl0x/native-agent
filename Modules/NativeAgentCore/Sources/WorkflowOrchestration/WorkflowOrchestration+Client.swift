@@ -107,6 +107,10 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         let verification: MotorVerificationState
         let expectedEvidence: String?
         switch normalized {
+        case "dry_run":
+            phase = .proposed
+            verification = .notRequired
+            expectedEvidence = nil
         case "queued", "ready":
             phase = .ready
             verification = .notStarted
@@ -249,9 +253,12 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             "createdAt": .string(now()),
         ])
         let tracesURL = tracesPath
-        try await persistence.withFileLock(tracesURL) {
-            try await persistence.appendJSONL(event, to: tracesURL)
-        }
+        try await appendPathOwnedJSONL(
+            event,
+            to: tracesURL,
+            using: persistence,
+            logLabel: "WorkflowOrchestration.trace"
+        )
     }
 
     private func setField(_ state: JSONValue, _ key: String, _ value: JSONValue) -> JSONValue {
@@ -452,19 +459,41 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         return WorkflowRunState.publicRun(committed)
     }
 
+    /// Called inside the existing registry lock. Only an absent directory entry
+    /// bootstraps defaults; damaged or unreadable saved workflows must survive
+    /// a list/create attempt, including a dangling symlink at the saved path.
+    private static func readWorkflowRegistry(_ path: URL) throws -> [JSONValue] {
+        let data: Data
+        do {
+            data = try Data(contentsOf: path)
+        } catch {
+            var metadata = stat()
+            if lstat(path.path, &metadata) != 0, errno == ENOENT { return [] }
+            throw error
+        }
+        guard case .array(let rows) = try JSONValue.parse(data) else {
+            throw NSError(domain: "WorkflowOrchestration", code: -422, userInfo: [
+                NSLocalizedDescriptionKey: "Workflow registry is unavailable: expected a JSON array at \(path.path). Saved bytes were preserved."
+            ])
+        }
+        return rows
+    }
+
     public func listWorkflows() async throws -> [JSONValue] {
         // The ENTIRE read -> merge -> write-back must be atomic under the
         // cross-process lock, otherwise a Python writer that commits between
         // our read and our locked write would be silently clobbered by our
         // stale-data write-back (gpt-5.5 review finding #1, 2026-06-01).
         let body: @Sendable () async throws -> [JSONValue] = { [persistence, registryPath, now] in
-            let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
-            let saved: [JSONValue]
-            if case .array(let arr) = raw { saved = arr } else { saved = [] }
+            let saved = try Self.readWorkflowRegistry(registryPath)
             let defaults = WorkflowDefaults.defaults(now: now())
             let (mergedUnsorted, sorted) = WorkflowMerge.mergeRegistry(defaults: defaults, saved: saved)
-            // Write back the merged (unsorted) registry, preserving retired semantics.
-            try await persistence.writeJSON(.array(mergedUnsorted), to: registryPath)
+            // Persist newly introduced defaults/fields, but an ordinary list
+            // read must not fsync identical bytes and wake registry observers.
+            let merged = JSONValue.array(mergedUnsorted)
+            if merged != .array(saved) {
+                try await persistence.writeJSON(merged, to: registryPath)
+            }
             return sorted
         }
         if useFileLock {
@@ -479,8 +508,11 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         // did not durably record an outcome; replaying it could duplicate an
         // irreversible effect, so recovery parks it for explicit review.
         try await reconcileInterruptedWorkflowRuns()
-        // Python: list(reversed(tail_jsonl(runs_path, 50)))
-        return try await readWorkflowRunLedgerFeedFamily().recentRuns
+        // Only the recent tail is presented here. The explicit feed-family
+        // diagnostic owns registry/state inventory; computing and discarding
+        // it here reparsed every state a second time after reconciliation.
+        let (tail, _) = await readWorkflowRunLedgerTail()
+        return Array(tail.rows.reversed())
     }
 
     /// Read the live workflow ledger family without manufacturing a clean empty
@@ -519,26 +551,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             }
         }
 
-        let tail: SwiftNativePersistenceCore.JSONLTailReadReceipt
-        let runsSource: WorkflowRunLedgerFeedSource
-        var runsPathIsDirectory = ObjCBool(false)
-        if !fm.fileExists(atPath: runsPath.path, isDirectory: &runsPathIsDirectory) {
-            tail = SwiftNativePersistenceCore.JSONLTailReadReceipt(rows: [], physicalRowsScanned: 0, malformedJSONRowCount: 0, bytesRead: 0, truncatedToByteWindow: false)
-            runsSource = .absent
-        } else if runsPathIsDirectory.boolValue {
-            tail = SwiftNativePersistenceCore.JSONLTailReadReceipt(rows: [], physicalRowsScanned: 0, malformedJSONRowCount: 0, bytesRead: 0, truncatedToByteWindow: false)
-            runsSource = .unavailable(reason: "runs.jsonl is a directory")
-        } else {
-            do {
-                tail = try await persistence.tailJSONLReadReceipt(runsPath, limit: 50, maxBytes: 1_048_576)
-                runsSource = tail.malformedJSONRowCount == 0
-                    ? .available
-                    : .partial(malformedRecords: tail.malformedJSONRowCount)
-            } catch {
-                tail = SwiftNativePersistenceCore.JSONLTailReadReceipt(rows: [], physicalRowsScanned: 0, malformedJSONRowCount: 0, bytesRead: 0, truncatedToByteWindow: false)
-                runsSource = .unavailable(reason: error.localizedDescription)
-            }
-        }
+        let (tail, runsSource) = await readWorkflowRunLedgerTail()
         let recentRuns = Array(tail.rows.reversed())
         var runStatusCounts: [String: Int] = [:]
         for run in recentRuns {
@@ -596,6 +609,33 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         )
     }
 
+    /// Shared tail contract for lightweight presentation and full diagnostics.
+    /// Preserve absence/damage evidence without requiring either caller to
+    /// inventory unrelated files or maintain its own decoding/error semantics.
+    private func readWorkflowRunLedgerTail() async -> (
+        SwiftNativePersistenceCore.JSONLTailReadReceipt, WorkflowRunLedgerFeedSource
+    ) {
+        let empty = SwiftNativePersistenceCore.JSONLTailReadReceipt(
+            rows: [], physicalRowsScanned: 0, malformedJSONRowCount: 0,
+            bytesRead: 0, truncatedToByteWindow: false
+        )
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: runsPath.path, isDirectory: &isDirectory) else {
+            return (empty, .absent)
+        }
+        guard !isDirectory.boolValue else {
+            return (empty, .unavailable(reason: "runs.jsonl is a directory"))
+        }
+        do {
+            let tail = try await persistence.tailJSONLReadReceipt(runsPath, limit: 50, maxBytes: 1_048_576)
+            let source: WorkflowRunLedgerFeedSource = tail.malformedJSONRowCount == 0
+                ? .available : .partial(malformedRecords: tail.malformedJSONRowCount)
+            return (tail, source)
+        } catch {
+            return (empty, .unavailable(reason: error.localizedDescription))
+        }
+    }
+
     private func reconcileInterruptedWorkflowRuns(only runId: String? = nil) async throws {
         let directory = root.appendingPathComponent("workflows/run_state", isDirectory: true)
         let paths: [URL]
@@ -617,10 +657,15 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 let runId = stateString(current, "id")
                 if let terminal = try await terminalLedgerRun(runId: runId) {
                     var joined = setField(current, "status", .string(stateString(terminal, "status")))
-                    joined = setField(joined, "completedAt", objectField(terminal, "completedAt") ?? .string(now()))
-                    joined = setField(joined, "updatedAt", .string(now()))
+                    joined = setField(joined, "completedAt", objectField(terminal, "completedAt")
+                        ?? objectField(current, "completedAt") ?? .string(now()))
                     joined = setField(joined, "activeStepAttempt", .null)
                     joined = setField(joined, "activeStepTimeoutSeconds", .null)
+                    // A list read must not keep rewriting already-reconciled
+                    // history or turn its updatedAt into a read timestamp.
+                    // Compare the durable join before adding the repair stamp.
+                    guard joined != current else { return nil }
+                    joined = setField(joined, "updatedAt", .string(now()))
                     try await persistence.writeJSON(joined, to: path)
                     return nil
                 }
@@ -745,29 +790,27 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         //                       if str(w["id"]) != workflow_id]
         //        workflows.append(workflow)
         //        write_json(self.workflows_path, workflows)
-        //    _list_workflows_locked() does the read+merge+WRITE-BACK of the
-        //    defaults-merged registry (same as listWorkflows' inner body), THEN
-        //    we filter+append+overwrite. The ENTIRE sequence runs inside ONE
-        //    flock acquisition so a concurrent Python writer can't interleave.
+        //    Compute the defaults merge, then filter+append and persist the
+        //    final registry ONCE. The retired implementation first persisted
+        //    an intermediate merge and immediately overwrote it under the same
+        //    lock; that extra fsync exposed no useful state to locked readers.
+        //    The ENTIRE sequence remains inside ONE flock acquisition.
         //    We call the lock-free merge here (NOT listWorkflows, which would
         //    re-acquire the SAME <path>.lock and deadlock — flock(2) is not
         //    recursive across fds; see Python's _list_workflows_locked note).
         let regPath = registryPath
         let nowFn = now
         let body2: @Sendable () async throws -> Void = { [persistence] in
-            // _list_workflows_locked: read -> merge -> write-back merged (unsorted)
-            // -> RETURN sorted. Python's workflow_defaults() takes a FRESH now_iso()
+            // Merge and retain the sorted result, without an intermediate
+            // write. Python's workflow_defaults() takes a FRESH now_iso()
             // each call (not create's stampNow), so the default rows written back
             // carry their own timestamp (gpt-5.5 review finding #6, 2026-06-02).
-            let raw = await persistence.readJSON(regPath, defaultValue: .array([]))
-            let saved: [JSONValue]
-            if case .array(let arr) = raw { saved = arr } else { saved = [] }
+            let saved = try Self.readWorkflowRegistry(regPath)
             let defaults = WorkflowDefaults.defaults(now: nowFn())
-            let (mergedUnsorted, mergedSorted) = WorkflowMerge.mergeRegistry(defaults: defaults, saved: saved)
-            // _list_workflows_locked WRITES BACK the merged UNSORTED list...
-            try await persistence.writeJSON(.array(mergedUnsorted), to: regPath)
-            // ...then RETURNS the SORTED list. create_workflow filters THAT sorted
-            // return, appends the new workflow, and overwrites. So the final
+            let (_, mergedSorted) = WorkflowMerge.mergeRegistry(defaults: defaults, saved: saved)
+            // create_workflow filters the SORTED merge return and appends the
+            // new workflow. Preserve that final ordering without publishing an
+            // intermediate version. So the final
             // on-disk order = sorted(minus same-id) + new-at-end — NOT the unsorted
             // merge order (gpt-5.5 review finding #3, 2026-06-02).
             let kept = mergedSorted.filter { WorkflowMerge.idKey($0) != workflowId }
@@ -1668,6 +1711,54 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         return run
     }
 
+    /// Static V2 preview, not a simulated execution. Preserve the saved plan
+    /// and merged inputs without inventing outputs, evaluating output-dependent
+    /// conditions, filing approvals, or creating resumable execution state.
+    private func previewWorkflowV2(workflow: JSONValue, objective: String, variables bodyVariables: JSONValue?) async throws -> JSONValue {
+        var variables = objectMap(workflow, "variables")
+        if case .object(let incoming)? = bodyVariables {
+            variables.merge(incoming) { _, requested in requested }
+        }
+        let detail = "Static preview only: no steps executed, conditions/dependencies not evaluated, and no outputs generated."
+        let steps = objectArray(workflow, "steps").compactMap { step -> JSONValue? in
+            guard case .object(var fields) = step else { return nil }
+            fields["status"] = .string("not_executed")
+            fields["detail"] = .string(detail)
+            fields["attempts"] = .array([])
+            fields["output"] = .object([:])
+            return .object(fields)
+        }
+        // Preview adds plan inputs to a public receipt; apply the existing
+        // recursive secret redactor before returning or persisting that view.
+        let run = WorkflowRedaction.redactValue(.object([
+            "id": .string(uuid()),
+            "workflowId": objectField(workflow, "id") ?? .null,
+            "workflowName": objectField(workflow, "name") ?? .null,
+            "objective": .string(objective),
+            "engineVersion": .string("2"),
+            "status": .string("dry_run"),
+            "mode": .string("dry_run"),
+            "detail": .string(detail),
+            "steps": .array(steps),
+            "variables": .object(variables),
+            "outputs": .object([:]),
+            "createdAt": .string(now()),
+            "completedAt": .string(now()),
+        ]))
+        try await appendRun(run)
+        try await appendActivity(
+            kind: "workflow", title: "Workflow preview recorded",
+            detail: detail, status: "ok",
+            payload: ["workflowRunId": objectField(run, "id") ?? .null]
+        )
+        try await appendTrace(
+            kind: "workflow.preview",
+            title: objectString(run, "workflowName"),
+            payload: ["workflowRunId": objectField(run, "id") ?? .null, "status": .string("dry_run")]
+        )
+        return run
+    }
+
     private func runWorkflowV2(workflow: JSONValue, objective: String, variables bodyVariables: JSONValue?) async throws -> JSONValue {
         let runId = uuid()
         var variables = objectMap(workflow, "variables")
@@ -1916,13 +2007,19 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             : objectString(workflow, "engineVersion", fallback: "2")
         )
         let resolvedObjective = workflowObjective(objective, workflow: workflow)
+        let usesV2 = ["2", "v2", "2.0"].contains(resolvedEngine)
+        if !execute && usesV2 {
+            return try await previewWorkflowV2(
+                workflow: workflow, objective: resolvedObjective, variables: variables
+            )
+        }
         let hasApprovalGate = objectArray(workflow, "steps").contains { step in
             objectBool(step, "requiresApproval") || objectString(step, "kind") == "approval"
         }
         // Heal saved v1 approval workflows at the live boundary. V1 can file
         // an approval but owns no resumable state file, so executing it would
         // create a permanent dead-end. Dry runs retain their legacy receipts.
-        if ["2", "v2", "2.0"].contains(resolvedEngine) || (execute && hasApprovalGate) {
+        if usesV2 || (execute && hasApprovalGate) {
             return try await runWorkflowV2(
                 workflow: workflow,
                 objective: resolvedObjective,

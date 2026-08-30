@@ -3,6 +3,7 @@
 // Missing, malformed, and unbounded feeds remain distinct; this intentionally
 // does not try to infer health from a generic reachability walk.
 import Foundation
+import Darwin
 
 enum FeedCoverageError: Error, CustomStringConvertible {
     case usage(String), refusedOutput(String)
@@ -33,9 +34,32 @@ while index < argv.count {
     }
     index += 1
 }
-let canonicalRoot = root.standardizedFileURL
-if let out, out.standardizedFileURL.path.hasPrefix(canonicalRoot.path + "/") || out.standardizedFileURL == canonicalRoot {
-    throw FeedCoverageError.refusedOutput("REFUSED: --out must not be inside the data root")
+// The report normally does not exist yet. Resolve its nearest existing
+// ancestor with the same kernel spelling as the data root (including macOS
+// /var -> /private/var), then append the missing path components.
+func canonicalLocation(_ url: URL) -> String {
+    var ancestor = url.path
+    var missing: [String] = []
+    while true {
+        if let resolved = realpath(ancestor, nil) {
+            defer { free(resolved) }
+            return missing.reversed().reduce(String(cString: resolved)) {
+                ($0 as NSString).appendingPathComponent($1)
+            }
+        }
+        let parent = (ancestor as NSString).deletingLastPathComponent
+        guard parent != ancestor, !parent.isEmpty else { return url.standardizedFileURL.path }
+        missing.append((ancestor as NSString).lastPathComponent)
+        ancestor = parent
+    }
+}
+let canonicalRoot = URL(fileURLWithPath: canonicalLocation(root), isDirectory: true)
+if let out {
+    let outputPath = canonicalLocation(out)
+    let rootPrefix = canonicalRoot.path.hasSuffix("/") ? canonicalRoot.path : canonicalRoot.path + "/"
+    if outputPath == canonicalRoot.path || outputPath.hasPrefix(rootPrefix) {
+        throw FeedCoverageError.refusedOutput("REFUSED: --out must not be inside the data root")
+    }
 }
 
 func modification(_ file: URL) -> Date? { (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? nil }

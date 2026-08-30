@@ -39,13 +39,13 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
     let approvalTimeoutSeconds: Double
     let historyLimit: Int
     let toolLoopMaxIterationsOverride: Int?
+    let turnWallClockSecondsOverride: TimeInterval?
     let promoter: (any MemoryPromoting)?
     let cognitiveObserver: (any CognitiveEventObserving)?
     let cognitiveContextProvider: (any CognitiveContextProviding)?
     let providerLifecycleObserverInstalled: Bool
     let autocompactionConfig: ChatSessionAutocompactionConfig
     let clock: @Sendable () -> Date
-    let publicSafeMode: Bool
 
     public init(
         engine: SwiftNativeTurnEngine,
@@ -62,13 +62,13 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         approvalTimeoutSeconds: Double = 30,
         historyLimit: Int = 40,
         toolLoopMaxIterations: Int? = nil,
+        turnWallClockSeconds: TimeInterval? = nil,
         promoter: (any MemoryPromoting)? = nil,
         cognitiveObserver: (any CognitiveEventObserving)? = nil,
         cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
         providerLifecycleObserverInstalled: Bool = false,
         autocompactionConfig: ChatSessionAutocompactionConfig = .productionDefault(),
-        clock: @escaping @Sendable () -> Date = { Date() },
-        publicSafeMode: Bool = false
+        clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.engine = engine
         self.tools = tools
@@ -93,6 +93,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         self.approvalTimeoutSeconds = approvalTimeoutSeconds
         self.historyLimit = historyLimit
         self.toolLoopMaxIterationsOverride = toolLoopMaxIterations
+        self.turnWallClockSecondsOverride = turnWallClockSeconds
         self.promoter = promoter
         self.cognitiveObserver = cognitiveObserver
         let runtime = cognitiveObserver as? (any CognitiveRuntimeProviding)
@@ -100,7 +101,6 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         self.providerLifecycleObserverInstalled = providerLifecycleObserverInstalled
         self.autocompactionConfig = autocompactionConfig
         self.clock = clock
-        self.publicSafeMode = publicSafeMode
     }
 
     // MARK: chat (non-streaming)
@@ -239,7 +239,9 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
                 persona: persona,
                 surface: surface,
                     suppressUserAppend: suppressUserAppend,
-                    persistToolMessages: false,
+                    // Saved conversational evidence must not depend on whether
+                    // this caller consumes live progress (bridge vs. Telegram).
+                    persistToolMessages: true,
                     progress: progress,
                     noticeSink: { kind, text in await progress?(.notice(kind: kind, text: text)) }
                 )

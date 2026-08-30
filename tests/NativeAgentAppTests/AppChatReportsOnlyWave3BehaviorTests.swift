@@ -75,17 +75,17 @@ struct AppChatReportsOnlyWave3BehaviorTests {
         var draftText = ""
         var draftSessionID = "stale-session"
         ChatEmptyStateSuggestionAction.apply(
-            "Run the audit",
+            "Draft a reply in my voice",
             model: model,
             activeSessionID: model.activeChatSessionId,
             draftText: &draftText,
             draftSessionID: &draftSessionID
         )
         model.activeChatSessionId = second
-        #expect(draftText == "Run the audit")
+        #expect(draftText == "Draft a reply in my voice")
         #expect(draftSessionID == first)
         #expect(model.chatDraft(for: second).isEmpty)
-        #expect(model.chatDraft(for: first) == "Run the audit")
+        #expect(model.chatDraft(for: first) == "Draft a reply in my voice")
         #expect(model.chatDraftInjectionGeneration == 1)
     }
 

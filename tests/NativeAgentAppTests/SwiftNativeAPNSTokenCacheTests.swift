@@ -9,6 +9,56 @@ import Testing
 /// under concurrency (the actor serializes access).
 @Suite struct SwiftNativeAPNSTokenCacheTests {
 
+    @Test func pushTokenRegistrationPreservesUnreadableExistingStores() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nativeagent-push-store-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let canonical = root.appendingPathComponent("notifications/push_tokens.json")
+        let legacy = root.appendingPathComponent("mobile_push/tokens.json")
+        try FileManager.default.createDirectory(
+            at: canonical.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: legacy.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let corrupt = Data("{not-json".utf8)
+        try corrupt.write(to: canonical)
+        try Data("[]".utf8).write(to: legacy)
+
+        await #expect(throws: (any Error).self) {
+            try await MacSyncMobileNotificationRelay.storePushToken(
+                deviceId: "iphone-new", token: "new-token", environment: "sandbox",
+                bundleId: "com.example.agent", dataRoot: root)
+        }
+        #expect(try Data(contentsOf: canonical) == corrupt)
+        #expect(try Data(contentsOf: legacy) == Data("[]".utf8))
+    }
+
+    @Test func pushTokenRotationCollapsesAllLegacyOwners() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nativeagent-push-rotation-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let legacy = root.appendingPathComponent("mobile_push/tokens.json")
+        try FileManager.default.createDirectory(
+            at: legacy.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("""
+        [
+          {"deviceId":"old-a","token":"same-token"},
+          {"deviceId":"old-b","token":"same-token"},
+          {"deviceId":"other","token":"other-token"}
+        ]
+        """.utf8).write(to: legacy)
+
+        try await MacSyncMobileNotificationRelay.storePushToken(
+            deviceId: "iphone-new", token: "same-token", environment: "production",
+            bundleId: "com.example.agent", dataRoot: root)
+
+        let rows = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: legacy)) as? [[String: Any]])
+        #expect(rows.count == 2)
+        #expect(rows.filter { $0["token"] as? String == "same-token" }.count == 1)
+        #expect(rows.first { $0["token"] as? String == "same-token" }?["deviceId"] as? String == "iphone-new")
+        #expect(rows.first { $0["token"] as? String == "other-token" }?["deviceId"] as? String == "other")
+    }
+
     @Test func processedInboxArchivesAreNotAPNSTokenAuthority() throws {
         let testFile = URL(fileURLWithPath: #filePath)
         let source = testFile
@@ -158,5 +208,78 @@ import Testing
         let again = try await sender.providerToken(keyId: "KID", teamId: "TEAM", keyPath: "/dev/null")
         #expect(again == first, "the failed re-mint must not have destroyed the prior valid cache entry")
         #expect(counter.value == 1)
+    }
+
+    // MARK: - C3: APNs `reason` parsing + TooManyProviderTokenUpdates hold
+
+    @Test func rejectionReasonParsesAPNSErrorBody() {
+        #expect(SwiftNativeAPNSSender.rejectionReason(
+            fromResponseBody: Data(#"{"reason":"TooManyProviderTokenUpdates"}"#.utf8)
+        ) == "TooManyProviderTokenUpdates")
+        #expect(SwiftNativeAPNSSender.rejectionReason(
+            fromResponseBody: Data(#"{"reason":"BadDeviceToken","timestamp":1660000000}"#.utf8)
+        ) == "BadDeviceToken")
+        #expect(SwiftNativeAPNSSender.rejectionReason(fromResponseBody: Data()) == nil)
+        #expect(SwiftNativeAPNSSender.rejectionReason(fromResponseBody: Data("not json".utf8)) == nil)
+        #expect(SwiftNativeAPNSSender.rejectionReason(fromResponseBody: Data(#"{"reason":""}"#.utf8)) == nil)
+    }
+
+    /// The C3 branch: after `TooManyProviderTokenUpdates`, the cached token is
+    /// served past its normal TTL instead of re-minting (Apple's remedy is to
+    /// stop updating the token), and a fresh mint happens only once the hold
+    /// lapses.
+    @Test func tooManyProviderTokenUpdatesHoldsCachedTokenPastTTL() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_000_000))
+        let counter = MintCounter()
+        let sender = makeSender(clock: clock, counter: counter)
+
+        let first = try await sender.providerToken(keyId: "KID", teamId: "TEAM", keyPath: "/dev/null")
+        // Rejection arrives just before the TTL would expire.
+        clock.advance(by: SwiftNativeAPNSSender.providerTokenTTL - 60)
+        await sender.noteRejection(reason: "TooManyProviderTokenUpdates")
+        // Past the TTL but inside the hold: the cached token must be reused.
+        clock.advance(by: 120)
+        let held = try await sender.providerToken(keyId: "KID", teamId: "TEAM", keyPath: "/dev/null")
+        #expect(held == first)
+        #expect(counter.value == 1)
+        // Past the hold: a fresh mint is allowed again.
+        clock.advance(by: SwiftNativeAPNSSender.providerTokenUpdateBackoff)
+        let fresh = try await sender.providerToken(keyId: "KID", teamId: "TEAM", keyPath: "/dev/null")
+        #expect(fresh != first)
+        #expect(counter.value == 2)
+    }
+
+    /// A hold never serves a token that could cross Apple's 60-min hard
+    /// expiry: past the hard cap the sender re-mints even mid-hold.
+    @Test func holdNeverServesTokenPastHardCap() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_000_000))
+        let counter = MintCounter()
+        let sender = makeSender(clock: clock, counter: counter)
+
+        let first = try await sender.providerToken(keyId: "KID", teamId: "TEAM", keyPath: "/dev/null")
+        // Hold starts just before TTL expiry, so it stretches past the cap.
+        clock.advance(by: SwiftNativeAPNSSender.providerTokenTTL - 60)
+        await sender.noteRejection(reason: "TooManyProviderTokenUpdates")
+        // Inside the hold but past the hard cap: must re-mint, never reuse.
+        // Age lands at hardCap + 30 while the hold still has 30s left.
+        clock.advance(by: SwiftNativeAPNSSender.providerTokenHardCap - SwiftNativeAPNSSender.providerTokenTTL + 90)
+        let fresh = try await sender.providerToken(keyId: "KID", teamId: "TEAM", keyPath: "/dev/null")
+        #expect(fresh != first)
+        #expect(counter.value == 2)
+    }
+
+    /// Every other rejection reason keeps current behavior — no hold, normal
+    /// TTL-driven re-mint.
+    @Test func otherRejectionReasonsDoNotHoldTheToken() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_000_000))
+        let counter = MintCounter()
+        let sender = makeSender(clock: clock, counter: counter)
+
+        _ = try await sender.providerToken(keyId: "KID", teamId: "TEAM", keyPath: "/dev/null")
+        await sender.noteRejection(reason: "BadDeviceToken")
+        await sender.noteRejection(reason: nil)
+        clock.advance(by: SwiftNativeAPNSSender.providerTokenTTL + 1)
+        _ = try await sender.providerToken(keyId: "KID", teamId: "TEAM", keyPath: "/dev/null")
+        #expect(counter.value == 2)
     }
 }

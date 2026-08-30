@@ -38,6 +38,23 @@ final class WakeResetThrottle: @unchecked Sendable {
         lastFire = now
         return true
     }
+
+    @discardableResult
+    func handleWake(
+        resetEffect: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void = { completion in
+            URLSession.shared.reset(completionHandler: completion)
+        },
+        resetCompleted: @escaping @Sendable () -> Void = {
+            NSLog("[wake] URLSession.shared reset after sleep")
+        }
+    ) -> Bool {
+        guard shouldFire() else {
+            NSLog("[wake] throttled — last fire was <30s ago, skipping URLSession reset")
+            return false
+        }
+        resetEffect(resetCompleted)
+        return true
+    }
 }
 
 @MainActor
@@ -115,13 +132,7 @@ private final class NativeAgentHotkeyBootstrap {
             object: nil,
             queue: .main
         ) { _ in
-            guard wakeThrottle.shouldFire() else {
-                NSLog("[wake] throttled — last fire was <30s ago, skipping URLSession reset")
-                return
-            }
-            URLSession.shared.reset {
-                NSLog("[wake] URLSession.shared reset after sleep")
-            }
+            wakeThrottle.handleWake()
         }
     }
 }
@@ -200,11 +211,6 @@ struct NativeAgentApp: App {
                 Task.detached(priority: .utility) {
                     await maybeWarmEmbeddingsForFastMode()
                 }
-            },
-            runInitialDoctor: {
-                Task(priority: .background) { @MainActor in
-                    await appModel.runDoctor(repair: false)
-                }
             }
         ))
     }
@@ -265,29 +271,23 @@ struct NativeAgentApp: App {
                 }
                 .keyboardShortcut("k", modifiers: .command)
                 Divider()
-                Button("Chat") { NativeAgentAppCoordinator.shared.request(.sidebar(.chat)) }
-                    .keyboardShortcut("1", modifiers: .command)
-                Button("Activity") { NativeAgentAppCoordinator.shared.request(.sidebar(.activity)) }
-                    .keyboardShortcut("2", modifiers: .command)
-                Button("Memories") { NativeAgentAppCoordinator.shared.request(.sidebar(.memories)) }
-                    .keyboardShortcut("3", modifiers: .command)
-                Button("Desk") { NativeAgentAppCoordinator.shared.request(.sidebar(.desk)) }
-                    .keyboardShortcut("4", modifiers: .command)
-                Button("Personality") { NativeAgentAppCoordinator.shared.request(.sidebar(.personality)) }
-                    .keyboardShortcut("5", modifiers: .command)
-                Button("Trust") { NativeAgentAppCoordinator.shared.request(.sidebar(.trust)) }
-                    .keyboardShortcut("6", modifiers: .command)
-                Button("Providers") { NativeAgentAppCoordinator.shared.request(.sidebar(.providers)) }
-                    .keyboardShortcut("7", modifiers: .command)
+                // D7: derived from SidebarItem.primaryItems so ⌘N is whatever
+                // the sidebar shows in position N. Do not hand-add entries here.
+                ForEach(NavigateMenuPresentation.entries) { entry in
+                    Button(entry.title) {
+                        NativeAgentAppCoordinator.shared.request(.sidebar(entry.item))
+                    }
+                    .keyboardShortcut(entry.shortcut.map {
+                        KeyboardShortcut(KeyEquivalent($0), modifiers: .command)
+                    })
+                }
                 // B2.2 review fix (gpt-5.5 BLOCKING): Knowledge Graph is a
                 // developer-gated surface — its menu entry hides with the gate
-                // (Cmd+8 goes with it; explicit deep links still resolve).
+                // (explicit deep links still resolve). It carries no digit: the
+                // digits belong to the sidebar's primary order.
                 if showDeveloperSurfaces {
                     Button("Knowledge Graph") { NativeAgentAppCoordinator.shared.request(.sidebar(.knowledge)) }
-                        .keyboardShortcut("8", modifiers: .command)
                 }
-                Button("Settings") { NativeAgentAppCoordinator.shared.request(.sidebar(.settings)) }
-                    .keyboardShortcut("9", modifiers: .command)
                 Divider()
                 Button("Approvals") { NativeAgentAppCoordinator.shared.request(.activity(.approvals)) }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
@@ -330,10 +330,12 @@ struct NativeAgentApp: App {
                 AppRelauncher.relaunchApp()
             }
             Divider()
-            Text(appModel.statusText)
-            if let health = appModel.health {
-                Text(health.ok ? "Native runtime online" : "Native runtime unavailable")
-            }
+            // D7: ONE truth line — see MenuBarStatusPresentation. The stacked
+            // pair could contradict itself ("Ready" over "unavailable").
+            Text(MenuBarStatusPresentation.line(
+                statusText: appModel.statusText,
+                health: appModel.health
+            ))
         }
 
         // W8 (2026-08-14) — THE LIVE CAPTURE INDICATOR.

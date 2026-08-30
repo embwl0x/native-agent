@@ -60,10 +60,16 @@ private enum MobileSkillsToolsSection: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// One primary destination matching the Mac app. Each page retains its own
-/// read/refresh owner; this wrapper owns only the visible page selection.
+/// One combined destination matching the Mac app. Each page retains its own
+/// read/refresh owner; this wrapper owns only the visible page selection and
+/// can either host its own navigation stack or live inside More's stack.
 struct SkillsToolsView: View {
     @AppStorage("NativeAgentMobile.skillsToolsSection") private var selectedRawValue = MobileSkillsToolsSection.skills.rawValue
+    private let embedInNavigationStack: Bool
+
+    init(embedInNavigationStack: Bool = true) {
+        self.embedInNavigationStack = embedInNavigationStack
+    }
 
     private var selection: Binding<MobileSkillsToolsSection> {
         Binding(
@@ -73,37 +79,45 @@ struct SkillsToolsView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                Picker("Skills and Tools page", selection: selection) {
-                    ForEach(MobileSkillsToolsSection.allCases) { section in
-                        Text(section.rawValue).tag(section)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding(.horizontal)
-                .padding(.vertical, 8)
-                .accessibilityIdentifier("skills-tools-section-picker")
+        if embedInNavigationStack {
+            NavigationStack { content }
+        } else {
+            content
+        }
+    }
 
-                Divider()
-
-                switch selection.wrappedValue {
-                case .skills:
-                    SkillLifecycleView()
-                case .tools:
-                    MobileToolCatalogView()
+    private var content: some View {
+        VStack(spacing: 0) {
+            Picker("Skills and Tools page", selection: selection) {
+                ForEach(MobileSkillsToolsSection.allCases) { section in
+                    Text(section.rawValue).tag(section)
                 }
             }
-            .navigationTitle("Skills & Tools")
-            .macSyncErrorBanner()
-            // Sweep R4 C11.4: skills and tools are read straight from the last
-            // Mac snapshot, so "is the Mac reachable" decides whether this list
-            // is current.
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    MacStatusChip()
-                }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .accessibilityIdentifier("skills-tools-section-picker")
+
+            Divider()
+
+            switch selection.wrappedValue {
+            case .skills:
+                SkillLifecycleView()
+            case .tools:
+                MobileToolCatalogView()
+            }
+        }
+        .navigationTitle("Skills & Tools")
+        .macSyncErrorBanner()
+        // E6: and how old that snapshot is.
+        .macSnapshotFreshnessBadge()
+        // Sweep R4 C11.4: skills and tools are read straight from the last
+        // Mac snapshot, so "is the Mac reachable" decides whether this list
+        // is current.
+        .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                MacStatusChip()
             }
         }
     }
@@ -160,14 +174,16 @@ private struct MobileToolCatalogView: View {
                     title: "Tool catalog unavailable",
                     systemImage: "icloud.slash",
                     kind: .unavailable,
-                    description: message
+                    description: message,
+                    action: retryAction
                 )
             case .unpublished:
                 AppEmptyState(
                     title: "No tools synced",
                     systemImage: "wrench.and.screwdriver",
                     kind: .unavailable,
-                    description: "The paired Mac has not published a readable tool catalog yet."
+                    description: "The paired Mac has not published a readable tool catalog yet.",
+                    action: retryAction
                 )
             case .noMatches:
                 AppEmptyState(
@@ -198,6 +214,16 @@ private struct MobileToolCatalogView: View {
                 }
             }
         }
+    }
+
+    private var retryAction: (title: String, systemImage: String, handler: () -> Void) {
+        (
+            title: "Try Again",
+            systemImage: "arrow.clockwise",
+            handler: {
+                Task { await store.refresh(pairingStore: pairingStore) }
+            }
+        )
     }
 }
 

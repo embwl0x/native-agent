@@ -9,7 +9,7 @@ import PersistenceCore
 //                         telegram.receipt.approvalDecision
 //
 // Four command-lane surfaces whose failure leaves a confident-looking reply:
-// /tools prints a hardcoded control list that has drifted from the registry;
+// /tools must reflect the complete registered control list;
 // /clear is the most destructive command in the fence and had ZERO behavioural
 // coverage (its reply reports messagesBefore from the PRE-delete read, so
 // clearing the wrong file — or nothing at all — prints an identical line);
@@ -51,13 +51,7 @@ private actor ReceiptApprovalHandler: TelegramApprovalHandling {
     // MARK: /tools
 
     /// The registry is the source of truth for what the user can type; the
-    /// /tools reply is a hand-maintained sentence. Set containment on the
-    /// MENU-VISIBLE names, not exact text.
-    ///
-    /// KNOWN GAP (stale UI, dated 2026-08-23): the reply lists 15 of 24 —
-    /// /stop /retry /sessions /resume /approve /deny /fast /tools /restart are
-    /// missing. Recorded as a known issue so this is green today and turns RED
-    /// the moment the string is fixed, which is when the ledger row flips.
+    /// /tools reply must project every MENU-VISIBLE name from that owner.
     @Test func toolsReply_should_advertise_every_menu_visible_command() async throws {
         let root = hermeticTelegramDataRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -70,14 +64,7 @@ private actor ReceiptApprovalHandler: TelegramApprovalHandling {
         #expect(!menuNames.isEmpty)
         let missing = menuNames.filter { !reply.contains("/\($0)") }
 
-        // The drift, measured — a growing count is itself the regression.
-        #expect(missing.count == 9)
-
-        withKnownIssue(
-            "telegram.command.tools: the hardcoded 'Available controls:' line has drifted from TelegramCommandRegistry"
-        ) {
-            #expect(missing.isEmpty, "commands missing from /tools: \(missing.sorted())")
-        }
+        #expect(missing.isEmpty, "commands missing from /tools: \(missing.sorted())")
     }
 
     // MARK: /clear

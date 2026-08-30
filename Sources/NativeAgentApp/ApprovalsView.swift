@@ -233,23 +233,55 @@ final class ApprovalLoadState {
     private(set) var approvals: [ApprovalRequest]
     private(set) var refreshErrorText: String?
     private(set) var actionErrorText: String?
+    private(set) var hasLoadedSnapshot = false
+    private(set) var isRefreshing = false
+    @ObservationIgnored private var refreshGeneration: UInt64 = 0
 
     var errorText: String? { actionErrorText ?? refreshErrorText }
 
     init(approvals: [ApprovalRequest] = []) {
         self.approvals = approvals
+        hasLoadedSnapshot = !approvals.isEmpty
+    }
+
+    var summaryTitle: String {
+        if refreshErrorText != nil {
+            return hasLoadedSnapshot ? "Approval refresh failed" : "Approval status unavailable"
+        }
+        guard hasLoadedSnapshot else { return "Checking approvals…" }
+        let count = approvals.filter { $0.status.lowercased() == "pending" }.count
+        return count == 0 ? "No actions need approval" : "\(count) action\(count == 1 ? "" : "s") need approval"
+    }
+
+    var summaryDetail: String {
+        if refreshErrorText != nil {
+            return hasLoadedSnapshot
+                ? "Showing the last successfully loaded approval state; retry to confirm what is current."
+                : "No approval state has loaded yet. Retry when the local approval store is available."
+        }
+        guard hasLoadedSnapshot else { return "Reading the local approval inbox before reporting what needs your attention." }
+        return "Approvals include tool calls, memory changes, Mac control, connector writes, browser/native actions, Desk tasks, and harness improvements."
     }
 
     @discardableResult
     func reload(
         read: @escaping @MainActor () async throws -> [ApprovalRequest]
     ) async -> Bool {
-        refreshErrorText = nil
-        actionErrorText = nil
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        isRefreshing = true
+        defer {
+            if refreshGeneration == generation { isRefreshing = false }
+        }
         do {
-            approvals = try await read()
+            let loaded = try await read()
+            guard !Task.isCancelled, refreshGeneration == generation else { return false }
+            approvals = loaded
+            hasLoadedSnapshot = true
+            refreshErrorText = nil
             return true
         } catch {
+            guard !Task.isCancelled, refreshGeneration == generation else { return false }
             refreshErrorText = ApprovalLoadFailurePresentation.banner(
                 error: error,
                 retainedApprovalCount: approvals.count
@@ -262,8 +294,7 @@ final class ApprovalLoadState {
         actionErrorText = text
     }
 
-    func clearError() {
-        refreshErrorText = nil
+    func clearActionError() {
         actionErrorText = nil
     }
 }
@@ -273,8 +304,19 @@ struct ApprovalsView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var approvalLoadState = ApprovalLoadState()
-    @State private var isRefreshing = false
     @State private var decidingID: String?
+
+    private var summaryColor: Color {
+        if approvalLoadState.refreshErrorText != nil { return .red }
+        guard approvalLoadState.hasLoadedSnapshot else { return .secondary }
+        return pending.isEmpty ? .green : .orange
+    }
+
+    private var summaryIcon: String {
+        if approvalLoadState.refreshErrorText != nil { return "exclamationmark.triangle.fill" }
+        guard approvalLoadState.hasLoadedSnapshot else { return "clock" }
+        return pending.isEmpty ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
+    }
 
     private var pending: [ApprovalRequest] {
         approvalLoadState.approvals.filter { $0.status.lowercased() == "pending" }
@@ -290,7 +332,10 @@ struct ApprovalsView: View {
                 HStack {
                     GradientText(text: "Approvals", colors: [.orange, .red], font: NativeAgentFont.title)
                     Spacer()
-                    StatusBadge(text: "\(approvalLoadState.approvals.count) total", status: "ok")
+                    StatusBadge(
+                        text: approvalLoadState.hasLoadedSnapshot ? "\(approvalLoadState.approvals.count) total" : "Not checked",
+                        status: approvalLoadState.hasLoadedSnapshot && approvalLoadState.refreshErrorText == nil ? "ok" : "info"
+                    )
                     Button {
                         Task { await refreshApprovals() }
                     } label: {
@@ -298,7 +343,7 @@ struct ApprovalsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .disabled(isRefreshing)
+                    .disabled(approvalLoadState.isRefreshing)
                     if !pending.isEmpty {
                         StatusBadge(text: "\(pending.count) pending", status: "warn")
                     }
@@ -306,29 +351,21 @@ struct ApprovalsView: View {
                 .padding(.horizontal, NativeAgentSpacing.xl)
                 .padding(.top, NativeAgentSpacing.lg)
 
-                NativePanel(tint: approvalLoadState.refreshErrorText == nil ? (pending.isEmpty ? .green : .orange) : .red) {
+                NativePanel(tint: summaryColor) {
                     HStack(alignment: .top, spacing: NativeAgentSpacing.md) {
-                        Image(systemName: approvalLoadState.refreshErrorText == nil
-                            ? (pending.isEmpty ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
-                            : "exclamationmark.triangle.fill")
+                        Image(systemName: summaryIcon)
                             .font(.title3)
-                            .foregroundStyle(approvalLoadState.refreshErrorText == nil ? (pending.isEmpty ? .green : .orange) : .red)
+                            .foregroundStyle(summaryColor)
                             .frame(width: 26)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(approvalLoadState.refreshErrorText == nil
-                                ? (pending.isEmpty ? "No actions need approval" : "\(pending.count) action\(pending.count == 1 ? "" : "s") need approval")
-                                : (approvalLoadState.approvals.isEmpty ? "Approval status unavailable" : "Approval refresh failed"))
+                            Text(approvalLoadState.summaryTitle)
                                 .font(NativeAgentFont.section)
-                            Text(approvalLoadState.refreshErrorText == nil
-                                ? "Approvals include tool calls, memory changes, Mac control, connector writes, browser/native actions, Desk tasks, and harness improvements."
-                                : (approvalLoadState.approvals.isEmpty
-                                    ? "No approval state has loaded yet. Retry when the local approval store is available."
-                                    : "Showing the last successfully loaded approval state; retry to confirm what is current."))
+                            Text(approvalLoadState.summaryDetail)
                                 .font(NativeAgentFont.body)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        if isRefreshing {
+                        if approvalLoadState.isRefreshing {
                             ProgressView()
                                 .controlSize(.small)
                         }
@@ -369,7 +406,7 @@ struct ApprovalsView: View {
                                 }
                             }
                         }
-                    } else if pending.isEmpty, approvalLoadState.refreshErrorText == nil {
+                    } else if pending.isEmpty, approvalLoadState.hasLoadedSnapshot, approvalLoadState.refreshErrorText == nil {
                         NativePanel(tint: .secondary) {
                             Label("No approval history yet. Risky actions will be listed here after they are approved or denied.", systemImage: "clock")
                                 .font(NativeAgentFont.body)
@@ -385,15 +422,13 @@ struct ApprovalsView: View {
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             await ApprovalRequestsLiveRefresh.observe(client: appModel.client) {
-                await refreshApprovals(showSpinner: false)
+                await refreshApprovals()
             }
         }
     }
 
     @MainActor
-    private func refreshApprovals(showSpinner: Bool = true) async {
-        if showSpinner { isRefreshing = true }
-        defer { if showSpinner { isRefreshing = false } }
+    private func refreshApprovals() async {
         if await approvalLoadState.reload(read: { try await appModel.getApprovals() }) {
             appModel.approvals = approvalLoadState.approvals
         }
@@ -402,7 +437,7 @@ struct ApprovalsView: View {
     @MainActor
     private func resolveApproval(id: String, decision: String) async {
         decidingID = id
-        approvalLoadState.clearError()
+        approvalLoadState.clearActionError()
         defer { decidingID = nil }
         switch await appModel.resolveApprovalOnce(id: id, decision: decision) {
         case .applied(let resolved):
@@ -411,23 +446,67 @@ struct ApprovalsView: View {
                 requestedID: id
             )
             ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
-            await refreshApprovals(showSpinner: false)
+            await refreshApprovals()
             if toast.kind == .error { approvalLoadState.showActionFailure(toast.text) }
             await appModel.loadHealthCard()
         case .noOpInFlight(let inFlightID):
             appModel.systemToasts.push(info: CapabilitiesApprovalInboxResolution.noOpInFlight(id: inFlightID).visibleMessage)
-            await refreshApprovals(showSpinner: false)
+            await refreshApprovals()
         case .noOpAlreadyResolved(let resolvedID, let status):
             appModel.systemToasts.push(info: CapabilitiesApprovalInboxResolution.noOpAlreadyResolved(id: resolvedID, status: status).visibleMessage)
-            await refreshApprovals(showSpinner: false)
+            await refreshApprovals()
         case .unavailable(let detail):
             let toast = ApprovalDecisionToastPresentation.unavailable(
                 NSError(domain: "NativeAgentApproval", code: 1, userInfo: [NSLocalizedDescriptionKey: detail])
             )
             ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
-            await refreshApprovals(showSpinner: false)
+            await refreshApprovals()
             approvalLoadState.showActionFailure(toast.text)
         }
+    }
+}
+
+/// The reader's preview can contain thousands of characters. Keep the compact
+/// card, but let the human inspect every published preview line before deciding.
+/// This is still a preview, not a claim to expose the underlying raw payload.
+struct ApprovalPayloadPreviewView: View {
+    let preview: String
+    @State private var isExpanded = false
+
+    init(preview: String, initiallyExpanded: Bool = false) {
+        self.preview = preview
+        _isExpanded = State(initialValue: initiallyExpanded)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if isExpanded {
+                ScrollView(.vertical) { previewText }
+                    .frame(maxHeight: 240)
+            } else {
+                previewText
+            }
+
+            Button(isExpanded ? "Show less" : "Show full preview") {
+                isExpanded.toggle()
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityIdentifier("approval.preview.toggle")
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var previewText: some View {
+        Text(preview)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .lineLimit(isExpanded ? nil : 4)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -467,14 +546,7 @@ private struct ApprovalRequestPanel: View {
                 }
                 switch payloadPreview {
                 case .available(let preview):
-                    Text(preview)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(4)
-                        .textSelection(.enabled)
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    ApprovalPayloadPreviewView(preview: preview)
                 case .unavailable:
                     Label(
                         ApprovalPayloadPreviewPresentation.unavailableText,

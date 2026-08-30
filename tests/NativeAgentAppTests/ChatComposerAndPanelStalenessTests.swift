@@ -132,6 +132,53 @@ func applyLoadedChatMessages_preservesSyntheticErrorBubbleMissingFromDisk() {
 }
 
 @MainActor
+@Test(arguments: [false, true])
+func applyLoadedChatMessages_preservesUnpersistedUserAndNoticeWhenCanonicalTailIsUnchanged(hasPriorReply: Bool) throws {
+    let model = AppModel()
+    let disk = hasPriorReply ? [msg("old-user", role: "user"), msg("old-reply")] : []
+    var user = msg("unsent-user", role: "user", content: "Keep this exact request")
+    var metadata = ChatMessageMetadata()
+    metadata.attachments = [PersistedAttachment(
+        id: "original-attachment", type: "image", mime: "image/png", name: "reference.png", byteSize: 17
+    )]
+    user.metadata = metadata
+    var notice = syntheticErrorBubble("unsent")
+    notice.metadata = .syntheticError("no_provider_connected", userRowPersisted: false, inputHadAttachments: true)
+    model.chatMessagesBySession["s1"] = disk + [user, notice]
+    let before = try #require(MacChatRetrySnapshot.capture(
+        target: notice, messages: disk + [user, notice], sessionId: "s1", isSyntheticNotice: true
+    ))
+
+    model.applyLoadedChatMessages(disk, for: "s1")
+    model.applyLoadedChatMessages(disk, for: "s1")
+
+    let reloaded = try #require(model.chatMessagesBySession["s1"])
+    #expect(reloaded == disk + [user, notice])
+    #expect(MacChatRetrySnapshot.capture(
+        target: notice, messages: reloaded, sessionId: "s1", isSyntheticNotice: true
+    ) == before)
+    #expect(before.matchesCanonical(disk))
+    #expect(before.inputHadAttachments)
+    #expect(!before.userRowPersisted)
+}
+
+@MainActor
+@Test(arguments: ["user", "assistant"])
+func applyLoadedChatMessages_dropsUnpersistedPairAfterCanonicalConversationAdvances(newRole: String) {
+    let model = AppModel()
+    let baseline = [msg("old-user", role: "user"), msg("old-reply")]
+    let user = msg("unsent-user", role: "user", content: "Unsent request")
+    var notice = syntheticErrorBubble("unsent")
+    notice.metadata = .syntheticError("no_provider_connected", userRowPersisted: false)
+    model.chatMessagesBySession["s1"] = baseline + [user, notice]
+    let disk = baseline + [msg("new-canonical-turn", role: newRole)]
+
+    model.applyLoadedChatMessages(disk, for: "s1")
+
+    #expect(model.chatMessagesBySession["s1"] == disk)
+}
+
+@MainActor
 @Test
 func applyLoadedChatMessages_dropsSyntheticBubbleWhenARealReplyLanded() {
     let model = AppModel()

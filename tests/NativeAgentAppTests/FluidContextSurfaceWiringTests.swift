@@ -6,18 +6,23 @@ import Testing
 struct FluidContextSurfaceWiringTests {
     @Test func productionChatSurfaceProfilesCentralizeToolBoundaries() {
         #expect(NativeAgentAppChatSurfaceProfile.allCases == [
-            .mac, .slack, .telegram, .ios, .bridge,
+            .mac, .slack, .telegram, .ios, .bridge, .background,
         ])
         #expect(NativeAgentAppChatSurfaceProfile.mac.includesEvolutionBridge)
         #expect(NativeAgentAppChatSurfaceProfile.bridge.includesEvolutionBridge)
         #expect(!NativeAgentAppChatSurfaceProfile.slack.includesEvolutionBridge)
         #expect(!NativeAgentAppChatSurfaceProfile.telegram.includesEvolutionBridge)
         #expect(!NativeAgentAppChatSurfaceProfile.ios.includesEvolutionBridge)
+        #expect(!NativeAgentAppChatSurfaceProfile.background.includesEvolutionBridge)
         #expect(NativeAgentAppChatSurfaceProfile.bridge.deniesExternalMCP)
+        #expect(NativeAgentAppChatSurfaceProfile.background.deniesExternalMCP)
         #expect(!NativeAgentAppChatSurfaceProfile.mac.deniesExternalMCP)
         #expect(!NativeAgentAppChatSurfaceProfile.slack.deniesExternalMCP)
         #expect(!NativeAgentAppChatSurfaceProfile.telegram.deniesExternalMCP)
         #expect(!NativeAgentAppChatSurfaceProfile.ios.deniesExternalMCP)
+        #expect(NativeAgentAppChatSurfaceProfile.mac.filesApprovalsByDefault)
+        #expect(NativeAgentAppChatSurfaceProfile.bridge.filesApprovalsByDefault)
+        #expect(!NativeAgentAppChatSurfaceProfile.background.filesApprovalsByDefault)
     }
 
     @Test func everyAppOwnedCoreClientFactoryCallInjectsContextFlow() throws {
@@ -31,15 +36,8 @@ struct FluidContextSurfaceWiringTests {
                 .map { (url.lastPathComponent, $0) }
         }
 
-        #expect(callSites.count == 3)
-        #expect(Set(callSites.map(\.0)) == [
-            "AppChatToolDispatcher.swift",
-            "BackgroundLoopsAssembly+WorkshopExecution.swift",
-            // The Workshop bounded session is a production chat client too —
-            // it must pin the same ContextFlow generation (per-site assertion
-            // below enforces the injection).
-            "WorkshopSession.swift",
-        ])
+        #expect(callSites.count == 1)
+        #expect(Set(callSites.map(\.0)) == ["AppChatToolDispatcher.swift"])
         for (file, call) in callSites {
             let injectsLiveContext = call.contains("contextFlow: NativeContextFlowRuntime.shared")
                 || call.contains("contextFlow: usesLiveAppBody ? NativeContextFlowRuntime.shared : nil")
@@ -47,9 +45,6 @@ struct FluidContextSurfaceWiringTests {
                 injectsLiveContext,
                 "\(file) constructs a production chat client without ContextTurnPreparing"
             )
-            if file == "BackgroundLoopsAssembly+WorkshopExecution.swift" {
-                #expect(call.contains("usesLiveAppBody ? NativeContextFlowRuntime.shared : nil"))
-            }
         }
     }
 
@@ -104,14 +99,21 @@ struct FluidContextSurfaceWiringTests {
 
         let workshop = try AppSourceScraping.appSource("BackgroundLoopsAssembly+WorkshopExecution.swift")
         let workshopExecutor = try AppSourceScraping.functionBody(named: "makeWorkshopExecutor", in: workshop)
-        #expect(workshopExecutor.contains("makeChatOrchestrationClient"))
-        #expect(workshopExecutor.contains("contextFlow: usesLiveAppBody ? NativeContextFlowRuntime.shared : nil"))
+        #expect(workshopExecutor.contains("makeNativeAgentAppChatOrchestrationClient"))
+        #expect(!workshopExecutor.contains("makeChatOrchestrationClient"))
 
         let workshopSession = try AppSourceScraping.appSource("WorkshopSession.swift")
         let productionTurn = try AppSourceScraping.functionBody(named: "productionTurnExecutor", in: workshopSession)
-        #expect(productionTurn.contains("dataRoot == PersistenceCore.defaultDataRoot()"))
-        #expect(productionTurn.contains("contextFlow: usesLiveAppBody ? NativeContextFlowRuntime.shared : nil"))
+        #expect(productionTurn.contains("makeNativeAgentAppChatOrchestrationClient"))
+        #expect(!productionTurn.contains("makeChatOrchestrationClient"))
         #expect(workshopSession.contains("allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot()"))
+
+        let triggerScheduler = try AppSourceScraping.appSource("BackgroundLoopsAssembly+TriggerScheduler.swift")
+        let morningBrief = try AppSourceScraping.functionBody(named: "makeMorningBriefSynthesizer", in: triggerScheduler)
+        #expect(morningBrief.contains("profile: .background"))
+        let inbox = try AppSourceScraping.appSource("NativeClient+ExportWorkshopInbox.swift")
+        let spokenInbox = try AppSourceScraping.functionBody(named: "postSpokenInboxMessage", in: inbox)
+        #expect(spokenInbox.contains("profile: .background"))
 
         let githubRuntime = try AppSourceScraping.appSource("GitHubCommandRuntime.swift")
         let liveRuntime = try AppSourceScraping.functionBody(named: "live", in: githubRuntime)
@@ -139,7 +141,7 @@ struct FluidContextSurfaceWiringTests {
         let observe = try AppSourceScraping.functionBody(named: "observe", in: cognitionRuntimeCore)
         #expect(observe.contains("if usesLiveAppBody"))
         let cognitionRuntimeOrganism = try AppSourceScraping.appSource("NativeCognitionRuntime+Organism.swift")
-        let somatic = try AppSourceScraping.functionBody(named: "ingestPreparedOrganismSignal", in: cognitionRuntimeOrganism)
+        let somatic = try AppSourceScraping.functionBody(named: "ingestPreparedOrganismSignalAfterBootstrap", in: cognitionRuntimeOrganism)
         #expect(somatic.contains("prewarmContext && usesLiveAppBody"))
 
         let workshopExecution = try AppSourceScraping.appSource("BackgroundLoopsAssembly+WorkshopExecution.swift")

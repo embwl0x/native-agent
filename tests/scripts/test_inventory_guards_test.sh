@@ -47,6 +47,15 @@ fi
 grep -q 'missing from the shared scheme TestAction' "$FIXTURE/missing-test-action.log" \
   || fail "shared-scheme refusal was not explicit"
 
+SKIPPED_FIXTURE="$(make_fixture skipped-test-action)"
+SCHEME="$SKIPPED_FIXTURE/iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj/xcshareddata/xcschemes/NativeAgentMobile.xcscheme"
+perl -0pi -e 's/skipped = "NO"/skipped = "YES"/' "$SCHEME"
+if "$CHECKER" --root "$SKIPPED_FIXTURE" >"$FIXTURE/skipped-test-action.log" 2>&1; then
+  fail "shared scheme with a skipped test target was accepted"
+fi
+grep -q 'unskipped TestableReference' "$FIXTURE/skipped-test-action.log" \
+  || fail "skipped-target refusal was not explicit"
+
 if command -v xcodegen >/dev/null 2>&1; then
   "$CHECKER" --require-reproducible >/dev/null
   DRIFT_FIXTURE="$(make_fixture project-drift)"

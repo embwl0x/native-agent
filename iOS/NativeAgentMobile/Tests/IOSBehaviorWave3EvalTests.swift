@@ -274,6 +274,13 @@ final class IOSBehaviorWave3EvalTests: XCTestCase {
         )
     }
 
+    func test_pairingCopyNamesTheCurrentCopyPasteFlow() {
+        XCTAssertTrue(IOSPairingPresentation.manualSectionDetail.contains("does not scan a QR code yet"))
+        XCTAssertTrue(IOSPairingPresentation.manualSectionDetail.contains("copy the pairing key"))
+        XCTAssertTrue(IOSPairingPresentation.notSignedSyncMessage.contains("copy and paste the current key"))
+        XCTAssertTrue(IOSPairingPresentation.signatureRetryMessage.contains("copy and paste the current key again"))
+    }
+
     func test_manualSecretStoreRejectsWellFormedBytesFromAnotherMac() {
         let macSecret = Data(repeating: 0xA1, count: 32)
         let wrongSecret = Data(repeating: 0xB2, count: 32)
@@ -473,6 +480,93 @@ final class IOSBehaviorWave3EvalTests: XCTestCase {
         XCTAssertEqual(store.pendingApprovals.map(\.id), ["approval"])
         XCTAssertEqual(Set(store.activeTasks.map(\.id)), Set(["active", "paused"]))
         XCTAssertEqual(store.doneTasks.map(\.id), ["done", "blocked"])
+    }
+
+    func test_workshopContentDoesNotPresentFailedOrLoadingReadsAsEmpty() {
+        XCTAssertEqual(
+            WorkshopContentPresentation.state(tasks: [], isLoading: true, loadError: "stale error"),
+            .loading
+        )
+        XCTAssertEqual(
+            WorkshopContentPresentation.state(tasks: [], isLoading: false, loadError: "Snapshot missing"),
+            .unavailable("Snapshot missing")
+        )
+        XCTAssertEqual(
+            WorkshopContentPresentation.state(tasks: [], isLoading: false, loadError: "  "),
+            .empty
+        )
+        XCTAssertEqual(
+            WorkshopContentPresentation.state(
+                tasks: [task("known", status: "running")],
+                isLoading: true,
+                loadError: "refresh failed"
+            ),
+            .content
+        )
+    }
+
+    func test_deskSnapshotRefreshReturnsItsOwnOutcomeForMissingAndValidEmptyData() async throws {
+        let engine = iCloudSyncEngine.shared
+        let priorSnapshotDir = engine.snapshotDir
+        let priorItems = engine.deskItems
+        let priorLastSync = engine.lastSyncAt
+        let priorError = engine.syncError
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-desk-outcome-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            engine.snapshotDir = priorSnapshotDir
+            engine.deskItems = priorItems
+            engine.lastSyncAt = priorLastSync
+            engine.syncError = priorError
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        engine.snapshotDir = root
+        engine.deskItems = []
+        let missingOutcome = await engine.refreshDeskSnapshot()
+        XCTAssertFalse(missingOutcome)
+
+        try Data("[]".utf8).write(
+            to: root.appendingPathComponent("desk.json"),
+            options: .atomic
+        )
+        let emptyOutcome = await engine.refreshDeskSnapshot()
+        XCTAssertTrue(emptyOutcome)
+        XCTAssertTrue(engine.deskItems.isEmpty)
+        XCTAssertNil(engine.syncError)
+    }
+
+    func test_runsSnapshotRefreshDistinguishesMissingFromValidEmptyData() async throws {
+        let engine = iCloudSyncEngine.shared
+        let priorSnapshotDir = engine.snapshotDir
+        let priorRuns = engine.runs
+        let priorLastSync = engine.lastSyncAt
+        let priorError = engine.syncError
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ios-runs-outcome-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            engine.snapshotDir = priorSnapshotDir
+            engine.runs = priorRuns
+            engine.lastSyncAt = priorLastSync
+            engine.syncError = priorError
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        engine.snapshotDir = root
+        engine.runs = []
+        let missingOutcome = await engine.refreshRunsSnapshot()
+        XCTAssertEqual(missingOutcome, .unavailable)
+
+        try Data("[]".utf8).write(
+            to: root.appendingPathComponent("runs.json"),
+            options: .atomic
+        )
+        let emptyOutcome = await engine.refreshRunsSnapshot()
+        XCTAssertEqual(emptyOutcome, .refreshed)
+        XCTAssertTrue(engine.runs.isEmpty)
+        XCTAssertNil(engine.syncError)
     }
 
     func test_workshopHistorySortsNewestTerminalOutcomeFirst() {
@@ -1131,7 +1225,12 @@ final class IOSScreenWave5StoreActionEvalTests: XCTestCase {
         let envelope = try await nextEnvelope()
         XCTAssertEqual(envelope["action"] as? String, "deleteMemory")
         try respond(to: envelope)
-        await waitUntil { !store.deletingMemoryIDs.contains(record.id) }
+        // Receipt completion clears the delete marker before the asynchronous
+        // snapshot reconciliation. Wait for both phases so we inspect settled
+        // presentation and never restore the shared engine during its refresh.
+        await waitUntil {
+            !store.deletingMemoryIDs.contains(record.id) && !store.isLoading
+        }
 
         XCTAssertEqual(store.memories.map(\.id), [record.id])
         XCTAssertTrue(store.error?.contains("waiting for Mac/iCloud") == true)

@@ -297,6 +297,69 @@ func sessionDigest_source_errors_fail_open() async throws {
 
 // MARK: - engine integration: injection point + cache invariant
 
+@Test(arguments: [false, true], [false, true])
+func buildTurnContextWithHistory_ordinary_turn_omits_activity_digest(
+    hasPersistedDigest: Bool,
+    passesExplicitNil: Bool
+) async throws {
+    let root = try makeTempRoot("ordinary-no-digest")
+    // Populate every activity source, but never request its provider on an
+    // ordinary turn. All optional source roots remain inside this fixture.
+    _ = try makeFullFixture(root: root, currentId: "s-ordinary")
+    let digestPath = root.appendingPathComponent("chat/session_state/s-ordinary/digest.txt")
+    let cachedDigest = SessionDigestProvider.headerLine + "\nCACHED-ACTIVITY-MARKER"
+    if hasPersistedDigest {
+        try write(cachedDigest, to: digestPath)
+    }
+    try write(
+        """
+        {"role": "user", "content": "CURRENT-CONVERSATION-MARKER", "createdAt": "2026-06-10T10:00:00Z"}
+        {"role": "assistant", "content": "CURRENT-REPLY-MARKER", "createdAt": "2026-06-10T10:00:01Z"}
+        """ + "\n",
+        to: root.appendingPathComponent("chat/messages/s-ordinary.jsonl")
+    )
+    let personaDir = try makeTempRoot("persona-ordinary-no-digest")
+    try write("PERSONA-MARKER-STABLE", to: personaDir.appendingPathComponent("SOUL.md"))
+    let engine = makeDigestEngine(
+        personaRoot: personaDir,
+        remPinsDataRoot: root,
+        recallHits: [MemoryRecallHit(score: 0.9, preview: "RECALL-MARKER-DYNAMIC")]
+    )
+    let reader = SessionHistoryReader(dataRoot: root)
+    let ctx: TurnContext
+    if passesExplicitNil {
+        ctx = try await engine.buildTurnContextWithHistory(
+            surface: "chat", userMessage: "hi", sessionId: "s-ordinary",
+            historyLimit: 8, historyReader: reader,
+            personaOverride: nil, sessionDigest: nil
+        )
+    } else {
+        // The same default overload used by ordinary production turns.
+        ctx = try await engine.buildTurnContextWithHistory(
+            surface: "chat", userMessage: "hi", sessionId: "s-ordinary",
+            historyLimit: 8, historyReader: reader
+        )
+    }
+
+    let prompt = try #require(ctx.systemPrompt)
+    #expect(!prompt.contains(SessionDigestProvider.headerLine))
+    #expect(!prompt.contains("CACHED-ACTIVITY-MARKER"))
+    #expect(!prompt.contains("DIGEST-WORKLOG-MARKER"))
+    #expect(!prompt.contains("DIGEST-STANDUP-MARKER"))
+    #expect(!prompt.contains("Memory wave planning"))
+    #expect(prompt.contains("CURRENT-CONVERSATION-MARKER"))
+    #expect(prompt.contains("CURRENT-REPLY-MARKER"))
+    #expect(prompt.contains("PERSONA-MARKER-STABLE"))
+    #expect(prompt.contains("RECALL-MARKER-DYNAMIC"))
+    #expect(ctx.systemSegments?.reassembles(into: prompt) == true)
+    if hasPersistedDigest {
+        // Disabling implicit injection does not delete or rewrite old caches.
+        #expect(try String(contentsOf: digestPath, encoding: .utf8) == cachedDigest)
+    } else {
+        #expect(!FileManager.default.fileExists(atPath: digestPath.path))
+    }
+}
+
 @Test
 func buildTurnContextWithHistory_injects_digest_at_head_of_dynamic_segment() async throws {
     let root = try makeTempRoot("inject")

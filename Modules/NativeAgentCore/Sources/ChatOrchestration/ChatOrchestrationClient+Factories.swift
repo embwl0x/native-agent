@@ -88,6 +88,15 @@ public func makeChatOrchestrationClient(
 public func makeChatOrchestrationClient(
     tools: any ToolDispatchClient,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    /// Per-surface tool-loop budget override forwarded to
+    /// `ToolLoopBudget.resolve(surface:requested:)` (clamped to hardCap).
+    /// nil = the surface's default. The bridge profile passes 180: the loop
+    /// runs under surface "chat" (the model pick must keep following the
+    /// chat picker — 2026-06-13), so a surface-keyed budget can never reach
+    /// it (proven live 2026-08-27: Agent exhausted at 60 with the
+    /// "claude-bridge" budget case shipped but unreachable).
+    toolLoopMaxIterations: Int? = nil,
+    turnWallClockSeconds: TimeInterval? = nil,
     /// OPTIONAL CREDENTIAL/ROUTING ROOT — token-refresh writes allowed there, nothing else (nil = today's behaviour,
     /// byte for byte). See `makeDefaultChatOrchestrationClient`.
     providersRoot: URL? = nil,
@@ -106,7 +115,6 @@ public func makeChatOrchestrationClient(
     providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
     contextFlow: (any ContextTurnPreparing)? = nil,
     memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
-    publicSafeMode: Bool = false,
     clock: @escaping @Sendable () -> Date = { Date() },
     // Factory seam for a controlled credential-root probe. Production takes
     // nil and constructs CodexAdapter directly; tests can observe the exact
@@ -116,6 +124,8 @@ public func makeChatOrchestrationClient(
     makeDefaultChatOrchestrationClient(
         tools: tools,
         approvalFiler: approvalFiler,
+        toolLoopMaxIterations: toolLoopMaxIterations,
+        turnWallClockSeconds: turnWallClockSeconds,
         dataRoot: dataRoot,
         providersRoot: providersRoot,
         activeProviderPathOverride: activeProviderPathOverride,
@@ -125,7 +135,6 @@ public func makeChatOrchestrationClient(
         providerLifecycleObserver: providerLifecycleObserver,
         contextFlow: contextFlow,
         memoryAtomTranslator: memoryAtomTranslator,
-        publicSafeMode: publicSafeMode,
         clock: clock,
         codexAdapterFactory: codexAdapterFactory
     )
@@ -212,6 +221,8 @@ public func makeGatedToolDispatchClient(
 private func makeDefaultChatOrchestrationClient(
     tools: any ToolDispatchClient,
     approvalFiler: (any ApprovalFiler)?,
+    toolLoopMaxIterations: Int? = nil,
+    turnWallClockSeconds: TimeInterval? = nil,
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     /// OPTIONAL CREDENTIAL/ROUTING ROOT. Reads credentials + routing there; the ONLY
     /// writes that may land there are the adapters' own token refreshes.
@@ -244,7 +255,6 @@ private func makeDefaultChatOrchestrationClient(
     providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
     contextFlow: (any ContextTurnPreparing)? = nil,
     memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
-    publicSafeMode: Bool = false,
     // Injectable so replay tooling (turn-replay bench) can pin assembly to a
     // fixture's capture instant; production callers take the Date() default.
     clock: @escaping @Sendable () -> Date = { Date() },
@@ -418,14 +428,15 @@ private func makeDefaultChatOrchestrationClient(
         turnTraceBus: turnTraceBus,
         trust: trust,
         approvalFiler: approvalFiler,
+        toolLoopMaxIterations: toolLoopMaxIterations,
+        turnWallClockSeconds: turnWallClockSeconds,
         // AdaptiveMemoryPromoter.shared is rooted in the production MemoryV2
         // singleton.  An alternate-root client must never feed a synthetic
         // turn back into that live process-wide owner.
         promoter: promoter,
         cognitiveObserver: cognitiveObserver,
         cognitiveContextProvider: cognitiveContextProvider,
-        providerLifecycleObserverInstalled: providerLifecycleObserver != nil,
-        publicSafeMode: publicSafeMode
+        providerLifecycleObserverInstalled: providerLifecycleObserver != nil
     )
 }
 

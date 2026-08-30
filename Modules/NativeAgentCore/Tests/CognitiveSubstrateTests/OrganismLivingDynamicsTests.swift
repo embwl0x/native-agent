@@ -109,6 +109,64 @@ struct OrganismLivingDynamicsTests {
         #expect(belief.uncertainty == 1)
     }
 
+    @Test func legacyReservoirCannotMasqueradeAsACapabilityFailureRate() throws {
+        let now = Date(timeIntervalSince1970: 46_000)
+        let failures = Dictionary(uniqueKeysWithValues: (0..<20).map { index in
+            let prediction = OrganismPrediction(
+                id: "legacy-failure-\(index)",
+                kind: .providerCompletion,
+                sourceOrgan: "provider",
+                createdAt: now,
+                dueAt: now,
+                status: .violated,
+                lastUpdatedAt: now
+            )
+            return (prediction.id, prediction)
+        })
+        let ledger = OrganismPredictionLedger(
+            predictions: failures,
+            bodyConfidence: OrganismBodyConfidence(providerPath: 0.92)
+        )
+        let belief = try #require(OrganismCapabilitySelfModel.beliefs(
+            ledger: ledger, at: now
+        ).first { $0.kind == .providerCompletion })
+
+        #expect(belief.evidenceBasis == .legacyBodyConfidence)
+        #expect(abs(belief.successLikelihood - 0.92) < 0.000_001)
+        #expect(belief.uncertainty >= 0.5)
+    }
+
+    @Test func cumulativePerCapabilityOutcomesSupersedeTheBoundedReservoir() throws {
+        let now = Date(timeIntervalSince1970: 47_000)
+        let retainedFailure = OrganismPrediction(
+            id: "retained-failure",
+            kind: .toolCompletion,
+            sourceOrgan: "tool",
+            createdAt: now,
+            dueAt: now,
+            status: .violated,
+            lastUpdatedAt: now
+        )
+        let ledger = OrganismPredictionLedger(
+            predictions: [retainedFailure.id: retainedFailure],
+            bodyConfidence: OrganismBodyConfidence(toolPath: 0.8),
+            outcomeCountsByKind: [
+                OrganismPredictionKind.toolCompletion.rawValue:
+                    OrganismPredictionOutcomeCounts(
+                        satisfied: 80, violated: 20, expired: 3, lastEvidenceAt: now
+                    ),
+            ]
+        )
+        let belief = try #require(OrganismCapabilitySelfModel.beliefs(
+            ledger: ledger, at: now
+        ).first { $0.kind == .toolCompletion })
+
+        #expect(belief.evidenceBasis == .cumulativeOutcomes)
+        #expect(belief.evidenceCount == 103)
+        #expect(belief.resolvedEvidenceCount == 100)
+        #expect(abs(belief.successLikelihood - 0.8) < 0.000_001)
+    }
+
     @Test func predictionResidualWithoutRepairableFieldDoesNotArmADeadline() {
         let now = Date(timeIntervalSince1970: 30_000)
         let failed = OrganismPrediction(

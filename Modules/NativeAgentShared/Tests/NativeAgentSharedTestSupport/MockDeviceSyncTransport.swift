@@ -1,8 +1,8 @@
 // MockDeviceSyncTransport.swift — in-memory DeviceSyncTransport for tests.
 //
-// Mirrors MockCloudKitSync (MemoryV2+CloudKit): an actor-isolated in-memory
-// store with a deterministic monotonic clock (no Date.now dependence for
-// ordering) so LWW / cursor filtering is testable.
+// Shared test support only: an actor-isolated in-memory store with a
+// deterministic monotonic clock (no Date.now dependence for ordering) so
+// LWW / cursor filtering is testable without linking mocks into either app.
 //
 // Two devices share one `MockDeviceCloud` substrate (the CloudKit stand-in),
 // so a send from one role is observable by the other exactly like the real
@@ -10,6 +10,7 @@
 // deterministic tests (no background timers).
 
 import Foundation
+import NativeAgentShared
 
 // MARK: - Shared in-memory substrate (the "CloudKit private DB" stand-in)
 

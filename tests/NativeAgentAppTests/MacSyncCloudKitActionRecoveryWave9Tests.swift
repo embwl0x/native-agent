@@ -67,29 +67,7 @@ struct MacSyncCloudKitActionRecoveryWave9Tests {
             InboxActionFileBoundary.jsonURL(in: responses, validatedID: messageID)
         )
         let probe = CloudKitActionDeliveryProbe()
-        let engine = MacSyncEngine.shared
-        let previous = (
-            responses: engine.responsesDir,
-            transaction: engine.transactionDir,
-            secret: engine._pairingSecret,
-            rotation: engine.pairingSecretRotationInProgress,
-            sender: engine.cloudKitActionResponseSender,
-            root: engine.cloudKitActionStateRootOverride,
-            persistence: engine.cloudKitActionProcessedIDPersistence,
-            ids: engine.processedMsgIds,
-            ordered: engine.processedMsgIdsOrdered
-        )
-        defer {
-            engine.responsesDir = previous.responses
-            engine.transactionDir = previous.transaction
-            engine._pairingSecret = previous.secret
-            engine.pairingSecretRotationInProgress = previous.rotation
-            engine.cloudKitActionResponseSender = previous.sender
-            engine.cloudKitActionStateRootOverride = previous.root
-            engine.cloudKitActionProcessedIDPersistence = previous.persistence
-            engine.processedMsgIds = previous.ids
-            engine.processedMsgIdsOrdered = previous.ordered
-        }
+        let engine = MacSyncEngine(stateDataRootOverride: root)
 
         engine.responsesDir = responses
         engine.transactionDir = root.appendingPathComponent("transactions", isDirectory: true)

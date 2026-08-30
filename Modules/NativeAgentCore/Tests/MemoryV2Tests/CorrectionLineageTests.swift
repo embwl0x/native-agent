@@ -108,4 +108,46 @@ import PersistenceCore
         _ = try await storage.insertMemory(new)
         #expect(!(try await storage.markCorrected(id: "no-such-id", by: new.id)))
     }
+
+    @Test func selfCorrectionPreservesCanonicalRowAndRecall() async throws {
+        let storage = try makeStorage()
+        let original = StoredMemory(content: "The orchard gate opens at dusk.", embedding: [1, 0, 0, 0])
+        _ = try await storage.insertMemory(original)
+        #expect(!(try await storage.markCorrected(id: original.id, by: original.id, reason: "reasserted")))
+        let after = try #require(try await storage.memory(id: original.id))
+        #expect(after.content == original.content)
+        #expect(after.lifecycle == original.lifecycle)
+        #expect(after.status == original.status)
+        #expect(after.updatedAt == original.updatedAt)
+        #expect(after.metadata == original.metadata)
+        let hits = try await storage.recall(embedding: [1, 0, 0, 0], queryText: "orchard gate", topK: 5, persona: nil)
+        #expect(hits.map(\.memory.id) == [original.id])
+    }
+
+    @Test(arguments: ["missing", "removed", "archived", "corrected", "contradicted", "deleted"])
+    func unavailableReplacementDoesNotRetireOldFact(state: String) async throws {
+        let storage = try makeStorage()
+        let original = StoredMemory(content: "The orchard gate opens at dusk.", embedding: [1, 0, 0, 0])
+        let replacement = StoredMemory(content: "The orchard gate opens at dawn.", embedding: [0, 1, 0, 0])
+        _ = try await storage.insertMemory(original)
+        if state != "missing" {
+            // Reproduce the canonical transition after store returned a valid
+            // replacement but before the later correction transaction.
+            _ = try await storage.insertMemory(replacement)
+            if state == "removed" {
+                _ = try await storage.deleteMemory(id: replacement.id)
+            } else if state == "archived" {
+                _ = try await storage.updateMemory(id: replacement.id, patch: MemoryPatch(status: "archived"))
+            } else {
+                _ = try await storage.updateMemory(id: replacement.id, patch: MemoryPatch(lifecycle: state))
+            }
+        }
+        #expect(!(try await storage.markCorrected(id: original.id, by: replacement.id)))
+        let after = try #require(try await storage.memory(id: original.id))
+        #expect(after.lifecycle == original.lifecycle)
+        #expect(after.metadata == original.metadata)
+        #expect(after.updatedAt == original.updatedAt)
+        let hits = try await storage.recallByKeyword(queryText: "orchard gate", topK: 5)
+        #expect(hits.map(\.memory.id) == [original.id])
+    }
 }

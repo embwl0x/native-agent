@@ -58,7 +58,7 @@ let onboardingTourSteps: [OnboardingTourStep] = [
         id: 6,
         item: .settings,
         title: "Settings",
-        body: "Device pairing, Telegram, appearance, memory backend setup, data limits, and replaying this tour live here.",
+        body: "Everything you can adjust. Connect your iPhone, link Telegram, switch to dark appearance, pick the keyboard shortcut that opens the app, choose how long a chat runs before it is shortened, check for updates, and replay this tour.",
         buttonLabel: "Continue"
     ),
     OnboardingTourStep(

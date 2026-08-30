@@ -120,20 +120,15 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             .appendingPathComponent("profile.json")
     }
 
-    /// Resolve the shared pool, creating the database file on first use (the
-    /// indexer is a WRITER, so unlike the read path it may create the file —
-    /// matching the pre-U5 eager-open behavior).
+    /// Resolve the shared pool. The indexer never creates memory.sqlite:
+    /// a bare DatabasePool open here minted a store with an EMPTY
+    /// grdb_migrations ledger, and MemoryStorage's next init replayed its
+    /// migrations against the existing kg tables and bricked the chain
+    /// (stable-failure #4 / Desk 751.7). MemoryStorage owns creation; a
+    /// missing file means there is nothing to index yet and the caller
+    /// fails loud with `.databaseMissing`.
     private func pool() async throws -> DatabasePool {
-        do {
-            return try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
-        } catch KnowledgeGraphPoolCache.PoolError.databaseMissing {
-            // First write against a fresh path: create the file, then cache it.
-            var config = Configuration()
-            config.foreignKeysEnabled = true
-            config.busyMode = .timeout(2)
-            _ = try DatabasePool(path: sqlitePath.path, configuration: config)
-            return try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
-        }
+        try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
     }
 
     public func indexMemory(_ fact: KnowledgeGraphMemoryFact, deleted: Bool = false) async throws {
@@ -421,6 +416,93 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
+    /// B4 (2026-08-28): index the active memories that have NO `kg_memory_index`
+    /// row, and only those.
+    ///
+    /// Why this exists next to `rebuildMemoryDerivedGraphFromCanonicalStore`:
+    /// the rebuild is the only batch path, and it is all-or-nothing — it drops
+    /// every indexer-owned entity, edge and index row and re-derives the world.
+    /// That is correct for a consolidation swap and far too heavy for the drift
+    /// this fixes. Indexing hooks are fire-and-forget `Task`s that die with the
+    /// process, so a steady residue of unindexed memories accumulates (47 active
+    /// memories, stable, measured on the live store 2026-08-28). Those memories
+    /// are invisible to every graph-derived surface until something reindexes
+    /// them.
+    ///
+    /// Additive and idempotent: memories that already have an index row are
+    /// never touched, so this cannot disturb a healthy graph, and `limit` caps
+    /// one pass so a large backlog drains over several runs instead of turning a
+    /// routine reconcile into a long write transaction. Returns the number of
+    /// memories indexed.
+    @discardableResult
+    public func backfillMissingMemoryIndexRows(limit: Int = 200) async throws -> Int {
+        let cap = max(0, limit)
+        guard cap > 0 else { return 0 }
+        let dbPool = try await pool()
+        let primaryUserName = resolvedPrimaryUserName()
+        return try await dbPool.write { db in
+            let memoryTableExists = (try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'memories'
+                    """
+            ) ?? 0) > 0
+            guard memoryTableExists else { return 0 }
+            // Same eligibility predicate as the full rebuild — one definition of
+            // "indexable memory", so a backfilled row is byte-identical to the
+            // row a rebuild would have written. The only added clause is the
+            // missing-index test.
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT id, content, source, status, created_at, updated_at,
+                       metadata_json
+                FROM memories
+                WHERE status = 'active'
+                  AND TRIM(COALESCE(content, '')) <> ''
+                  AND lower(COALESCE(NULLIF(TRIM(lifecycle), ''), 'confirmed'))
+                        NOT IN ('corrected', 'contradicted', 'deleted')
+                  AND id NOT LIKE 'skill-pointer:%'
+                  AND NOT EXISTS (
+                        SELECT 1 FROM kg_memory_index i WHERE i.memory_id = memories.id
+                  )
+                ORDER BY id ASC
+                LIMIT ?
+                """, arguments: [cap])
+            guard !rows.isEmpty else { return 0 }
+            let now = Self.nowISO8601()
+            var indexed = 0
+            for row in rows {
+                guard let id: String = row["id"],
+                      let content: String = row["content"] else { continue }
+                let memoryID = id.trimmingCharacters(in: .whitespacesAndNewlines)
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !memoryID.isEmpty, !trimmed.isEmpty else { continue }
+                let metadataRaw: String? = row["metadata_json"]
+                let fact = KnowledgeGraphMemoryFact(
+                    id: memoryID,
+                    content: content,
+                    source: row["source"],
+                    status: row["status"] ?? "active",
+                    createdAt: row["created_at"] ?? "",
+                    updatedAt: row["updated_at"] ?? "",
+                    metadata: metadataRaw.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+                )
+                try Self.indexActiveFact(
+                    db,
+                    fact: fact,
+                    memoryID: memoryID,
+                    content: trimmed,
+                    contentHash: Self.contentHash("\(Self.indexVersion):\(trimmed)"),
+                    now: now,
+                    extracted: Self.extractEntities(from: trimmed),
+                    primaryUserName: primaryUserName
+                )
+                indexed += 1
+            }
+            return indexed
+        }
+    }
+
     func resolvedPrimaryUserName() -> String {
         Self.resolvePrimaryUserName(
             explicit: explicitPrimaryUserName,
@@ -671,8 +753,20 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Idempotent kg_* schema. Internal (was private) so the shared
-    /// KnowledgeGraphPoolCache can run it once per pool creation.
+    /// Idempotent kg_* schema completion for an EXISTING file. Internal so the
+    /// shared KnowledgeGraphPoolCache can run it once per pool open.
+    ///
+    /// Ownership (stable-failure #4 / Desk 751.7, 2026-08-27): MemoryStorage's
+    /// migrator is the schema owner for every store it creates
+    /// (v2_knowledge_graph + v8_kg_memory_index), and the KnowledgeGraph side
+    /// NEVER creates memory.sqlite itself — the pool cache throws
+    /// `.databaseMissing` and the indexer's create-on-missing fallback is gone.
+    /// That removal is what closed the brick path (a graph-first bare file had
+    /// an empty grdb_migrations ledger, so MemoryStorage's next init replayed
+    /// v2 against the existing tables and the whole chain failed). This
+    /// IF NOT EXISTS completion remains for stores the migrator never owned:
+    /// hand-built test fixtures and minimal/legacy stores, which the module
+    /// deliberately tolerates for reads and hook-driven indexing.
     static func ensureSchema(_ pool: DatabasePool) throws {
         try pool.write { db in
             try db.execute(sql: """

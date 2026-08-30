@@ -360,6 +360,30 @@ struct MemoryConsolidatorTests {
         // Fresh volatile → ~1.0. Unparseable timestamp → exempt, not crash.
         #expect(MemoryRecallScoring.decayFactor(kind: "volatile", updatedAt: now) > 0.99)
         #expect(MemoryRecallScoring.decayFactor(kind: "volatile", updatedAt: "garbage") == 1.0)
+        // Long-lived kinds decay too, just far slower: 60 days is well under
+        // one 180-day half-life, so a decision is still worth most of itself.
+        let d = MemoryRecallScoring.decayFactor(kind: "decision", updatedAt: sixtyAgo)
+        #expect(d > 0.75 && d < 0.85)
+        #expect(d > v)   // and always outlives a volatile fact of the same age
+    }
+
+    /// The use-count term feeds back on itself (recordRecallHits bumps
+    /// use_count on every recall), so the CAP is the whole safety story.
+    @Test func useCountFactorIsBoundedAndNeverPenalises() {
+        // Unused rows are untouched — the term only ever nudges upward.
+        #expect(MemoryRecallScoring.useCountFactor(0) == 1.0)
+        #expect(MemoryRecallScoring.useCountFactor(-5) == 1.0)
+        // Monotone in use count.
+        #expect(MemoryRecallScoring.useCountFactor(10) > MemoryRecallScoring.useCountFactor(1))
+        #expect(MemoryRecallScoring.useCountFactor(100) > MemoryRecallScoring.useCountFactor(10))
+        // Hard-capped: no runaway, however many times a row has been recalled.
+        let ceiling = 1.0 + memoryUseCountBoostCap
+        #expect(MemoryRecallScoring.useCountFactor(1) < 1.02)
+        #expect(MemoryRecallScoring.useCountFactor(1_000_000) == ceiling)
+        #expect(MemoryRecallScoring.useCountFactor(Int64.max) <= ceiling)
+        // Small enough that it reorders near-ties only: a 10% nudge cannot
+        // lift a mediocre match past a materially better one.
+        #expect(ceiling < 1.0 + memoryBM25LexicalBoost)
     }
 
     @Test func recallRanksFreshVolatileAboveStaleVolatileAtEqualCosine() async throws {

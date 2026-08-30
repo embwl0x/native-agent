@@ -227,6 +227,32 @@ struct WorkshopExecutionChatToolDispatchTests {
         #expect(recent.isEmpty)
     }
 
+    @Test func statusListsActiveAndRecentFromQueueOwner() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = SwiftNativeWorkshopRunner(root: root)
+        let persistence = SwiftNativePersistenceCore()
+        for status in ["running", "completed", "unknown"] {
+            try await persistence.writeJSON(.object([
+                "id": .string(status), "title": .string(status), "status": .string(status),
+                "created_at": .string("2026-01-01"), "updated_at": .string("2026-01-02"),
+            ]), to: runner.executionRecordPath(status))
+        }
+        let result = try await hermeticDispatcher(root).impl_workshop_status(input: [:])
+        guard case .object(let object) = result,
+              case .array(let active)? = object["active"],
+              case .array(let recent)? = object["recent"],
+              case .object(let activeRow)? = active.first,
+              case .object(let recentRow)? = recent.first else {
+            Issue.record("missing status rows"); return
+        }
+        #expect(active.count == 1)
+        #expect(recent.count == 1)
+        #expect(activeRow["id"] == .string("running"))
+        #expect(recentRow["id"] == .string("completed"))
+        #expect(activeRow["updated_at"] == .string("2026-01-02"))
+    }
+
     // MARK: workshop_submit — policy-off refusal surfaces as honest envelope
 
     @Test func submitWithWorkshopPolicyOffReturnsForbiddenEnvelope() async throws {

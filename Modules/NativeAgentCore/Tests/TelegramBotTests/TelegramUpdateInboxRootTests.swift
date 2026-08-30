@@ -257,11 +257,6 @@ private final class TelegramClaimReadCapture: @unchecked Sendable {
     /// prune removes the `.json` and never the sibling. On the live install the
     /// directory holds 256 claims and 315 orphaned `.lock` files, and the lock
     /// count grows without bound for the life of the install.
-    ///
-    /// Written as a KNOWN issue so it is green today and turns RED the moment a
-    /// lock-sidecar sweep lands — which is when the ledger row flips to COVERED.
-    /// PersistenceCore already has the sweep this needs:
-    /// ProcedureArtifactStore.swift:701 `lockSidecarIsAgedOrphan`.
     @Test func pruneTerminalClaims_should_leave_no_orphan_lock_sidecars() async throws {
         let root = hermeticTelegramDataRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -279,17 +274,9 @@ private final class TelegramClaimReadCapture: @unchecked Sendable {
             .filter { $0.hasSuffix(".json.lock") }
             .filter { !claims.contains(String($0.dropLast(5))) }
 
-        // The leak, observed: seeded 10, kept 4, and the sidecars for the 6
-        // deleted claims are still on disk.
-        #expect(orphanLocks.count == 6)
-
-        withKnownIssue(
-            "telegram.updateInbox.pruneTerminalClaims leaks <id>.json.lock sidecars — needs an orphan sweep in TelegramUpdateInbox.pruneTerminalClaims"
-        ) {
-            #expect(orphanLocks.isEmpty)
-            // Total FILE count, not just the *.json count: the bound the
-            // retention policy claims to enforce must cover every class.
-            #expect(names.count <= 4)
-        }
+        #expect(orphanLocks.isEmpty)
+        // Kept claims may each retain their own live lock sidecar plus the
+        // maintained index — the tooth is orphanLocks above, not lock absence.
+        #expect(names.count <= claims.count * 2 + 1)
     }
 }

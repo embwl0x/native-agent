@@ -675,7 +675,7 @@ func streamingLoop_countsProviderCallOnExhaustion() async throws {
         userMessage: "never done", maxIterations: 3, llm: llm, tools: tools
     )
 
-    #expect(result.reply.contains("tool loop exhausted after 3 iterations"))
+    #expect(result.reply.contains("tool loop exhausted after 3/3 iterations"))
     // Exhausted-fallback return also carries the count (3 iterations = 3 calls).
     #expect(result.providerCallCount == 3)
 }
@@ -1013,4 +1013,112 @@ func singleParallelSafeCall_runsSequential_keepsExactSerialProgressOrder() async
     #expect(result.reply == "fin")
     let kinds = await log.kinds
     #expect(kinds == ["toolUse", "toolResult"])
+}
+
+// MARK: - Fleet-dispatch override (invoke_codex per-lane worktrees)
+
+@Suite("fleet parallel overrides — invoke_codex distinct-cwd exception")
+struct FleetParallelOverrideTests {
+    private func inputs(_ cwds: [String?]) -> [[String: JSONValue]] {
+        cwds.map { c in c.map { ["cwd": .string($0)] } ?? [:] }
+    }
+
+    private func makeDirs(_ n: Int) throws -> [String] {
+        try (0..<n).map { i in
+            let u = FileManager.default.temporaryDirectory
+                .appendingPathComponent("fleet-\(UUID().uuidString)-\(i)")
+            try FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
+            return u.path
+        }
+    }
+
+    @Test("two invoke_codex with distinct existing cwds are forced parallel-safe")
+    func distinctCwds_forceParallel() throws {
+        let dirs = try makeDirs(2)
+        defer { dirs.forEach { try? FileManager.default.removeItem(atPath: $0) } }
+        let names = ["invoke_codex", "invoke_codex"]
+        let over = ParallelToolDispatch.fleetParallelOverrides(
+            names: names, inputs: inputs([dirs[0], dirs[1]]))
+        #expect(over == [true, true])
+        // And the resulting plan coalesces them into one concurrent group.
+        let groups = ParallelToolDispatch.plan(
+            parallelSafe: over.map { $0 ?? false }, forceSerial: false)
+        #expect(groups == [.concurrent([0, 1])])
+    }
+
+    @Test("duplicate cwds keep the whole iteration serial (negative control)")
+    func duplicateCwds_staysSerial() throws {
+        let dirs = try makeDirs(1)
+        defer { dirs.forEach { try? FileManager.default.removeItem(atPath: $0) } }
+        let over = ParallelToolDispatch.fleetParallelOverrides(
+            names: ["invoke_codex", "invoke_codex"],
+            inputs: inputs([dirs[0], dirs[0] + "/."]))
+        #expect(over == [nil, nil], "path aliases of one directory must fail closed")
+    }
+
+    @Test("a SYMLINK alias of the same directory fails closed (review BLOCKING pin)")
+    func symlinkAlias_staysSerial() throws {
+        let dirs = try makeDirs(1)
+        let link = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fleet-link-\(UUID().uuidString)").path
+        try FileManager.default.createSymbolicLink(
+            atPath: link, withDestinationPath: dirs[0])
+        defer {
+            try? FileManager.default.removeItem(atPath: link)
+            dirs.forEach { try? FileManager.default.removeItem(atPath: $0) }
+        }
+        let over = ParallelToolDispatch.fleetParallelOverrides(
+            names: ["invoke_codex", "invoke_codex"],
+            inputs: inputs([dirs[0], link]))
+        #expect(over == [nil, nil], "symlink alias resolves to same (dev,inode) — serial")
+    }
+
+    @Test("a nonexistent cwd fails closed")
+    func nonexistentCwd_staysSerial() throws {
+        let dirs = try makeDirs(1)
+        defer { dirs.forEach { try? FileManager.default.removeItem(atPath: $0) } }
+        let over = ParallelToolDispatch.fleetParallelOverrides(
+            names: ["invoke_codex", "invoke_codex"],
+            inputs: inputs([dirs[0], "/tmp/does-not-exist-\(UUID().uuidString)"]))
+        #expect(over == [nil, nil])
+    }
+
+    @Test("a missing or blank cwd keeps the whole iteration serial (negative control)")
+    func missingCwd_staysSerial() throws {
+        let dirs = try makeDirs(1)
+        defer { dirs.forEach { try? FileManager.default.removeItem(atPath: $0) } }
+        #expect(ParallelToolDispatch.fleetParallelOverrides(
+            names: ["invoke_codex", "invoke_codex"],
+            inputs: inputs([dirs[0], nil])) == [nil, nil])
+        #expect(ParallelToolDispatch.fleetParallelOverrides(
+            names: ["invoke_codex", "invoke_codex"],
+            inputs: inputs([dirs[0], "   "])) == [nil, nil])
+    }
+
+    @Test("a single invoke_codex gets no override — serial event order preserved")
+    func singleCall_noOverride() throws {
+        let dirs = try makeDirs(1)
+        defer { dirs.forEach { try? FileManager.default.removeItem(atPath: $0) } }
+        #expect(ParallelToolDispatch.fleetParallelOverrides(
+            names: ["invoke_codex"], inputs: inputs([dirs[0]])) == [nil])
+    }
+
+    @Test("invoke_claude is never overridden — one pinned session (negative control)")
+    func invokeClaude_neverOverridden() {
+        let over = ParallelToolDispatch.fleetParallelOverrides(
+            names: ["invoke_claude", "invoke_claude"],
+            inputs: inputs(["/tmp/a", "/tmp/b"]))
+        #expect(over == [nil, nil])
+        #expect(!ParallelToolDispatch.isParallelSafe(internalToolName: "invoke_claude"))
+    }
+
+    @Test("non-codex serial neighbors stay serial around a codex pair")
+    func mixedIteration_onlyCodexPairOverridden() throws {
+        let dirs = try makeDirs(2)
+        defer { dirs.forEach { try? FileManager.default.removeItem(atPath: $0) } }
+        let over = ParallelToolDispatch.fleetParallelOverrides(
+            names: ["invoke_codex", "mac_notify", "invoke_codex"],
+            inputs: inputs([dirs[0], nil, dirs[1]]))
+        #expect(over == [true, nil, true])
+    }
 }

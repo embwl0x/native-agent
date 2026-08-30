@@ -171,6 +171,76 @@ private func withTailTransitions(
     #expect(FileManager.default.fileExists(atPath: snapshotPath.path))
 }
 
+// Restart continuity is real rather than write-only telemetry: recent EMA,
+// degradation dwell, and the card latch survive; in-flight call starts do not
+// appear in the snapshot contract at all.
+@Test func recentSnapshotRestoresProviderVitalsContinuity() async throws {
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("vitals-restore-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let config = ProviderVitalsConfiguration(warmupSamples: 2, cardStageAfter: 0)
+    let source = ProviderVitalsSensor(configuration: config)
+    for i in 0..<3 {
+        _ = await source.observe(sample: sample("moonshot", at: Double(i), durationMs: 500))
+    }
+    for i in 3..<12 {
+        _ = await source.observe(sample: sample("moonshot", at: Double(i), durationMs: 500, isError: true))
+    }
+    _ = await source.evaluateCardDecisions(now: epoch.addingTimeInterval(20))
+    let before = await source.vitals(for: "moonshot")
+    #expect(before?.band == .degraded)
+    #expect(before?.cardActive == true)
+
+    let path = tmp
+        .appendingPathComponent("telemetry", isDirectory: true)
+        .appendingPathComponent("provider_vitals.json")
+    let persistence = SwiftNativePersistenceCore()
+    try await persistence.writeJSON(
+        await source.snapshotJSON(generatedAt: epoch.addingTimeInterval(30)),
+        to: path
+    )
+
+    let restored = ProviderVitalsSensor(configuration: config)
+    let didRestore = await restored.restoreSnapshot(
+        dataRoot: tmp,
+        now: epoch.addingTimeInterval(40)
+    )
+    let after = await restored.vitals(for: "MOONSHOT")
+    #expect(didRestore)
+    #expect(after == before)
+    #expect(await restored.evaluateCardDecisions(now: epoch.addingTimeInterval(50)).isEmpty)
+}
+
+@Test func staleOrFutureSnapshotDoesNotRestoreProviderVitals() async throws {
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("vitals-stale-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let path = tmp
+        .appendingPathComponent("telemetry", isDirectory: true)
+        .appendingPathComponent("provider_vitals.json")
+    let persistence = SwiftNativePersistenceCore()
+    let source = ProviderVitalsSensor()
+    _ = await source.observe(sample: sample("moonshot", at: 0, durationMs: 500))
+
+    try await persistence.writeJSON(
+        await source.snapshotJSON(generatedAt: epoch),
+        to: path
+    )
+    let stale = ProviderVitalsSensor()
+    #expect(await !stale.restoreSnapshot(dataRoot: tmp, now: epoch.addingTimeInterval(7 * 60 * 60)))
+    #expect(await stale.allVitals().isEmpty)
+
+    try await persistence.writeJSON(
+        await source.snapshotJSON(generatedAt: epoch.addingTimeInterval(10 * 60)),
+        to: path
+    )
+    let future = ProviderVitalsSensor()
+    #expect(await !future.restoreSnapshot(dataRoot: tmp, now: epoch))
+    #expect(await future.allVitals().isEmpty)
+}
+
 // The lifecycle seam feeds the sensor passively: started + terminal pair yields
 // exactly one sample; a cancelled call is ignored (not provider ill-health).
 @Test func lifecyclePairingProducesOneSamplePerCall() async {

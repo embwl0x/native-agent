@@ -29,7 +29,7 @@ extension NativeCognitionRuntime {
     /// the read/subscription gap. Matching by exact path preserves injected
     /// data-root hermeticity; `.desk` would cross-invalidate every runtime.
     func startPursuitObservationIfNeeded() {  // internal for actor extensions (move-only Wave C)
-        guard pursuitObservationTask == nil else { return }
+        guard !isFlushedForTermination, pursuitObservationTask == nil else { return }
         let path = dataRoot.appendingPathComponent("desk/desk_ops.jsonl")
         let events = EventDeadlinePhysiology.storeAndFileEvents(paths: [path])
         pursuitObservationTask = Task { [weak self] in
@@ -41,6 +41,7 @@ extension NativeCognitionRuntime {
     }
 
     private func pursuitSourceInvalidated() {
+        guard !isFlushedForTermination else { return }
         pursuitProjectionGeneration &+= 1
         // A possibly closed pursuit must stop steering attention immediately.
         pursuitCandidates = []
@@ -55,6 +56,7 @@ extension NativeCognitionRuntime {
     }
 
     func startPursuitRefresh(waitForCompletion: Bool) async {  // internal for actor extensions (move-only Wave C)
+        guard !isFlushedForTermination else { return }
         if pursuitRefreshInFlight {
             pursuitRefreshQueued = true
             return
@@ -71,6 +73,7 @@ extension NativeCognitionRuntime {
             }
             await self?.finishPursuitRefresh(state: state, generation: generation)
         }
+        pursuitRefreshTask = task
         if waitForCompletion {
             await task.value
         }
@@ -81,6 +84,11 @@ extension NativeCognitionRuntime {
 
     private func finishPursuitRefresh(state: DeskState?, generation: UInt64) {
         pursuitRefreshInFlight = false
+        pursuitRefreshTask = nil
+        guard !isFlushedForTermination else {
+            pursuitRefreshQueued = false
+            return
+        }
         if generation == pursuitProjectionGeneration {
             pursuitCandidates = Array((state?.items ?? []).filter {
                 $0.isPursuit && !$0.status.isTerminal

@@ -1,7 +1,6 @@
 // PATCH-2026-05-07: ios-parity ContentView — focused bottom TabView.
 // Primary tabs stay below iOS overflow; advanced/workspace surfaces live behind More.
 // Design-system pass: accent tint applied to TabView selection color.
-// PATCH-2026-05-09: skill-lifecycle-ios — Skills tab added (SkillLifecycleView)
 // PATCH-2026-05-09: proactive-inbox-ios — Inbox tab added (InboxView + InboxStore)
 // PATCH-2026-05-10: sidebar-flatten — collapse the former 6-tab layout
 // Approvals / Inbox / Settings / More) into 5 (Chat / Activity / Memories /
@@ -13,6 +12,8 @@
 // tab (where the new MacIntegrationView lives under Manage). The view itself
 // is reached one tap deeper; collapsing it into a primary tab would break the
 // 5-tab geometry and the Tab-enum-driven badge/notification routing.
+// PATCH-2026-08-27: Desk replaces Skills as the fourth primary tab. Skills &
+// Tools remains available from More so the live work surface is one tap away.
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -36,7 +37,7 @@ struct ContentView: View {
     @State private var activityNavigationTarget: ActivitySection?
 
     enum Tab: Hashable {
-        case chat, activity, memories, skills, more
+        case chat, activity, memories, desk, more
     }
 
     private var activityBadgeCount: Int {
@@ -67,7 +68,8 @@ struct ContentView: View {
         case "chat": return .chat
         case "activity", "approvals", "inbox": return .activity
         case "memory", "memories": return .memories
-        case "skills": return .skills
+        case "desk": return .desk
+        case "skills": return .more
         case "missions", "workshop", "more", "advanced", "settings": return .more
         case "mac_integration", "macintegration", "mac-integration": return .more
         default: return .chat
@@ -100,11 +102,13 @@ struct ContentView: View {
                 }
                 .tag(Tab.memories)
 
-            SkillsToolsView()
+            NavigationStack {
+                MobileDeskView()
+            }
                 .tabItem {
-                    Label("Skills", systemImage: "puzzlepiece.extension")
+                    Label("Desk", systemImage: "rectangle.3.group")
                 }
-                .tag(Tab.skills)
+                .tag(Tab.desk)
 
             AdvancedView()
                 .tabItem {
@@ -184,7 +188,8 @@ struct ContentView: View {
         switch screen.lowercased() {
         case "chat": return .chat
         case "memories", "memory": return .memories
-        case "skills": return .skills
+        case "desk": return .desk
+        case "skills": return .more
         case "more", "settings", "advanced": return .more
         case "mac_integration", "macintegration", "mac-integration": return .more
         case "activity", "approvals", "inbox": return .activity

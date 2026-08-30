@@ -280,6 +280,39 @@ func toolCallParserRejectsMarkdownPseudoCallsAndFencedMarkers() {
     let bareMarker = #"<tool_use name="echo">{"q":42}</tool_use>"#
     #expect(ToolCallParser.formattedToolCallViolation(in: bareMarker) == nil)
     #expect(ToolCallParser.parse(bareMarker).map(\.name) == ["echo"])
+
+    let liveTruncatedMarker = #"ool_use name="commit_memory">{"text":"remember"}</tool_use>"#
+    #expect(
+        ToolCallParser.formattedToolCallViolation(in: liveTruncatedMarker)?.kind
+            == .malformedToolUseMarker
+    )
+    #expect(ToolCallParser.parse(liveTruncatedMarker).isEmpty)
+    #expect(
+        ToolCallParser.earliestPotentialProtocolMarker(in: liveTruncatedMarker)?.lowerBound
+            == liveTruncatedMarker.startIndex
+    )
+}
+
+@Test
+func executeTurnWithToolLoopBouncesTruncatedMarkerBeforeDispatch() async throws {
+    let dir = try makeTempDir("truncated-tool-marker")
+    let persona = hermeticPersona(root: dir)
+    let malformed = #"ool_use name="echo">{"q":42}</tool_use>"#
+    let bareMarker = #"<tool_use name="echo">{"q":42}</tool_use>"#
+    let llm = MockLLMClient(scriptedResponses: [malformed, bareMarker, "done after correction"])
+    let tools = MockToolDispatchClient(scripted: ["echo": .string("ok")])
+    let engine = makeEngine(persona: persona, llm: llm, tools: tools)
+
+    let result = try await engine.executeTurnWithToolLoop(
+        userMessage: "use echo",
+        llm: llm,
+        tools: tools
+    )
+
+    #expect(llm.callCount == 3)
+    #expect(tools.dispatches.map(\.tool) == ["echo"])
+    #expect(result.reply == "done after correction")
+    #expect(!result.reply.contains("ool_use"))
 }
 
 @Test
@@ -470,7 +503,7 @@ func executeTurnWithToolLoop_max_iterations_returns_readable_fallback() async th
     let result = try await engine.executeTurnWithToolLoop(
         userMessage: "x", maxIterations: 3, llm: llm, tools: tools
     )
-    #expect(result.reply.contains("tool loop exhausted after 3 iterations"))
+    #expect(result.reply.contains("tool loop exhausted after 3/3 iterations"))
     #expect(result.toolDispatches.count == 3)
     #expect(result.rawLLMResponse == alwaysCall)
 }

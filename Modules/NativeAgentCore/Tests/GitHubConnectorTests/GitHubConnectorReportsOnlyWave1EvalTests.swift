@@ -86,34 +86,70 @@ struct GitHubConnectorReportsOnlyWave1EvalTests {
         }
     }
 
-    @Test("contribution tracking binds only to the authenticated account")
+    @Test("github.setting.contributorLoginGuard binds only to the authenticated account")
     func contributionLoginGuardFailsClosedForAnotherAccount() throws {
         #expect(try GitHubConnectorActions.contributionLogin(requested: nil, authenticated: "Agent") == "Agent")
+        #expect(try GitHubConnectorActions.contributionLogin(requested: "   ", authenticated: "Agent") == "Agent")
         #expect(try GitHubConnectorActions.contributionLogin(requested: " agent ", authenticated: "Agent") == "Agent")
-        #expect(throws: GitHubConnectorError.self) {
+
+        do {
             _ = try GitHubConnectorActions.contributionLogin(requested: "someone-else", authenticated: "Agent")
+            Issue.record("a different contributor login must be refused")
+        } catch let error as GitHubConnectorError {
+            guard case .invalidInput(let message) = error else {
+                Issue.record("a contributor mismatch must be invalidInput, got \(error)")
+                return
+            }
+            #expect(message.contains("someone-else"))
+            #expect(message.contains("Agent"))
         }
-        #expect(throws: GitHubConnectorError.self) {
+
+        do {
             _ = try GitHubConnectorActions.contributionLogin(requested: nil, authenticated: "   ")
+            Issue.record("a missing authenticated login must be refused")
+        } catch let error as GitHubConnectorError {
+            guard case .invalidResponse(let message) = error else {
+                Issue.record("a missing authenticated login must be invalidResponse, got \(error)")
+                return
+            }
+            #expect(message.contains("did not include a login"))
         }
     }
 
-    @Test("tracker cadence clamps both forgotten-work and refresh bounds")
-    func trackingTimingIsExplicitlyBounded() {
+    @Test("tracker refresh cadence keeps its default and documented bounds")
+    func refreshTimingIsExplicitlyBounded() {
         let defaults = GitHubConnectorActions.trackingTiming(input: [:])
         #expect(defaults.refreshIntervalMinutes == 5)
-        #expect(defaults.staleAfterHours == 72)
 
         let low = GitHubConnectorActions.trackingTiming(input: [
-            "refresh_interval_minutes": .int(0), "stale_after_hours": .int(0),
+            "refresh_interval_minutes": .int(0),
         ])
         #expect(low.refreshIntervalMinutes == 5)
-        #expect(low.staleAfterHours == 1)
 
         let high = GitHubConnectorActions.trackingTiming(input: [
-            "refresh_interval_minutes": .int(99_999), "stale_after_hours": .int(99_999),
+            "refresh_interval_minutes": .int(99_999),
         ])
         #expect(high.refreshIntervalMinutes == 1_440)
-        #expect(high.staleAfterHours == 2_160)
+    }
+
+    @Test("github.setting.staleAfterHours defaults to 72 and clamps to 1...2160")
+    func staleAfterHoursDefaultsAndClampsToDocumentedBounds() {
+        #expect(GitHubConnectorActions.trackingTiming(input: [:]).staleAfterHours == 72)
+
+        let cases: [(raw: Int64, expected: Int)] = [
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+            (72, 72),
+            (2_160, 2_160),
+            (2_161, 2_160),
+            (99_999, 2_160),
+        ]
+        for item in cases {
+            let timing = GitHubConnectorActions.trackingTiming(input: [
+                "stale_after_hours": .int(item.raw),
+            ])
+            #expect(timing.staleAfterHours == item.expected)
+        }
     }
 }

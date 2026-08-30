@@ -74,6 +74,92 @@ private enum BoundaryEvalError: Error { case expectedObject }
     #expect(auditFailure["audit_error"]?.stringValue?.isEmpty == false)
 }
 
+@Test func builderAuditPrunesToNewestRetentionLimit() throws {
+    let root = try boundaryTempRoot("builder-audit-prune")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let auditDir = root.appendingPathComponent("builder_audit", isDirectory: true)
+    try FileManager.default.createDirectory(at: auditDir, withIntermediateDirectories: true)
+    let now = Date()
+
+    var seeded: [String] = []
+    for offset in 0..<(SwiftToolDispatcher.builderAuditRetentionLimit + 3) {
+        let id = UUID().uuidString.lowercased()
+        let url = auditDir.appendingPathComponent("\(id).json")
+        try Data("{}".utf8).write(to: url)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(TimeInterval(-(offset + 1)))],
+            ofItemAtPath: url.path
+        )
+        seeded.append(id)
+    }
+
+    let currentID = UUID().uuidString.lowercased()
+    let result = SwiftToolDispatcher.builderWriteAudit(
+        runId: currentID,
+        entry: ["toolName": "shell", "runId": currentID, "status": "completed"],
+        dataRoot: root
+    )
+
+    #expect(result.error == nil)
+    let remaining = try FileManager.default.contentsOfDirectory(
+        at: auditDir,
+        includingPropertiesForKeys: nil
+    ).map(\.lastPathComponent)
+    #expect(remaining.count == SwiftToolDispatcher.builderAuditRetentionLimit)
+    #expect(remaining.contains("\(currentID).json"))
+    #expect(!remaining.contains("\(seeded.last!).json"))
+}
+
+@Test func builderAuditPruneReportsFilesystemFailures() throws {
+    let root = try boundaryTempRoot("builder-audit-prune-failure")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let notDirectory = root.appendingPathComponent("not-a-directory")
+    try Data("occupied".utf8).write(to: notDirectory)
+
+    let result = SwiftToolDispatcher.pruneBuilderAuditsIfNeeded(
+        in: notDirectory,
+        keeping: 1
+    )
+
+    #expect(result.removedCount == 0)
+    #expect(result.error?.contains("could not enumerate receipts") == true)
+}
+
+@Test func builderAuditPruneUsesDeterministicNewestThenNameOrder() throws {
+    let root = try boundaryTempRoot("builder-audit-prune-order")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let auditDir = root.appendingPathComponent("builder_audit", isDirectory: true)
+    try FileManager.default.createDirectory(at: auditDir, withIntermediateDirectories: true)
+    let equalTimestamp = Date(timeIntervalSince1970: 1_700_000_000)
+    let ids = [
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+        "00000000-0000-0000-0000-000000000003",
+        "00000000-0000-0000-0000-000000000004",
+    ]
+    for id in ids {
+        let url = auditDir.appendingPathComponent("\(id).json")
+        try Data("{}".utf8).write(to: url)
+        try FileManager.default.setAttributes(
+            [.modificationDate: equalTimestamp],
+            ofItemAtPath: url.path
+        )
+    }
+    let unrelatedLog = auditDir.appendingPathComponent("active-install_app.log")
+    try Data("keep".utf8).write(to: unrelatedLog)
+
+    let result = SwiftToolDispatcher.pruneBuilderAuditsIfNeeded(in: auditDir, keeping: 2)
+
+    #expect(result.removedCount == 2)
+    #expect(result.error == nil)
+    let remaining = try Set(FileManager.default.contentsOfDirectory(atPath: auditDir.path))
+    #expect(remaining.contains("\(ids[3]).json"))
+    #expect(remaining.contains("\(ids[2]).json"))
+    #expect(!remaining.contains("\(ids[1]).json"))
+    #expect(!remaining.contains("\(ids[0]).json"))
+    #expect(remaining.contains(unrelatedLog.lastPathComponent))
+}
+
 @Test func swiftPMShimIsPrivateExecutableRepairingAndIdempotent() throws {
     let root = try boundaryTempRoot("swiftpm-shim")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -154,6 +240,39 @@ func builderTimeoutReapsTheBackgroundProcessGroup() async throws {
     let deadline = Date().addingTimeInterval(5)
     while kill(pid, 0) == 0 && Date() < deadline { usleep(25_000) }
     #expect(kill(pid, 0) != 0, "background descendant \(pid) survived the watchdog")
+}
+
+/// F3 (2026-08-28): install_app drops a `<runId>-install_app.log` beside its
+/// receipt. The prune only matched `<uuid>.json`, so those logs outlived every
+/// receipt they belonged to and accumulated with no bound.
+@Test func builderAuditPruneRetiresSidecarLogsWithTheirReceipt() throws {
+    let root = try boundaryTempRoot("builder-audit-prune-sidecars")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let auditDir = root.appendingPathComponent("builder_audit", isDirectory: true)
+    try FileManager.default.createDirectory(at: auditDir, withIntermediateDirectories: true)
+
+    let victim = "00000000-0000-0000-0000-0000000000aa"
+    let survivor = "00000000-0000-0000-0000-0000000000bb"
+    for (id, age) in [(victim, 100.0), (survivor, 1.0)] {
+        let receipt = auditDir.appendingPathComponent("\(id).json")
+        try Data("{}".utf8).write(to: receipt)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-age)],
+            ofItemAtPath: receipt.path
+        )
+        try Data("log".utf8).write(
+            to: auditDir.appendingPathComponent("\(id)-install_app.log")
+        )
+    }
+
+    let result = SwiftToolDispatcher.pruneBuilderAuditsIfNeeded(in: auditDir, keeping: 1)
+
+    #expect(result.error == nil)
+    let remaining = try Set(FileManager.default.contentsOfDirectory(atPath: auditDir.path))
+    #expect(!remaining.contains("\(victim).json"))
+    #expect(!remaining.contains("\(victim)-install_app.log"))
+    #expect(remaining.contains("\(survivor).json"))
+    #expect(remaining.contains("\(survivor)-install_app.log"))
 }
 
 private extension JSONValue {

@@ -137,6 +137,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     // A corrupt DB next to a stale-but-valid JSON snapshot — the resurrection
     // scenario: pre-U5 this silently served the JSON entity as healthy.
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     try Data("definitely not a sqlite database, padded to look real enough to open".utf8)
         .write(to: sqlitePath)
     let jsonPath = dir.appendingPathComponent("knowledge_graph.json")
@@ -259,6 +260,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     let f = fact("mem-concurrent", "the user ships NativeAgent tonight.")
     try await withThrowingTaskGroup(of: Void.self) { group in
@@ -276,6 +278,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     let f = fact("mem-cycle", "NativeAgent build notes.")
     try await indexer.indexMemory(f)
@@ -360,6 +363,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     try await indexer.indexMemory(fact("mem-stale", "NativeAgent uses TradingView."))
 
@@ -429,6 +433,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     let memA = fact("mem-a", "NativeAgent ships tonight.")
     let memB = fact("mem-b", "TradingView dashboards inside NativeAgent.")
@@ -460,6 +465,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     let memB = fact("mem-b", "TradingView charts look healthy.")
     try await indexer.indexMemory(memB)
@@ -478,6 +484,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     // Two distinct orphans-to-be.
     let m1 = fact("m1", "TradingView analysis session.")
@@ -513,6 +520,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     // Indexed seconds ago, but ABSENT from the caller's (stale) live list —
     // the new-memory race. Its index row is inside the grace window, so the
@@ -664,6 +672,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     try await indexer.indexMemory(fact("mem-live", "NativeAgent reconcile notes."))
     try await indexer.indexMemory(fact("mem-leaked", "OpenClaw leaked row."))
@@ -693,6 +702,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     try await indexer.indexMemory(fact("mem-solo", "KG-only fixture row."))
     // No `memories` table at all (KG-only fixture): reconcile must be a
@@ -810,6 +820,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     try await indexer.indexMemory(fact(
         "generic-user",
@@ -834,6 +845,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let dir = try hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     try await indexer.indexMemory(fact("before-profile", "NativeAgent is ready."))
 
@@ -962,4 +974,159 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     )
     #expect(match.contains { $0.name == "Apple" && $0.type == "organization" })
     #expect(match.contains { $0.name == "macOS" && $0.type == "tool" })
+}
+
+// MARK: - B5: age + provenance stale sweep
+
+/// The whole reason the predicate is a conjunction. A provenance-only sweep
+/// would delete the recent rows in this fixture — on the live store that is 53
+/// current entities. Age alone would delete the old attributed one.
+@Test func staleSweepRequiresBothAgeAndMissingProvenance() async throws {
+    let dir = try hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path)
+    let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+    // Opening through the indexer guarantees the kg_* schema exists.
+    _ = try await indexer.sweepStaleUnprovenancedEntities(apply: false)
+
+    let pool = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
+    try await pool.write { db in
+        // (id, last_seen, provenance)
+        let rows: [(String, String?, String?)] = [
+            ("old-null", "2026-01-05T00:00:00Z", nil),          // swept
+            ("old-provenanced", "2026-01-05T00:00:00Z", "manual"), // attributed
+            ("recent-null", "2026-08-20T00:00:00Z", nil),       // the 53 live rows
+            ("undated-null", nil, nil),                          // cannot prove stale
+        ]
+        for (id, lastSeen, provenance) in rows {
+            try db.execute(sql: """
+                INSERT INTO kg_entities (id, name, type, last_seen, provenance)
+                VALUES (?, ?, 'concept', ?, ?)
+                """, arguments: [id, id, lastSeen, provenance])
+        }
+        // An edge on the doomed entity, to prove edges go with it.
+        try db.execute(sql: """
+            INSERT INTO kg_relationships (from_id, to_id, type)
+            VALUES ('old-null', 'recent-null', 'mentions')
+            """)
+    }
+
+    let preview = try await indexer.sweepStaleUnprovenancedEntities(apply: false)
+    #expect(preview.candidates.map(\.id) == ["old-null"])
+    #expect(!preview.applied)
+
+    let applied = try await indexer.sweepStaleUnprovenancedEntities(
+        apply: true, expectedCandidateIDs: ["old-null"]
+    )
+    #expect(applied.applied)
+    #expect(applied.entitiesDeleted == 1)
+    #expect(applied.edgesDeleted == 1)
+
+    let survivors = try await pool.read { db in
+        try String.fetchAll(db, sql: "SELECT id FROM kg_entities ORDER BY id")
+    }
+    #expect(survivors == ["old-provenanced", "recent-null", "undated-null"])
+}
+
+/// A preview is not permission to delete a later state — same contract the
+/// orphan sweep enforces.
+@Test func staleSweepRefusesWhenTheCandidateSetMovedSinceThePreview() async throws {
+    let dir = try hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path)
+    let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+    _ = try await indexer.sweepStaleUnprovenancedEntities(apply: false)
+    let pool = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
+    try await pool.write { db in
+        try db.execute(sql: """
+            INSERT INTO kg_entities (id, name, type, last_seen, provenance)
+            VALUES ('old-null', 'old-null', 'concept', '2026-01-05T00:00:00Z', NULL)
+            """)
+    }
+    let report = try await indexer.sweepStaleUnprovenancedEntities(
+        apply: true, expectedCandidateIDs: ["some-other-id"]
+    )
+    #expect(report.candidateSetDiverged)
+    #expect(!report.applied)
+    #expect(report.entitiesDeleted == 0)
+    let remaining = try await pool.read { db in
+        try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM kg_entities") ?? 0
+    }
+    #expect(remaining == 1)
+}
+
+// MARK: - B4: index backfill + one-hop related entities
+
+/// Backfill touches only memories with no index row, and leaves indexed ones
+/// exactly as they were.
+@Test func backfillIndexesOnlyMemoriesMissingAnIndexRow() async throws {
+    let dir = try hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    let pool = try DatabasePool(path: sqlitePath.path)
+    try await pool.write { db in
+        try db.execute(sql: """
+            CREATE TABLE memories (
+              id TEXT PRIMARY KEY, content TEXT, source TEXT, status TEXT,
+              lifecycle TEXT, created_at TEXT, updated_at TEXT, metadata_json TEXT
+            )
+            """)
+        for (id, content) in [
+            ("mem-indexed", "NativeAgent ships tonight."),
+            ("mem-missing", "TradingView dashboards inside NativeAgent."),
+            ("mem-archived", "Obsolete note about Telegram."),
+        ] {
+            let status = id == "mem-archived" ? "archived" : "active"
+            try db.execute(sql: """
+                INSERT INTO memories
+                  (id, content, source, status, lifecycle, created_at, updated_at)
+                VALUES (?, ?, 'unit', ?, 'confirmed', '2026-08-01T00:00:00Z',
+                        '2026-08-01T00:00:00Z')
+                """, arguments: [id, content, status])
+        }
+    }
+    let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+    try await indexer.indexMemory(fact("mem-indexed", "NativeAgent ships tonight."))
+
+    let backfilled = try await indexer.backfillMissingMemoryIndexRows()
+    // Only the active, unindexed one. The archived memory is not indexable and
+    // the already-indexed one is left alone.
+    #expect(backfilled == 1)
+
+    let cached = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
+    let indexedIDs = try await cached.read { db in
+        try String.fetchAll(db, sql: "SELECT memory_id FROM kg_memory_index ORDER BY memory_id")
+    }
+    #expect(indexedIDs == ["mem-indexed", "mem-missing"])
+    // Re-running is a no-op: nothing is left missing.
+    let second = try await indexer.backfillMissingMemoryIndexRows()
+    #expect(second == 0)
+}
+
+/// One hop from a memory's fact node reaches the entities that memory mentions
+/// — and neither the primary-user hub (which touches everything) nor another
+/// memory's fact node (whose "name" is memory text).
+@Test func relatedEntityNamesReturnOneHopWithoutHubOrFactNodes() async throws {
+    let dir = try hygieneTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path)
+    let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+    try await indexer.indexMemory(fact("mem-a", "TradingView dashboards inside NativeAgent."))
+    try await indexer.indexMemory(fact("mem-b", "Telegram bridge is healthy."))
+
+    let related = try await indexer.relatedEntityNames(forMemoryIDs: ["mem-a", "mem-b"])
+    let aNames = Set(related["mem-a"] ?? [])
+    #expect(aNames.contains("TradingView"))
+    #expect(aNames.contains("NativeAgent"))
+    // The hub is excluded, or every memory would relate to everything.
+    #expect(!aNames.contains("the user"))
+    // mem-b's own entity never leaks into mem-a's bucket: no second hop.
+    #expect(!aNames.contains("Telegram"))
+    #expect(Set(related["mem-b"] ?? []).contains("Telegram"))
+    // Unknown ids are not an error.
+    let unknown = try await indexer.relatedEntityNames(forMemoryIDs: ["nope"])
+    #expect(unknown.isEmpty)
 }

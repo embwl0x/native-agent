@@ -27,7 +27,10 @@ struct SkillLifecycleReviewSheetInstallEvalTests {
         #expect(receipt.confirmedName == "Reviewed Draft")
         #expect(receipt.confirmedState == "installed")
         #expect(SkillReviewInstallPresentation.successMessage(for: receipt)
-            == "‘Reviewed Draft’ is installed and available to recall.")
+            == "‘Reviewed Draft’ is installed.")
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("skills/bodies/review-draft.md").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("skills/.pointer_sync_receipt.json").path))
+        #expect(app.statusText == "Skill installed")
 
         let reread = try registryState(at: root)
         #expect(reread == "installed")

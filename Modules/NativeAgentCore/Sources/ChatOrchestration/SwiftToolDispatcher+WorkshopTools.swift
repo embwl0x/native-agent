@@ -418,8 +418,7 @@ extension SwiftToolDispatcher {
         }
 
         // List branch: active (live) first, then recent history.
-        let active = await runner.listActive()
-        let history = await runner.listHistory()
+        let snapshot = await runner.listStatusSnapshot()
         func row(_ r: WorkshopExecutionRecord) -> JSONValue {
             .object([
                 "id": .string(r.id),
@@ -431,8 +430,8 @@ extension SwiftToolDispatcher {
         }
         return .object([
             "status": .string("ok"),
-            "active": .array(active.map(row)),
-            "recent": .array(history.map(row)),
+            "active": .array(snapshot.active.map(row)),
+            "recent": .array(snapshot.recent.map(row)),
         ])
     }
 

@@ -30,6 +30,19 @@ actor NativeToolCallCollector {
     func drain() -> [LLMStreamToolCall] { calls }
 }
 
+/// One tool receipt on its way to the transcript, fully redacted at the
+/// point of production so the writer can drain the queue off the dispatch
+/// critical path without touching turn state (A2). Every field is a value
+/// type: the writer is a separate task, and the row must be complete before
+/// it leaves the dispatch loop.
+struct TextCompatToolReceipt: Sendable {
+    let toolName: String
+    let inputJSON: String
+    let resultJSON: String
+    let ok: Bool
+    let redactedResult: JSONValue
+}
+
 extension SwiftNativeChatOrchestrationClient {
     /// Does THIS turn ride the provider-native tools lane?
     ///
@@ -176,6 +189,12 @@ extension SwiftNativeChatOrchestrationClient {
                 ?? String(describing: iterationError)
             throw ChatOrchestrationError.underlying(message)
         }
+        // The producer can report a persistence failure after generating its
+        // final reply. A generated answer is not a successful saved turn when
+        // that terminal write (including an explicit regenerate) was refused.
+        if let lastError {
+            throw ChatOrchestrationError.underlying(lastError)
+        }
 
         guard let finalResult else {
             throw ChatOrchestrationError.underlying(
@@ -290,6 +309,7 @@ extension SwiftNativeChatOrchestrationClient {
         // turn.terminal carried 9.7 s for a 23-tool turn that ran 204 s
         // (2026-08-23 instrument lead).
         let turnStartNs = DispatchTime.now().uptimeNanoseconds
+        let wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface)
         let resolvedSession: String
         do {
             resolvedSession = try Self.resolveSessionId(sessionId)
@@ -389,8 +409,9 @@ extension SwiftNativeChatOrchestrationClient {
             fileAccess: fileAccess
         )
         async let preloadActiveToolsTask = activeToolsStore.load(sessionId: resolvedSession)
-        async let preloadAvailableNamesTask: Set<String> = {
-            Set(((try? await tools.listAvailableToolSchemas()) ?? []).map(\.name))
+        async let preloadToolSchemaCatalogSeedTask: TurnToolSchemaCatalogSeed? = {
+            guard let schemas = try? await tools.listAvailableToolSchemas() else { return nil }
+            return TurnToolSchemaCatalogSeed(schemas: schemas)
         }()
 
         // U1 step 7 fix (2026-06-10 review): this Anthropic text-compat path
@@ -406,7 +427,8 @@ extension SwiftNativeChatOrchestrationClient {
         let residentPreparation = await residentPreparationTask
         let turnPlan = residentPreparation.turnPlan
         let preloadActiveTools = await preloadActiveToolsTask.activeTools
-        let preloadAvailableNames = await preloadAvailableNamesTask
+        let preloadToolSchemaCatalogSeed = await preloadToolSchemaCatalogSeedTask
+        let preloadAvailableNames = Set(preloadToolSchemaCatalogSeed?.schemas.map(\.name) ?? [])
         let preloadPrediction = turnPlan?.preloadPrediction
             ?? ToolPreloadHeuristics.predict(userMessage: message)
         let turnActiveTools = await ToolPreloadHeuristics.preloadIfConfident(
@@ -454,6 +476,7 @@ extension SwiftNativeChatOrchestrationClient {
         var violationNudgeCount = 0
         var didCancel = false
         var exhaustedToolLoop = false
+        var wallClockElapsedSeconds: Int?
         var lastProtocolViolation: ToolCallProtocolViolation?
         var noProgressGuard = ToolLoopNoProgressGuard()
         var loopRecoveryReply: String?
@@ -573,6 +596,10 @@ extension SwiftNativeChatOrchestrationClient {
         // it mid-turn — byte-diff-proven cache bust. The turn is one moment:
         // freeze its instant here and pass it to every iteration's build.
         let turnClockNow = Date()
+        // Quiet-hours configuration is likewise a whole-turn snapshot. This
+        // wrapper preserves configured absence, so legacy grown-prompt and
+        // native-tools iterations cannot turn one preference read into N.
+        let quietHoursSnapshot = await engine.captureTurnQuietHoursSnapshot()
         // Third pin (see streamTurn.preBuiltContext): iteration 1's fully
         // built context is captured and reused for every later iteration, so
         // ContextFlow prepares ONCE per turn and the packet bytes cannot
@@ -598,6 +625,15 @@ extension SwiftNativeChatOrchestrationClient {
             reuseTurnContext ? { @Sendable ctx in turnContextBox.set(ctx) } : nil
 
         toolLoop: for iteration in 0..<maxToolIterations {
+            // A6: observe the whole-turn ceiling only between iterations. An
+            // active provider stream or tool dispatch always settles under
+            // its own timeout contract; expiry then joins the existing
+            // exhausted-loop fallback and persistence path below.
+            if wholeTurnBudget.isExhausted {
+                exhaustedToolLoop = true
+                wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                break toolLoop
+            }
             providerCallCount += 1
             var iterAccumulated = ""
             var iterFinal: TurnEngineResult?
@@ -648,6 +684,8 @@ extension SwiftNativeChatOrchestrationClient {
                 turnActiveTools: turnActiveTools,
                 pinnedActiveTools: ridesNativeTools ? nil : turnActiveTools,
                 clockNowOverride: turnClockNow,
+                toolSchemaCatalogSeed: preloadToolSchemaCatalogSeed,
+                quietHoursSnapshot: quietHoursSnapshot,
                 preBuiltContext: reusedTurnContext,
                 onContextBuilt: onTurnContextBuilt,
                 imageBlocks: imageBlocks,
@@ -1093,15 +1131,20 @@ extension SwiftNativeChatOrchestrationClient {
             // the SAME literal the grown shape appends — only the carrier
             // changes (new message vs string growth).
             //
-            // SERIAL DISPATCH — INTENTIONAL (gpt-5.5 review 2026-06-11):
-            // this inline call-by-call loop deliberately preserves the
-            // legacy compat path's serial semantics — zero behavior change
-            // vs the pre-item-9 production loop. Unifying it onto
-            // ChatOrchestration+ToolLoop's dispatchIterationCalls (which
-            // would introduce PARALLEL dispatch here, the step-6 semantics)
-            // is a named follow-up, NOT part of item 9. See the matching
-            // Decisions entry in docs/build_plans/u1-performance-core.md
-            // (2026-06-11).
+            // PARALLEL DISPATCH (A1, 2026-08-28): the follow-up the old
+            // "SERIAL DISPATCH — INTENTIONAL" note named (u1-performance-core
+            // Decisions, 2026-06-11) is now taken. This path no longer owns a
+            // dispatch loop: it hands its prepared calls to the SAME
+            // `runIterationDispatchGroups` behind ToolLoop's
+            // dispatchIterationCalls, so the fail-closed ParallelToolDispatch
+            // veto table, the fleet cwd overrides and the
+            // NATIVE_AGENT_SERIAL_TOOL_DISPATCH escape hatch are ONE
+            // implementation for every lane. Yield order is the structured
+            // contract: .toolUse for a concurrent group up-front in index
+            // order, .toolResult per slot in index order as the group lands.
+            // Slot FINALIZATION stays here — the prose carrier and the native
+            // tool_result/tool_use block shapes below are this lane's format,
+            // not the structured lane's.
             var iterationToolResults = ""
             // NATIVE LANE: the append-only conversation carries real content
             // blocks instead of prose. The assistant message replays the
@@ -1113,82 +1156,124 @@ extension SwiftNativeChatOrchestrationClient {
             var nativeToolResultBlocks: [LLMContentBlock] = []
             let iterationDispatchStart = dispatches.count
 
-            for (index, call) in calls.enumerated() {
-                let dispatchInput = Self.inputWithSessionIfNeeded(
-                    toolName: call.name,
-                    input: call.input,
-                    sessionId: resolvedSession
-                )
-                let inputObj: JSONValue = .object(dispatchInput)
-                let redactedInput = ChatSecretRedactor.redactValue(inputObj)
-                continuation.yield(.toolUse(name: call.name, input: redactedInput))
-                // Use the same deadline/runtime/notice dispatch core as the
-                // structured loops. This closes the former Claude text-compat
-                // carve where an interactive tool could still hang forever.
-                let prepared = SwiftNativeTurnEngine.PreparedToolCall(
+            // Same deadline/runtime/notice dispatch core as the structured
+            // loops (this closed the former Claude text-compat carve where an
+            // interactive tool could hang forever) — now reached through the
+            // shared group runner rather than one call at a time.
+            let preparedCalls = calls.map { call in
+                SwiftNativeTurnEngine.PreparedToolCall(
                     pairedId: call.id,
                     internalName: call.name,
-                    dispatchInput: dispatchInput
-                )
-                let (result, isError) = await LLMCallContext.$turnActiveTools.withValue(turnActiveTools) {
-                    await SwiftNativeTurnEngine.runSingleDispatch(
-                        prepared: prepared,
-                        modelId: model,
-                        surface: surface,
-                        tools: gated,
-                        progress: { event in
-                            if case .notice(let kind, let text) = event {
-                                continuation.yield(.notice(kind: kind, text: text))
-                            }
-                        }
+                    dispatchInput: Self.inputWithSessionIfNeeded(
+                        toolName: call.name,
+                        input: call.input,
+                        sessionId: resolvedSession
                     )
+                )
+            }
+
+            // A2 (2026-08-28): transcript receipts leave the dispatch critical
+            // path. Rows are ENQUEUED in call order as each slot lands and
+            // drained by ONE serial writer that overlaps the remaining
+            // dispatch, so no tool call ever blocks on the previous call's
+            // disk write. Write order is therefore CALL order, never
+            // completion order. The M2 fail-loud receipt contract is intact:
+            // a failed write still raises the same user-visible notice, and
+            // the writer is awaited before the iteration continues so the
+            // notice cannot outlive the turn (silent receipt loss is a
+            // previously-fixed bug class — see the catch below).
+            let (receiptRows, receiptSink) = AsyncStream<TextCompatToolReceipt>.makeStream()
+            let receiptWriter = Task { [runId, surface, resolvedSession] in
+                for await row in receiptRows {
+                    do {
+                        try await self.appendToolMessage(
+                            sessionId: resolvedSession,
+                            runId: runId,
+                            toolName: row.toolName,
+                            inputJSON: row.inputJSON,
+                            resultSummary: row.resultJSON,
+                            ok: row.ok,
+                            cognitiveResult: ChatToolOutcome.cognitiveResult(
+                                tool: row.toolName,
+                                output: row.redactedResult
+                            ),
+                            source: surface
+                        )
+                    } catch {
+                        // M2 completion (gpt-5.5 review HIGH, 2026-07-09): the
+                        // sweep fixed the structured path and missed this
+                        // text-compat twin — the same dropped-receipt silent
+                        // loss, same fail-loud remedy.
+                        await Self.reportTranscriptWriteFailure(
+                            label: "appendToolMessage(\(row.toolName)) [text-compat]",
+                            path: self.dataRoot,
+                            error: error,
+                            userText: "Couldn't save the receipt for tool '\(row.toolName)' - it won't appear in the saved transcript.",
+                            onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
+                        )
+                    }
                 }
-                let ok = !isError
+            }
+
+            let slots = await LLMCallContext.$turnActiveTools.withValue(turnActiveTools) {
+                await SwiftNativeTurnEngine.runIterationDispatchGroups(
+                    prepared: preparedCalls,
+                    modelId: model,
+                    surface: surface,
+                    tools: gated,
+                    progress: { event in
+                        if case .notice(let kind, let text) = event {
+                            continuation.yield(.notice(kind: kind, text: text))
+                        }
+                    },
+                    onToolUse: { prepared in
+                        continuation.yield(.toolUse(
+                            name: prepared.internalName,
+                            input: ChatSecretRedactor.redactValue(.object(prepared.dispatchInput))
+                        ))
+                    },
+                    onOutcome: { prepared, result, isError in
+                        let redactedResult = ChatSecretRedactor.redactValue(result)
+                        continuation.yield(.toolResult(
+                            name: prepared.internalName,
+                            output: redactedResult
+                        ))
+                        let redactedInput = ChatSecretRedactor.redactValue(
+                            .object(prepared.dispatchInput)
+                        )
+                        receiptSink.yield(TextCompatToolReceipt(
+                            toolName: prepared.internalName,
+                            inputJSON: (try? redactedInput.serialize(pretty: false)) ?? "{}",
+                            resultJSON: (try? redactedResult.serialize(pretty: false)) ?? "null",
+                            ok: !isError,
+                            redactedResult: redactedResult
+                        ))
+                    }
+                )
+            }
+            receiptSink.finish()
+
+            for slot in slots {
+                let index = slot.index
+                let call = slot.prepared
+                let redactedResult = ChatSecretRedactor.redactValue(slot.result)
+                let ok = !slot.isError
                 dispatches.append(TurnEngineResult.ToolDispatchRecord(
-                    id: call.id,
-                    name: call.name,
-                    input: dispatchInput,
-                    result: result
+                    id: call.pairedId,
+                    name: call.internalName,
+                    input: call.dispatchInput,
+                    result: slot.result
                 ))
-                let redactedResult = ChatSecretRedactor.redactValue(result)
-                continuation.yield(.toolResult(name: call.name, output: redactedResult))
-                let inputJSON = (try? redactedInput.serialize(pretty: false)) ?? "{}"
                 let resultJSON = (try? redactedResult.serialize(pretty: false)) ?? "null"
                 let providerResultJSON = await ProviderToolResultProjection.project(
-                    toolName: call.name,
+                    toolName: call.internalName,
                     content: resultJSON,
                     sessionId: resolvedSession,
                     turnId: TurnTraceContext.turnId
                 )
-                do {
-                    try await appendToolMessage(
-                        sessionId: resolvedSession,
-                        runId: runId,
-                        toolName: call.name,
-                        inputJSON: inputJSON,
-                        resultSummary: resultJSON,
-                        ok: ok,
-                        cognitiveResult: ChatToolOutcome.cognitiveResult(
-                            tool: call.name,
-                            output: redactedResult
-                        ),
-                        source: surface
-                    )
-                } catch {
-                    // M2 completion (gpt-5.5 review HIGH, 2026-07-09): the sweep
-                    // fixed the structured path and missed this text-compat twin —
-                    // the same dropped-receipt silent loss, same fail-loud remedy.
-                    await Self.reportTranscriptWriteFailure(
-                        label: "appendToolMessage(\(call.name)) [text-compat]",
-                        path: self.dataRoot,
-                        error: error,
-                        userText: "Couldn't save the receipt for tool '\(call.name)' - it won't appear in the saved transcript.",
-                        onNotice: { kind, text in continuation.yield(.notice(kind: kind, text: text)) }
-                    )
-                }
                 let toolResultBlock = """
 
-                NativeAgent tool result for \(call.name):
+                NativeAgent tool result for \(call.internalName):
                 \(providerResultJSON)
                 Use this verified result. If more action is needed, emit another exact <tool_use name="...">{...}</tool_use> marker; otherwise answer the user directly.
                 """
@@ -1212,7 +1297,7 @@ extension SwiftNativeChatOrchestrationClient {
                         ))
                     }
                     nativeToolResultBlocks.append(.toolResult(
-                        toolUseId: call.id,
+                        toolUseId: call.pairedId,
                         content: providerResultJSON,
                         isError: !ok
                     ))
@@ -1222,6 +1307,10 @@ extension SwiftNativeChatOrchestrationClient {
                     currentUserMessage += toolResultBlock
                 }
             }
+            // Receipts must be durable (or their loss reported) before the
+            // next provider call — the write is off the dispatch critical
+            // path, not off the turn.
+            await receiptWriter.value
 
             var stopForNoProgress = false
             let iterationRecords = Array(dispatches[iterationDispatchStart...])
@@ -1274,7 +1363,9 @@ extension SwiftNativeChatOrchestrationClient {
             let fallback = loopRecoveryReply ?? lastProtocolViolation?.terminalReply
                 ?? ToolLoopExhaustion.fallbackReply(
                     iterationLimit: maxToolIterations,
-                    dispatchCount: dispatches.count
+                    dispatchCount: dispatches.count,
+                    providerRounds: providerCallCount,
+                    wallClockElapsedSeconds: wallClockElapsedSeconds
                 )
             let fallbackResult = TurnEngineResult(
                 reply: fallback,

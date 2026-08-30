@@ -289,7 +289,14 @@ struct SkillLifecycleView: View {
                         title: "Skills unavailable",
                         systemImage: "iphone.and.arrow.forward",
                         kind: .unavailable,
-                        description: error
+                        description: error,
+                        action: (
+                            title: "Try Again",
+                            systemImage: "arrow.clockwise",
+                            handler: {
+                                Task { await store.refresh(pairingStore: pairingStore) }
+                            }
+                        )
                     )
                 } else if filtered.isEmpty {
                     AppEmptyState(

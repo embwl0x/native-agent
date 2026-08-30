@@ -21,11 +21,10 @@ import WorkshopExecution
 import ActivityWatch
 
 private struct SwiftToolDispatcherMacControlPolicyProvider: MacControlPolicyProvider {
-    let dataRoot: URL
+    let policy: MacControlPolicy
 
     func currentPolicy() async -> MacControlPolicy? {
-        let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
-        return MacControlPolicy.fromTrustPolicyObject(policy)
+        policy
     }
 }
 
@@ -428,6 +427,11 @@ extension SwiftToolDispatcher {
     }
 
     struct FullMacToolAccess: Sendable {
+        /// The exact policy snapshot used to admit this tool call. Passing the
+        /// same snapshot into MacControl avoids reading and decoding Trust
+        /// Center a second time inside one dispatch while keeping every new
+        /// tool call sensitive to policy changes and trust-window expiry.
+        var macPolicy: MacControlPolicy
         var fullMacActive: Bool
         var fileOpsAllowed: Bool
         var systemAllowed: Bool
@@ -471,6 +475,7 @@ extension SwiftToolDispatcher {
         }
 
         return FullMacToolAccess(
+            macPolicy: macPolicy,
             fullMacActive: fullMacActive,
             fileOpsAllowed: categoryAllowed("file_ops"),
             systemAllowed: categoryAllowed("system"),
@@ -635,7 +640,7 @@ extension SwiftToolDispatcher {
             )
         }
         let impl = makeMacControl(
-            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
             auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
         )
         // Defense in depth (W2/W3-FIX): this route calls the UNPRIVILEGED
@@ -703,7 +708,7 @@ extension SwiftToolDispatcher {
             }
         }
         let impl = makeMacControl(
-            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
             auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
         )
         guard let host = impl as? MacFourVerbsHost else {
@@ -733,6 +738,22 @@ extension SwiftToolDispatcher {
                 guard verb == "scroll", let direction = str("direction") else { return verb }
                 return "scroll \(direction)"
             }()
+            if verb == "scroll", input["direction"] != nil {
+                guard let direction = str("direction"), ["up", "down", "left", "right"].contains(direction) else {
+                    throw AutonomyGateError.toolDenied(reason: "scroll direction must be up, down, left or right")
+                }
+            }
+            if input["button"] != nil, str("button") == nil {
+                throw AutonomyGateError.toolDenied(reason: "act button must be the string auto, left or right")
+            }
+            let scrollAmount: Int?
+            if input["scroll_amount"] != nil {
+                guard let value = num("scroll_amount"), value.isFinite,
+                      value.rounded() == value, (0...120).contains(value) else {
+                    throw AutonomyGateError.toolDenied(reason: "scroll_amount must be an integer from 0 to 120; 0 means default")
+                }
+                scrollAmount = Int(value)
+            } else { scrollAmount = nil }
             reply = await verbs.act(
                 verb: directedVerb,
                 target: target,
@@ -744,7 +765,9 @@ extension SwiftToolDispatcher {
                     return nil
                 },
                 interval: num("interval"),
-                holding: str("holding")
+                holding: str("holding"),
+                button: str("button"),
+                scrollAmount: scrollAmount
             )
         case "go":
             guard let name = str("name") ?? str("target") else {
@@ -767,7 +790,7 @@ extension SwiftToolDispatcher {
         if let operationId = reply.detail["operationId"] { payload["operationId"] = operationId }
         if let operationState = reply.detail["operationState"] { payload["operationState"] = operationState }
         if let verification = reply.detail["verification"] { payload["verification"] = verification }
-        if !reply.detail.isEmpty { payload["detail"] = .object(reply.detail) }
+        if !reply.agentDetail.isEmpty { payload["detail"] = .object(reply.agentDetail) }
         return .object(payload)
     }
 
@@ -796,7 +819,7 @@ extension SwiftToolDispatcher {
             )
         }
         let impl = makeMacControl(
-            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
             auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
         )
         // Same defense in depth as the app-control route: the READ tier goes
@@ -973,7 +996,7 @@ extension SwiftToolDispatcher {
             )
         }
         let impl = makeMacControl(
-            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
             auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
         )
         // `nudge` takes no parameters — the body is dropped rather than
@@ -1044,7 +1067,7 @@ extension SwiftToolDispatcher {
             )
         }
         let impl = makeMacControl(
-            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(dataRoot: dataRoot),
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
             auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
         )
         // The capability is bound to the action and to a digest of this exact

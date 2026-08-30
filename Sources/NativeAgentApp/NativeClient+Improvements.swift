@@ -644,9 +644,12 @@ extension NativeClient {
             "payload": .object(eventPayload),
             "createdAt": .string(SwiftNativeManifestSigner.isoTimestamp(Date())),
         ])
-        try await persistence.withFileLock(path) {
-            try await persistence.appendJSONL(event, to: path)
-        }
+        try await appendPathOwnedJSONL(
+            event,
+            to: path,
+            using: persistence,
+            logLabel: "NativeClient.capabilityPackTrace"
+        )
     }
 
     private static func capabilityPackInstallsPath(root: URL) -> URL {

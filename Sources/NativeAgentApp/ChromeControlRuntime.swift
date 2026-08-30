@@ -10,6 +10,7 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case disconnected
     case invalidResponse
     case requestTimedOut
+    case outcomeUnknown(action: String, reason: String)
     case socketFailure(Int32)
     case socketPathTooLong
     case relayUnavailable
@@ -22,6 +23,8 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
         case .disconnected: return "Chrome is not connected to NativeAgent."
         case .invalidResponse: return "Chrome returned an invalid control response."
         case .requestTimedOut: return "Chrome did not answer before the control deadline."
+        case .outcomeUnknown(let action, let reason):
+            return "Chrome did not confirm \(action) after dispatch. \(reason) The action may have completed; do not automatically repeat it. Observe the page before retrying."
         case .socketFailure(let code): return "Chrome control socket failed (errno \(code))."
         case .socketPathTooLong: return "Chrome control socket path is too long."
         case .relayUnavailable: return "The bundled NativeAgent Chrome relay is unavailable."
@@ -50,6 +53,14 @@ enum ChromeControlEffect: String, Sendable, CaseIterable {
         case .acquire, .navigate, .snapshot, .click, .fill, .type, .select,
              .keypress, .setChecked, .doubleClick, .wait, .scroll: true
         case .release: false
+        }
+    }
+
+    var mayChangeExternalState: Bool {
+        switch self {
+        case .snapshot, .wait: false
+        case .acquire, .navigate, .click, .fill, .type, .select, .keypress,
+             .setChecked, .doubleClick, .scroll, .release: true
         }
     }
 }
@@ -81,19 +92,31 @@ private final class ChromeSocketHandle: @unchecked Sendable {
 
 actor ChromeControlChannel {
     private struct Pending {
+        let expectedAction: ChromeControlEffect
+        let leaseID: String?
         let continuation: CheckedContinuation<JSONValue, Error>
         let timeout: Task<Void, Never>
+
+        func unconfirmedFailure(_ error: Error) -> Error {
+            guard expectedAction.mayChangeExternalState else { return error }
+            return ChromeControlRuntimeError.outcomeUnknown(
+                action: expectedAction.rawValue,
+                reason: error.localizedDescription
+            )
+        }
     }
 
     private let socket: ChromeSocketHandle
     private let framer = NativeMessagingFramer()
+    private let requestTimeout: Duration
     private var readTask: Task<Void, Never>?
     private var pending: [String: Pending] = [:]
     private var activeLeaseIDs: Set<String> = []
     private var closed = false
 
-    init(descriptor: Int32) {
+    init(descriptor: Int32, requestTimeout: Duration = .seconds(30)) {
         socket = ChromeSocketHandle(descriptor: descriptor)
+        self.requestTimeout = requestTimeout
     }
 
     func start() {
@@ -127,11 +150,16 @@ actor ChromeControlChannel {
         let data = try envelope.serializedData(pretty: false)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let timeout = Task { [weak self] in
-                    try? await Task.sleep(for: .seconds(30))
+                let timeout = Task { [weak self, requestTimeout] in
+                    try? await Task.sleep(for: requestTimeout)
                     await self?.timeoutRequest(id)
                 }
-                pending[id] = Pending(continuation: continuation, timeout: timeout)
+                pending[id] = Pending(
+                    expectedAction: action,
+                    leaseID: { if case .string(let id)? = payload["leaseId"] { id } else { nil } }(),
+                    continuation: continuation,
+                    timeout: timeout
+                )
                 do {
                     try framer.writeMessage(data, to: handle)
                 } catch {
@@ -148,21 +176,9 @@ actor ChromeControlChannel {
 
     func shutdown(releaseLeases: Bool, error: Error = ChromeControlRuntimeError.disabled) {
         guard !closed else { return }
-        if releaseLeases, let handle = socket.fileHandle() {
+        if releaseLeases {
             for leaseID in activeLeaseIDs.sorted() {
-                let envelope = JSONValue.object([
-                    "version": .int(1),
-                    "type": .string("request"),
-                    "id": .string("shutdown-\(UUID().uuidString.lowercased())"),
-                    "action": .string(ChromeControlEffect.release.rawValue),
-                    "payload": .object([
-                        "leaseId": .string(leaseID),
-                        "closeCreatedTab": .bool(false),
-                    ]),
-                ])
-                if let data = try? envelope.serializedData(pretty: false) {
-                    try? framer.writeMessage(data, to: handle)
-                }
+                sendLeaseRelease(leaseID)
             }
         }
         closed = true
@@ -178,6 +194,7 @@ actor ChromeControlChannel {
     private func receive(_ data: Data) {
         guard let value = try? JSONValue.parse(data),
               case .object(let object) = value,
+              case .int(1)? = object["version"],
               case .string(let type)? = object["type"] else {
             connectionEnded(error: ChromeControlRuntimeError.invalidResponse)
             return
@@ -187,16 +204,25 @@ actor ChromeControlChannel {
             return
         }
         guard type == "response", case .string(let id)? = object["id"],
-              let row = pending.removeValue(forKey: id) else { return }
+              let row = pending[id] else { return }
+        guard case .string(row.expectedAction.rawValue)? = object["action"],
+              case .bool(let ok)? = object["ok"],
+              (ok && object["result"] != nil && object["error"] == nil)
+                || (!ok && object["result"] == nil && object["error"] != nil) else {
+            // A response id alone is not proof that this is the effect we
+            // dispatched. Close the channel so a mismatched/replayed envelope
+            // cannot settle the wrong action or corrupt lease ownership.
+            connectionEnded(error: ChromeControlRuntimeError.invalidResponse)
+            return
+        }
+        pending.removeValue(forKey: id)
         row.timeout.cancel()
-        if case .bool(true)? = object["ok"] {
-            if case .string(let action)? = object["action"],
-               action == ChromeControlEffect.acquire.rawValue,
+        if ok {
+            if row.expectedAction == .acquire,
                case .object(let result)? = object["result"],
                case .string(let leaseID)? = result["leaseId"] {
                 activeLeaseIDs.insert(leaseID)
-            } else if case .string(let action)? = object["action"],
-                      action == ChromeControlEffect.release.rawValue,
+            } else if row.expectedAction == .release,
                       case .object(let result)? = object["result"],
                       case .string(let leaseID)? = result["leaseId"] {
                 activeLeaseIDs.remove(leaseID)
@@ -232,13 +258,37 @@ actor ChromeControlChannel {
     private func timeoutRequest(_ id: String) {
         guard let row = pending.removeValue(forKey: id) else { return }
         row.timeout.cancel()
-        row.continuation.resume(throwing: ChromeControlRuntimeError.requestTimedOut)
+        row.continuation.resume(throwing: row.unconfirmedFailure(ChromeControlRuntimeError.requestTimedOut))
     }
 
     private func cancelRequest(_ id: String) {
         guard let row = pending.removeValue(forKey: id) else { return }
         row.timeout.cancel()
+        if row.expectedAction == .type, let leaseID = row.leaseID {
+            // A delayed type action may be between characters. Revoking its
+            // lease stops the content loop without closing the user's tab.
+            sendLeaseRelease(leaseID)
+        }
+        // Task cancellation remains cancellation, not proof that a dispatched
+        // browser effect was rolled back or safe to repeat.
         row.continuation.resume(throwing: CancellationError())
+    }
+
+    private func sendLeaseRelease(_ leaseID: String) {
+        guard !closed, let handle = socket.fileHandle() else { return }
+        let envelope = JSONValue.object([
+            "version": .int(1),
+            "type": .string("request"),
+            "id": .string("cleanup-\(UUID().uuidString.lowercased())"),
+            "action": .string(ChromeControlEffect.release.rawValue),
+            "payload": .object([
+                "leaseId": .string(leaseID),
+                "closeCreatedTab": .bool(false),
+            ]),
+        ])
+        if let data = try? envelope.serializedData(pretty: false) {
+            try? framer.writeMessage(data, to: handle)
+        }
     }
 
     private func connectionEnded(error: Error) {
@@ -256,7 +306,7 @@ actor ChromeControlChannel {
         pending.removeAll()
         for row in rows {
             row.timeout.cancel()
-            row.continuation.resume(throwing: error)
+            row.continuation.resume(throwing: row.unconfirmedFailure(error))
         }
     }
 }

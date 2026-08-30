@@ -86,18 +86,10 @@ extension SwiftNativeResearchClient {
     /// So the flock is a one-sided Swift-only precaution, exactly like
     /// DispatchLedger.append. Errors propagate (see ERROR PROPAGATION note).
     private func appendEnvelope(_ envelope: JSONValue, to path: URL) async throws {
-        // A5.5(d): traces/events.jsonl is a MULTI-writer feed — the
-        // ProviderRouting LLM adapter caps it to activityEvents (5000) via
-        // appendJSONLCapped, but this trace co-writer used to append UNBOUNDED.
-        // A quiet-on-LLM but research-active install grew the file with no
-        // rotation. Match the sibling writers' 5000-line budget so every
-        // co-writer trims to the same newest-N invariant (no trim-fighting).
-        // appendJSONLCapped takes the same one-sided flock this used to.
-        try await appendJSONLCapped(
+        try await appendPathOwnedJSONL(
             envelope,
             to: path,
             using: persistence,
-            maxLines: JSONLLineCaps.activityEvents,
             logLabel: "Research.trace"
         )
     }

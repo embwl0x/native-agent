@@ -832,7 +832,10 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
           "filename": .string(attachment.name ?? URL(fileURLWithPath: path).lastPathComponent),
         ]
         if let threadId = route.threadId { input["thread_ts"] = .string(threadId) }
-        let result = try await SlackConnectorActions.uploadFile(input: input)
+        let result = try await SlackConnectorActions.uploadFile(
+          input: input,
+          dataRoot: dataRoot
+        )
         try Self.requireSlackAcceptance(result)
       case .iosBundle, .iosNotification:
         throw DeliveryError.emptyCompletion

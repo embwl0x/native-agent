@@ -18,6 +18,14 @@ private func wave3Root(_ label: String) throws -> URL {
     return root
 }
 
+private func readJSONLRows(at path: URL) throws -> [[String: Any]] {
+    let data = try Data(contentsOf: path)
+    let text = try #require(String(data: data, encoding: .utf8))
+    return try text.split(whereSeparator: \.isNewline).map { line in
+        try #require(JSONSerialization.jsonObject(with: Data(String(line).utf8)) as? [String: Any])
+    }
+}
+
 private actor SnapshotStatusTransport: DeviceSyncTransport {
     nonisolated let role: NADeviceRole = .mac
     private var failingKeys: Set<String>
@@ -125,13 +133,14 @@ struct BridgeRuntimeWave3PersistenceEvalTests {
 
         await iCloudBridge.appendChatDeliveryReceipt(
             message,
+            direction: "mac_to_ios",
             transport: "cloudkit",
             status: .acceptedByTransport,
             secret: secret,
             dataRoot: root
         )
         let path = root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl")
-        let row = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
+        let row = try #require(readJSONLRows(at: path).last)
 
         #expect(row["messageId"] as? String == "receipt-signed")
         #expect(row["transport"] as? String == "cloudkit")
@@ -168,7 +177,7 @@ struct BridgeRuntimeWave3PersistenceEvalTests {
         #expect(bridge.syncStatus == "CloudKit accepted message — waiting for iOS")
 
         let path = root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl")
-        let row = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
+        let row = try #require(readJSONLRows(at: path).last)
         #expect(row["messageId"] as? String == "chat-send-boundary")
         #expect(row["status"] as? String == "accepted_by_transport")
         #expect(row["deliveryConfirmed"] as? Bool == false)
@@ -190,9 +199,9 @@ struct BridgeRuntimeWave3PersistenceEvalTests {
             atPath: macOutbox.appendingPathComponent("chat-send-drive.json").path
         ))
         #expect(driveBridge.syncStatus == "Queued for iCloud sync — waiting for iOS")
-        let driveReceipt = try #require(JSONSerialization.jsonObject(
-            with: Data(contentsOf: driveRoot.appendingPathComponent("icloud/chat_delivery_receipts.jsonl"))
-        ) as? [String: Any])
+        let driveReceipt = try #require(readJSONLRows(
+            at: driveRoot.appendingPathComponent("icloud/chat_delivery_receipts.jsonl")
+        ).last)
         #expect(driveReceipt["status"] as? String == "queued_for_icloud_sync")
         #expect(driveReceipt["deliveryConfirmed"] as? Bool == false)
 
@@ -253,16 +262,237 @@ struct BridgeRuntimeWave3PersistenceEvalTests {
 
         await iCloudBridge.appendChatDeliveryReceipt(
             tampered,
+            direction: "mac_to_ios",
             transport: "icloud_drive",
             status: .queuedForICloudSync,
             secret: signingSecret,
             dataRoot: root
         )
         let path = root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl")
-        let row = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
+        let row = try #require(readJSONLRows(at: path).last)
 
         #expect(row["signatureVerified"] as? Bool == false)
         #expect(row["textPreview"] as? String == "changed after signing")
+    }
+
+    // app.bridges / icloud.chatDeliveryReceipts
+    @Test("verified inbound chat success records explicit ios_to_mac delivery evidence")
+    func verifiedInboundChatSuccessUsesInboundDirection() async throws {
+        let root = try wave3Root("receipt-inbound-chat")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let secret = Data(repeating: 5, count: 32)
+        let message = try BridgeMessage.make(
+            id: "inbound-chat-1",
+            sender: "ios",
+            text: "hello mac",
+            sessionID: "ios:7",
+            correlationID: "turn-7",
+            metadata: ["kind": "reply"]
+        ).signed(with: secret)
+
+        await iCloudBridge.appendInboundSuccessReceipt(
+            message,
+            transport: "cloudkit",
+            secret: secret,
+            dataRoot: root
+        )
+        let row = try #require(readJSONLRows(at: root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl")).last)
+
+        #expect(row["direction"] as? String == "ios_to_mac")
+        #expect(row["status"] as? String == "delivered_to_mac")
+        #expect(row["deliveryConfirmed"] as? Bool == true)
+        #expect(row["signatureVerified"] as? Bool == true)
+    }
+
+    // app.bridges / icloud.chatDeliveryReceipts
+    @Test("action responses persist their transport-specific mac_to_ios receipt rows")
+    func actionResponsesPersistAcrossBothDirections() async throws {
+        let root = try wave3Root("receipt-action-response")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        await iCloudBridge.appendActionResponseDeliveryReceipt(
+            response: ["status": "ok", "msgId": "action-1", "message": "saved"],
+            correlationID: "action-1",
+            transport: "cloudkit",
+            status: .acceptedByTransport,
+            dataRoot: root
+        )
+        await iCloudBridge.appendInboundActionSuccessReceipt(
+            messageID: "action-1",
+            action: "saveSettings",
+            transport: "cloudkit",
+            dataRoot: root
+        )
+        let rows = try readJSONLRows(at: root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl"))
+        let responseRow = try #require(rows.first { ($0["kind"] as? String) == "icloud_action_response" })
+        let inboundRow = try #require(rows.first {
+            ($0["kind"] as? String) == "icloud_action"
+                && ($0["direction"] as? String) == "ios_to_mac"
+        })
+
+        #expect(responseRow["direction"] as? String == "mac_to_ios")
+        #expect(responseRow["correlationId"] as? String == "action-1")
+        #expect(responseRow["deliveryConfirmed"] as? Bool == false)
+        #expect(inboundRow["messageId"] as? String == "action-1")
+        #expect(inboundRow["deliveryConfirmed"] as? Bool == true)
+    }
+
+    // app.bridges / icloud.chatDeliveryReceipts
+    @Test("peer notification confirmation upserts the existing event receipt by explicit direction")
+    func peerNotificationConfirmationUpdatesExistingReceipt() async throws {
+        let root = try wave3Root("receipt-confirmation")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let secret = Data(repeating: 4, count: 32)
+        let message = try BridgeMessage.make(
+            id: "notify-1",
+            sender: "mac",
+            text: "Heads up",
+            metadata: ["kind": "notification", "userInfo.eventId": String(repeating: "a", count: 64)]
+        ).signed(with: secret)
+
+        await iCloudBridge.appendChatDeliveryReceipt(
+            message,
+            direction: "mac_to_ios",
+            transport: "cloudkit",
+            status: .acceptedByTransport,
+            secret: secret,
+            dataRoot: root
+        )
+        let updated = await iCloudBridge.confirmChatDeliveryReceipt(
+            direction: "mac_to_ios",
+            eventID: String(repeating: "a", count: 64),
+            channel: "ios",
+            dataRoot: root
+        )
+        let rows = try readJSONLRows(at: root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl"))
+        let row = try #require(rows.last)
+
+        #expect(updated)
+        #expect(rows.count == 1)
+        #expect(row["status"] as? String == "confirmed_by_peer")
+        #expect(row["deliveryConfirmed"] as? Bool == true)
+        #expect(row["eventId"] as? String == String(repeating: "a", count: 64))
+        #expect(row["confirmationChannel"] as? String == "ios")
+    }
+
+    // app.bridges / icloud.chatDeliveryReceipts
+    @Test("peer notification confirmation rejects missing or invalid explicit direction")
+    func peerNotificationConfirmationRequiresExplicitDirection() async throws {
+        let root = try wave3Root("receipt-confirmation-invalid")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let missingDirection = await iCloudBridge.confirmChatDeliveryReceipt(
+            direction: "",
+            eventID: String(repeating: "b", count: 64),
+            channel: "ios",
+            dataRoot: root
+        )
+        let invalidEvent = await iCloudBridge.confirmChatDeliveryReceipt(
+            direction: "mac_to_ios",
+            eventID: "not-canonical",
+            channel: "ios",
+            dataRoot: root
+        )
+
+        #expect(missingDirection == false)
+        #expect(invalidEvent == false)
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl").path
+        ))
+    }
+
+    // app.bridges / icloud.chatDeliveryReceipts
+    @Test("delivery receipt cap retains the newest 500 rows across append and upsert")
+    func deliveryReceiptCapKeepsNewestRows() async throws {
+        let root = try wave3Root("receipt-cap")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let secret = Data(repeating: 6, count: 32)
+
+        for index in 0..<501 {
+            let message = try BridgeMessage.make(
+                id: "msg-\(index)",
+                sender: "mac",
+                text: "row \(index)",
+                metadata: ["kind": "notification", "userInfo.eventId": String(format: "%064d", index)]
+            ).signed(with: secret)
+            await iCloudBridge.appendChatDeliveryReceipt(
+                message,
+                direction: "mac_to_ios",
+                transport: "cloudkit",
+                status: .acceptedByTransport,
+                secret: secret,
+                dataRoot: root
+            )
+        }
+        _ = await iCloudBridge.confirmChatDeliveryReceipt(
+            direction: "mac_to_ios",
+            eventID: String(format: "%064d", 500),
+            channel: "ios",
+            dataRoot: root
+        )
+        let rows = try readJSONLRows(at: root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl"))
+
+        #expect(rows.count == 500)
+        #expect(rows.first?["messageId"] as? String == "msg-1")
+        #expect(rows.last?["messageId"] as? String == "msg-500")
+        #expect(rows.last?["deliveryConfirmed"] as? Bool == true)
+    }
+
+    // app.bridges / icloud.chatDeliveryReceipts
+    @Test("rejected CloudKit actions write their response row but never claim inbound ios_to_mac success")
+    @MainActor
+    func rejectedCloudKitActionExcludesInboundSuccessReceipt() async throws {
+        let root = try wave3Root("receipt-rejected-action")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let responses = root.appendingPathComponent("responses", isDirectory: true)
+        try FileManager.default.createDirectory(at: responses, withIntermediateDirectories: true)
+        let actionID = "11111111-1111-1111-1111-111111111111"
+
+        let action = InboxAction(
+            msgId: actionID,
+            clientId: "ios-fixture",
+            action: "getStatus",
+            payload: [:],
+            createdAt: ISO8601DateFormatter().string(from: Date()),
+            protocolVersion: 1,
+            transactionId: actionID,
+            signature: "bad-signature"
+        )
+        let actionData = try JSONEncoder().encode(action)
+        let secret = Data("cloudkit-invalid-action-fixture-secret".utf8)
+        let envelope = try BridgeMessage.make(
+            id: UUID().uuidString,
+            sender: "ios",
+            text: try #require(String(data: actionData, encoding: .utf8)),
+            metadata: ["kind": "icloud_action", "actionId": action.msgId]
+        ).signed(with: secret)
+
+        let engine = MacSyncEngine(stateDataRootOverride: root)
+        engine.responsesDir = responses
+        engine.transactionDir = root.appendingPathComponent("transactions", isDirectory: true)
+        engine._pairingSecret = secret
+        engine.pairingSecretRotationInProgress = false
+        engine.cloudKitActionStateRootOverride = root
+        engine.processedMsgIds = []
+        engine.processedMsgIdsOrdered = []
+        engine.cloudKitActionResponseSender = { _, _ in }
+
+        #expect(await engine.processCloudKitActionMessage(envelope))
+        #expect(
+            FileManager.default.fileExists(
+                atPath: responses.appendingPathComponent("\(actionID).json").path
+            )
+        )
+        let receiptsURL = root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl")
+        let rows: [[String: Any]] = if FileManager.default.fileExists(atPath: receiptsURL.path) {
+            try readJSONLRows(at: receiptsURL)
+        } else {
+            []
+        }
+        #expect(rows.contains {
+            ($0["kind"] as? String) == "icloud_action"
+                && ($0["direction"] as? String) == "ios_to_mac"
+        } == false)
     }
 
     // app.bridges / icloud.publishMobileSnapshotStatus

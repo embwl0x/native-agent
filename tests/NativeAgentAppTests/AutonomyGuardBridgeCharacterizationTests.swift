@@ -60,14 +60,58 @@ private actor AGCBridgeAllowingTrust: AutonomyResolver {
     func tools() -> [String] { observedTools }
 }
 
+private actor AGCBridgeFactoryTrace {
+    private var events: [String] = []
+
+    func record(_ event: String) {
+        events.append(event)
+    }
+
+    func snapshot() -> [String] { events }
+}
+
+private struct AGCBridgeFactoryInner: ToolDispatchClient {
+    let trace: AGCBridgeFactoryTrace
+
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        await trace.record("inner:\(tool)")
+        return .object(["status": .string("reached_inner")])
+    }
+
+    func listAvailableTools() async throws -> [String] {
+        ["mobile.notify", "read_file", "mcp__broker__place_equity_order"]
+    }
+
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] { [] }
+}
+
+private actor AGCBridgeFactoryTrust: AutonomyResolver {
+    let trace: AGCBridgeFactoryTrace
+
+    init(trace: AGCBridgeFactoryTrace) {
+        self.trace = trace
+    }
+
+    func autonomyLevel(forTool toolName: String, surface: String) async throws -> String {
+        await trace.record("trust:\(toolName)")
+        return "auto"
+    }
+}
+
 @Suite("AutonomyGuardBridge characterization")
 struct AutonomyGuardBridgeCharacterizationTests {
 
     @Test func sharedBridgeFactoryKeepsMCPDenialOutsideThePolicyOracle() async throws {
-        let inner = AGCBridgeReachInner()
-        let trust = AGCBridgeAllowingTrust()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bridge-factory-boundary-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let trace = AGCBridgeFactoryTrace()
+        let inner = AGCBridgeFactoryInner(trace: trace)
+        let trust = AGCBridgeFactoryTrust(trace: trace)
         let tools = makeNativeAgentBridgeToolDispatchClient(
-            baseTools: inner,
+            appInnerTools: inner,
+            dataRoot: root,
             trust: trust
         )
 
@@ -78,8 +122,22 @@ struct AutonomyGuardBridgeCharacterizationTests {
                 surface: "claude-bridge"
             )
         }
-        #expect(await trust.tools().isEmpty)
-        #expect(inner.dispatched.isEmpty)
+        #expect(await trace.snapshot().isEmpty)
+
+        // Synthetic roots have no Mac/iPhone body. Reaching this refusal proves
+        // the bridge factory retained AppChatToolDispatcher around the injected
+        // fake instead of substituting the fake above that composition seam.
+        let bodyUnavailable = try await tools.dispatch(
+            tool: "mobile.notify",
+            input: ["message": .string("must not notify")],
+            surface: "claude-bridge"
+        )
+        guard case .object(let unavailableObject) = bodyUnavailable else {
+            Issue.record("expected canonical-body refusal")
+            return
+        }
+        #expect(unavailableObject["reason"] == .string("canonical_body_unavailable"))
+        #expect(await trace.snapshot() == ["trust:mobile.notify"])
 
         let result = try await tools.dispatch(
             tool: "read_file",
@@ -87,8 +145,11 @@ struct AutonomyGuardBridgeCharacterizationTests {
             surface: "claude-bridge"
         )
         #expect(result == .object(["status": .string("reached_inner")]))
-        #expect(await trust.tools() == ["read_file"])
-        #expect(inner.dispatched == ["read_file"])
+        #expect(await trace.snapshot() == [
+            "trust:mobile.notify",
+            "trust:read_file",
+            "inner:read_file",
+        ])
     }
 
     /// The external MCP namespace the bridge must DENY — the third-party /

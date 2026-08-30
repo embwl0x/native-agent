@@ -284,6 +284,178 @@ struct ChatSessionRetentionTests {
         #expect(!kept.joined().contains("\"a-0\""))
     }
 
+    // F6 (2026-08-28): orphaned chat/session_state/<id>/ dirs are pruned on
+    // the archive-prune pass — no live index row AND nothing written for 30
+    // days. Derived state only; transcripts live elsewhere and are untouched.
+    @Test func sessionStatePrune_removesAgedOrphanKeepsLiveRecentAndTouched() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = try date("2026-08-28T12:00:00Z")
+        let old = now.addingTimeInterval(
+            -(ChatSessionRetention.sessionStateRetentionSeconds + 86_400)
+        )
+
+        try writeSessions(root: root, rows: [
+            session("live", updatedAt: "2026-08-27T12:00:00Z", messageCount: 2),
+        ])
+        // Live session: kept even though its state is old — liveness wins.
+        let liveDir = try makeStateDir(root: root, id: "live", mtime: old)
+        let agedOrphan = try makeStateDir(root: root, id: "aged-orphan", mtime: old)
+        let freshOrphan = try makeStateDir(
+            root: root, id: "fresh-orphan", mtime: now.addingTimeInterval(-3_600)
+        )
+        // Orphan whose dir is old but a child was written recently: kept —
+        // the newest mtime across dir and children decides.
+        let touchedOrphan = try makeStateDir(
+            root: root, id: "touched-orphan", mtime: old,
+            childMtime: now.addingTimeInterval(-3_600)
+        )
+
+        _ = try ChatSessionRetention.enforce(dataRoot: root, now: now)
+
+        let fm = FileManager.default
+        #expect(fm.fileExists(atPath: liveDir.path), "live session state must survive")
+        #expect(!fm.fileExists(atPath: agedOrphan.path), "aged orphan must be removed")
+        #expect(fm.fileExists(atPath: freshOrphan.path), "recent orphan must be kept")
+        #expect(fm.fileExists(atPath: touchedOrphan.path), "recently written orphan must be kept")
+    }
+
+    @Test func sessionStatePrune_failsClosedWhenLiveIndexIsMissingOrMalformed() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = try date("2026-08-28T12:00:00Z")
+        let old = now.addingTimeInterval(
+            -(ChatSessionRetention.sessionStateRetentionSeconds + 86_400)
+        )
+        let agedOrphan = try makeStateDir(root: root, id: "aged-orphan", mtime: old)
+
+        // No sessions.json at all: nothing may be treated as an orphan.
+        _ = try ChatSessionRetention.enforce(dataRoot: root, now: now)
+        #expect(FileManager.default.fileExists(atPath: agedOrphan.path))
+
+        // Malformed sessions.json: enforce throws, and the prune (which ran
+        // first) must still have refused to treat the dir as an orphan.
+        let sessionsPath = sessionsPath(root: root)
+        try FileManager.default.createDirectory(
+            at: sessionsPath.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("not valid json".utf8).write(to: sessionsPath)
+        let later = now.addingTimeInterval(ChatSessionRetention.pruneMinIntervalSeconds + 60)
+        #expect(throws: (any Error).self) {
+            _ = try ChatSessionRetention.enforce(dataRoot: root, now: later)
+        }
+        #expect(FileManager.default.fileExists(atPath: agedOrphan.path))
+    }
+
+    @Test func sessionStatePrune_boundsRemovalsPerPass() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = try date("2026-08-28T12:00:00Z")
+        let old = now.addingTimeInterval(
+            -(ChatSessionRetention.sessionStateRetentionSeconds + 86_400)
+        )
+        try writeSessions(root: root, rows: [
+            session("live", updatedAt: "2026-08-27T12:00:00Z", messageCount: 2),
+        ])
+        let overflow = 10
+        for i in 0..<(ChatSessionRetention.sessionStatePruneMaxPerPass + overflow) {
+            _ = try makeStateDir(root: root, id: "orphan-\(i)", mtime: old)
+        }
+
+        _ = try ChatSessionRetention.enforce(dataRoot: root, now: now)
+        #expect(sessionStateDirCount(root: root) == overflow, "one pass removes at most the bound")
+
+        // Next pass (outside the prune throttle window) clears the remainder.
+        let later = now.addingTimeInterval(ChatSessionRetention.pruneMinIntervalSeconds + 60)
+        _ = try ChatSessionRetention.enforce(dataRoot: root, now: later)
+        #expect(sessionStateDirCount(root: root) == 0)
+    }
+
+    @Test func bestEffortLogsFailureInsteadOfSwallowingIt() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessionsPath = sessionsPath(root: root)
+        try FileManager.default.createDirectory(
+            at: sessionsPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("not valid json".utf8).write(to: sessionsPath)
+
+        final class LogBox: @unchecked Sendable {
+            var lines: [String] = []
+        }
+        let box = LogBox()
+        let report = ChatSessionRetention.enforceBestEffort(
+            dataRoot: root,
+            now: try date("2026-06-16T12:00:00Z"),
+            context: "ChatSessionRetentionTests.bestEffort",
+            failureLogger: { box.lines.append($0) }
+        )
+
+        #expect(report == nil)
+        #expect(box.lines.count == 1)
+        let line = try #require(box.lines.first)
+        #expect(line.contains("ChatSessionRetentionTests.bestEffort"))
+        #expect(line.contains("ChatSessionRetention.enforce failed"))
+        #expect(line.contains(root.path))
+    }
+
+    @Test func currentSwallowSitesUseBestEffortHelper() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sites: [(path: String, calls: Int, contexts: [String])] = [
+            (
+                "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+MessagePersistence.swift",
+                1,
+                ["ChatOrchestrationClient.syncSessionIndex"]
+            ),
+            (
+                "Modules/NativeAgentCore/Sources/TelegramBot/TelegramSessionStore.swift",
+                2,
+                ["TelegramSessionStore.ensureSessionRow", "TelegramSessionStore.patchSessionRow"]
+            ),
+            (
+                "Sources/NativeAgentApp/SlackSocketModeLoop.swift",
+                1,
+                ["SlackSocketModeLoop.ensureSessionRow"]
+            ),
+            (
+                "Sources/NativeAgentApp/NativeClient+ProviderTelegramSessions.swift",
+                1,
+                ["NativeClient.createChatSession"]
+            ),
+            (
+                "Sources/NativeAgentApp/AppDelegate+ICloudRuntimeForwarding.swift",
+                1,
+                ["AppDelegate.upsertMobileChatSessionRow"]
+            ),
+        ]
+        for site in sites {
+            let source = try String(
+                contentsOf: repoRoot.appendingPathComponent(site.path),
+                encoding: .utf8
+            )
+            let helperCalls = source.components(
+                separatedBy: "ChatSessionRetention.enforceBestEffort("
+            ).count - 1
+            #expect(
+                helperCalls == site.calls,
+                "\(site.path) must route all \(site.calls) swallowed calls through the logging helper"
+            )
+            #expect(
+                !source.contains("try? ChatSessionRetention.enforce"),
+                "\(site.path) must not silently swallow retention throws"
+            )
+            for context in site.contexts {
+                #expect(source.contains("context: \"\(context)\""))
+            }
+        }
+    }
+
     // MARK: - LEDGER: core.persistence.ChatSessionRetention.transcriptLockOrphaning
     //
     // THE LEAK. `withBoundedTranscriptLock` (ChatSessionRetention.swift:390) is a
@@ -419,6 +591,38 @@ struct ChatSessionRetentionTests {
             options: [.skipsHiddenFiles]
         )) ?? []
         return entries.filter { $0.pathExtension == "lock" }.sorted { $0.path < $1.path }
+    }
+
+    /// Creates `chat/session_state/<id>/` with a digest child, then pins the
+    /// child's and (last, so the file writes don't refresh it) the dir's mtime.
+    private func makeStateDir(
+        root: URL,
+        id: String,
+        mtime: Date,
+        childMtime: Date? = nil
+    ) throws -> URL {
+        let dir = root
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("session_state", isDirectory: true)
+            .appendingPathComponent(id, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let digest = dir.appendingPathComponent("digest.txt")
+        try "digest".write(to: digest, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: childMtime ?? mtime], ofItemAtPath: digest.path
+        )
+        try FileManager.default.setAttributes([.modificationDate: mtime], ofItemAtPath: dir.path)
+        return dir
+    }
+
+    private func sessionStateDirCount(root: URL) -> Int {
+        let stateDir = root
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("session_state", isDirectory: true)
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: stateDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        )) ?? []
+        return entries.filter { $0.lastPathComponent.hasPrefix("orphan-") }.count
     }
 
     private func makeTempRoot() throws -> URL {

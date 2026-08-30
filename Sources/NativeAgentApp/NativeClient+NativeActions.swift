@@ -70,13 +70,15 @@ extension NativeClient {
         let result = try await Self.dispatchNativeAction(
             tool: actionId,
             input: Self.jsonValueBody(input),
-            dryRun: dryRun
+            dryRun: dryRun,
+            dataRoot: dataRootOverride
         )
         return try await Self.appendNativeActionReceipt(
             action: action,
             status: result.status,
             dryRun: dryRun,
-            output: Self.dispatchResultJSON(result)
+            output: Self.dispatchResultJSON(result),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 
@@ -221,18 +223,31 @@ extension NativeClient {
     static func dispatchNativeAction(
         tool: String,
         input: [String: JSONValue],
-        dryRun: Bool
+        dryRun: Bool,
+        dataRoot: URL? = nil
     ) async throws -> Dispatcher.DispatchResult {
-        let dispatcher = makeDispatcher(localActions: swiftNativeDispatcherActions())
-        let ctx = try strictDispatchContextForTool(tool, surface: "native_actions")
+        let ledger = DispatchLedger(ledgerPath: DispatchLedger.defaultLedgerPath(
+            dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
+        ))
+        let dispatcher = makeDispatcher(ledger: ledger, localActions: swiftNativeDispatcherActions())
+        let ctx = try strictDispatchContextForTool(tool, surface: "native_actions", dataRoot: dataRoot)
         return try await dispatcher.dispatch(tool: tool, input: input, ctx: ctx, dryRun: dryRun)
     }
 
-    static func strictDispatchContextForTool(_ tool: String, surface: String) throws -> DispatchContext {
+    static func strictDispatchContextForTool(_ tool: String, surface: String, dataRoot: URL? = nil) throws -> DispatchContext {
         guard tool == "read_file" || tool == "file_excerpt" else {
-            return DispatchContext.defaultForSurface(surface)
+            var context = DispatchContext.defaultForSurface(surface)
+            // Ordinary clients retain the established persona/workspace
+            // resolver. Only an explicit isolated root overrides those reads.
+            if let dataRoot {
+                context.extra["_na_data_root"] = .string(dataRoot.path)
+                context.extra["_na_workspace_root"] = .string(
+                    NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot, environment: [:]).path
+                )
+            }
+            return context
         }
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = dataRoot ?? PersistenceCore.defaultDataRoot()
         guard let repoRootURL = PersistenceCore.resolveSandboxRepoRoot(dataRoot: dataRoot) else {
             throw NSError(domain: "NativeAgentNativeActions", code: 403, userInfo: [
                 NSLocalizedDescriptionKey: "Cannot run \(tool): Swift file sandbox root is unavailable"
@@ -282,7 +297,8 @@ extension NativeClient {
             action: action,
             status: dryRun ? "dry_run" : run.status,
             dryRun: dryRun,
-            output: output
+            output: output,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 

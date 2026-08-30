@@ -123,7 +123,7 @@ enum NativeAgentNotificationLaunchIntent {
 
     /// Allowed screen values that route to a top-level tab.
     static let allowedScreens: Set<String> = [
-        "activity", "approvals", "inbox", "chat", "memories", "skills", "more",
+        "activity", "approvals", "inbox", "chat", "memories", "desk", "skills", "more",
         "mac_integration", "macintegration", "mac-integration",
     ]
 
@@ -383,6 +383,12 @@ struct NativeAgentMobileApp: App {
                         .environment(voiceInput)
                         .environmentObject(voiceOutput)
                         .onAppear {
+                            // E8: durable queued sends resume themselves when
+                            // the phone's network path returns, instead of
+                            // waiting for the user to notice and retry.
+                            bridgeClient.onNetworkPathRestored = { [weak chatStore] in
+                                chatStore?.resumeQueuedSends()
+                            }
                             configureNotifications()
                             configureTransport()
                             checkLaunchArgsForTestSend()
@@ -767,7 +773,7 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
             actionIdentifier: response.actionIdentifier
         ) else { return }
         // F7: route per notification payload's `screen` field instead of always
-        // landing on Activity. Allowed values: activity, chat, memories, skills, more.
+        // landing on Activity. Allowed values: activity, chat, memories, desk, skills, more.
         let screen = NativeAgentRemoteNotificationPayload.string(
             directKey: "screen",
             cloudKitRecordKey: "notificationScreen",

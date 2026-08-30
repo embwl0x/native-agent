@@ -234,9 +234,25 @@ public let memorySupersessionCosineFloor: Double = 0.55
 /// Kinds absent from this table — identity/relationship/preference AND
 /// nil/legacy — are exempt (factor 1.0): decay only acts on data that carries
 /// the volatile-class kind signal.
+/// Long-lived-but-not-permanent kinds decay too, just much slower: a decision
+/// or an incident stays relevant for months, not forever, so 180d lets a fresh
+/// one outrank a stale one without ever pushing it out of reach. NOTE: the
+/// STAMP path can't mint these kinds (`MemoryKindStamp.taxonomy` lacks them),
+/// but rows written with explicit metadata already carry them (29 live rows
+/// as of 2026-08-28) — the entries are live for those, not inert.
 public let memoryDecayHalfLifeDays: [String: Double] = [
     "volatile": 60, "project": 60, "operational": 60,
+    "decision": 180, "note": 180, "incident": 180,
 ]
+
+/// Bounded use-frequency nudge applied to the recall score. `recordRecallHits`
+/// bumps `use_count` on every recall, so this term FEEDS BACK on itself — a row
+/// that surfaces once scores fractionally higher next time. The log scale plus
+/// a HARD cap is the entire safety: at most +10%, and only around ~100 recalls,
+/// which can reorder near-ties but never promote a row past a materially better
+/// match. Deliberately well under the lexical boost (0.25).
+public let memoryUseCountBoostCap: Double = 0.10
+public let memoryUseCountBoostWeight: Double = 0.05
 
 /// Additive lexical boost used by hybrid recall. The base dense cosine remains
 /// intact, then normalized BM25 can add up to this amount before kind-recency
@@ -278,10 +294,65 @@ public enum MemoryRecallScoring {
         return pow(0.5, ageDays / halfLifeDays)
     }
 
+    /// Age is a bounded ranking preference, not evidence that an active fact
+    /// stopped being true. Keep at least 90% of relevance even after many
+    /// half-lives; lifecycle/supersession owns invalidation. Fresh near-ties
+    /// still win without burying an old direct answer under newer tangents.
+    public static func recallRecencyFactor(kind: String?, updatedAt: String, now: Date = Date()) -> Double {
+        0.9 + 0.1 * decayFactor(kind: kind, updatedAt: updatedAt, now: now)
+    }
+
+    /// Multiplier in [1, 1 + memoryUseCountBoostCap]: log10-scaled use count,
+    /// hard-capped. Zero/negative counts return exactly 1.0, so an unused row
+    /// is never penalised — the term only ever nudges upward, bounded.
+    public static func useCountFactor(_ useCount: Int64) -> Double {
+        guard useCount > 0 else { return 1.0 }
+        let raw = log10(1 + Double(useCount)) * memoryUseCountBoostWeight
+        return 1 + min(memoryUseCountBoostCap, raw)
+    }
+
     /// Extract the kind stamped by the #1 signal-carry (metadata.kind).
     public static func kind(of metadata: JSONValue?) -> String? {
         guard case .object(let obj)? = metadata, case .string(let k)? = obj["kind"] else { return nil }
         return k.isEmpty ? nil : k
+    }
+
+    /// The same bounded hint-share policy serves the storage candidate window
+    /// and the final post-disclosure result window. A widened retrieval window
+    /// is not the user's requested top-K, so the latter must enforce it again.
+    static func selectRecallResults<Candidates: Sequence>(
+        from candidates: Candidates,
+        limit: Int,
+        isSkillHint: (Candidates.Element) -> Bool
+    ) -> [Candidates.Element] {
+        let cappedLimit = max(0, limit)
+        guard cappedLimit > 0 else { return [] }
+        // Skills are discovery hints, not the answer corpus. Preserve the
+        // existing one-third share while filling scarce-fact / skill-only
+        // results from deferred hints rather than losing discovery entirely.
+        let preferredSkillLimit = cappedLimit == 1 ? 1 : max(1, cappedLimit / 3)
+        var out: [Candidates.Element] = []
+        var deferredSkills: [Candidates.Element] = []
+        var skillCount = 0
+        for candidate in candidates {
+            let skill = isSkillHint(candidate)
+            if skill, skillCount >= preferredSkillLimit {
+                deferredSkills.append(candidate)
+                continue
+            }
+            out.append(candidate)
+            if skill { skillCount += 1 }
+            if out.count >= cappedLimit { break }
+        }
+        if out.count < cappedLimit {
+            out.append(contentsOf: deferredSkills.prefix(cappedLimit - out.count))
+        }
+        return out
+    }
+
+    static func isSkillRecallHint(id: String, kind: String?) -> Bool {
+        id.hasPrefix("skill-pointer:")
+            || kind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "skill"
     }
 
     public static func lexicalTokens(_ text: String) -> [String] {
@@ -289,7 +360,7 @@ public enum MemoryRecallScoring {
             .split { character in
                 !(character.isLetter || character.isNumber)
             }
-            .map(String.init)
+            .map { RecallLexicalNormalization.term(String($0)) }
             .filter { !$0.isEmpty }
     }
 
@@ -367,6 +438,10 @@ public struct MemoryPatch: Sendable {
     public var observedAt: String?
     public var evidence: JSONValue?
     public var metadata: JSONValue?
+    /// Keys merged into the row's current metadata inside the same SQLite
+    /// transaction as the rest of the patch. Narrow metadata updates use this
+    /// so a bridge-side read/replace cannot overwrite a concurrent owner write.
+    public var metadataMerge: [String: JSONValue]?
 
     public init(
         content: String? = nil,
@@ -380,7 +455,8 @@ public struct MemoryPatch: Sendable {
         validTo: String? = nil,
         observedAt: String? = nil,
         evidence: JSONValue? = nil,
-        metadata: JSONValue? = nil
+        metadata: JSONValue? = nil,
+        metadataMerge: [String: JSONValue]? = nil
     ) {
         self.content = content
         self.source = source
@@ -394,6 +470,7 @@ public struct MemoryPatch: Sendable {
         self.observedAt = observedAt
         self.evidence = evidence
         self.metadata = metadata
+        self.metadataMerge = metadataMerge
     }
 }
 
@@ -490,8 +567,13 @@ public actor MemoryStorage {
     private var replayedStartupSpotlightProjection = false
     private var replayedStartupKnowledgeGraphProjection = false
     private var userMDGenerator: UserMDGenerator?
-    private var spotlightHook: (@Sendable (StoredMemory, Bool) -> Void)?
-    private var knowledgeGraphHook: (@Sendable (StoredMemory, Bool) -> Void)?
+    private var spotlightHook: (@Sendable (StoredMemory, Bool) async -> Void)?
+    private var knowledgeGraphHook: (@Sendable (StoredMemory, Bool) async -> Void)?
+    /// Ordered, bounded projection lanes. Canonical SQLite mutations enter this
+    /// actor in order; each lane preserves that order across asynchronous index
+    /// I/O so a late update cannot land after a newer delete and resurrect it.
+    private var spotlightProjectionTail: Task<Void, Never>?
+    private var knowledgeGraphProjectionTail: Task<Void, Never>?
 
     // MARK: - R5 fast recall: in-actor candidate cache + data_version net
     //
@@ -550,22 +632,26 @@ public actor MemoryStorage {
     /// Install a Spotlight-index hook. Fires for every insert/update/
     /// acceptProposal/archive/delete with `deleted` derived from final row
     /// projection eligibility.
-    public func attachSpotlightHook(_ hook: @escaping @Sendable (StoredMemory, Bool) -> Void) {
+    public func attachSpotlightHook(
+        _ hook: @escaping @Sendable (StoredMemory, Bool) async -> Void
+    ) {
         self.spotlightHook = hook
         if !replayedStartupSpotlightProjection {
             replayedStartupSpotlightProjection = true
-            for evicted in startupBoundEvictions { hook(evicted, true) }
+            for evicted in startupBoundEvictions { pokeSpotlight(evicted, deleted: true) }
         }
     }
 
     /// Install a Knowledge Graph indexing hook. Fires for every insert/update/
     /// acceptProposal/archive/delete with `deleted` derived from final row
     /// projection eligibility.
-    public func attachKnowledgeGraphHook(_ hook: @escaping @Sendable (StoredMemory, Bool) -> Void) {
+    public func attachKnowledgeGraphHook(
+        _ hook: @escaping @Sendable (StoredMemory, Bool) async -> Void
+    ) {
         self.knowledgeGraphHook = hook
         if !replayedStartupKnowledgeGraphProjection {
             replayedStartupKnowledgeGraphProjection = true
-            for evicted in startupBoundEvictions { hook(evicted, true) }
+            for evicted in startupBoundEvictions { pokeKnowledgeGraph(evicted, deleted: true) }
         }
     }
 
@@ -575,11 +661,31 @@ public actor MemoryStorage {
     }
 
     private func pokeSpotlight(_ stored: StoredMemory, deleted: Bool) {
-        spotlightHook?(stored, deleted)
+        guard let hook = spotlightHook else { return }
+        let prior = spotlightProjectionTail
+        spotlightProjectionTail = Task {
+            await prior?.value
+            await hook(stored, deleted)
+        }
     }
 
     private func pokeKnowledgeGraph(_ stored: StoredMemory, deleted: Bool) {
-        knowledgeGraphHook?(stored, deleted)
+        guard let hook = knowledgeGraphHook else { return }
+        let prior = knowledgeGraphProjectionTail
+        knowledgeGraphProjectionTail = Task {
+            await prior?.value
+            await hook(stored, deleted)
+        }
+    }
+
+    /// Wait through every projection scheduled before this call. New canonical
+    /// mutations may enqueue later work while the actor is suspended; those
+    /// belong to a later flush boundary.
+    func flushProjectionHooks() async {
+        let spotlight = spotlightProjectionTail
+        let knowledgeGraph = knowledgeGraphProjectionTail
+        await spotlight?.value
+        await knowledgeGraph?.value
     }
 
     private func pokeDerivedState(_ stored: StoredMemory, deleted: Bool) async {
@@ -587,6 +693,7 @@ public actor MemoryStorage {
             namespace: "memory-v2",
             stableID: stored.id,
             operation: deleted ? .removed : .changed,
+            canonicalLocator: path.standardizedFileURL.path,
             reason: deleted ? "memory_projection_removed" : "memory_projection_changed"
         )
         await DerivedStateInvalidationCenter.shared.publish(change)
@@ -620,6 +727,7 @@ public actor MemoryStorage {
             try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
         }
         let pool = try DatabasePool(path: path.path, configuration: config)
+        try Self.adoptLedgerlessGraphStoreIfNeeded(pool)
         try MemoryStorage.migrator.migrate(pool)
         try pool.read { db in
             try Self.requireSemanticIntegrity(in: db)
@@ -670,6 +778,51 @@ public actor MemoryStorage {
     }
 
     // MARK: - Migrator
+
+    /// One-time adoption of stores poisoned by the pre-2026-08-27 graph-first
+    /// bug (stable-failure #4 / Desk 751.7): the KnowledgeGraph side could
+    /// create memory.sqlite itself — kg tables present, zero grdb_migrations
+    /// rows — and replaying v2_knowledge_graph against those tables bricked
+    /// the whole migration chain on the next open. Stamp v2 as applied ONLY
+    /// when the ledger has no applied migrations, the memories table is absent
+    /// (v1 never ran, so this cannot be a real migrated store), and both kg
+    /// tables match the v2 shape column-for-column. Any other shape is left
+    /// untouched so migrate() fails loud rather than guessing (gpt-5.5 review
+    /// 2026-08-27: stamp only on exact match, otherwise stay loud).
+    private static func adoptLedgerlessGraphStoreIfNeeded(_ pool: DatabasePool) throws {
+        try pool.write { db in
+            let applied = (try? Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM grdb_migrations")) ?? 0
+            guard applied == 0 else { return }
+            guard try !db.tableExists("memories"),
+                  try db.tableExists("kg_entities"),
+                  try db.tableExists("kg_relationships") else { return }
+            func columns(_ table: String) throws -> [String] {
+                try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
+                    .compactMap { $0["name"] as String? }
+            }
+            let v2Entities = [
+                "id", "name", "type", "summary", "aliases_json",
+                "mention_count", "first_seen", "last_seen",
+                "provenance", "metadata_json",
+            ]
+            let v2Relationships = [
+                "id", "from_id", "to_id", "type", "weight",
+                "mention_count", "provenance", "metadata_json",
+            ]
+            guard try columns("kg_entities") == v2Entities,
+                  try columns("kg_relationships") == v2Relationships else { return }
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS grdb_migrations (
+                  identifier TEXT NOT NULL PRIMARY KEY
+                )
+                """)
+            try db.execute(sql: """
+                INSERT OR IGNORE INTO grdb_migrations (identifier)
+                VALUES ('v2_knowledge_graph')
+                """)
+        }
+    }
 
     private static var migrator: DatabaseMigrator {
         var m = DatabaseMigrator()
@@ -826,6 +979,25 @@ public actor MemoryStorage {
                 CREATE INDEX idx_memories_valid_from ON memories(valid_from);
                 CREATE INDEX idx_memories_valid_to ON memories(valid_to);
                 CREATE INDEX idx_memories_observed_at ON memories(observed_at);
+            """)
+        }
+        // v8 (2026-08-27): adopt kg_memory_index into the migrator, making the
+        // migration lineage the SINGLE owner of every kg_* table. This table
+        // was historically created only by the KnowledgeGraph side's
+        // ensureSchema, which also let a graph-first open mint a memory.sqlite
+        // with an empty grdb_migrations ledger — the next MemoryStorage init
+        // then replayed v2 against existing tables and bricked the chain
+        // (stable-failure #4 / Desk 751.7). IF NOT EXISTS here is a one-time
+        // ADOPTION of live stores that already carry the hand-created table;
+        // the KnowledgeGraph side now verifies schema and never creates it.
+        m.registerMigration("v8_kg_memory_index") { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS kg_memory_index (
+                  memory_id TEXT PRIMARY KEY,
+                  content_hash TEXT NOT NULL,
+                  indexed_at TEXT NOT NULL,
+                  index_version TEXT NOT NULL
+                );
             """)
         }
         return m
@@ -1087,6 +1259,7 @@ public actor MemoryStorage {
                     namespace: "memory-v2",
                     stableID: memory.id,
                     operation: .removed,
+                    canonicalLocator: memoryPath.standardizedFileURL.path,
                     reason: "memory_capacity_evicted_on_open"
                 ))
             }
@@ -1204,6 +1377,12 @@ public actor MemoryStorage {
             if let observedAt = patch.observedAt { existing.observedAt = observedAt }
             if let evidence = patch.evidence { existing.evidence = evidence }
             if let m = patch.metadata { existing.metadata = m }
+            if let merge = patch.metadataMerge, !merge.isEmpty {
+                var metadata: [String: JSONValue] = [:]
+                if case .object(let current)? = existing.metadata { metadata = current }
+                for (key, value) in merge { metadata[key] = value }
+                existing.metadata = .object(metadata)
+            }
             existing.updatedAt = Self.nowISO8601()
             try Self.validateTemporalEvidence(existing)
             try Self.requireWritableEpoch(
@@ -1423,15 +1602,20 @@ public actor MemoryStorage {
             let lexicalBoost = (idx < lexicalScores.count)
                 ? memoryBM25LexicalBoost * lexicalScores[idx]
                 : 0
-            // Wave1 D-lane: kind-scoped recency decay — RANK only, inside the
-            // scan that already runs (zero added read cost). Exempt kinds and
-            // legacy nil-kind records get factor 1.0 (unchanged behavior).
-            let decay = MemoryRecallScoring.decayFactor(
+            // Recency may break near-ties, never erase semantic relevance.
+            // Exempt kinds and legacy nil-kind records retain factor 1.0.
+            let decay = MemoryRecallScoring.recallRecencyFactor(
                 kind: MemoryRecallScoring.kind(of: m.metadata),
                 updatedAt: m.updatedAt,
                 now: now
             )
-            scored.append((m, (sim + lexicalBoost) * decay * MemoryLifecycle.rankingFactor(m.lifecycle)))
+            scored.append((
+                m,
+                (sim + lexicalBoost)
+                    * decay
+                    * MemoryLifecycle.rankingFactor(m.lifecycle)
+                    * MemoryRecallScoring.useCountFactor(m.useCount)
+            ))
         }
         scored.sort { $0.1 > $1.1 }
         return Self.uniqueRecallResults(scored, limit: topK)
@@ -1474,7 +1658,11 @@ public actor MemoryStorage {
                 sql += " AND persona_id = ?"
                 arguments.append(persona)
             }
-            let likeClauses = tokens.map { _ in "content LIKE ? ESCAPE '\\'" }
+            // SQLite LIKE folds only ASCII case, while lexicalTokens and
+            // BM25 use Swift Unicode lowercasing. GRDB installs this exact
+            // String.lowercased() function on every database connection.
+            // Match the scorer before the existing bounded candidate cutoff.
+            let likeClauses = tokens.map { _ in "swiftLowercaseString(content) LIKE ? ESCAPE '\\'" }
             sql += " AND (" + likeClauses.joined(separator: " OR ") + ")"
             for token in tokens {
                 arguments.append("%" + Self.escapedLikePattern(token) + "%")
@@ -1497,14 +1685,18 @@ public actor MemoryStorage {
         for (idx, memory) in candidates.enumerated() {
             let lexical = idx < lexicalScores.count ? lexicalScores[idx] : 0
             guard lexical > 0 else { continue }
-            let decay = MemoryRecallScoring.decayFactor(
+            let decay = MemoryRecallScoring.recallRecencyFactor(
                 kind: MemoryRecallScoring.kind(of: memory.metadata),
                 updatedAt: memory.updatedAt,
                 now: now
             )
-            scored.append(
-                (memory, lexical * decay * MemoryLifecycle.rankingFactor(memory.lifecycle))
-            )
+            scored.append((
+                memory,
+                lexical
+                    * decay
+                    * MemoryLifecycle.rankingFactor(memory.lifecycle)
+                    * MemoryRecallScoring.useCountFactor(memory.useCount)
+            ))
         }
         scored.sort { $0.1 > $1.1 }
         return Self.uniqueRecallResults(scored, limit: topK)
@@ -1654,10 +1846,24 @@ public actor MemoryStorage {
             guard proposal.status == "pending" else {
                 throw MemoryStorageError.alreadyResolved(id)
             }
+            // Recheck the exact denylist inside the admission transaction.
+            // A tombstone can arrive after the caller's earlier check, and
+            // embeddingless legacy claims cannot rely on the semantic gate.
+            let exactTombstone = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM tombstones WHERE content_hash = ?",
+                arguments: [Self.contentHash(proposal.content)]
+            ) ?? 0 > 0
+            if exactTombstone {
+                try db.execute(sql: """
+                    UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
+                    WHERE id = ?
+                """, arguments: [Self.nowISO8601(), "tombstoned: exact match to a rejected claim", id])
+                return .tombstoned
+            }
             // Semantic tombstone gate at acceptance, in the SAME transaction
             // (wave1 T3): a proposal that paraphrases a tombstoned claim must
             // not promote even if its exact hash differs. Legacy/no-embedding
-            // proposals skip (the exact-hash gate upstream still covers them).
+            // proposals skip (the transaction's exact-hash gate covers them).
             if let pe = proposal.embedding,
                try Self.tombstoneMatch(
                    db: db,
@@ -1795,10 +2001,21 @@ public actor MemoryStorage {
     /// untouched — lifecycle is the single source of correction state, and
     /// correction is demotion, not erasure (same canon as supersession).
     /// Conditional on the row being active and not already lifecycle-terminal;
-    /// returns false when there was nothing eligible to correct.
+    /// returns false when either endpoint is no longer eligible.
     @discardableResult
     public func markCorrected(id: String, by newerId: String, reason: String? = nil) async throws -> Bool {
+        // A deduplicated reassertion can resolve to the original record. It
+        // must not retire that sole fact or create a self-referential lineage.
+        guard id != newerId else { return false }
         let correctedRow = try await dbPool.write { db -> StoredMemory? in
+            // The replacement may have changed after store/dedup returned.
+            // Check it inside this same transaction so retiring the old fact
+            // cannot leave lineage pointing to a missing or retired record.
+            guard let replacement = try Row.fetchOne(
+                db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [newerId]
+            ).map(Self.decodeMemory), Self.projectionEligible(replacement) else {
+                return nil
+            }
             guard var row = try Row.fetchOne(db, sql: """
                 SELECT * FROM memories
                 WHERE id = ? AND status = 'active'
@@ -2047,6 +2264,70 @@ public actor MemoryStorage {
         return false
     }
 
+    /// Fill in the semantic key on tombstones that never got one.
+    ///
+    /// The ordinary delete/reject path calls `addTombstone(content:reason:)`
+    /// and lets `embedding` default to nil (both MemoryV2 facades do), while
+    /// `tombstoneMatch` selects `WHERE embedding IS NOT NULL`. Every tombstone
+    /// written that way is invisible to the semantic forget-gate and blocks
+    /// only its own exact content hash — the gate covers a minority of the set.
+    ///
+    /// This re-embeds them in bounded batches with the SAME embedder the live
+    /// write path uses. `content`, `rejected_at` and `reason` are never
+    /// rewritten, and an embedding that already exists is never overwritten:
+    /// `embedding IS NULL` is re-checked in the UPDATE, so a concurrent real
+    /// tombstone write always wins. The 0.92 match threshold is untouched —
+    /// this widens what the gate can SEE, not what counts as a match.
+    ///
+    /// Bounded per call so a large legacy backlog drains over several passes
+    /// rather than stalling one. Returns the number of rows filled.
+    @discardableResult
+    public func backfillTombstoneEmbeddings(
+        using embedder: any EmbeddingProvider,
+        limit: Int = 64
+    ) async throws -> Int {
+        let cap = max(0, limit)
+        guard cap > 0 else { return 0 }
+        let pending = try await dbPool.read { db -> [(hash: String, content: String)] in
+            try Row.fetchAll(db, sql: """
+                SELECT content_hash, content FROM tombstones
+                WHERE embedding IS NULL AND content IS NOT NULL AND content <> ''
+                ORDER BY rejected_at DESC
+                LIMIT ?
+            """, arguments: [cap]).compactMap { row in
+                guard let hash: String = row["content_hash"],
+                      let content: String = row["content"] else { return nil }
+                return (hash, content)
+            }
+        }
+        guard !pending.isEmpty else { return 0 }
+
+        let batch = try await embedder.embedWithEpoch(pending.map(\.content))
+        guard batch.vectors.count == pending.count else {
+            throw MemoryStorageError.databaseUnavailable(
+                "tombstone backfill: embedder returned \(batch.vectors.count) "
+                    + "vectors for \(pending.count) rows"
+            )
+        }
+        let epoch = batch.epoch.rawValue
+
+        return try await dbPool.write { db -> Int in
+            // Same epoch guard every other embedding write goes through: a
+            // vector from the wrong vector space must never land in the store.
+            try Self.requireWritableEpoch(in: db, vector: batch.vectors.first, epoch: epoch)
+            var written = 0
+            for (row, vector) in zip(pending, batch.vectors) {
+                guard !vector.isEmpty else { continue }
+                try db.execute(sql: """
+                    UPDATE tombstones SET embedding = ?, embedding_epoch = ?
+                    WHERE content_hash = ? AND embedding IS NULL
+                """, arguments: [Self.encodeEmbedding(vector), epoch, row.hash])
+                written += db.changesCount
+            }
+            return written
+        }
+    }
+
     // MARK: - Embedding epoch activation
 
     /// Snapshot every canonical text-bearing row. Callers embed this immutable
@@ -2160,6 +2441,7 @@ public actor MemoryStorage {
             namespace: "memory-v2",
             stableID: "embedding-epoch",
             operation: .changed,
+            canonicalLocator: path.standardizedFileURL.path,
             reason: "embedding_epoch_activated"
         ))
         await DerivedStateInvalidationCenter.shared.flush()
@@ -2363,40 +2645,21 @@ public actor MemoryStorage {
     ) -> [(memory: StoredMemory, similarity: Double)] {
         let cappedLimit = max(0, limit)
         guard cappedLimit > 0 else { return [] }
-        // Skill rows are discovery hints, not the answer corpus. Preserve
-        // score order but reserve room for ordinary memories when available;
-        // if a query truly has only skill matches, deferred skills fill the
-        // remaining slots so discovery behavior is never lost.
-        let preferredSkillLimit = cappedLimit == 1 ? 1 : max(1, (cappedLimit + 1) / 2)
         var seen: Set<String> = []
-        var out: [(memory: StoredMemory, similarity: Double)] = []
-        var deferredSkills: [(memory: StoredMemory, similarity: Double)] = []
-        var skillCount = 0
-        out.reserveCapacity(min(cappedLimit, scored.count))
-        for (memory, similarity) in scored {
-            let key = normalizedRecallContent(memory.content)
+        // Lazy uniqueness retains the prior early stop: do not normalize an
+        // entire corpus when the bounded result has already been filled.
+        let unique = scored.lazy.filter { candidate in
+            let key = normalizedRecallContent(candidate.0.content)
             if !key.isEmpty {
-                guard seen.insert(key).inserted else { continue }
+                return seen.insert(key).inserted
             }
-            if isSkillRecallHint(memory), skillCount >= preferredSkillLimit {
-                deferredSkills.append((memory, similarity))
-                continue
-            }
-            out.append((memory, similarity))
-            if isSkillRecallHint(memory) { skillCount += 1 }
-            if out.count >= cappedLimit { break }
+            return true
         }
-        if out.count < cappedLimit {
-            out.append(contentsOf: deferredSkills.prefix(cappedLimit - out.count))
+        return MemoryRecallScoring.selectRecallResults(from: unique, limit: cappedLimit) {
+            MemoryRecallScoring.isSkillRecallHint(
+                id: $0.0.id, kind: MemoryRecallScoring.kind(of: $0.0.metadata)
+            )
         }
-        return out
-    }
-
-    private static func isSkillRecallHint(_ memory: StoredMemory) -> Bool {
-        memory.id.hasPrefix("skill-pointer:")
-            || MemoryRecallScoring.kind(of: memory.metadata)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased() == "skill"
     }
 
     private static func normalizedRecallContent(_ content: String) -> String {

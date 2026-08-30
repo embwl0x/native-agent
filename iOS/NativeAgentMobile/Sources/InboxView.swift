@@ -556,6 +556,8 @@ struct InboxView: View {
         }
         .navigationTitle("Inbox")
         .macSyncErrorBanner()
+        // E6: freshness of the Mac snapshot behind this list.
+        .macSnapshotFreshnessBadge()
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 MacStatusChip()

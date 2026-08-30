@@ -117,6 +117,7 @@ struct WorkflowRunLedgerFeedFamilyEvalTests {
         // the companion evidence never lets diagnostics call the damaged tail a
         // clean empty source.
         let presented = try await reloaded.listWorkflowRuns()
+        #expect(presented == damaged.recentRuns)
         #expect(presented.count == 3)
         #expect(Self.status(presented.first ?? .null) == "failed")
     }
@@ -135,6 +136,8 @@ struct WorkflowRunLedgerFeedFamilyEvalTests {
         #expect(absent.runsSource == .absent)
         #expect(absent.registrySource == .absent)
         #expect(absent.runStateSource == .absent)
+        #expect(try await SwiftNativeWorkflowOrchestrationClient(root: absentRoot, useFileLock: false)
+            .listWorkflowRuns() == absent.recentRuns)
 
         let unavailableRuns = unavailableRoot.appendingPathComponent("workflows/runs.jsonl", isDirectory: true)
         try FileManager.default.createDirectory(at: unavailableRuns, withIntermediateDirectories: true)
@@ -148,6 +151,8 @@ struct WorkflowRunLedgerFeedFamilyEvalTests {
         if case .unavailable = unavailable.runStateSource {} else {
             Issue.record("a file at run_state must not read as an absent state family")
         }
+        #expect(try await SwiftNativeWorkflowOrchestrationClient(root: unavailableRoot, useFileLock: false)
+            .listWorkflowRuns() == unavailable.recentRuns)
     }
 
     private static func string(_ value: JSONValue, _ key: String) -> String? {

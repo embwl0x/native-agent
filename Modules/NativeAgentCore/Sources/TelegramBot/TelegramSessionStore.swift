@@ -425,7 +425,11 @@ public struct TelegramSessionStore: Sendable {
             ]
             rows.insert(row, at: 0)
             try await persistence.writeJSON(.array(rows.map(JSONValue.object)), to: sessionsPath)
-            _ = try? ChatSessionRetention.enforce(dataRoot: dataRoot, now: Date())
+            ChatSessionRetention.enforceBestEffort(
+                dataRoot: dataRoot,
+                now: Date(),
+                context: "TelegramSessionStore.ensureSessionRow"
+            )
         }
     }
 
@@ -453,7 +457,11 @@ public struct TelegramSessionStore: Sendable {
             guard updated != original else { return }
             rows[index] = updated
             try await persistence.writeJSON(.array(rows.map(JSONValue.object)), to: sessionsPath)
-            _ = try? ChatSessionRetention.enforce(dataRoot: dataRoot, now: Date())
+            ChatSessionRetention.enforceBestEffort(
+                dataRoot: dataRoot,
+                now: Date(),
+                context: "TelegramSessionStore.patchSessionRow"
+            )
         }
     }
 

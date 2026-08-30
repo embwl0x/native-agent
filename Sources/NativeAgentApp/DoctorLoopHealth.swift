@@ -29,6 +29,13 @@ struct LoopHealthObservation: Equatable, Sendable {
     /// Sweep R4 item 3: event-listener liveness. nil for loops with no event
     /// lane at all — which is NOT the same as a loop whose listener is down.
     let eventListener: LoopEventListenerHealth?
+    /// C8: when the loop last COMPLETED work, and what its last tick said. A
+    /// loop can be running, scheduled, error-free and ticking on time while
+    /// every tick skips — every other field on this observation reads healthy
+    /// for that state, which is exactly how dormant lanes stayed invisible.
+    let lastSuccessfulWorkAt: Date?
+    let lastResult: String?
+    let firstSeenAt: Date?
 
     init(
         loopId: String,
@@ -39,7 +46,10 @@ struct LoopHealthObservation: Equatable, Sendable {
         executing: Bool = false,
         executionStartedAt: Date? = nil,
         executionTimeout: TimeInterval = 300,
-        eventListener: LoopEventListenerHealth? = nil
+        eventListener: LoopEventListenerHealth? = nil,
+        lastSuccessfulWorkAt: Date? = nil,
+        lastResult: String? = nil,
+        firstSeenAt: Date? = nil
     ) {
         self.loopId = loopId
         self.lastRun = lastRun
@@ -50,6 +60,9 @@ struct LoopHealthObservation: Equatable, Sendable {
         self.executionStartedAt = executionStartedAt
         self.executionTimeout = executionTimeout
         self.eventListener = eventListener
+        self.lastSuccessfulWorkAt = lastSuccessfulWorkAt
+        self.lastResult = lastResult
+        self.firstSeenAt = firstSeenAt
     }
 
     init(status: LoopStatus) {
@@ -62,7 +75,10 @@ struct LoopHealthObservation: Equatable, Sendable {
             executing: status.executing,
             executionStartedAt: status.executionStartedAt,
             executionTimeout: status.executionTimeout,
-            eventListener: status.eventListener
+            eventListener: status.eventListener,
+            lastSuccessfulWorkAt: status.lastSuccessfulWorkAt,
+            lastResult: status.lastResult,
+            firstSeenAt: status.firstSeenAt
         )
     }
 }
@@ -118,7 +134,8 @@ enum DoctorLoopHealth {
     }
 
     /// Pure health rule. `recentFailureDates` maps loopId → receipt timestamps
-    /// (any order); only receipts inside the loop's grace window count toward
+    /// (any order), with coalesced incidents contributing one timestamp per
+    /// occurrence. Only receipts inside the loop's grace window count toward
     /// persistence.
     static func evaluate(
         observations: [LoopHealthObservation],
@@ -126,8 +143,11 @@ enum DoctorLoopHealth {
         now: Date
     ) -> [LoopHealthVerdict] {
         observations.map { observation in
-            merge(baseVerdict(for: observation, recentFailureDates: recentFailureDates, now: now),
-                  with: eventListenerVerdict(for: observation, now: now))
+            let base = merge(
+                baseVerdict(for: observation, recentFailureDates: recentFailureDates, now: now),
+                with: eventListenerVerdict(for: observation, now: now)
+            )
+            return merge(base, with: dormancyVerdict(for: observation, now: now))
         }
         .sorted { lhs, rhs in
             if lhs.level != rhs.level { return rank(lhs.level) < rank(rhs.level) }
@@ -160,6 +180,50 @@ enum DoctorLoopHealth {
             ? .fail
             : .warn
         return (level, detail)
+    }
+
+    /// C8: how long a running loop may go without COMPLETING work before
+    /// Doctor calls it dormant. Floored at a week so a genuinely slow lane is
+    /// not slandered, and scaled to `3 × interval` so a weekly loop needs three
+    /// missed weeks — the same "three periods" shape `graceWindow` uses.
+    static let dormancyFloor: TimeInterval = 7 * 24 * 60 * 60
+
+    static func dormancyThreshold(for observation: LoopHealthObservation) -> TimeInterval {
+        max(dormancyFloor, 3 * estimatedInterval(for: observation))
+    }
+
+    /// Verdict contribution from the WORK lane: registered, ticking, no error —
+    /// and nothing to show for it. nil for a loop that is not running (the
+    /// schedule rules already fail that), that has completed recently, or that
+    /// has not yet been given its threshold's worth of time to complete
+    /// anything.
+    ///
+    /// A loop that has NEVER completed is judged from `firstSeenAt` — the
+    /// durable stamp of when it was first registered. `lastRun` cannot serve:
+    /// a lane that ticks hourly and completes nothing has a fresh `lastRun`
+    /// forever, which is precisely the state this rule exists to catch. With no
+    /// first-seen stamp (a loop registered by an older build) the rule stays
+    /// silent rather than guessing.
+    static func dormancyVerdict(
+        for observation: LoopHealthObservation,
+        now: Date
+    ) -> (level: LoopHealthLevel, detail: String)? {
+        guard observation.running else { return nil }
+        let threshold = dormancyThreshold(for: observation)
+        let reference = [observation.lastSuccessfulWorkAt, observation.firstSeenAt]
+            .compactMap { $0 }
+            .max()
+        guard let reference else { return nil }
+        let idle = now.timeIntervalSince(reference)
+        guard idle > threshold else { return nil }
+        let lead = observation.lastSuccessfulWorkAt == nil
+            ? "Registered and ticking, but it has NEVER completed any work"
+            : "Registered and ticking, but no work completed in \(describeAge(idle))"
+        let reason = observation.lastResult.map { " Last outcome: \($0)." } ?? ""
+        return (
+            .warn,
+            "\(lead) (dormancy bound \(describeAge(threshold))).\(reason)"
+        )
     }
 
     private static func merge(
@@ -309,11 +373,15 @@ enum DoctorLoopHealth {
         for line in usable.suffix(maxReceipts) {
             guard let rowData = line.data(using: .utf8),
                   let row = try? JSONSerialization.jsonObject(with: rowData) as? [String: Any],
-                  let loopId = row["loopId"] as? String,
-                  let createdAt = row["createdAt"] as? String,
-                  let date = parser.date(from: createdAt) ?? fractional.date(from: createdAt)
-            else { continue }
-            result[loopId, default: []].append(date)
+                  let loopId = row["loopId"] as? String else { continue }
+            let timestamp = (row["lastAt"] as? String) ?? (row["createdAt"] as? String) ?? ""
+            guard let date = parser.date(from: timestamp) ?? fractional.date(from: timestamp) else {
+                continue
+            }
+            let occurrences = max(1, row["occurrences"] as? Int ?? 1)
+            for _ in 0..<occurrences {
+                result[loopId, default: []].append(date)
+            }
         }
         return result
     }

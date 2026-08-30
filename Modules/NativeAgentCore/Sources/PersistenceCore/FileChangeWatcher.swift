@@ -23,6 +23,7 @@ public final class FileChangeWatcher: @unchecked Sendable {
     private var sources: [URL: Armed] = [:]
     private var stopped = false
     private let seam: TestSeam?
+    private var pooledSubscription: SharedFileChangeWatcherRegistry.Subscription?
 
     /// Internal test seam. Production builds pass `nil`; tests use it to drive
     /// the create-then-teardown-before-resume window deterministically instead
@@ -44,6 +45,14 @@ public final class FileChangeWatcher: @unchecked Sendable {
         self.handler = handler
         self.seam = seam
         self.queue = DispatchQueue(label: "com.nativeagent.persistence.file-watcher", qos: .utility)
+        self.pooledSubscription = nil
+        if seam == nil {
+            pooledSubscription = SharedFileChangeWatcherRegistry.shared.subscribe(
+                paths: self.paths,
+                handler: handler
+            )
+            return
+        }
         // Return only after the vnode sources are armed. An asynchronous first
         // arm leaves a startup window where a CLI can create/replace the file
         // before any source exists, and that edge would remain invisible until
@@ -55,6 +64,10 @@ public final class FileChangeWatcher: @unchecked Sendable {
     func tearDownForTesting() { tearDown() }
 
     public func cancel() {
+        if seam == nil {
+            tearDown()
+            return
+        }
         queue.async { [self] in
             self.tearDown()
         }
@@ -71,7 +84,10 @@ public final class FileChangeWatcher: @unchecked Sendable {
         stopped = true
         let old = Array(sources.values)
         sources.removeAll()
+        let pooledSubscription = self.pooledSubscription
+        self.pooledSubscription = nil
         stateLock.unlock()
+        pooledSubscription?.cancel()
         old.forEach { $0.source.cancel() }
     }
 
@@ -188,5 +204,134 @@ public final class FileChangeWatcher: @unchecked Sendable {
     private func discardUnresumed(_ source: DispatchSourceFileSystemObject) {
         source.resume()
         source.cancel()
+    }
+
+    static func pooledSourceCountForTesting(path: URL) -> Int {
+        SharedFileChangeWatcherRegistry.shared.sourceCount(path: path.standardizedFileURL)
+    }
+}
+
+/// Process-wide vnode observation pool. Consumers retain independent callback
+/// and cancellation lifecycles, but identical canonical paths share the one
+/// O_EVTONLY descriptor the kernel actually needs.
+private final class SharedFileChangeWatcherRegistry: @unchecked Sendable {
+    static let shared = SharedFileChangeWatcherRegistry()
+
+    final class Subscription: @unchecked Sendable {
+        private let lock = NSLock()
+        private weak var registry: SharedFileChangeWatcherRegistry?
+        private let id: UUID
+        private let paths: [URL]
+        private var cancelled = false
+
+        init(registry: SharedFileChangeWatcherRegistry, id: UUID, paths: [URL]) {
+            self.registry = registry
+            self.id = id
+            self.paths = paths
+        }
+
+        func cancel() {
+            lock.lock()
+            guard !cancelled else {
+                lock.unlock()
+                return
+            }
+            cancelled = true
+            let registry = self.registry
+            self.registry = nil
+            lock.unlock()
+            registry?.remove(id: id, paths: paths)
+        }
+
+        deinit { cancel() }
+    }
+
+    private final class Entry {
+        var handlers: [UUID: FileChangeWatcher.Handler]
+        var watcher: FileChangeWatcher?
+
+        init(id: UUID, handler: @escaping FileChangeWatcher.Handler) {
+            handlers = [id: handler]
+        }
+    }
+
+    private let lock = NSLock()
+    private var entries: [URL: Entry] = [:]
+
+    func subscribe(
+        paths: [URL],
+        handler: @escaping FileChangeWatcher.Handler
+    ) -> Subscription {
+        let normalized = Array(Set(paths.map(\.standardizedFileURL)))
+        let id = UUID()
+        for path in normalized {
+            add(id: id, path: path, handler: handler)
+        }
+        return Subscription(registry: self, id: id, paths: normalized)
+    }
+
+    private func add(
+        id: UUID,
+        path: URL,
+        handler: @escaping FileChangeWatcher.Handler
+    ) {
+        lock.lock()
+        if let entry = entries[path] {
+            entry.handlers[id] = handler
+            lock.unlock()
+            return
+        }
+        let entry = Entry(id: id, handler: handler)
+        entries[path] = entry
+        lock.unlock()
+
+        // A non-nil seam selects the unpooled primitive and prevents recursion.
+        let watcher = FileChangeWatcher(paths: [path], handler: { [weak self] changedPath in
+            self?.publish(path: changedPath)
+        }, seam: FileChangeWatcher.TestSeam())
+
+        lock.lock()
+        guard entries[path] === entry else {
+            lock.unlock()
+            watcher.cancel()
+            return
+        }
+        entry.watcher = watcher
+        lock.unlock()
+    }
+
+    private func publish(path: URL) {
+        lock.lock()
+        let handlers: [FileChangeWatcher.Handler]
+        if let entry = entries[path.standardizedFileURL] {
+            handlers = Array(entry.handlers.values)
+        } else {
+            handlers = []
+        }
+        lock.unlock()
+        for handler in handlers {
+            handler(path.standardizedFileURL)
+        }
+    }
+
+    private func remove(id: UUID, paths: [URL]) {
+        var retired: [FileChangeWatcher] = []
+        lock.lock()
+        for path in paths {
+            guard let entry = entries[path] else { continue }
+            entry.handlers.removeValue(forKey: id)
+            if entry.handlers.isEmpty {
+                entries.removeValue(forKey: path)
+                if let watcher = entry.watcher { retired.append(watcher) }
+            }
+        }
+        lock.unlock()
+        retired.forEach { $0.cancel() }
+    }
+
+    func sourceCount(path: URL) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries[path] == nil ? 0 : 1
     }
 }

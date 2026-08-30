@@ -198,6 +198,11 @@ final class MemoryAtomRecordIndex: @unchecked Sendable {
         lock.withLock { atomIDs.compactMap { atomToRecord[$0] } }
     }
 
+    func recordMap(for atomIDs: [ContextAtomID]) -> [ContextAtomID: String] {
+        let requested = Set(atomIDs)
+        return lock.withLock { atomToRecord.filter { requested.contains($0.key) } }
+    }
+
     var count: Int {
         lock.withLock { atomToRecord.count }
     }
@@ -208,6 +213,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
 
     var projectionIdentifier: String { Self.owner }
     var invalidationNamespaces: Set<String> { ["memory-v2"] }
+    let invalidationSourceURL: URL?
 
     private static let schemaVersion = "memory-context-projection-v1"
     private let memory: any NativeMemoryContextProjectionMemory
@@ -217,11 +223,14 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     init(
         memory: any NativeMemoryContextProjectionMemory = SwiftNativeMemoryV2.shared,
         limits: NativeMemoryContextProjectionLimits = .standard,
-        provenanceIndex: MemoryAtomRecordIndex? = nil
+        provenanceIndex: MemoryAtomRecordIndex? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         self.memory = memory
         self.limits = limits
         self.provenanceIndex = provenanceIndex
+        self.invalidationSourceURL = dataRoot.appendingPathComponent("memory/memory.sqlite")
+            .standardizedFileURL
     }
 
     func compiledProjection(
@@ -280,7 +289,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
         var offset = 0
         while offset < changed.count {
             let end = min(offset + limits.maximumEmbeddingBatchSize, changed.count)
-            let texts = changed[offset..<end].map(\.body)
+            let texts = changed[offset..<end].map(\.embeddingText)
             let batch = try await memory.embedForDerivedContextWithEpoch(texts)
             guard batch.epoch.rawValue == modelFingerprint else {
                 throw NativeMemoryContextProjectionError.invalidModelFingerprint
@@ -337,6 +346,7 @@ private extension NativeMemoryContextProjection {
         let atomKind: ContextAtomKind
         let contentRole: ContextContentRole
         let body: String
+        let embeddingText: String
         let sourceHash: String
         let authority: ContextAuthority
         let confidence: Double
@@ -407,15 +417,15 @@ private extension NativeMemoryContextProjection {
             return nil
         }
 
-        let body = normalizedText(record.text)
-        guard !body.isEmpty,
-              body.utf8.count <= limits.maximumTextUTF8Bytes,
-              !containsDisallowedControl(body),
-              !ContextSecretContentPolicy.containsSecretLikeContent(body) else {
+        let embeddingText = normalizedText(record.text)
+        guard !embeddingText.isEmpty,
+              embeddingText.utf8.count <= limits.maximumTextUTF8Bytes,
+              !containsDisallowedControl(embeddingText),
+              !ContextSecretContentPolicy.containsSecretLikeContent(embeddingText) else {
             return nil
         }
         guard MemoryCandidateQuality.isDurableCandidate(
-            text: body,
+            text: embeddingText,
             source: record.sourceRunId,
             kind: record.memoryKind
         ) else {
@@ -429,6 +439,9 @@ private extension NativeMemoryContextProjection {
         guard let provenance = provenanceText(record, limit: limits.maximumProvenanceUTF8Bytes) else {
             return nil
         }
+        let body = presentationBody(
+            embeddingText, record: record, maximumUTF8Bytes: limits.maximumTextUTF8Bytes
+        )
 
         let correction = isCorrection(record, tags: tags)
         let pinned = record.pinned == true
@@ -496,6 +509,17 @@ private extension NativeMemoryContextProjection {
             id: correction ? "correction" : (pinned ? "pinned" : "adaptive"),
             label: correction ? "explicit correction" : (pinned ? "pinned memory" : "adaptive memory")
         ))
+        if case .array(let values)? = objectValue(record.extras, key: "context_topics") {
+            for case .string(let topic) in values.prefix(8) {
+                let clean = topic.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !clean.isEmpty, clean.count <= 120 else { continue }
+                entities.append(ContextEntity(
+                    kind: ContextCorrectionScope.entityKind,
+                    id: ContextStableID.digest(parts: [clean.lowercased()]),
+                    label: clean
+                ))
+            }
+        }
         if !provenance.isEmpty {
             entities.append(ContextEntity(
                 kind: "provenance",
@@ -528,7 +552,8 @@ private extension NativeMemoryContextProjection {
             record.validTo ?? "",
             record.observedAt ?? "",
             canonicalJSONString(record.evidence) ?? "",
-        ])
+            canonicalJSONString(objectValue(record.extras, key: "context_topics")) ?? "",
+        ] + (body == embeddingText ? [] : [embeddingText]))
 
         return PreparedRecord(
             recordID: recordID,
@@ -538,6 +563,7 @@ private extension NativeMemoryContextProjection {
             atomKind: atomKind,
             contentRole: .memory,
             body: body,
+            embeddingText: embeddingText,
             sourceHash: sourceHash,
             authority: authority,
             confidence: confidence,
@@ -633,6 +659,45 @@ private extension NativeMemoryContextProjection {
             return nil
         }
         return combined
+    }
+
+    /// Dates are presentation evidence, not vector input or a valid-now test.
+    /// Prefix them so the existing bounded context_expand prefix also retains
+    /// them. Reserve their bytes inside the existing body cap, never above it.
+    static func presentationBody(
+        _ text: String, record: NativeMemoryProjectionRecord, maximumUTF8Bytes: Int
+    ) -> String {
+        let fields = [
+            ("valid_from", record.validFrom),
+            ("valid_to", record.validTo),
+            ("observed_at", record.observedAt),
+        ].compactMap { key, raw -> String? in
+            guard let raw else { return nil }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard value.utf8.count <= 64,
+                  !containsDisallowedControl(value), parseDate(value) != nil else { return nil }
+            return "\(key)=\(value)"
+        }
+        guard !fields.isEmpty else { return text }
+        let prefix = "[Recorded dates; not a live-status check; observed_at is evidence time: "
+            + fields.joined(separator: "; ") + "]\n"
+        if prefix.utf8.count + text.utf8.count <= maximumUTF8Bytes {
+            return prefix + text
+        }
+        let suffix = "\n[Excerpt; full_content_chars=\(text.count)]"
+        let available = maximumUTF8Bytes - prefix.utf8.count - suffix.utf8.count
+        // A custom tiny budget must not discard the canonical fact merely
+        // because a complete date label cannot fit. Standard budget is 16 KiB.
+        guard available > 0 else { return text }
+        var excerpt = ""
+        var bytes = 0
+        for character in text {
+            let size = String(character).utf8.count
+            guard bytes + size <= available else { break }
+            excerpt.append(character)
+            bytes += size
+        }
+        return prefix + excerpt + suffix
     }
 
     static func canonicalJSONString(_ value: JSONValue?) -> String? {

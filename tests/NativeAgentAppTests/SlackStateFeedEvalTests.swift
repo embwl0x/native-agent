@@ -98,6 +98,37 @@ struct SlackStateFeedEvalTests {
         #expect(malformed.runtimeStatus == "unavailable")
     }
 
+    @Test("durable recovery and intake pressure stay visible through the mounted Connectors status after a healthy hello")
+    func connectorOverlayShowsDurableRecoveryWithoutChangingAuthority() async throws {
+        let root = try makeRoot("recovery")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeSlackRegistry(root: root)
+        let token = root.appendingPathComponent("oauth_tokens/slack.json")
+        try FileManager.default.createDirectory(at: token.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{\"access_token\":\"configured\"}".utf8).write(to: token)
+        let journal = SlackInboundDeliveryJournal(dataRoot: root, pendingCap: 2)
+        func message(_ ts: String) -> SlackInboundMessage {
+            SlackInboundMessage(eventId: "T1:C1:\(ts)", teamId: "T1", channelId: "C1", userId: "U1", eventType: "message", text: "PRIVATE MESSAGE BODY", ts: ts, threadTs: nil, channelType: "channel", isDirectMessage: false)
+        }
+        let first = message("1.000")
+        _ = try await journal.claim(first)
+        _ = try await journal.markOutcomeUnknown(eventId: first.eventId, detail: "manual recovery required")
+        #expect(await SlackRuntimeStateStore.apply(["connected": .bool(true), "lastError": .null], dataRoot: root) == .stored)
+        let client = NativeClient(baseURL: "", dataRootOverride: root)
+        let recovering = try #require(try await client.getConnectors().first { $0.id == "slack" })
+        #expect(recovering.authState == "connected")
+        #expect(recovering.runtimeStatus == "recovery_required")
+        #expect(recovering.runtimeDetail?.contains("1 replies have an unknown outcome") == true)
+        #expect(recovering.runtimeDetail?.contains("PRIVATE MESSAGE BODY") == false)
+        _ = try await journal.claim(message("2.000"))
+        let paused = try #require(try await client.getConnectors().first { $0.id == "slack" })
+        #expect(paused.authState == "connected")
+        #expect(paused.runtimeStatus == "intake_paused")
+        #expect(paused.runtimeDetail?.contains("2 pending replies") == true)
+        #expect(paused.runtimeDetail?.contains("nothing is automatically discarded or resent") == true)
+        #expect(try await journal.unresolved().count == 2)
+    }
+
     private func makeRoot(_ label: String) throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("slack-state-feed-\(label)-\(UUID().uuidString)", isDirectory: true)

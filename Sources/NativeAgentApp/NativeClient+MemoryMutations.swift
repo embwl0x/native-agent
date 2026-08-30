@@ -42,36 +42,29 @@ import Browser
 // postScratch + their dispatch-decode helpers), relocated verbatim into a
 // same-module extension. Zero visibility lifts required.
 extension NativeClient {
-    func updateMemory(id: String, pinned: Bool) async throws -> [String: Any] {
-        // fix2/F1: pin/unpin used to flock-R-M-W memory.json — that was a
-        // dead duplicate after MemoryV2 took over. Route through MemoryStorage.
-        // SQLite schema has no pinned column yet; encode the flag in the
-        // metadata blob so the row survives the round-trip (the UI reader is
-        // tolerant of the field landing under metadata).
-        // F2: reuse the launch-attached shared storage so USER.md regen +
-        // Spotlight/KG hooks fire on UI mutations. Live-owner failure is
-        // unavailable, never permission to open a hookless second store.
-        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        guard let existing = try await storage.memory(id: id) else {
+    func updateMemory(id: String, pinned: Bool, memory: SwiftNativeMemoryV2? = nil) async throws -> [String: Any] {
+        // The canonical patch merges only pinned inside its transaction and
+        // joins derived publication. Never replace a stale metadata snapshot.
+        let owner = memory ?? SwiftNativeMemoryV2.resolvedOwner(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+        do {
+            _ = try await owner.updateMemory(id: id, update: .object(["pinned": .bool(pinned)]))
+        } catch MemoryV2Error.recordNotFound {
             throw NSError(domain: "NativeAgent", code: 404, userInfo: [
                 NSLocalizedDescriptionKey: "memory id not found: \(id)"
             ])
         }
-        var meta: [String: JSONValue]
-        if case .object(let obj) = existing.metadata ?? .object([:]) { meta = obj } else { meta = [:] }
-        meta["pinned"] = .bool(pinned)
-        _ = try await storage.updateMemory(id: id, patch: MemoryPatch(metadata: .object(meta)))
         return ["status": "ok"]
     }
 
-    func deleteMemory(id: String) async throws -> [String: Any] {
-        // fix2/F1: SQLite truth instead of memory.json R-M-W.
-        // F2: reuse launch-attached shared storage (USER.md + Spotlight hooks).
-        let storage = try await SwiftNativeMemoryV2.resolvedStorage(
-            dataRoot: PersistenceCore.defaultDataRoot()
+    func deleteMemory(id: String, memory: SwiftNativeMemoryV2? = nil) async throws -> [String: Any] {
+        // Foreground completion joins the canonical owner's derived updates;
+        // the storage's atomic result preserves missing-row behavior.
+        let owner = memory ?? SwiftNativeMemoryV2.resolvedOwner(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
-        let ok = try await storage.deleteMemory(id: id)
+        let ok = try await owner.deleteMemoryIfPresent(id: id)
         guard ok else {
             throw NSError(domain: "NativeAgent", code: 404, userInfo: [
                 NSLocalizedDescriptionKey: "memory id not found: \(id)"
@@ -92,18 +85,21 @@ extension NativeClient {
 
     // PATCH-2026-05-08: wave2-chat-ux slash /remember support
     //
-    // FINAL/F1 (2026-06-03): daemon-dead PORT. SwiftNativeMemoryV2.shared.store
-    // (MemoryV2+Wiring.swift:142) embeds + inserts through MemoryStorage
-    // (MemoryV2+Storage.swift:286) with the same tombstone gate the daemon ran.
-    // The `layer` parameter is preserved on the round-tripped shared record
+    // The resolved canonical owner embeds + inserts through MemoryStorage
+    // with the same tombstone gate for both default and alternate roots.
+    // The `layer` parameter is preserved on the round-tripped record
     // (Core may omit it; the shared decoder requires it).
     func addMemory(
         text: String,
         layer: String = "semantic",
         source: String = "mac.slash-remember",
-        metadata: JSONValue? = nil
+        metadata: JSONValue? = nil,
+        memory: SwiftNativeMemoryV2? = nil
     ) async throws -> MemoryRecord {
-        let core = try await SwiftNativeMemoryV2.shared.store(
+        let owner = memory ?? SwiftNativeMemoryV2.resolvedOwner(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+        let core = try await owner.store(
             content: text,
             source: source,
             metadata: metadata

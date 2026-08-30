@@ -13,7 +13,14 @@ import {
 let nativePort = null;
 const NATIVE_RECONNECT_ALARM = "nativeagent.native-reconnect";
 const MAX_SNAPSHOT_FRAMES = 64;
+// The relay admits at most 1,048,576 UTF-8 bytes including the response
+// envelope. Reserve headroom rather than relying on character/node counts.
+const MAX_SNAPSHOT_RESULT_BYTES = 1_000_000;
+const utf8Encoder = new TextEncoder();
 const snapshotRoutes = new Map();
+const activeSnapshotReads = new Map();
+const activeNavigations = new Map();
+const activeTabWaits = new Map();
 const leaseManager = new TabLeaseManager({
   chromeApi: chrome,
   emitEvent: sendEvent,
@@ -107,7 +114,7 @@ async function dispatch(request) {
     case "lease.release":
       return leaseManager.release(request.payload);
     case "navigate":
-      return navigateLeasedTab(request.payload);
+      return navigateLeasedTab(request.payload, request.id);
     case "page.snapshot.read":
       return readStructuredSnapshot(request.payload);
     case "page.element.click":
@@ -133,32 +140,88 @@ async function dispatch(request) {
   }
 }
 
-async function navigateLeasedTab(payload) {
+async function navigateLeasedTab(payload, actionId) {
   const lease = leaseManager.requireForPageAction(payload);
   invalidateTabSnapshots(lease.tabId);
-  const updated = await chrome.tabs.update(lease.tabId, { url: payload.url });
-  if (updated?.active === true && lease.originalTab.active !== true) {
-    await leaseManager.yieldForTab(lease.tabId, "tab_activated_during_navigation");
-    throw new ProtocolError("focus_invariant_failed", "Navigation unexpectedly activated the leased tab.");
+  cancelTabWaits(lease.tabId, new ProtocolError("navigation_superseded", "A newer navigation superseded the pending observation."));
+  const navigation = {};
+  activeNavigations.set(lease.tabId, navigation);
+  const startedAt = new Date().toISOString();
+  function requireCurrentNavigation() {
+    leaseManager.requireForPageAction(payload);
+    if (activeNavigations.get(lease.tabId) !== navigation) {
+      throw new ProtocolError("navigation_superseded", "A newer navigation or user takeover superseded this request.");
+    }
   }
-  const tab = updated?.status === "complete"
-    ? updated
-    : await waitForTabComplete(lease.tabId, 30_000);
-  return {
-    leaseId: lease.leaseId,
-    tabId: lease.tabId,
-    url: tab.url ?? payload.url,
-    title: tab.title ?? "",
-    status: "complete",
-  };
+  try {
+    const updated = await chrome.tabs.update(lease.tabId, { url: payload.url });
+    requireCurrentNavigation();
+    if (updated?.active === true && lease.originalTab.active !== true) {
+      await leaseManager.yieldForTab(lease.tabId, "tab_activated_during_navigation");
+      throw new ProtocolError("focus_invariant_failed", "Navigation unexpectedly activated the leased tab.");
+    }
+    await waitForTabComplete(lease.tabId, 30_000, requireCurrentNavigation);
+    const tab = await chrome.tabs.get(lease.tabId);
+    requireCurrentNavigation();
+    if (tab.active === true && lease.originalTab.active !== true) {
+      await leaseManager.yieldForTab(lease.tabId, "tab_activated_during_navigation");
+      throw new ProtocolError("focus_invariant_failed", "The tab became active before navigation could be confirmed.");
+    }
+    if (tab.id !== lease.tabId || tab.status !== "complete" || typeof tab.url !== "string") {
+      throw new ProtocolError("navigation_changed", "The exact tab no longer has an observed complete page.");
+    }
+    return pageActionResult({
+      actionId, action: "navigate", lease, payload, startedAt,
+      outcome: "succeeded", verification: "not_verified",
+      detail: {
+        leaseId: lease.leaseId, tabId: lease.tabId, requestedUrl: payload.url,
+        url: tab.url, title: tab.title ?? "", status: "complete", verified: false,
+      },
+    });
+  } catch (error) {
+    // tabs.update has already been dispatched. Lost ownership or observation
+    // cannot prove that navigation did not happen, so never invite blind replay.
+    return pageActionResult({
+      actionId, action: "navigate", lease, payload, startedAt,
+      outcome: "outcome_unknown", verification: "outcome_unknown",
+      detail: {
+        leaseId: lease.leaseId, tabId: lease.tabId, requestedUrl: payload.url,
+        status: "outcome_unknown", verified: false,
+        error: { code: error.code ?? "navigation_reply_lost", message: error.message ?? "Chrome navigation could not be confirmed." },
+      },
+    });
+  } finally {
+    if (activeNavigations.get(lease.tabId) === navigation) activeNavigations.delete(lease.tabId);
+  }
 }
 
 async function readStructuredSnapshot(payload) {
   const lease = leaseManager.requireForPageAction(payload);
   invalidateTabSnapshots(lease.tabId);
+  const capture = { localSnapshotKeys: new Set(), invalidatedSnapshotKeys: new Set(), invalidationOverflow: false };
+  activeSnapshotReads.set(lease.tabId, capture);
+  try {
+    return await readStructuredSnapshotForCapture(payload, lease, capture);
+  } finally {
+    if (activeSnapshotReads.get(lease.tabId) === capture) activeSnapshotReads.delete(lease.tabId);
+  }
+}
+
+function requireCurrentSnapshotCapture(lease, capture) {
+  leaseManager.requireForPageAction({ leaseId: lease.leaseId, expectedUserSequence: lease.userSequence });
+  if (activeSnapshotReads.get(lease.tabId) !== capture) {
+    throw new ProtocolError("snapshot_superseded", "A newer read or navigation superseded this snapshot capture.");
+  }
+  if (capture.invalidationOverflow || [...capture.localSnapshotKeys].some((key) => capture.invalidatedSnapshotKeys.has(key))) {
+    throw new ProtocolError("snapshot_stale", "A captured frame changed while the combined snapshot was being read.");
+  }
+}
+
+async function readStructuredSnapshotForCapture(payload, lease, capture) {
   const maxNodes = payload.maxNodes ?? 500;
   const maxTextChars = payload.maxTextChars ?? 50_000;
   const discovered = await chrome.webNavigation.getAllFrames({ tabId: lease.tabId });
+  requireCurrentSnapshotCapture(lease, capture);
   const ordered = [...(discovered ?? [])].sort((left, right) => {
     if (left.frameId === 0) return -1;
     if (right.frameId === 0) return 1;
@@ -171,6 +234,7 @@ async function readStructuredSnapshot(payload) {
   let topSnapshot = null;
 
   for (const frame of ordered.slice(0, MAX_SNAPSHOT_FRAMES)) {
+    requireCurrentSnapshotCapture(lease, capture);
     if (remainingNodes <= 0) {
       frames.push({
         frameId: frame.frameId,
@@ -194,6 +258,7 @@ async function readStructuredSnapshot(payload) {
         maxTextChars: Math.max(1, remainingText),
       }, { frameId: frame.frameId });
     } catch (error) {
+      requireCurrentSnapshotCapture(lease, capture);
       frames.push({
         frameId: frame.frameId,
         parentFrameId: frame.parentFrameId,
@@ -205,6 +270,8 @@ async function readStructuredSnapshot(payload) {
       });
       continue;
     }
+    capture.localSnapshotKeys.add(JSON.stringify([frame.frameId, local.snapshotId]));
+    requireCurrentSnapshotCapture(lease, capture);
     const nodes = Array.isArray(local.nodes) ? local.nodes : [];
     const text = String(local.summary?.text ?? "").slice(0, remainingText);
     remainingNodes -= nodes.length;
@@ -259,14 +326,8 @@ async function readStructuredSnapshot(payload) {
   const joinedSummary = summaryParts.join("\n");
   if (joinedSummary.length > maxTextChars) truncationReasons.push("text_limit");
   const summaryText = joinedSummary.slice(0, maxTextChars);
-  snapshotRoutes.set(snapshotId, {
-    leaseId: lease.leaseId,
-    tabId: lease.tabId,
-    userSequence: lease.userSequence,
-    routes,
-  });
   const { frame: _topFrameMetadata, ...topPage } = topSnapshot;
-  return {
+  const result = boundSnapshotForTransport({
     ...topPage,
     snapshotId,
     nodes,
@@ -277,7 +338,58 @@ async function readStructuredSnapshot(payload) {
       truncated: truncationReasons.length > 0 || frames.some((frame) => !frame.accessible),
       truncationReasons: [...new Set(truncationReasons)],
     },
+  }, routes);
+  requireCurrentSnapshotCapture(lease, capture);
+  snapshotRoutes.set(snapshotId, {
+    leaseId: lease.leaseId,
+    tabId: lease.tabId,
+    userSequence: lease.userSequence,
+    routes,
+  });
+  return result;
+}
+
+function boundSnapshotForTransport(snapshot, routes) {
+  const encodedBytes = (value) => utf8Encoder.encode(JSON.stringify(value)).byteLength;
+  if (encodedBytes(snapshot) <= MAX_SNAPSHOT_RESULT_BYTES) return snapshot;
+
+  const candidates = snapshot.nodes;
+  snapshot.nodes = [];
+  snapshot.frames = snapshot.frames.map((frame) => ({ ...frame, nodeCount: 0 }));
+  snapshot.summary = {
+    ...snapshot.summary,
+    nodeCount: 0,
+    truncated: true,
+    truncationReasons: [...new Set([...snapshot.summary.truncationReasons, "encoded_size_limit"])],
   };
+  // Counts grow by at most three digits per frame/node total. Keep a small
+  // accounting margin and measure each retained node only once (linear work).
+  let remainingBytes = MAX_SNAPSHOT_RESULT_BYTES - encodedBytes(snapshot) - 1_024;
+  if (remainingBytes < 0) {
+    throw new ProtocolError(
+      "snapshot_metadata_too_large",
+      "Snapshot metadata exceeds the transport budget; request a smaller text budget or a narrower page view.",
+    );
+  }
+  const retainedIDs = new Set();
+  const frameCounts = new Map();
+  for (const node of candidates) {
+    const cost = encodedBytes(node) + 1;
+    if (cost > remainingBytes) break;
+    remainingBytes -= cost;
+    snapshot.nodes.push(node);
+    retainedIDs.add(node.nodeId);
+    frameCounts.set(node.frameId, (frameCounts.get(node.frameId) ?? 0) + 1);
+  }
+  for (const nodeID of routes.keys()) {
+    if (!retainedIDs.has(nodeID)) routes.delete(nodeID);
+  }
+  for (const node of snapshot.nodes) {
+    if (node.parentNodeId && !retainedIDs.has(node.parentNodeId)) node.parentNodeId = null;
+  }
+  for (const frame of snapshot.frames) frame.nodeCount = frameCounts.get(frame.frameId) ?? 0;
+  snapshot.summary.nodeCount = snapshot.nodes.length;
+  return snapshot;
 }
 
 async function clickSnapshotNode(payload) {
@@ -322,6 +434,8 @@ async function typeIntoSnapshotNode(payload, actionId) {
     action: "type",
     pageMessage: {
       type: "nativeagent.page.type",
+      leaseId: lease.leaseId,
+      leaseExpiresAtMs: Date.parse(lease.expiresAt),
       snapshotId: route.localSnapshotId,
       nodeId: route.localNodeId,
       text: payload.text,
@@ -366,19 +480,22 @@ async function waitForPage(payload, actionId) {
   const timeoutMs = payload.timeoutMs ?? 5_000;
   if (payload.condition === "navigation_settled") {
     try {
-      const tab = await waitForTabComplete(lease.tabId, timeoutMs);
+      await waitForTabComplete(lease.tabId, timeoutMs, () => leaseManager.requireForPageAction(payload));
       if ((payload.settleMs ?? 0) > 0) await delay(payload.settleMs);
+      const tab = await chrome.tabs.get(lease.tabId);
+      leaseManager.requireForPageAction(payload);
+      const matched = tab.id === lease.tabId && tab.status === "complete";
       return pageActionResult({
         actionId,
         action: "wait",
         lease,
         payload,
         startedAt,
-        outcome: "succeeded",
-        verification: "verified",
+        outcome: matched ? "succeeded" : "not_settled",
+        verification: matched ? "verified" : "not_verified",
         detail: {
           condition: payload.condition,
-          matched: true,
+          matched,
           url: tab.url ?? "",
           title: tab.title ?? "",
         },
@@ -400,6 +517,8 @@ async function waitForPage(payload, actionId) {
   try {
     response = await chrome.tabs.sendMessage(lease.tabId, {
       type: "nativeagent.page.wait",
+      leaseId: lease.leaseId,
+      leaseExpiresAtMs: Date.parse(lease.expiresAt),
       snapshotId: route.localSnapshotId,
       nodeId: route.localNodeId,
       state: payload.state,
@@ -416,6 +535,7 @@ async function waitForPage(payload, actionId) {
       },
     });
   }
+  leaseManager.requireForPageAction(payload);
   if (!response?.ok) {
     return pageActionResult({
       actionId, action: "wait", lease, payload, startedAt,
@@ -465,7 +585,11 @@ async function performSnapshotMutation({ lease, route, payload, actionId, action
   }
   return pageActionResult({
     actionId, action, lease, payload, startedAt,
-    outcome: "succeeded", verification: "page_acknowledged",
+    outcome: action === "type" && response.result?.completed === false
+      ? (response.result.characterCount > 0 ? "partially_completed" : "refused")
+      : "succeeded",
+    verification: action === "type" && response.result?.characterCount === 0 && response.result?.completed === false
+      ? "not_verified" : "page_acknowledged",
     detail: { ...response.result, snapshotId: payload.snapshotId, nodeId: payload.nodeId, frameId: route.frameId },
   });
 }
@@ -480,7 +604,8 @@ function pageActionResult({ actionId, action, lease, payload, startedAt, outcome
     nodeId: payload.nodeId ?? null,
     outcome,
     verification,
-    retry: outcome === "outcome_unknown" ? "never_automatic" : "fresh_snapshot_required",
+    retry: outcome === "outcome_unknown" ? "never_automatic"
+      : outcome === "partially_completed" ? "fresh_snapshot_then_remaining_text_only" : "fresh_snapshot_required",
     startedAt,
     completedAt: new Date().toISOString(),
   };
@@ -541,6 +666,7 @@ function requireSnapshotRoute(lease, payload) {
 }
 
 function invalidateTabSnapshots(tabId) {
+  activeSnapshotReads.delete(tabId);
   for (const [snapshotId, snapshot] of snapshotRoutes) {
     if (snapshot.tabId === tabId) snapshotRoutes.delete(snapshotId);
   }
@@ -548,6 +674,16 @@ function invalidateTabSnapshots(tabId) {
 
 function invalidateFrameSnapshots(tabId, frameId, localSnapshotIds) {
   const invalidated = new Set(Array.isArray(localSnapshotIds) ? localSnapshotIds : []);
+  const capture = activeSnapshotReads.get(tabId);
+  if (capture) {
+    for (const id of invalidated) {
+      if (capture.invalidatedSnapshotKeys.size >= MAX_SNAPSHOT_FRAMES * 2) {
+        capture.invalidationOverflow = true;
+        break;
+      }
+      capture.invalidatedSnapshotKeys.add(JSON.stringify([frameId, id]));
+    }
+  }
   for (const [snapshotId, snapshot] of snapshotRoutes) {
     if (snapshot.tabId !== tabId) continue;
     if ([...snapshot.routes.values()].some(
@@ -556,28 +692,44 @@ function invalidateFrameSnapshots(tabId, frameId, localSnapshotIds) {
   }
 }
 
-async function waitForTabComplete(tabId, timeoutMs) {
-  const initial = await chrome.tabs.get(tabId);
-  if (initial.status === "complete") return initial;
+async function waitForTabComplete(tabId, timeoutMs, requireCurrent = () => {}) {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    let settled = false;
+    const waits = activeTabWaits.get(tabId) ?? new Set();
+    activeTabWaits.set(tabId, waits);
+    function finish(error, tab) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new ProtocolError("navigation_timeout", "Chrome navigation did not finish before the deadline."));
+      waits.delete(cancel);
+      if (waits.size === 0 && activeTabWaits.get(tabId) === waits) activeTabWaits.delete(tabId);
+      if (error) reject(error); else resolve(tab);
+    }
+    const cancel = (error) => finish(error);
+    const timeout = setTimeout(() => {
+      finish(new ProtocolError("navigation_timeout", "Chrome navigation did not finish before the deadline."));
     }, timeoutMs);
+    function observe(tab) {
+      if (settled) return;
+      try {
+        requireCurrent();
+        if (tab.id !== tabId) throw new ProtocolError("tab_identity_changed", "Chrome returned a different tab identity.");
+        if (tab.status === "complete") finish(null, tab);
+      } catch (error) { finish(error); }
+    }
     function listener(updatedTabId, changeInfo, tab) {
       if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
-      clearTimeout(timeout);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve(tab);
+      observe(tab);
     }
+    waits.add(cancel);
     chrome.tabs.onUpdated.addListener(listener);
-    void chrome.tabs.get(tabId).then((tab) => {
-      if (tab.status !== "complete") return;
-      clearTimeout(timeout);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve(tab);
-    }).catch(() => {});
+    void chrome.tabs.get(tabId).then(observe).catch((error) => finish(error));
   });
+}
+
+function cancelTabWaits(tabId, error) {
+  for (const cancel of [...(activeTabWaits.get(tabId) ?? [])]) cancel(error);
 }
 
 function delay(milliseconds) { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
@@ -585,6 +737,14 @@ function delay(milliseconds) { return new Promise((resolve) => setTimeout(resolv
 function sendEvent(event, payload) {
   if ((event === "lease.yielded" || event === "lease.released") && Number.isInteger(payload?.tabId)) {
     invalidateTabSnapshots(payload.tabId);
+    activeNavigations.delete(payload.tabId);
+    cancelTabWaits(payload.tabId, new ProtocolError("lease_not_found", "The tab lease ended before navigation could be confirmed."));
+    // Stop an in-flight delayed action in every frame, not just future host
+    // requests. A local trusted-input listener also stops typing immediately.
+    void chrome.tabs.sendMessage(payload.tabId, {
+      type: "nativeagent.page.lease.invalidated",
+      leaseId: payload.leaseId,
+    }).catch(() => {});
   }
   if (!nativePort) return;
   try {

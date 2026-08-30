@@ -669,6 +669,60 @@ private actor PushSpy {
     var count: Int { events.count }
 }
 
+private actor RecoverySpy {
+    private(set) var events: [(String, Date)] = []
+    func resolve(_ loopId: String, healthyAt: Date) -> Bool {
+        events.append((loopId, healthyAt))
+        return true
+    }
+    var count: Int { events.count }
+}
+
+@Test func loopFailureRecovery_probesOnceAtLaunchAndAgainAfterSurfacedFailure() async {
+    let clock = MutableClock(Date(timeIntervalSince1970: 1_000_000))
+    let sched = SwiftNativeLoopScheduler(clock: { clock.time() })
+    let failures = PushSpy()
+    let recoveries = RecoverySpy()
+    await sched.setFailureTransitionPush { id, err in await failures.record(id, err) }
+    await sched.setFailureRecoveryPush { id, healthyAt in
+        await recoveries.resolve(id, healthyAt: healthyAt)
+    }
+    await sched.register(CounterLoop(loopId: "L", interval: 86_400))
+
+    // First healthy tick repairs a card that may have survived a prior process;
+    // later healthy ticks do not keep probing the inbox.
+    await sched._testRunOneTick(loopId: "L")
+    await sched._testRunOneTick(loopId: "L")
+    #expect(await recoveries.count == 1)
+
+    await sched.recordFailure(loopId: "L", error: "e1")
+    clock.advance(150)
+    await sched.recordFailure(loopId: "L", error: "e2")
+    #expect(await failures.count == 1)
+    await sched.recordResult(loopId: "L", result: "completed")
+    #expect(await recoveries.count == 2)
+}
+
+@Test func loopFailureRecovery_usesNewerDurableCompletionAtRegistration() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("loop-recovery-state-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let statePath = root.appendingPathComponent("background_loop_state.json")
+    try Data(#"{"version":"1","loops":{"L":"2026-08-29T10:00:00Z"},"completions":{"L":"2026-08-29T09:00:00Z"},"firstSeen":{"L":"2026-08-01T00:00:00Z"}}"#.utf8)
+        .write(to: statePath)
+    let recoveries = RecoverySpy()
+    let sched = SwiftNativeLoopScheduler(loopStatePath: statePath)
+    await sched.setFailureRecoveryPush { id, healthyAt in
+        await recoveries.resolve(id, healthyAt: healthyAt)
+    }
+
+    await sched.register(CounterLoop(loopId: "L", interval: 86_400))
+    #expect(await recoveries.count == 1)
+    await sched._testRunOneTick(loopId: "L")
+    #expect(await recoveries.count == 1)
+}
+
 @Test func loopFailurePush_firesOnPersistentStreak_notPerFailure() async {
     let clock = MutableClock(Date(timeIntervalSince1970: 1_000_000))
     let sched = SwiftNativeLoopScheduler(clock: { clock.time() })

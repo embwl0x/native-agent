@@ -40,6 +40,23 @@ struct FileChangeWatcherLifecycleTests {
         return dir
     }
 
+    @Test("watchers for one path share one kernel source")
+    func duplicatePathsShareSource() throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("shared.json")
+        try Data("{}".utf8).write(to: path)
+
+        let first = FileChangeWatcher(paths: [path]) { _ in }
+        let second = FileChangeWatcher(paths: [path]) { _ in }
+        #expect(FileChangeWatcher.pooledSourceCountForTesting(path: path) == 1)
+
+        first.cancel()
+        #expect(FileChangeWatcher.pooledSourceCountForTesting(path: path) == 1)
+        second.cancel()
+        #expect(FileChangeWatcher.pooledSourceCountForTesting(path: path) == 0)
+    }
+
     @Test("watchers dropped without cancel() close every descriptor")
     func deinitClosesDescriptors() throws {
         let root = try makeRoot()

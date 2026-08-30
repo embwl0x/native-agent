@@ -84,21 +84,23 @@ extension MemoryStorage {
     /// (gpt-5.5 review A4). Lifecycle-terminal rows are excluded on the same
     /// grounds `listMemories` excludes them.
     public func laneHandles(sourcePrefix: String, limit: Int?) async throws -> [MemoryLaneHandle] {
-        // LIKE-escape the caller's prefix so a `%`/`_` in a lane id can never
-        // widen the match beyond that lane.
+        // GLOB is case-sensitive like the protocol's hasPrefix fallback and
+        // can use the existing BINARY source index. LIKE both widened ASCII
+        // lane identities across case and forced an active-memory table scan.
+        // Escape pattern characters so every caller-supplied byte is literal.
         let escaped = sourcePrefix
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "%", with: "\\%")
-            .replacingOccurrences(of: "_", with: "\\_")
+            .replacingOccurrences(of: "[", with: "[[]")
+            .replacingOccurrences(of: "*", with: "[*]")
+            .replacingOccurrences(of: "?", with: "[?]")
         return try await dbPool.read { db in
             var sql = """
                 SELECT id, created_at, source FROM memories
-                WHERE source LIKE ? ESCAPE '\\'
+                WHERE source GLOB ?
                   AND status = 'active'
                   AND lifecycle NOT IN ('corrected', 'contradicted', 'deleted')
                 ORDER BY created_at DESC, id DESC
             """
-            var args: [DatabaseValueConvertible] = [escaped + "%"]
+            var args: [DatabaseValueConvertible] = [escaped + "*"]
             if let limit {
                 sql += " LIMIT ?"
                 args.append(max(0, limit))

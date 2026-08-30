@@ -80,10 +80,34 @@ if [[ -z "$SIM_NAME" ]]; then
 fi
 
 echo "[test-ios] running $SCHEME tests on simulator: $SIM_NAME"
+mkdir -p "$ROOT/.runtime/test-ios-results"
+RESULT_DIR="$(mktemp -d "$ROOT/.runtime/test-ios-results/run.XXXXXX")"
+RESULT_BUNDLE="$RESULT_DIR/tests.xcresult"
+echo "[test-ios] result bundle: $RESULT_BUNDLE"
 xcodebuild test \
   -project "$PROJECT" \
   -scheme "$SCHEME" \
   -destination "platform=iOS Simulator,name=$SIM_NAME" \
   -derivedDataPath "$ROOT/iOS/NativeAgentMobile/build/DerivedData" \
+  -resultBundlePath "$RESULT_BUNDLE" \
   CODE_SIGNING_ALLOWED=NO
-echo "[test-ios] passed"
+# Exit zero alone does not prove discovery or execution. Read Xcode's typed
+# summary from this exact, fresh run; never borrow an older successful bundle.
+xcrun xcresulttool get test-results summary --path "$RESULT_BUNDLE" --compact > "$RESULT_DIR/summary.json"
+python3 -c '
+import json, sys
+try:
+    result = json.load(sys.stdin)
+    fields = ("totalTestCount", "passedTests", "failedTests", "skippedTests", "expectedFailures")
+    if not isinstance(result, dict) or any(type(result.get(k)) is not int or result[k] < 0 for k in fields):
+        raise ValueError("missing or malformed test counts")
+    total, passed, failed, skipped, expected = (result[k] for k in fields)
+    if result.get("result") != "Passed" or failed or passed == 0:
+        raise ValueError("run did not pass with at least one executed passing test")
+    if total != passed + failed + skipped + expected:
+        raise ValueError("inconsistent test counts")
+except Exception as error:
+    print("[test-ios] FAIL: invalid execution proof: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+print(f"[test-ios] passed: {passed} passed, {skipped} skipped, {expected} expected failures, {total} discovered")
+' < "$RESULT_DIR/summary.json"

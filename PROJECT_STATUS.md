@@ -1,13 +1,97 @@
 # NativeAgent Project Status
 
-Last updated: 2026-08-25
+Last updated: 2026-08-30
 
 ## Summary
 
-Public release 0.4.2 is live. Version 0.4.3 is the current release candidate,
-bringing the subsequent personality, evaluation, natural computer-use, memory,
-provider-routing, and reliability work together on one integrated source.
+Public release 0.4.3 is live. Version 0.4.4 is the current release candidate,
+bringing the subsequent computer-use, relevant recall, conversation continuity,
+delegation, evaluation, and reliability work together on one integrated source.
+Release validation and publication are pending; this is not a release receipt.
 Source and live behavior remain authoritative over older release prose below.
+
+The post-0.4.3 integration audit is complete. It repaired a vision-region
+regression that fragmented connected controls, made Telegram `/retry` obey the
+same durable FIFO queue contract as ordinary messages, and restored the toolbar
+health claim from existing live health evidence without reintroducing a full
+Doctor run at launch. The canonical eval path now builds its ActivityWatch
+process probe once, bounds every child process, prunes ignored `.claude`
+workspace tooling, and exercises persistence-cap eviction at the production
+stride rather than forcing a synchronous cap scan after all 5,000 setup writes.
+That persistence suite fell from more than ten minutes to 6.6 seconds, while
+the ActivityWatch boundary suite now passes 151 checks in 16.3 seconds. The
+full Mac app gate passes 2,786 tests, and the iOS simulator gate passes 506
+XCTest cases plus 13 Swift Testing cases.
+
+Chat-history retrieval now returns compact, pageable result sets. Live traces
+showed Agent requesting the former 25-result ceiling twice in one turn and
+receiving roughly 18 KB each time. The tool now caps each page at 12 ranked
+snippets, reports the total and returned counts, and exposes an exact next
+offset so deeper recall remains available without flooding the decision step.
+
+Delegation status now applies its agent filter before its display window, so a
+Codex-specific check cannot lose older Codex work behind newer OMP or Claude
+rows. Ordinary results use compact eight-job pages capped at 12, with exact
+offset continuation and an explicit full-detail mode. This replaces repeated
+12–13 KB status payloads while keeping every lifecycle field reachable.
+
+Runtime introspection now answers ordinary identity/provider questions through
+a compact projection. Live traces showed 13 calls in one day, with the former
+default repeatedly rebuilding tool inventories, trusted roots, MCP names, and
+a seven-day outcome audit for 3 KB responses taking up to 1.2 seconds. Those
+diagnostics remain available through `detail=full`; tool names stay canonical
+in `tool_catalog`.
+
+Codex bridge dead letters now close their sender-facing lifecycle explicitly.
+The unretryable brief remains unread and recoverable, but its inbox row records
+terminal delivery failure instead of looking like a live message stuck before
+consumption. Startup repair projects older durable receipts, the dead-letter
+ledger is locked and bounded at 5,000 rows, and diagnosis reports terminal
+failure separately from a true consumer backlog. Nothing auto-replays or
+deletes the abandoned brief. All 96 wake-helper cases and the complete
+instrument fixture/mutation suite pass.
+
+Fluid Context chat turns now reuse the schema catalog already built for tool
+preload. Once packet preparation determines whether `context_expand` is valid,
+the turn adds or removes that single canonical schema rather than discarding
+the preload and repeating every built-in, registry, and MCP schema walk. Tool
+eligibility and provider ordering remain unchanged; the duplicate resident
+work is gone. The root app build and focused Core regression pass.
+
+Routine delegated-job success traffic now uses one active informational rollup
+per bridge source rather than one unread inbox row per job. This stops the live
+notification surface from growing as a completion ledger while preserving
+exact cards for failures, unconfirmed delivery, stalls, recovery, and backlog.
+Existing read/dismissed history is not silently rewritten. The root build and
+all five focused production-write-path cases pass.
+
+The current private source makes whole-system diagnosis deployment-aware. Turn
+latency, lifecycle coherence, and Mac-control store/trace comparisons use the
+currently installed build epoch rather than blaming today's executable for
+retained rows from older builds. The organism instrument correctly treats
+`resourcePressure: nominal` as healthy, bridge intake reads canonical
+read/consumed stamps instead of requiring an optional outbound reply, OAuth
+health relies on explicit expiry rather than file age, and inert `disabled/`
+snapshots raise a lead only if a live reader crosses into them. The complete
+instrument fixture and mutation suite passes, and the live report now preserves
+the real expired-X and bridge-backlog findings without the repaired false alarms.
+
+The latest private source closes the deep-audit findings without adding a new
+resident owner or broad test loop. The instrument now separates historical or
+bounded residue from current failures across Telegram, Slack, provider pins,
+context assembly, GitHub watchers, and the passive organism sampler. Applied
+memory consolidations repair their exact hygiene health projection; malformed,
+failed, mismatched, or genuinely staged receipts remain unhealthy. Lazy bridge
+tools recover only the canonical task-local session and fail closed on stale or
+conflicting builder handles. Repeated informational notices can opt into one
+stable roll-up, while one bounded heartbeat review card surfaces old workflow,
+preserved Codex-reply, and Desk residue without replay or deletion. Eval ledger
+truth now records 3,711 covered surfaces and 81 reports-only surfaces.
+The integrated build, 38 focused Core checks, 6 focused app checks, complete
+instrument fixture/mutation suite, and whitespace gate pass. The signed build
+is installed and live as PID 55460; idle CPU settled to 0.1%, chat is ready,
+and live organism memory health is green. The working source is intentionally
+uncommitted, so strict exact-commit identity reports dirty provenance.
 
 The latest private fix closes one production permission/crash chain without
 reducing autonomous builder access. Permission-authority shell mutations are
@@ -374,6 +458,15 @@ tissue over the builders' canonical histories, not a new transcript, memory,
 agent, or scheduler. Wrong-worker and malformed references fail before durable
 queueing. The change is locally verified and remains uninstalled/unreleased.
 
+Codex and Claude implementation handoffs can now opt into one paired reviewer
+with `pair_reviewer`. The builder pairs that reviewer at dispatch, commits the
+coherent candidate before review, gives the reviewer the exact SHA, receives
+findings back, and owns any fixes. The bit is durable and idempotency-sensitive;
+ordinary notes and questions carry no review prompt. This is routed bridge
+guidance, not a Factory manifest, authority model, or second workflow engine.
+The enqueue receipt reports only `reviewerPairRequested`; skipped and failed
+wakes never claim that a reviewer was actually paired.
+
 Release `0.3.8` (2026-08-06) is the current public build: notarized DMG on
 the releases page, Sparkle feed serving it to installed 0.3.7 clients, and
 a clean-VM install verified end-to-end (Gatekeeper-accepted, blank first
@@ -553,11 +646,12 @@ external gates; the release stays manual after approval.
 
 The iOS companion now offers root-owned System/Light/Dark appearance, honors
 Reduce Motion for shared decorative effects, and uses 44-point primary chat
-controls. Its primary Skills destination is a combined `Skills & Tools`
-surface: Skills retains its lifecycle controls while Tools displays a compact,
-read-only projection of the exact Mac chat dispatcher catalog, lazy-load state,
-and effective autonomy. The Mac remains the sole registry, policy, approval,
-and execution owner. Fresh-install states are truthful, and the target packages
+controls. Desk is its fourth primary tab so the live work surface is one tap
+away; the combined `Skills & Tools` surface remains under More. Skills retains
+its lifecycle controls while Tools displays a compact, read-only projection of
+the exact Mac chat dispatcher catalog, lazy-load state, and effective autonomy.
+The Mac remains the sole registry, policy, approval, and execution owner.
+Fresh-install states are truthful, and the target packages
 a valid privacy manifest while omitting obsolete camera and local-network
 privacy declarations. All 66 iOS tests and a generic iOS Release archive pass;
 Apple-signed production CloudKit/APNS, TestFlight, and App Store privacy
@@ -1226,19 +1320,277 @@ from 64.75 seconds/six provider calls to 23.68 seconds/three calls with no
 catalog/load turn, all eight tool dispatches successful, and GPT-5.6 Sol
 unchanged. This is production integration, not a shadow latency controller.
 
+Telegram ordinary follow-ups now queue by default instead of returning a busy
+rejection. The canonical durable update inbox owns the queued phase; the
+per-chat coordinator drains a bounded FIFO after natural completion. Each
+queued acknowledgement offers exact-bound `Steer now` and `Remove` controls,
+and steering crosses the existing confirmed cancellation boundary before the
+promoted message starts. The durable claim also retains the known
+acknowledgement message identity, so restart reconstructs queued work from its
+original Telegram update bytes and reclaims its original controls without
+replaying ambiguous in-flight effects.
+
+The dynamic-computer-use fixture again proves Agent can click a moving
+pixel-only target and verify the resulting hit without a miss. Scoped
+`screen(part:)` requests for a canvas, viewport, world, or visual surface now
+retain the fused visual scene instead of fuzzy-matching identically named
+browser chrome, removing one observed full-screen/provider recovery round.
+Repeated Full Mac action receipts retain the caller's original repeat request
+separately from the accepted hard cap and duration-bounded plan. This keeps
+runaway upstream requests visible in structured and natural results while the
+existing bounded motor behavior remains unchanged.
+The same burst also enforces its thirty-second resource boundary against
+monotonic elapsed capture, resolution, action, verification, and pause time,
+so slow owner work cannot continue launching new attempts past the boundary.
+Runtime-limited replies expose the elapsed time and stop reason while retaining
+the exact completed-effect count and releasing any burst-owned attention lease.
+Provider-facing `act` schemas carry the same repeat, hold, and interval bounds
+as runtime enforcement and name the burst receipt stages, preventing avoidable
+invalid calls without adding a new authority gate or provider round trip.
+Visible-browser navigation enforces its HTTP(S) capture perimeter on every
+top-level WebKit navigation action and on the final committed URL, so a remote
+redirect cannot promote a local or custom scheme into text/image capture
+authority. Refusals retain their exact scheme reason and release the navigation
+latch for a safe retry; ordinary HTTP(S) and subframe behavior remain intact.
+Chrome native-messaging responses are bound to the pending request's exact
+protocol version, id, action, and success/error shape before they can settle an
+effect or update lease ownership. A mismatched or replayed response closes the
+channel with an invalid-response result rather than claiming the wrong action;
+admitted Chrome capabilities and effect-time authority remain unchanged.
+Dispatched Chrome mutations that lose their confirmation at a deadline,
+disconnect, or shutdown now carry an explicit unknown-outcome/no-automatic-retry
+error with the original reason. Read/wait failures and pre-dispatch authority
+refusals retain their ordinary errors; cancellation does not claim rollback.
+Chrome typing accepts its full requested input but runs within twenty seconds
+and the remaining lease, returning exact code-point progress and a UTF-16-safe
+continuation offset on partial completion. Per-character target/lease checks,
+periodic zero-delay yields, immediate trusted-input takeover, and non-closing
+lease release on cancellation prevent an old typing loop from writing on after
+control changes hands. Partial receipts require observation before typing only
+the remaining suffix, never blind replay of the original full input.
+Chrome's combined structured snapshot budgets actual UTF-8 JSON size below
+the relay frame limit, preserving a usable node prefix, exact retained routes,
+and truthful frame/summary counts with explicit byte-limit truncation. Large
+URLs and multibyte strings can no longer turn an otherwise valid snapshot into
+a transport disconnect; metadata-only overflow is an explicit bounded error.
+Chrome page effects and renewal enforce the existing lease expiry at use time,
+independent of delayed alarm delivery; expired leases remain releasable for
+cleanup but cannot be used or resurrected through renewal.
+Combined Chrome snapshots retain bounded in-flight frame invalidations and
+recheck active lease ownership before publication. Concurrent captures cannot
+republish obsolete routes, and mutation/takeover during a frame read produces
+an explicit stale/superseded result instead of dead actionable node ids.
+Chrome navigation completion retains an exact per-tab request token and checks
+the existing active lease after waits and final readback. Post-dispatch takeover
+or supersession is outcome-unknown with no blind retry, and event wait resources
+are released promptly. Requested/observed URLs remain distinct for redirects;
+tab completion is unverified, while settlement waits verify only fresh state.
+Soft saliency halos tightly centred on a precise visual candidate now
+corroborate that object rather than becoming a duplicate, while a bounded area
+ratio preserves genuinely separate nested controls. Numbered regions describe
+themselves as physical objects without leaking an uncertain shape-role guess.
+For matched moving regions, capture-time velocity now provides a bounded,
+surface-clamped motor lead through perception latency; screen prose continues
+to report only the observed position and motion, and teleport/stale intervals
+produce no speculative trajectory.
+Visual-world diagnostics split monotonic host capture/AX time from pixel
+compile/tracking/render time, so cadence improvements can target the measured
+owner without retaining frame content or adding a provider call.
+The host side is further split into AX snapshot, ScreenCaptureKit capture, and
+image crop/PNG rendering, scene selection, post-render assembly/store, and total
+view-handler time; the outer clock distinguishes handler work from dispatch
+overhead. A display-descriptor cache was removed after a live before/after
+showed no warm capture improvement.
+Each Full Mac tool call now passes its freshly admitted Trust Center policy
+snapshot into the inner MacControl gate instead of reading and decoding the
+same policy file twice inside one action; policy is never cached across calls.
+Read-only accessibility perception also bypasses the durable motor-operation
+ledger after its policy check: this removes frame-by-frame persistence latency
+and prevents operation-ID replay from returning stale sight, while every
+effectful action retains durable transitions, cancellation, and verification.
+Post-action confirmation for a physical-only visual target returns that fresh
+visual surface and its values instead of repeating surrounding browser chrome;
+semantic actions retain their full-window result.
+Unlabeled visual fragments that fail every actionability gate are represented
+by one counted, reason-categorized uncertainty row rather than repeated
+provider-facing debris; named uncertainty and physical targets stay explicit.
+For numbered physical-only objects, the rendered confidence measures the
+claimed pointing evidence (bounded by both edge confidence and visual
+prominence) instead of importing semantic-role uncertainty into that number;
+the separate role-uncertain abstention remains explicit.
+Colour-region evidence survives into compact scene prose through a bounded
+perceptual colour vocabulary and participates in temporal appearance matching,
+so similarly shaped moving objects with different known colours do not exchange
+stable identities when they cross.
+The screen adapter and live tracker also share a bounded duplicate rule that
+removes a soft colorless saliency halo when a centre-near, strongly bounded
+coloured region already represents the same object; broad or distant regions
+remain independent.
+Numbered physical objects expose compact surface-normalized centre and size
+percentages alongside coarse position, colour, contrast, and motion, allowing
+precise spatial reasoning without leaking global mouse coordinates.
+Motor-confident physical objects also expose their known shape/colour phrases
+as resolver aliases for the same target, so `click the yellow object` can act
+without repeating a synthetic region number; duplicate appearances remain an
+ordinary ambiguity and act on nothing.
+Successful and refused physical actions echo an exact appearance alias in
+their natural prose while retaining the stable region identity privately in
+the structured match receipt.
+Both numbered visual references and compact natural object phrases receive one
+immediate fresh observation after a transient no-match. The retry acts only
+when that second frame visibly resolves the target; old or occluded coordinates
+never become motor authority.
+An actively tracked trajectory also becomes part of the same natural address:
+phrases such as `moving yellow object` and `yellow object moving right slowly`
+resolve to the visible target, while a teleport marked `repositioned` does not
+pretend to be continuous motion.
+The bounded scene graph also contributes one nearest-neighbour relational alias
+per motor-confident object, so a phrase such as `yellow object left of blue
+object` can disambiguate from the fresh frame without expanding into an
+all-pairs token wall or weakening ambiguity refusal.
+Physical action confirmation compares a separate effect-value lane containing
+only HUD indicators, readouts, and recognized text. Changing motion,
+occlusion-memory, and spatial-relation prose remains useful scene context but
+can no longer masquerade as evidence that an input worked.
+Literal hover/move/drag/hold gestures on pixel-only objects likewise suppress
+generic full-render change as verification, because an animated world changes
+without their input. These gestures preserve exact appearance aliases as
+centre-aiming identities and echo the user's natural target phrase.
+Their natural reply also withholds “changed” language when only the hand
+handler accepted the input, keeping the prose aligned with the structured
+`unverified` verdict.
+Hover/move/drag/hold target acquisition now shares the click lane's one-frame
+recovery for compact moving-object phrases: the second frame must visibly
+resolve the object before any input is emitted, and the recovery is explicit in
+the receipt.
+A destination-only dropout during a physical drag receives the same one fresh
+look, but both source and destination are re-resolved together so coordinates
+from different scene generations are never mixed.
+Private motor projection now caps the first two-frame velocity estimate at
+three quarters of one object width, expands to the existing full bound only
+after trajectory continuity, and suppresses lead for one frame on a measured
+direction reversal.
+Natural alias containment is asymmetric: a short phrase may match a richer
+visible alias, but a request carrying motion, position, or relation qualifiers
+cannot fall back to the unqualified base object. Explicit within-target aim
+prefixes are parsed separately and retain quarter-point motor control.
+An established trajectory also retains 85% of its prior velocity through one
+sub-50 ms undersampled capture for motion language and identity association
+only. That continuity never creates motor lead; the fresh observed frame still
+owns the action point.
+When a motion-qualified target lookup still fails, its single permitted fresh
+retry waits 60 ms so a post-bounce trajectory can be measured; ordinary object
+misses remain immediate and the retry remains strictly bounded.
+After three stable observations with no retained trajectory, a physical object
+is positively described and addressable as `stationary`; earlier frames and
+quantized motion continuity remain unclassified rather than guessing stillness.
+Temporal aliases retain the known shape as well as colour, allowing both
+`moving yellow object` and `moving round yellow object` (and the stationary
+equivalents) to address the same current target without weakening ambiguity.
+State-only aliases such as `moving object`, `stationary object`, and their
+known-shape variants resolve when unique and reuse the ordinary ambiguity
+refusal when several current targets share that state.
+The same state-only aliases are available to a motor-confident saliency target
+whose colour and shape remain unknown; appearance/position phrases stay absent
+rather than being inferred from motion.
+The bounded 60 ms retry interval applies to both `moving` and `stationary`
+qualified misses, allowing either temporal state to be freshly measured while
+leaving unqualified lookups immediate.
+Those aliases also include coarse rendered position phrases (for example
+`yellow object on the left` and `upper blue object`), allowing same-appearance
+objects in different scene sectors to remain naturally addressable without
+creating a new coordinate or weakening ambiguity refusal.
+An exact position-bearing alias identifies the object and keeps the motor point
+at its safe centre; an added within-object qualifier such as `left side of
+yellow object` deliberately moves the point within that same resolved target.
+Visual-world zooms retain those fields with a scoped 96-character detail cap;
+ordinary UI labels keep their existing compact rendering budget.
+Saliency-only regions larger than 12% of the visual surface remain summarized
+perception evidence but cannot become numbered objects or motor targets; the
+shared tracker uses the same admission rule.
+Strongly bounded, extreme-aspect coloured strips become non-motor visual
+indicator values with orientation, normalized position, and length instead of
+click targets; no domain meaning is inferred from the bar.
+Touching, aligned colour strips are fused into one segmented indicator with
+visible colour proportions, rather than exposed as unrelated status values.
+Strongly bounded low-contrast regions occupying at least 0.1% of the visual
+surface can remain physical scene objects; tiny muted texture still requires
+the stricter contrast floor.
+Those muted scene objects receive a motor target only when their independent
+physical pointing confidence reaches 0.25; lower-confidence objects remain
+numbered, tracked, and available to scene relations without inviting a click.
+Physical scene prose distinguishes compact/wide/tall geometry, low/visible/high
+contrast, and dark chromatic colours without inferring semantic object roles.
+For bounded colour objects, a capped connected-component walk can add the
+conservative silhouette `round` or `square` from occupancy and corner evidence;
+uncertain cases remain `compact`, and curved edge pixels cannot seed duplicate
+objects. This changes neither action bounds nor semantic role.
+Known differing silhouettes are also negative temporal-identity evidence, so
+same-coloured round and square objects do not swap stable IDs when they cross;
+an unknown silhouette remains compatible.
+Nearby percentage readouts are fused with segmented indicator geometry only
+when a visible segment proportion independently agrees within three points.
+Sparse recognized HUD text retains frame geometry for the same meter fusion;
+isolated bullet-style OCR noise is omitted from the value vocabulary.
+The standalone-marker filter applies to both sparse recognized text and
+prominent readouts, matching whichever OCR promotion path wins on a frame.
+It also gates uncertain row labels, so a marker-bound fragment remains counted
+uncertainty instead of becoming a fake unknown grid object.
+Repeated marker-only OCR such as `• •` is handled by the same rule; the filter
+requires every non-whitespace character to be a known marker glyph.
+Strongly overlapping same-colour detector views collapse to the best-pinned row
+before rendering and tracking, preventing duplicate physical identities after
+teleports or redraws.
+Temporal discontinuities preserve appearance-backed identity but render as
+`repositioned` and carry zero motor lead; directional motion requires the same
+bounded-continuity evidence used by prediction.
+An exact numbered visual-region action that sees one detector miss takes one
+immediate fresh re-observation and acts only if that second frame exposes the
+target; it never clicks an old coordinate or promotes occlusion memory to motor
+authority, and ordinary semantic targets retain one-frame resolution.
+An established short trajectory can bridge a fast object's ordinary matching
+radius when its next observation agrees with measured velocity; prediction
+time, travel, and residual error are bounded, while unmatched jumps remain
+appearance-only discontinuities.
+Continuous-motion prose also distinguishes normalized slow and quick pace from
+the ordinary middle band, giving the planner useful temporal scale without
+exposing desktop pixel velocity or adding pace to teleports.
+One same-pixel observation retains a rapidly decaying prior trajectory for
+matching and occlusion continuity, preventing slow subpixel motion from being
+erased by sampling quantization; motor lead remains zero unless the current
+frame itself observes at least three points of displacement.
+An identity match admitted only by appearance outside ordinary spatial reach is
+always treated as a discontinuity, even if its raw distance fits the broader
+motion ceiling.
+Established coloured tracks missing for one or two frames remain as decaying,
+non-actionable last-seen scene facts; low-confidence or one-frame detections do
+not become occlusion memory.
+When a stable missing track has a recent bounded velocity, that non-motor fact
+also carries conservative shape and an explicitly conditional expected
+position for up to 1.5 seconds; stale or excessive travel is not projected.
+Stable visual-region identities expose up to four measured nearest-neighbour
+relations, providing a bounded relative scene graph after higher-priority HUD
+values.
+Materially intersecting visible regions use the depth-neutral relation
+`overlaps` rather than a misleading directional relation, and relation labels
+retain conservative shape and colour when known.
+Ordered on-screen window metadata suspends canvas and physical-region targets
+when a foreign foreground window covers at least 3% of the visual world, while
+retaining perception and an explicit obstruction receipt.
+
 ## Capability Snapshot
 
 | Area | Status | Notes |
 |---|---|---|
 | Mac app runtime | Real | SwiftUI app plus in-process Swift runtime services. |
-| Agent-readable Mac screen | Experimental/live-integrated | The four natural verbs consume one fused semantic screen rather than exposing view handles. AX remains the lossless semantic lane; pixel-only canvases, games, video, and custom renderers enter the same representation through a Swift-native visual compiler. The first temporal framebuffer slice requests the frozen raw capture without human marker ink, crops perception to the AX-located visual surface, and assigns rebuildable stable region identities plus motion descriptions across observations. Physical regions remain role-uncertain and physical-only, actions aim at their current global position, and fresh observation—not dispatch success—owns visible verification. Broader object meaning, occlusion, meters, spatial relations, and continuous-frame tracking remain open. |
-| Chat orchestration | Real | Streaming and non-streaming provider paths, Swift tool loop, turn planning, compact context, same-turn lazy schema activation, action receipts, an exact provider-backed Mac context meter with separate provider input, transcript growth, per-turn delta, and visible compaction threshold, bounded transcript/tool-result projections (12,000 provider-facing UTF-8 bytes for GitHub and blocking delegation; 32,000 elsewhere), lossless same-turn paging of oversized redacted results, finite tool-dispatch watchdogs on every surface, exact no-progress loop recovery, authoritative turn-trace inspection, fail-closed compaction, and a strict shared session-index mutation boundary. One scene-active vnode subscription now rereads only that canonical session index after bridge/iOS/Slack/Telegram/Mac mutations, coalesces bursts, suppresses equal observed writes, and updates Chat, detached-window titles, Status, command search, and project/session lineage with no idle polling. Mac and iOS chat accept additional messages while Agent is working into a visible, per-session, bounded FIFO; natural completion sends next, Stop pauses without discarding, and Steer promotes a selected message through an ordered cancellation boundary. Queued turns remain out of the transcript/provider context until execution starts and are intentionally process-local rather than restart-durable. Mac chat turns are user-initiated on dev installs; the one exception is the first-run welcome greeting, which fires exactly once on a fresh public-release install (gated on `isPublicReleaseBundle` at both the onboarding marker write and the fire path). |
+| Agent-readable Mac screen | Experimental/live-integrated | The four natural verbs consume one fused semantic screen rather than exposing view handles. AX remains the lossless semantic lane; pixel-only canvases, games, video, and custom renderers enter the same representation through a Swift-native visual compiler. The temporal framebuffer path requests the frozen raw capture without human marker ink, crops perception to the AX-located visual surface, and assigns rebuildable stable region identities, bounded motion/pace, brief-occlusion memory, conservative colour/shape, HUD meter fusion, and nearest-neighbour relations across observations. Scoped canvas/viewport/world requests preserve that visual scene and omit surrounding AX chrome instead of losing requested pixels to fuzzy browser-tab matching. Physical regions remain role-uncertain and physical-only; matched bounded motion projects the private motor point through measured perception latency while visible prose stays anchored to observed evidence. Fresh observation—not dispatch success—owns visible verification. Rich object meaning and a continuous high-rate frame stream remain open. |
+| Chat orchestration | Real | Streaming and non-streaming provider paths, Swift tool loop, turn planning, compact context, same-turn lazy schema activation, action receipts, an exact provider-backed Mac context meter with separate provider input, transcript growth, per-turn delta, and visible compaction threshold, bounded transcript/tool-result projections (12,000 provider-facing UTF-8 bytes for GitHub and blocking delegation; 32,000 elsewhere), lossless same-turn paging of oversized redacted results, finite tool-dispatch watchdogs on every surface, exact no-progress loop recovery, authoritative turn-trace inspection, fail-closed compaction, and a strict shared session-index mutation boundary. Every app-owned production turn—including purpose-built restricted Workshop clients—now enters Core through one app chat-body composition boundary for cognition, ContextFlow, memory projection, provider lifecycle, and root scoping. Scheduled/internal turns use an explicit background profile that omits evolution tools, denies external MCP, and cannot create approval work without an explicitly supplied filer. One scene-active vnode subscription now rereads only that canonical session index after bridge/iOS/Slack/Telegram/Mac mutations, coalesces bursts, suppresses equal observed writes, and updates Chat, detached-window titles, Status, command search, and project/session lineage with no idle polling. Mac and iOS chat accept additional messages while Agent is working into a visible, per-session, bounded FIFO; natural completion sends next, Stop pauses without discarding, and Steer promotes a selected message through an ordered cancellation boundary. Queued turns remain out of the transcript/provider context until execution starts and are intentionally process-local rather than restart-durable. Mac chat turns are user-initiated on dev installs; the one exception is the first-run welcome greeting, which fires exactly once on a fresh public-release install (gated on `isPublicReleaseBundle` at both the onboarding marker write and the fire path). |
 | First-party model routing | Real | One verified catalog now drives public OpenAI, ChatGPT OAuth, Codex CLI, Anthropic API-key/OAuth, xAI OAuth, and Moonshot API across Mac/iOS/Telegram/Slack. Preferences and active providers publish through one crash-recoverable transaction; every central provider call and every accepted Telegram/Slack turn consumes one checked reconciled snapshot, so corrupt saved routing cannot silently borrow defaults, mix generations, or invoke a surface-local effort classifier. GPT-5.6 Sol remains the canonical account-backed default; persisted exact GPT-5.5 selections are upgraded at both preference migration and route normalization, so no executable fallback silently downgrades a turn. Public GPT-5.6 exposes None-through-Max while account-backed Sol/Terra retain Low-through-Ultra and Luna Low-through-Max; signed cache data overlays an account-verified fallback. Direct ChatGPT OAuth maps the account Max/Ultra presets to its deepest accepted `xhigh` wire effort, while Codex CLI retains the literal client preset. Its ordinary, streaming, structured-tool, OAuth authorization, and image routes share one accepted Codex-backend identity with NativeAgent build attribution; current nested SSE failures are decoded truthfully, and only explicit capacity failure before any output receives one token-preserving retry. The Claude catalog includes Sonnet 5/Fable 5/Opus 4.8 with exact model effort levels, xAI exposes live-proven Grok 4.5 with Low/Medium/High plus priority Fast, and Moonshot exposes an authenticated live model catalog with a documented offline Kimi baseline. Kimi K3 preserves provider reasoning state across structured tool loops, forces its required Max reasoning control, streams without exposing hidden reasoning, and supports native vision/tool payloads. Moonshot keys remain Mac-local and never traverse iCloud. Providers exposes provider/model/Think/Fast for every canonical task/chat surface, successful saves update an already-open Mac chat immediately, provider-scoped rows override stale/global duplicates, and the corresponding controls reach each provider's real request body. |
 | Cognitive substrate / organism | Experimental/default-off, live-gated | `CognitiveSubstrate` now has bounded events, fail-closed SQLite bundle restore with typed ready/degraded health, workspace/spreading activation, provenance-backed capsule injection with need classification, affect decay, thought suggestions, Dream/REM replay lineage, reflection proposal receipts, research exports, reproducible experiments, welfare bounds, and Observatory controls. Its complete maintenance transition is atomic across nodes, thought seeds, affect, emotional consolidation, standing-view cleanup, lineage, receipts, and pruning. Continuous reads are analytic; maintenance exposes one exact next boundary for emotional consolidation, thought-seed physical expiry, and proposed-view retirement instead of relying on a five-minute checkpoint heartbeat. The consumerless cue-authoring lane is retired from runtime, provider routing, persistence families, and package sources; legacy cue receipts and inert node metadata drain idempotently at store open. The fast microcycle is resident and event-coalesced; resident sensory admission defers durability to one existing canonical transaction covering nodes, affect, thought seeds, pruning, and its receipt. Rebuildable owner-local token and defensive-turn-kind indexes remove repeated node-prose compilation from activation/workspace scoring. Deterministic analytic-time proof now covers fourteen idle days, exact decay/deadlines, residual repair wake without a cross-owner cognitive poke, payload-free chat timing, restart parity, and lossless burst coalescing. CognitiveSubstrate and OrganismKernel publish bounded immutable attention after owner transitions; ordinary turns merge that with resident pursuit intent through one lock-backed read and enter no owner actor or persistence path. Owner-published, payload-free runtime invalidations refresh visible cognition/living-state projections after events, microcycles, maintenance, replay, reflection, controls, and provider lifecycle changes without a view polling heartbeat. Semantic appraisal remains the sole owner of conversational meaning: somatic chat signals carry topology/intensity without lexically re-appraising text, routine assistant speech earns no synthetic coherence/confidence reward, and typed evidence/freshness/uncertainty beliefs drive operational posture. The live default-root runtime self-collects bounded installed physiology from existing events only—no sampling heartbeat—and `chat-drive physiology-soak-report` keeps real elapsed evidence distinct from generated proof. Event rows separate total, substrate, somatic, and residual-scheduling admission time. The current v3 epoch requires explicit turn class: live+system form the production resident population, live alone forms the ordinary population, and debug/verification rows are retained but excluded. Each resident and ordinary admission/microcycle population requires twenty samples and `<25 ms` p95; ordinary chat latency independently requires twenty live samples. Multi-day qualification also rejects saturated retention, quiet CPU at or above 0.5%, and process wakes at or above 18,000/hour. A fresh `runtime_started` row with both native counter families available is required to open a qualifying evidence window; older rows remain retained but cannot contaminate the current comparable latency/restart population. Committed Dream/REM evidence wakes replay immediately; a daily pass remains only as missed-event/crash integrity fallback, and failed immediate replay leaves a durable reconciliation receipt plus one deadline retry. The Organism Kernel adds somatic signals, body schema, plastic field, prediction, dream repair with bounded field/evidence receipts, reflex candidates with approve/hold/permanent-reject review, durable who/when/what receipts, approved low-risk posture bias, behavior posture coupling, real-time elapsed settlement, bounded decayed continuity under `data/cognition/organism_state.json`, deterministic loop skip/defer receipts, Dream/REM somatic integration, signed iOS reflex review controls, iOS living-status snapshots, phone-origin somatic pulses from signed iOS actions, and longitudinal eval metadata. Paired and time-compressed longitudinal ablations prove mechanisms without relabeling generated elapsed time as personal/installed evidence. Cognitive/organism state still cannot write MemoryV2 facts, mutate persona files, bypass TrustCenter, dispatch tools/actions directly, or send notifications directly. Blueprint completion is tracked row-by-row in `docs/COGNITIVE_SUBSTRATE_TRACEABILITY.md` plus the organism roadmap docs. |
 | Memory | Real | Swift MemoryV2, lifecycle/confidence hygiene, semantic/lexical recall, skill-hint diversity that preserves ordinary facts in bounded top-K results, opportunistic no-wait semantic Context queries when MiniLM is already warm, exact-only generated-USER deduplication, user-authored-only adaptive extraction, review-only one-turn preferences/goals, narrow structured-fact auto-save, acceptance-time quality revalidation, honest proposal evidence, active semantic-fragment/duplicate hygiene through the approval-gated consolidation swap, and Fluid Context projection quarantine. One immutable embedding epoch binds backend, model/vocabulary artifacts, preprocessing, pooling, normalization, dimensions, and sequence length across memories, proposals, tombstones, Context atoms, and query vectors; unknown/mismatched spaces never receive cosine or semantic-tombstone authority. Full re-embedding activates atomically with prior-vector rollback, never as a mixed or active-only migration. One pure record-disclosure policy governs persona, privacy, surface aliases, lifecycle, and status for automatic projection, explicit recall, and legacy failover while TrustCenter remains separate authority. Nullable `validFrom`, `validTo`, `observedAt`, and evidence retain provenance without invented dates. A frozen-copy `memory-eval` composes explicit MemoryV2 probes with the production Context selector and cannot mutate live use counts. An approved swap is not terminal until `USER.md`, Spotlight, the exact MemoryV2-owned knowledge graph, and Fluid Context have converged from canonical memory; projection failure retains the candidate and retries after restart without repeating the swap. Corrected facts retract prior indexer-owned KG claims while manual/legacy graph content remains intact. Once the MemoryV2 SQLite graph exists it is the sole graph read and mutation owner for Mac panels, tools, iCloud/iOS projections, forget, and Dream/REM growth distillation. Reads are checked and bounded; unreadable SQLite fails closed, and legacy JSON is pre-SQLite migration/compatibility only. Readable SQLite remains authoritative even when empty, so stale compatibility JSON cannot resurrect after migration. |
 | Desk / directed work | Real | Desk is the single Mac/iPhone work surface and canonical identity/lifecycle owner for agent pursuits and user-directed tasks. It lines up large projects, dependency edges, bridge references, scheduled work, research, approvals, progress receipts, and verified completion. Directed tasks retain the bounded multi-step `WorkshopExecution` planner/executor as an execution lane inside Desk, with checkpoint approvals, trigger scheduling, terminal Desk synchronization, and unified receipts. Terminal records carry a domain-owned verification result: exact text criteria and bounded local `write_file` bytes can be proven without an LLM, mismatches fail the execution, and unsupported external effects remain explicitly unverified. A completed execution closes Desk only when verification is `satisfied`; otherwise the durable commitment stays blocked awaiting domain verification. ContextFlow projects bounded Desk/linked-child status, verification, decision need, and expected evidence into later relevant turns, wakes from exact file edges, rebuilds after restart, and never owns action authority. Provider accounting is exact across the planner, ephemeral tool loop, and final synthesis. One locally reviewed `read_file -> write_file` shape has an immutable deterministic artifact with canonical execution, checked TrustCenter reads, exact timeline replay, domain verification, zero provider calls, and stable-key idempotency. Manual invocation remains available. After twelve distinct verified zero-provider executions, one exact implementation-bound, local-only approval activated the compatibility wire `workshop_submit(operation: copy_workspace_file)` through a replaceable pointer; the first natural GPT-5.6 invocation is canonically verified. There is no prose matcher, broad learned selector, permission authority, new scheduler, or ordinary-chat preflight. Missing activation falls back before admission; malformed exact input fails closed; admitted work never duplicates; pointer rollback waits for in-flight consequence and closes later admission. Cancellation and procedure race observation use kqueue-backed events rather than subsecond polling. The Mac Desk refreshes from store invalidation tokens and kqueue file events with burst coalescing and visibility gating. Compatibility execution state lives under `data/workshop`; launch performs a fail-loud, receipt-backed one-way migration of legacy `data/missions` state. |
 | iOS companion | Real | CloudKit chat, inbox/activity, approvals, settings/read snapshots, APNS registration, and remote action responses. Timed-out chat resumes observation of the original signed event instead of sending a duplicate turn, and its active fallback drains the selected transport rather than a retired Drive lane. Public Mac snapshots travel as bounded, compressed, digest-checked status groups and retain the existing file/read-model contracts in a rebuildable iOS cache; Mac remains the sole canonical owner. Signed action envelopes reuse the CloudKit message transport while MacSyncEngine retains HMAC/freshness, idempotency, TrustCenter/router, receipt, and signed-response authority. Snapshot reads fail closed when iCloud cannot prove the replica current; partial refreshes retain last-proven fields without advancing full-sync freshness. Mac body reachability derives from the latest HMAC- and freshness-validated iOS chat/action receipt; push-token state proves notification configuration only. The retired unsigned `mobile/pairing.json` token surface cannot configure the body or imply peer presence; pairing is owned by the signed PairingSecretManager/iCloud transport. One payload-free device-event digest correlates APNS, iCloud-bridge, and snapshot-local notification projections; APNS and the visual CloudKit route use it as the collapse identity. CloudKit query subscriptions are exact user-level private-database rows shared by the user's devices, not duplicate Mac/iPhone role rows; setup fetches before create and never accepts a production rejection as proof of existence. General chat/state sync retains its silent content-available subscription, while explicit notification records use a filtered Apple-presented visual subscription because silent wakes may be coalesced. Once that visual route is registered, the later signed record drain absorbs the event without scheduling a duplicate local copy. |
-| Scheduler/background loops | Real | App-owned jobs for notifications, dreams/REM, improvements, and proactive scans. Cognition's fast dirty microcycle is event-coalesced in the resident runtime; its retired 30-second factory is gone. Cognition maintenance is likewise exact-deadline driven by the same runtime, with a daily integrity fallback instead of a five-minute rewrite cadence. Canonical Dream/REM commits signal replay immediately; the replay registration is a daily integrity fallback rather than an hourly cognitive heartbeat. Trigger scheduling is invalidation-driven and sleeps until its exact next time/idle threshold with Core as the sole owner. Codex completion and pending-queue drain now suspend on app-server/vnode evidence and retain one exact deadline/durable reread instead of polling rollout state every two seconds. Residual sleep wakes only the real local-repair lane and no longer schedules an unrelated cognitive microcycle; operational-consolidation and identity-dream diagnostic deadlines do not wake production because they have no production consumer. The orphan harness-learning runtime and write-only trigger mirror are removed. Reflection retains its distinct budget/deadline cadence. |
+| Scheduler/background loops | Real | App-owned jobs for notifications, dreams/REM, improvements, and proactive scans. Cognition's fast dirty microcycle is event-coalesced in the resident runtime; its retired 30-second factory is gone. Cognition maintenance is likewise exact-deadline driven by the same runtime, with a daily integrity fallback instead of a five-minute rewrite cadence. Canonical Dream/REM commits signal replay immediately; the replay registration is a daily integrity fallback rather than an hourly cognitive heartbeat. Trigger scheduling is invalidation-driven and sleeps until its exact next time/idle threshold with Core as the sole owner. Codex completion and pending-queue drain suspend on app-server/vnode evidence and retain one exact deadline/durable reread instead of polling rollout state every two seconds. Codex wake consumption is FIFO-serial per canonical conversation, concurrent across conversations under an exact four-slot filesystem cap, and keeps only short queue/inbox mutations globally locked. New Codex, Claude, and OMP coding conversations receive distinct Git worktrees before queueing; contextual follow-ups reuse a private path pointer and conflicting cwd overrides fail before queueing. Omitted and ordinary non-Git cwd behavior is preserved, while Git evidence with a failed probe or allocation is refused before queueing. A 15-minute queued wake can be re-admitted in place only after two five-second-separated probes prove its owning turn dead or unlisted; live and uncertain old turns are preserved. Delegated builder/reviewer jobs reuse the bridge status projector's recorded stall verdict: the outcome loop wakes at the next exact liveness crossing, files one actionable stuck-step card, and resolves the same row if progress resumes; it never replays or replaces the work. Workshop owner-cadence selection mirrors Desk's one-attempt-per-item/day admission before taking a lease, sleeps capped items until their next UTC-day eligibility, and generation-fences its own watched Desk/lease writes so reservation refusals cannot form a CPU wake loop. Residual sleep wakes only the real local-repair lane and no longer schedules an unrelated cognitive microcycle; operational-consolidation and identity-dream diagnostic deadlines do not wake production because they have no production consumer. The orphan harness-learning runtime and write-only trigger mirror are removed. Reflection retains its distinct budget/deadline cadence. |
 | Policy/trust | Real | Unified policy receipts, shared Full Mac / Developer Mode boundaries, default-off multimodal gates such as OpenAI image generation, and one canonical conversation-surface profile shared by planning, policy, and approval execution so aliases cannot drift across trust seams. Shared chat composition authenticates the exact origin and makes one autonomy/approval decision; its inner app dispatcher still runs SecurityCenter hard checks without contradicting that decision, while direct/raw app clients retain their own autonomy gate. Full Mac YOLO therefore follows authenticated Telegram/Slack/iOS conversation identity for ordinary tools, never a claimed surface label, and cannot silently authorize self-modification, money, external sends, bad signatures, or prompt injection. Once the already-policy-filtered inventory proves Full Mac, native file, shell, Git, patch, build, Mac-control, restart, and evolution schemas are supplied immediately on the next turn without a lazy-load detour or app restart; ordinary chat remains lazy, and schema availability grants no new safety authority. Existing TrustCenter policy, capability sources/roots, Mac Integration permissions, and local capability signing keys are checked authority: only missing state bootstraps defaults; corrupt saved state is byte-preserved, unavailable, and fail-closed for reads, mutations, SecurityCenter, command execution, Mac integration dispatch/preload, and backup restore. ApprovalInbox is authoritative safety state: missing means empty, while corrupt/unreadable/malformed state fails closed and cannot be overwritten by a new approval. |
 | Image generation | Real/default-off | `image_generate` lazy-loads for art/image prompts and defaults to Codex/ChatGPT OAuth through the Codex Responses `image_generation` tool (`gpt-image-2`, PNG receipts under `data/generated_images/`). It requires the Trust Center `image_generation_openai` gate. `provider="codex_cli"` remains as an explicit diagnostic artifact collector for CLI child-session experiments; `provider="openai_api"` is the platform API fallback. |
 | Connectors | Mixed+ | Status/proof gates exist; credentialed non-status actions require proven account readiness and policy approval where appropriate. Telegram routes to its canonical settings owner, Browser opens its real surface, Slack/GitHub use validated token entry, X/Gmail/Google Calendar accept locally saved OAuth application credentials and use PKCE with exact loopback callbacks, and Notion validates an internal-integration token before connection. Gmail search/read, primary Calendar status/list, and Notion search/page read are real bounded lazy tools with Google refresh-token handling; Google scopes are read-only until verified write executors ship. Empty or malformed credential files cannot mark a row connected or pass the shared connector-auth mutation boundary. Unsupported providers have no mutation affordance, and the retired generic device-flow poll plus credential-free `connected=true` mutation remain removed. GitHub is first-class: its PAT is Keychain-backed with fail-closed exact-path plaintext migration and symmetric revoke; its synchronous UI status reads validated Keychain metadata while every action still resolves the secret from Keychain. Configurable connected-account repository discovery, compact 20-row provider read models, bounded body/diff excerpts, typed rate-limit failures, confirm-only external mutations, and due-driven cached refresh are real. Durable contribution scope persists the authenticated login, tracks only its authored PRs plus keyword-linked issues, keeps closed PR history outside current Desk work, replaces explicit repository selections, reconciles prior snapshot-owned Desk rows, and emits a sampled low-noise digest with exact counts. Other connector depth varies. |

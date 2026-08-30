@@ -1313,6 +1313,144 @@ public struct OpLogHealthCheck: DoctorCheck {
     }
 }
 
+// MARK: - OAuthTokenExpiryCheck
+
+/// C9-3 (upgrade sweep 2026-08-28). Two OAuth credentials in the live data
+/// root had been expired for weeks with nothing anywhere reporting it — the
+/// `x` connector (expired 2026-06-20) and the `xai_oauth_direct` provider
+/// (expired 2026-07-10). Both still hold a refresh token, so the failure is
+/// invisible until a call fails somewhere far from the cause. Doctor now says
+/// it out loud.
+///
+/// STRICTLY READ-ONLY, and deliberately so: this check never writes, never
+/// refreshes, never deletes a credential, and never reads a secret field. It
+/// reads `expires_at`, the file name, and whether a nonempty refresh credential
+/// is present. Credential material is never copied into the result, so a Doctor
+/// report can never carry it.
+public struct OAuthTokenExpiryCheck: DoctorCheck {
+    public let id: String = "oauth_token_expiry"
+    public let title: String = "OAuth Token Expiry"
+    private let root: URL
+    private let now: Date
+
+    /// Inside this window a still-valid token is reported as expiring soon, so
+    /// a credential is surfaced before the first failed call, not after.
+    static let expiringSoonWindow: TimeInterval = 7 * 24 * 60 * 60
+
+    public init(root: URL = defaultDataRoot(), now: Date = Date()) {
+        self.root = root
+        self.now = now
+    }
+
+    /// The live stores disagree on shape: `oauth_tokens/x.json` writes epoch
+    /// seconds as a STRING ("1781971620.402659") while
+    /// `providers/xai_oauth_direct.json` writes ISO-8601 ("2026-07-10T16:05:22Z").
+    /// A credential store that stops being read because its stamp is spelled
+    /// differently is exactly the silence this check exists to break, so both
+    /// spellings (plus a bare number) resolve here.
+    static func parseExpiry(_ value: JSONValue?) -> Date? {
+        let raw: String
+        switch value {
+        case .string(let s): raw = s.trimmingCharacters(in: .whitespaces)
+        case .int(let i): return Date(timeIntervalSince1970: TimeInterval(i))
+        case .double(let d): return Date(timeIntervalSince1970: d)
+        default: return nil
+        }
+        if raw.isEmpty { return nil }
+        if let seconds = Double(raw) {
+            // Guard against a millisecond stamp being read as year ~57000.
+            return Date(timeIntervalSince1970: seconds > 100_000_000_000 ? seconds / 1000 : seconds)
+        }
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFractional.date(from: raw) { return date }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+
+    /// Every credential file Doctor inspects, as (label, url). Both stores are
+    /// named explicitly: a glob over `providers/` would sweep in model caches
+    /// and provider config that carry no expiry at all.
+    static func credentialFiles(root: URL) -> [(String, URL)] {
+        let fm = FileManager.default
+        var found: [(String, URL)] = []
+        let tokensDir = root.appendingPathComponent("oauth_tokens", isDirectory: true)
+        for url in ((try? fm.contentsOfDirectory(at: tokensDir, includingPropertiesForKeys: nil)) ?? [])
+        where url.pathExtension == "json" {
+            found.append((url.deletingPathExtension().lastPathComponent, url))
+        }
+        let providersDir = root.appendingPathComponent("providers", isDirectory: true)
+        for url in ((try? fm.contentsOfDirectory(at: providersDir, includingPropertiesForKeys: nil)) ?? [])
+        where url.pathExtension == "json" && url.deletingPathExtension().lastPathComponent.hasSuffix("_oauth_direct") {
+            found.append((url.deletingPathExtension().lastPathComponent, url))
+        }
+        return found.sorted { $0.0 < $1.0 }
+    }
+
+    public func run() async -> CheckResult {
+        var expired: [String] = []
+        var expiringSoon: [String] = []
+        var refreshableExpired: [String] = []
+        var checked = 0
+        var unreadable: [String] = []
+
+        for (label, url) in Self.credentialFiles(root: root) {
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            guard let parsed = try? DoctorFileRepair.parseJSONFile(url), case .object(let object) = parsed else {
+                unreadable.append(label)
+                continue
+            }
+            guard let expiry = Self.parseExpiry(object["expires_at"]) else { continue }
+            checked += 1
+            let stamp = ISO8601DateFormatter().string(from: expiry)
+            let refreshToken: String? = {
+                if case .string(let value)? = object["refresh_token"] { return value }
+                if case .object(let tokens)? = object["tokens"],
+                   case .string(let value)? = tokens["refresh_token"] { return value }
+                return nil
+            }()
+            let canRefresh = refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            if expiry <= now {
+                let days = Int(now.timeIntervalSince(expiry) / 86_400)
+                if canRefresh {
+                    refreshableExpired.append("\(label) access expired \(days)d ago; refresh is available")
+                } else {
+                    expired.append("\(label) expired \(stamp) (\(days)d ago)")
+                }
+            } else if expiry.timeIntervalSince(now) <= Self.expiringSoonWindow {
+                if !canRefresh {
+                    expiringSoon.append("\(label) expires \(stamp)")
+                }
+            }
+        }
+
+        let repair = "Re-authorize the named integration from Settings → Connectors / Providers. "
+            + "Doctor never touches credential files: it reads `expires_at` only."
+        if !expired.isEmpty {
+            return CheckResult(
+                id: id, title: title, status: "warn",
+                detail: "Expired OAuth credential(s): \(expired.joined(separator: "; "))."
+                    + (expiringSoon.isEmpty ? "" : " Expiring soon: \(expiringSoon.joined(separator: "; "))."),
+                repair: repair
+            )
+        }
+        if !expiringSoon.isEmpty {
+            return CheckResult(
+                id: id, title: title, status: "warn",
+                detail: "OAuth credential(s) expiring within 7 days: \(expiringSoon.joined(separator: "; ")).",
+                repair: repair
+            )
+        }
+        var detail = "\(checked) OAuth credential(s) carry an expiry and none is expired."
+        if !refreshableExpired.isEmpty {
+            detail = "OAuth access token expiry is recoverable: \(refreshableExpired.joined(separator: "; "))."
+        }
+        if !unreadable.isEmpty {
+            detail += " Unparseable credential file(s) skipped: \(unreadable.joined(separator: ", "))."
+        }
+        return CheckResult(id: id, title: title, status: "ok", detail: detail)
+    }
+}
+
 public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
     private let checks: [DoctorCheck]
 
@@ -1326,6 +1464,7 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         CoreMLEmbedderCheck(),
         ICloudBridgeStateCheck(),
         OpLogHealthCheck(),
+        OAuthTokenExpiryCheck(),
     ]) {
         self.checks = checks
     }

@@ -118,11 +118,13 @@ struct BridgeSourceContractTests {
         ]
 
         #expect(Set(emitted) == expected, "SSE kinds drifted: \(Set(emitted).symmetricDifference(expected).sorted())")
-        // 17 emit sites for 12 kinds (message_out ×2, message_failed ×2,
-        // organism_debug ×4). Losing a site without losing the kind is the
-        // half-dark case set equality alone cannot see.
-        #expect(emitted.count == 17, "publishEvent emit-site count changed: \(emitted.count)")
-        #expect(emitted.filter { $0 == "organism_debug" }.count == 4)
+        // 14 canonical emitters for 12 kinds (message_out ×2 and
+        // message_failed ×2). Organism route branches converge on one typed
+        // emitter per kind so their exact payload routing is executable
+        // without a live listener.
+        #expect(emitted.count == 14, "publishEvent emit-site count changed: \(emitted.count)")
+        #expect(emitted.filter { $0 == "organism_debug" }.count == 1)
+        #expect(emitted.filter { $0 == "organism_reflex_review" }.count == 1)
         #expect(emitted.filter { $0 == "message_out" }.count == 2)
         #expect(emitted.filter { $0 == "message_failed" }.count == 2)
         // Every kind must be a literal — a computed `kind:` argument would make

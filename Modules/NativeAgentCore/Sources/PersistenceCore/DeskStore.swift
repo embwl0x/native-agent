@@ -62,6 +62,9 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case blockedOnSelf(handle: String)
     case blockedOnCycle(handle: String, handles: [String])
     case deferUntilUnparseable(handle: String, value: String)
+    case liveActivityMetadataEmpty(field: String)
+    case laneOfUnknown(handle: String, laneOf: String)
+    case laneOfSelf(handle: String)
     /// The compaction base exists on disk but does not decode. Replaying from
     /// the tail alone would silently blank every compacted item, so reads FAIL
     /// LOUD instead (fail-loud over fail-over).
@@ -119,6 +122,12 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: that edge would close a blocked-on cycle through \(handles.joined(separator: " → ")) — \(handle) would wait on itself"
         case let .deferUntilUnparseable(handle, value):
             return "desk: cannot defer \(handle) until '\(value)' — expected a yyyy-MM-dd day or a full ISO timestamp"
+        case .liveActivityMetadataEmpty(let field):
+            return "desk: \(field) must be non-empty when supplied"
+        case let .laneOfUnknown(handle, laneOf):
+            return "desk: cannot link \(handle) to laneOf \(laneOf) — no live item has that handle"
+        case .laneOfSelf(let handle):
+            return "desk: \(handle) cannot be its own laneOf parent"
         case .compactionBaseCorrupt(let path):
             return "desk: compaction base at \(path) exists but does not decode — refusing to replay from the tail alone (that would silently drop every compacted item)"
         case .compactionBaseUnreadable(let path):
@@ -346,6 +355,15 @@ struct DeskFeed: Sendable {
 }
 
 public struct SwiftNativeDeskStore: Sendable {
+    public struct CreateResult: Sendable, Equatable {
+        public let item: DeskItem
+        public let reusedEquivalent: Bool
+
+        public init(item: DeskItem, reusedEquivalent: Bool) {
+            self.item = item
+            self.reusedEquivalent = reusedEquivalent
+        }
+    }
     public static let logLabel = "DeskStore"
     /// Default archive-grace window for done items (48h) before they become
     /// sweep-eligible.
@@ -634,7 +652,7 @@ public struct SwiftNativeDeskStore: Sendable {
         }
         for op in ops {
             switch op.body {
-            case let .createItem(alias, _, _, _, parent, _, _, _):
+            case let .createItem(alias, _, _, _, parent, _, _, _, _, _):
                 if let parent {
                     bump(parent, seq: alias.split(separator: ".").last.flatMap { Int($0) })
                 } else {
@@ -661,7 +679,7 @@ public struct SwiftNativeDeskStore: Sendable {
             switch op.body {
             case .createItem, .openPursuit:
                 records[op.handle] = DeskNonTerminalRecord(status: .watch, blockedReason: nil, waitingOn: nil)
-            case let .setStatus(status, blockedReason, waitingOn) where !status.isTerminal:
+            case let .setStatus(status, blockedReason, waitingOn, _, _, _) where !status.isTerminal:
                 records[op.handle] = DeskNonTerminalRecord(status: status, blockedReason: blockedReason, waitingOn: waitingOn)
             default:
                 break
@@ -681,8 +699,58 @@ public struct SwiftNativeDeskStore: Sendable {
         project: String,
         title: String,
         parent: String? = nil,
-        summary: String? = nil
+        summary: String? = nil,
+        assignee: String? = nil,
+        laneOf: String? = nil
     ) async throws -> DeskItem {
+        try await createItemTransaction(
+            kind: kind,
+            project: project,
+            title: title,
+            parent: parent,
+            summary: summary,
+            assignee: assignee,
+            laneOf: laneOf,
+            reuseEquivalent: false
+        ).item
+    }
+
+    /// Idempotent owner-create path for conversational tools. Equivalence is
+    /// checked under the same flock as alias allocation and append, so two
+    /// agents asking for the same live top-level intent cannot race into two
+    /// owners. Terminal history never blocks a new item; callers may explicitly
+    /// choose `createItem` when a same-named sibling is intentional.
+    public func createOrReuseEquivalentItem(
+        kind: DeskKind,
+        project: String,
+        title: String,
+        parent: String? = nil,
+        summary: String? = nil,
+        assignee: String? = nil,
+        laneOf: String? = nil
+    ) async throws -> CreateResult {
+        try await createItemTransaction(
+            kind: kind,
+            project: project,
+            title: title,
+            parent: parent,
+            summary: summary,
+            assignee: assignee,
+            laneOf: laneOf,
+            reuseEquivalent: true
+        )
+    }
+
+    private func createItemTransaction(
+        kind: DeskKind,
+        project: String,
+        title: String,
+        parent: String?,
+        summary: String?,
+        assignee: String?,
+        laneOf: String?,
+        reuseEquivalent: Bool
+    ) async throws -> CreateResult {
         return try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let priorState = Self.compact(base: feed.base, feed.ops)
@@ -700,6 +768,17 @@ public struct SwiftNativeDeskStore: Sendable {
                 }
                 parentAlias = live.alias
             }
+            if reuseEquivalent,
+               let existing = priorState.items.first(where: {
+                   !$0.status.isTerminal
+                       && $0.parent == parent
+                       && $0.laneOf == laneOf
+                       && Self.equivalentDeskText($0.assignee) == Self.equivalentDeskText(assignee)
+                       && Self.equivalentDeskText($0.project) == Self.equivalentDeskText(project)
+                       && Self.equivalentDeskText($0.title) == Self.equivalentDeskText(title)
+               }) {
+                return CreateResult(item: existing, reusedEquivalent: true)
+            }
             let alias = Self.nextAlias(parentHandle: parent, parentAlias: parentAlias, base: feed.base, ops: feed.ops)
             let handle = DeskClock.newHandle()
             // The generic create path is HARD-PINNED to origin=.owner with no
@@ -707,6 +786,7 @@ public struct SwiftNativeDeskStore: Sendable {
             // openPursuit, which builds the create op with a validated dossier.
             let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: .createItem(
                 alias: alias, kind: kind, project: project, title: title, parent: parent, summary: summary,
+                assignee: assignee, laneOf: laneOf,
                 origin: .owner, pursuit: nil
             ))
             try Self.validateHierarchyTransition(op, in: priorState, allowArchive: false)
@@ -715,8 +795,22 @@ public struct SwiftNativeDeskStore: Sendable {
             guard let created = committedState.items.first(where: { $0.handle == handle }) else {
                 throw DeskError.unknownHandle(handle)
             }
-            return created
+            return CreateResult(item: created, reusedEquivalent: false)
         }
+    }
+
+    private static func equivalentDeskText(_ value: String?) -> String {
+        let folded = (value ?? "")
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+        let wordsOnly = folded.unicodeScalars.map { scalar in
+            CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : " "
+        }.joined()
+        return wordsOnly
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
     }
 
     /// add_child(parentHandle, kind?, title) = create_item with the parent set.
@@ -934,8 +1028,36 @@ public struct SwiftNativeDeskStore: Sendable {
     }
 
     @discardableResult
-    public func setStatus(_ handle: String, status: DeskStatus, blockedReason: String? = nil, waitingOn: String? = nil) async throws -> DeskOp {
-        try await appendValidated(DeskOp(handle: handle, body: .setStatus(status: status, blockedReason: blockedReason, waitingOn: waitingOn)))
+    public func setStatus(
+        _ handle: String,
+        status: DeskStatus,
+        blockedReason: String? = nil,
+        waitingOn: String? = nil,
+        progress: DeskProgress? = nil,
+        assignee: String? = nil,
+        laneOf: String? = nil
+    ) async throws -> DeskOp {
+        func normalized(_ value: String?, field: String) throws -> String? {
+            guard let value else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw DeskError.liveActivityMetadataEmpty(field: field)
+            }
+            return trimmed
+        }
+        let normalizedAssignee = try normalized(assignee, field: "assignee")
+        let normalizedLaneOf = try normalized(laneOf, field: "laneOf")
+        return try await appendValidated(DeskOp(
+            handle: handle,
+            body: .setStatus(
+                status: status,
+                blockedReason: blockedReason,
+                waitingOn: waitingOn,
+                progress: progress,
+                assignee: normalizedAssignee,
+                laneOf: normalizedLaneOf
+            )
+        ))
     }
 
     @discardableResult
@@ -956,6 +1078,40 @@ public struct SwiftNativeDeskStore: Sendable {
     @discardableResult
     public func appendNote(_ handle: String, text: String) async throws -> DeskOp {
         try await appendValidated(DeskOp(handle: handle, body: .appendNote(text: text)))
+    }
+
+    /// Append a receipt exactly once, with the existence check and append in
+    /// the same flock transaction. Callers supply a stable machine marker at
+    /// the start of the note; retries after a crash or concurrent wakeup are a
+    /// durable no-op instead of duplicating user-visible history.
+    @discardableResult
+    public func appendNoteIfAbsent(
+        _ handle: String,
+        marker: String,
+        text: String
+    ) async throws -> DeskOp? {
+        let normalizedMarker = marker.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedMarker.isEmpty, normalizedText.hasPrefix(normalizedMarker) else {
+            throw DeskError.liveActivityMetadataEmpty(field: "idempotent note marker/text")
+        }
+        return try await persistence.withFileLock(opsPath) {
+            let feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
+                throw DeskError.unknownHandle(handle)
+            }
+            guard !item.notes.contains(where: { $0.text.hasPrefix(normalizedMarker) }) else {
+                return nil
+            }
+            let op = DeskOp(
+                ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
+                handle: handle,
+                body: .appendNote(text: normalizedText)
+            )
+            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            return op
+        }
     }
 
     /// Commit the user-facing Observatory veto as one replayable Desk op. A
@@ -1223,7 +1379,10 @@ public struct SwiftNativeDeskStore: Sendable {
                     body: .setStatus(
                         status: prior.status,
                         blockedReason: prior.blockedReason,
-                        waitingOn: prior.waitingOn
+                        waitingOn: prior.waitingOn,
+                        progress: nil,
+                        assignee: nil,
+                        laneOf: nil
                     )
                 )
                 try Self.validateHierarchyTransition(repair, in: state, allowArchive: false)
@@ -1548,7 +1707,7 @@ public struct SwiftNativeDeskStore: Sendable {
         viaGenericPath: Bool
     ) throws {
         switch op.body {
-        case let .createItem(_, _, _, _, _, _, origin, _):
+        case let .createItem(_, _, _, _, _, _, _, _, origin, _):
             // A create_item can NEVER mint an agent pursuit — that path is
             // open_pursuit only (H2). An origin=agent create_item is refused
             // regardless of who calls it.
@@ -1637,7 +1796,7 @@ public struct SwiftNativeDeskStore: Sendable {
                 throw DeskError.reservationAlreadyComplete(reservationId: attemptId, handle: op.handle)
             }
 
-        case let .setStatus(status, _, _):
+        case let .setStatus(status, _, _, _, _, _):
             // Only a REOPEN (terminal → non-terminal) of an agent pursuit is
             // capped. Any other status move on a pursuit is free.
             guard !status.isTerminal,
@@ -1664,7 +1823,7 @@ public struct SwiftNativeDeskStore: Sendable {
         allowArchive: Bool
     ) throws {
         switch op.body {
-        case let .createItem(_, _, _, _, parent, _, _, _):
+        case let .createItem(_, _, _, _, parent, _, _, _, _, _):
             guard let parent else { return }
             guard state.items.contains(where: { $0.handle == parent }) else {
                 throw DeskError.unknownHandle(parent)
@@ -1673,7 +1832,15 @@ public struct SwiftNativeDeskStore: Sendable {
                 throw DeskError.childRefusedTerminalParent(parentHandle: terminal.handle)
             }
 
-        case let .setStatus(status, _, _):
+        case let .setStatus(status, _, _, _, _, laneOf):
+            if let laneOf {
+                guard laneOf != op.handle else {
+                    throw DeskError.laneOfSelf(handle: op.handle)
+                }
+                guard state.items.contains(where: { $0.handle == laneOf }) else {
+                    throw DeskError.laneOfUnknown(handle: op.handle, laneOf: laneOf)
+                }
+            }
             if status.isTerminal {
                 try rejectTerminalParentWithOpenDescendant(op.handle, in: state)
             } else if let item = state.items.first(where: { $0.handle == op.handle }),
@@ -1742,7 +1909,7 @@ public struct SwiftNativeDeskStore: Sendable {
             switch op.body {
             case .createItem:
                 result = (.watch, nil, nil)
-            case let .setStatus(status, blockedReason, waitingOn) where !status.isTerminal:
+            case let .setStatus(status, blockedReason, waitingOn, _, _, _) where !status.isTerminal:
                 result = (status, blockedReason, waitingOn)
             default:
                 break
@@ -1843,7 +2010,7 @@ public struct SwiftNativeDeskStore: Sendable {
     static func nextAlias(parentHandle: String?, parentAlias: String?, base: DeskCompactionBase? = nil, ops: [DeskOp]) -> String {
         let siblingAliases: [String] = ops.compactMap { op in
             switch op.body {
-            case .createItem(let alias, _, _, _, let parent, _, _, _):
+            case .createItem(let alias, _, _, _, let parent, _, _, _, _, _):
                 return parent == parentHandle ? alias : nil
             case .openPursuit(let alias, _, _, _, _, _):
                 return parentHandle == nil ? alias : nil
@@ -1895,11 +2062,12 @@ public struct SwiftNativeDeskStore: Sendable {
 
         for op in ops {
             switch op.body {
-            case let .createItem(alias, kind, project, title, parent, summary, origin, pursuit):
+            case let .createItem(alias, kind, project, title, parent, summary, assignee, laneOf, origin, pursuit):
                 if byHandle[op.handle] == nil { createOrder.append(op.handle) }
                 byHandle[op.handle] = DeskItem(
                     handle: op.handle, alias: alias, parent: parent, kind: kind,
                     status: .watch, project: project, title: title, summary: summary,
+                    assignee: assignee, laneOf: laneOf,
                     cadence: Cadence(), notify: NotifyPolicy(),
                     openedAt: op.ts, updatedAt: op.ts,
                     origin: origin, pursuit: pursuit
@@ -1915,11 +2083,14 @@ public struct SwiftNativeDeskStore: Sendable {
                     openedAt: op.ts, updatedAt: op.ts,
                     origin: .agent, pursuit: pursuit
                 )
-            case let .setStatus(status, blockedReason, waitingOn):
+            case let .setStatus(status, blockedReason, waitingOn, progress, assignee, laneOf):
                 guard var item = byHandle[op.handle] else { continue }
                 item.status = status
                 item.blockedReason = blockedReason
                 item.waitingOn = waitingOn
+                if let progress { item.progress = progress }
+                if let assignee { item.assignee = assignee }
+                if let laneOf { item.laneOf = laneOf }
                 // A terminal status reached via set_status (not close_item) still
                 // needs closedAt, or archiveSweep + the "archives in" countdown
                 // skip it forever (gpt-5.5 review HIGH). A non-terminal status

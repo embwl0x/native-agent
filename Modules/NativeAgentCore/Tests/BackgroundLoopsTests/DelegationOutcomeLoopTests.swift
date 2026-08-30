@@ -136,6 +136,32 @@ struct DelegationOutcomeLoopTests {
         #expect(job.terminalOutcome?.severity == "actionable")
     }
 
+    @Test(arguments: ["completed", "failed"])
+    func blockedDeliveryIsActionableWithoutClaimingWorkerOrDeliverySuccess(status: String) throws {
+        for agent in ["claude", "omp"] {
+            let job = DelegationJobSnapshot(
+                id: "blocked-\(agent)", source: agent, agent: agent, state: "settled", status: status, runStatus: status,
+                completedAt: Self.iso(-30), deliveryOutcome: "blocked", deliveryLost: false,
+                completionTextHead: "retained terminal evidence"
+            )
+            #expect(job.isTerminal)
+            #expect(job.terminalOutcome == .unknown)
+            #expect(job.terminalOutcome?.severity == "actionable")
+            let motor = job.motorActionReadModel()
+            #expect(motor.phase == .blocked)
+            #expect(motor.verification == .unknown)
+            #expect(motor.domainState.contains(status))
+            #expect(motor.expectedNextEvidence?.contains("Do not rerun the worker") == true)
+            let card = try #require(DelegationOutcomeCard.make(from: job, now: Self.now))
+            #expect(card.title.contains("delivery is blocked"))
+            #expect(card.severity == "actionable")
+            #expect(card.summary.contains("run \(status)"))
+            #expect(card.detail.contains("retained terminal evidence"))
+            #expect(card.detail.contains("original completion route"))
+            #expect(card.detail.contains("Do not rerun the worker"))
+        }
+    }
+
     @Test func codexTurnResultStatusDrivesTheOutcome() {
         let job = DelegationJobSnapshot(
             id: "codex-1", source: "codex", agent: "codex",
@@ -144,6 +170,30 @@ struct DelegationOutcomeLoopTests {
             deliveryOutcome: nil, deliveryLost: nil,
             completionTextHead: "Resolved Hermes PR #65084.")
         #expect(job.terminalOutcome == .succeeded)
+    }
+
+    @Test func motorProjectionKeepsCompletionDistinctFromTaskVerification() {
+        let completed = Self.claudeSuccess(id: "bridge-action")
+            .motorActionReadModel()
+        #expect(completed.domain == "agent_bridge")
+        #expect(completed.actionIdentity
+            == CausalTransitionEvidence.opaqueIdentity("bridge-action"))
+        #expect(completed.phase == .succeeded)
+        #expect(completed.verification == .unverified)
+        #expect(completed.expectedNextEvidence?.contains("originating request") == true)
+
+        let waiting = DelegationJobSnapshot(
+            id: "waiting", source: "codex", agent: "codex", state: "watching_turn"
+        ).motorActionReadModel()
+        #expect(waiting.phase == .waitingExternal)
+        #expect(waiting.verification == .pending)
+
+        let stuck = DelegationJobSnapshot(
+            id: "stuck", source: "omp", agent: "omp", state: "running",
+            stalled: true, stallBasis: "stall_seconds"
+        ).motorActionReadModel()
+        #expect(stuck.phase == .blocked)
+        #expect(stuck.verification == .pending)
     }
 
     // MARK: - Card shape
@@ -286,6 +336,32 @@ struct DelegationOutcomeLoopTests {
         #expect(recorder.cards.count == 1)
     }
 
+    @Test func recentCodexDeliveryIdentityOutranksAnAheadCrossJobTimestamp() async throws {
+        let path = cursorPath()
+        var cursor = DelegationOutcomeCursor()
+        // Another Codex job advanced the coarse completion cursor first.
+        cursor.record(source: "codex", id: "different-job", stamp: Self.now)
+        try cursor.write(to: path)
+        let recorder = CardRecorder()
+        let receipt = DelegationJobSnapshot(
+            id: "message-id",
+            motorOwnerID: "message-id",
+            source: "codex",
+            agent: "codex",
+            state: "settled",
+            status: "delivered",
+            runStatus: "completed",
+            completedAt: Self.iso(-60),
+            deliveryOutcome: "delivered"
+        )
+
+        _ = await makeLoop(cursor: path, jobs: { [receipt] }, recorder: recorder).tickOutcome()
+
+        #expect(recorder.cards.map(\.jobKey) == ["codex:message-id"])
+        let settled = try #require(DelegationOutcomeCursor.load(from: path))
+        #expect(settled.store("codex").cardedIDs.contains("message-id"))
+    }
+
     /// A failed inbox write must leave the job un-carded so the next tick
     /// retries — otherwise a transient failure silently swallows the card.
     @Test func failedInboxWriteIsRetriedOnTheNextTick() async throws {
@@ -310,6 +386,28 @@ struct DelegationOutcomeLoopTests {
         let retryLoop = makeLoop(cursor: path, jobs: { [job] }, recorder: succeeding)
         _ = await retryLoop.tickOutcome()
         #expect(succeeding.cards.map(\.jobKey) == ["claude:retry-me"])
+    }
+
+    @Test func failedTransitionReceiptKeepsTheOutcomeUnsettledForRetry() async throws {
+        let path = cursorPath()
+        let recorder = CardRecorder()
+        _ = await makeLoop(cursor: path, jobs: { [] }, recorder: recorder).tickOutcome()
+        let job = Self.claudeSuccess(id: "receipt-retry", completedAt: Self.iso(-60))
+        let observations = TransitionReceiptRecorder(results: [false, true])
+        let loop = DelegationOutcomeLoop(
+            cursorPath: path,
+            clock: { Self.now },
+            readJobs: { [job] },
+            fileCard: { recorder.file($0) },
+            observeTransition: { observations.observe($0) }
+        )
+
+        _ = await loop.tickOutcome()
+        #expect(DelegationOutcomeCursor.load(from: path)?.store("claude").cardedIDs.isEmpty == true)
+        _ = await loop.tickOutcome()
+
+        #expect(observations.ids == ["receipt-retry", "receipt-retry"])
+        #expect(DelegationOutcomeCursor.load(from: path)?.store("claude").cardedIDs == ["receipt-retry"])
     }
 
     @Test func olderFailurePreventsCursorFromSkippingItForANewerSuccess() async throws {
@@ -365,8 +463,88 @@ struct DelegationOutcomeLoopTests {
         guard case .completed(let result) = outcome else {
             Issue.record("expected completed, got \(outcome)"); return
         }
-        #expect(result?.contains("no newly-terminal") == true)
+        #expect(result?.contains("no newly-terminal or stuck") == true)
         #expect(recorder.cards.isEmpty)
+    }
+
+    @Test func stalledStepSpeaksOnceAndClearsWhenLivenessReturns() async throws {
+        let path = cursorPath()
+        let recorder = CardRecorder()
+        _ = await makeLoop(cursor: path, jobs: { [] }, recorder: recorder).tickOutcome()
+
+        let healthy = DelegationJobSnapshot(
+            id: "review-1", source: "omp", agent: "omp",
+            topicSlug: "review-candidate-a32e6ce6", state: "running",
+            stalled: false, stallBasis: "stall_seconds",
+            lastLiveness: Self.iso(-5))
+        let box = SnapshotBox([healthy])
+        let loop = makeLoop(cursor: path, jobs: { box.value }, recorder: recorder)
+
+        // Persisted output more frequent than the OMP idle threshold keeps the
+        // projector verdict healthy, so the outcome loop files no warning.
+        _ = await loop.tickOutcome()
+        #expect(recorder.cards.isEmpty)
+
+        var stalled = healthy
+        stalled.stalled = true
+        stalled.lastLiveness = Self.iso(-900)
+        box.value = [stalled]
+
+        let first = await loop.tickOutcome()
+        guard case .completed(let firstResult) = first else {
+            Issue.record("expected completed, got \(first)"); return
+        }
+        #expect(firstResult?.contains("filed 1 delegation liveness card") == true)
+        #expect(recorder.cards.count == 1)
+        let stuck = try #require(recorder.cards.first)
+        #expect(stuck.title == "OMP step is stuck")
+        #expect(stuck.summary.contains("review-candidate-a32e6ce6"))
+        #expect(stuck.detail.contains("recorded liveness stopped advancing"))
+        #expect(stuck.detail.contains("did not replay the request or start replacement work"))
+        #expect(stuck.severity == "actionable")
+        #expect(stuck.resolved == false)
+        #expect(try #require(DelegationOutcomeCursor.load(from: path))
+            .store("omp").announcedStallIDs == ["review-1"])
+
+        // Steady stalled state is quiet: the same liveness episode speaks once.
+        _ = await loop.tickOutcome()
+        #expect(recorder.cards.count == 1)
+
+        var recovered = stalled
+        recovered.stalled = false
+        recovered.lastLiveness = Self.iso(-5)
+        box.value = [recovered]
+        _ = await loop.tickOutcome()
+        #expect(recorder.cards.count == 2)
+        let cleared = try #require(recorder.cards.last)
+        #expect(cleared.cardId == stuck.cardId)
+        #expect(cleared.title == "OMP step is moving again")
+        #expect(cleared.resolved == true)
+        #expect(cleared.detail.contains("proves renewed liveness, not completion"))
+        #expect(try #require(DelegationOutcomeCursor.load(from: path))
+            .store("omp").announcedStallIDs.isEmpty)
+
+        // Recovery is also edge-triggered rather than a recurring heartbeat.
+        _ = await loop.tickOutcome()
+        #expect(recorder.cards.count == 2)
+    }
+
+    @Test func stalledStepVisibleOnTheFirstSeedTickIsNotSilenced() async throws {
+        let path = cursorPath()
+        let recorder = CardRecorder()
+        let stalled = DelegationJobSnapshot(
+            id: "builder-1", source: "omp", agent: "omp",
+            topicSlug: "builder-candidate", state: "running",
+            stalled: true, stallBasis: "deadline", lastLiveness: Self.iso(-1_800))
+        let outcome = await makeLoop(
+            cursor: path, jobs: { [stalled] }, recorder: recorder
+        ).tickOutcome()
+        guard case .completed(let result) = outcome else {
+            Issue.record("expected completed, got \(outcome)"); return
+        }
+        #expect(result?.contains("seeded delegation outcome cursor") == true)
+        #expect(result?.contains("filed 1 delegation liveness card") == true)
+        #expect(recorder.cards.map(\.title) == ["OMP step is stuck"])
     }
 
     // MARK: - Outcome upgrade re-card (the codex mid-delivery race)
@@ -483,11 +661,13 @@ struct DelegationOutcomeLoopTests {
         cursor.record(source: "codex", id: "a", stamp: Self.now, outcome: .succeeded)
         cursor.record(source: "codex", id: "a", stamp: nil, outcome: .unknown)  // upgrade overwrites
         cursor.record(source: "claude", id: "b", stamp: nil)  // no outcome recorded
+        cursor.markStallAnnounced(source: "claude", id: "live-stuck")
         cursor.codexBacklogKey = "codex:undelivered-backlog:1:x"
         try cursor.write(to: path)
         let loaded = try #require(DelegationOutcomeCursor.load(from: path))
         #expect(loaded.cardedOutcome(source: "codex", id: "a") == .unknown)
         #expect(loaded.cardedOutcome(source: "claude", id: "b") == nil)
+        #expect(loaded.store("claude").announcedStallIDs == ["live-stuck"])
         #expect(loaded.codexBacklogKey == "codex:undelivered-backlog:1:x")
         #expect(loaded == cursor)
     }
@@ -627,4 +807,18 @@ private final class AttemptRecorder: @unchecked Sendable {
     private var storage: [String] = []
     func record(_ value: String) { lock.withLock { storage.append(value) } }
     var values: [String] { lock.withLock { storage } }
+}
+
+private final class TransitionReceiptRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [Bool]
+    private var storage: [String] = []
+    init(results: [Bool]) { self.results = results }
+    func observe(_ job: DelegationJobSnapshot) -> Bool {
+        lock.withLock {
+            storage.append(job.id)
+            return results.isEmpty ? true : results.removeFirst()
+        }
+    }
+    var ids: [String] { lock.withLock { storage } }
 }

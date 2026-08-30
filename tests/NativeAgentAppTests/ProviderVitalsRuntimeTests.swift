@@ -5,9 +5,9 @@ import NativeAgentCore
 import ProviderRouting
 
 // INTEROCEPTION runtime notice lane (gpt-5.5 review round): the vitals card is
-// an append-only INBOX NOTICE (notifications/inbox.jsonl event-log semantics),
-// idempotent from DISK — restart-safe with no in-memory association — and
-// ordinary lifecycle observation never writes anything.
+// a grouped INBOX NOTICE (notifications/inbox.jsonl): only the provider's
+// latest state remains active, earlier states stay archived, idempotency is
+// restart-safe from disk, and ordinary lifecycle observation never writes.
 
 private func makeRuntime(root: URL) -> NativeCognitionRuntime {
     NativeCognitionRuntime(
@@ -38,7 +38,13 @@ private func degradedTransition(_ providerId: String) -> ProviderVitalsTransitio
     )
 }
 
-private func vitalsRows(root: URL) throws -> [(kind: String, provider: String)] {
+private struct VitalsRow: Equatable {
+    let kind: String
+    let provider: String
+    let status: String
+}
+
+private func vitalsRows(root: URL) throws -> [VitalsRow] {
     let path = root
         .appendingPathComponent("notifications", isDirectory: true)
         .appendingPathComponent("inbox.jsonl")
@@ -51,7 +57,11 @@ private func vitalsRows(root: URL) throws -> [(kind: String, provider: String)] 
                 obj["source"] as? String == "provider_vitals",
                 let kind = obj["providerVitalsKind"] as? String,
                 let provider = obj["providerVitalsProvider"] as? String else { return nil }
-            return (kind, provider)
+            return VitalsRow(
+                kind: kind,
+                provider: provider,
+                status: obj["status"] as? String ?? "unread"
+            )
         }
 }
 
@@ -79,6 +89,7 @@ private func vitalsRows(root: URL) throws -> [(kind: String, provider: String)] 
     // association derived from disk, not memory. A second recovery no-ops.
     await second.postProviderVitalsRecoveryNotice(providerId: "kimi-code")
     #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered"])
+    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "unread"])
     await second.postProviderVitalsRecoveryNotice(providerId: "kimi-code")
     #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered"])
 
@@ -87,6 +98,7 @@ private func vitalsRows(root: URL) throws -> [(kind: String, provider: String)] 
         providerId: "kimi-code", transition: degradedTransition("kimi-code")
     )
     #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered", "degraded"])
+    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "archived", "unread"])
 }
 
 // 2026-08-01 concurrency fix: the idempotency check used to read the inbox
@@ -117,6 +129,28 @@ private func vitalsRows(root: URL) throws -> [(kind: String, provider: String)] 
     // behind for the latest-row gate to miss.
     await runtimes[0].postProviderVitalsRecoveryNotice(providerId: "kimi-code")
     #expect(try vitalsRows(root: root).map(\.kind) == ["degraded", "recovered"])
+    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "unread"])
+}
+
+@Test func launchReconciliationArchivesSupersededLegacyStates() async throws {
+    let root = try tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = root.appendingPathComponent("notifications/inbox.jsonl")
+    try FileManager.default.createDirectory(
+        at: inbox.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+    let rows = [
+        #"{"id":"old-degraded","source":"provider_vitals","severity":"important","status":"unread","providerVitalsProvider":"kimi-code","providerVitalsKind":"degraded"}"#,
+        #"{"id":"new-recovered","source":"provider_vitals","severity":"info","status":"unread","providerVitalsProvider":"kimi-code","providerVitalsKind":"recovered"}"#,
+        #"{"id":"other-open","source":"provider_vitals","severity":"important","status":"unread","providerVitalsProvider":"openai","providerVitalsKind":"degraded"}"#,
+    ]
+    try Data((rows.joined(separator: "\n") + "\n").utf8).write(to: inbox)
+
+    let runtime = makeRuntime(root: root)
+    await runtime.reconcileProviderVitalsNotices()
+    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "unread", "unread"])
+    await runtime.reconcileProviderVitalsNotices()
+    #expect(try vitalsRows(root: root).map(\.status) == ["archived", "unread", "unread"])
 }
 
 @Test func recoveryWithoutOpenDegradationIsSilent() async throws {

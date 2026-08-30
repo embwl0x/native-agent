@@ -200,7 +200,11 @@ public enum VisionTextLayer {
         config: VisionTextLayerConfig = .default
     ) -> [VisionTextBox] {
         var kept: [VisionTextBox] = []
-        for box in boxes.sorted(by: { $0.confidence > $1.confidence }) {
+        for box in boxes.sorted(by: {
+            $0.confidence == $1.confidence
+                ? geometryPrecedes($0, $1)
+                : $0.confidence > $1.confidence
+        }) {
             let duplicate = kept.contains { existing in
                 existing.text == box.text && existing.rect.iou(box.rect) >= config.dedupeIoU
             }
@@ -209,51 +213,98 @@ public enum VisionTextLayer {
         // Reading order: top-to-bottom, then left-to-right. Deterministic
         // output is a contract — the same frame must compile to the same
         // handles in the same order, in this launch and the next.
-        return kept.sorted { lhs, rhs in
-            if abs(lhs.rect.y - rhs.rect.y) > 1 { return lhs.rect.y < rhs.rect.y }
-            if abs(lhs.rect.x - rhs.rect.x) > 1 { return lhs.rect.x < rhs.rect.x }
-            return lhs.text < rhs.text
+        // A tolerance inside a pairwise comparator is not transitive: nearby
+        // A/B and B/C can each tie while A/C do not. Anchor each 1px group to
+        // its first coordinate after strict sorting instead, then order groups.
+        let rows = toleranceGroups(kept.sorted(by: geometryPrecedes), coordinate: { $0.rect.y })
+        return rows.flatMap { row in
+            let byX = row.sorted {
+                $0.rect.x == $1.rect.x ? geometryPrecedes($0, $1) : $0.rect.x < $1.rect.x
+            }
+            return toleranceGroups(byX, coordinate: { $0.rect.x }).flatMap { column in
+                column.sorted {
+                    $0.text == $1.text ? geometryPrecedes($0, $1) : $0.text < $1.text
+                }
+            }
         }
     }
 
+    private static func geometryPrecedes(_ lhs: VisionTextBox, _ rhs: VisionTextBox) -> Bool {
+        if lhs.rect.y != rhs.rect.y { return lhs.rect.y < rhs.rect.y }
+        if lhs.rect.x != rhs.rect.x { return lhs.rect.x < rhs.rect.x }
+        if lhs.rect.w != rhs.rect.w { return lhs.rect.w < rhs.rect.w }
+        if lhs.rect.h != rhs.rect.h { return lhs.rect.h < rhs.rect.h }
+        if lhs.text != rhs.text { return lhs.text < rhs.text }
+        return lhs.source < rhs.source
+    }
+
+    private static func toleranceGroups(
+        _ boxes: [VisionTextBox],
+        coordinate: (VisionTextBox) -> Double
+    ) -> [[VisionTextBox]] {
+        var groups: [[VisionTextBox]] = []
+        for box in boxes {
+            if let anchor = groups.last?.first, coordinate(box) - coordinate(anchor) <= 1 {
+                groups[groups.count - 1].append(box)
+            } else {
+                groups.append([box])
+            }
+        }
+        return groups
+    }
+
     /// Whole-frame pass, plus a tiling pass ONLY when the text is genuinely
-    /// tiny. This is the entry point the compiler uses.
+    /// tiny. Foreground-covered boxes do not trigger expensive refinement of
+    /// another app's text. They remain in the result for whole-frame redaction
+    /// context; the compiler owns exclusion from the published percept.
     public static func recognize(
         image: CGImage,
         using recognizer: some VisionTextRecognizing,
-        config: VisionTextLayerConfig = .default
+        config: VisionTextLayerConfig = .default,
+        ignoredForRefinement: [VisionRect] = []
     ) throws -> VisionTextLayerResult {
+        try Task.checkCancellation()
         let size = VisionSize(width: Double(image.width), height: Double(image.height))
         let whole = try recognizer.recognizeText(in: image, region: nil)
-        let decision = tilingDecision(boxes: whole, imageHeight: size.height, config: config)
+        try Task.checkCancellation()
+        let relevant = whole.filter { box in
+            !ignoredForRefinement.contains { $0.intersection(box.rect).area > 0 }
+        }
+        let decision = tilingDecision(boxes: relevant, imageHeight: size.height, config: config)
+        let exclusionNote = relevant.count == whole.count
+            ? "" : "; foreground-covered text ignored for refinement"
         let regions: [VisionRect]
         let reason: String
         if decision.shouldTile {
             regions = tiles(imageSize: size, config: config)
-            reason = decision.reason
+            reason = decision.reason + exclusionNote
         } else {
-            regions = sparseRecoveryRegions(boxes: whole, imageSize: size, config: config)
+            regions = sparseRecoveryRegions(boxes: relevant, imageSize: size, config: config)
             reason = regions.isEmpty
-                ? decision.reason
-                : "sparse text recovery (\(whole.count) whole-frame box(es), \(regions.count) local region(s))"
+                ? decision.reason + exclusionNote
+                : "sparse text recovery (\(relevant.count) relevant whole-frame box(es), \(regions.count) local region(s))" + exclusionNote
         }
         guard !regions.isEmpty else {
             return VisionTextLayerResult(
                 boxes: dedupe(whole, config: config),
                 tiled: false,
-                tilingReason: decision.reason
+                tilingReason: reason
             )
         }
         var all = whole
         var tileFailures = 0
         for tile in regions {
+            try Task.checkCancellation()
             do {
                 all.append(contentsOf: try recognizer.recognizeText(in: image, region: tile))
             } catch {
+                if error is CancellationError { throw error }
+                try Task.checkCancellation()
                 // Counted, never swallowed: the compiler surfaces this in notes.
                 tileFailures += 1
             }
         }
+        try Task.checkCancellation()
         return VisionTextLayerResult(
             boxes: dedupe(all, config: config),
             tiled: true,

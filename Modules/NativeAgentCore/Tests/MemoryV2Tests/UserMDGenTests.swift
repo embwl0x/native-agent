@@ -2,6 +2,7 @@ import Testing
 import Foundation
 @testable import MemoryV2
 import NativeAgentCore
+import PersistenceCore
 
 @Suite("UserMDGenerator")
 struct UserMDGenTests {
@@ -96,6 +97,76 @@ struct UserMDGenTests {
         #expect(!text.contains("Last regenerated:"))
         #expect(!text.contains("Total memories:"))
         #expect(!text.contains("old auto body"))
+    }
+
+    @Test func identicalRegenerationPreservesFileModificationTime() async throws {
+        let store = try MemoryStorage()
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
+        let generator = UserMDGenerator(
+            storage: store,
+            dataRoot: root,
+            personaRoot: personaRoot
+        )
+        let target = try await generator.regenerate()
+        let oldDate = Date(timeIntervalSince1970: 946_684_800)
+        try FileManager.default.setAttributes(
+            [.modificationDate: oldDate],
+            ofItemAtPath: target.path
+        )
+
+        _ = try await generator.regenerate()
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: target.path)
+        #expect(attributes[.modificationDate] as? Date == oldDate)
+    }
+
+    @Test func contendedRegenerationReadsCanonicalMemoryAfterAcquiringDocumentLock() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try MemoryStorage(dataRoot: root)
+        let personaRoot = root.appendingPathComponent("persona", isDirectory: true)
+        let generator = UserMDGenerator(storage: store, dataRoot: root, personaRoot: personaRoot)
+        let target = try await generator.regenerate()
+        let held = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let release = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let regenerationReachedLock = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        defer {
+            release.continuation.finish()
+            held.continuation.finish()
+            regenerationReachedLock.continuation.finish()
+        }
+        await generator._testSetBeforeProjectionLock {
+            regenerationReachedLock.continuation.yield(())
+        }
+        let holder = Task {
+            try await SwiftNativePersistenceCore().withFileLock(target) {
+                held.continuation.yield(())
+                for await _ in release.stream { break }
+                let edited = """
+                \(UserMDGenerator.preambleStartMarker)
+                Human note edited while regeneration waits.
+                \(UserMDGenerator.preambleEndMarker)
+                """
+                try edited.write(to: target, atomically: true, encoding: .utf8)
+            }
+        }
+        for await _ in held.stream { break }
+        let pending = Task { try await generator.regenerate() }
+        for await _ in regenerationReachedLock.stream { break }
+        // No generator hook is attached to storage: this one pending request
+        // must carry the mutation; a later automatic repair cannot mask loss.
+        _ = try await store.insertMemory(StoredMemory(
+            content: "A fact committed while the document lock was held.",
+            source: "chat", metadata: .object(["kind": .string("user_fact")])
+        ))
+        release.continuation.yield(())
+        try await holder.value
+        #expect(try await pending.value == target)
+        let text = try String(contentsOf: target, encoding: .utf8)
+        #expect(text.contains("A fact committed while the document lock was held."))
+        #expect(text.contains("Human note edited while regeneration waits."))
     }
 
     @Test func partialPreambleMarkerRefusesWithoutChangingBytes() async throws {

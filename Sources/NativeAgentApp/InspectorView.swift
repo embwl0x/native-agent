@@ -84,6 +84,9 @@ struct InspectorView: View {
                     if store.replayLoading {
                         ProgressView().controlSize(.small)
                     }
+                    Text(store.replayPresentation.statusText)
+                        .font(NativeAgentFont.label)
+                        .foregroundStyle(.secondary)
                     if store.replaySkipped > 0 {
                         Text("\(store.replaySkipped) unreadable rows skipped")
                             .font(NativeAgentFont.tag)
@@ -102,7 +105,10 @@ struct InspectorView: View {
 
     @ViewBuilder
     private var content: some View {
-        if store.cards.isEmpty {
+        if store.mode == .replay, store.cards.isEmpty, store.replayPresentation.isLoading {
+            ProgressView(store.replayPresentation.statusText)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if store.cards.isEmpty {
             emptyState
         } else {
             ScrollView {
@@ -198,31 +204,18 @@ private struct EventRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: NativeAgentSpacing.sm) {
-                InlineStatusDot(status: row.status.themeStatus)
-                Text(row.kindChip)
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 78, alignment: .leading)
-                Text(row.title)
-                    .font(NativeAgentFont.label)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
-                if let ms = row.durationMs {
-                    Text("\(ms)ms")
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.tertiary)
-                        .monospacedDigit()
+            if row.isExpandable {
+                Button {
+                    expanded.toggle()
+                } label: {
+                    eventHeader
                 }
-                if row.isExpandable {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
+                .buttonStyle(.plain)
+                .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+                .accessibilityHint(expanded ? "Collapses event details" : "Shows event details")
+            } else {
+                eventHeader
             }
-            .contentShape(Rectangle())
-            .onTapGesture { if row.isExpandable { expanded.toggle() } }
 
             if expanded {
                 VStack(alignment: .leading, spacing: 2) {
@@ -243,5 +236,32 @@ private struct EventRowView: View {
                 .padding(.vertical, 2)
             }
         }
+    }
+
+    private var eventHeader: some View {
+        HStack(spacing: NativeAgentSpacing.sm) {
+            InlineStatusDot(status: row.status.themeStatus)
+            Text(row.kindChip)
+                .font(NativeAgentFont.tag)
+                .foregroundStyle(.secondary)
+                .frame(width: 78, alignment: .leading)
+            Text(row.title)
+                .font(NativeAgentFont.label)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            if let ms = row.durationMs {
+                Text("\(ms)ms")
+                    .font(NativeAgentFont.tag)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
+            if row.isExpandable {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .contentShape(Rectangle())
     }
 }

@@ -70,9 +70,20 @@ extension SwiftNativeMacControl: MacFourVerbsHost {}
 /// or role ordinal, while the implementation may use a current view mark or a
 /// confidence-gated physical point.
 public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
+    /// The screenshot mark's AX identity, private to fusion and never an
+    /// action authority or a rendered name. Nil denotes pixel-only evidence.
+    public let sourceAXPath: [Int]?
+    public let enabled: Bool
     public let label: MacScreenText?
+    /// Exact natural names for the same target. They add no second address and
+    /// resolve through the ordinary ambiguity rules when several objects share
+    /// an appearance.
+    public let aliases: [String]
     public let kind: String
     public let frame: MacAXFrame
+    /// Captured bounds, distinct from the private motion-led motor frame.
+    public let observedFrame: MacAXFrame
+    public let excludedFrames: [MacAXFrame]
     public let provenance: MacScreenRender.Provenance
     public let viewId: String?
     public let mark: Int?
@@ -82,27 +93,42 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
     /// object occupies it. Such a target may receive literal hand gestures,
     /// but must never be promoted into type/select/toggle/dismiss semantics.
     public let physicalOnly: Bool
+    /// The live vision owner has not yet distinguished motion from a jump.
+    /// A time-sensitive click may collect bounded fresh frames before aiming.
+    public let motionUncertain: Bool
 
     public init(
         label: MacScreenText?,
+        aliases: [String] = [],
         kind: String,
         frame: MacAXFrame,
+        observedFrame: MacAXFrame? = nil,
+        excludedFrames: [MacAXFrame] = [],
         provenance: MacScreenRender.Provenance,
         viewId: String? = nil,
         mark: Int? = nil,
         ordinal: Int? = nil,
         regionOnly: Bool = false,
-        physicalOnly: Bool = false
+        physicalOnly: Bool = false,
+        motionUncertain: Bool = false,
+        sourceAXPath: [Int]? = nil,
+        enabled: Bool = true
     ) {
         self.label = label
+        self.aliases = aliases
         self.kind = kind
         self.frame = frame
+        self.observedFrame = observedFrame ?? frame
+        self.excludedFrames = excludedFrames
         self.provenance = provenance
         self.viewId = viewId
         self.mark = mark
         self.ordinal = ordinal
         self.regionOnly = regionOnly
         self.physicalOnly = physicalOnly
+        self.motionUncertain = motionUncertain
+        self.sourceAXPath = sourceAXPath
+        self.enabled = enabled
     }
 }
 
@@ -113,6 +139,8 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
     public let appName: String?
     public let bundleIdentifier: String?
     public let visibleFrame: MacAXFrame?
+    public let pointer: MacPointerPosition?
+    public let pointerFrame: MacAXFrame?
     public let contents: [MacScreenRender.Content]
     public let controls: [MacScreenRender.Control]
     public let values: [MacScreenRender.Value]
@@ -125,6 +153,8 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
         appName: String? = nil,
         bundleIdentifier: String? = nil,
         visibleFrame: MacAXFrame? = nil,
+        pointer: MacPointerPosition? = nil,
+        pointerFrame: MacAXFrame? = nil,
         contents: [MacScreenRender.Content] = [],
         controls: [MacScreenRender.Control] = [],
         values: [MacScreenRender.Value] = [],
@@ -134,6 +164,8 @@ public struct MacFourVerbsSupplement: Sendable, Equatable {
         self.appName = appName
         self.bundleIdentifier = bundleIdentifier
         self.visibleFrame = visibleFrame
+        self.pointer = pointer
+        self.pointerFrame = pointerFrame
         self.contents = contents
         self.controls = controls
         self.values = values
@@ -150,12 +182,14 @@ public protocol MacFourVerbsSupplementalPerceptionSource: Sendable {
 /// instantly and must be able to model a screen that never settles.
 public protocol MacFourVerbsClock: Sendable {
     func now() -> Date
+    func monotonicSeconds() -> Double
     func sleep(seconds: Double) async
 }
 
 public struct SystemMacFourVerbsClock: MacFourVerbsClock {
     public init() {}
     public func now() -> Date { Date() }
+    public func monotonicSeconds() -> Double { ProcessInfo.processInfo.systemUptime }
     public func sleep(seconds: Double) async {
         guard seconds > 0 else { return }
         try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
@@ -174,6 +208,13 @@ public struct MacFourVerbsReply: Sendable, Equatable {
     public let ok: Bool
     public let text: String
     public let detail: [String: JSONValue]
+
+    /// Effect comparison keeps complete readouts internally. The agent sees
+    /// their bounded SAYS rendering and can ask screen(part:) for more, rather
+    /// than receiving the same strings twice more in diagnostic arrays.
+    public var agentDetail: [String: JSONValue] {
+        detail.filter { $0.key != "vision_value_text" && $0.key != "vision_effect_value_text" }
+    }
 
     public init(ok: Bool, text: String, detail: [String: JSONValue] = [:]) {
         self.ok = ok
@@ -251,15 +292,19 @@ public struct MacFourVerbs: Sendable {
         seconds: Double? = nil,
         repeat requestedRepeat: Int? = nil,
         interval: Double? = nil,
-        holding: String? = nil
+        holding: String? = nil,
+        button: String? = nil,
+        scrollAmount: Int? = nil
     ) async -> MacFourVerbsReply {
-        let requested = max(1, min(requestedRepeat ?? 1, Self.maximumActRepeats))
+        let requestedInput = requestedRepeat ?? 1
+        let requested = max(1, requestedInput)
+        let accepted = min(requested, Self.maximumActRepeats)
         let pause = max(0, min(interval ?? 0, Self.maximumActIntervalSeconds))
         let perAttemptBudget = max(0, min(seconds ?? 0, 10)) + pause
         let durationBound = perAttemptBudget > 0
             ? max(1, Int(Self.maximumActBurstSeconds / perAttemptBudget))
             : Self.maximumActRepeats
-        let attempts = min(requested, durationBound)
+        let attempts = min(accepted, durationBound)
         if attempts == 1 {
             return await actOnce(
                 verb: rawVerb,
@@ -268,6 +313,8 @@ public struct MacFourVerbs: Sendable {
                 to: destination,
                 seconds: seconds,
                 holding: holding,
+                button: button,
+                scrollAmount: scrollAmount,
                 attention: nil
             )
         }
@@ -282,11 +329,18 @@ public struct MacFourVerbs: Sendable {
                 detail: ["error": .string("continuous_attention_unavailable")]
             )
         }
+        let burstStartedAt = clock.monotonicSeconds()
         var completed = 0
         var visiblyVerified = 0
+        var runtimeLimited = false
         var finalReply: MacFourVerbsReply?
         for attempt in 1...attempts {
             guard !Task.isCancelled else { break }
+            if attempt > 1,
+               clock.monotonicSeconds() - burstStartedAt >= Self.maximumActBurstSeconds {
+                runtimeLimited = true
+                break
+            }
             let reply = await actOnce(
                 verb: rawVerb,
                 target: target,
@@ -294,6 +348,8 @@ public struct MacFourVerbs: Sendable {
                 to: destination,
                 seconds: seconds,
                 holding: holding,
+                button: button,
+                scrollAmount: scrollAmount,
                 attention: attention
             )
             finalReply = reply
@@ -302,7 +358,15 @@ public struct MacFourVerbs: Sendable {
             if Self.string(reply.detail["verification"]) == MotorVerificationState.satisfied.rawValue {
                 visiblyVerified += 1
             }
-            if attempt < attempts, pause > 0 { await clock.sleep(seconds: pause) }
+            if attempt < attempts, pause > 0 {
+                let elapsed = max(0, clock.monotonicSeconds() - burstStartedAt)
+                let remaining = max(0, Self.maximumActBurstSeconds - elapsed)
+                guard remaining > 0 else {
+                    runtimeLimited = true
+                    break
+                }
+                await clock.sleep(seconds: min(pause, remaining))
+            }
         }
         if attention.owned {
             _ = try? await host.dispatch(action: "attention", body: ["mode": .string("stop")])
@@ -317,11 +381,17 @@ public struct MacFourVerbs: Sendable {
         }
         var detail = finalReply.detail
         detail["repeat_requested"] = .int(Int64(requested))
+        detail["repeat_requested_input"] = .int(Int64(requestedInput))
+        detail["repeat_accepted"] = .int(Int64(accepted))
         detail["repeat_planned"] = .int(Int64(attempts))
         detail["repeat_completed"] = .int(Int64(completed))
         detail["repeat_visibly_verified"] = .int(Int64(visiblyVerified))
         detail["repeat_stopped_early"] = .bool(completed < requested)
+        let elapsed = max(0, clock.monotonicSeconds() - burstStartedAt)
+        detail["repeat_elapsed_seconds"] = .double(elapsed)
+        detail["repeat_runtime_limited"] = .bool(runtimeLimited)
         if let holding { detail["holding"] = .string(holding) }
+        if let button { detail["button"] = .string(button) }
         if completed == attempts, visiblyVerified == completed {
             detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
             detail["verification_evidence"] = .string("fresh_visible_evidence_for_every_burst_attempt")
@@ -330,8 +400,14 @@ public struct MacFourVerbs: Sendable {
             detail.removeValue(forKey: "verification_evidence")
         }
 
-        let boundNote = attempts < requested
+        let hardCapNote = accepted < requested
+            ? " The \(Self.maximumActRepeats)-attempt safety cap limited this burst before execution."
+            : ""
+        let durationNote = attempts < accepted
             ? " The 30-second safety bound limited this burst to \(attempts)."
+            : ""
+        let runtimeNote = runtimeLimited
+            ? " The 30-second runtime boundary stopped the burst before another attempt."
             : ""
         let proof: String
         if completed == 0 {
@@ -343,9 +419,9 @@ public struct MacFourVerbs: Sendable {
         }
         let lead: String
         if completed == attempts {
-            lead = "Completed \(completed)/\(requested) requested attempts. \(proof)\(boundNote)"
+            lead = "Completed \(completed)/\(requested) requested attempts. \(proof)\(hardCapNote)\(durationNote)\(runtimeNote)"
         } else {
-            lead = "Stopped after \(completed)/\(requested) requested attempts. \(proof)\(boundNote)"
+            lead = "Stopped after \(completed)/\(requested) requested attempts. \(proof)\(hardCapNote)\(durationNote)\(runtimeNote)"
         }
         return MacFourVerbsReply(
             ok: finalReply.ok && completed == attempts,
@@ -415,14 +491,39 @@ public struct MacFourVerbs: Sendable {
         to destination: String?,
         seconds: Double?,
         holding: String?,
+        button rawButton: String?,
+        scrollAmount: Int?,
         attention: BurstAttention?
     ) async -> MacFourVerbsReply {
         let (verbName, parsedDirection) = Self.parseVerb(rawVerb)
-        let direction: MacActScrollDirection = {
+        let amount = scrollAmount ?? 0
+        guard (0...120).contains(amount), amount == 0 || verbName == "scroll" else {
+            return MacFourVerbsReply(ok: false,
+                text: "Scroll amount must be 1–120 lines, or 0 for the ordinary/default action. I haven't sent input.",
+                detail: ["error": .string("invalid_scroll_amount")])
+        }
+        let normalizedButton = rawButton?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // Some tool bindings require every declared field. An explicit auto
+        // value preserves ordinary semantic/key/hover actions in those bindings.
+        let button = normalizedButton == "auto" ? nil : normalizedButton
+        if let button {
+            guard MacMouseButton(rawValue: button) != nil,
+                  ["click", "open", "drag", "hold"].contains(verbName),
+                  !(verbName == "hold" && Self.keySpec(target) != nil) else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: "Use auto for the ordinary action, or left/right on a click, open, drag, or pointer hold. I haven't sent input.",
+                    detail: ["error": .string("invalid_mouse_button_action")]
+                )
+            }
+        }
+        let direction: ScrollDirection = {
             guard verbName == MacActVerb.scroll.rawValue else { return parsedDirection }
             let hint = Self.normalize(text ?? "")
             if hint == "up" || hint.contains("scroll up") { return .up }
             if hint == "down" || hint.contains("scroll down") { return .down }
+            if hint == "left" || hint.contains("scroll left") { return .left }
+            if hint == "right" || hint.contains("scroll right") { return .right }
             return parsedDirection
         }()
         if let physical = PhysicalVerb(rawValue: verbName) {
@@ -432,6 +533,7 @@ public struct MacFourVerbs: Sendable {
                 destination: destination,
                 seconds: seconds,
                 holding: holding,
+                button: button,
                 attention: attention
             )
         }
@@ -456,16 +558,69 @@ public struct MacFourVerbs: Sendable {
         // a. A FRESH percept. Never a stored one: resolution happens against the
         //    screen as it is at the moment of acting, which is the entire reason
         //    `frame_id` can leave her hands.
-        let sighting: Sighting
+        var sighting: Sighting
         switch await sight(part: nil) {
         case .blind(let reply): return reply
         case .seen(let hit): sighting = hit
         }
 
         // b. RESOLVE BY NAME.
-        let resolution = verb == .scroll
+        var resolution = verb == .scroll
             ? Self.resolveScrollTarget(target, among: sighting.targets)
             : Self.resolve(target, among: sighting.targets)
+        var reobservedAfterTransientMiss = false
+        var acquisitionSamples = 0
+        if case .none = resolution, Self.isPotentialDynamicVisualReference(target) {
+            // Fast appearance-only association needs a third frame to establish
+            // motion. Spend the same two-frame acquisition budget on a temporal
+            // name that cannot exist yet, without stripping its qualifier.
+            let temporal = Self.hasTemporalQualifier(target)
+            let sampledApp = sighting.bundleIdentifier ?? sighting.appName
+            var previousTargets = sighting.targets
+            for sample in 0..<(temporal ? 3 : 1) {
+                guard case .none = resolution else { break }
+                if sample == 2, !Self.canConfirmTemporalTurn(target, previous: previousTargets, current: sighting.targets) { break }
+                if temporal { await clock.sleep(seconds: 0.06) }
+                switch await sight(part: nil) {
+                case .blind(let reply): return reply
+                case .seen(let refreshed):
+                    guard (refreshed.bundleIdentifier ?? refreshed.appName) == sampledApp else {
+                        return Self.motionAppChangedReply(screen: refreshed.render)
+                    }
+                    previousTargets = sighting.targets
+                    sighting = refreshed
+                    resolution = verb == .scroll
+                        ? Self.resolveScrollTarget(target, among: sighting.targets)
+                        : Self.resolve(target, among: sighting.targets)
+                    acquisitionSamples += 1
+                    reobservedAfterTransientMiss = true
+                }
+            }
+        }
+        if verb == .click || verb == .open {
+            // A model round trip can leave only one usable motion sample.
+            // Acquire at most two more, inside this act, and always resolve
+            // again against the newest evidence. No click is sent while the
+            // target is absent/ambiguous, and no remembered point is reused.
+            let sampledApp = sighting.bundleIdentifier ?? sighting.appName
+            for _ in 0..<max(0, 2 - acquisitionSamples) {
+                guard case .hit(let candidate) = resolution,
+                      candidate.physicalOnly, candidate.motionUncertain else { break }
+                switch await sight(part: nil) {
+                case .blind(let reply): return reply
+                case .seen(let refreshed):
+                    guard (refreshed.bundleIdentifier ?? refreshed.appName) == sampledApp else {
+                        return MacFourVerbsReply(
+                            ok: false,
+                            text: "The foreground app changed while I was observing motion. I haven't clicked.\n" + refreshed.render,
+                            detail: ["error": .string("motion_sampling_app_changed")]
+                        )
+                    }
+                    sighting = refreshed
+                    resolution = Self.resolve(target, among: refreshed.targets)
+                }
+            }
+        }
         switch resolution {
         case .none(let nearest):
             var line = "Nothing on this screen is called \"\(target)\"."
@@ -477,15 +632,17 @@ public struct MacFourVerbs: Sendable {
             return MacFourVerbsReply(
                 ok: false,
                 text: line + "\n" + sighting.render,
-                detail: ["error": .string("no_match"), "target": .string(target)]
+                detail: [
+                    "error": .string("no_match"),
+                    "target": .string(target),
+                    "dynamic_reobserved": .bool(reobservedAfterTransientMiss),
+                ]
             )
 
         case .ambiguous(let candidates):
             // The reply IS the question. Nothing is acted on.
             let listed = candidates.map { candidate -> String in
-                let name = candidate.label ?? MacScreenRender.unlabeledMarker
-                if let ordinal = candidate.ordinal { return "row \(ordinal) \"\(name)\" (\(candidate.kind))" }
-                return "\"\(name)\" (\(candidate.kind))"
+                Self.recoveryName(candidate) + " (\(candidate.kind))"
             }
             return MacFourVerbsReply(
                 ok: false,
@@ -500,6 +657,12 @@ public struct MacFourVerbs: Sendable {
             )
 
         case .hit(let candidate):
+            guard candidate.enabled else {
+                return MacFourVerbsReply(
+                    ok: false, text: "\(Self.name(candidate)) is disabled. I haven't touched it.\n" + sighting.render,
+                    detail: ["error": .string("target_disabled"), "target": .string(target)]
+                )
+            }
             if candidate.regionOnly, verb != .scroll {
                 return MacFourVerbsReply(
                     ok: false,
@@ -521,11 +684,12 @@ public struct MacFourVerbs: Sendable {
             // thing is the web area/list itself. Route containers through the
             // same hand so a page or game surface actually moves.
             if verb == .scroll,
-               Self.physicalScrollKinds.contains(candidate.kind),
-               candidate.kind == "web area" || candidate.frame != nil {
+               (amount > 0 || direction.isHorizontal || Self.physicalScrollKinds.contains(candidate.kind)),
+               amount > 0 || direction.isHorizontal || candidate.kind == "web area" || candidate.frame != nil {
                 return await performSupplementalSemantic(
                     verb,
                     direction: direction,
+                    scrollAmount: amount,
                     candidate: candidate,
                     target: target,
                     text: text,
@@ -534,7 +698,7 @@ public struct MacFourVerbs: Sendable {
                     before: sighting
                 )
             }
-            if holding != nil {
+            if holding != nil || button != nil {
                 guard verb != .type else {
                     return MacFourVerbsReply(
                         ok: false,
@@ -545,18 +709,21 @@ public struct MacFourVerbs: Sendable {
                 return await performSupplementalSemantic(
                     verb,
                     direction: direction,
+                    scrollAmount: amount,
                     candidate: candidate,
                     target: target,
                     text: text,
                     holding: holding,
+                    button: button,
                     attention: attention,
                     before: sighting
                 )
             }
             if candidate.isSupplemental {
-                return await performSupplementalSemantic(
+                let reply = await performSupplementalSemantic(
                     verb,
                     direction: direction,
+                    scrollAmount: amount,
                     candidate: candidate,
                     target: target,
                     text: text,
@@ -564,6 +731,10 @@ public struct MacFourVerbs: Sendable {
                     attention: attention,
                     before: sighting
                 )
+                guard reobservedAfterTransientMiss else { return reply }
+                var detail = reply.detail
+                detail["dynamic_reobserved"] = .bool(true)
+                return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
             }
             // c. DRIVE THE EXISTING ACT PATH. The handle and the frame id are
             //    OURS — they are read off the look we just took and never
@@ -637,6 +808,7 @@ public struct MacFourVerbs: Sendable {
             detail["target"] = .string(target)
             detail["matched"] = .string(Self.name(candidate))
             detail["status"] = .string(effect.status)
+            detail["dynamic_reobserved"] = .bool(reobservedAfterTransientMiss)
             // `acted` is the closed loop's semantic verdict, not merely "an
             // event was emitted": navigation moved structurally and matched
             // its destination; typing read the intended edit back from the
@@ -676,12 +848,13 @@ public struct MacFourVerbs: Sendable {
         destination: String?,
         seconds: Double?,
         holding: String?,
+        button: String?,
         attention: BurstAttention?
     ) async -> MacFourVerbsReply {
-        if verb == .hold, holding != nil {
+        if verb == .hold, Self.keySpec(target) != nil, holding != nil {
             return MacFourVerbsReply(
                 ok: false,
-                text: "A hold already keeps its target down; don't give it a second held-key set.",
+                text: "A keyboard hold already keeps its key set down; include all keys in that target instead of a second held-key set.",
                 detail: ["error": .string("nested_hold_not_supported")]
             )
         }
@@ -711,13 +884,67 @@ public struct MacFourVerbs: Sendable {
             )
         }
 
-        let before: Sighting
+        var before: Sighting
         switch await sight(part: nil) {
         case .blind(let reply): return reply
         case .seen(let seen): before = seen
         }
+        var resolution = Self.resolve(target, among: before.targets)
+        var reobservedAfterTransientMiss = false
+        if case .none = resolution, Self.isPotentialDynamicVisualReference(target) {
+            let temporal = Self.hasTemporalQualifier(target)
+            let sampledApp = before.bundleIdentifier ?? before.appName
+            var previousTargets = before.targets
+            for sample in 0..<(temporal ? 3 : 1) {
+                guard case .none = resolution else { break }
+                if sample == 2, !Self.canConfirmTemporalTurn(target, previous: previousTargets, current: before.targets) { break }
+                if temporal { await clock.sleep(seconds: 0.06) }
+                switch await sight(part: nil) {
+                case .blind(let reply): return reply
+                case .seen(let refreshed):
+                    guard (refreshed.bundleIdentifier ?? refreshed.appName) == sampledApp else {
+                        return Self.motionAppChangedReply(screen: refreshed.render)
+                    }
+                    previousTargets = before.targets
+                    before = refreshed
+                    resolution = Self.resolve(target, among: before.targets)
+                    reobservedAfterTransientMiss = true
+                }
+            }
+        }
+        if !reobservedAfterTransientMiss,
+           verb == .drag,
+           let destination,
+           case .hit = resolution,
+           case .none = Self.resolve(destination, among: before.targets),
+           Self.isPotentialDynamicVisualReference(destination) {
+            // A drag needs two current points. If only its moving destination
+            // dropped out, refresh the entire sight and resolve both ends
+            // again so an old source coordinate is never paired with a fresh
+            // destination.
+            let temporal = Self.hasTemporalQualifier(destination)
+            let sampledApp = before.bundleIdentifier ?? before.appName
+            var previousTargets = before.targets
+            for sample in 0..<(temporal ? 3 : 1) {
+                guard case .hit = resolution,
+                      case .none = Self.resolve(destination, among: before.targets) else { break }
+                if sample == 2, !Self.canConfirmTemporalTurn(destination, previous: previousTargets, current: before.targets) { break }
+                if temporal { await clock.sleep(seconds: 0.06) }
+                switch await sight(part: nil) {
+                case .blind(let reply): return reply
+                case .seen(let refreshed):
+                    guard (refreshed.bundleIdentifier ?? refreshed.appName) == sampledApp else {
+                        return Self.motionAppChangedReply(screen: refreshed.render)
+                    }
+                    previousTargets = before.targets
+                    before = refreshed
+                    resolution = Self.resolve(target, among: before.targets)
+                    reobservedAfterTransientMiss = true
+                }
+            }
+        }
         let source: ActTarget
-        switch Self.resolve(target, among: before.targets) {
+        switch resolution {
         case .hit(let hit): source = hit
         case .none(let nearest):
             return unresolvedPhysical(target, nearest: nearest, screen: before.render)
@@ -742,19 +969,29 @@ public struct MacFourVerbs: Sendable {
                 detail: ["error": .string("target_has_no_physical_point")]
             )
         }
-        let start = Self.aimPoint(in: sourceFrame, describedBy: target)
+        let exactSourceAlias = source.aliases.contains {
+            Self.normalize($0) == Self.normalize(target)
+        }
+        guard let start = Self.safeAimPoint(for: source, in: sourceFrame,
+            describedBy: exactSourceAlias ? "" : target) else {
+            return Self.obstructedPointReply(screen: before.render)
+        }
+        let spokenSource = Self.spokenName(source, requestedAs: target)
 
         var body: [String: JSONValue] = [
             "gesture": .string(verb.rawValue),
             "x": .double(start.x),
             "y": .double(start.y),
         ]
-        if let seconds { body["seconds"] = .double(seconds) }
+        if verb == .drag {
+            body["travel_seconds"] = .double(seconds ?? 0)
+        } else if let seconds { body["seconds"] = .double(seconds) }
         if let holding { body["holding"] = .string(holding) }
+        if let button { body["button"] = .string(button) }
         var description: String
         if verb == .drag {
             guard let destination, !destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return MacFourVerbsReply(ok: false, text: "Where should I drag \(Self.name(source)) to?")
+                return MacFourVerbsReply(ok: false, text: "Where should I drag \(spokenSource) to?")
             }
             let endTarget: ActTarget
             switch Self.resolve(destination, among: before.targets) {
@@ -771,45 +1008,65 @@ public struct MacFourVerbs: Sendable {
                     detail: ["error": .string("destination_has_no_physical_point")]
                 )
             }
-            let end = Self.aimPoint(in: endFrame, describedBy: destination)
+            let exactDestinationAlias = endTarget.aliases.contains {
+                Self.normalize($0) == Self.normalize(destination)
+            }
+            guard let end = Self.safeAimPoint(for: endTarget, in: endFrame,
+                describedBy: exactDestinationAlias ? "" : destination) else {
+                return Self.obstructedPointReply(screen: before.render)
+            }
+            guard MacRegionAim.pathIsClear(from: start, to: end,
+                excluding: source.excludedFrames + endTarget.excludedFrames) else {
+                return Self.obstructedPointReply(screen: before.render)
+            }
             body["to_x"] = .double(end.x)
             body["to_y"] = .double(end.y)
-            description = "Dragged \(Self.name(source)) to \(Self.name(endTarget))."
+            description = "\(button == "right" ? "Right-dragged" : "Dragged") \(spokenSource) to \(Self.spokenName(endTarget, requestedAs: destination))."
         } else {
             switch verb {
-            case .hover: description = "Hovered over \(Self.name(source))."
-            case .hold: description = "Held \(Self.name(source))."
-            case .move: description = "Moved to \(Self.name(source))."
-            case .drag, .key: description = "Used \(Self.name(source))."
+            case .hover: description = "Hovered over \(spokenSource)."
+            case .hold: description = button == "right" ? "Held the right button on \(spokenSource)." : "Held \(spokenSource)."
+            case .move: description = "Moved to \(spokenSource)."
+            case .drag, .key: description = "Used \(spokenSource)."
             }
         }
-        return await performHand(
+        let reply = await performHand(
             body: body,
             description: description,
             attention: attention,
-            before: before
+            before: before,
+            allowGenericScreenChangeVerification: !source.physicalOnly,
+            afterPart: source.physicalOnly ? "visual surface" : nil,
+            pointerTarget: (verb == .hover || verb == .move) ? target : nil
         )
+        var detail = reply.detail
+        if reobservedAfterTransientMiss { detail["dynamic_reobserved"] = .bool(true) }
+        if let button { detail["button"] = .string(button) }
+        return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
     }
 
     private func performSupplementalSemantic(
         _ verb: MacActVerb,
-        direction: MacActScrollDirection,
+        direction: ScrollDirection,
+        scrollAmount: Int = 0,
         candidate: ActTarget,
         target: String,
         text: String?,
         holding: String?,
+        button: String? = nil,
         attention: BurstAttention?,
         before: Sighting
     ) async -> MacFourVerbsReply {
+        let spokenTarget = Self.spokenName(candidate, requestedAs: target)
         if let viewId = candidate.viewId, let mark = candidate.mark,
-           verb != .open, verb != .scroll, holding == nil {
+           verb != .open, verb != .scroll, holding == nil, button == nil {
             var body: [String: JSONValue] = [
                 "view": .string(viewId),
                 "mark": .int(Int64(mark)),
             ]
             if verb == .type {
                 guard let text, !text.isEmpty else {
-                    return MacFourVerbsReply(ok: false, text: "Nothing to type into \(Self.name(candidate)).")
+                    return MacFourVerbsReply(ok: false, text: "Nothing to type into \(spokenTarget).")
                 }
                 body["value"] = .string(text)
             } else {
@@ -818,7 +1075,7 @@ public struct MacFourVerbs: Sendable {
             return await performObservedDispatch(
                 action: "ax_act",
                 body: body,
-                description: Self.pastTense(verb, direction: direction) + " " + Self.name(candidate) + ".",
+                description: Self.pastTense(verb, direction: direction) + " " + spokenTarget + ".",
                 before: before,
                 target: target,
                 verb: verb.rawValue,
@@ -827,19 +1084,28 @@ public struct MacFourVerbs: Sendable {
         }
 
         var body: [String: JSONValue] = [:]
-        if !(verb == .scroll && candidate.kind == "web area") {
+        let usesPageKey = verb == .scroll && candidate.kind == "web area"
+            && !direction.isHorizontal && scrollAmount == 0
+        if !usesPageKey {
             guard let candidateFrame = Self.visiblePortion(of: candidate.frame, within: before.visibleFrame) else {
                 return MacFourVerbsReply(
                     ok: false,
-                    text: "I can see \(Self.name(candidate)), but I do not have a safe point for it.",
+                    text: "I can see \(spokenTarget), but I do not have a safe point for it.",
                     detail: ["error": .string("target_has_no_physical_point")]
                 )
             }
-            let point = Self.aimPoint(in: candidateFrame, describedBy: target)
+            let exactAppearanceAlias = candidate.aliases.contains {
+                Self.normalize($0) == Self.normalize(target)
+            }
+            guard let point = Self.safeAimPoint(for: candidate, in: candidateFrame,
+                describedBy: exactAppearanceAlias ? "" : target) else {
+                return Self.obstructedPointReply(screen: before.render)
+            }
             body["x"] = .double(point.x)
             body["y"] = .double(point.y)
         }
         if let holding { body["holding"] = .string(holding) }
+        if let button { body["button"] = .string(button) }
         switch verb {
         case .click, .select, .toggle, .dismiss:
             body["gesture"] = .string("click")
@@ -847,12 +1113,12 @@ public struct MacFourVerbs: Sendable {
             body["gesture"] = .string("double_click")
         case .type:
             guard let text, !text.isEmpty else {
-                return MacFourVerbsReply(ok: false, text: "Nothing to type into \(Self.name(candidate)).")
+                return MacFourVerbsReply(ok: false, text: "Nothing to type into \(spokenTarget).")
             }
             body["gesture"] = .string("click_type")
             body["text"] = .string(text)
         case .scroll:
-            if candidate.kind == "web area" {
+            if usesPageKey {
                 // Live Chrome proof: synthesized wheel events were accepted
                 // but inert on the AX web area, while the ordinary Page key
                 // moved the same visible document and produced fresh proof.
@@ -862,21 +1128,26 @@ public struct MacFourVerbs: Sendable {
                 body["keys"] = .string(direction == .up ? "pageup" : "pagedown")
             } else {
                 body["gesture"] = .string("scroll")
-                body["dy"] = .int(direction == .up ? 6 : -6)
+                let magnitude = Int64(scrollAmount == 0 ? 6 : scrollAmount)
+                body["dx"] = .int(direction == .left ? magnitude : direction == .right ? -magnitude : 0)
+                body["dy"] = .int(direction == .up ? magnitude : direction == .down ? -magnitude : 0)
             }
         }
         let reply = await performHand(
             body: body,
-            description: Self.pastTense(verb, direction: direction) + " " + Self.name(candidate) + ".",
+            description: (button == "right" ? (verb == .open ? "Double-right-clicked" : "Right-clicked")
+                : Self.pastTense(verb, direction: direction)) + " " + spokenTarget + ".",
             unverifiedDescription: verb == .scroll
-                ? "Tried to scroll \(direction.rawValue) in \(Self.name(candidate))."
+                ? "Tried to scroll \(direction.rawValue) in \(spokenTarget)."
                 : nil,
             attention: attention,
             before: before,
-            allowGenericScreenChangeVerification: !candidate.physicalOnly
+            allowGenericScreenChangeVerification: !candidate.physicalOnly,
+            afterPart: candidate.physicalOnly ? "visual surface" : nil
         )
         var detail = reply.detail
         detail["verb"] = .string(verb.rawValue)
+        if let button { detail["button"] = .string(button) }
         detail["target"] = .string(target)
         detail["matched"] = .string(Self.name(candidate))
         let physicalRoute: String
@@ -884,7 +1155,7 @@ public struct MacFourVerbs: Sendable {
         case .click, .select, .toggle, .dismiss: physicalRoute = "click"
         case .open: physicalRoute = "double_click"
         case .type: physicalRoute = "click_type"
-        case .scroll: physicalRoute = candidate.kind == "web area" ? "page_key" : "wheel"
+        case .scroll: physicalRoute = usesPageKey ? "page_key" : "wheel"
         }
         detail["physical_route"] = .string(physicalRoute)
         detail["status"] = .string(
@@ -927,11 +1198,19 @@ public struct MacFourVerbs: Sendable {
         unverifiedDescription: String? = nil,
         attention: BurstAttention? = nil,
         before: Sighting?,
-        allowGenericScreenChangeVerification: Bool = true
+        allowGenericScreenChangeVerification: Bool = true,
+        afterPart: String? = nil,
+        pointerTarget: String? = nil
     ) async -> MacFourVerbsReply {
         let result: MacControlResult
         var request = body
         Self.addAttention(attention, to: &request)
+        // This composed physical-only act already owns a fresh pre-observation
+        // and the mandatory observedReply below. Recapturing inside the hand
+        // delays input after its motion-compensated point was calculated.
+        if before != nil, afterPart == "visual surface", !allowGenericScreenChangeVerification {
+            request["defer_visual_verification"] = .bool(true)
+        }
         do { result = try await host.dispatch(action: "hand", body: request) }
         catch { return MacFourVerbsReply(ok: false, text: "I couldn't use that hand: \(error).") }
         guard result.ok else {
@@ -947,7 +1226,9 @@ public struct MacFourVerbs: Sendable {
             description: description,
             unverifiedDescription: unverifiedDescription,
             before: before,
-            allowGenericScreenChangeVerification: allowGenericScreenChangeVerification
+            allowGenericScreenChangeVerification: allowGenericScreenChangeVerification,
+            afterPart: afterPart,
+            pointerTarget: pointerTarget
         )
     }
 
@@ -956,9 +1237,11 @@ public struct MacFourVerbs: Sendable {
         description: String,
         unverifiedDescription: String? = nil,
         before: Sighting?,
-        allowGenericScreenChangeVerification: Bool = true
+        allowGenericScreenChangeVerification: Bool = true,
+        afterPart: String? = nil,
+        pointerTarget: String? = nil
     ) async -> MacFourVerbsReply {
-        switch await sight(part: nil) {
+        switch await sight(part: afterPart) {
         case .blind(let reply):
             return MacFourVerbsReply(
                 ok: true,
@@ -967,7 +1250,13 @@ public struct MacFourVerbs: Sendable {
                 detail: Self.operationDetail(result).merging(["observed_after": .bool(false)]) { current, _ in current }
             )
         case .seen(let after):
-            let structuralChanged = before.map { $0.render != after.render }
+            // A scoped post-action render is intentionally shaped differently
+            // from the full pre-action screen. That difference is presentation,
+            // not effect evidence; visible values and handler evidence remain
+            // independently comparable.
+            let structuralChanged = afterPart == nil
+                ? before.map { $0.effectRender != after.effectRender }
+                : nil
             let handlerEvidence = Self.bool(Self.object(result.output)["verified"]) == true
             let changed = structuralChanged.map { $0 || handlerEvidence }
             let visibleValueChanged: Bool = {
@@ -976,10 +1265,21 @@ public struct MacFourVerbs: Sendable {
                       let afterValues = Self.visionValueTexts(after.detail) else { return false }
                 return beforeValues != afterValues
             }()
+            let pointerOnTarget: Bool? = {
+                guard let pointerTarget, let before,
+                      before.bundleIdentifier == after.bundleIdentifier,
+                      before.appName == after.appName,
+                      let pointer = after.pointer,
+                      case .hit(let target) = Self.resolve(pointerTarget, among: after.targets),
+                      let frame = target.observedFrame else { return nil }
+                return pointer.isInside(frame) && !target.excludedFrames.contains { pointer.isInside($0) }
+            }()
             let observation: String
-            if visibleValueChanged { observation = " A value the fresh screen says changed after it." }
+            if pointerOnTarget == true { observation = " The system pointer is inside the target's freshly observed bounds." }
+            else if pointerOnTarget == false { observation = " The system pointer is outside the target's freshly observed bounds." }
+            else if visibleValueChanged { observation = " A value the fresh screen says changed after it." }
             else if structuralChanged == true { observation = " The fresh screen changed after it." }
-            else if handlerEvidence {
+            else if handlerEvidence && allowGenericScreenChangeVerification {
                 observation = " The fresh fused view changed after it, although the structural words stayed the same."
             }
             else if changed == false { observation = " The fresh screen did not visibly change." }
@@ -996,7 +1296,16 @@ public struct MacFourVerbs: Sendable {
             // evidence that the visible computer reacted, so settle THAT claim
             // (not the caller's larger goal). An unchanged screen remains
             // explicitly unverified.
-            if visibleValueChanged {
+            if pointerTarget != nil {
+                detail["pointer_on_target"] = pointerOnTarget.map(JSONValue.bool) ?? .null
+                detail["verification"] = .string(pointerOnTarget == true
+                    ? MotorVerificationState.satisfied.rawValue : MotorVerificationState.unverified.rawValue)
+                detail.removeValue(forKey: "verification_evidence")
+                if pointerOnTarget == true {
+                    detail["verification_evidence"] = .string("fresh_system_pointer_in_observed_target")
+                    detail["verification_scope"] = .string("pointer_position_only")
+                }
+            } else if visibleValueChanged {
                 detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
                 detail["verification_evidence"] = .string("fresh_visible_value_change")
             } else if changed == true, allowGenericScreenChangeVerification {
@@ -1030,7 +1339,7 @@ public struct MacFourVerbs: Sendable {
     }
 
     private func ambiguousPhysical(_ target: String, candidates: [ActTarget], screen: String) -> MacFourVerbsReply {
-        let names = candidates.map(Self.name).joined(separator: ", ")
+        let names = candidates.map(Self.recoveryName).joined(separator: ", ")
         return MacFourVerbsReply(
             ok: false,
             text: "More than one thing matches \"\(target)\": \(names). Which one? I haven't touched anything.\n" + screen,
@@ -1248,6 +1557,8 @@ public struct MacFourVerbs: Sendable {
 
     struct Sighting {
         let render: String
+        let effectRender: String
+        let pointer: MacPointerPosition?
         let place: String
         let appName: String?
         let bundleIdentifier: String?
@@ -1261,6 +1572,7 @@ public struct MacFourVerbs: Sendable {
     /// A resolvable thing on the screen. `label` is the DISPLAY text — what the
     /// renderer printed — so anything redaction withheld cannot be named.
     struct ActTarget: Equatable {
+        let sourceAXPath: [Int]?
         let handle: String
         let label: String?
         /// Additional exact natural names for this SAME target. These never
@@ -1276,10 +1588,13 @@ public struct MacFourVerbs: Sendable {
         let roleOrdinal: Int?
         let enabled: Bool
         let frame: MacAXFrame?
+        let observedFrame: MacAXFrame?
+        let excludedFrames: [MacAXFrame]
         let viewId: String?
         let mark: Int?
         let regionOnly: Bool
         let physicalOnly: Bool
+        let motionUncertain: Bool
 
         // A semantic look handle remains the preferred semantic route even
         // after fusion enriches it with a physical frame/mark. Only a target
@@ -1297,12 +1612,17 @@ public struct MacFourVerbs: Sendable {
             roleOrdinal: Int? = nil,
             enabled: Bool,
             frame: MacAXFrame? = nil,
+            observedFrame: MacAXFrame? = nil,
+            excludedFrames: [MacAXFrame] = [],
             viewId: String? = nil,
             mark: Int? = nil,
             regionOnly: Bool = false,
-            physicalOnly: Bool = false
+            physicalOnly: Bool = false,
+            motionUncertain: Bool = false,
+            sourceAXPath: [Int]? = nil
         ) {
             self.handle = handle
+            self.sourceAXPath = sourceAXPath
             self.label = label
             self.aliases = aliases
             self.kind = kind
@@ -1310,14 +1630,19 @@ public struct MacFourVerbs: Sendable {
             self.roleOrdinal = roleOrdinal
             self.enabled = enabled
             self.frame = frame
+            self.observedFrame = observedFrame ?? frame
+            self.excludedFrames = excludedFrames
             self.viewId = viewId
             self.mark = mark
             self.regionOnly = regionOnly
             self.physicalOnly = physicalOnly
+            self.motionUncertain = motionUncertain
         }
     }
 
-    private func sight(part: String?) async -> Sighted {
+    // Module-internal so paired perception fixtures can inspect the same
+    // private target/render compilation used by screen and act.
+    func sight(part: String?) async -> Sighted {
         await sight(part: part, wakeAttemptsRemaining: 2)
     }
 
@@ -1406,21 +1731,15 @@ public struct MacFourVerbs: Sendable {
                 enabled: row.enabled,
                 frame: row.frame,
                 viewId: nil,
-                mark: nil
+                mark: nil,
+                sourceAXPath: row.path
             ))
         }
-        var unnamedControlRoleOrdinals: [String: Int] = [:]
+        let controlOrdinals = MacScreenRender.controlRoleOrdinals(for: controls)
         for control in controls {
             let kind = MacScreenRender.kindName(role: control.role)
             let display = MacScreenText(control.label, redacted: control.labelJSON).display
-            let roleOrdinal: Int?
-            if display == nil {
-                let next = (unnamedControlRoleOrdinals[kind] ?? 0) + 1
-                unnamedControlRoleOrdinals[kind] = next
-                roleOrdinal = next
-            } else {
-                roleOrdinal = nil
-            }
+            let roleOrdinal = controlOrdinals[control.handle]
             targets.append(ActTarget(
                 handle: control.handle,
                 label: display,
@@ -1430,7 +1749,8 @@ public struct MacFourVerbs: Sendable {
                 enabled: control.enabled,
                 frame: control.frame,
                 viewId: nil,
-                mark: nil
+                mark: nil,
+                sourceAXPath: control.path
             ))
         }
 
@@ -1456,39 +1776,30 @@ public struct MacFourVerbs: Sendable {
                 roleOrdinal: roleOrdinal,
                 enabled: true,
                 frame: frame,
-                regionOnly: true
+                regionOnly: true,
+                sourceAXPath: landmark.path
             ))
         }
 
         var visibleFrame: MacAXFrame?
+        var pointer: MacPointerPosition?
+        var pointerFrame: MacAXFrame?
         var supplementalDiagnostics: [String: JSONValue] = [:]
         if let supplement = await supplementalSource?.observe(),
            Self.sameApp(percept: percept, supplement: supplement) {
             visibleFrame = supplement.visibleFrame
+            pointer = supplement.pointer
+            pointerFrame = supplement.pointerFrame ?? supplement.visibleFrame
             supplementalDiagnostics = supplement.diagnostics
             var addedTargets: [ActTarget] = []
+            var mergedAXPaths: Set<[Int]> = []
+            var addedAXOrdinals: [[Int]: Int] = [:]
             for candidate in supplement.targets {
                 let display = candidate.label?.display
                 let combined = targets + addedTargets
-                let duplicateIndex = combined.firstIndex { existing in
-                    if let display, let existingLabel = existing.label,
-                       Self.normalize(display) == Self.normalize(existingLabel),
-                       candidate.kind == existing.kind { return true }
-                    // Nested saliency regions commonly overlap (for example a
-                    // bright core and its moving glow). Their live-scene names
-                    // are the identity. Geometric dedup may keep region 2,
-                    // discard region 1's resolver target, and still render
-                    // both rows—making ACT deny the exact name SCREEN printed.
-                    // Only an exact label may fuse physical-only regions.
-                    if candidate.physicalOnly || existing.physicalOnly { return false }
-                    // A toolbar/sidebar/list contains its controls, so pure
-                    // geometric containment is not identity. Cross-kind frame
-                    // dedup swallowed every nested button into its landmark
-                    // while the renderer still truthfully printed the button.
-                    return candidate.kind == existing.kind
-                        && Self.framesOverlap(candidate.frame, existing.frame)
-                }
+                let duplicateIndex = Self.supplementalDuplicateIndex(candidate, among: combined)
                 if let duplicateIndex {
+                    if let path = candidate.sourceAXPath { mergedAXPaths.insert(path) }
                     // The semantic `look` lane intentionally keeps coordinates
                     // private, while the fused view carries the same element's
                     // frame and mark. Do not discard that richer address merely
@@ -1499,24 +1810,32 @@ public struct MacFourVerbs: Sendable {
                     let existing = combined[duplicateIndex]
                     let mergedLabel = existing.label ?? display
                     let mergedFrame = existing.frame ?? candidate.frame
-                    let mergedViewId = existing.viewId ?? candidate.viewId
-                    let mergedMark = existing.mark ?? candidate.mark
-                    guard mergedLabel != existing.label
-                            || mergedFrame != existing.frame
-                            || mergedViewId != existing.viewId
-                            || mergedMark != existing.mark else { continue }
+                    // A containing row and its filename are one named item,
+                    // but their marks still address DIFFERENT AX elements.
+                    // Keep the semantic leaf handle; never donate the row mark.
+                    let sameAXElement = existing.sourceAXPath == nil || candidate.sourceAXPath == nil
+                        || existing.sourceAXPath == candidate.sourceAXPath
+                    let mergedViewId = existing.viewId ?? (sameAXElement ? candidate.viewId : nil)
+                    let mergedMark = existing.mark ?? (sameAXElement ? candidate.mark : nil)
                     let enriched = ActTarget(
                         handle: existing.handle,
                         label: mergedLabel,
+                        aliases: (existing.aliases + candidate.aliases).reduce(into: []) {
+                            if !$0.contains($1) { $0.append($1) }
+                        },
                         kind: existing.kind,
                         ordinal: existing.ordinal,
                         roleOrdinal: existing.roleOrdinal,
                         enabled: existing.enabled,
                         frame: mergedFrame,
+                        observedFrame: existing.observedFrame ?? candidate.observedFrame,
+                        excludedFrames: existing.excludedFrames + candidate.excludedFrames,
                         viewId: mergedViewId,
                         mark: mergedMark,
                         regionOnly: existing.regionOnly,
-                        physicalOnly: existing.physicalOnly || candidate.physicalOnly
+                        physicalOnly: existing.physicalOnly || candidate.physicalOnly,
+                        motionUncertain: candidate.motionUncertain,
+                        sourceAXPath: existing.sourceAXPath ?? candidate.sourceAXPath
                     )
                     if duplicateIndex < targets.count {
                         targets[duplicateIndex] = enriched
@@ -1525,27 +1844,52 @@ public struct MacFourVerbs: Sendable {
                     }
                     continue
                 }
+                let roleOrdinal = candidate.ordinal ?? Self.nextRoleOrdinal(
+                    for: candidate.kind, among: targets + addedTargets
+                )
+                if let path = candidate.sourceAXPath { addedAXOrdinals[path] = roleOrdinal }
                 addedTargets.append(ActTarget(
                     handle: "",
                     label: display,
+                    aliases: candidate.aliases,
                     kind: candidate.kind,
                     ordinal: rows.isEmpty ? candidate.ordinal : nil,
-                    roleOrdinal: candidate.ordinal ?? Self.nextRoleOrdinal(
-                        for: candidate.kind,
-                        among: targets + addedTargets
-                    ),
-                    enabled: true,
+                    roleOrdinal: roleOrdinal,
+                    enabled: candidate.enabled,
                     frame: candidate.frame,
+                    observedFrame: candidate.observedFrame,
+                    excludedFrames: candidate.excludedFrames,
                     viewId: candidate.viewId,
                     mark: candidate.mark,
                     regionOnly: candidate.regionOnly,
-                    physicalOnly: candidate.physicalOnly
+                    physicalOnly: candidate.physicalOnly,
+                    motionUncertain: candidate.motionUncertain,
+                    sourceAXPath: candidate.sourceAXPath
                 ))
             }
             targets.append(contentsOf: addedTargets)
+            let supplementalControls = supplement.controls.compactMap { control -> MacScreenRender.Control? in
+                guard let path = control.sourceAXPath else { return control }
+                guard !mergedAXPaths.contains(path) else { return nil }
+                return MacScreenRender.Control(
+                    label: control.label, kind: control.kind,
+                    ordinal: addedAXOrdinals[path] ?? control.ordinal,
+                    value: control.value, states: control.states, provenance: control.provenance,
+                    abstain: control.abstain, sourceAXPath: path
+                )
+            }
+            let supplementalContents = supplement.contents.map { content in
+                MacScreenRender.Content(
+                    kind: content.kind, noun: content.noun,
+                    rows: content.rows.filter { row in
+                        row.sourceAXPath.map { !mergedAXPaths.contains($0) } ?? true
+                    },
+                    totalRows: content.totalRows, scrollable: content.scrollable, canvas: content.canvas
+                )
+            }
             full = Self.adding(
-                contents: supplement.contents,
-                controls: supplement.controls,
+                contents: supplementalContents,
+                controls: supplementalControls,
                 values: supplement.values,
                 to: full
             )
@@ -1576,10 +1920,14 @@ public struct MacFourVerbs: Sendable {
                         roleOrdinal: existing.roleOrdinal,
                         enabled: existing.enabled,
                         frame: existing.frame,
+                        observedFrame: existing.observedFrame,
+                        excludedFrames: existing.excludedFrames,
                         viewId: existing.viewId,
                         mark: existing.mark,
                         regionOnly: existing.regionOnly,
-                        physicalOnly: existing.physicalOnly
+                        physicalOnly: existing.physicalOnly,
+                        motionUncertain: existing.motionUncertain,
+                        sourceAXPath: existing.sourceAXPath
                     )
                     full = Self.adding(
                         controls: [MacScreenRender.Control(
@@ -1600,10 +1948,14 @@ public struct MacFourVerbs: Sendable {
                         roleOrdinal: existing.roleOrdinal,
                         enabled: existing.enabled,
                         frame: existing.frame,
+                        observedFrame: existing.observedFrame,
+                        excludedFrames: existing.excludedFrames,
                         viewId: existing.viewId,
                         mark: existing.mark,
                         regionOnly: existing.regionOnly,
-                        physicalOnly: existing.physicalOnly
+                        physicalOnly: existing.physicalOnly,
+                        motionUncertain: existing.motionUncertain,
+                        sourceAXPath: existing.sourceAXPath
                     )
                 }
             } else {
@@ -1619,7 +1971,8 @@ public struct MacFourVerbs: Sendable {
                     enabled: true,
                     frame: nil,
                     viewId: nil,
-                    mark: nil
+                    mark: nil,
+                    sourceAXPath: focus.path
                 ))
                 full = Self.adding(
                     controls: [MacScreenRender.Control(
@@ -1635,8 +1988,19 @@ public struct MacFourVerbs: Sendable {
 
         let zoom = part.flatMap { Self.zoom(full, part: $0, options: options) }
         let rendering = MacScreenRender.rendering(zoom?.screen ?? full, options: zoom?.options ?? options)
+        let pointerLine: String = {
+            guard let pointer else { return "POINTER: position unavailable." }
+            guard let frame = pointerFrame else { return "POINTER: observed; surface position unavailable." }
+            guard pointer.isInside(frame) else { return "POINTER: outside the observed surface." }
+            let x = Int(((pointer.x - frame.x) / frame.w * 100).rounded())
+            let y = Int(((pointer.y - frame.y) / frame.h * 100).rounded())
+            return "POINTER: \(x)%,\(y)% of the observed surface (system position)."
+        }()
+        let renderedText = rendering.text + "\n" + pointerLine
         return .seen(Sighting(
-            render: rendering.text,
+            render: renderedText,
+            effectRender: rendering.text,
+            pointer: pointer,
             place: Self.place(percept),
             appName: percept.app?.name,
             bundleIdentifier: percept.app?.bundleIdentifier,
@@ -1645,9 +2009,10 @@ public struct MacFourVerbs: Sendable {
             frameId: frameId,
             zoomNote: zoom?.note,
             detail: [
-                "bytes": .int(Int64(rendering.bytes)),
+                "bytes": .int(Int64(renderedText.utf8.count)),
                 "rows_dropped": .int(Int64(rendering.rowsDropped)),
                 "controls_dropped": .int(Int64(rendering.controlsDropped)),
+                "semantic_targets_omitted": .int(Int64(percept.affordancesOmitted)),
             ].merging(supplementalDiagnostics) { current, _ in current }
         ))
     }
@@ -1672,13 +2037,85 @@ public struct MacFourVerbs: Sendable {
         let needle = normalize(part)
         guard !needle.isEmpty else { return nil }
 
-        let matchingControls = screen.controls.filter { matches(needle, $0.label.display, kind: $0.kind) }
+        // A visual world is a first-class screen section, not browser chrome.
+        // Without this branch, "the open X canvas" can fuzzy-match the tab
+        // named X and hide the pixel regions the agent actually asked to see,
+        // forcing another full-screen/provider round before acting.
+        let words = Set(needle.split(separator: " ").map(String.init))
+        let asksForVisualSurface = words.contains("canvas")
+            || words.contains("world")
+            || words.contains("viewport")
+            || needle.contains("visual surface")
+        if asksForVisualSurface,
+           screen.contents.contains(where: { $0.kind == .canvas }) {
+            let visualContents = screen.contents.filter { content in
+                content.kind == .canvas || content.rows.contains { $0.provenance.isVision }
+            }
+            let visualControls = screen.controls.filter { $0.provenance.isVision }
+            let visualRows = visualContents.reduce(0) { $0 + $1.rows.count }
+            let scoped = MacScreenRender.Screen(
+                appName: screen.appName,
+                windowTitle: screen.windowTitle,
+                isFront: screen.isFront,
+                otherWindows: screen.otherWindows,
+                provenance: screen.provenance,
+                modal: screen.modal,
+                whereSteps: screen.whereSteps,
+                contents: visualContents,
+                controls: visualControls,
+                totalControls: visualControls.count,
+                unlabeledControls: [:],
+                values: screen.values,
+                totalValues: screen.totalValues,
+                unclassifiedOmittedTargets: screen.unclassifiedOmittedTargets
+            )
+            return Zoom(
+                screen: scoped,
+                options: MacScreenRender.Options(
+                    maxRows: max(options.maxRows, Self.zoomMaxRows),
+                    maxControls: options.maxControls,
+                    maxValues: options.maxValues,
+                    maxWhereSteps: options.maxWhereSteps,
+                    // Visual object details carry compact colour, normalized
+                    // geometry, and motion. The ordinary 40-character UI
+                    // label cap cuts those facts at "at …"; this scoped world
+                    // has few rows and can afford the bounded wider field.
+                    maxLabelChars: max(options.maxLabelChars, 96)
+                ),
+                note: "Visual surface retained with \(visualRows + visualControls.count) interpreted region"
+                    + (visualRows + visualControls.count == 1 ? "" : "s")
+                    + "; surrounding controls omitted."
+            )
+        }
+
+        let asksForControls = ["controls", "actions", "actionable controls"].contains(needle)
+        let matchingControls = asksForControls ? screen.controls
+            : screen.controls.filter { matches(needle, $0.label.display, kind: $0.kind) }
         let matchingRows = screen.contents.flatMap { content in
             content.rows.enumerated().filter { matches(needle, $0.element.label?.display, kind: nil) }
                 .map { $0.offset + 1 }
         }
 
-        if !matchingControls.isEmpty, matchingRows.isEmpty {
+        let asksForReadouts = ["hud", "the hud", "values", "readouts", "status text"].contains(needle)
+        let matchingValues = asksForReadouts ? screen.values : screen.values.filter {
+            matches(needle, $0.text.display, kind: nil)
+        }
+        if asksForReadouts || (!matchingValues.isEmpty && matchingControls.isEmpty && matchingRows.isEmpty) {
+            let scoped = MacScreenRender.Screen(
+                appName: screen.appName, windowTitle: screen.windowTitle, isFront: screen.isFront,
+                otherWindows: screen.otherWindows, provenance: screen.provenance,
+                modal: screen.modal, whereSteps: screen.whereSteps,
+                values: matchingValues, totalValues: asksForReadouts ? screen.totalValues : matchingValues.count,
+                unclassifiedOmittedTargets: screen.unclassifiedOmittedTargets
+            )
+            return Zoom(screen: scoped, options: MacScreenRender.Options(
+                maxRows: options.maxRows, maxControls: options.maxControls,
+                maxValues: max(options.maxValues, Self.zoomMaxRows), maxWhereSteps: options.maxWhereSteps,
+                maxLabelChars: options.maxLabelChars
+            ), note: "\(matchingValues.count) observed readout\(matchingValues.count == 1 ? "" : "s") match; surrounding controls omitted.")
+        }
+
+        if asksForControls || (!matchingControls.isEmpty && matchingRows.isEmpty) {
             let scoped = MacScreenRender.Screen(
                 appName: screen.appName,
                 windowTitle: screen.windowTitle,
@@ -1689,14 +2126,21 @@ public struct MacFourVerbs: Sendable {
                 whereSteps: screen.whereSteps,
                 contents: [],
                 controls: matchingControls,
-                totalControls: matchingControls.count,
-                unlabeledControls: [:],
+                totalControls: asksForControls ? screen.totalControls : matchingControls.count,
+                unlabeledControls: asksForControls ? screen.unlabeledControls : [:],
                 values: screen.values,
-                totalValues: screen.totalValues
+                totalValues: screen.totalValues,
+                unclassifiedOmittedTargets: screen.unclassifiedOmittedTargets
             )
             return Zoom(
                 screen: scoped,
-                options: options,
+                options: MacScreenRender.Options(
+                    maxRows: options.maxRows,
+                    maxControls: max(options.maxControls, Self.zoomMaxRows),
+                    maxValues: options.maxValues,
+                    maxWhereSteps: options.maxWhereSteps,
+                    maxLabelChars: options.maxLabelChars
+                ),
                 note: "\(matchingControls.count) of \(screen.totalControls) actionable match; "
                     + "the rest of the screen is unchanged."
             )
@@ -1748,10 +2192,15 @@ public struct MacFourVerbs: Sendable {
 
     static func resolve(_ target: String, among targets: [ActTarget]) -> Resolution {
         let hint = roleHint(in: target)
-        let needle = normalize(stripRoleWords(target))
+        let identityTarget = stripWithinTargetAimQualifier(target)
+        let qualifier = trailingRoleQualifier(in: identityTarget)
+        let needle = qualifier?.label ?? normalize(stripRoleWords(identityTarget))
         guard !needle.isEmpty || hint != nil else { return .none(nearest: nearest(to: "", among: targets)) }
 
-        func narrow(_ candidates: [ActTarget]) -> Resolution? {
+        func narrow(_ matches: [ActTarget], respectingQualifier: Bool = true) -> Resolution? {
+            let candidates = respectingQualifier && qualifier != nil
+                ? matches.filter { $0.kind == qualifier?.kind }
+                : matches
             guard !candidates.isEmpty else { return nil }
             if candidates.count == 1 { return .hit(candidates[0]) }
             if let hint {
@@ -1773,11 +2222,33 @@ public struct MacFourVerbs: Sendable {
         // the existing target so "focused field" and "focused control" reach
         // the one element the screen says is focused without minting a second
         // handle or letting fuzzy matching choose another control.
-        let normalizedTarget = normalize(target)
+        let normalizedTarget = normalize(identityTarget)
         if let hit = narrow(targets.filter { candidate in
             candidate.aliases.contains { normalize($0) == normalizedTarget }
-        }) {
+        }, respectingQualifier: false) {
             return hit
+        }
+
+        // A literal label can contain role words without describing its role
+        // (a row named "Send button", for example). Preserve that exact
+        // address before interpreting a trailing kind as a qualifier.
+        if let hit = narrow(targets.filter {
+            normalize($0.label ?? "") == normalizedTarget && !normalizedTarget.isEmpty
+        }, respectingQualifier: false) { return hit }
+
+        // A copied DO/recovery address includes both its ordinal and label,
+        // e.g. `button 4 Remove`. Resolve that complete address before fuzzy
+        // name matching can discard the number. The label must still agree:
+        // a changed screen must not silently redirect a stale address.
+        if let address = labeledOrdinalAddress(in: identityTarget) {
+            let matches = targets.filter { candidate in
+                let ordinalMatches = address.kind == "row"
+                    ? candidate.ordinal == address.ordinal
+                    : candidate.kind == address.kind && candidate.roleOrdinal == address.ordinal
+                return ordinalMatches && candidate.label.map(normalize) == address.label
+            }
+            return narrow(matches, respectingQualifier: false)
+                ?? .none(nearest: nearest(to: address.label, among: targets))
         }
 
         // 1. exact
@@ -1786,9 +2257,21 @@ public struct MacFourVerbs: Sendable {
         }
         // 2. contains
         let contains = targets.filter { candidate in
-            guard !needle.isEmpty, let label = candidate.label else { return false }
-            let normalized = normalize(label)
-            return !normalized.isEmpty && (normalized.contains(needle) || needle.contains(normalized))
+            guard !needle.isEmpty else { return false }
+            let labelMatches: Bool = {
+                guard let label = candidate.label else { return false }
+                let normalized = normalize(label)
+                return !normalized.isEmpty
+                    && (normalized.contains(needle) || needle.contains(normalized))
+            }()
+            let aliasMatches = candidate.aliases.contains { alias in
+                let normalized = normalize(alias)
+                // An alias may refine a short request ("yellow" -> "yellow
+                // object"), but a longer request may not silently discard
+                // qualifiers such as moving, above, or left-of.
+                return !normalized.isEmpty && normalized.contains(needle)
+            }
+            return labelMatches || aliasMatches
         }
         if let hit = narrow(contains) { return hit }
         // 3. ordinal. A bare ordinal and `row N` mean the visible content-row
@@ -1812,6 +2295,44 @@ public struct MacFourVerbs: Sendable {
             }
         }
         return .none(nearest: nearest(to: needle, among: targets))
+    }
+
+    static func isPotentialDynamicVisualReference(_ target: String) -> Bool {
+        let words = normalize(target).split(separator: " ")
+        let exactRegion = words.count == 3
+            && words[0] == "visual"
+            && words[1] == "region"
+            && Int(words[2]) != nil
+        let compactObjectPhrase = (2...7).contains(words.count)
+            && (words.contains("object") || words.contains("square") || words.contains("circle"))
+        return exactRegion || compactObjectPhrase
+    }
+
+    private static func motionAppChangedReply(screen: String) -> MacFourVerbsReply {
+        MacFourVerbsReply(ok: false,
+            text: "The foreground app changed while I was observing motion. I haven't sent input.\n" + screen,
+            detail: ["error": .string("motion_sampling_app_changed")])
+    }
+
+    /// This identity probe only earns one more observation. It NEVER supplies
+    /// an action target: the original motion-qualified name must still resolve.
+    static func canConfirmTemporalTurn(_ target: String, previous: [ActTarget], current: [ActTarget]) -> Bool {
+        guard hasTemporalQualifier(target) else { return false }
+        let appearance = normalize(target).split(separator: " ")
+            .filter { $0 != "moving" && $0 != "stationary" }.joined(separator: " ")
+        func identity(_ targets: [ActTarget]) -> String? {
+            guard case .hit(let candidate) = resolve(appearance, among: targets),
+                  candidate.physicalOnly, candidate.motionUncertain, candidate.enabled,
+                  candidate.observedFrame != nil, let label = candidate.label, !label.isEmpty else { return nil }
+            return candidate.handle + "|" + label
+        }
+        guard let previousID = identity(previous), let currentID = identity(current) else { return false }
+        return previousID == currentID
+    }
+
+    static func hasTemporalQualifier(_ target: String) -> Bool {
+        let words = normalize(target).split(separator: " ")
+        return words.contains("moving") || words.contains("stationary")
     }
 
     static let editableKinds: Set<String> = ["text", "text area", "secure text"]
@@ -1848,7 +2369,7 @@ public struct MacFourVerbs: Sendable {
                 score = shared.count * 10
                 if let first = needle.first, normalized.hasPrefix(String(first)) { score += 1 }
             }
-            return (candidate.ordinal.map { "row \($0) \"\(label)\"" } ?? "\"\(label)\"", score)
+            return (recoveryName(candidate), score)
         }
         let ranked = named.enumerated()
             .sorted { ($0.element.1, -$0.offset) > ($1.element.1, -$1.offset) }
@@ -1892,6 +2413,21 @@ public struct MacFourVerbs: Sendable {
         return out
     }()
 
+    private static let trailingRolePhrases = roleWords.keys.sorted {
+        $0.count == $1.count ? $0 < $1 : $0.count > $1.count
+    }
+
+    /// Only a trailing role phrase qualifies the remaining fuzzy/exact-name
+    /// rungs. Embedded words in a literal name are not role restrictions.
+    static func trailingRoleQualifier(in phrase: String) -> (label: String, kind: String)? {
+        let normalized = normalize(phrase)
+        for role in trailingRolePhrases where normalized.hasSuffix(" " + role) {
+            guard let kind = roleWords[role] else { continue }
+            return (normalize(String(normalized.dropLast(role.count))), kind)
+        }
+        return nil
+    }
+
     static func roleHint(in phrase: String) -> String? {
         let words = normalize(phrase).split(separator: " ").map(String.init)
         // Longest match first, so "menu item" beats "menu".
@@ -1916,7 +2452,54 @@ public struct MacFourVerbs: Sendable {
         return words.joined(separator: " ")
     }
 
+    /// These prefixes specify an aim point *within* an already named object;
+    /// unlike motion, coarse position, and relations, they are not part of its
+    /// identity. Strip them for resolution while preserving the original
+    /// phrase for `aimPoint`.
+    static func stripWithinTargetAimQualifier(_ phrase: String) -> String {
+        withinTargetAimQualifier(phrase)?.target ?? normalize(phrase)
+    }
+
+    /// Interpret only a bounded spatial prefix. Hyphens in the object's own
+    /// name (for example "upper-left-icon") remain part of its identity.
+    private static func withinTargetAimQualifier(_ phrase: String) -> (target: String, words: Set<String>)? {
+        let normalized = normalize(phrase)
+        guard let separator = normalized.range(of: " of ") else { return nil }
+        let qualifier = String(normalized[..<separator.lowerBound])
+            .replacingOccurrences(of: "-", with: " ")
+            .split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let singles: Set<String> = ["left side", "right side", "top", "upper part",
+                                    "bottom", "lower part", "center", "centre", "middle"]
+        let diagonal = qualifier.count >= 2 && qualifier.count <= 3
+            && ["top", "upper", "bottom", "lower"].contains(qualifier[0])
+            && ["left", "right"].contains(qualifier[1])
+            && (qualifier.count == 2 || ["corner", "part", "side"].contains(qualifier[2]))
+        guard diagonal || singles.contains(qualifier.joined(separator: " ")) else { return nil }
+        let target = normalize(String(normalized[separator.upperBound...]))
+        guard !target.isEmpty else { return nil }
+        return (target, Set(qualifier))
+    }
+
+    private static func aimWords(in phrase: String) -> Set<String> {
+        withinTargetAimQualifier(phrase)?.words
+            ?? Set(normalize(phrase).split(separator: " ").map(String.init))
+    }
+
     static let ordinalNouns: Set<String> = ["row", "item", "cell", "line", "no", "number", "#"]
+
+    static func labeledOrdinalAddress(in phrase: String) -> (kind: String, ordinal: Int, label: String)? {
+        let normalized = normalize(phrase)
+        for role in trailingRolePhrases where normalized.hasPrefix(role + " ") {
+            let remainder = normalized.dropFirst(role.count + 1)
+            let parts = remainder.split(separator: " ", maxSplits: 1)
+            guard parts.count == 2, let ordinal = Int(parts[0]),
+                  let kind = roleWords[role] else { continue }
+            let label = normalize(String(parts[1]))
+            guard !label.isEmpty else { continue }
+            return (kind, ordinal, label)
+        }
+        return nil
+    }
 
     static func ordinalAddress(in phrase: String) -> Int? {
         let words = normalize(phrase)
@@ -1943,14 +2526,20 @@ public struct MacFourVerbs: Sendable {
 
     // MARK: - Words
 
-    static func parseVerb(_ raw: String) -> (String, MacActScrollDirection) {
+    enum ScrollDirection: String {
+        case up, down, left, right
+        var isHorizontal: Bool { self == .left || self == .right }
+    }
+
+    static func parseVerb(_ raw: String) -> (String, ScrollDirection) {
         let words = normalize(raw).split(separator: " ").map(String.init)
         let head = words.first ?? ""
-        let direction: MacActScrollDirection = words.contains("up") ? .up : .down
+        let direction: ScrollDirection = words.contains("up") ? .up
+            : words.contains("left") ? .left : words.contains("right") ? .right : .down
         return (head, direction)
     }
 
-    static func pastTense(_ verb: MacActVerb, direction: MacActScrollDirection) -> String {
+    static func pastTense(_ verb: MacActVerb, direction: ScrollDirection) -> String {
         switch verb {
         case .click: return "Clicked"
         case .open: return "Opened"
@@ -1962,7 +2551,7 @@ public struct MacFourVerbs: Sendable {
         }
     }
 
-    static func attempted(_ verb: MacActVerb, direction: MacActScrollDirection) -> String {
+    static func attempted(_ verb: MacActVerb, direction: ScrollDirection) -> String {
         switch verb {
         case .scroll: return "Tried to scroll \(direction.rawValue) in"
         default: return "Tried to \(verb.rawValue)"
@@ -1975,11 +2564,45 @@ public struct MacFourVerbs: Sendable {
         return "that \(candidate.kind)"
     }
 
+    static func recoveryName(_ candidate: ActTarget) -> String {
+        let address = candidate.ordinal.map { "row \($0)" }
+            ?? candidate.roleOrdinal.map { "\(candidate.kind) \($0)" }
+        guard let address else { return name(candidate) }
+        if let label = candidate.label, !label.isEmpty { return "\(address) \"\(label)\"" }
+        return address
+    }
+
+    static func spokenName(_ candidate: ActTarget, requestedAs target: String) -> String {
+        let requested = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identity = normalize(stripWithinTargetAimQualifier(requested))
+        if !requested.isEmpty,
+           candidate.aliases.contains(where: { normalize($0) == identity }) {
+            return "\"\(requested)\""
+        }
+        return name(candidate)
+    }
+
     /// Natural spatial qualifiers turn one visible region into useful aim
     /// points without exposing coordinates. Quarter-points leave a margin so
     /// "right side" does not accidentally target a resize edge.
+    static func safeAimPoint(for target: ActTarget, in frame: MacAXFrame,
+                            describedBy phrase: String) -> MacPointerPosition? {
+        let aim = aimPoint(in: frame, describedBy: phrase)
+        guard let preferred = MacPointerPosition(x: aim.x, y: aim.y) else { return nil }
+        let words = aimWords(in: phrase)
+        let spatialWords: Set<String> = ["left", "right", "top", "upper", "bottom", "lower", "center", "centre", "middle"]
+        return MacRegionAim.point(in: frame, preferred: preferred, excluding: target.excludedFrames,
+                                  allowAlternate: target.regionOnly && words.isDisjoint(with: spatialWords))
+    }
+
+    private static func obstructedPointReply(screen: String) -> MacFourVerbsReply {
+        MacFourVerbsReply(ok: false,
+            text: "That point is covered by a foreground window; I haven't sent input. Name a clear part of the surface or move the obstruction first.\n" + screen,
+            detail: ["error": .string("target_point_obstructed")])
+    }
+
     static func aimPoint(in frame: MacAXFrame, describedBy phrase: String) -> (x: Double, y: Double) {
-        let words = Set(normalize(phrase).split(separator: " ").map(String.init))
+        let words = aimWords(in: phrase)
         let xRatio = words.contains("left") ? 0.25 : words.contains("right") ? 0.75 : 0.5
         let yRatio = words.contains("top") || words.contains("upper")
             ? 0.25
@@ -2400,6 +3023,50 @@ public struct MacFourVerbs: Sendable {
         return (rows, controls)
     }
 
+    /// Fuse only one supported identity. An AX path is capture-local: labels
+    /// and available geometry must still agree so a reordered tree cannot
+    /// donate a different control's physical mark to an old semantic handle.
+    /// A matching row/cell and its contained filename may share the named item,
+    /// without sharing marks; separate rows and interactive descendants cannot.
+    static func supplementalDuplicateIndex(
+        _ candidate: MacFourVerbsSupplementalTarget, among targets: [ActTarget]
+    ) -> Int? {
+        let display = candidate.label?.display.map(normalize)
+        let matches = targets.indices.filter { index in
+            let existing = targets[index]
+            let existingLabel = existing.label.map(normalize)
+            let sameLabel = display != nil && display == existingLabel
+            let incompatibleLabel = display != nil && existingLabel != nil && !sameLabel
+            if let path = candidate.sourceAXPath, let existingPath = existing.sourceAXPath,
+               path != existingPath {
+                let itemKinds: Set<String> = ["row", "cell", "item"]
+                let displayKinds = itemKinds.union(["text"])
+                let shorter = path.count < existingPath.count ? path : existingPath
+                let longer = path.count < existingPath.count ? existingPath : path
+                return sameLabel && display?.isEmpty == false
+                    && candidate.enabled == existing.enabled
+                    && !candidate.physicalOnly && !existing.physicalOnly
+                    && displayKinds.contains(candidate.kind) && displayKinds.contains(existing.kind)
+                    && (itemKinds.contains(candidate.kind) || itemKinds.contains(existing.kind))
+                    && !shorter.isEmpty && longer.count - shorter.count <= 2
+                    && longer.starts(with: shorter)
+                    && framesOverlap(candidate.frame, existing.frame)
+            }
+            guard candidate.kind == existing.kind else { return false }
+            if let path = candidate.sourceAXPath, let existingPath = existing.sourceAXPath {
+                guard path == existingPath, !incompatibleLabel else { return false }
+                return existing.frame.map { framesOverlap(candidate.frame, $0) } ?? sameLabel
+            }
+            // Named moving pixel regions can overlap by design. Their live
+            // names, not geometric containment, identify the region.
+            if candidate.physicalOnly || existing.physicalOnly { return sameLabel }
+            guard !incompatibleLabel else { return false }
+            if let frame = existing.frame { return framesOverlap(candidate.frame, frame) }
+            return sameLabel
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
     static func framesOverlap(_ lhs: MacAXFrame, _ rhs: MacAXFrame?) -> Bool {
         guard let rhs, lhs.w > 0, lhs.h > 0, rhs.w > 0, rhs.h > 0 else { return false }
         let left = max(lhs.x, rhs.x)
@@ -2434,6 +3101,12 @@ public struct MacFourVerbs: Sendable {
         }
 
         let newControls = controls.filter { control in
+            // AX-backed rows were reconciled with targets by identity above.
+            // Equal labels on distinct paths are not duplicate controls.
+            if control.sourceAXPath != nil {
+                if let label = control.label.display { known.insert(normalize(label)) }
+                return true
+            }
             guard let label = control.label.display else { return true }
             return known.insert(normalize(label)).inserted
         }
@@ -2444,6 +3117,10 @@ public struct MacFourVerbs: Sendable {
                 continue
             }
             let rows = content.rows.filter { row in
+                if row.sourceAXPath != nil {
+                    if let label = row.label?.display { known.insert(normalize(label)) }
+                    return true
+                }
                 guard let label = row.label?.display else { return true }
                 return known.insert(normalize(label)).inserted
             }
@@ -2463,6 +3140,13 @@ public struct MacFourVerbs: Sendable {
             return known.insert(normalize(text)).inserted
         }
 
+        // An open native menu is the immediate interaction surface. Keep its
+        // choices ahead of background toolbar controls under the render cap,
+        // preserving order within each role so existing ordinals stay valid.
+        let allControls = screen.controls + newControls
+        let orderedControls = allControls.filter { $0.kind == "menu item" }
+            + allControls.filter { $0.kind != "menu item" }
+
         return MacScreenRender.Screen(
             appName: screen.appName,
             windowTitle: screen.windowTitle,
@@ -2472,11 +3156,12 @@ public struct MacFourVerbs: Sendable {
             modal: screen.modal,
             whereSteps: screen.whereSteps,
             contents: screen.contents + newContents,
-            controls: screen.controls + newControls,
+            controls: orderedControls,
             totalControls: screen.totalControls + newControls.count,
             unlabeledControls: screen.unlabeledControls,
             values: screen.values + newValues,
-            totalValues: screen.totalValues + newValues.count
+            totalValues: screen.totalValues + newValues.count,
+            unclassifiedOmittedTargets: screen.unclassifiedOmittedTargets
         )
     }
 
@@ -2488,7 +3173,8 @@ public struct MacFourVerbs: Sendable {
     }
 
     static func visionValueTexts(_ detail: [String: JSONValue]) -> Set<String>? {
-        guard case .array(let values)? = detail["vision_value_text"] else { return nil }
+        let source = detail["vision_effect_value_text"] ?? detail["vision_value_text"]
+        guard case .array(let values)? = source else { return nil }
         return Set(values.compactMap { string($0) }.map(normalize))
     }
 

@@ -153,7 +153,7 @@ final class ActionChannelTests: XCTestCase {
         }
     }
 
-    private func successfulMacResponse(for envelope: [String: Any], result: String = "Mac committed") throws {
+    private func successfulMacResponse(for envelope: [String: Any], result: String = "Mac committed", canonicalFields: [String: String] = [:]) throws {
         let msgID = try XCTUnwrap(envelope["msgId"] as? String)
         let action = try XCTUnwrap(envelope["action"] as? String)
         let transactionID = try XCTUnwrap(envelope["transactionId"] as? String)
@@ -166,7 +166,7 @@ final class ActionChannelTests: XCTestCase {
                 "ok": "true",
                 "applied": "true",
                 "result": result,
-            ],
+            ].merging(canonicalFields, uniquingKeysWith: { _, canonical in canonical }),
             as: "\(msgID).json"
         )
     }
@@ -788,9 +788,32 @@ final class ActionChannelTests: XCTestCase {
                 "reasoning_effort": "high", "service_tier": "priority",
             ]
         )
-        try successfulMacResponse(for: envelope, result: "selection-committed")
+        try successfulMacResponse(for: envelope, canonicalFields: [
+            "surface": "ios", "provider_id": "openai_oauth_direct", "model": "gpt-5.6-terra",
+            "reasoning_effort": "low", "service_tier": "default",
+        ])
         let selectionResult = try await selection.value
-        XCTAssertEqual(selectionResult, "selection-committed")
+        XCTAssertEqual(selectionResult.model, "gpt-5.6-terra")
+        XCTAssertEqual(selectionResult.reasoningEffort, "low")
+        XCTAssertEqual(selectionResult.serviceTier, "default")
+        let suite = "NativeAgentMobileTests.signed-selection.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(7, forKey: ChatRuntimeControlPresentation.generationDefaultsKey)
+        let adopted = try XCTUnwrap(ChatRuntimeControlPresentation.acceptReceipt(
+            selectionResult, defaults: defaults, requestGeneration: 7
+        ))
+        XCTAssertEqual(adopted.providerID, "openai_oauth_direct")
+        XCTAssertEqual(adopted.model, "gpt-5.6-terra")
+        XCTAssertEqual(adopted.reasoningEffort, "low")
+        XCTAssertFalse(adopted.fastMode)
+        XCTAssertEqual(defaults.string(forKey: ChatRuntimeControlPresentation.modelDefaultsKey), "gpt-5.6-terra")
+        let acknowledged = ChatSurfaceModelPreferenceAdoption.resolve(
+            current: .init(providerID: adopted.providerID, model: adopted.model, reasoningEffort: adopted.reasoningEffort, fastMode: adopted.fastMode),
+            preference: .init(model: "gpt-5.6-terra", reasoningEffort: "low", serviceTier: "default", providerId: "openai_oauth_direct"),
+            awaitingAcknowledgement: true, selectableProviderIDs: ["openai_oauth_direct"]
+        )
+        XCTAssertFalse(acknowledged.awaitingAcknowledgement)
         try assertTerminalTransaction(for: envelope, expectedAction: "configure_surface_selection")
 
         try await assertStringActionRoundTrip(
@@ -807,6 +830,29 @@ final class ActionChannelTests: XCTestCase {
                 surface: "ios", model: "gpt-5.6-sol", reasoningEffort: "high", serviceTier: "priority"
             )
         }
+    }
+
+    func test_successfulSignedSelectionWithoutCanonicalTupleIsNotAnAdoptableReceipt() async throws {
+        let selection = Task { @MainActor in
+            try await self.engine.configureSurfaceSelection(
+                surface: "ios", providerId: "openai_oauth_direct", model: "gpt-5.6-sol",
+                reasoningEffort: "high", serviceTier: "priority"
+            )
+        }
+        let envelope = try await nextSignedEnvelope()
+        try successfulMacResponse(for: envelope, canonicalFields: [
+            "surface": "ios", "provider_id": "openai_oauth_direct", "model": "gpt-5.6-sol",
+            "service_tier": "priority",
+        ])
+        do {
+            _ = try await selection.value
+            XCTFail("An incomplete signed success cannot invent canonical reasoning state")
+        } catch SyncError.persistence(let message) {
+            XCTAssertTrue(message.contains("reasoning_effort"))
+        }
+        // The action transport really completed; only picker-state proof is
+        // incomplete. Do not rewrite its durable terminal outcome or replay it.
+        try assertTerminalTransaction(for: envelope, expectedAction: "configure_surface_selection")
     }
 
     func test_signatureRecoveryUsesNewActionIdentityAndLeavesBothDurableReceipts() async throws {

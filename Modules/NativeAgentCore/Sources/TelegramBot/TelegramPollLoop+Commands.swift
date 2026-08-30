@@ -3,6 +3,9 @@ import NativeAgentCore
 import PersistenceCore
 
 extension TelegramPollLoop {
+    /// Returns true only when the command transferred ownership of its durable
+    /// inbox claim to a tracked turn. Ordinary commands finish synchronously
+    /// and let the poll loop settle their claim.
     func handleSlashCommand(
         update: TelegramUpdate,
         message: TelegramMessage,
@@ -19,7 +22,7 @@ extension TelegramPollLoop {
                 message: message,
                 text: text
             )
-            return true
+            return false
         }
 
         guard let parsed = TelegramCommandRegistry.parse(text: text) else {
@@ -27,7 +30,7 @@ extension TelegramPollLoop {
                 Data("TelegramPollLoop: unsupported slash command \(text)\n".utf8)
             )
             await recordBlocked(reason: "unsupported_slash_command", update: update, message: message, text: text)
-            return true
+            return false
         }
 
         switch parsed.definition.handler {
@@ -59,19 +62,18 @@ extension TelegramPollLoop {
                     text: text
                 )
             }
-            return true
+            return false
 
         case .retry:
-            await handleRetryCommand(update: update, message: message, text: text)
-            return true
+            return await handleRetryCommand(update: update, message: message, text: text)
 
         case .sessions:
             await handleSessionsCommand(update: update, message: message, text: text)
-            return true
+            return false
 
         case .resume:
             await handleResumeCommand(args: parsed.args, update: update, message: message, text: text)
-            return true
+            return false
 
         case .status:
             if await refreshLiveTurnCard(chatId: message.chatId) {
@@ -86,11 +88,11 @@ extension TelegramPollLoop {
                 let reply = await buildStatusReply(chatId: message.chatId)
                 await sendCommandReply(reply, kind: "slash_reply", update: update, message: message, text: text)
             }
-            return true
+            return false
 
         case .model where parsed.args.isEmpty:
             await handleModelMenuCommand(parsed: parsed, update: update, message: message, text: text)
-            return true
+            return false
 
         case .approve, .deny:
             await sendCommandReply(
@@ -100,11 +102,11 @@ extension TelegramPollLoop {
                 message: message,
                 text: text
             )
-            return true
+            return false
 
         default:
             await handleExistingBotCommand(parsed: parsed, update: update, message: message, text: text)
-            return true
+            return false
         }
     }
 
@@ -335,7 +337,7 @@ extension TelegramPollLoop {
         update: TelegramUpdate,
         message: TelegramMessage,
         text: String
-    ) async {
+    ) async -> Bool {
         guard chatHandler != nil || progressChatHandler != nil || attachmentChatHandler != nil else {
             await sendCommandReply(
                 "Chat handling is not wired on this Telegram surface.",
@@ -344,7 +346,7 @@ extension TelegramPollLoop {
                 message: message,
                 text: text
             )
-            return
+            return false
         }
         guard let last = await turnCoordinator.lastUserMessage(chatId: message.chatId) else {
             await sendCommandReply(
@@ -354,22 +356,70 @@ extension TelegramPollLoop {
                 message: message,
                 text: text
             )
-            return
+            return false
         }
 
-        guard await turnCoordinator.startTrackedTurn(
-            chatId: message.chatId,
-            text: last.text,
-            operation: { turnId in
-                await runRetryTurn(
-                    turnId: turnId,
+        let updateInbox = TelegramUpdateInbox(offsetURL: offsetURL)
+        let retryOperation: @Sendable (UUID) async -> Void = { turnId in
+            do {
+                let processing = try await updateInbox.transition(
+                    updateId: update.updateId,
+                    from: [.queued],
+                    to: .processing
+                )
+                guard processing.phase == .processing else {
+                    await recordError(
+                        context: "retry_update_start",
+                        error: "durable retry claim was \(processing.phase.rawValue)",
+                        update: update,
+                        message: message,
+                        text: text
+                    )
+                    return
+                }
+                let completed = try await updateInbox.transition(
+                    updateId: update.updateId,
+                    from: [.processing],
+                    to: .completed
+                )
+                guard completed.phase == .completed else {
+                    await recordError(
+                        context: "retry_update_start",
+                        error: "durable retry claim could not settle",
+                        update: update,
+                        message: message,
+                        text: text
+                    )
+                    return
+                }
+            } catch {
+                await recordError(
+                    context: "retry_update_start",
+                    error: String(describing: error),
                     update: update,
                     message: message,
-                    commandText: text,
-                    retryText: last.text
+                    text: text
                 )
+                return
             }
-        ) != nil else {
+            await runRetryTurn(
+                turnId: turnId,
+                update: update,
+                message: message,
+                commandText: text,
+                retryText: last.text
+            )
+        }
+
+        if await turnCoordinator.startTrackedTurn(
+            chatId: message.chatId,
+            text: last.text,
+            operation: retryOperation
+        ) != nil {
+            return true
+        }
+
+        guard await turnCoordinator.canEnqueue(chatId: message.chatId) else {
             await sendCommandReply(
                 "A Telegram turn is already running for this chat. Use /stop before retrying.",
                 kind: "retry_busy",
@@ -377,8 +427,93 @@ extension TelegramPollLoop {
                 message: message,
                 text: text
             )
-            return
+            return false
         }
+
+        do {
+            let queued = try await updateInbox.transition(
+                updateId: update.updateId,
+                from: [.processing],
+                to: .queued
+            )
+            guard queued.phase == .queued else {
+                await sendCommandReply(
+                    "The retry could not be queued safely. Try again after the current turn finishes.",
+                    kind: "retry_busy",
+                    update: update,
+                    message: message,
+                    text: text
+                )
+                return false
+            }
+        } catch {
+            await recordError(
+                context: "retry_queue_update",
+                error: String(describing: error),
+                update: update,
+                message: message,
+                text: text
+            )
+            return false
+        }
+
+        let preview = String(last.text.replacingOccurrences(of: "\n", with: " ").prefix(120))
+        var acknowledgementMessageId: Int?
+        do {
+            let sentMessageId = try await sendMessageWithReplyMarkupReturningId(
+                token,
+                message.chatId,
+                "Queued retry · \(preview)",
+                TelegramQueuedTurnControlCallback.replyMarkup(updateId: update.updateId)
+            )
+            acknowledgementMessageId = sentMessageId
+            _ = try await updateInbox.recordQueueAcknowledgement(
+                updateId: update.updateId,
+                messageId: sentMessageId
+            )
+            await recordReceipt(
+                kind: "retry_queued",
+                update: update,
+                message: message,
+                text: text,
+                reply: "Queued retry"
+            )
+        } catch {
+            await recordError(
+                context: "send_retry_queued_notice",
+                error: String(describing: error),
+                update: update,
+                message: message,
+                text: text
+            )
+        }
+
+        let queued = await turnCoordinator.enqueueTrackedTurn(
+            updateId: update.updateId,
+            chatId: message.chatId,
+            text: last.text,
+            acknowledgementMessageId: acknowledgementMessageId,
+            operation: retryOperation,
+            onStart: { messageId in
+                guard let messageId else { return }
+                try? await editMessageTextWithReplyMarkup(
+                    token,
+                    message.chatId,
+                    messageId,
+                    "Running retry · \(preview)",
+                    TelegramTurnControlCallback.clearedReplyMarkup
+                )
+            }
+        )
+        guard queued != nil else {
+            _ = try? await updateInbox.transition(
+                updateId: update.updateId,
+                from: [.queued],
+                to: .completed
+            )
+            return true
+        }
+        return true
     }
 
     private func runRetryTurn(

@@ -251,13 +251,13 @@ struct DeskReportsOnlyWave10EvalTests {
         #expect(relaunched.panelStaleNotice(for: .diagnostics)?.contains("Nothing has loaded") == true)
         let presentation = RunsPresentation.state(
             runs: relaunched.runs,
-            staleNotice: relaunched.panelStaleNotice(for: .diagnostics)
+            refresh: relaunched.panelRefreshStatus[.diagnostics]
         )
         guard case .unavailable(let notice) = presentation else {
             Issue.record("corrupt cold relaunch rendered a runs state instead of unavailable")
             return
         }
-        #expect(notice == relaunched.panelStaleNotice(for: .diagnostics))
+        #expect(notice.contains("runs ledger is unavailable"))
     }
 
     @Test("Desk status actions carry the Desk surface through the gated router, persist once, and a bad handle cannot manufacture a second operation")

@@ -90,6 +90,36 @@ fileprivate func hasToolUse(_ events: [TurnStreamEvent]) -> Bool {
     return false
 }
 
+fileprivate final class HeldEOFStreamingClient: MessagesStreamingLLMClient, @unchecked Sendable {
+    private let textContinuation = LockedBox<AsyncThrowingStream<String, Error>.Continuation?>(nil)
+    private let messageContinuation = LockedBox<AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation?>(nil)
+
+    func stream(prompt: String, system: String?, model: String?) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            textContinuation.set(continuation)
+            continuation.yield("This reply is still incomplete.")
+        }
+    }
+
+    func streamMessages(
+        messages: [LLMMessage], system: String?, model: String?, surface: String, tools: [LLMToolSchema]?
+    ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            messageContinuation.set(continuation)
+            continuation.yield(.toolCall(LLMStreamToolCall(
+                id: "held-call", name: "read_file", inputJSON: Data("{}".utf8)
+            )))
+        }
+    }
+
+    func finishNormally() {
+        textContinuation.get()?.finish()
+        messageContinuation.get()?.finish()
+        textContinuation.set(nil)
+        messageContinuation.set(nil)
+    }
+}
+
 // MARK: - MockStreamingLLMClient tests
 
 @Test
@@ -165,6 +195,40 @@ func streamTurn_cleanEmptyEOF_isAnErrorNotASuccessfulBlankReply() async throws {
     #expect(errorEvent(events)?.contains("no answer text or tool call") == true)
 }
 
+@Test(arguments: [false, true])
+func streamTurn_remoteStopAfterLastChunkIsCancelledAtEOF(usingNativeTools: Bool) async throws {
+    let dir = try makeTempDir("stop-at-eof")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let flag = dir.appendingPathComponent("cancelled.flag")
+    let engine = makeEngine(persona: hermeticPersona(root: dir))
+    let streamer = HeldEOFStreamingClient()
+    defer { streamer.finishNormally() }
+    let nativeCall = LockedBox<LLMStreamToolCall?>(nil)
+    let stream = engine.streamTurn(
+        userMessage: "continue", streamingLLM: streamer,
+        cancelFlagPath: flag, cancelCheckEveryN: 1,
+        textToolCompatibility: true,
+        conversation: usingNativeTools ? [.user("continue")] : nil,
+        nativeTools: usingNativeTools,
+        nativeToolCallSink: { call in nativeCall.set(call) }
+    )
+    var events: [TurnStreamEvent] = []
+    for try await event in stream {
+        events.append(event)
+        if case .delta = event {
+            // The engine has consumed (and checked) its only chunk. The
+            // provider remains open until this external Stop is recorded,
+            // then finishes silently: no later chunk can observe the flag.
+            try Data().write(to: flag)
+            streamer.finishNormally()
+        }
+    }
+    #expect(deltaTexts(events) == [usingNativeTools ? "" : "This reply is still incomplete."])
+    #expect(errorEvent(events) == "cancelled")
+    #expect(finalResult(events) == nil)
+    #expect(nativeCall.get()?.id == (usingNativeTools ? "held-call" : nil))
+}
+
 @Test
 func textToolCompatibilityLayout_cachesToolContractBeforeVolatileContext() throws {
     let stable = "persona-stable"
@@ -231,6 +295,10 @@ func delegatedCampaignContract_advancesAcceptedFindings_butPreservesAuthorityChe
         #expect(prompt.contains("reversible follow-through is authorized end-to-end"))
         #expect(prompt.contains("file, route, recover, verify, and advance until independently verified done"))
         #expect(prompt.contains("never pause to ask whether to file it, keep going, dispatch the next step, or verify it"))
+        #expect(prompt.contains(DelegatedCampaignGuidance.deskConvergence))
+        #expect(prompt.contains("update that exact item in the same turn with desk_set_status or desk_close"))
+        #expect(prompt.contains("Never close from fuzzy title similarity"))
+        #expect(prompt.contains("when exact mapping or independent verification is missing, keep the item open"))
         #expect(prompt.contains(DelegatedCampaignGuidance.authorityCheckpoint))
         #expect(prompt.contains("Stop and escalate only for a genuine operator-only boundary"))
         #expect(prompt.contains("operator-only boundary: an approval"))

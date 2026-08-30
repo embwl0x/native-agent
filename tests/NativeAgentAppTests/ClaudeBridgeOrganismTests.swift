@@ -5,6 +5,82 @@ import Testing
 
 @Suite("Claude bridge organism projection")
 struct ClaudeBridgeOrganismTests {
+    @Test("bridge carries typed body beliefs instead of compatibility bits alone")
+    func typedBodyBeliefProjection() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func evidence(_ id: String, _ evidenceClass: BodyEvidenceClass) -> BodyEvidenceReference {
+            BodyEvidenceReference(
+                id: id,
+                evidenceClass: evidenceClass,
+                observedAt: now,
+                receivedAt: now
+            )
+        }
+        let body = BodySchema(
+            providersHealthy: false,
+            providersAvailable: true,
+            peerPresenceBelief: PeerPresenceBelief(
+                generatedAt: now,
+                evidence: [evidence("peer", .signedPeerContact)]
+            ),
+            notificationDeliveryBelief: NotificationDeliveryBelief(
+                generatedAt: now,
+                transportConfigured: true,
+                transportAccepted: true,
+                evidence: [evidence("apns", .apnsAcceptance)]
+            ),
+            memoryIntegrityReading: MemoryIntegrityReading(
+                generatedAt: now,
+                storeAvailable: true,
+                maintenanceSucceeded: true,
+                evidence: [evidence("memory", .maintenanceReceipt)]
+            ),
+            dreamIntegrityReading: DreamIntegrityReading(
+                generatedAt: now,
+                storeAvailable: true,
+                completionEvidence: [evidence("dream", .dreamCompletion)]
+            ),
+            toolCapabilityReading: ToolCapabilityReading(
+                generatedAt: now,
+                configured: true,
+                liveCapabilityObserved: true,
+                evidence: [evidence("tool", .liveToolCapability)]
+            ),
+            approvalPathReading: ApprovalPathReading(
+                generatedAt: now,
+                writable: true,
+                evidence: [evidence("approval", .approvalStore)]
+            ),
+            resourcePressureReading: ResourcePressureReading(
+                generatedAt: now,
+                thermalPressure: .elevated,
+                lowPowerMode: false,
+                evidence: [evidence("thermal", .processThermalState)]
+            )
+        )
+
+        let json = ClaudeBridge.organismBodySchemaJSON(body)
+        #expect(json["providersAvailable"] as? Bool == true)
+        let peer = try #require(json["peerPresenceBelief"] as? [String: Any])
+        #expect(peer["category"] as? String == "present")
+        #expect(peer["evidenceCount"] as? Int == 1)
+        #expect(peer["evidenceClasses"] as? [String] == ["signedPeerContact"])
+        let notification = try #require(json["notificationDeliveryBelief"] as? [String: Any])
+        #expect(notification["category"] as? String == "transportAccepted")
+        #expect(notification["transportAccepted"] as? Bool == true)
+        let memory = try #require(json["memoryIntegrityReading"] as? [String: Any])
+        #expect(memory["category"] as? String == "healthy")
+        let dream = try #require(json["dreamIntegrityReading"] as? [String: Any])
+        #expect(dream["storeAvailable"] as? Bool == true)
+        let tool = try #require(json["toolCapabilityReading"] as? [String: Any])
+        #expect(tool["liveCapabilityObserved"] as? Bool == true)
+        let approval = try #require(json["approvalPathReading"] as? [String: Any])
+        #expect(approval["writable"] as? Bool == true)
+        let resource = try #require(json["resourcePressureReading"] as? [String: Any])
+        #expect(resource["thermalPressure"] as? String == "elevated")
+        #expect(resource["lowPowerMode"] as? Bool == false)
+    }
+
     @Test("bridge exposes process-local microcycle proof without control authority")
     func microcycleTelemetryProjection() throws {
         var telemetry = CognitiveMicrocycleTelemetry.fresh(

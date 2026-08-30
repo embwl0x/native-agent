@@ -933,6 +933,121 @@ private func makeConsentJSON(
             "expected \(expected) distinct rows with no lost updates, got \(consents.count): \(ids.sorted())")
 }
 
+@Test func consentTraceFailureIsLoggedButDoesNotFailGrant() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    final class LogBox: @unchecked Sendable {
+        var lines: [String] = []
+    }
+    struct TraceAppendFailingPersistence: PersistenceCoreProtocol {
+        let inner = SwiftNativePersistenceCore()
+
+        func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue {
+            await inner.readJSON(path, defaultValue: defaultValue)
+        }
+
+        func writeJSON(_ value: JSONValue, to path: URL) async throws {
+            try await inner.writeJSON(value, to: path)
+        }
+
+        func appendJSONL(_ record: JSONValue, to path: URL) async throws {
+            if path.lastPathComponent == "events.jsonl",
+               path.deletingLastPathComponent().lastPathComponent == "traces" {
+                throw NSError(domain: "MCPDispatcherTests", code: 41)
+            }
+            try await inner.appendJSONL(record, to: path)
+        }
+
+        func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] {
+            try await inner.tailJSONL(path, limit: limit, maxBytes: maxBytes)
+        }
+
+        func tailJSONLReadReceipt(
+            _ path: URL,
+            limit: Int,
+            maxBytes: Int?
+        ) async throws -> SwiftNativePersistenceCore.JSONLTailReadReceipt {
+            try await inner.tailJSONLReadReceipt(path, limit: limit, maxBytes: maxBytes)
+        }
+
+        func readJSONL(_ path: URL) async throws -> [JSONValue] {
+            try await inner.readJSONL(path)
+        }
+
+        func replaceJSONL(_ records: [JSONValue], to path: URL) async throws {
+            try await inner.replaceJSONL(records, to: path)
+        }
+
+        func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport) {
+            try await inner.readJSONLReporting(path)
+        }
+
+        func appendJSONLDurable(_ record: JSONValue, to path: URL) async throws {
+            try await inner.appendJSONLDurable(record, to: path)
+        }
+
+        func writeDataAtomicDurable(_ data: Data, to path: URL) async throws {
+            try await inner.writeDataAtomicDurable(data, to: path)
+        }
+    }
+
+    let logs = LogBox()
+    let dispatcher = SwiftNativeMCPDispatcher(
+        root: root,
+        persistence: TraceAppendFailingPersistence(),
+        traceFailureLogger: { logs.lines.append($0) }
+    )
+
+    let granted = try await dispatcher.grantConsent(MCPConsentGrant(
+        serverId: "trace-test",
+        toolName: "sample",
+        risk: "network_localhost"
+    ))
+
+    #expect(granted.id == "trace-test:sample")
+    let consents = try await dispatcher.listConsents()
+    #expect(consents.contains { $0.id == granted.id })
+    #expect(logs.lines.count == 1)
+    #expect(logs.lines[0].contains("best-effort consent trace append failed"))
+    #expect(logs.lines[0].contains("mcp.consent.grant"))
+}
+
+@Test func consentTraceUsesPathOwnedCapInsteadOfRawAppend() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tracePath = root.appendingPathComponent("traces/events.jsonl")
+    try FileManager.default.createDirectory(
+        at: tracePath.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let padding = String(repeating: "x", count: 900)
+    let seeded = (0...JSONLLineCaps.traceEvents).map {
+        #"{"i":\#($0),"padding":"\#(padding)"}"#
+    }.joined(separator: "\n") + "\n"
+    try Data(seeded.utf8).write(to: tracePath)
+
+    let dispatcher = SwiftNativeMCPDispatcher(root: root)
+    _ = try await dispatcher.grantConsent(MCPConsentGrant(
+        serverId: "cap-test",
+        toolName: "sample",
+        risk: "network_localhost"
+    ))
+
+    let rows = try String(contentsOf: tracePath, encoding: .utf8)
+        .split(separator: "\n", omittingEmptySubsequences: true)
+    #expect(rows.count == JSONLLineCaps.traceEvents)
+    let first = try JSONValue.parse(Data(rows[0].utf8))
+    let last = try JSONValue.parse(Data(rows[rows.count - 1].utf8))
+    guard case .object(let firstObject) = first,
+          case .object(let lastObject) = last else {
+        Issue.record("MCP trace rotation did not preserve whole JSON rows")
+        return
+    }
+    #expect(firstObject["i"] == .int(2))
+    #expect(lastObject["kind"] == .string("mcp.consent.grant"))
+}
+
 // MARK: - W31 W02: trace parity (gpt-5.5 review MAJOR fix)
 
 /// grant/revoke must emit an `mcp.consent.grant` / `mcp.consent.revoke` event

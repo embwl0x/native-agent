@@ -249,6 +249,14 @@ extension SwiftNativeTurnEngine {
         // segment's clock line, passed identically on every iteration of a
         // tool loop so a minute boundary can't churn the cache mid-turn.
         clockNowOverride: Date? = nil,
+        // Successful eager schema walk already used by text compatibility for
+        // preload prediction. The context builder reuses it only when the
+        // eventual ContextFlow expansion eligibility is identical.
+        toolSchemaCatalogSeed: TurnToolSchemaCatalogSeed? = nil,
+        // Captured once by a caller that owns a multi-iteration turn. The
+        // wrapper represents configured absence too, so nil alone means this
+        // stream invocation should perform its own preference read.
+        quietHoursSnapshot: TurnQuietHoursSnapshot? = nil,
         // Full per-turn context reuse (turn-context-iteration-cache, third
         // churn source): on the live app the ContextFlow PACKET rides the
         // dynamic segment, and the turn's own tool results move her
@@ -355,7 +363,9 @@ extension SwiftNativeTurnEngine {
                             excludeHistoryRunId: excludeHistoryRunId,
                             imageBlocks: imageBlocks,
                             queryUserMessage: queryUserMessage,
-                            clockNowOverride: clockNowOverride
+                            clockNowOverride: clockNowOverride,
+                            toolSchemaCatalogSeed: toolSchemaCatalogSeed,
+                            quietHoursSnapshot: quietHoursSnapshot
                         )
                     } else {
                         rawCtx = try await self.buildTurnContext(
@@ -364,7 +374,9 @@ extension SwiftNativeTurnEngine {
                             personaOverride: personaOverride,
                             imageBlocks: imageBlocks,
                             queryUserMessage: queryUserMessage,
-                            clockNowOverride: clockNowOverride
+                            clockNowOverride: clockNowOverride,
+                            toolSchemaCatalogSeed: toolSchemaCatalogSeed,
+                            quietHoursSnapshot: quietHoursSnapshot
                         )
                     }
                     let plannedCtx = Self.contextByAppendingTurnPlanHint(
@@ -568,6 +580,13 @@ extension SwiftNativeTurnEngine {
                         return
                     }
 
+                    // A remote Stop can arrive after the final chunk. Recheck
+                    // at EOF so a silent finish cannot turn that partial (or a
+                    // native tool-only response) into a completed iteration.
+                    if let flag = cancelFlagPath,
+                       FileManager.default.fileExists(atPath: flag.path) {
+                        cancelledByFlag = true
+                    }
                     if Task.isCancelled || cancelledByFlag {
                         if cancelledByFlag {
                             continuation.yield(.error("cancelled"))

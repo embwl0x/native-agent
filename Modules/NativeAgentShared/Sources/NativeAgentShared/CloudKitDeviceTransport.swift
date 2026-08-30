@@ -1,22 +1,9 @@
 // CloudKitDeviceTransport.swift — CloudKit implementation of DeviceSyncTransport.
 //
-// Modeled CLOSELY on Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+CloudKit.swift
-// (SystemCloudKitSync): CKContainer(identifier:).privateCloudDatabase,
-// CKModifyRecordsOperation push (.ifServerRecordUnchanged), CKQuery pull
-// (modificationDate predicate + cursor pagination), CKQuerySubscription with
-// silent push (shouldSendContentAvailable), CKError mapping, and the
-// withCKTimeout / withCKTimeoutThrowing timeout-race helpers.
-//
-// The timeout-race machinery below is a PARALLEL COPY of the memory-sync
-// helpers (Device-prefixed). This is intentional: the memory-sync file is
-// gpt-5.5-reviewed and load-bearing; a copy keeps CK-1 at zero risk to it and
-// avoids coupling NativeAgentShared to NativeAgentCore (iOS only depends on
-// NativeAgentShared). Keep the two copies in sync if the race logic changes.
-//
-// LWW is by modificationDate (CloudKit server-stamped), exactly like the
-// memory framework. This wave lands the compiling, unit-testable transport;
-// it is NOT wired into iCloudBridge and does not run at launch (the resolver
-// defaults to .kvs). Live APNs push → pull wiring is CK-3.
+// The live Mac/iPhone transport owns private-database writes, cursor-paginated
+// reads, subscriptions, error mapping, and bounded CloudKit operations here.
+// It remains independent of NativeAgentCore so both apps share the same
+// device-sync contract. The retired MemoryV2 sync prototype is not a dependency.
 
 import Foundation
 
@@ -193,8 +180,7 @@ private final class DeviceCKPullPageHolder: @unchecked Sendable {
 // MARK: - CloudKitDeviceTransport
 
 /// CloudKit-backed device transport. `@unchecked Sendable` with an internal
-/// NSLock for mutable state (handlers + last-pull cursor + seen ids), mirroring
-/// `SystemCloudKitSync`'s `final class ... @unchecked Sendable` shape.
+/// NSLock for mutable state (handlers + last-pull cursor + seen ids).
 public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Sendable {
     public let role: NADeviceRole
     public let containerIdentifier: String
@@ -962,7 +948,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         }
     }
 
-    // MARK: pull (cursor-paginated, mirrors SystemCloudKitSync.pullSince)
+    // MARK: pull (cursor-paginated)
 
     private func pull(
         recordType: String,

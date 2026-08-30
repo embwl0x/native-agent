@@ -45,3 +45,64 @@ func inboxErrorBannerTracksTheActualLoadOutcome() async throws {
     #expect(state.items.map(\.id) == ["fresh"])
     #expect(state.errorText == nil)
 }
+
+@MainActor
+@Test("inbox distinguishes an unchecked or failed lane from a confirmed empty lane")
+func inboxEmptyStateRequiresASuccessfulRead() async {
+    let state = InboxLoadState()
+    #expect(state.contentPresentation(hasVisibleItems: false) == .loading)
+    #expect(!(await state.reload { throw NSError(domain: "InboxEval", code: 1) }))
+    #expect(state.contentPresentation(hasVisibleItems: false) == .unavailable)
+    #expect(await state.reload { [] })
+    #expect(state.contentPresentation(hasVisibleItems: false) == .empty)
+}
+
+@MainActor
+@Test("retry retains known rows and their failed-read warning until it really succeeds")
+func inboxRetryPreservesLastKnownEvidence() async throws {
+    let item = try inboxRecord("known")
+    let state = InboxLoadState(items: [item])
+    #expect(!(await state.reload { throw NSError(domain: "InboxEval", code: 1) }))
+    var continuation: CheckedContinuation<[InboxItemRecord], Never>?
+    let retry = Task { @MainActor in
+        await state.reload { await withCheckedContinuation { continuation = $0 } }
+    }
+    while continuation == nil { await Task.yield() }
+    #expect(state.isLoading)
+    #expect(state.errorText != nil)
+    #expect(state.contentPresentation(hasVisibleItems: true) == .content)
+    #expect(state.contentPresentation(hasVisibleItems: false) == .unavailable)
+    continuation?.resume(returning: [item])
+    #expect(await retry.value)
+    #expect(!state.isLoading)
+    #expect(state.errorText == nil)
+}
+
+@MainActor
+@Test("older and canceled inbox reads cannot publish rows, errors, or tombstones")
+func outdatedInboxReadsCannotChangeTheMountedSnapshot() async throws {
+    let item = try inboxRecord("current")
+    let state = InboxLoadState(items: [item])
+    var continuation: CheckedContinuation<[InboxItemRecord], any Error>?
+    let oldRead = Task { @MainActor in
+        await state.reload { try await withCheckedThrowingContinuation { continuation = $0 } }
+    }
+    while continuation == nil { await Task.yield() }
+    #expect(await state.reload { [item] })
+    continuation?.resume(returning: [])
+    #expect(!(await oldRead.value))
+    #expect(state.items == [item])
+    #expect(state.locallyResolvedIDs.isEmpty)
+
+    continuation = nil
+    let canceledRead = Task { @MainActor in
+        await state.reload { try await withCheckedThrowingContinuation { continuation = $0 } }
+    }
+    while continuation == nil { await Task.yield() }
+    canceledRead.cancel()
+    continuation?.resume(throwing: CancellationError())
+    #expect(!(await canceledRead.value))
+    #expect(state.items == [item])
+    #expect(state.errorText == nil)
+    #expect(!state.isLoading)
+}

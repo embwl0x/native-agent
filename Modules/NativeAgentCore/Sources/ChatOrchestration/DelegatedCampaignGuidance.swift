@@ -6,5 +6,7 @@ enum DelegatedCampaignGuidance {
 
     static let authorityCheckpoint = "- AUTHORITY CHECKPOINT: Stop and escalate only for a genuine operator-only boundary: an approval; an irreversible, destructive, or consequential external action; credentials, TCC, or physical presence; spending or a public commitment; or a real taste/scope decision after reversible work is exhausted. Use the canonical approval path when available, preserve every safety gate, and ask only for the missing authority or decision."
 
-    static let rendered = acceptedFinding + "\n" + authorityCheckpoint
+    static let deskConvergence = "- DESK CONVERGENCE: When fresh canonical evidence proves the exact tracked Desk defect or outcome is resolved, update that exact item in the same turn with desk_set_status or desk_close and attach the specific evidence in the outcome. If the mutation tool is not loaded, use tool_load. Never close from fuzzy title similarity, a merely completed execution, or an unattributed commit; when exact mapping or independent verification is missing, keep the item open and state what proof is missing."
+
+    static let rendered = acceptedFinding + "\n" + deskConvergence + "\n" + authorityCheckpoint
 }

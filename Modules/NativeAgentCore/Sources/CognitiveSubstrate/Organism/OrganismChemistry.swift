@@ -164,11 +164,17 @@ public enum OrganismChemistry {
     ) -> ChemicalState {
         var next = state
 
-        if !nextBody.providersHealthy, previousBody.providersHealthy {
+        // The compatibility Bool deliberately maps unknown provider evidence
+        // to false for conservative consumers. Unknown is not a newly observed
+        // failure (nor is its later resolution to healthy a recovery). Otherwise
+        // each success followed by a sparse/aged body read erodes coherence.
+        let previousProviderHealth = observedProviderHealth(previousBody)
+        let nextProviderHealth = observedProviderHealth(nextBody)
+        if nextProviderHealth == false, previousProviderHealth != false {
             next.vigilance = raise(next.vigilance, by: 0.08)
             next.confidence = lower(next.confidence, by: 0.04)
             next.coherence = lower(next.coherence, by: 0.02)
-        } else if nextBody.providersHealthy, !previousBody.providersHealthy {
+        } else if nextProviderHealth == true, previousProviderHealth == false {
             next.vigilance = lower(next.vigilance, by: 0.05)
             next.confidence = raise(next.confidence, by: 0.04)
         }
@@ -213,12 +219,23 @@ public enum OrganismChemistry {
         return next
     }
 
+    private static func observedProviderHealth(_ body: BodySchema) -> Bool? {
+        if !body.providersAvailable { return false }
+        if let belief = body.providerPathBelief {
+            return belief.bodySchemaProvidersHealthy
+        }
+        return body.providersHealthy
+    }
+
     private static func bodyLine(
         chemicalState: ChemicalState,
         bodySchema: BodySchema
     ) -> String? {
-        if bodySchema.resourcePressure == .critical || chemicalState.fatigue >= 0.24 {
-            return "- Body: resources feel tight; keep the next move lightweight."
+        if bodySchema.resourcePressure == .critical {
+            return "- Body: the Mac is under thermal or low-power pressure; keep the next move lightweight."
+        }
+        if chemicalState.fatigue >= 0.24 {
+            return "- Body: internal workload fatigue is high; keep the next move lightweight."
         }
         if !bodySchema.providersHealthy || !bodySchema.toolHandsAvailable || chemicalState.vigilance >= 0.22 {
             return "- Body: provider or tool path feels brittle; be careful before claiming completion."

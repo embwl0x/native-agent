@@ -332,7 +332,9 @@ func eachDispatchedActionRecordsItsOwnDocumentedTimeoutBudget() async throws {
     }
 
     #expect(try await budget(action: "spotlight", body: ["query": .string("x")], id: "b-spotlight") == 10)
-    #expect(try await budget(action: "ax_status", body: [:], id: "b-axstatus") == 15)
+    // Live perception deliberately bypasses the durable motor ledger: replaying
+    // an operation id must never hand a caller stale accessibility state.
+    #expect(try await budget(action: "ax_status", body: [:], id: "b-axstatus") == nil)
     #expect(try await budget(action: "shell", body: ["command": .string("true")], id: "b-shell") == 60)
     // Anything without a named budget falls to the conservative default.
     #expect(try await budget(action: "notify", body: [
@@ -1089,9 +1091,9 @@ func screenVisionCaptureCallSitesAreTheTwoKnownUngatedOnes() throws {
 // identity, no durable lifecycle row. Every result still looks well-formed, so
 // a caller assembled without a root loses the entire audit trail silently.
 //
-// `ax_status` is used as the probe because it is a pure READ: it reports the
-// accessibility trust state and never touches the screen, the pointer, or the
-// keyboard.
+// `file/list` is used as the probe because it is a pure READ that still travels
+// through the durable operation lifecycle. Live perception reads intentionally
+// bypass that lifecycle so an operation-id replay cannot return a stale screen.
 // ============================================================================
 
 @Test
@@ -1101,8 +1103,10 @@ func makeMacControlWiresTheOperationStoreExactlyWhenARootCanBeDerived() async th
 
     // (a) NO ROOT ⇒ NO STORE. The result is still ok — the read succeeded —
     // but it carries no operation identity, which is the tell.
-    let rootless = try await makeMacControl().dispatch(action: "ax_status", body: [:])
-    #expect(rootless.ok, "ax_status is a status read; it reports rather than fails")
+    let rootless = try await makeMacControl().dispatch(
+        action: "file/list", body: ["path": .string(root.path)]
+    )
+    #expect(rootless.ok, "file/list is a read-only probe")
     #expect(rootless.operationId == nil,
             "a client with no data root has no canonical lifecycle — the absence must be visible")
     #expect(rootless.operationState == nil)
@@ -1111,7 +1115,9 @@ func makeMacControlWiresTheOperationStoreExactlyWhenARootCanBeDerived() async th
     // result.
     let explicitRoot = root.appendingPathComponent("explicit", isDirectory: true)
     let explicit = try await makeMacControl(operationDataRoot: explicitRoot)
-        .dispatch(action: "ax_status", body: ["operationId": .string("factory-explicit")])
+        .dispatch(action: "file/list", body: [
+            "path": .string(root.path), "operationId": .string("factory-explicit"),
+        ])
     #expect(explicit.operationId == "factory-explicit")
     #expect(explicit.operationState == .completed)
     let explicitPath = explicitRoot.appendingPathComponent("mac_control/operations.json")
@@ -1125,7 +1131,9 @@ func makeMacControlWiresTheOperationStoreExactlyWhenARootCanBeDerived() async th
     try FileManager.default.createDirectory(at: auditRoot, withIntermediateDirectories: true)
     let derived = try await makeMacControl(
         auditAppendPath: auditRoot.appendingPathComponent("mac_control_audit.jsonl")
-    ).dispatch(action: "ax_status", body: ["operationId": .string("factory-derived")])
+    ).dispatch(action: "file/list", body: [
+        "path": .string(root.path), "operationId": .string("factory-derived"),
+    ])
     #expect(derived.operationId == "factory-derived")
     #expect(FileManager.default.fileExists(
         atPath: auditRoot.appendingPathComponent("mac_control/operations.json").path
@@ -1137,7 +1145,9 @@ func makeMacControlWiresTheOperationStoreExactlyWhenARootCanBeDerived() async th
     _ = try await makeMacControl(
         auditAppendPath: auditRoot.appendingPathComponent("mac_control_audit.jsonl"),
         operationDataRoot: bothRoot
-    ).dispatch(action: "ax_status", body: ["operationId": .string("factory-both")])
+    ).dispatch(action: "file/list", body: [
+        "path": .string(root.path), "operationId": .string("factory-both"),
+    ])
     #expect(FileManager.default.fileExists(
         atPath: bothRoot.appendingPathComponent("mac_control/operations.json").path
     ))

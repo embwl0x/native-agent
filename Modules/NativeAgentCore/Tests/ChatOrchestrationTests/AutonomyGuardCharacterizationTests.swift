@@ -190,8 +190,8 @@ private func scEvaluate(_ center: SwiftNativeSecurityCenter, _ tool: String) asy
 
 // MARK: - SC_REMOTE suite — evaluateTool(enforceAutonomy:false), remote surfaces
 //
-// PERSONAL policy so Developer Mode is not the blocker; the remote trust gates
-// (Gate 1 origin trust, Gate 2 signed-command waiver) are the subject.
+// PERSONAL policy so Developer Mode is not the blocker; Full Mac admission
+// (before the risk-specific gates) and the signed-command waiver are the subject.
 
 private func remoteCenter(
     telegramConfig: JSONValue? = nil,
@@ -218,17 +218,21 @@ private func remoteCenter(
 
     let shell = await center.evaluateTool(tool: "shell", input: [:], origin: untrusted, enforceAutonomy: false)
     #expect(shell.decision == .block, "SC_REMOTE telegram-untrusted shell expected block, got \(shell.decision.rawValue) — \(shell.reasons)")
-    #expect(shell.reasons.contains { $0.contains("remote high-risk origin is not trusted") },
-            "SC_REMOTE telegram-untrusted shell expected Gate1 reason, got \(shell.reasons)")
+    #expect(shell.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+            "SC_REMOTE telegram-untrusted shell expected Full Mac admission reason, got \(shell.reasons)")
 
     let invoke = await center.evaluateTool(tool: "invoke_claude", input: [:], origin: untrusted, enforceAutonomy: false)
     #expect(invoke.decision == .block, "SC_REMOTE telegram-untrusted invoke_claude expected block, got \(invoke.decision.rawValue) — \(invoke.reasons)")
-    #expect(invoke.reasons.contains { $0.contains("remote high-risk origin is not trusted") },
-            "SC_REMOTE telegram-untrusted invoke_claude expected Gate1 reason, got \(invoke.reasons)")
+    #expect(invoke.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+            "SC_REMOTE telegram-untrusted invoke_claude expected Full Mac admission reason, got \(invoke.reasons)")
 
-    // read_file is low risk — Gate 1 needs >= high, so it ALLOWS even untrusted.
+    // Full Mac is not admission: even low-risk reads stay blocked for an
+    // origin the surface owner did not admit (8b7f7b35). Trusted remote cases
+    // below remain allowed; remoteness alone is not the blocking condition.
     let read = await center.evaluateTool(tool: "read_file", input: [:], origin: untrusted, enforceAutonomy: false)
-    #expect(read.decision == .allow, "SC_REMOTE telegram-untrusted read_file expected allow, got \(read.decision.rawValue) — \(read.reasons)")
+    #expect(read.decision == .block, "SC_REMOTE telegram-untrusted read_file expected block, got \(read.decision.rawValue) — \(read.reasons)")
+    #expect(read.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+            "SC_REMOTE telegram-untrusted read_file expected Full Mac admission reason, got \(read.reasons)")
 }
 
 @Test func AutonomyGuardCharacterization_SCRemote_telegram_trusted() async throws {
@@ -256,10 +260,10 @@ private func remoteCenter(
     let invoke = await center.evaluateTool(tool: "invoke_claude", input: [:], origin: ios, enforceAutonomy: false)
     #expect(invoke.originTrusted == false, "SC_REMOTE ios-unpaired invoke_claude expected untrusted")
     #expect(invoke.decision == .block, "SC_REMOTE ios-unpaired invoke_claude expected block, got \(invoke.decision.rawValue) — \(invoke.reasons)")
-    // gpt-5.5 review fix: pin the Gate-1 reason so a removed origin-trust gate
-    // can't be masked by Gate-2 (unsigned) also blocking.
-    #expect(invoke.reasons.contains { $0.contains("remote high-risk origin is not trusted") },
-            "SC_REMOTE ios-unpaired invoke_claude expected Gate1 reason, got \(invoke.reasons)")
+    // Pin the Full Mac admission reason so a removed admission boundary
+    // cannot be masked by a later risk/signature gate also blocking.
+    #expect(invoke.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+            "SC_REMOTE ios-unpaired invoke_claude expected Full Mac admission reason, got \(invoke.reasons)")
 }
 
 @Test func AutonomyGuardCharacterization_SCRemote_ios_paired_allows_invoke() async throws {
@@ -306,8 +310,8 @@ private func remoteCenter(
     let forged = SecurityOriginContext(surface: "telegram", chatId: "999", isRemote: false)
     let env = await center.evaluateTool(tool: "shell", input: [:], origin: forged, enforceAutonomy: false)
     #expect(env.decision == .block, "forged-local telegram shell expected block, got \(env.decision.rawValue) — \(env.reasons)")
-    #expect(env.reasons.contains { $0.contains("remote high-risk origin is not trusted") },
-            "forged-local telegram shell expected Gate1 reason (still remote), got \(env.reasons)")
+    #expect(env.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") },
+            "forged-local telegram shell expected Full Mac admission reason (still remote), got \(env.reasons)")
 }
 
 // MARK: - SC_GATES suite — isolated security-gate pins (kill switch, secret firewall)

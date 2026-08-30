@@ -561,7 +561,7 @@ enum GitHubCommandObservationBuilder {
     }
 
     private static func isStale(_ timestamp: String, hours: Int) -> Bool {
-        guard let date = ISO8601DateFormatter().date(from: timestamp) else { return false }
+        guard let date = DeskClock.parseISO(timestamp) else { return false }
         return Date().timeIntervalSince(date) >= Double(hours * 3_600)
     }
 }

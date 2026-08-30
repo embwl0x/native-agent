@@ -71,27 +71,3 @@ extension ButtonStyle where Self == NAButtonStyle {
     /// `\.buttonStyle(.naFeel)` — the app-wide press/hover feel.
     static var naFeel: NAButtonStyle { NAButtonStyle() }
 }
-
-// MARK: - Liquid Glass chrome
-
-/// Glass treatment for CHROME surfaces (sidebar, composer, toolbars,
-/// overlays). Content surfaces keep their existing materials.
-/// Deployment floor is macOS 26 (User 2026-08-16), so no availability gates.
-extension View {
-    /// Regular Liquid Glass in a continuous rounded rect.
-    func naGlassChrome(radius: CGFloat = NativeAgentRadius.panel) -> some View {
-        glassEffect(
-            .regular,
-            in: RoundedRectangle(cornerRadius: radius, style: .continuous)
-        )
-    }
-
-    /// Interactive Liquid Glass (responds to pointer) — for the composer and
-    /// floating controls.
-    func naGlassInteractive(radius: CGFloat = NativeAgentRadius.panel) -> some View {
-        glassEffect(
-            .regular.interactive(),
-            in: RoundedRectangle(cornerRadius: radius, style: .continuous)
-        )
-    }
-}

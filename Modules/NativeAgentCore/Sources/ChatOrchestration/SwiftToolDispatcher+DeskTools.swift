@@ -52,6 +52,46 @@ extension SwiftToolDispatcher {
             .filter { !$0.isEmpty }
     }
 
+    /// Parse explicit model-reported progress. Missing means no new progress;
+    /// malformed or impossible values fail before any Desk op is appended.
+    private func deskProgress(_ input: [String: JSONValue]) throws -> DeskProgress? {
+        guard let raw = input["progress"] else { return nil }
+        guard case .object(let object) = raw,
+              case .int(let doneRaw)? = object["done"],
+              case .int(let totalRaw)? = object["total"],
+              doneRaw >= Int64(Int.min), doneRaw <= Int64(Int.max),
+              totalRaw >= Int64(Int.min), totalRaw <= Int64(Int.max) else {
+            throw AutonomyGateError.toolDenied(
+                reason: "desk_set_status: progress requires integer done and total fields"
+            )
+        }
+        let note: String?
+        switch object["note"] {
+        case nil: note = nil
+        case .some(.string(let value)): note = value
+        default:
+            throw AutonomyGateError.toolDenied(reason: "desk_set_status: progress.note must be a string")
+        }
+        guard let progress = DeskProgress(done: Int(doneRaw), total: Int(totalRaw), note: note) else {
+            throw AutonomyGateError.toolDenied(
+                reason: "desk_set_status: progress requires 0 <= done <= total and total > 0"
+            )
+        }
+        return progress
+    }
+
+    /// Optional live-activity metadata updates only from nonblank strings.
+    /// Models may fill optional string slots with blanks; like omission these
+    /// preserve the prior value, never clear it or invent a lane reference.
+    private func deskMetadataString(_ input: [String: JSONValue], _ key: String) throws -> String? {
+        guard let raw = input[key] else { return nil }
+        guard case .string(let value) = raw else {
+            throw AutonomyGateError.toolDenied(reason: "desk_set_status: \(key) must be a string")
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// Resolve a mutation's `handle` param to a stable handle. Accepts EITHER a
     /// stable handle (desk_…) OR the visible desk NUMBER the user sees in the
     /// projection ("1", "2.1") — so User/Agent can drive an item by its number,
@@ -76,14 +116,90 @@ extension SwiftToolDispatcher {
         )
     }
 
+    /// `laneOf` has no hierarchy validator in the store because it is display
+    /// metadata, so its tool boundary must prove the referenced item is live.
+    private func resolveDeskLaneRef(_ raw: String, updating handle: String? = nil) async throws -> String {
+        let reference = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !reference.isEmpty else {
+            throw AutonomyGateError.toolDenied(reason: "desk: empty lane_of reference")
+        }
+        let state = try await deskStore().liveState()
+        guard let laneParent = state.items.first(where: {
+            $0.handle == reference || $0.alias == reference
+        }) else {
+            throw AutonomyGateError.toolDenied(
+                reason: "desk: lane_of '\(reference)' is not a live Desk item"
+            )
+        }
+        guard laneParent.handle != handle else {
+            throw AutonomyGateError.toolDenied(reason: "desk_set_status: an item cannot be its own lane_of parent")
+        }
+        return laneParent.handle
+    }
+
     // MARK: - desk_read
 
-    /// desk_read — render the live Desk projection. With include_archived=true,
+    /// desk_read — render the bounded live Desk projection, or search the full
+    /// live store by exact handle/alias or text. With include_archived=true,
     /// append a compact list of archived records.
     func impl_desk_read(input: [String: JSONValue]) async throws -> JSONValue {
         let store = deskStore()
         let state = try await store.liveState()
-        var text = DeskProjection.render(state)
+        let handle = optionalString(input, "handle")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = optionalString(input, "query")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard handle?.isEmpty != false || query?.isEmpty != false else {
+            throw AutonomyGateError.toolDenied(
+                reason: "desk_read: use handle for one exact item or query for text search, not both"
+            )
+        }
+
+        let rawMatches: [DeskItem]
+        if let handle, !handle.isEmpty {
+            rawMatches = state.items.filter { $0.handle == handle || $0.alias == handle }
+        } else if let query, !query.isEmpty {
+            let needle = query.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            rawMatches = state.items.filter { item in
+                [item.alias, item.handle, item.project, item.title, item.summary ?? ""]
+                    .contains { value in
+                        value.folding(
+                            options: [.caseInsensitive, .diacriticInsensitive],
+                            locale: Locale(identifier: "en_US_POSIX")
+                        ).contains(needle)
+                    }
+            }
+        } else {
+            rawMatches = []
+        }
+
+        let isFiltered = (handle?.isEmpty == false) || (query?.isEmpty == false)
+        let matchCap = 25
+        let matches = Array(rawMatches.prefix(matchCap))
+        let renderState: DeskState
+        if isFiltered {
+            var selected = Set(matches.map(\.handle))
+            var frontier = matches.compactMap(\.parent)
+            while let parent = frontier.popLast(), selected.insert(parent).inserted {
+                frontier.append(contentsOf: state.items.first { $0.handle == parent }?.parent.map { [$0] } ?? [])
+            }
+            for match in matches where match.parent == nil {
+                selected.formUnion(state.children(of: match.handle).map(\.handle))
+            }
+            renderState = DeskState(
+                items: state.items.filter { selected.contains($0.handle) },
+                generatedTs: state.generatedTs
+            )
+        } else {
+            renderState = state
+        }
+        var text = DeskProjection.render(renderState)
+        if isFiltered, matches.isEmpty {
+            text += "\nno live Desk items matched"
+        }
 
         let includeArchived: Bool
         switch input["include_archived"] {
@@ -101,9 +217,19 @@ extension SwiftToolDispatcher {
                 text += "\n" + lines.joined(separator: "\n")
             }
         }
+        let defaultProjectionIsBounded = !isFiltered && (
+            state.topLevel.count > DeskProjection.topLevelCap
+                || state.topLevel.filter { $0.status.isTerminal }.count > DeskProjection.doneCap
+        )
         return .object([
             "status": .string("ok"),
             "projection": .string(text),
+            "liveItemCount": .int(Int64(state.items.count)),
+            "topLevelItemCount": .int(Int64(state.topLevel.count)),
+            "projectionTopLevelCap": .int(Int64(DeskProjection.topLevelCap)),
+            "projectionIsBounded": .bool(defaultProjectionIsBounded),
+            "matchCount": .int(Int64(rawMatches.count)),
+            "matchesTruncated": .bool(rawMatches.count > matchCap),
         ])
     }
 
@@ -119,21 +245,48 @@ extension SwiftToolDispatcher {
         }
         let parentRaw = optionalString(input, "parent")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let summary = optionalString(input, "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let assignee = optionalString(input, "assignee")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let laneRaw = optionalString(input, "lane_of")?.trimmingCharacters(in: .whitespacesAndNewlines)
         // Resolve a parent given as a number ("2") to its handle, so "add a step
         // under 2" works by the visible alias.
         let parent: String? = (parentRaw?.isEmpty == false) ? try await resolveDeskRef(parentRaw!) : nil
+        let laneOf: String? = (laneRaw?.isEmpty == false) ? try await resolveDeskLaneRef(laneRaw!) : nil
 
+        let allowDuplicate: Bool
+        switch input["allow_duplicate"] {
+        case .some(.bool(let value)): allowDuplicate = value
+        default: allowDuplicate = false
+        }
         let store = deskStore()
-        let item = try await store.createItem(
-            kind: kind, project: project, title: title,
-            parent: parent,
-            summary: (summary?.isEmpty == false) ? summary : nil
-        )
+        let result: SwiftNativeDeskStore.CreateResult
+        if allowDuplicate {
+            let item = try await store.createItem(
+                kind: kind, project: project, title: title,
+                parent: parent,
+                summary: (summary?.isEmpty == false) ? summary : nil,
+                assignee: (assignee?.isEmpty == false) ? assignee : nil,
+                laneOf: laneOf
+            )
+            result = .init(item: item, reusedEquivalent: false)
+        } else {
+            result = try await store.createOrReuseEquivalentItem(
+                kind: kind, project: project, title: title,
+                parent: parent,
+                summary: (summary?.isEmpty == false) ? summary : nil,
+                assignee: (assignee?.isEmpty == false) ? assignee : nil,
+                laneOf: laneOf
+            )
+        }
+        let item = result.item
         return .object([
             "status": .string("ok"),
+            "disposition": .string(result.reusedEquivalent ? "existing" : "created"),
+            "created": .bool(!result.reusedEquivalent),
             "handle": .string(item.handle),
             "alias": .string(item.alias),
-            "confirmation": .string("created \(item.alias) \(item.kind.rawValue) \(item.project) · \(item.title)"),
+            "confirmation": .string(result.reusedEquivalent
+                ? "reused existing \(item.alias) \(item.kind.rawValue) \(item.project) · \(item.title)"
+                : "created \(item.alias) \(item.kind.rawValue) \(item.project) · \(item.title)"),
         ])
     }
 
@@ -235,8 +388,25 @@ extension SwiftToolDispatcher {
         }
         let blockedReason = optionalString(input, "blocked_reason")
         let waitingOn = optionalString(input, "waiting_on")
+        let progress = try deskProgress(input)
+        let assignee = try deskMetadataString(input, "assignee")
+        let laneRaw = try deskMetadataString(input, "lane_of")
+        let laneOf: String?
+        if let laneRaw {
+            laneOf = try await resolveDeskLaneRef(laneRaw, updating: handle)
+        } else {
+            laneOf = nil
+        }
         let store = deskStore()
-        _ = try await store.setStatus(handle, status: status, blockedReason: blockedReason, waitingOn: waitingOn)
+        _ = try await store.setStatus(
+            handle,
+            status: status,
+            blockedReason: blockedReason,
+            waitingOn: waitingOn,
+            progress: progress,
+            assignee: assignee,
+            laneOf: laneOf
+        )
         return await deskConfirm(store, handle: handle, prefix: "status set")
     }
 

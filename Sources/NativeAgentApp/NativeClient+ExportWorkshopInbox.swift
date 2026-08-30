@@ -641,7 +641,7 @@ extension NativeClient {
             NSLog("[NativeClient] inbox act chat_spoken: no active chat session — falling back to draft")
             return false
         }
-        let client = makeNativeAgentAppChatOrchestrationClient()
+        let client = makeNativeAgentAppChatOrchestrationClient(profile: .background)
         do {
             // Keyed on the inbox item, so pressing Act twice on the same card
             // is one message — and so an Act on the card the SCHEDULED brief
@@ -890,7 +890,14 @@ extension NativeClient {
         let inboxPath = root
             .appendingPathComponent("notifications", isDirectory: true)
             .appendingPathComponent("inbox.jsonl")
-        let rows = try await LiveNotificationInbox(path: inboxPath).rows()
+        // The default live owner keeps the parsed 1–2 MB JSONL snapshot until
+        // its file identity changes. Constructing a fresh actor here defeated
+        // that cache on every UI/mobile refresh and repeatedly reparsed the
+        // entire inbox during launch. Test/override roots remain isolated.
+        let inbox = dataRootOverride == nil
+            ? LiveNotificationInbox.shared
+            : LiveNotificationInbox(path: inboxPath)
+        let rows = try await inbox.rows()
         let decoder = JSONDecoder()
         var items: [InboxItemRecord] = []
         var decodeFailures = 0
@@ -916,7 +923,8 @@ extension NativeClient {
         items.sort { lhs, rhs in
             if lhs.created_at.isEmpty { return false }
             if rhs.created_at.isEmpty { return true }
-            return lhs.created_at > rhs.created_at
+            if lhs.created_at != rhs.created_at { return lhs.created_at > rhs.created_at }
+            return lhs.id > rhs.id
         }
         return items
     }

@@ -172,6 +172,15 @@ func exact_tool_outcome_never_promotes_pending_or_ambiguous_envelopes() {
 }
 
 @Test
+func exact_tool_outcome_records_terminal_direct_values_as_success() {
+    #expect(ChatToolOutcome.exactResultClass(.string("file contents")) == .succeeded)
+    #expect(ChatToolOutcome.exactResultClass(.array([.string("one"), .string("two")])) == .succeeded)
+    #expect(ChatToolOutcome.exactResultClass(.bool(false)) == .succeeded)
+    #expect(ChatToolOutcome.exactResultClass(.int(0)) == .succeeded)
+    #expect(ChatToolOutcome.exactResultClass(.null) == .unknown)
+}
+
+@Test
 func canonical_motor_tools_suppress_owned_terminals_but_preserve_ownerless_failures() {
     let success: JSONValue = .object(["status": .string("completed")])
     let failure: JSONValue = .object(["status": .string("failed")])
@@ -239,6 +248,7 @@ func causal_tool_boundary_is_shared_and_external_protocol_results_stay_neutral()
         ("browser.navigate", .object(["runId": .string("browser-1")]), .browser, "browser-1"),
         ("mac_quit_app", .object(["operation_id": .string("mac-1")]), .macControl, "mac-1"),
         ("external_send", .object(["approvalId": .string("send-1")]), .externalSend, "send-1"),
+        ("codex_message", .object(["messageId": .string("bridge-1")]), .agentBridge, "bridge-1"),
     ]
     for (tool, output, domain, ownerID) in aliases {
         let reference = try #require(ToolCausalBoundary.motorReference(tool: tool, output: output))
@@ -385,16 +395,19 @@ func tracer_cap_trims_to_5000_lines_under_flock() async throws {
     )
     // Seed 5100 rows; the next traced append (5101 total) must tail-trim to
     // exactly 5000, dropping the oldest 101.
-    let seeded = (1...5100).map { #"{"i":\#($0)}"# }.joined(separator: "\n") + "\n"
+    let padding = String(repeating: "x", count: 900)
+    let seeded = (1...5100).map { #"{"i":\#($0),"padding":"\#(padding)"}"# }
+        .joined(separator: "\n") + "\n"
     try seeded.write(to: path, atomically: true, encoding: .utf8)
 
     let inner = MockToolDispatchClient(scripted: ["time_now": .object(["status": .string("ok")])])
-    let tracer = ChatToolDispatchTracer(inner: inner, dataRoot: root, trimCheckInterval: 1)
+    let tracer = ChatToolDispatchTracer(inner: inner, dataRoot: root)
     _ = try await tracer.dispatch(tool: "time_now", input: [:], surface: "chat")
 
     let lines = readTraceLines(root)
-    #expect(lines.count == ChatToolDispatchTracer.maxTraceLines)
-    #expect(lines.first == #"{"i":102}"#)
+    #expect(lines.count == JSONLLineCaps.traceEvents)
+    let first = parseRows([lines.first ?? ""])
+    #expect(first.first?["i"] == .int(102))
     let rows = parseRows([lines.last ?? ""])
     #expect(rows.first?["kind"] == .string("tool.dispatch"))
     #expect(rows.first?["title"] == .string("time_now"))
@@ -556,10 +569,14 @@ func recent_trace_summary_ignores_empty_optional_filters() async throws {
 func recent_trace_summary_reads_current_ledger_not_legacy_aggregate() async throws {
     let root = try makeTempRoot("summary-current-ledger")
     defer { try? FileManager.default.removeItem(at: root) }
-    try await SwiftNativePersistenceCore().appendJSONL(.object([
+    // F2: traces/events.jsonl is path-owned, so a raw append now throws by
+    // design. Seed the legacy row through the sanctioned capped route.
+    try await appendPathOwnedJSONL(.object([
         "kind": .string("legacy.only"),
         "status": .string("ok"),
-    ]), to: tracesPath(root))
+    ]), to: tracesPath(root),
+       using: SwiftNativePersistenceCore(),
+       logLabel: "test.legacy-trace")
     await TurnTracePersistLane(dataRootOverride: root).append(TurnTraceEvent(
         turnId: "turn-current",
         kind: "llm.call",
@@ -620,6 +637,50 @@ func recent_trace_summary_session_filter_includes_turn_siblings(alias: String) a
         guard case .object(let trace) = value else { return false }
         return trace["turn_id"] == .string("turn-target")
     })
+}
+
+@Test(arguments: ["", " \n", "session-other"], [" session-target ", ""])
+func recent_trace_summary_normalizes_aliases_before_selecting_filter(primary: String, alias: String) async throws {
+    let root = try makeTempRoot("summary-alias-precedence")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let lane = TurnTracePersistLane(dataRootOverride: root)
+    await lane.append(TurnTraceEvent(
+        turnId: "turn-target", kind: "llm.call", sessionId: "session-target", surface: "chat"
+    ))
+    await lane.append(TurnTraceEvent(
+        turnId: "turn-target", kind: "tool.dispatch", surface: "chat"
+    ))
+    await lane.append(TurnTraceEvent(
+        turnId: "turn-other", kind: "llm.call", sessionId: "session-other", surface: "chat"
+    ))
+    let result = try await SwiftToolDispatcher(dataRoot: root).dispatch(
+        tool: "recent_trace_summary",
+        input: ["session_id": .string(primary), "sessionId": .string(alias)],
+        surface: "chat"
+    )
+    guard case .object(let object) = result,
+          case .array(let traces)? = object["traces"] else {
+        Issue.record("expected trace summary envelope")
+        return
+    }
+    if primary == "session-other" {
+        #expect(object["session_id"] == .string("session-other"))
+        #expect(traces.count == 1)
+        #expect(traces.allSatisfy {
+            guard case .object(let row) = $0 else { return false }
+            return row["turn_id"] == .string("turn-other")
+        })
+    } else if !alias.isEmpty {
+        #expect(object["session_id"] == .string("session-target"))
+        #expect(traces.count == 2)
+        #expect(traces.allSatisfy {
+            guard case .object(let row) = $0 else { return false }
+            return row["turn_id"] == .string("turn-target")
+        })
+    } else {
+        #expect(object["session_id"] == .null)
+        #expect(traces.count == 3)
+    }
 }
 
 @Test

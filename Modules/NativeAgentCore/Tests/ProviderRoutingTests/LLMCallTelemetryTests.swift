@@ -1377,8 +1377,7 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
 @Suite(.serialized) struct LLMCallTraceRecorderConcurrencyTests {
     /// record() writes fire-and-forget on a detached utility task. Before the
     /// fix, concurrent provider calls serialized on the events.jsonl flock in
-    /// nondeterministic order and a racing trimLocked could drop a sibling's
-    /// fresh row. Writes now route through ONE shared actor queue (the
+    /// nondeterministic order. Writes now route through ONE shared actor queue (the
     /// SessionUsageReceiptWriter pattern) — this pins the observable contract:
     /// N concurrent records → N durable, distinct rows.
     @Test func concurrentDetachedRecordsDoNotLoseRows() async throws {

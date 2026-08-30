@@ -335,6 +335,8 @@ struct ApprovalsView: View {
         // Sweep R4 C11.3: an approval decision made against a stale snapshot is
         // exactly the case where a silent sync failure hurts most.
         .macSyncErrorBanner()
+        // E6: and a stale queue must not read as a measured-empty one.
+        .macSnapshotFreshnessBadge()
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 MacStatusChip()

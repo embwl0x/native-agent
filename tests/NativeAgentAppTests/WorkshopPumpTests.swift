@@ -530,6 +530,52 @@ private func makePump(
             "…but the global 6/day cap pre-filters every pursuit — no lease spent on a doomed reserve")
 }
 
+@Test func ownerCadenceDailyCapPreFiltersDueItemUntilNextUTCDate() throws {
+    let formatter = ISO8601DateFormatter()
+    let now = try #require(formatter.date(from: "2026-08-29T10:35:00Z"))
+    let completedAt = "2026-08-29T10:01:00Z"
+    let item = DeskItem(
+        handle: "desk_owner_capped",
+        alias: "650",
+        kind: .watch,
+        status: .watch,
+        project: "ops",
+        title: "short cadence",
+        cadence: Cadence(
+            mode: .tick,
+            interval: "15m",
+            nextRefreshAt: "2026-08-29T10:16:00Z",
+            lastRefreshAt: completedAt
+        ),
+        notify: NotifyPolicy(),
+        openedAt: "2026-08-01T00:00:00Z",
+        updatedAt: completedAt,
+        workAttempts: [DeskWorkAttempt(
+            attemptId: "attempt-today",
+            lane: .ownerCadence,
+            day: "2026-08-29",
+            slot: "2026-08-29-b5",
+            reservedAt: "2026-08-29T10:00:00Z",
+            receipt: "completed",
+            completedAt: completedAt
+        )]
+    )
+    let state = DeskState(items: [item], generatedTs: completedAt)
+
+    #expect(WorkshopPump.selectDueItem(from: state, now: now) == nil,
+            "a store-capped owner item must not acquire a lease for a doomed reservation")
+    let due = try #require(WorkshopPump.nextMeaningfulDeadline(from: state, after: now))
+    #expect(formatter.string(from: due) == "2026-08-30T00:00:00Z",
+            "the item becomes eligible again only when the Desk day changes")
+}
+
+@Test func workshopPhysiologyArmsGenerationBasedSelfWriteSuppression() throws {
+    let source = try AppSourceScraping.appSource("BackgroundLoopsAssembly+Workshop.swift")
+    let body = try AppSourceScraping.functionBody(named: "physiologyEvents", in: source)
+    #expect(body.contains("loopId: loopId"),
+            "Workshop watches its lease and Desk files, so its own writes must not wake it again")
+}
+
 @Test func workshopNextDeadlineUsesExactUTCWindowBoundary() throws {
     let formatter = ISO8601DateFormatter()
     let now = try #require(formatter.date(from: "2026-07-13T10:35:00Z"))

@@ -8,11 +8,10 @@ import PersistenceCore
 //                         telegram.media.unsupportedAttachmentSilentDrop
 //                         telegram.blocked.jsonl
 //
-// Everything the Telegram front door REFUSES lands in blocked.jsonl and
-// nowhere else. Nothing drove the mention gate at all, nothing drove the
-// non-image attachment lane (the one drop class with neither a reply nor a
-// tripwire), and nothing pinned the reason vocabulary — the live feed carries
-// a `stale_update` reason with no writer left in the sources.
+// Refusals retain bounded blocked evidence. Admitted unsupported documents
+// and videos also report the missing capability without starting a turn or
+// bypassing the mention gate. Pin the existing reason vocabulary, notices,
+// receipts, duplicate-update behavior, and canonical feed cap.
 
 private final class TelegramInboundDropStub: ConfigurableURLProtocolStub {}
 
@@ -39,13 +38,15 @@ private actor InboundDropCapture {
     func handle(chatId: Int, text: String) { handled.append((chatId: chatId, text: text)) }
     func sentSnapshot() -> [String] { sent }
     func handledCount() -> Int { handled.count }
+    func handledTexts() -> [String] { handled.map(\.text) }
 }
 
 private func makeDropLoop(
     root: URL,
     requireMention: Bool,
     responses: TelegramInboundDropResponses,
-    capture: InboundDropCapture
+    capture: InboundDropCapture,
+    failNoticeSend: Bool = false
 ) -> TelegramPollLoop {
     let session = TelegramInboundDropStub.makeSession { request in
         (
@@ -69,7 +70,10 @@ private func makeDropLoop(
         offsetURL: root
             .appendingPathComponent("telegram", isDirectory: true)
             .appendingPathComponent("last_offset.json"),
-        sendMessage: { _, _, text in await capture.send(text) },
+        sendMessage: { _, _, text in
+            if failNoticeSend { throw URLError(.networkConnectionLost) }
+            await capture.send(text)
+        },
         sendChatAction: { _, _, _ in },
         answerCallbackQuery: { _, _, _ in },
         sendMessageReturningId: { _, _, text in
@@ -174,14 +178,9 @@ struct TelegramInboundDropTests {
 
     // MARK: non-image attachment drop
 
-    /// A PDF (or video, sticker, location…) produces a blocked row and NOTHING
-    /// else: no user-visible notice and no telegram.attachment_dropped trace —
-    /// that tripwire only fires for a RECOGNISED image that failed. From the
-    /// sender's side Agent simply ignored them.
-    ///
-    /// The current silence is asserted so the drop cannot get quieter, and the
-    /// desired envelope (a notice OR a trace) is recorded as a KNOWN issue so
-    /// it turns RED the moment either lands.
+    /// Unsupported documents remain no-turn drops, with one truthful notice,
+    /// delivered-notice receipt, and redacted attachment trace.
+    // Historical function name is retained for the coverage-ledger anchor.
     @Test func nonImageDocument_is_dropped_with_no_user_facing_evidence() async throws {
         let root = hermeticTelegramDataRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -208,15 +207,16 @@ struct TelegramInboundDropTests {
         }
         let notices = await capture.sentSnapshot()
 
-        // Observed today: neither channel fires.
-        #expect(notices.isEmpty)
-        #expect(droppedTraces.isEmpty)
-
-        withKnownIssue(
-            "telegram.media.unsupportedAttachmentSilentDrop: an unsupported inbound attachment is consumed with zero user-facing evidence (no reply, no attachment_dropped trace)"
-        ) {
-            #expect(!notices.isEmpty || !droppedTraces.isEmpty)
-        }
+        #expect(notices.count == 1)
+        #expect(notices.first?.contains("can't read that document") == true)
+        #expect(droppedTraces.count == 1)
+        let receipts = await telegramFeedRows(root: root, "receipts")
+        #expect(receipts.filter { $0["kind"] == .string("attachment_dropped") }.count == 1)
+        #expect(!String(describing: droppedTraces).contains("DOC-1"))
+        #expect(!notices.joined().contains("contract.pdf"))
+        // Repeated delivery of the same update cannot repeat the notice.
+        _ = await loop.tickOutcome()
+        #expect(await capture.sentSnapshot() == notices)
     }
 
     /// A video takes the same path — pinned so a future notice has to cover
@@ -236,6 +236,59 @@ struct TelegramInboundDropTests {
         let blocked = await telegramFeedRows(root: root, "blocked")
         #expect(telegramFeedStrings(blocked, "reason") == ["empty_or_non_text"])
         #expect(await capture.handledCount() == 0)
+        #expect(await capture.sentSnapshot().count == 1)
+        #expect(await capture.sentSnapshot().first?.contains("can't read that video") == true)
+    }
+
+    @Test(arguments: [false, true])
+    func unsupportedAttachment_never_notifies_an_outsider_or_unmentioned_group(requireMention: Bool) async throws {
+        let root = hermeticTelegramDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let responses = TelegramInboundDropResponses()
+        let capture = InboundDropCapture()
+        let loop = makeDropLoop(root: root, requireMention: requireMention, responses: responses, capture: capture)
+        let chat = requireMention ? -1001 : -9999
+        let user = requireMention ? 11 : 9999
+        responses.setUpdate("""
+        {"update_id":31,"message":{"message_id":31,"chat":{"id":\(chat)},"from":{"id":\(user)},"video":{"file_id":"VID-1"}}}
+        """)
+        _ = await loop.tickOutcome()
+        #expect(await capture.sentSnapshot().isEmpty)
+        #expect(await capture.handledCount() == 0)
+        #expect(await telegramFeedRows(root: root, "receipts").isEmpty)
+    }
+
+    @Test func unsupportedAttachment_caption_keeps_its_original_text_turn() async throws {
+        let root = hermeticTelegramDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let responses = TelegramInboundDropResponses()
+        let capture = InboundDropCapture()
+        let loop = makeDropLoop(root: root, requireMention: true, responses: responses, capture: capture)
+        responses.setUpdate("""
+        {"update_id":32,"message":{"message_id":32,"chat":{"id":-1001},"from":{"id":11},"caption":"@agent my caption","document":{"file_id":"DOC-1","mime_type":"application/pdf"}}}
+        """)
+        _ = await loop.tickOutcome()
+        #expect(await waitForHandler(capture))
+        await loop.shutdown()
+        #expect(await capture.handledTexts() == ["@agent my caption"])
+        #expect(await capture.sentSnapshot().filter { $0.contains("can't read that document") }.count == 1)
+    }
+
+    @Test func unsupportedAttachment_failed_notice_is_not_receipted_as_delivered() async throws {
+        let root = hermeticTelegramDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let responses = TelegramInboundDropResponses()
+        let capture = InboundDropCapture()
+        let loop = makeDropLoop(root: root, requireMention: false, responses: responses, capture: capture, failNoticeSend: true)
+        responses.setUpdate("""
+        {"update_id":33,"message":{"message_id":33,"chat":{"id":-1001},"from":{"id":11},"video":{"file_id":"VID-1"}}}
+        """)
+        _ = await loop.tickOutcome()
+        #expect(await capture.sentSnapshot().isEmpty)
+        #expect(await capture.handledCount() == 0)
+        #expect(await telegramFeedRows(root: root, "receipts").isEmpty)
+        let errors = await telegramFeedRows(root: root, "errors")
+        #expect(errors.contains { $0["context"] == .string("send_unsupported_attachment_notice") })
     }
 
     // MARK: blocked.jsonl vocabulary + cap (source conformance)
@@ -294,9 +347,7 @@ struct TelegramInboundDropTests {
         #expect(!found.contains("stale_update"))
     }
 
-    /// receipts.jsonl and errors.jsonl are both bounded; blocked.jsonl uses a
-    /// bare `appendJSONL` and grows forever. Asserted at the source so the fix
-    /// (an appendJSONLCapped + a JSONLLineCaps entry) flips this row.
+    /// Keep the blocked feed on the same canonical capped writer as receipts.
     @Test func blockedFeed_should_be_line_capped_like_its_siblings() throws {
         // The sibling feeds are bounded; this is the one that is not.
         #expect(JSONLLineCaps.telegramReceipts > 0)
@@ -317,10 +368,26 @@ struct TelegramInboundDropTests {
         }()
         #expect(recordBlockedBody.contains("blocked.jsonl"))
 
-        withKnownIssue(
-            "telegram.blocked.jsonl is UNCAPPED (plain appendJSONL) while receipts/errors rotate"
-        ) {
-            #expect(recordBlockedBody.contains("appendJSONLCapped"))
-        }
+        #expect(JSONLLineCaps.telegramBlocked > 0)
+        #expect(recordBlockedBody.contains("appendJSONLCapped"))
+        #expect(recordBlockedBody.contains("JSONLLineCaps.telegramBlocked"))
+    }
+
+    @Test func blockedFeed_retains_newest_history_when_a_new_row_crosses_the_cap() async throws {
+        let root = hermeticTelegramDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let responses = TelegramInboundDropResponses()
+        let capture = InboundDropCapture()
+        let loop = makeDropLoop(root: root, requireMention: false, responses: responses, capture: capture)
+        let path = root.appendingPathComponent("telegram/blocked.jsonl")
+        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let cap = JSONLLineCaps.telegramBlocked
+        let rows = (0..<cap).map { "{\"updateId\":\($0),\"reason\":\"not_allowlisted\"}" }
+        try (rows.joined(separator: "\n") + "\n").write(to: path, atomically: true, encoding: .utf8)
+        await loop.recordBlocked(reason: "not_allowlisted", update: TelegramUpdate(updateId: cap, message: nil), message: nil, text: nil)
+        let retained = await telegramFeedRows(root: root, "blocked")
+        #expect(retained.count == cap)
+        #expect(retained.first?["updateId"] == .int(1))
+        #expect(retained.last?["updateId"] == .int(Int64(cap)))
     }
 }

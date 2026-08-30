@@ -8,6 +8,10 @@ enum ChatQueuePresentation {
         var id: String { turn.id }
         var sendLabel: String { "Send \(ordinal) now: \(turn.preview)" }
         var removeLabel: String { "Remove \(ordinal): \(turn.preview)" }
+
+        func actionLabel(isBusy: Bool) -> String {
+            isBusy ? "Stop current response and send \(ordinal): \(turn.preview)" : sendLabel
+        }
     }
 
     static func visibleTurns(_ turns: [QueuedChatTurn]) -> [QueuedChatTurn] {
@@ -104,7 +108,7 @@ struct ChatQueuedTurnsView: View {
                     run(item.turn)
                 } label: {
                     Label(
-                        item.sendLabel,
+                        item.actionLabel(isBusy: isBusy),
                         systemImage: item.ordinal == 1 ? "arrow.up.to.line" : "arrow.up"
                     )
                 }

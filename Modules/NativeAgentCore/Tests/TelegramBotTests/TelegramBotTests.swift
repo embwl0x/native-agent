@@ -366,9 +366,33 @@ struct SwiftNativeTelegramBotPhaseBTests {
             replyTo: replyTo
         )
         #expect(rendered.contains("Telegram reply context"))
-        #expect(rendered.contains("Telegram message from the assistant #1"))
+        #expect(rendered.contains("a Telegram bot message #1"))
+        #expect(!rendered.contains("from the assistant"))
         #expect(rendered.contains("Want me to fix that reference"))
         #expect(rendered.contains("User message: Yeah go ahead"))
+    }
+
+    @Test func longPoll_preserves_otherBot_group_reply_without_claiming_assistant_authorship() async throws {
+        let raw = #"""
+        {"ok":true,"result":[{"update_id":18,"message":{"message_id":12,"chat":{"id":-99,"type":"group"},"from":{"id":11},"text":"@Agent can you check this?","reply_to_message":{"message_id":8,"chat":{"id":-99,"type":"group"},"from":{"id":777,"is_bot":true},"text":"The report is ready.","date":1700000000},"date":1700000001}}]}
+        """#
+        let session = mockSession { req in
+            (makeResponse(req.url!, 200), Data(raw.utf8))
+        }
+        let bot = SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot())
+        let result = try await bot.longPoll(token: tokenStr, offset: 0, session: session)
+        let replyTo = try #require(result.updates.first?.message?.replyTo)
+        #expect(replyTo.messageId == 8)
+        #expect(replyTo.chatId == -99)
+        #expect(replyTo.fromUserId == 777)
+        #expect(replyTo.fromIsBot == true)
+        let rendered = TelegramReplyPromptRenderer.messageWithReplyContext(
+            text: "@Agent can you check this?", replyTo: replyTo
+        )
+        #expect(rendered.contains("The user replied to a Telegram bot message #8:"))
+        #expect(rendered.contains("\"The report is ready.\""))
+        #expect(rendered.contains("User message: @Agent can you check this?"))
+        #expect(!rendered.contains("from the assistant"))
     }
 
     @Test func longPoll_returns_nextOffset_max_plus_one() async throws {
@@ -1542,7 +1566,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
                   case .string(let kind)? = object["kind"] else { return nil }
             return kind
         }
-        #expect(receiptKinds == ["reply", "empty_retry_notice"])
+        #expect(receiptKinds == ["reply", "retry_queued", "empty_retry_notice"])
     }
 
     @Test func telegramPollLoop_syncs_command_menu_once_per_registry_version() async throws {
@@ -2640,6 +2664,56 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(sent.contains { $0.contains("I got your voice note") })
         // But no permission card is raised: no TCC switch would fix this.
         #expect(capabilities.isEmpty)
+    }
+
+    @Test func telegramPollLoop_cancelled_voice_transcription_remains_durably_pending() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_voice_cancelled_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let offset = root
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        let raw = #"""
+        {"ok":true,"result":[{"update_id":94,"message":{"message_id":8,"chat":{"id":77},"from":{"id":11},"voice":{"file_id":"VOICE_FILE_ID","file_size":10,"mime_type":"audio/ogg","duration":3},"date":1}}]}
+        """#
+        let session = mockSession { request in
+            (makeResponse(request.url!, 200), Data(raw.utf8))
+        }
+
+        actor Capture {
+            var sent: [String] = []
+            func append(_ text: String) { sent.append(text) }
+        }
+        let capture = Capture()
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [77],
+            session: session,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, text in await capture.append(text) },
+            sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
+            progressChatHandler: { _, _, _, _ in "must not run" },
+            voiceDownloader: FakeVoiceDownloader(bytes: Data("voice-bytes".utf8)),
+            voiceTranscriber: FailingVoiceTranscriber(error: CancellationError()),
+            voiceMaxBytes: 1024 * 1024,
+            typingRefreshNanoseconds: 0
+        )
+
+        let outcome = await loop.tickOutcome()
+        guard case .skipped(let reason, _) = outcome else {
+            Issue.record("expected retryable cancellation, got \(outcome)")
+            return
+        }
+        #expect(reason.contains("retained for retry"))
+        let inbox = TelegramUpdateInbox(offsetURL: offset)
+        #expect(try await inbox.snapshots().first?.phase == .pending)
+        #expect(try readTelegramJSONL(root, "receipts.jsonl").isEmpty)
     }
 
     @Test func telegramPollLoop_voice_post_download_byte_cap_drops_oversized() async throws {

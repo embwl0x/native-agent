@@ -134,6 +134,39 @@ enum MobileToolCatalogProjection {
     }
 }
 
+enum MobileProjectionEncoder {
+    static func largestPrefix<Record: Encodable>(
+        of records: [Record],
+        maximumEncodedBytes: Int,
+        encoder: JSONEncoder
+    ) throws -> (data: Data, included: Int) {
+        let fullData = try encoder.encode(records)
+        guard fullData.count > maximumEncodedBytes else {
+            return (fullData, records.count)
+        }
+
+        // Encoded array size grows monotonically with its prefix. Find the
+        // largest safe prefix in logarithmic encodes instead of removing one
+        // row and re-encoding the whole array on every pass.
+        var low = 0
+        var high = records.count
+        var bestData = try encoder.encode([Record]())
+        var bestCount = 0
+        while low <= high {
+            let midpoint = low + (high - low) / 2
+            let data = try encoder.encode(Array(records.prefix(midpoint)))
+            if data.count <= maximumEncodedBytes {
+                bestData = data
+                bestCount = midpoint
+                low = midpoint + 1
+            } else {
+                high = midpoint - 1
+            }
+        }
+        return (bestData, bestCount)
+    }
+}
+
 enum MobileInboxProjection {
     static let maximumRows = 300
     static let maximumActiveRows = 200
@@ -141,26 +174,32 @@ enum MobileInboxProjection {
 
     static func data(
         from items: [InboxItemRecord],
-        encoder: JSONEncoder
+        encoder: JSONEncoder,
+        alreadyNewestFirst: Bool = false
     ) throws -> (data: Data, included: Int) {
-        let sorted = items.sorted {
+        let sorted = alreadyNewestFirst ? items : items.sorted {
             if $0.created_at != $1.created_at { return $0.created_at > $1.created_at }
             return $0.id > $1.id
         }
-        let active = sorted.filter(\.isActivityPending).prefix(maximumActiveRows)
-        let activeIDs = Set(active.map(\.id))
-        let resolved = sorted
-            .filter { !activeIDs.contains($0.id) && !$0.isActivityPending }
-            .prefix(max(0, maximumRows - active.count))
-        var projection = Array(active) + Array(resolved)
-        while true {
-            let data = try encoder.encode(projection)
-            if data.count <= maximumEncodedBytes {
-                return (data, projection.count)
+
+        var active: [InboxItemRecord] = []
+        var resolved: [InboxItemRecord] = []
+        active.reserveCapacity(min(maximumActiveRows, sorted.count))
+        resolved.reserveCapacity(min(maximumRows, sorted.count))
+        for item in sorted {
+            if item.isActivityPending {
+                if active.count < maximumActiveRows { active.append(item) }
+            } else if resolved.count < maximumRows {
+                resolved.append(item)
             }
-            guard !projection.isEmpty else { return (data, 0) }
-            projection.removeLast()
         }
+        resolved = Array(resolved.prefix(max(0, maximumRows - active.count)))
+        let projection = active + resolved
+        return try MobileProjectionEncoder.largestPrefix(
+            of: projection,
+            maximumEncodedBytes: maximumEncodedBytes,
+            encoder: encoder
+        )
     }
 }
 
@@ -170,7 +209,7 @@ enum MobileDeskProjection {
     static let maximumEncodedBytes = 512 * 1024
 
     static func data(from items: [DeskItem], encoder: JSONEncoder) throws -> (data: Data, included: Int) {
-        var records = items.sorted {
+        let records = items.sorted {
             if $0.status.isTerminal != $1.status.isTerminal { return !$0.status.isTerminal }
             if $0.pinned != $1.pinned { return $0.pinned }
             return $0.updatedAt > $1.updatedAt
@@ -199,22 +238,24 @@ enum MobileDeskProjection {
                 }
             )
         }
-        while true {
-            let data = try encoder.encode(records)
-            if data.count <= maximumEncodedBytes { return (data, records.count) }
-            guard !records.isEmpty else { return (data, 0) }
-            records.removeLast()
-        }
+        return try MobileProjectionEncoder.largestPrefix(
+            of: records,
+            maximumEncodedBytes: maximumEncodedBytes,
+            encoder: encoder
+        )
     }
 }
 
-private enum SnapshotFileWriteResult {
+enum SnapshotFileWriteResult: Equatable {
     case unchanged
     case changed
     case failed(String)
 }
 
 extension MacSyncEngine {
+    nonisolated static let turnSummariesSnapshotFilename = "turn_summaries.json"
+    nonisolated static let organismLivingStatusSnapshotFilename = "organism_living_status.json"
+
     enum SnapshotWriteScope: Sendable {
         case standard
         case chatSessions
@@ -293,7 +334,7 @@ extension MacSyncEngine {
             async let memProposalsTask = api.getMemoryProposals()
             async let trainingTask = api.getTrainingProposals()
             async let promotionTask = api.getPromotionPending()
-            async let organismTask = Self.organismLivingStatusSnapshot()
+            async let organismTask = self.organismLivingStatusSnapshot()
 
             // fix-2026-06-10 sync-audit #1: a transient fetch failure must NOT
             // become a successfully-written EMPTY snapshot (`?? []` fabricated
@@ -303,30 +344,45 @@ extension MacSyncEngine {
             // that snapshot file (keep the last good one) and record the error
             // so it's visible in syncError + the log.
             var snapshotFetchFailures: [String] = []
+            var attemptedSnapshotGroups = Set<String>()
+            var skippedSnapshotGroups: [String: String] = [:]
+            func snapshotGroupName(for filename: String) -> String {
+                URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
+            }
             func recordFetchFailure(_ label: String, _ error: Error) {
-                snapshotFetchFailures.append("\(label): \(error.localizedDescription)")
+                let reason = error.localizedDescription
+                attemptedSnapshotGroups.insert(label)
+                skippedSnapshotGroups[label] = reason
+                snapshotFetchFailures.append("\(label): \(reason)")
                 NSLog("[MacSyncEngine] snapshot fetch failed for %@ — keeping last good file: %@", label, "\(error)")
             }
             // Sweep R4 item 2: groups the native helpers could not build. Same
             // publish behavior as before (keep last good), but the group is now
             // NAMED — in syncError and in the durable skip file Doctor reads —
             // so "iPhone is showing stale approvals" stops being invisible.
-            var skippedSnapshotGroups: [String: String] = [:]
             func recordGroupSkip(_ label: String, _ reason: String) {
+                attemptedSnapshotGroups.insert(label)
                 skippedSnapshotGroups[label] = reason
                 snapshotFetchFailures.append("\(label): \(reason)")
                 NSLog("[MacSyncEngine] snapshot group %@ SKIPPED — keeping last good file: %@", label, reason)
             }
 
             var executions: [WorkshopExecutionRecord]?
-            do { executions = try await executionsTask } catch { recordFetchFailure("missions", error) }
+            do { executions = try await executionsTask } catch { recordFetchFailure("workshop_tasks", error) }
             var skills: [SkillRecord]?
             var memories: [MemoryRecord]?
             var connectors: [ConnectorRecord]?
             var toolCatalog: ChatToolCatalogSnapshot?
             var sessions: [ChatSession]?
-            do { sessions = try await sessionsTask } catch { recordFetchFailure("sessions", error) }
-            let health = try? await healthTask
+            do { sessions = try await sessionsTask } catch {
+                recordFetchFailure("sessions", error)
+                recordGroupSkip("pinned_chat_sessions", "sessions unavailable: \(error.localizedDescription)")
+                if includeTranscriptSnapshots {
+                    recordGroupSkip("chat_transcripts", "sessions unavailable: \(error.localizedDescription)")
+                }
+            }
+            var health: RuntimeHealth?
+            do { health = try await healthTask } catch { recordFetchFailure("health", error) }
             var memProposals: [MemoryProposalRecord]?
             do { memProposals = try await memProposalsTask } catch { recordFetchFailure("memory_proposals", error) }
             var training: [TrainingProposalSummary]?
@@ -370,11 +426,11 @@ extension MacSyncEngine {
             )
             var providers: [ProviderInfo]?
             if includeHeavySnapshots {
-                do { skills = try await api.getSkills() } catch { recordFetchFailure("skills", error) }
+                do { skills = try await api.getSkills() } catch { recordFetchFailure("skills_snapshot", error) }
                 do { memories = try await api.getMemories() } catch { recordFetchFailure("memories", error) }
                 do { connectors = try await api.getConnectors() } catch { recordFetchFailure("connectors", error) }
                 do { toolCatalog = try await api.getChatToolCatalogSnapshot() } catch {
-                    recordFetchFailure("tool_catalog", error)
+                    recordFetchFailure("tools_snapshot", error)
                 }
                 // PATCH-2026-05-07: leftover-1 providers.json snapshot so iOS reads provider state.
                 // This can refresh provider catalogs, so keep it out of the idle timer.
@@ -390,6 +446,8 @@ extension MacSyncEngine {
 
             func writeData(_ data: Data, to filename: String) async {
                 guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
+                let group = snapshotGroupName(for: filename)
+                attemptedSnapshotGroups.insert(group)
                 switch await writeSnapshotData(
                     data,
                     to: filename,
@@ -400,19 +458,26 @@ extension MacSyncEngine {
                     wroteAnySnapshot = true
                     changedSnapshotFilenames.insert(filename)
                 case .failed(let reason):
-                    snapshotFetchFailures.append("\(filename) write: \(reason)")
+                    recordGroupSkip(group, "write failed: \(reason)")
                 case .unchanged:
                     break
                 }
             }
 
             func write<T: Encodable>(_ value: T, to filename: String) async {
-                guard let data = try? encoder.encode(value) else { return }
-                await writeData(data, to: filename)
+                do {
+                    await writeData(try encoder.encode(value), to: filename)
+                } catch {
+                    recordGroupSkip(
+                        snapshotGroupName(for: filename),
+                        "encoding failed: \(error.localizedDescription)"
+                    )
+                }
             }
 
             /// Publish when the group built; NAME it when it was skipped.
             func publish(_ build: SnapshotGroupBuild, as label: String, to filename: String) async {
+                attemptedSnapshotGroups.insert(label)
                 switch build {
                 case .built(let data): await writeData(data, to: filename)
                 case .skipped(let reason): recordGroupSkip(label, reason)
@@ -469,8 +534,16 @@ extension MacSyncEngine {
                 approvalsData,
                 inboxData
             )
-            if let trustRaw { await writeData(trustRaw, to: "trust_policy.json") }
-            if let personalityProfile { await write(personalityProfile, to: "personality.json") }
+            if let trustRaw {
+                await writeData(trustRaw, to: "trust_policy.json")
+            } else {
+                recordGroupSkip("trust_policy", "native trust snapshot unavailable")
+            }
+            if let personalityProfile {
+                await write(personalityProfile, to: "personality.json")
+            } else {
+                recordGroupSkip("personality", "native personality snapshot unavailable")
+            }
             await publish(approvalsRaw, as: "approvals", to: "approvals.json")
             await publish(inboxRaw, as: "inbox", to: "inbox.json")
             if includeHeavySnapshots {
@@ -478,7 +551,11 @@ extension MacSyncEngine {
                 // inspector (content-free; size-budgeted). Off-main read of the
                 // persisted day file — not a bus subscriber, no hot-path cost.
                 async let turnSummariesData: Data? = self.turnSummariesSnapshotData()
-                async let commandPaletteData = api.fetchCommandPaletteRawData()
+                // E8 (upgrade-sweep 2026-08): command_palette.json was fetched
+                // and published on every heavy pass with ZERO readers in the
+                // iOS target. Choice made: stop writing it rather than build a
+                // palette screen nobody asked for. Reinstate the fetch here if
+                // that screen is ever wanted.
                 // Swift-native cutover: native KG file read.
                 // R25 (2026-07-02): the fabricated capabilities/agent_map/
                 // coordination stubs are GONE — no iOS surface ever consumed
@@ -495,14 +572,14 @@ extension MacSyncEngine {
                     }
                     return rows
                 }()
-                let (turnSummariesRaw, commandPaletteRaw, knowledgeGraphRaw, runsAll) = await (
+                let (turnSummariesRaw, knowledgeGraphRaw, runsAll) = await (
                     turnSummariesData,
-                    commandPaletteData,
                     knowledgeGraphData,
                     runsFetch
                 )
-                if let turnSummariesRaw { await writeData(turnSummariesRaw, to: "turn_summaries.json") }
-                if let commandPaletteRaw { await writeData(commandPaletteRaw, to: "command_palette.json") }
+                if let turnSummariesRaw {
+                    await writeData(turnSummariesRaw, to: Self.turnSummariesSnapshotFilename)
+                }
                 await publish(knowledgeGraphRaw, as: "knowledge_graph", to: "knowledge_graph.json")
                 if let runsAll {
                     // Byte-budget the snapshot copy (review MED #2): prompt/
@@ -544,10 +621,19 @@ extension MacSyncEngine {
                         }
                         bounded = Array(bounded.prefix(bounded.count / 2))
                     }
+                } else {
+                    recordGroupSkip("runs", "run ledger unavailable or unreadable")
                 }
                 // R25: sweep the retired fabricated stubs out of the synced
                 // container so no stale fake-empty file lingers (idempotent).
-                for retired in ["capabilities.json", "agent_map.json", "coordination_summary.json"] {
+                // E8 adds command_palette.json to the same sweep: it was
+                // written for years and never read.
+                for retired in [
+                    "capabilities.json",
+                    "agent_map.json",
+                    "coordination_summary.json",
+                    "command_palette.json",
+                ] {
                     try? FileManager.default.removeItem(at: snapshotDir.appendingPathComponent(retired))
                 }
                 lastHeavySnapshotAt = Date()
@@ -569,7 +655,7 @@ extension MacSyncEngine {
                 }
             }
             if let health { await write(health, to: "health.json") }
-            await write(organismLivingStatus, to: "organism_living_status.json")
+            await write(organismLivingStatus, to: Self.organismLivingStatusSnapshotFilename)
             if let memProposals { await write(memProposals, to: "memory_proposals.json") }
             if let training { await write(training, to: "training_proposals.json") }
             if let promotion { await write(promotion, to: "promotion_candidates.json") }
@@ -596,26 +682,23 @@ extension MacSyncEngine {
             // of clearing them — the snapshot files themselves kept last-good data.
             // Sweep R4 item 2: lead with the SKIPPED GROUP NAMES, because that
             // is what tells the owner which iPhone surface is stale.
-            if snapshotFetchFailures.isEmpty {
+            let unresolvedSnapshotGroups = Self.updateSnapshotSkipState(
+                currentSkips: skippedSnapshotGroups,
+                attemptedGroups: attemptedSnapshotGroups,
+                dataRoot: NativeAgentPaths.dataRoot
+            )
+            if snapshotFetchFailures.isEmpty, unresolvedSnapshotGroups.isEmpty {
                 syncError = nil
             } else {
-                let staleGroups = skippedSnapshotGroups.keys.sorted()
+                let staleGroups = unresolvedSnapshotGroups.keys.sorted()
                 let prefix = staleGroups.isEmpty
                     ? "Snapshot fetch failed (kept last good files)"
                     : "iPhone is showing STALE \(staleGroups.joined(separator: ", ")) (kept last good files)"
-                syncError = "\(prefix): \(snapshotFetchFailures.joined(separator: "; "))"
+                let reasons = staleGroups.compactMap { group in
+                    unresolvedSnapshotGroups[group].map { "\(group): \($0)" }
+                }
+                syncError = "\(prefix): \(reasons.joined(separator: "; "))"
             }
-            // Durable so Doctor can report it later, from a different process,
-            // without depending on this @Published in-memory string.
-            // NativeAgentPaths.dataRoot, not PersistenceCore.defaultDataRoot():
-            // every other piece of MacSyncEngine's local bookkeeping (processed
-            // ids, completion markers) resolves through NativeAgentPaths, and
-            // two resolvers for one subsystem is how state ends up split across
-            // two roots.
-            Self.persistSnapshotSkipState(
-                skippedSnapshotGroups,
-                dataRoot: NativeAgentPaths.dataRoot
-            )
 
             // Notify iOS via KVS only when content changed; unchanged digest
             // ticks should not wake the phone into another full snapshot read.
@@ -817,7 +900,7 @@ extension MacSyncEngine {
         return String(content.prefix(maxCharacters)) + "\n[truncated for iPhone snapshot]"
     }
 
-    private func writeSnapshotData(
+    func writeSnapshotData(
         _ data: Data,
         to filename: String,
         in snapshotDir: URL,
@@ -915,7 +998,11 @@ extension MacSyncEngine {
         enc.dateEncodingStrategy = .iso8601
         enc.outputFormatting = .sortedKeys
         do {
-            let projection = try MobileInboxProjection.data(from: items, encoder: enc)
+            let projection = try MobileInboxProjection.data(
+                from: items,
+                encoder: enc,
+                alreadyNewestFirst: true
+            )
             if !items.isEmpty, projection.included == 0 {
                 return .skipped("mobile inbox rows exceeded the bounded projection budget")
             }
@@ -945,8 +1032,13 @@ extension MacSyncEngine {
         }
     }
 
-    private static func organismLivingStatusSnapshot() async -> OrganismLivingStatusFile {
-        let snapshot = await NativeCognitionRuntime.shared.organismSnapshot()
+    func organismLivingStatusSnapshot() async -> OrganismLivingStatusFile {
+        Self.organismLivingStatusSnapshot(from: await organismSnapshotProvider())
+    }
+
+    nonisolated static func organismLivingStatusSnapshot(
+        from snapshot: OrganismSnapshot
+    ) -> OrganismLivingStatusFile {
         let posture = OrganismBehaviorPosture.from(snapshot: snapshot)
         let behaviorLine: String
         if let posture {
@@ -1035,10 +1127,13 @@ extension MacSyncEngine {
     /// are off the main actor and off the chat hot path (this is a 30s-poll read
     /// of the persisted day file, NOT a TurnTraceBus subscriber). Returns nil
     /// only on encode failure so a transient miss keeps the last good snapshot.
-    private func turnSummariesSnapshotData() async -> Data? {
-        await Task.detached(priority: .utility) { () -> Data? in
-            let root = TurnSummarySource.liveRoot()
-            let events = TurnSummarySource.loadEvents(root: root)
+    func turnSummariesSnapshotData(
+        sourceRoot: URL? = nil,
+        now: Date = Date()
+    ) async -> Data? {
+        let root = sourceRoot ?? stateDataRootOverride ?? TurnSummarySource.liveRoot()
+        return await Task.detached(priority: .utility) { () -> Data? in
+            let events = TurnSummarySource.loadEvents(root: root, now: now)
             let encoder = TurnSummaryComputer.makeEncoder()
             let file = TurnSummaryComputer.compute(from: events, encoder: encoder)
             return try? encoder.encode(file)
@@ -1079,9 +1174,31 @@ extension MacSyncEngine {
 }
 
 extension MacSyncEngine {
-    /// Durable record of which snapshot groups the last pass could not build.
-    /// Written on EVERY pass — including the clean one, which removes the file —
-    /// so Doctor never reports a skip the next pass already recovered from.
+    /// Reconcile one pass with durable stale-state truth. A lightweight pass
+    /// must not clear a heavyweight group's prior failure merely because that
+    /// group was not attempted. Successfully attempted groups are cleared;
+    /// current failures replace their prior reason.
+    @discardableResult
+    nonisolated static func updateSnapshotSkipState(
+        currentSkips: [String: String],
+        attemptedGroups: Set<String>,
+        dataRoot: URL
+    ) -> [String: String] {
+        let url = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
+        var unresolved: [String: String] = [:]
+        if let data = try? Data(contentsOf: url),
+           let prior = try? JSONDecoder().decode([String: String].self, from: data) {
+            unresolved = prior.filter { $0.key != "_observedAt" }
+        }
+        for group in attemptedGroups { unresolved.removeValue(forKey: group) }
+        for (group, reason) in currentSkips where group != "_observedAt" {
+            unresolved[group] = reason
+        }
+        persistSnapshotSkipState(unresolved, dataRoot: dataRoot)
+        return unresolved
+    }
+
+    /// Full replacement helper retained for isolated callers and tests.
     nonisolated static func persistSnapshotSkipState(
         _ skips: [String: String],
         dataRoot: URL

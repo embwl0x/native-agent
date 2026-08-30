@@ -147,6 +147,8 @@ public enum MacScreenRender {
     /// assigned by the renderer, 1-based, in the order the rows arrive, so she
     /// can say "open 3" for a row whose label is ambiguous or absent.
     public struct Row: Sendable, Equatable {
+        /// Private fusion metadata; never printed as a model-facing address.
+        public let sourceAXPath: [Int]?
         public let label: MacScreenText?
         /// Extra columns, in the caller's order — a type ("folder"), a quantity,
         /// a price. Rendered as columns, not as prose.
@@ -155,16 +157,24 @@ public enum MacScreenRender {
         /// Non-nil ⇒ this row ABSTAINS, with this reason. Printed, never dropped.
         public let abstain: String?
 
+        /// A located physical point, not an understood semantic control. The
+        /// act owner still rechecks visibility and authority before input.
+        public let physicalOnly: Bool
+
         public init(
             label: MacScreenText?,
             detail: [MacScreenText] = [],
             provenance: Provenance,
-            abstain: String? = nil
+            abstain: String? = nil,
+            sourceAXPath: [Int]? = nil,
+            physicalOnly: Bool = false
         ) {
             self.label = label
             self.detail = detail
             self.provenance = provenance
             self.abstain = abstain
+            self.sourceAXPath = sourceAXPath
+            self.physicalOnly = physicalOnly
         }
     }
 
@@ -172,6 +182,8 @@ public enum MacScreenRender {
     /// `(checked)`, `(selected)` — never in a parallel object the reader has to
     /// correlate.
     public struct Control: Sendable, Equatable {
+        /// Private fusion metadata; never printed as a model-facing address.
+        public let sourceAXPath: [Int]?
         public let label: MacScreenText
         /// The kind, in this renderer's fixed vocabulary (see `kindName`).
         public let kind: String
@@ -197,7 +209,8 @@ public enum MacScreenRender {
             value: MacScreenText? = nil,
             states: [String] = [],
             provenance: Provenance,
-            abstain: String? = nil
+            abstain: String? = nil,
+            sourceAXPath: [Int]? = nil
         ) {
             self.label = label
             self.kind = kind
@@ -206,6 +219,7 @@ public enum MacScreenRender {
             self.states = states
             self.provenance = provenance
             self.abstain = abstain
+            self.sourceAXPath = sourceAXPath
         }
     }
 
@@ -241,9 +255,8 @@ public enum MacScreenRender {
     /// The four content types. The section KEYWORD is the type, which is how a
     /// reader knows what kind of thing she is looking at before reading a row.
     ///
-    /// `canvas` is the honest handoff to the pixel lane: it means "genuinely not
-    /// interpretable as controls, act physically", and it always carries its
-    /// pixel size so a physical act has something to aim inside.
+    /// `canvas` is the pixel surface. It distinguishes an unparsed extent from
+    /// partial object/text evidence without claiming semantic understanding.
     public enum ContentKind: String, Sendable, Equatable, CaseIterable {
         case list
         case grid
@@ -272,19 +285,24 @@ public enum MacScreenRender {
         }
     }
 
-    /// The uninterpreted region. Its SIZE is mandatory in the render: "act
+    /// The pixel region. Its SIZE is mandatory in the render: "act
     /// physically" is not actionable without an extent.
     public struct Canvas: Sendable, Equatable {
         public let description: String
         public let width: Double
         public let height: Double
         public let provenance: Provenance
+        public let hasPerceptualEvidence: Bool
 
-        public init(description: String, width: Double, height: Double, provenance: Provenance) {
+        public init(
+            description: String, width: Double, height: Double,
+            provenance: Provenance, hasPerceptualEvidence: Bool = false
+        ) {
             self.description = description
             self.width = width
             self.height = height
             self.provenance = provenance
+            self.hasPerceptualEvidence = hasPerceptualEvidence
         }
     }
 
@@ -341,6 +359,9 @@ public enum MacScreenRender {
         public let unlabeledControls: [String: Int]
         public let values: [Value]
         public let totalValues: Int
+        /// Omitted AX affordances have no retained role or location evidence.
+        /// They must not be relabeled as extra files/rows below the viewport.
+        public let unclassifiedOmittedTargets: Int
 
         public init(
             appName: String?,
@@ -355,7 +376,8 @@ public enum MacScreenRender {
             totalControls: Int? = nil,
             unlabeledControls: [String: Int] = [:],
             values: [Value] = [],
-            totalValues: Int? = nil
+            totalValues: Int? = nil,
+            unclassifiedOmittedTargets: Int = 0
         ) {
             self.appName = appName
             self.windowTitle = windowTitle
@@ -370,6 +392,7 @@ public enum MacScreenRender {
             self.unlabeledControls = unlabeledControls
             self.values = values
             self.totalValues = max(totalValues ?? values.count, values.count)
+            self.unclassifiedOmittedTargets = max(0, unclassifiedOmittedTargets)
         }
     }
 
@@ -499,6 +522,9 @@ public enum MacScreenRender {
 
         // The dominant content, TYPED. Fixed order by TYPE so a screen with more
         // than one never reorders between turns.
+        if screen.unclassifiedOmittedTargets > 0 {
+            lines.append(section("LIMITS", "Semantic read omitted \(screen.unclassifiedOmittedTargets) AX targets; types/locations unknown."))
+        }
         for content in screen.contents.sorted(by: { $0.kind.order < $1.kind.order }) {
             let block = contentBlock(content, options: options)
             lines.append(contentsOf: block.lines)
@@ -569,7 +595,10 @@ public enum MacScreenRender {
                 let size = "\(integer(canvas.width))x\(integer(canvas.height))"
                 let described = canvas.description.trimmingCharacters(in: .whitespacesAndNewlines)
                 line = (described.isEmpty ? "region" : described)
-                    + ", \(size) — not interpreted, act physically"
+                    + ", \(size) — "
+                    + (canvas.hasPerceptualEvidence
+                        ? "partial vision; use listed targets, roles may be uncertain"
+                        : "not interpreted, act physically")
                 if canvas.provenance.isVision { line += "  " + canvas.provenance.text }
             } else {
                 line = "region, size unknown — not interpreted, act physically"
@@ -633,7 +662,14 @@ public enum MacScreenRender {
             ))
         }
         if hidden > 0 {
-            block.lines.append(indentedNote("… \(hidden) more not shown (raise maxControls)"))
+            let observedHidden = max(0, screen.controls.count - kept.count)
+            if observedHidden > 0 {
+                block.lines.append(indentedNote("… \(observedHidden) observed controls not shown (screen part: controls, or name a control)"))
+            }
+            let unavailable = max(0, hidden - observedHidden)
+            if unavailable > 0 {
+                block.lines.append(indentedNote("… \(unavailable) further controls outside this observation; inspect the relevant visible region"))
+            }
         }
         // The unlabeled census. Sorted by kind so the bytes are identical every
         // run; counted rather than hidden, because an unnamed control she cannot
@@ -670,7 +706,14 @@ public enum MacScreenRender {
             block.lines.append(trimTrailing(line))
         }
         if hidden > 0 {
-            block.lines.append(indentedNote("… \(hidden) more not shown (raise maxValues)"))
+            let observedHidden = max(0, screen.values.count - kept.count)
+            if observedHidden > 0 {
+                block.lines.append(indentedNote("… \(observedHidden) observed readouts not shown (screen part: hud, or name a readout)"))
+            }
+            let unavailable = max(0, hidden - observedHidden)
+            if unavailable > 0 {
+                block.lines.append(indentedNote("… \(unavailable) further values outside this observation; inspect the relevant visible region"))
+            }
         }
         return block
     }
@@ -706,6 +749,8 @@ public enum MacScreenRender {
         // a dropped row: a refusal she cannot see is a guess.
         if let abstain = row.abstain, !abstain.isEmpty {
             line += "  ABSTAINED: " + abstain
+        } else if row.physicalOnly {
+            line += "  PHYSICAL ONLY: role uncertain"
         }
         return trimTrailing(line)
     }
@@ -832,6 +877,36 @@ public enum MacScreenRender {
     /// percept publishes.
     static let controlContainerKinds: Set<String> = ["toolbar", "sheet", "dialog"]
 
+    /// Keep the established unnamed-control addresses, then number duplicated
+    /// names after them. Rendering and resolution consume this same assignment;
+    /// a repeated label never forces the caller to guess the first match.
+    static func controlRoleOrdinals(for controls: [MacLookAffordance]) -> [String: Int] {
+        let identities = controls.map { control in
+            (
+                handle: control.handle,
+                kind: kindName(role: control.role),
+                label: MacScreenText(control.label, redacted: control.labelJSON).display.map(MacFourVerbs.normalize)
+            )
+        }
+        var frequencies: [String: [String: Int]] = [:]
+        for item in identities {
+            if let label = item.label { frequencies[item.kind, default: [:]][label, default: 0] += 1 }
+        }
+        var next: [String: Int] = [:]
+        var ordinals: [String: Int] = [:]
+        func assign(_ handle: String, kind: String) {
+            next[kind, default: 0] += 1
+            ordinals[handle] = next[kind]
+        }
+        for item in identities where item.label == nil { assign(item.handle, kind: item.kind) }
+        for item in identities {
+            if let label = item.label, (frequencies[item.kind]?[label] ?? 0) > 1 {
+                assign(item.handle, kind: item.kind)
+            }
+        }
+        return ordinals
+    }
+
     public static func screen(
         from percept: MacLookPercept,
         isFront: Bool = false,
@@ -854,27 +929,17 @@ public enum MacScreenRender {
             }
         }
 
-        // Named controls already have a direct natural address. Role ordinals
-        // are reserved for the visible controls AX left unnamed, so a toolbar
-        // with "Back", "Forward", and two glyph buttons renders the latter as
-        // `button 1` and `button 2` rather than forcing the model to count
-        // unrelated named controls.
-        var unnamedControlOrdinals: [String: Int] = [:]
-        for affordance in percept.affordances {
-            let isControl = !contentRowRoles.contains(affordance.role)
+        func isControl(_ affordance: MacLookAffordance) -> Bool {
+            !contentRowRoles.contains(affordance.role)
                 && (MacPerceptionCompiler.controlRoles.contains(affordance.role)
                     || insideControlContainer(affordance.path))
+        }
+        let controlOrdinals = controlRoleOrdinals(for: percept.affordances.filter(isControl))
+        for affordance in percept.affordances {
             let label = MacScreenText(affordance.label, redacted: affordance.labelJSON)
-            if isControl {
+            if isControl(affordance) {
                 let kind = kindName(role: affordance.role)
-                let ordinal: Int?
-                if label.display == nil {
-                    let next = (unnamedControlOrdinals[kind] ?? 0) + 1
-                    unnamedControlOrdinals[kind] = next
-                    ordinal = next
-                } else {
-                    ordinal = nil
-                }
+                let ordinal = controlOrdinals[affordance.handle]
                 var states: [String] = []
                 if !affordance.enabled { states.append("disabled") }
                 if affordance.selected == true { states.append("selected") }
@@ -886,7 +951,8 @@ public enum MacScreenRender {
                     ordinal: ordinal,
                     value: affordance.value.map { MacScreenText($0, redacted: affordance.valueJSON) },
                     states: states,
-                    provenance: .ax
+                    provenance: .ax,
+                    sourceAXPath: affordance.path
                 ))
             } else {
                 var detail: [MacScreenText] = [
@@ -899,20 +965,20 @@ public enum MacScreenRender {
                 if affordance.selected == true {
                     detail.append(MacScreenText("selected", redacted: .string("selected")))
                 }
-                rows.append(Row(label: label, detail: detail, provenance: .ax))
+                rows.append(Row(label: label, detail: detail, provenance: .ax, sourceAXPath: affordance.path))
             }
         }
 
-        // The compiler ranks controls ahead of row content, so the rows it
-        // dropped at its own cap are content rows: the omission is attributed
-        // where it actually landed, and is spoken by the content elision line.
+        // The wire's omission count also includes byte-budget truncation and
+        // does not retain the omitted roles/locations. Report that limit once,
+        // without inventing extra rows or claiming they are below the viewport.
         var contents: [Content] = []
         if !rows.isEmpty {
             let landmarkKinds = Set(percept.landmarks.map(\.kind))
             contents.append(Content(
                 kind: landmarkKinds.contains("table") ? .grid : .list,
                 rows: rows,
-                totalRows: rows.count + percept.affordancesOmitted,
+                totalRows: rows.count,
                 scrollable: landmarkKinds.contains("scrollarea")
                     || landmarkKinds.contains("list")
                     || landmarkKinds.contains("table")
@@ -932,7 +998,7 @@ public enum MacScreenRender {
             whereSteps: whereSteps(from: percept),
             contents: contents,
             controls: controls,
-            totalControls: controls.count + (rows.isEmpty ? percept.affordancesOmitted : 0),
+            totalControls: controls.count,
             // The compiler now retains unnamed interactive affordances so
             // their role ordinals can be rendered and resolved. A census still
             // exists for older/external percept producers that genuinely omit
@@ -941,7 +1007,8 @@ public enum MacScreenRender {
             values: percept.readouts.map {
                 Value(text: MacScreenText($0.text, redacted: $0.textJSON), provenance: .ax)
             },
-            totalValues: percept.readouts.count + percept.readoutsOmitted
+            totalValues: percept.readouts.count + percept.readoutsOmitted,
+            unclassifiedOmittedTargets: percept.affordancesOmitted
         )
     }
 

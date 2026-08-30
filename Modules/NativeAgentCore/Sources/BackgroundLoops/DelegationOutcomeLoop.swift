@@ -50,6 +50,10 @@ import PersistenceCore
 /// two cannot drift into disagreeing about what a record says.
 public struct DelegationJobSnapshot: Sendable, Equatable {
     public var id: String
+    /// The identity returned to the dispatching turn. This differs from the
+    /// Codex bridge's internal reply-job id and is the key the motor lifecycle
+    /// opened under.
+    public var motorOwnerID: String?
     /// "claude" | "codex" | "omp" — which store the row came from.
     public var source: String
     public var agent: String
@@ -65,9 +69,22 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
     /// Only set when the record ITSELF asserts it (claude's `deliveryLost`).
     public var deliveryLost: Bool?
     public var completionTextHead: String?
+    /// Exact stable Desk handle explicitly bound at delegation time. Never
+    /// inferred from a topic or title.
+    public var deskHandle: String?
+    /// Existing bridge/job liveness verdict from `DelegationStatusProjector`.
+    /// This loop consumes it; it never recomputes a stall from wall time.
+    public var stalled: Bool
+    /// Raw `DelegationJobProjection.StallBasis` value (for example
+    /// `deadline` or `stall_seconds`). Kept as a string to preserve the
+    /// intentional module boundary between BackgroundLoops and
+    /// ChatOrchestration.
+    public var stallBasis: String?
+    public var lastLiveness: String?
 
     public init(
         id: String,
+        motorOwnerID: String? = nil,
         source: String,
         agent: String,
         topicSlug: String? = nil,
@@ -77,9 +94,14 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         completedAt: String? = nil,
         deliveryOutcome: String? = nil,
         deliveryLost: Bool? = nil,
-        completionTextHead: String? = nil
+        completionTextHead: String? = nil,
+        deskHandle: String? = nil,
+        stalled: Bool = false,
+        stallBasis: String? = nil,
+        lastLiveness: String? = nil
     ) {
         self.id = id
+        self.motorOwnerID = motorOwnerID
         self.source = source
         self.agent = agent
         self.topicSlug = topicSlug
@@ -90,6 +112,10 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         self.deliveryOutcome = deliveryOutcome
         self.deliveryLost = deliveryLost
         self.completionTextHead = completionTextHead
+        self.deskHandle = deskHandle
+        self.stalled = stalled
+        self.stallBasis = stallBasis
+        self.lastLiveness = lastLiveness
     }
 
     /// Status words that mean the RUN produced an outcome. Deliberately does
@@ -136,6 +162,10 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         // Proven-lost outranks everything: a job whose answer never reached
         // Agent is a failure of the delegation regardless of how the run went.
         if deliveryLost == true || deliveryOutcome == "lost" { return .deliveryLost }
+        // Execution may have completed or failed, but an explicitly blocked
+        // handoff is never a successful delegation or permission to rerun it.
+        // Reuse the existing actionable uncertainty outcome/cursor class.
+        if deliveryOutcome == "blocked" { return .unknown }
         if let statusWord, Self.failureStatusWords.contains(statusWord) { return .failed }
         // Completed, but the bridge could not confirm the handoff. NOT folded
         // into success — "we don't know if you got the answer" is precisely the
@@ -144,6 +174,64 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         if let statusWord, Self.terminalStatusWords.contains(statusWord) { return .succeeded }
         // completedAt with no status word at all: it ended, we cannot say how.
         return .unknown
+    }
+
+    /// Shared resident-action projection for an asynchronous builder handoff.
+    /// A clean runner completion is deliberately still `unverified`: it proves
+    /// the delegated agent returned, not that its answer satisfied Agent's
+    /// original request.
+    public func motorActionReadModel() -> MotorActionReadModel {
+        let phase: MotorActionPhase
+        let verification: MotorVerificationState
+        let next: String?
+        if isTerminal && deliveryOutcome == "blocked" && deliveryLost != true {
+            phase = .blocked
+            verification = .unknown
+            next = "Inspect the retained result and resolve the original completion route before explicitly delivering it. Do not rerun the worker."
+        } else if stalled && !isTerminal {
+            phase = .blocked
+            verification = .pending
+            next = "Fresh bridge liveness or a terminal runner outcome."
+        } else {
+            switch terminalOutcome {
+            case .succeeded:
+                phase = .succeeded
+                verification = .unverified
+                next = "Agent must assess the returned result against the originating request."
+            case .failed, .deliveryLost:
+                phase = .failed
+                verification = .failed
+                next = deliveryLost == true || deliveryOutcome == "lost"
+                    ? "Recover or replay the undelivered reply before relying on the delegation."
+                    : "Inspect the canonical bridge failure before retrying or replacing the work."
+            case .unknown:
+                phase = .unknown
+                verification = .unknown
+                next = "Resolve the bridge's unconfirmed delivery before relying on the delegation."
+            case nil:
+                let normalized = (state ?? "").lowercased()
+                phase = ["running", "claimed", "bound", "watching", "executing"].contains(normalized)
+                    ? .running : .waitingExternal
+                verification = .pending
+                next = "A terminal runner outcome tied to this bridge message id."
+            }
+        }
+        let stateParts = [source, state, status, runStatus, deliveryOutcome]
+            .compactMap { value -> String? in
+                guard let value, !value.isEmpty else { return nil }
+                return value
+            }
+        return MotorActionReadModel(
+            domain: "agent_bridge",
+            actionIdentity: CausalTransitionEvidence.opaqueIdentity(motorOwnerID ?? id),
+            phase: phase,
+            domainState: stateParts.joined(separator: ":"),
+            verification: verification,
+            expectedNextEvidence: next,
+            updatedAt: completedAt ?? lastLiveness,
+            cancellationIdentity: nil,
+            deadline: nil
+        )
     }
 
     /// The instant used to order this job against the cursor. `nil` when the
@@ -294,11 +382,18 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
                 + "answer did not reach NativeAgent. Anything it says below is the "
                 + "job record's own copy of the completion text."
         case .unknown:
-            title = "\(name) outcome is unconfirmed"
-            summary = "\(name) finished\(topicPhrase); delivery unconfirmed"
-            reasonLine = "The run ended, but the bridge could not confirm whether the "
-                + "reply was delivered. That is NOT the same as lost — it means "
-                + "unverified either way."
+            if job.deliveryOutcome == "blocked" {
+                title = "\(name) result delivery is blocked"
+                summary = "\(name) run \(job.statusWord ?? "unknown")\(topicPhrase); delivery blocked"
+                reasonLine = "The run ended with status \"\(job.statusWord ?? "unknown")\", but its result handoff is blocked. "
+                    + "Inspect the retained result and resolve the original completion route before explicitly delivering it. Do not rerun the worker."
+            } else {
+                title = "\(name) outcome is unconfirmed"
+                summary = "\(name) finished\(topicPhrase); delivery unconfirmed"
+                reasonLine = "The run ended, but the bridge could not confirm whether the "
+                    + "reply was delivered. That is NOT the same as lost — it means "
+                    + "unverified either way."
+            }
         }
 
         var detailLines: [String] = []
@@ -331,6 +426,80 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             summary: summary,
             detail: detailLines.joined(separator: "\n"),
             createdAt: DelegationOutcomeCursor.formatISO(now)
+        )
+    }
+
+    /// An open delegated step whose existing bridge/job liveness verdict is
+    /// stalled. This is deliberately the same inbox row as the eventual
+    /// outcome: completion or recovery replaces the warning instead of
+    /// leaving a stale second card behind.
+    public static func makeStalled(
+        from job: DelegationJobSnapshot, now: Date
+    ) -> DelegationOutcomeCard? {
+        guard job.stalled, !job.isTerminal else { return nil }
+        let name = displayName(source: job.source, agent: job.agent)
+        let topic = job.topicSlug.flatMap { $0.isEmpty ? nil : $0 }
+        let topicPhrase = topic.map { ": \($0)" } ?? ""
+        let basis: String = switch job.stallBasis {
+        case "deadline": "its recorded deadline passed"
+        case "stall_seconds": "its recorded liveness stopped advancing"
+        case .some(let raw) where !raw.isEmpty: "the bridge reported \(raw)"
+        default: "the bridge reported a stall"
+        }
+        var detail = [
+            "The existing bridge/job liveness record marks this delegated step as stuck; \(basis).",
+            "Agent: \(name)  ·  Job: \(job.id)",
+        ]
+        if let topic { detail.append("Topic: \(topic)") }
+        if let lastLiveness = job.lastLiveness {
+            detail.append("Last recorded liveness: \(lastLiveness)")
+        }
+        detail.append("NativeAgent did not replay the request or start replacement work.")
+        return DelegationOutcomeCard(
+            cardId: "delegation-outcome:\(job.source):\(job.id)",
+            jobKey: "\(job.source):\(job.id):stuck",
+            source: job.source,
+            agent: job.agent,
+            topicSlug: topic,
+            outcome: .failed,
+            title: "\(name) step is stuck",
+            summary: "\(name) stopped making progress\(topicPhrase)",
+            detail: detail.joined(separator: "\n"),
+            createdAt: DelegationOutcomeCursor.formatISO(now)
+        )
+    }
+
+    /// Clears a prior liveness warning when the same non-terminal job begins
+    /// advancing again. A terminal outcome uses `make(from:)` instead, so the
+    /// final result remains the visible row.
+    public static func makeStallCleared(
+        from job: DelegationJobSnapshot, now: Date
+    ) -> DelegationOutcomeCard {
+        let name = displayName(source: job.source, agent: job.agent)
+        let topic = job.topicSlug.flatMap { $0.isEmpty ? nil : $0 }
+        let topicPhrase = topic.map { ": \($0)" } ?? ""
+        var detail = [
+            "The same bridge/job record no longer reports this delegated step as stalled.",
+            "Agent: \(name)  ·  Job: \(job.id)",
+        ]
+        if let topic { detail.append("Topic: \(topic)") }
+        if let lastLiveness = job.lastLiveness {
+            detail.append("Latest recorded liveness: \(lastLiveness)")
+        }
+        detail.append("This proves renewed liveness, not completion.")
+        return DelegationOutcomeCard(
+            cardId: "delegation-outcome:\(job.source):\(job.id)",
+            jobKey: "\(job.source):\(job.id):stuck-cleared",
+            source: job.source,
+            agent: job.agent,
+            topicSlug: topic,
+            outcome: .succeeded,
+            title: "\(name) step is moving again",
+            summary: "\(name) resumed progress\(topicPhrase)",
+            detail: detail.joined(separator: "\n"),
+            createdAt: DelegationOutcomeCursor.formatISO(now),
+            severityOverride: "info",
+            resolved: true
         )
     }
 
@@ -468,12 +637,18 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         /// Ids recorded before this field existed have no entry and never
         /// re-card — the cursor cannot prove what their card said.
         public var cardedOutcomes: [String: String]
+        /// Open jobs whose stalled liveness warning has landed. Unlike
+        /// terminal outcome ids, these are removed after a proven recovery so
+        /// a later stall can speak again.
+        public var announcedStallIDs: [String]
 
         public init(lastSeen: Date? = nil, cardedIDs: [String] = [],
-                    cardedOutcomes: [String: String] = [:]) {
+                    cardedOutcomes: [String: String] = [:],
+                    announcedStallIDs: [String] = []) {
             self.lastSeen = lastSeen
             self.cardedIDs = cardedIDs
             self.cardedOutcomes = cardedOutcomes
+            self.announcedStallIDs = announcedStallIDs
         }
     }
 
@@ -521,6 +696,24 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         store(source).cardedOutcomes[id].flatMap(DelegationOutcome.init(rawValue:))
     }
 
+    public mutating func markStallAnnounced(source: String, id: String) {
+        var cursor = store(source)
+        if !cursor.announcedStallIDs.contains(id) {
+            cursor.announcedStallIDs.append(id)
+            if cursor.announcedStallIDs.count > Self.cardedIDLimit {
+                cursor.announcedStallIDs.removeFirst(
+                    cursor.announcedStallIDs.count - Self.cardedIDLimit)
+            }
+        }
+        stores[source] = cursor
+    }
+
+    public mutating func clearStallAnnouncement(source: String, id: String) {
+        var cursor = store(source)
+        cursor.announcedStallIDs.removeAll { $0 == id }
+        stores[source] = cursor
+    }
+
     // MARK: Codable-by-hand (the on-disk shape is snake_case JSON, and a
     // Codable synthesis would silently rename the keys if a field is renamed).
 
@@ -545,6 +738,12 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
                     if case .string(let s) = v { cursor.cardedOutcomes[id] = s }
                 }
             }
+            if case .array(let ids)? = obj["announced_stall_ids"] {
+                cursor.announcedStallIDs = ids.compactMap {
+                    if case .string(let s) = $0 { return s }
+                    return nil
+                }
+            }
             result.stores[source] = cursor
         }
         if case .string(let key)? = root["codex_undelivered_backlog"], !key.isEmpty {
@@ -566,6 +765,10 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
                 var outcomes: [String: JSONValue] = [:]
                 for (id, raw) in cursor.cardedOutcomes { outcomes[id] = .string(raw) }
                 obj["carded_outcomes"] = .object(outcomes)
+            }
+            if !cursor.announcedStallIDs.isEmpty {
+                obj["announced_stall_ids"] = .array(
+                    cursor.announcedStallIDs.map { .string($0) })
             }
             stores[source] = .object(obj)
         }
@@ -628,6 +831,9 @@ public struct DelegationOutcomeLoop: LoopRunner {
     /// Upserts one inbox card. Returns whether the row actually landed; a
     /// `false` leaves the job un-carded so the next tick retries it.
     private let fileCard: @Sendable (DelegationOutcomeCard) async -> Bool
+    /// Records downstream transition evidence. `false` keeps the cursor
+    /// unsettled so the same transition is retried on the next reconciliation.
+    private let observeTransition: @Sendable (DelegationJobSnapshot) async -> Bool
     private let cursorPath: URL
     private let clock: @Sendable () -> Date
 
@@ -636,19 +842,27 @@ public struct DelegationOutcomeLoop: LoopRunner {
     /// a hundred rows into the inbox at once. Never silent — the tick outcome
     /// names the remainder (`no_silent_caps`).
     public static let maxCardsPerTick = 10
+    /// A Codex delivery receipt is appended after the runner completion time
+    /// it carries. A cross-job timestamp cursor can therefore already be ahead
+    /// of a newly visible receipt. Exact unhandled receipt identity wins over
+    /// that timestamp for one bounded recent window; this repairs races and
+    /// upgrades without turning installation into an unbounded history replay.
+    public static let recentCodexReceiptReconciliationWindow: TimeInterval = 24 * 60 * 60
 
     public init(
         interval: TimeInterval = 5 * 60,
         cursorPath: URL,
         clock: @escaping @Sendable () -> Date = { Date() },
         readJobs: @escaping @Sendable () async -> [DelegationJobSnapshot],
-        fileCard: @escaping @Sendable (DelegationOutcomeCard) async -> Bool
+        fileCard: @escaping @Sendable (DelegationOutcomeCard) async -> Bool,
+        observeTransition: @escaping @Sendable (DelegationJobSnapshot) async -> Bool = { _ in true }
     ) {
         self.interval = interval
         self.cursorPath = cursorPath
         self.clock = clock
         self.readJobs = readJobs
         self.fileCard = fileCard
+        self.observeTransition = observeTransition
     }
 
     /// Conventional cursor location under a data root.
@@ -662,14 +876,22 @@ public struct DelegationOutcomeLoop: LoopRunner {
         let now = clock()
         let jobs = await readJobs()
         let terminal = jobs.filter { $0.isTerminal }
+        let wasSeeded: Bool
+        let seedResult: String?
 
-        // FIRST RUN: seed and file nothing. Every job visible right now predates
-        // this loop's existence; carding them would be a history dump, not a
-        // notification. A cursor file that EXISTS but fails to parse is not a
-        // first run — it means outcomes since the last good cursor are being
-        // skipped, so that case must be named, never laundered into an
-        // ordinary seed (sweep 2026-08-21).
-        guard var cursor = DelegationOutcomeCursor.load(from: cursorPath) else {
+        // FIRST RUN: seed terminal history and file no historical outcome
+        // cards. A currently stalled OPEN job is a live condition rather than
+        // history, so the liveness pass below may still speak on this tick. A
+        // cursor file that EXISTS but fails to parse is not a first run — it
+        // means outcomes since the last good cursor are being skipped, so that
+        // case must be named, never laundered into an ordinary seed (sweep
+        // 2026-08-21).
+        var cursor: DelegationOutcomeCursor
+        if let loaded = DelegationOutcomeCursor.load(from: cursorPath) {
+            cursor = loaded
+            wasSeeded = false
+            seedResult = nil
+        } else {
             let corrupt = FileManager.default.fileExists(atPath: cursorPath.path)
             var seeded = DelegationOutcomeCursor()
             for job in terminal {
@@ -679,23 +901,56 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 seeded.record(source: job.source, id: job.id, stamp: job.completionStamp,
                               outcome: job.terminalOutcome)
             }
-            // A backlog visible at seed time is not history either — it is the
-            // standing condition this card exists to name. The seeded cursor
-            // carries no backlog key, so the next tick files that card.
-            do {
-                try seeded.write(to: cursorPath)
-            } catch {
-                return .failed(error: "delegation outcome cursor seed failed: \(error)")
-            }
+            cursor = seeded
+            wasSeeded = true
             if corrupt {
-                return .completed(result:
+                seedResult =
                     "RECOVERED corrupt delegation outcome cursor at \(cursorPath.lastPathComponent): "
                     + "reseeded over \(terminal.count) terminal job(s) — any outcomes since the last "
-                    + "good cursor were skipped without cards")
+                    + "good cursor were skipped without cards"
+            } else {
+                seedResult =
+                    "seeded delegation outcome cursor over \(terminal.count) pre-existing terminal job(s); no outcome cards filed"
             }
-            return .completed(result:
-                "seeded delegation outcome cursor over \(terminal.count) pre-existing terminal job(s); no cards filed")
         }
+
+        // Stuck liveness is not a terminal outcome. It gets its own reversible
+        // cursor bit so the first real stall speaks once, recovered liveness
+        // clears the warning, and a later stall can speak again. The verdict
+        // itself came from DelegationStatusProjector; this loop never invents
+        // another timeout or state machine.
+        let newlyStalled = jobs.filter { job in
+            job.stalled && !job.isTerminal
+                && !cursor.store(job.source).announcedStallIDs.contains(job.id)
+        }.sorted { ($0.source, $0.id) < ($1.source, $1.id) }
+        let recovered = jobs.filter { job in
+            !job.stalled && !job.isTerminal
+                && cursor.store(job.source).announcedStallIDs.contains(job.id)
+        }.sorted { ($0.source, $0.id) < ($1.source, $1.id) }
+
+        var livenessFiled = 0
+        var livenessFailed = 0
+        let livenessPending = newlyStalled.map { (job: $0, stalled: true) }
+            + recovered.map { (job: $0, stalled: false) }
+        let livenessBatch = livenessPending.prefix(Self.maxCardsPerTick)
+        for entry in livenessBatch {
+            let card = entry.stalled
+                ? DelegationOutcomeCard.makeStalled(from: entry.job, now: now)
+                : DelegationOutcomeCard.makeStallCleared(from: entry.job, now: now)
+            guard let card else { continue }
+            if await fileCard(card), await observeTransition(entry.job) {
+                if entry.stalled {
+                    cursor.markStallAnnounced(source: entry.job.source, id: entry.job.id)
+                } else {
+                    cursor.clearStallAnnouncement(source: entry.job.source, id: entry.job.id)
+                }
+                livenessFiled += 1
+            } else {
+                livenessFailed += 1
+                break
+            }
+        }
+        let livenessDeferred = livenessPending.count - livenessBatch.count
 
         let pending = terminal.filter { job in
             let store = cursor.store(job.source)
@@ -708,6 +963,11 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 guard let recorded = cursor.cardedOutcome(source: job.source, id: job.id),
                       let current = job.terminalOutcome else { return false }
                 return current.alarmRank > recorded.alarmRank
+            }
+            if job.source == "codex", job.deliveryOutcome == "delivered",
+               let stamp = job.completionStamp,
+               stamp >= now.addingTimeInterval(-Self.recentCodexReceiptReconciliationWindow) {
+                return true
             }
             // A job whose completion predates the cursor was already handled in
             // an earlier tick (or by the seed) and has simply aged out of the
@@ -723,16 +983,22 @@ public struct DelegationOutcomeLoop: LoopRunner {
         let ordered = pending.sorted {
             ($0.completionStamp ?? .distantPast, $0.id) < ($1.completionStamp ?? .distantPast, $1.id)
         }
-        let batch = ordered.prefix(Self.maxCardsPerTick)
+        // Liveness warnings take the shared per-tick card budget first: a job
+        // that is stuck now should not sit silent behind a terminal-history
+        // burst. Terminal outcomes remain ordered oldest-first in the space
+        // left this tick.
+        let outcomeCapacity = max(0, Self.maxCardsPerTick - livenessBatch.count)
+        let batch = ordered.prefix(outcomeCapacity)
         let deferred = ordered.count - batch.count
 
         var filed = 0
         var failed = 0
         for job in batch {
             guard let card = DelegationOutcomeCard.make(from: job, now: now) else { continue }
-            if await fileCard(card) {
+            if await fileCard(card), await observeTransition(job) {
                 cursor.record(source: job.source, id: job.id, stamp: job.completionStamp,
                               outcome: card.outcome)
+                cursor.clearStallAnnouncement(source: job.source, id: job.id)
                 filed += 1
             } else {
                 // Contiguous settlement: stop at the first failed card. If a
@@ -751,7 +1017,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         // write leaves the cursor key untouched so the next tick retries.
         var backlogNote: String?
         var backlogFailed = false
-        if let backlogCard = DelegationOutcomeCard.makeBacklog(jobs: jobs, now: now) {
+        if !wasSeeded, let backlogCard = DelegationOutcomeCard.makeBacklog(jobs: jobs, now: now) {
             if cursor.codexBacklogKey != backlogCard.jobKey {
                 if await fileCard(backlogCard) {
                     cursor.codexBacklogKey = backlogCard.jobKey
@@ -761,7 +1027,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
                     backlogFailed = true
                 }
             }
-        } else if cursor.codexBacklogKey != nil {
+        } else if !wasSeeded, cursor.codexBacklogKey != nil {
             let cleared = DelegationOutcomeCard.makeBacklogCleared(now: now)
             if await fileCard(cleared) {
                 cursor.codexBacklogKey = nil
@@ -772,8 +1038,16 @@ public struct DelegationOutcomeLoop: LoopRunner {
             }
         }
 
-        if pending.isEmpty && backlogNote == nil {
-            return .completed(result: "no newly-terminal delegated jobs (\(terminal.count) terminal on record)")
+        if pending.isEmpty && backlogNote == nil && livenessPending.isEmpty {
+            if wasSeeded {
+                do {
+                    try cursor.write(to: cursorPath)
+                } catch {
+                    return .failed(error: "delegation outcome cursor seed failed: \(error)")
+                }
+                return .completed(result: seedResult)
+            }
+            return .completed(result: "no newly-terminal or stuck delegated jobs (\(terminal.count) terminal on record)")
         }
 
         do {
@@ -786,14 +1060,19 @@ public struct DelegationOutcomeLoop: LoopRunner {
         }
 
         var result = "filed \(filed) delegation outcome card(s)"
-        let writeFailures = failed + (backlogFailed ? 1 : 0)
-        if writeFailures > 0 { result += "; \(writeFailures) inbox write(s) failed and will retry next tick" }
+        if livenessFiled > 0 { result += "; filed \(livenessFiled) delegation liveness card(s)" }
+        if let seedResult { result += "; \(seedResult)" }
+        let writeFailures = failed + livenessFailed + (backlogFailed ? 1 : 0)
+        if writeFailures > 0 {
+            result += "; \(writeFailures) outcome settlement write(s) failed and will retry next tick"
+        }
         let failureDeferred = max(0, batch.count - filed - failed)
-        let totalDeferred = deferred + failureDeferred
+        let livenessFailureDeferred = max(0, livenessBatch.count - livenessFiled - livenessFailed)
+        let totalDeferred = deferred + failureDeferred + livenessDeferred + livenessFailureDeferred
         if totalDeferred > 0 { result += "; \(totalDeferred) more deferred for contiguous settlement" }
         if let backlogNote { result += "; \(backlogNote)" }
-        if filed == 0 && failed == 0 && backlogNote == nil {
-            return .skipped(reason: "no terminal outcome could be classified from \(pending.count) pending job(s)")
+        if filed == 0 && livenessFiled == 0 && failed == 0 && livenessFailed == 0 && backlogNote == nil {
+            return .skipped(reason: "no delegation outcome or liveness card could be classified")
         }
         return .completed(result: result)
     }

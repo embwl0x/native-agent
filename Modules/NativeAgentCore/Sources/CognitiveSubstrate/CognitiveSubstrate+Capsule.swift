@@ -144,11 +144,7 @@ extension CognitiveSubstrate {
             provenanceNodeIds: provenanceNodeIds,
             truncated: fittedLines.truncated || boundedStableKernel.count < stableKernel.count
         )
-        let turnKind = CognitiveTurnKind.inferred(fromSignals: [
-            request.surface,
-            request.sessionId ?? "",
-            request.userMessage,
-        ])
+        let turnKind = request.resolvedTurnKind
         let commit: CognitiveCapsulePresentationCommit?
         if turnKind == .live,
            request.mode == .inject,
@@ -194,7 +190,8 @@ extension CognitiveSubstrate {
             at: now,
             affect: frozenRead?.affect,
             mood: frozenRead?.mood,
-            proxies: frozenRead?.feltProxies
+            proxies: frozenRead?.feltProxies,
+            dynamics: dyn
         )
         // W4/P11 — the felt MODE, finally doing something. It stays what it always
         // was in the prompt: nothing. Not a word, not a line, not a byte. It only
@@ -268,7 +265,8 @@ extension CognitiveSubstrate {
         if let settling = settlingLine(
             mood: frozenRead?.mood ?? derivedMood(at: now),
             incoming: conversationalAppraisal(in: request.userMessage),
-            affectEnabled: frozenRead?.configuration.affectEnabled
+            affectEnabled: frozenRead?.configuration.affectEnabled,
+            cognitionEnabled: frozenRead?.configuration.enabled
         ) {
             // Cadence cap: at most `settlingMaxRun` consecutive presentations;
             // then silent until the condition lapses (the run resets below).
@@ -311,6 +309,7 @@ extension CognitiveSubstrate {
         // keyword classifiers were swept 2026-07-09 — see git if archaeology calls.)
         if let fingerprint = feltFingerprintLine(
             signals: signals,
+            intensityFloor: dyn.feltIntensityFloor,
             affectEnabled: frozenRead?.configuration.affectEnabled
         ) {
             // W4/P4 — SUPPRESS WHEN UNCHANGED. The rule the echo learned the hard
@@ -861,7 +860,10 @@ extension CognitiveSubstrate {
             guard node.turnKind == .live,
                   node.kind == .conversationFocus,
                   node.subjectReference.type == "chat.assistant_turn" else { return false }
-            let age = now.timeIntervalSince(node.lastActivatedAt)
+            // A recalled turn is active now, not newly spoken now. The Sound
+            // line describes recent conversation, so admission and ranking use
+            // the original per-turn creation time rather than reactivation.
+            let age = now.timeIntervalSince(node.createdAt)
             return age >= 0 && age <= dyn.soundEchoWindow
         }
         guard !assistantTurns.isEmpty else { return .silent }
@@ -875,13 +877,6 @@ extension CognitiveSubstrate {
         // over nodes already in RAM; it adds no provider call, store, or output
         // rewriting. The cue never names the worn word, so it cannot re-seed it.
         let recentAssistantTurns = assistantTurns
-            // A recalled old turn may become active again, but it did not just
-            // happen. Rut cooling follows conversational chronology rather
-            // than activation/reconsolidation chronology.
-            .filter {
-                let age = now.timeIntervalSince($0.createdAt)
-                return age >= 0 && age <= dyn.soundEchoWindow
-            }
             .sorted {
                 if $0.createdAt != $1.createdAt {
                     return $0.createdAt > $1.createdAt
@@ -891,7 +886,7 @@ extension CognitiveSubstrate {
             .prefix(dyn.soundRutRecentTurnLimit)
         var edgeTokenCounts: [String: Int] = [:]
         for node in recentAssistantTurns {
-            for token in soundRutEdgeTokens(node.summary) {
+            for token in soundRutEdgeTokens(node.summary, edgeSentenceCount: dyn.soundRutEdgeSentenceCount) {
                 edgeTokenCounts[token, default: 0] += 1
             }
         }
@@ -957,7 +952,7 @@ extension CognitiveSubstrate {
                 valence: node.emotionalValence,
                 targetWarmth: targetWarmth,
                 targetValence: targetValence,
-                age: now.timeIntervalSince(node.lastActivatedAt),
+                age: now.timeIntervalSince(node.createdAt),
                 tolerance: dyn.soundEchoRegisterTolerance,
                 halfLife: dyn.soundEchoRecencyHalfLife)
             // W7/P10 — did it LAND? Bounded re-rank inside the register band.
@@ -971,7 +966,7 @@ extension CognitiveSubstrate {
             let lhsScore = score(lhs)
             let rhsScore = score(rhs)
             if lhsScore != rhsScore { return lhsScore > rhsScore }
-            if lhs.lastActivatedAt != rhs.lastActivatedAt { return lhs.lastActivatedAt > rhs.lastActivatedAt }
+            if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
             return lhs.id.uuidString < rhs.id.uuidString
         }
         // Verbal-rut damping (2026-08-01, the "handsome" loop): her warmest
@@ -1048,7 +1043,7 @@ extension CognitiveSubstrate {
     /// Distinctive tokens at the conversational edges of one assistant turn.
     /// `soundEchoFragment` remains the exemplar source; this separate view is
     /// awareness-only so a closing tic can be noticed without quoting it back.
-    private func soundRutEdgeTokens(_ summary: String) -> Set<String> {
+    private func soundRutEdgeTokens(_ summary: String, edgeSentenceCount: Int) -> Set<String> {
         var cleaned = summary
         if let quoted = cleaned.range(of: "User message:", options: [.caseInsensitive]) {
             cleaned = String(cleaned[..<quoted.lowerBound])
@@ -1090,7 +1085,7 @@ extension CognitiveSubstrate {
         let closingSentences = sentences(in: String(cleaned.suffix(800)))
         guard let first = openingSentences.first else { return [] }
 
-        let tail = closingSentences.suffix(dynamics.soundRutEdgeSentenceCount)
+        let tail = closingSentences.suffix(edgeSentenceCount)
         let edges = ([first] + tail)
             .map { String($0.prefix(320)) }
             .joined(separator: " ")
@@ -1197,11 +1192,12 @@ extension CognitiveSubstrate {
     /// substrate + neutral fallback when the organism is off.
     private func feltFingerprintLine(
         signals: FeltSignals,
+        intensityFloor: Double,
         affectEnabled: Bool? = nil
     ) -> String? {
         guard affectEnabled ?? configuration.affectEnabled else { return nil }
         return CognitiveSubstrate.feltFingerprint(
-            signals, intensityFloor: dynamics.feltIntensityFloor)
+            signals, intensityFloor: intensityFloor)
     }
 
     /// The live FeltSignals the fingerprint is built from — extracted so tests can read
@@ -1215,10 +1211,11 @@ extension CognitiveSubstrate {
         /// W4/P2 — non-nil on the FROZEN path, where the proxies were captured at
         /// freeze time and must be replayed rather than recomputed from live
         /// state that has since moved.
-        proxies capturedProxies: CognitiveFeltProxyReads? = nil
+        proxies capturedProxies: CognitiveFeltProxyReads? = nil,
+        dynamics capturedDynamics: PersonalityDynamicsConfiguration? = nil
     ) -> FeltSignals {
         let now = explicitNow ?? dependencies.now()
-        let dyn = dynamics
+        let dyn = capturedDynamics ?? dynamics
         let mood = explicitMood ?? derivedMood(at: now)
         let currentAffect = explicitAffect ?? projectedAffect(at: now)
         // Immediate workspace tint (User, 2026-07-08): what she's HOLDING right now colors
@@ -1499,11 +1496,7 @@ extension CognitiveSubstrate {
     }
 
     public func prepareCapsule(_ request: CognitiveCapsuleRequest) async -> CognitiveCapsule? {
-        let requestTurnKind = CognitiveTurnKind.inferred(fromSignals: [
-            request.surface,
-            request.sessionId ?? "",
-            request.userMessage,
-        ])
+        let requestTurnKind = request.resolvedTurnKind
         guard requestTurnKind == .live || request.allowNonLiveProjection else { return nil }
         let capsule = await compileCapsule(request)
         guard capsule.mode == .inject,
@@ -1529,11 +1522,7 @@ extension CognitiveSubstrate {
         _ request: CognitiveCapsuleRequest,
         at fixedAt: Date
     ) async -> CognitivePreparedCapsule? {
-        let requestTurnKind = CognitiveTurnKind.inferred(fromSignals: [
-            request.surface,
-            request.sessionId ?? "",
-            request.userMessage,
-        ])
+        let requestTurnKind = request.resolvedTurnKind
         guard requestTurnKind == .live || request.allowNonLiveProjection else { return nil }
         let read = await frozenRead(at: fixedAt, currentSessionId: request.sessionId)
         let prepared = compileFrozenCapsulePresentation(request, from: read)
@@ -1607,8 +1596,14 @@ extension CognitiveSubstrate {
     /// kindness, but warmth comes back a step at a time, not all at once. Pure.
     static let settlingMoodThreshold = -0.05
     static let settlingMaxRun = 2
-    func settlingLine(mood: CognitiveMoodReading, incoming: AffectAppraisal, affectEnabled: Bool?) -> String? {
-        guard configuration.enabled, affectEnabled ?? configuration.affectEnabled else { return nil }
+    func settlingLine(
+        mood: CognitiveMoodReading,
+        incoming: AffectAppraisal,
+        affectEnabled: Bool?,
+        cognitionEnabled: Bool? = nil
+    ) -> String? {
+        guard cognitionEnabled ?? configuration.enabled,
+              affectEnabled ?? configuration.affectEnabled else { return nil }
         guard mood.basis > 0, mood.valence < Self.settlingMoodThreshold else { return nil }
         guard incoming.valence > 0, incoming.warmth > 0 || incoming.affection else { return nil }
         return "- Settling: still settling from a hard stretch; the kindness lands, "

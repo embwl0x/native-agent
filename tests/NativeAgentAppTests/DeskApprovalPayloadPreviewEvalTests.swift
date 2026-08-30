@@ -1,13 +1,32 @@
 import ApprovalInbox
+import AppKit
 import Foundation
 import NativeAgentShared
 import PersistenceCore
 import Testing
+import SwiftUI
 @testable import NativeAgentApp
 
 // EVAL FENCE: app.desk / desk.approvals.payloadPreview
 @Suite("Desk approval payload preview")
 struct DeskApprovalPayloadPreviewEvalTests {
+    @MainActor
+    @Test("the full preview expands beyond its compact lines while keeping a bounded card")
+    func fullPreviewIsReachableWithoutChangingDecisionReadiness() throws {
+        let preview = (1...35).map { "Review line \($0): recipient, effect, and requested change" }.joined(separator: "\n")
+        let collapsed = NSHostingView(rootView: ApprovalPayloadPreviewView(preview: preview).frame(width: 400))
+        let expanded = NSHostingView(rootView: ApprovalPayloadPreviewView(preview: preview, initiallyExpanded: true).frame(width: 400))
+        let compactSize = collapsed.fittingSize
+        let fullSize = expanded.fittingSize
+        #expect(compactSize.height > 70, "The collapsed preview must retain its four visible text lines")
+        #expect(fullSize.height > compactSize.height)
+        #expect(fullSize.height < 300)
+        let source = try AppSourceScraping.appSource("ApprovalsView.swift")
+        #expect(source.contains(".lineLimit(isExpanded ? nil : 4)"))
+        #expect(source.contains("Show full preview"))
+        #expect(source.contains(".textSelection(.enabled)"))
+    }
+
     @Test("a persisted canonical payload preview remains observable and reviewable at the Desk reader")
     func canonicalPreviewSurvivesStoreAndClientBoundary() async throws {
         let root = try temporaryRoot()

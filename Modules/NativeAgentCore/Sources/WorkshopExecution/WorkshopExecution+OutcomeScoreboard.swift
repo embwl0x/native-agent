@@ -92,6 +92,7 @@ public struct WeeklyOutcomeStats: Sendable, Equatable {
     public var completed: Int
     public var failed: Int
     public var cancelled: Int
+    public var unverified: Int
     /// completed / terminal (0 when no terminal Workshop executions that week). Excludes
     /// still-running/queued from the denominator so the rate isn't dragged
     /// down by jobs that simply haven't finished yet.
@@ -111,7 +112,7 @@ public struct WeeklyOutcomeStats: Sendable, Equatable {
 
     public init(
         weekStart: Date, total: Int, terminal: Int, completed: Int, failed: Int,
-        cancelled: Int, completionRate: Double, medianTotalSteps: Double,
+        cancelled: Int, unverified: Int = 0, completionRate: Double, medianTotalSteps: Double,
         medianCompletedSteps: Double, medianWallSeconds: Double, medianRerunCount: Double,
         stubRate: Double = 0
     ) {
@@ -121,6 +122,7 @@ public struct WeeklyOutcomeStats: Sendable, Equatable {
         self.completed = completed
         self.failed = failed
         self.cancelled = cancelled
+        self.unverified = unverified
         self.completionRate = completionRate
         self.medianTotalSteps = medianTotalSteps
         self.medianCompletedSteps = medianCompletedSteps
@@ -135,8 +137,9 @@ public enum WorkshopOutcomeScoreboard {
     public static let completedStatuses: Set<String> = ["completed", "done", "succeeded"]
     public static let failedStatuses: Set<String> = ["failed"]
     public static let cancelledStatuses: Set<String> = ["cancelled", "canceled"]
+    public static let unverifiedStatuses: Set<String> = ["unverified"]
     public static let terminalStatuses: Set<String> =
-        completedStatuses.union(failedStatuses).union(cancelledStatuses)
+        completedStatuses.union(failedStatuses).union(cancelledStatuses).union(unverifiedStatuses)
 
     /// UTC ISO-8601 calendar — deterministic week bucketing regardless of host
     /// timezone (the host TZ must NOT shift which week a Workshop execution lands in).
@@ -186,6 +189,7 @@ public enum WorkshopOutcomeScoreboard {
             let completed = group.filter { $0.isCompleted }.count
             let failed = group.filter { failedStatuses.contains($0.status.lowercased()) }.count
             let cancelled = group.filter { cancelledStatuses.contains($0.status.lowercased()) }.count
+            let unverified = group.filter { unverifiedStatuses.contains($0.status.lowercased()) }.count
             let completionRate = terminal.isEmpty ? 0 : Double(completed) / Double(terminal.count)
             let stubs = group.filter { $0.wasStub }.count
             let stubRate = group.isEmpty ? 0 : Double(stubs) / Double(group.count)
@@ -196,6 +200,7 @@ public enum WorkshopOutcomeScoreboard {
                 completed: completed,
                 failed: failed,
                 cancelled: cancelled,
+                unverified: unverified,
                 completionRate: completionRate,
                 medianTotalSteps: median(group.map { Double($0.totalSteps) }),
                 medianCompletedSteps: median(group.map { Double($0.completedSteps) }),
@@ -280,13 +285,30 @@ public enum WorkshopOutcomeScoreboard {
             deskHandle: receipt.handle,
             createdAt: created,
             updatedAt: completed,
-            status: receipt.status,
+            status: outcomeStatus(for: receipt),
             totalSteps: receipt.totalSteps,
             completedSteps: receipt.completedSteps,
             rerunCount: receipt.rerunCount,
             triggerSource: receipt.triggerSource,
             wasStub: receipt.wasStub
         )
+    }
+
+    /// New receipts distinguish a process ending from its promised outcome
+    /// being proven. Legacy receipts omit verificationStatus and retain their
+    /// historical interpretation instead of being rewritten speculatively.
+    private static func outcomeStatus(for receipt: WorkshopDirectedTaskReceipt) -> String {
+        guard completedStatuses.contains(receipt.status.lowercased()) else {
+            return receipt.status
+        }
+        switch receipt.verificationStatus {
+        case .satisfied, .none:
+            return receipt.status
+        case .failed:
+            return "failed"
+        case .unverified:
+            return "unverified"
+        }
     }
 }
 
@@ -316,6 +338,7 @@ extension WorkshopOutcomeScoreboard {
                 : "\(Int(w.medianWallSeconds.rounded()))s"
             return "- week of \(df.string(from: w.weekStart)): "
                 + "\(w.total) job(s), \(w.completed)/\(w.terminal) completed (\(rate)%), "
+                + "\(w.unverified) unverified, "
                 + "median \(Int(w.medianTotalSteps.rounded())) steps, ~\(wall) wall, "
                 + "\(String(format: "%.1f", w.medianRerunCount)) reruns, "
                 + "\(Int((w.stubRate * 100).rounded()))% planner-fallback"
@@ -360,10 +383,17 @@ extension SwiftNativeWorkshopRunner {
 
         var samples: [WorkshopOutcomeSample] = []
         for record in await listAll() {
-            if let receipt = receiptByExecution[record.id],
-               let sample = WorkshopOutcomeScoreboard.sample(from: receipt) {
-                samples.append(sample)
-                continue
+            if var receipt = receiptByExecution[record.id] {
+                // Hydrate pre-migration receipts from their canonical execution
+                // record when possible. This corrects existing scoreboards
+                // without inventing verification for orphaned legacy history.
+                if receipt.verificationStatus == nil {
+                    receipt.verificationStatus = record.verification?.status
+                }
+                if let sample = WorkshopOutcomeScoreboard.sample(from: receipt) {
+                    samples.append(sample)
+                    continue
+                }
             }
             guard var sample = WorkshopOutcomeScoreboard.sample(from: record) else { continue }
             // `fromStub` isn't on WorkshopExecutionRecord, so migration-fallback samples

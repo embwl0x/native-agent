@@ -194,6 +194,119 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(receipts.count == 1)
 }
 
+// F5 (2026-08-28): the first byte-triggered trim archives the pre-trim ledger
+// to a sibling `audit-archive-<date>.jsonl` — once, ever — so lowering the
+// trigger to a value that actually fires cannot silently drop the accumulated
+// history. Later crossings must never mint a second archive.
+@Test func SecurityCenter_archivesAuditOnceBeforeFirstByteTriggeredTrim() async throws {
+    let root = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let securityDir = root.appendingPathComponent("security", isDirectory: true)
+    let auditPath = securityDir.appendingPathComponent("audit.jsonl")
+    try FileManager.default.createDirectory(at: securityDir, withIntermediateDirectories: true)
+
+    // Seed past BOTH bounds (byte trigger and row cap) so the append trims.
+    let pad = String(repeating: "x", count: 1_024)
+    let seededRows = JSONLLineCaps.securityAudit + 1_000
+    var seed = ""
+    seed.reserveCapacity(seededRows * (pad.utf8.count + 24))
+    for i in 0..<seededRows { seed += "{\"i\":\(i),\"pad\":\"\(pad)\"}\n" }
+    #expect(seed.utf8.count >= JSONLLineCaps.securityAuditTrimTriggerBytes)
+    try Data(seed.utf8).write(to: auditPath)
+
+    let persistence = SwiftNativePersistenceCore()
+    let center = SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence)
+    let envelope = await center.evaluateTool(
+        tool: "tool_catalog",
+        input: [:],
+        origin: SecurityOriginContext(surface: "chat")
+    )
+    try await center.record(envelope)
+
+    func archiveFiles() throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(
+            at: securityDir, includingPropertiesForKeys: nil
+        ).filter {
+            $0.lastPathComponent.hasPrefix("audit-archive-")
+                && $0.lastPathComponent.hasSuffix(".jsonl")
+        }
+    }
+
+    let archives = try archiveFiles()
+    #expect(archives.count == 1, "first trigger crossing archives exactly once")
+    let completionMarker = securityDir.appendingPathComponent(
+        ".audit-pretrim-archive-complete-v1"
+    )
+    #expect(FileManager.default.fileExists(atPath: completionMarker.path))
+    if let archive = archives.first {
+        #expect(
+            try Data(contentsOf: archive) == Data(seed.utf8),
+            "archive is the verbatim pre-trim ledger"
+        )
+    }
+    let hotLines = try String(contentsOf: auditPath, encoding: .utf8)
+        .split(separator: "\n", omittingEmptySubsequences: true)
+    #expect(hotLines.count == JSONLLineCaps.securityAudit, "trim applied the row cap")
+    #expect(hotLines.last?.contains("tool_catalog") == true, "newest receipt survives")
+
+    // A later crossing (the trimmed file is still above the trigger here)
+    // must trust the durable completion marker rather than enumerate archives
+    // or create another. Removing the temp archive proves the marker is the
+    // durable decision, not merely a cache of the directory listing.
+    if let archive = archives.first { try FileManager.default.removeItem(at: archive) }
+    try await center.record(envelope)
+    #expect(try archiveFiles().isEmpty)
+}
+
+// F5 review fix (gpt-5.5, HIGH): stride appends enforce the ROW cap with no
+// byte gate, so a compact over-cap ledger UNDER the byte trigger is trimmed
+// on the first append to its path. The one-shot archive must fire on that
+// path too — bytes >= trigger is not the only door rows can drop through.
+@Test func SecurityCenter_archivesAuditBeforeRowCapTrimBelowByteTrigger() async throws {
+    let root = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let securityDir = root.appendingPathComponent("security", isDirectory: true)
+    let auditPath = securityDir.appendingPathComponent("audit.jsonl")
+    try FileManager.default.createDirectory(at: securityDir, withIntermediateDirectories: true)
+
+    // Exactly at the row cap, comfortably under the byte trigger. The pending
+    // append is what crosses the boundary, so the pre-append archive guard must
+    // treat equality as a potential trim rather than waiting one row too late.
+    let seededRows = JSONLLineCaps.securityAudit
+    let seed = (0..<seededRows).map { "{\"i\":\($0)}" }.joined(separator: "\n") + "\n"
+    #expect(seed.utf8.count < JSONLLineCaps.securityAuditTrimTriggerBytes)
+    try Data(seed.utf8).write(to: auditPath)
+
+    let persistence = SwiftNativePersistenceCore()
+    let center = SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence)
+    let envelope = await center.evaluateTool(
+        tool: "tool_catalog",
+        input: [:],
+        origin: SecurityOriginContext(surface: "chat")
+    )
+    // First append to this path: the stride counter forces a full line-cap
+    // check, which drops rows despite the file being below the byte trigger.
+    try await center.record(envelope)
+
+    let archives = try FileManager.default.contentsOfDirectory(
+        at: securityDir, includingPropertiesForKeys: nil
+    ).filter {
+        $0.lastPathComponent.hasPrefix("audit-archive-")
+            && $0.lastPathComponent.hasSuffix(".jsonl")
+    }
+    #expect(archives.count == 1, "row-cap trim below the byte trigger must archive first")
+    if let archive = archives.first {
+        #expect(
+            try Data(contentsOf: archive) == Data(seed.utf8),
+            "archive is the verbatim pre-trim ledger"
+        )
+    }
+    let hotLines = try String(contentsOf: auditPath, encoding: .utf8)
+        .split(separator: "\n", omittingEmptySubsequences: true)
+    #expect(hotLines.count == JSONLLineCaps.securityAudit, "row cap applied after archiving")
+    #expect(hotLines.last?.contains("tool_catalog") == true, "newest receipt survives")
+}
+
 // MARK: - LEDGER: core.persistence.securityAuditEffectiveBound
 
 @Test func SecurityCenter_auditRetentionReport_exposesByteBoundNotDeferredRowCap() async throws {
@@ -205,17 +318,22 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     try FileManager.default.createDirectory(
         at: auditPath.deletingLastPathComponent(), withIntermediateDirectories: true
     )
-    let seededCount = JSONLLineCaps.securityAudit + 1
-    let seed = String(repeating: "{}\n", count: seededCount)
-    #expect(seed.utf8.count < JSONLLineCaps.securityAuditTrimTriggerBytes)
-    try Data(seed.utf8).write(to: auditPath)
-
     let center = SwiftNativeSecurityCenter(dataRoot: root)
     let envelope = await center.evaluateTool(
         tool: "tool_catalog",
         input: [:],
         origin: SecurityOriginContext(surface: "chat")
     )
+    // F2 (2026-08-28): the FIRST append to a path always evaluates the line
+    // cap in full (`capCheckStride` fires on the 1st, stride+1th, … append),
+    // so warm the stride counter up before seeding — the deferred-cap
+    // behaviour this test pins is the steady state between stride checks.
+    try await center.record(envelope)
+
+    let seededCount = JSONLLineCaps.securityAudit + 1
+    let seed = String(repeating: "{}\n", count: seededCount)
+    #expect(seed.utf8.count < JSONLLineCaps.securityAuditTrimTriggerBytes)
+    try Data(seed.utf8).write(to: auditPath)
     try await center.record(envelope)
 
     // The evaluation enters through the real SecurityCenter writer and reads
@@ -522,7 +640,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(!envelope.allowed)
     #expect(envelope.decision == .block)
     #expect(envelope.capabilities.contains("external_send"))
-    #expect(envelope.reasons.contains { $0.contains("remote high-risk origin is not trusted") })
+    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
 }
 
 @Test func SecurityCenter_canonicalizesXChatReadToolsToSignedConnectorActions() async throws {
@@ -723,7 +841,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(!envelope.originTrusted)
     #expect(!envelope.allowed)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("remote high-risk origin is not trusted") })
+    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
 }
 
 @Test func SecurityCenter_treatsMacIntegrationChatToolsAsKnownBuiltins() async throws {
@@ -1097,17 +1215,10 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(!envelope.reasons.contains { $0.contains("operator review") })
 }
 
-/// OLD CONTRACT: a flagged payload from an UNTRUSTED origin always tripped the
-/// prompt-injection shield to .ask, even inside a Full Mac (YOLO) window.
-/// NEW CONTRACT (User 2026-08-13, "yolo means yolo, nothing gated, end of
-/// story"): an ACTIVE YOLO window is a blanket operator grant — the shield
-/// NOTES the markers but does not escalate. The real boundary for untrusted
-/// senders is the perimeter (the Telegram allowlist drops non-allowlisted
-/// chats before dispatch); the shield is not a second gate inside YOLO.
-/// TEETH: the same payload with NO YOLO window still asks — proven by the
-/// non-fullMac branch below and by SecurityCenter_externalSendWithPATPrompt-
-/// MarkersStillAsks (which runs on a root with no Full Mac window).
-@Test func SecurityCenter_untrustedTelegramMarkersUnderYolo_notedNotGated_butGatesWithoutYolo() async throws {
+/// Full Mac is a grant to admitted operators, not a way for an untrusted
+/// remote sender to manufacture admission. The paired test immediately above
+/// proves an allowlisted Telegram origin keeps the full YOLO behavior.
+@Test func SecurityCenter_untrustedTelegramCannotInheritYolo_butStillUsesOrdinaryGateWithoutYolo() async throws {
     // makeTrustedTelegramRoot arms a Full Mac (YOLO) window.
     let (yoloRoot, yoloPersistence) = try await makeTrustedTelegramRoot(
         toolAutonomy: ["codex_message": .string("auto")]
@@ -1125,10 +1236,11 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
 
     let yolo = await yoloCenter.evaluateTool(tool: "codex_message", input: input, origin: untrustedOrigin)
     #expect(yolo.originTrusted == false)
-    #expect(yolo.decision == .allow)
-    #expect(yolo.reasons.contains { $0.contains("yolo: not gating") })
+    #expect(yolo.decision == .block)
+    #expect(yolo.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
 
-    // TEETH: no YOLO window → the shield still gates the identical payload.
+    // No YOLO authority is available to inherit, so the ordinary injection
+    // shield remains the governing gate for the identical payload.
     let plainRoot = try makeSecurityTempRoot()
     let plainCenter = SwiftNativeSecurityCenter(dataRoot: plainRoot)
     let gated = await plainCenter.evaluateTool(tool: "codex_message", input: input, origin: untrustedOrigin)
@@ -1236,7 +1348,7 @@ private func makeTrustedTelegramRoot(
 }
 
 /// An UNTRUSTED remote origin (chat not in the allowlist) stays hard-blocked by the
-/// trust gate (Gate 1) — the waiver never elevates a stranger.
+/// Full Mac admission boundary — the waiver never elevates a stranger.
 @Test func SecurityCenter_blocks_untrusted_remote_high_risk() async throws {
     let (root, persistence) = try await makeTrustedTelegramRoot()
     let center = SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence)
@@ -1251,7 +1363,7 @@ private func makeTrustedTelegramRoot(
     #expect(envelope.originTrusted == false)
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("not trusted") })
+    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
 }
 
 /// With trustedRemoteHighRiskAllowed=false, the user restores strict signing: even a
@@ -1557,7 +1669,9 @@ private func makeTrustedTelegramRoot(
     #expect(!envelope.originTrusted)
     #expect(envelope.autonomyLevel == "send_approval")
     #expect(!envelope.allowed)
-    #expect(envelope.decision == .ask)
+    // An unadmitted remote origin stops before the autonomy approval stage.
+    #expect(envelope.decision == .block)
+    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
 }
 
 @Test func SecurityCenter_unifiedPolicyDecisionLabelsLocalFullMacCriticalAllow() async throws {
@@ -1789,7 +1903,83 @@ private func makeTrustedTelegramRoot(
     #expect(envelope.originTrusted == false)
     #expect(envelope.allowed == false)
     #expect(envelope.decision == .block)
-    #expect(envelope.reasons.contains { $0.contains("not trusted") })
+    #expect(envelope.reasons.contains { $0.contains("untrusted remote origin cannot use Full Mac authority") })
+}
+
+@Test func SecurityCenter_corruptTelegramAdmissionCannotReachYolo() async throws {
+    let (root, persistence) = try await makeTrustedTelegramRoot(
+        toolAutonomy: ["default": .string("send_approval")]
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let config = root.appendingPathComponent("telegram", isDirectory: true)
+        .appendingPathComponent("config.json")
+    try Data("{\"allowed_chat_ids\":[123]".utf8).write(to: config, options: .atomic)
+    let center = SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence)
+
+    let envelope = await center.evaluateTool(
+        tool: "install_app",
+        input: ["reason": .string("corrupt admission must not inherit Full Mac")],
+        origin: SecurityOriginContext(
+            surface: "telegram",
+            sessionId: "telegram:123",
+            chatId: "123",
+            isRemote: true
+        )
+    )
+
+    #expect(!envelope.originTrusted)
+    #expect(!envelope.allowed)
+    #expect(envelope.decision == .block)
+    #expect(envelope.autonomyLevel != "auto")
+    #expect(envelope.reasons.contains { $0.contains("allowlist not configured") })
+}
+
+@Test func SecurityCenter_remoteAdmissionNamespacesDoNotCrossUnderYolo() async throws {
+    let (root, persistence) = try await makeTrustedTelegramRoot(
+        toolAutonomy: ["default": .string("send_approval")]
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+    let slackDir = root.appendingPathComponent("connectors", isDirectory: true)
+        .appendingPathComponent("slack", isDirectory: true)
+    try FileManager.default.createDirectory(at: slackDir, withIntermediateDirectories: true)
+    try Data(#"{"allowed_channel_ids":["C123"]}"#.utf8)
+        .write(to: slackDir.appendingPathComponent("auth.json"), options: .atomic)
+    let center = SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence)
+
+    let admittedTelegram = await center.evaluateTool(
+        tool: "install_app",
+        input: ["reason": .string("admitted Telegram")],
+        origin: SecurityOriginContext(surface: "telegram", chatId: "123", isRemote: true)
+    )
+    let admittedSlack = await center.evaluateTool(
+        tool: "install_app",
+        input: ["reason": .string("admitted Slack")],
+        origin: SecurityOriginContext(surface: "slack", chatId: "C123", isRemote: true)
+    )
+    #expect(admittedTelegram.originTrusted)
+    #expect(admittedTelegram.allowed)
+    #expect(admittedTelegram.autonomyLevel == "auto")
+    #expect(admittedSlack.originTrusted)
+    #expect(admittedSlack.allowed)
+    #expect(admittedSlack.autonomyLevel == "auto")
+
+    let telegramUsingSlackCredential = await center.evaluateTool(
+        tool: "install_app",
+        input: ["reason": .string("cross-surface Telegram claim")],
+        origin: SecurityOriginContext(surface: "telegram", chatId: "C123", isRemote: true)
+    )
+    let slackUsingTelegramCredential = await center.evaluateTool(
+        tool: "install_app",
+        input: ["reason": .string("cross-surface Slack claim")],
+        origin: SecurityOriginContext(surface: "slack", chatId: "123", isRemote: true)
+    )
+    for envelope in [telegramUsingSlackCredential, slackUsingTelegramCredential] {
+        #expect(!envelope.originTrusted)
+        #expect(!envelope.allowed)
+        #expect(envelope.decision == .block)
+        #expect(envelope.autonomyLevel != "auto")
+        #expect(envelope.reasons.contains { $0.contains("not in allowlist") })
+    }
 }
 
 @Test func SecurityCenter_localYoloTreatsNativeToolsAsAutonomyAuto() async throws {

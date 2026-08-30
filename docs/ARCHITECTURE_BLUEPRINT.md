@@ -1,6 +1,79 @@
 # NativeAgent Architecture Blueprint
 
-Last updated: 2026-08-16
+Bounded discovery contract (2026-08-30): `MacFourVerbs.zoom` owns on-demand
+HUD/readout and controls/actions scopes. Whole-section expansion retains
+source omissions and original addresses; observed caps and unobserved values
+are distinct. `MacScreenRender` supplies real `screen(part:)` recourse without
+exposing inaccessible renderer knobs. Ordinary-turn caps remain unchanged.
+
+Natural aiming contract (2026-08-30): within-target diagonal prefixes are
+parsed separately from object identity and select inset quarter-points.
+Explicit covered points never relocate. `VisionFourVerbAdapter` shares natural
+shape names across existing nearest-object relation aliases, without inferring
+new relations or exposing the alias catalog in model context.
+
+Fine-wheel contract (2026-08-30): Four-verb scroll has a local four-direction
+type and optional bounded line magnitude; explicit wheel requests never fall
+through to vertical page keys or change the lower semantic scroll enum. Zero
+keeps defaults expressible in strict tool bindings. Existing hand input and
+fresh clear-point selection own both axes and outcome observation.
+
+Partial-region contract (2026-08-30): FourVerbPerception retains broad visual
+regions with exact foreground exclusions; discrete objects still fail overlap
+admission. `MacRegionAim` chooses a clear default point with bounded geometry
+work, but never relocates an explicit spatial request or permits a drag across
+an exclusion. All current region exclusions survive target fusion. This adds
+no authority, input path, cached screen, or background observer.
+
+Held-key contract (2026-08-30): `MacKeySyntax.parseHeldKeys` owns simultaneous
+space-separated key/chord/modifier sets for both timed key holds and `holding`
+around gestures. The ordinary key parser still means sequential chords. Both
+paths reuse the existing balanced hand and cancellation release owner.
+
+Pointer feedback contract (2026-08-30): `MacPointerPositionSource` supplies one
+read-only system position to fused `view`. FourVerbPerception carries it with
+the observed surface frame; screen renders a bounded normalized line. Hover
+and move settle only pointer-in-current-target bounds, never inferred application
+effects. Observed vision bounds remain separate from predicted motor bounds;
+pointer prose is excluded from structural-effect comparisons. Missing reads
+stay unavailable, and default test sources never read the real cursor.
+
+Pointer button contract (2026-08-30): public four-verb `act` carries optional
+left/right button choice through the canonical hand to click/drag/hold input.
+`auto` (or omission) preserves ordinary semantic/key/hover actions even in tool
+bindings that require a value for every field.
+Explicit buttons never become AXPress or Control-left substitutes. Invalid
+combinations fail before input; cancellation releases the actual held button.
+
+Visual naming contract (2026-08-30): `VisionFourVerbAdapter` maps measured
+square/round silhouettes to ordinary shape-noun aliases on existing targets.
+Motion qualifiers require current tracker evidence; aliases neither fabricate
+geometry nor relax ambiguity, and remain private rather than expanding context.
+
+Transient menu contract (2026-08-30): `MacAXElementSource.transientMenuRoots`
+and `MacTransientMenus` own bounded current native menu evidence. The fused
+`view` publishes redacted, handle-free menu items; FourVerbPerception adds
+fresh named physical targets. Application-sibling menu paths are never treated
+as document-window paths, and hidden menu-bar inventories are not expanded.
+Discovery includes direct siblings along the focused element's ancestor chain
+(16 ancestors / 96 children maximum), because Chrome keeps page focus while
+showing a menu beside the page's containing group.
+
+Pointer coordination contract (2026-08-30): `MacHandRepertoire.hold` carries
+held flags on key, mouse, and scroll events through `CGEventSink`, alongside
+physical key down/up. Do not depend on asynchronous HID state for modified
+clicks. Release flags track only still-held modifiers; cancellation retains
+the canonical neutral-hand recovery.
+
+Selective-context contract (2026-08-30): explicit correction topics remain
+canonical memory metadata and become derived Context applicability, not a new
+authority owner. Applied memory corrections return exact selected-atom feedback
+through the prepared turn. Conversation continuation is bounded and on-demand;
+work/reminders are not newly surfaced without the user's request. See
+`docs/build_plans/fluid-context-as-built-map.md` for current telemetry and eval
+boundaries.
+
+Last updated: 2026-08-29
 
 This is the fast architecture map for any LLM or human collaborator working on NativeAgent. Read this before making structural changes.
 
@@ -79,12 +152,99 @@ identity, connector readiness, protected approval floors, provenance,
 effect-time validation, receipts, or domain verification. Non-Full-Mac turns
 remain compact and lazy.
 
+New `codex_message`, `claude_message`, and `omp_message` coding conversations fork the
+resolved Git checkout into distinct ordinary worktrees before their durable
+inbox rows are queued. A private two-line conversation pointer returns later
+contextual messages to the same tree; a conflicting explicit follow-up cwd is
+rejected before queueing. An omitted cwd remains absent, ordinary non-Git paths
+retain their prior behavior, and Git evidence with a failed probe or allocation
+is refused instead of dispatching into a potentially shared source directory.
+This is dispatch isolation only, not a Factory state machine or lifecycle.
+
 ### Swarm workers
+
+Ordinary chat turns do not construct or inject cross-session activity digests.
+`buildTurnContextWithHistory` keeps same-session history and relevant memory;
+its optional `SessionDigestProvider` is an explicit caller opt-in, including
+when a cached digest exists. Historical work feeds and digest files remain
+available to requested inspection, not automatic conversational agenda.
+Active context assembly checks actual task cancellation at preparation and
+completion boundaries. Packet memory-use accounting is admitted only after
+the final context is assembled, not merely after selection; ordinary provider
+failures still use the established fallback without claiming a user Stop.
+
+Memory projection keeps validated canonical dates in its bounded presentation
+body while embedding the original admitted fact text. These dates describe
+recorded evidence, not a live-status check; adaptive memory remains subject to
+the same selection and expansion policy. Canonical correction flushes join the
+current owner's already-admitted derived deliveries as well as the pending
+batch, without cancelling those deliveries or changing immutable turn leases.
+Explicit `recall_memory`/`recall_search` reads can recover a truncated hit by
+`memory_id`, following `read_more` in pages capped at 2,000 characters. Its
+content hash binds continuations to one displayed text version; after the
+usual eligibility check, a mismatch returns `record_changed` without text and
+requires restarting at zero. Legacy unbound continuations are explicitly
+unverified, without adding a cursor store or changing access authority.
+The existing MemoryV2 boundary performs canonical point lookup and the same
+lifecycle, disclosure and durable-quality checks; denied and missing IDs are
+indistinguishable and never fall back to KnowledgeGraph. Ordinary search and
+automatic turn budgets remain unchanged.
+Search fallback may use KnowledgeGraph only to find exact memory-backed fact
+candidates, then reads their current text through that same canonical MemoryV2
+boundary. Retired, denied, missing, or unlinked graph summaries cannot bypass
+recall eligibility after a zero-hit result or semantic outage. Explicit graph
+inspection remains separately available.
+Skill reads resolve an exact registered display name or ID before applying
+legacy `.md` spelling compatibility. Punctuation in a display name never
+becomes a filesystem path: only validated body handles and the existing
+canonical-root containment checks reach file reads.
+Saving a legacy skill without an ID allocates a collision-free identity before
+body or version-history writes, including case-only filename collisions.
+Explicit IDs remain unchanged; update receipts point to the body actually
+written while the prior version and unrelated skill bodies are preserved.
+App runtime-skill enable, status, delete, archive, and restore mutations await the existing serialized MemoryV2 pointer
+reconciliation and admitted projection delivery before reporting completion.
+If recall reconciliation fails after the canonical mutation, the UI refreshes
+the saved state and explicitly reports the partial result without rollback.
+Manifest-only installation confirms registration, not an unread body or recall
+pointer; it does not construct a memory owner merely to change that state.
+Canonical memory correction refuses a self-reference. If storing the correction
+deduplicates to the original fact, that fact remains active and the tool reports
+that no correction was applied rather than retiring its only recallable copy.
+The same write transaction checks that a distinct replacement still exists and
+is eligible before retiring the original, preserving recall if the replacement
+was removed or retired between storage and correction.
+Proposal acceptance rechecks exact forgotten-content hashes inside its write
+transaction before the existing semantic tombstone gate, including legacy
+records without embeddings; a late tombstone remains a committed rejection.
+Foreground memory deletion uses the canonical owner's atomic delete result and
+awaited projection completion, preserving missing-row errors and exact-root
+isolation without changing prepared turn leases.
+Foreground pinning uses the same owner's transactional pinned-only metadata
+patch and completion boundary, without replacing a stale metadata snapshot.
+Manual memory saves resolve that same exact-root owner rather than always
+using the process-default singleton.
+Duplicate reassertions also await existing projection publication after their
+metadata update, so observed dates and provenance reach the next prepared turn
+without changing identity, creation time, or embedding work.
 
 `agent_swarm` is temporary fan-out inside the same runtime, not another mind.
 Provider Routing's checked `swarms` surface tuple owns its default provider,
 model, and reasoning effort. Explicit model choices can specialize workers;
 TrustCenter does not own a competing model default.
+Explicit malformed worker lists or unrecognized access modes are rejected
+before provider execution, rather than silently substituting default workers
+or another access mode. Omitted/nullable defaults and valid aliases remain.
+Explicit worker mission/context aliases must contain text, null, or no value;
+malformed supplied constraints fail before any worker starts instead of being
+silently dropped, even when another alias contains valid text.
+Each admitted swarm also captures its provider transport and service tier.
+Prompt-only and inherited workers bind their selected model and effort to
+that captured route; same-family specialization preserves the selected
+transport, while explicit cross-family models retain existing inference.
+Synthesis reuses the admitted tuple rather than rereading picker settings.
+An inherited worker's originating surface still controls authority, not its
+provider tier, and no parent call's effort silently replaces a worker choice.
 
 Workers are prompt-only/read-only unless the parent selects `access: inherit`.
 Inherited workers reuse `runEphemeralToolTurn` and the existing tool dispatcher,
@@ -94,6 +254,115 @@ authorization identity even though LLM calls use the Swarms provider. Nested
 delegation and NativeAgent install/restart are withheld from worker catalogs
 and dispatch. SwarmRuns owns fan-out and receipts only; it does not become a
 memory, permission, provider, or tool owner.
+Worker discovery reflects that same scope. Its fixed-request load/unload
+receipts never mutate the parent session's durable readiness; ordinary tools
+retain their existing capabilities and effect-time authority checks.
+
+Temporary tool turns bind their own execution ID to the existing trace bus
+and durable tool receipts, without creating a chat session. Worker aliases
+are canonicalized before the existing parent-only recursion/lifecycle check.
+Cancellation stops queued admission and synthesis; retained partial output
+is evidence, not proof of completed effects. Builder inbox retries retain the
+accepted message ID, operation, brain and reply origin. Only explicit identical
+unconsumed retries may re-enter canonical helpers; those helpers preserve
+uncertain execution/delivery outcomes instead of inferring safety from a dead
+process or elapsed time.
+Prompt-only worker calls use their exact retained report IDs as trace IDs;
+synthesis uses `<swarmRunId>-synthesis`. The existing trace bus carries an
+ID-only link to the parent and report, without recording prompts or creating
+another session or event store. Inherited tool workers retain their own
+ephemeral turn identity.
+Ephemeral large-result recovery and its turn-exit cleanup use the same verified
+tool-session identity, releasing bounded spill capacity without creating a
+persisted chat session or permitting cross-turn reads.
+Regenerated assistant replies may follow their own canonical retry tool
+receipts: the locked writer retains those receipts and replaces only the
+target assistant. Any unrelated trailing turn or untyped receipt still
+rejects replacement, preserving concurrent conversation evidence.
+Local-only requests stopped before provider admission retain their exact user
+row and typed retry notice across reloads only while the canonical conversation
+IDs remain unchanged; a newer user or assistant turn supersedes them.
+After a pre-write stream failure, that same canonical-ID proof restores the
+original optimistic request and marks its notice unpersisted. An older
+unanswered user row cannot substitute for the current request during retry.
+Detached initial loads and session-selection snapshots use this same merge
+after their existing lifecycle guards, rather than bypassing retry preservation.
+Decoded UI messages belong to the validated transcript being viewed. A fork's
+byte-identical copied source rows retain stored IDs/provenance, while actions
+on those displayed rows target the fork rather than its source conversation.
+Mac transcript clearing preflights the canonical session index, then clears
+under the transcript lock and resets count/preview under a separate index
+lock only while the transcript remains empty. A new append retains its own
+projection; a later metadata-save failure explicitly reports a partial clear.
+The UI reloads the exact target session behind existing lifecycle guards, so
+selection changes and newer turns cannot be replaced by stale clear snapshots.
+Compaction summaries share the cleared transcript; canonical memories remain
+separate and are not implicitly forgotten by this action.
+Native tool workers carry the engine's typed completed/incomplete terminal
+state to swarm receipts. Exhaustion retains bounded partial evidence as failed,
+not a completed report inferred from nonempty fallback text. Ordinary ephemeral
+callers retain their existing behavior unless they request strict completion.
+Text-compatible streaming rechecks the actual cancellation flag at EOF, so a
+Stop after the last delta still retains partial output without issuing a final.
+The nonstream text-compatible collector also treats a terminal save error as
+failure even if reply generation already emitted a final value.
+
+External `delegation_status` reads retain readable jobs while reporting bounded
+per-source availability from the same observation. Missing stores are absent
+evidence, not read failures; malformed or unreadable records produce partial
+or unavailable status rather than a falsely healthy empty result.
+Bridge `message_id` lookup matches canonical accepted-message IDs before
+paging, including messages grouped into one Codex reply job. Matching output
+keeps its internal job ID and exposes only recorded bounded thread/turn IDs;
+it does not assign a single motor owner to a multi-message batch. A missing
+match is `not_observed`, never proof that execution did not occur.
+`delegation_status` can inspect an exact native swarm `run_id` with
+`agent=swarm`, using the existing retained receipt store. The initial response
+is compact metadata; selecting a `report_id` reads at most 2,000 characters
+and provides a continuation offset. Receipt inspection never reruns work or
+claims discarded output can be recovered. Bridge status pagination retains
+its separate existing semantics, and a successful approval-filing receipt is
+rendered as awaiting approval/not run rather than completed execution.
+Canonical transcript tool rows retain the existing exact outcome class before
+result clipping. History and compaction distinguish unconfirmed completion,
+cancellation, timeout and failure from transport acceptance; legacy rows use
+only valid explicit-status envelopes, never prose guesses. Claude delivery
+reconciliation compares the exact retained completion text in the originating
+session, so an earlier same-ID rejection cannot confirm a later result.
+Claude/OMP completion delivery requires the original session. Missing routes
+retain the terminal result as `blocked/missing_origin_session` without posting
+to the currently selected chat; retries cannot rerun work or guess a route.
+Ordinary incoming messages and Codex receipt-only GitHub delivery are unchanged.
+Explicit Claude/OMP conversation handles carry a resume requirement into the
+durable inbox and helper, including same-message-ID retry binding. Under the
+existing topic lock, an unavailable pointer settles as `continuation_unavailable`
+without starting fresh work. Claude also preserves an explicit pointer when
+the provider reports its session missing, rather than automatically starting
+a replacement. Legacy omitted-handle behavior and cwd selection are unchanged.
+Claude preserves admitted Unicode message IDs rather than clipping UTF-16
+units. Direct input beyond the existing 160-grapheme bound is rejected before
+claiming work. A retained legacy truncated-ID mismatch remains ambiguous and
+cannot authorize execution or delivery replay; filename mapping is unchanged.
+Delegation projection retains blocked delivery and its allowlisted missing-route
+reason separately from execution status. Outcome cards and motor state report
+the blocked handoff rather than success, using the existing uncertainty class
+without retrying the worker or adding a new outcome store.
+Swarm receipt appends check the existing collection under the writer lock.
+Only a missing file bootstraps an empty collection; unreadable, malformed, or
+wrong-shaped evidence is preserved and reported unavailable after workers settle.
+Persistence failures carry the settled run ID, execution status and counts in
+a bounded error with the original diagnostic cause retained separately. Saving
+is unconfirmed, not proven absent; inspect that run before considering replay.
+Public non-streaming structured chat uses the same bounded, redacted tool-row
+writer as streaming chat, whether or not the caller consumes progress events.
+Telegram and bridge conversations therefore retain tool evidence for later
+history instead of saving only the user prompt and final assistant reply.
+Telegram reply quotes retain transport identity without assuming any bot sender
+is this assistant; group replies to other bots use neutral bot attribution.
+Post-approval receipt replacement preserves the same exact outcome class from
+the original result before its preview is clipped. Approval permits execution;
+it does not convert a queued, unknown, cancelled or timed-out result into
+completed work. Existing approval authority and receipt identity remain intact.
 
 ## Shared Causal Language At Protocol Edges
 
@@ -188,6 +457,10 @@ These rules are part of the architecture, not optional hardening:
   joins the existing watcher shutdown barrier, and chronological rollups reuse
   one Calendar/DST boundary set without changing overlap or clipping semantics.
 - Default-root MemoryV2 resolves to one canonical actor/storage owner; injected
+  roots never affect live stores. MemoryStorage caps kind-age recall attenuation
+  at 10%; lifecycle owns invalidation. ContextSelector weights lexical relevance
+  by specificity over its eligible resident corpus, without increasing context
+  budgets or weakening mandatory coverage, disclosure, or permissions. Injected
   alternate roots remain isolated. Knowledge Graph panels, tools, and phone
   snapshots use bounded SQL reads, and a complete graph snapshot is compiled in
   one SQLite read transaction. Once SQLite exists, corruption fails closed and
@@ -234,7 +507,24 @@ These rules are part of the architecture, not optional hardening:
 | `NativeLoopbackListenerParameters.swift` | Shared listener-level loopback binding and preferred/consecutive/system-assigned fallback plan for the Mac Control and Codex/Claude bridges; each bridge publishes its selected port, while accept-time peer checks and bearer auth remain separate defense-in-depth gates |
 | `ChromeControlRuntime.swift` | NativeAgent.app's sole real-Chrome authority and Unix-socket owner. The default-off Trust Center switch is reread before lease acquisition, navigation, structured snapshot, click, fill, sequential type, select, bounded keypress, checked-state, double-click, bounded wait, and scroll effects; disabling it removes the listener and exact native-host registration and releases active leases without closing tabs. Acts remain snapshot-scoped, password-inert, receipt-bearing, no-focus content-script operations; a lost post-dispatch page reply is outcome-unknown and never automatically retried. Structured snapshots aggregate a bounded every-frame content-script walk plus open shadow roots through service-worker-owned opaque node routing; unavailable frames and closed roots remain explicit rather than guessed. |
 | `NativeAgentChromeRelay` | Minimal Swift native-messaging transport for the optional real-Chrome surface. It forwards bounded, length-prefixed top-level JSON objects between Chrome stdin/stdout and the app-owned Unix socket without interpreting browser operations or owning policy, leases, TrustCenter state, receipts, or verification. The host manifest pins the exact extension origin and exists only while the app-owned Chrome control capability is enabled. |
-| `AppChatToolDispatcher.swift` | App-native notification/browser tools plus lazy `reflex_review`, which routes approve/hold/reject into `NativeCognitionRuntime` rather than writing organism state directly. One `ToolCausalBoundary.MotorReference` observer replaces per-domain Workshop/Mac/external-send callbacks; the factory still rereads the exact canonical owner before resident consequence admission, while Browser keeps its existing runner-owned readback. Shared chat composition disables only the inner duplicate autonomy decision because `ChatOrchestrationClient` has already authenticated the exact origin and owns the single approval/autonomy membrane; direct/raw app-tool clients retain the inner gate, and all SecurityCenter hard checks still run. |
+| `AppChatToolDispatcher.swift` | App-native notification/browser tools plus lazy `reflex_review`, which routes approve/hold/reject into `NativeCognitionRuntime` rather than writing organism state directly. It is also the sole app-owned chat-body composition boundary: standard surface profiles and purpose-built restricted Workshop dispatchers converge on the same cognition, ContextFlow, memory-atom, provider-lifecycle, and root policy before entering Core. The explicit background profile omits evolution tools, denies external MCP, and does not file approvals without an explicit user-backed filer. One `ToolCausalBoundary.MotorReference` observer replaces per-domain Workshop/Mac/external-send callbacks; the factory still rereads the exact canonical owner before resident consequence admission, while Browser keeps its existing runner-owned readback. Shared chat composition disables only the inner duplicate autonomy decision because `ChatOrchestrationClient` has already authenticated the exact origin and owns the single approval/autonomy membrane; direct/raw app-tool clients retain the inner gate, and all SecurityCenter hard checks still run. |
+
+Installed physiology submissions use one runtime-owned FIFO worker, capped at
+256 accepted operations including the in-flight operation. This matches the
+recorder's existing burst envelope without blocking cognition or chat. Overflow
+and abandoned submissions aggregate into the existing recorder-loss evidence;
+a failed drain also blocks the report's completeness claim. Abandonment clears
+queued closures and fences later execution by generation, not merely counters.
+The recorder's separate 256-row bound includes both pending and in-flight rows;
+failed batches restore ahead of newer arrivals without creating extra capacity.
+Loss counters become ordered durable rows only when a slot is available, so
+repeated append failures cannot expand the retained buffer through loss receipts.
+
+Accepted chat events and cognitive capsules share the same provenance-based
+workload classifier. `CognitiveCapsuleRequest.turnKind` carries that class through
+preparation and presentation commit, so diagnostic topic words cannot suppress
+an admitted live turn's inner state. Bare diagnostic requests that omit the
+explicit class retain their legacy inference and non-live presentation behavior.
 
 Bridge message responses carry generated attachment metadata (`id`, type, MIME, name, byte size, and local generated-image path) but never inline base64 bytes. `/codex/message` uses the shared chat factory; `/codex/tool` uses read-only file access with no approval filer. Both deny and scrub external `mcp__*` tools.
 
@@ -317,7 +607,7 @@ Large NativeClient endpoint families are split by product surface:
 | `NativeClient+Notifications.swift` | Notification, inbox, and APNS status/action helpers |
 | `NativeClient+OnboardingActions.swift` | Onboarding start/complete/reset |
 | `NativeClient+ProcedureExactActivation.swift` | Idempotent executor and crash reconciliation for the local-only, evidence-bound exact Workshop procedure activation approval; it revalidates canonical evidence before installing the active pointer |
-| `NativeClient+ProviderTelegramSessions.swift` | Provider/Telegram session linkage helpers plus explicit-root model catalog reads |
+| `NativeClient+ProviderTelegramSessions.swift` | Provider/Telegram session linkage helpers plus explicit-root model preference reads from one checked canonical routing snapshot. Damaged saved routing throws so MacSync retains its last-good phone projection. `iCloudBridge.publishProviderCatalogStatus` likewise projects provider/model/effort/tier from one frozen snapshot rather than independently rereading picker files; failed reads do not replace or deduplicate away the last accepted status. |
 | `NativeClient+ProviderWorkflowGraph.swift` | Provider workflow/graph helpers plus explicit-root surface/provider preference writes |
 | `NativeClient+Providers.swift` | Provider/model catalog, OAuth readiness, model preferences, and exact injected auth/cache roots for alternate-runtime construction |
 | `NativeClient+RegistryMutations.swift` | Registry-backed runtime mutation helpers |
@@ -345,7 +635,9 @@ Large NativeClient endpoint families are split by product surface:
 |---|---|
 | `BackgroundLoopsAssembly+Autonomy.swift` | Autonomy/proactive/self-improvement loop wiring |
 | `BackgroundLoopsAssembly+ChatSurfaces.swift` | Telegram, Slack, and iCloud/iOS chat-surface loop wiring; each long-lived surface registration reuses one client with that exact surface profile rather than reconstructing the full chat factory per turn |
+| `SlackSocketModeLoop.swift` / `SlackInboundDeliveryJournal.swift` | Slack claims admitted payloads durably before ACK, prepares reply artifacts before dispatch, and recovers once at the canonical tick start even when Socket Mode cannot open. The journal is atomically published with creation-time 0600 permissions; it retains 500 completed deliveries and never evicts the at-most-100 pending/unknown rows. Interrupted generation and ambiguous sends do not automatically replay. Complete channel/thread history may prove one matching metadata/fingerprint/bot reply; absence is not non-delivery proof, and ambiguous image completion remains explicit. `NativeClient+LocalAPI` projects durable recovery/capacity counts into the existing Connectors `runtimeStatus`/`runtimeDetail` line independently of a healthy socket heartbeat, without exposing message bodies or changing credential/tool authority. Capacity requires human recovery, not automatic deletion or resend. |
 | `BackgroundLoopsAssembly+DeskNotify.swift` | Desk-side push loop when a tracked item changes (idempotent, no cognition) |
+| `BackgroundLoopsAssembly+UnconfiguredLane.swift` | Registered `.skipped` placeholders for unconfigured lanes so dormancy is visible to Doctor instead of a lane silently not existing (C8) |
 | `BackgroundLoopsAssembly+GitHubTracking.swift` | Event/deadline-driven persisted-scope GitHub refresh. Exact tracking config/snapshot, Desk base/tail, and GitHub Command base/tail changes wake a coalesced reread; `GitHubConnector` projects the learned canonical next-refresh crossing, and the six-hour periodic interval is missed-event repair only. Contribution mode circulates only authenticated authored PRs plus their linked issues into deduplicated Desk refs/items, archives prior snapshot-owned rows that leave scope, and preserves closed PR snapshot history. Before delta carry it batches authoritative GraphQL mergeability across every open authored PR because base movement does not bump PR timestamps and REST may remain unknown; conflicting, changed, or indeterminate results force exact detail, while only PRs needing detail consume review-thread reads. New non-bot external PR conversation comments after the prior detail boundary are actionable without replaying history. The shared check classifier keeps executable CI failures actionable but treats a failing maintainer review-label gate plus its aggregate as maintainer-owned waiting when every executable check passes. |
 | `BackgroundLoopsAssembly+DreamsMemory.swift` | Dream, REM, memory hygiene, and consolidation loop wiring |
 | `BackgroundLoopsAssembly+Heartbeat.swift` | Heartbeat, watchdog, app-health, and self-healing loop wiring |
@@ -353,8 +645,8 @@ Large NativeClient endpoint families are split by product surface:
 | `BackgroundLoopsAssembly+TriggerScheduler.swift` | TriggerScheduler due-deadline owner: canonical trigger file invalidations and exact next-fire deadlines wake one bounded due-job pass; no periodic trigger sweep |
 | `BackgroundLoopsAssembly+WorkshopExecution.swift` | Workshop multi-step execution, approval staging, and due-trigger runner wiring |
 | `BackgroundLoopsAssembly+Cognition.swift` | Manual/diagnostic microcycle factory plus production maintenance, daily replay integrity fallback, and budgeted reflection loop wiring; the 30-second microcycle is not in the production manifest because runtime events coalesce dirty settlement directly, and canonical Dream/REM commits wake replay directly |
-| `BackgroundLoopsAssembly+Workshop.swift` | Organism-gated Desk Workshop pump, durable lease/reservation, and bounded restricted-session wiring |
-| `BackgroundLoopsAssembly+Delegation.swift` | DelegationOutcomeLoop wiring: ordered cursor-tracked terminal-outcome cards for delegated builder jobs, including OMP, filed through the sticky-signature inbox lane; the cursor records the OUTCOME each job was carded under, so a codex job carded "finished" while its POST was in flight re-cards as "outcome is unconfirmed" once the bridge preserves it under `reply-jobs/undelivered/` (one-way alarm rank, same card id, new signature → unread + push), plus ONE rolling "Codex: N undelivered replies preserved (oldest Xd)" card that re-files only on change and marks itself read when the directory empties — nothing re-delivers those replies by design. Scans page through bursts beyond 100 without skipping older failures, preserve stable card/push identity, wake from canonical invalidation with slow missed-event repair, and map OMP through its own adapter rather than a universal bus. |
+| `BackgroundLoopsAssembly+Workshop.swift` | Organism-gated Desk Workshop pump, durable lease/reservation, bounded restricted-session wiring, exact Desk daily-cap prefiltering, and generation-based suppression of its own watched-file echoes |
+| `BackgroundLoopsAssembly+Delegation.swift` | DelegationOutcomeLoop wiring: ordered cursor-tracked outcomes for delegated builder jobs, including OMP. Routine successful outcomes share one active informational rollup per bridge source so the inbox cannot become a completion ledger; failed, unknown, lost-delivery, stalled, recovered, and backlog states retain exact per-job/sticky identity. Open jobs consume `DelegationStatusProjector`'s existing stalled verdict, file one actionable stuck-step card at the exact recorded liveness crossing, and resolve that same row if liveness resumes without replaying or replacing work. OMP stdout/stderr observations persist into the existing claim-checked wake-job record while its process runs, so active output moves that crossing before evaluation and true silence still crosses `idleSeconds`. The cursor records the OUTCOME each terminal job was carded under, so a codex job carded "finished" while its POST was in flight re-cards as "outcome is unconfirmed" once the bridge preserves it under `reply-jobs/undelivered/`, plus ONE rolling "Codex: N undelivered replies preserved (oldest Xd)" card that re-files only on change and marks itself read when the directory empties — nothing re-delivers those replies by design. The Codex wake helper separately owns unretryable intake: it retains the full brief in a locked/bounded dead-letter ledger and projects terminal failure onto the exact unread inbox row; launch recovery reconciles older receipts without consuming or replaying them. Scans page through bursts beyond 100 without skipping older failures, preserve stable card/push identity, wake from canonical invalidation or the next exact stall deadline with slow missed-event repair, and map OMP through its own adapter rather than a universal bus. |
 
 `SchedulerDueJobRunner.swift` is the due-job actor shell and `runDueJobs` entry. Scheduler behavior is split by responsibility:
 
@@ -395,6 +687,11 @@ OAuth callback state lives in `NativeOAuthCallbackRegistry.swift`, generic
 session support lives in `NativeOAuthSessionSupport.swift`, and xAI plus cloud
 connectors reuse `NativeOAuthLoopbackCallbackServer.swift`.
 
+The iOS `ContentView.swift` owns the five primary tabs: Chat, Activity,
+Memories, Desk, and More. `MobileDeskView` is the fourth primary destination;
+`AdvancedView.swift` keeps the combined `SkillsToolsView` reachable from More,
+and launch/notification aliases route through that same tab contract.
+
 `MacSyncEngine.swift` is the iCloud bridge state shell. Keep mutable bridge state there; put behavior in the focused extensions:
 
 | File | Owns |
@@ -431,6 +728,13 @@ path, not the normal setup flow.
 `MacAppleScriptBridge.swift` is the AppleScript bridge namespace only.
 
 `NativeAgentShared/DeviceEventIdentity.swift` owns payload-free notification event identity across Mac APNS/iCloud fanout and iOS snapshot-local presentation. APNS collapse IDs, bridge metadata, Inbox/Approval/Workshop local notifications, and delivery receipts carry the same bounded digest when they represent the same semantic event; the iOS presentation gate checks pending/delivered requests before adding another local alert.
+
+Repeated informational notifications may collapse only through the
+producer-declared, stable-key API on `LiveNotificationInbox`; important,
+actionable, archived, dismissed, and unrelated rows retain their individual
+identity. The heartbeat's durable-residue projection is one bounded review
+card derived from old workflow rows, preserved Codex replies, and old Desk
+items. It never resumes, replays, deletes, or mutates those canonical owners.
 
 `NativeAgentShared/CloudKitDeviceTransport.swift` owns the exact private-database
 query-subscription contract. Subscriptions are user-level CloudKit objects, not
@@ -503,7 +807,7 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 | `ChatComposerChrome.swift` | Shared main/detached composer control strip. Voice, screen capture, and attachments live in one compact options menu while Stop and Send remain immediate; each window retains its own transactional draft owner. |
 | `MacChatTranscriptSearch.swift` | Bounded view-local transcript search projection, async controller, shared search bar, exact result status, and stable message scroll targets. JSONL and AppModel remain the only transcript/state owners. |
 | `LivingStatusPanel.swift` | Retained aggregate organism/Desk/approval/dream read model and reusable global-status presentation. Main Chat intentionally does not compose this dashboard panel; the canonical Activity, Desk, approval, health, and cognition owners remain unchanged. The internal `needsUser` state (rendered as "needs you") is reserved for canonical pending approvals or nonterminal Desk rows whose exact waiting party is `owner`, `user`, or `human`; failed verification, generic blocks, provider/tool caution, phone/resource trouble, and reflex review remain visible as `no action needed` attention. The panel refreshes from the existing Desk/approval/file and cognition invalidations. |
-| `DeskLiveReloader.swift` | Event-driven Desk invalidation merge: process-local store tokens plus kqueue file watching, trailing-edge coalescing, visibility gating, and reload timing receipts |
+| `DeskLiveReloader.swift` | Event-driven Desk invalidation merge: process-local store tokens plus kqueue file watching, trailing-edge coalescing, visibility gating, reload timing receipts, and one replaceable exact presentation deadline for Desk Live Activity's five-minute stale / thirty-minute expiry boundaries. The deadline produces one ordinary dirty edge; it is not a polling cadence. |
 
 `CognitionObservatoryView.swift` owns the Advanced sidebar view for default-off CognitiveSubstrate controls, Organism Kernel visibility/toggle, metrics, capsule preview, reflection receipts, schema proposals, standing views, and the developmental timeline. The never-produced resident identity-proposal family and never-called external-grounding/promotion island are retired. Legacy `identity_proposal` SQLite artifacts and timeline enum values remain decode/preservation compatibility only; store open and runtime restore do not delete or promote those historical bytes.
 
@@ -519,6 +823,12 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 
 ## iOS Companion Map
 
+`NativeAgentSharedTestSupport` contains the in-memory device cloud and transport
+used by Shared, Mac, and iPhone tests. Only test targets depend on this product;
+the production apps keep `NativeAgentShared` and its live CloudKit transport.
+
+Signed provider-selection success carries a complete canonical surface/provider/model/effort/tier receipt through `iCloudSyncEngine+Actions` into Chat and Providers. Incomplete or wrong-surface receipts cannot supply defaults. Only the still-current request generation may adopt the recovered tuple, including Mac normalization; older replies preserve newer/ABA selections. The existing snapshot confirmation fence compares against that canonical tuple rather than the optimistic request, so stale projections cannot undo success and a normalized choice cannot remain permanently unacknowledged. Providers' success text names the returned model.
+
 `iOS/NativeAgentMobile/Sources/iCloudSyncEngine.swift` owns iCloud sync state only. `iCloudSyncEngine+Setup.swift` owns setup and the rebuildable CloudKit snapshot/action cache, `iCloudSyncEngine+Snapshots.swift` owns lifecycle-fenced group routing/refresh/loaders, and `iCloudSyncEngine+Actions.swift` owns signed inbox actions, response polling, and Mac-control/provider mutation helpers. `MacSyncEngine` remains the sole snapshot compiler and action dispatcher. Public Developer ID builds carry its exact established snapshot files in five bounded, compressed, digest-checked `NAStatus` groups because they cannot use the Mac-App-Store-only CloudDocuments/KVS lane; CloudKit and KVS group signals enter one exact router and iOS atomically adopts those bytes into a local cache without creating another model or authority owner. Once the entitlement-checked CloudKit transport is live, neither app mounts or scans the legacy Drive data plane; KVS remains only a best-effort progress/resync nudge, and a failed CloudKit factory or explicit KVS selection retains the complete legacy path. Signed public action envelopes and responses reuse `BridgeMessage` CloudKit transport, but still pass the inner action HMAC/freshness, exact idempotency, TrustCenter/router, transaction receipt, and signed-response boundaries. The mobile inbox projection is active-first and bounded to 300 total rows, 200 active rows, and 384 KiB; truncation, write, publication, signal, and oversize failure are visible rather than advancing false freshness. A response is durably cached before CloudKit acknowledgement so retry resends evidence rather than repeating an effect. Partial multi-file refreshes preserve last-proven values and cannot advance full-sync freshness. Mac and iPhone use the same `NativeAgentIdentity` pure formatter over their already-authoritative profile projection; the helper owns no identity storage or sync and supplies only bounded configured-name display plus a neutral fallback.
 
 `iOS/NativeAgentMobile/Sources/ChatStore.swift` owns observable chat state and cached-session helpers only. The app scene owns exactly one `ChatStore`; a view recreation cannot become a second queue restorer. Behavior lives in `ChatStore+Sending.swift`, `ChatStore+Sessions.swift`, `ChatStore+SnapshotMerge.swift`, `ChatStore+ICloudReplies.swift`, `ChatStore+Typewriter.swift`, and `ChatStore+Refresh.swift`. iOS mirrors the Mac send-next contract with a bounded, visible, session-owned, relaunch-persistent FIFO: natural completion drains it; Stop pauses it; Steer retires the old reply correlations, awaits signed Mac cancellation, and only then runs the promoted turn so late cancellation/final replies cannot stop or overwrite the replacement. Cached transcripts use a session-stamped envelope; a corrupt exact cache fails empty and refreshes from the Mac, and an unowned legacy global cache can never fill a pinned session. Chat no longer runs a five-second session poll: published sessions, pins, and changed transcript groups trigger a targeted read and exact-visible-session merge. That merge preserves pending user rows, active streaming placeholders and tool events, and composer input. Already-visible Chat, Workshop, Memory, Runs, Turn Inspector, approval, and inbox-badge stores consume the sync engine's publications directly; only the explicit legacy transport keeps a sampled activity fallback. While a reply is outstanding and on explicit refresh/foreground events, iOS still drains the active transport; it never checks the retired Drive outbox when CloudKit is selected and adds no idle polling. Transcript retention includes one exact Mac main session, one canonical `mobile_app` main session, and pinned sessions; legacy `source == ios` rows are accepted and migrated rather than becoming a second owner. Closing a pinned phone tab sends the signed `unpinChatSession` action, mutates the Mac-owned pin list, and republishes the snapshot without deleting or archiving the conversation. If another surface removes the selected pin, the next authoritative snapshot retires its pending correlations and returns the phone to its main chat.
@@ -531,7 +841,7 @@ Chat surface helpers belong in focused `ChatView+*.swift` extensions:
 |---|---|
 | `ChatOrchestration` | Turn engine, session history, turn planning, context assembly, tool loop, dispatch wrappers, same-turn lazy schema refresh, provider-facing tool-result ceilings with turn-scoped recovery paging, dispatch watchdogs, and exact no-progress recovery. One checked admission freezes provider/model/effort/tier for the accepted turn; central streaming/non-streaming paths, budget/compaction decisions, and actual completion/transcript accounting reuse that tuple rather than mixing routing generations. Canonical user persistence, cognition ingestion, and the compaction check finish before ordinary preparation fans out; deterministic turn planning and one frozen cognition/organism projection may then overlap unchanged Fluid Context/history assembly and active-tool/schema reads. The joined projection remains turn-scoped and commits only after entering provider input; this overlap introduces no cache or authority owner. `NaturalExpressionGuidance` is small prompt tissue inside this existing owner, not a personality subsystem: one positive identity-neutral sentence follows the compiled persona in the stable cached prefix, while a bounded pure scan of the six newest assistant rows may stage one unnamed response-shape cue. The existing turn plan admits that temporary cue only for chat/personality conversation, consumes it for task routes, and a single constructor option removes both additions without touching persona, memory, cognition, or transcript state. It performs no model call, persistence, output rewriting, provider override, or vocabulary ban. `ContextBudgetPolicy` is the single source of truth for prompt-assembly character budgets: budgets use a verified exact provider/model window when known (including the exact-root live OpenRouter catalog cache) and otherwise keep the conservative shipped floor; windows at or below 32k tokens stay byte-identical to those floors, and absolute ceilings are sized so the worst-case derived ask provably fits the smallest catalog-gated window because no post-assembly provider input clamp exists. In the floor regime Dynamic Context remains 6,000 characters; the shared turn engine permits one coordinator-owned retry only for authoritative mandatory overflow, bounded at the ranked-packet expanded budget (24,000 at the floor) with ranked-context reserve, so accumulated explicit corrections do not force the much larger legacy reconstruction path and strict callers still fail closed. The same admission compiles route-owned closed tool-group readiness with lexical hints and the exact surface policy before the first provider call; it changes request-scoped schemas only, never durable tool activation or authority. |
 | `Context` | Rebuildable immutable context generations, required-document mirrors, bounded RAM arena, generation-checked cancellation-safe event coalescing, owner-selective projection invalidation, eligibility/ranking, feedback/prewarm, and generation-pinned expansion. `ContextSelector` is the sole live ranker; feedback utility/decay may reorder privacy-eligible peers but cannot bypass privacy. Cancellation is control flow rather than source degradation. MemoryV2 and Desk/Workshop projections remain derived reads; canonical stores and TrustCenter retain authority. |
-| `PersistenceCore` | Canonical append-only local stores plus the single exact eight-pattern digest-bearing secret-redaction contract for durable receipts/activity and the shared non-digest chat/Turn Inspector preview contract, bounded store invalidation tokens, vnode file watching, a bounded `FileChangeEvents` async bridge with one registration-race read, visibility-aware reload debouncing for live projections, and bounded asynchronous TurnTrace emission/persistence pumps. Its canonical Python-compatible JSON serializer appends without repeatedly counting the accumulated Unicode string, keeping large derived projections linear while preserving exact bytes. Shared JSONL caps support stat-first soft byte triggers: authority owners may keep every append synchronous and durable while amortizing locked exact-line rotation instead of rereading a growing ledger on every write. Its installed-physiology store is observational evidence only: bounded daily JSONL/rotation and pure reporting, with no prompt/action/permission authority or scheduler. In measurement epoch `resident-live-latency-v3`, event rows require live/system/debug/verification class and separate total, substrate, somatic, and residual-scheduling admission latency. Live+system form the production resident population; live alone forms the ordinary population; diagnostics remain auditable but excluded. Resident and ordinary admission/microcycle populations each require twenty samples and fail at 25 ms or above; ordinary chat latency independently requires twenty live samples. The multi-day gate also rejects retention saturation, quiet CPU at or above 0.5%, and process wake rate at or above 18,000/hour. A fresh compatible `runtime_started` row opens the epoch, retaining older evidence without mixing it into current latency/restart claims. Recorder durability timeout becomes an explicit blocker rather than an unbounded shutdown wait. |
+| `PersistenceCore` | Canonical append-only local stores plus the single exact eight-pattern digest-bearing secret-redaction contract for durable receipts/activity and the shared non-digest chat/Turn Inspector preview contract, bounded store invalidation tokens, vnode file watching, a bounded `FileChangeEvents` async bridge with one registration-race read, visibility-aware reload debouncing for live projections, and bounded asynchronous TurnTrace emission/persistence pumps. Its canonical Python-compatible JSON serializer appends without repeatedly counting the accumulated Unicode string, keeping large derived projections linear while preserving exact bytes. Shared JSONL caps support stat-first soft byte triggers: authority owners may keep every append synchronous and durable while amortizing locked exact-line rotation instead of rereading a growing ledger on every write. The path-owned JSONL registry is the sole append chokepoint for the shared legacy `traces/events.jsonl` ledger and `harness/benchmark/runs.jsonl`, so callers cannot select a conflicting cap or bypass the common flock. Its installed-physiology store is observational evidence only: bounded daily JSONL/rotation and pure reporting, with no prompt/action/permission authority or scheduler. In measurement epoch `resident-live-latency-v3`, event rows require live/system/debug/verification class and separate total, substrate, somatic, and residual-scheduling admission latency. Live+system form the production resident population; live alone forms the ordinary population; diagnostics remain auditable but excluded. Resident and ordinary admission/microcycle populations each require twenty samples and fail at 25 ms or above; ordinary chat latency independently requires twenty live samples. The multi-day gate also rejects retention saturation, quiet CPU at or above 0.5%, and process wake rate at or above 18,000/hour. A fresh compatible `runtime_started` row opens the epoch, retaining older evidence without mixing it into current latency/restart claims. Recorder durability timeout becomes an explicit blocker rather than an unbounded shutdown wait. |
 | `Onboarding` | First-run identity/persona creation and reset. Completion is a resumable exact manifest transaction with persona/profile targets first and sentinel last. Public runtime safety treats a pending profile-before-sentinel manifest as incomplete; the narrow legacy compatibility read requires a valid local profile plus every required persona document. Reset has its own exact phased manifest: byte-preserving backups are written and reverified before source removal, completion markers clear only after cleanup, and reset intent clears last. Start/complete/resume reconcile an interrupted reset before exposing or creating onboarding state. |
 | `CognitiveSubstrate` | Experimental/default-off active cognitive state infrastructure: bounded events, continuity field, SQLite snapshot/restore, workspace, capsule preview, affect, thought seeds, replay references, reflection receipts, and observatory read model (commitment/prediction task-tracking removed 2026-07-01 — the subconscious is feelings/views/continuity, not a task tracker). Affect and thought-seed reads settle analytically at the requested instant. `CognitiveFrozenRead` captures configuration, workspace, affect, mood, thought seeds, standing-view text, and Sound echo as one immutable evaluation epoch; ordinary chat compiles from that epoch at the same fixed time as its organism projection. Sound's duty-cycled self-exemplar and verbal-rut awareness are bounded local reads over this frozen/in-memory assistant history: first and closing edges can produce an unnamed range cue, while quoted content is excluded; the lane adds no provider call or durable owner and never bans vocabulary or rewrites output. Continuity owns rebuildable derived token and defensive-turn-kind indexes, so activation/workspace reads do not repeatedly reclassify every node from prose. Thought-seed score/decay/cap changes replace the exact persisted family and apply protected-family retention in one SQLite transaction. Resident sensory ingestion mutates bounded owner state but defers durability to the coalesced microcycle; that microcycle and larger maintenance use the existing canonical transaction for nodes, seed replacement, affect/ambient settlement, receipts, and pruning. Full maintenance additionally owns emotional consolidation, stale standing views, and lineage; all live mutators serialize at that transition boundary. |
 | `ProviderRouting` | OpenAI/Anthropic/Codex/xAI/Moonshot/OpenRouter model routing and streaming adapters. Direct ChatGPT OAuth uses one shared accepted Codex-backend client identity across ordinary, streaming, structured-tool, OAuth authorization, and image-generation paths while retaining the NativeAgent build version in its User-Agent. Its SSE decoder accepts legacy and current nested error envelopes; explicit pre-output capacity failures may retry once without refreshing a healthy token, while any assistant/tool output closes that replay window. Moonshot owns authenticated live Kimi discovery, K3 Max reasoning, hidden-reasoning preservation through tool loops, streaming, tools, and vision without borrowing another provider's identity or credentials. OpenRouter carries structured image/tool/tool-result messages and streamed tool calls; its discovered capability/context cache is truthful and exact-root, with static verified fallback only. Surface provider+model preferences publish through one pending-marker recovery transaction without folding distinct API/OAuth/MCP siblings; `ProviderRoutingSnapshot` is the checked reconciled read consumed once at every central provider dispatch boundary, and Mac current-state/configuration delegates to that Core owner. GPT-5.6 Sol remains the canonical account default and exact persisted GPT-5.5 routes normalize forward at the execution boundary. |
@@ -649,7 +959,9 @@ Trust and security implementation files are split by policy boundary:
 | `SecurityCenter+InputScanning.swift` | Risk input scanning |
 | `SecurityCenter+RegistryReceipts.swift` | Registry receipt helpers |
 
-The surface-neutral `NativeAgentCore/TurnPresentation.swift` owns the single pure accepted-turn lifecycle kernel: stable phases, sanitized bounded activity history, timestamps and last movement, terminal immutability, stream-length coalescing, and derived stall classification. It imports no surface or transport module. Mac `MacChatTurnActivity.swift` maps the existing `TurnStreamEvent` notice/tool intake into the boundary-redacted shared vocabulary; raw tool arguments/results stop there and only safe notices continue through the pre-existing `nativeAgentTurnNotice` path. `MacChatTurnLifecycle.swift` is the one Mac lifecycle owner layered on that kernel: exact session/turn routing, nonterminal Stop intent, evidence-backed terminals, strict bounded canonical transcript receipts, a bounded payload-free snapshot, and restart repair that marks unproved interrupted work outcome-unknown. Natural stream close, `.final` alone, or cancellation request alone cannot claim completion or cancellation. Cancellation specifically is settled only from canonical transcript evidence or a TYPED cancellation observed at the app's own stream boundary; an untyped stream error string — including one whose whole body reads `cancelled` — is classified ambiguous and can only ever resolve to outcome-unknown, so a provider failure can never present as a quiet user cancel. Restart repair likewise keeps a record pending only while outcome work genuinely remains, so a deleted session's already-settled tombstone cannot pin repair incomplete for the life of the process. Telegram chat handler/progress contracts live in `TelegramChatHandling.swift`; ordinary growing-draft edits live in `TelegramDraftStreamer.swift`; command-menu sync contracts live in `TelegramCommandMenu.swift`; and Telegram's `TelegramTurnPresentation.swift` is a thin inward adapter that maps Telegram progress vocabulary and token redaction into the shared kernel while retaining Telegram-only text rendering. `TelegramTurnControls.swift` owns the bounded callback wire shape; and `TelegramTurnProgressCardDriver.swift` owns one best-effort, in-place-edited ordinary-message work card per accepted turn. Its active keyboard exposes status, redacted details, and stop; its 7-second heartbeat refreshes elapsed/stall presentation; terminal state removes stale controls; and card transport failure records redacted evidence without affecting or duplicating the separate draft/final reply. `TelegramRichMessage.swift` owns the bounded, user-visible-only Bot API 10.2 block subset; `TelegramAssistantDeliveryDriver.swift` selects exactly one rich or ordinary assistant-response lane and permits ordinary fallback only when rich delivery is known not to have occurred; and `TelegramTurnCardLedger.swift` persists bounded redacted card identities so process-start repair can edit interrupted cards in place to outcome-unknown and clear stale controls. Confirmed terminal cards are durably terminal-marked before their final edit and then removed from the ledger, so restart repair cannot overwrite terminal truth. `TelegramPollLoop.swift` owns the polling tick/state shell and admits turn execution into the actor-owned coordinator without blocking the next long poll. `TelegramTurnCoordinator.startTrackedTurn` makes per-chat admission, immutable turn identity, card ownership, callback de-duplication, and user-priority Task creation one actor operation. Ordinary turns remain serialized, while callbacks and control commands can act on the exact active generation; scheduler shutdown cancels and drains coordinator-owned tasks. Mutable attachments are frozen before the `@Sendable` boundary, so an ordinary message and approval continuation cannot both begin the same chat turn.
+The surface-neutral `NativeAgentCore/TurnPresentation.swift` owns the single pure accepted-turn lifecycle kernel: stable phases, sanitized bounded activity history, timestamps and last movement, terminal immutability, stream-length coalescing, and derived stall classification. It imports no surface or transport module. Mac `MacChatTurnActivity.swift` maps the existing `TurnStreamEvent` notice/tool intake into the boundary-redacted shared vocabulary; raw tool arguments/results stop there and only safe notices continue through the pre-existing `nativeAgentTurnNotice` path. `MacChatTurnLifecycle.swift` is the one Mac lifecycle owner layered on that kernel: exact session/turn routing, nonterminal Stop intent, evidence-backed terminals, strict bounded canonical transcript receipts, a bounded payload-free snapshot, and restart repair that marks unproved interrupted work outcome-unknown. Natural stream close, `.final` alone, or cancellation request alone cannot claim completion or cancellation. Cancellation specifically is settled only from canonical transcript evidence or a TYPED cancellation observed at the app's own stream boundary; an untyped stream error string — including one whose whole body reads `cancelled` — is classified ambiguous and can only ever resolve to outcome-unknown, so a provider failure can never present as a quiet user cancel. Restart repair likewise keeps a record pending only while outcome work genuinely remains, so a deleted session's already-settled tombstone cannot pin repair incomplete for the life of the process. Telegram chat handler/progress contracts live in `TelegramChatHandling.swift`; ordinary growing-draft edits live in `TelegramDraftStreamer.swift`; command-menu sync contracts live in `TelegramCommandMenu.swift`; and Telegram's `TelegramTurnPresentation.swift` is a thin inward adapter that maps Telegram progress vocabulary and token redaction into the shared kernel while retaining Telegram-only text rendering. `TelegramTurnControls.swift` owns the bounded active-turn callback wire shape; `TelegramQueuedTurnControls.swift` owns exact queued-update steer/remove callbacks; and `TelegramTurnProgressCardDriver.swift` owns one best-effort, in-place-edited ordinary-message work card per accepted turn. Its active keyboard exposes status, redacted details, and stop; its 7-second heartbeat refreshes elapsed/stall presentation; terminal state removes stale controls; and card transport failure records redacted evidence without affecting or duplicating the separate draft/final reply. `TelegramRichMessage.swift` owns the bounded, user-visible-only Bot API 10.2 block subset; `TelegramAssistantDeliveryDriver.swift` selects exactly one rich or ordinary assistant-response lane and permits ordinary fallback only when rich delivery is known not to have occurred; and `TelegramTurnCardLedger.swift` persists bounded redacted card identities so process-start repair can edit interrupted cards in place to outcome-unknown and clear stale controls. Confirmed terminal cards are durably terminal-marked before their final edit and then removed from the ledger, so restart repair cannot overwrite terminal truth. `TelegramPollLoop.swift` owns the polling tick/state shell and admits turn execution into the actor-owned coordinator without blocking the next long poll. `TelegramTurnCoordinator.startTrackedTurn` makes per-chat admission, immutable turn identity, card ownership, callback de-duplication, and user-priority Task creation one actor operation. Ordinary follow-ups are durably marked `queued` in the canonical update inbox and mirrored into a bounded per-chat coordinator FIFO. Natural completion starts the next item; its acknowledgement offers exact-bound `Steer now` and `Remove` controls; steering promotes that update and crosses the existing confirmed cancellation boundary before launch. Restart rehydrates queued claims from their original Telegram update bytes. Callbacks and control commands remain responsive against the exact active or queued generation; scheduler shutdown cancels active tasks while durable queued claims remain recoverable. Mutable attachments are frozen before the `@Sendable` boundary, so an ordinary message and approval continuation cannot both begin the same chat turn.
+
+The queued Telegram claim also retains its known acknowledgement message identity. Restart recovery therefore reclaims and edits the original queue card rather than leaving stale controls and sending a duplicate acknowledgement; legacy claims without the optional identity remain readable.
 
 Telegram poll-loop behavior belongs in focused extensions:
 
@@ -662,6 +974,7 @@ Telegram poll-loop behavior belongs in focused extensions:
 | `TelegramPollLoop+Approvals.swift` | Approval slash-command and inline-callback routing |
 | `TelegramPollLoop+Commands.swift` | Slash-command dispatch, model callbacks, retry/session command handling |
 | `TelegramPollLoop+TurnControls.swift` | Live work-card status/details/stop callbacks, stale/duplicate protection, and observed cancellation outcomes |
+| `TelegramPollLoop+QueuedTurnControls.swift` | Exact queued-message steer/remove callbacks, stale binding checks, durable removal settlement, and confirmed steering handoff |
 | `TelegramPollLoop+Transport.swift` | Typed rich/ordinary send, edit, chat-action, callback, default-command transport, shared semantic response validation, and chunking |
 | `TelegramRichMessage.swift` | User-visible-only rich block models, redaction, structural rendering, and Telegram 10.2 limits |
 | `TelegramAssistantDeliveryDriver.swift` | One-response rich/ordinary draft and final lane, known-rejection fallback, and ambiguous-delivery suppression |
@@ -683,7 +996,7 @@ Telegram command/media helpers are split by their own boundaries: `TelegramBot+C
 | `ChatOrchestrationClient+RuntimeHelpers.swift` | Compact runtime helper functions |
 | `ChatOrchestrationClient+StreamFacade.swift` | `chatStream` facade; signed remote regenerate binds its validated replacement identity inside the stream producer Task so task-local lifetime and transcript replacement remain request-scoped |
 | `ChatOrchestrationClient+StructuredChat.swift` | Structured non-streaming/streaming execution |
-| `ChatOrchestrationClient+TextCompatibility.swift` | Anthropic text-stream compatibility |
+| `ChatOrchestrationClient+TextCompatibility.swift` | Anthropic text-stream compatibility, including one eager tool-schema preload per turn; `TurnToolSchemaCatalogSeed` reuses that catalog after packet preparation and scopes only the canonical `context_expand` member instead of repeating the full schema walk |
 | `ChatOrchestrationClient+ToolDispatching.swift` | Traced/gated dispatcher choke point |
 | `ChatOrchestrationClient+Types.swift` | Public response/support types and the current client-owned chat error contract; the retired protocol compatibility shell no longer ships |
 
@@ -727,6 +1040,13 @@ tools or changing TrustCenter authority.
 
 `SwiftToolDispatcher.swift` is now the state/init/schema-listing shell. Keep it small.
 
+Lazy dispatch may derive a missing `session_id` only from the current
+task-local canonical chat session. Builder bridge tools distinguish a new
+conversation from an explicit resume, reject stale or conflicting handles, and
+return the continuation handle in successful receipts. Optional Desk
+`assignee` and `lane_of` values are omitted or non-empty; empty identities are
+schema errors rather than normalized state.
+
 Tool families belong here:
 
 | File | Owns |
@@ -738,13 +1058,14 @@ Tool families belong here:
 | `SwiftToolDispatcher+ToolImplHelpers.swift` | Shared JSON/parsing helpers for tool implementations |
 | `SwiftToolDispatcher+MemoryTools.swift` | Memory search/commit/proposal tools |
 | `SwiftToolDispatcher+KnowledgeGraphTools.swift` | KG query/status/fact tools |
-| `SwiftToolDispatcher+ChatHistoryTools.swift` | Chat/session search tools |
+| `SwiftToolDispatcher+ChatHistoryTools.swift` | Chat/session search tools; broad ranked matches are projected through compact 12-result offset pages so provider turns do not absorb the former 25-snippet payload while complete recall remains reachable |
+| `SwiftToolDispatcher+DelegationTools.swift` | Read-only provider projection over canonical Claude/Codex/OMP job stores; agent filtering precedes compact offset pagination, and full lifecycle detail is explicit rather than paid on every progress check |
 | `SwiftToolDispatcher+DeskTools.swift` | Desk explicit task-tracking tools |
 | `SwiftToolDispatcher+WorkshopTools.swift` | Workshop submit/status tools |
-| `SwiftToolDispatcher+PersonaTools.swift` | Persona/doc read tools |
+| `SwiftToolDispatcher+PersonaTools.swift` | Persona/doc reads plus compact runtime/provider/session identity; expensive roots, MCP/tool inventory, and outcome-population diagnosis are explicit `agent_introspect(detail=full)` work rather than the default status path |
 | `SwiftToolDispatcher+RemoteNodes.swift` | Trusted remote-node list/execute tools; execution delegates to the MacControl owner, revalidates exact node policy at effect time, and retains a non-YOLO approval floor |
-| `SwiftToolDispatcher+ToolLoading.swift` | Tool catalog/load state actions; compact catalog is the default group/count/readiness read, `detail=full` exposes model-visible schema rows for diagnostics, and explicit loads remain the only durable active-tool mutation |
-| `SwiftToolDispatcher+FourVerbPerception.swift` | Source-neutral bridge from MacControl's current fused `view` to the four-verb `screen`/target contract. It asks the existing capture owner for the frozen raw frame without human marker ink, crops pixel perception to the AX-located visual surface, preserves structural AX marks, and adds confidence-gated VisionPerception rows. Its dispatcher-local `SwiftToolDispatcherFourVerbLiveScene` gives physical regions rebuildable stable identities and motion descriptions across observations; it is perception continuity, not memory, authority, persistence, event posting, or a second screen schema. |
+| `SwiftToolDispatcher+ToolLoading.swift` | Tool catalog/load state actions; compact catalog is the default group/count/readiness read, `detail=full` exposes model-visible schema rows for diagnostics, and explicit loads remain the only durable active-tool mutation. Custom registry names without a current active schema stay discoverable but return unavailable rather than being persisted or renewed as loaded; mixed loads retain usable tools without changing built-in/MCP authority. |
+| `SwiftToolDispatcher+FourVerbPerception.swift` | Source-neutral bridge from MacControl's current fused `view` to the four-verb `screen`/target contract. It asks the existing capture owner for the frozen raw frame without human marker ink, crops pixel perception to the AX-located visual surface, preserves structural AX marks, and adds confidence-gated VisionPerception rows. Foreground-window geometry excludes covered pixels before world fusion/tracking and checks final projected targets while preserving clear targets; small overlays do not disappear behind screen-area thresholds. Its dispatcher-local `SwiftToolDispatcherFourVerbLiveScene` gives physical regions rebuildable stable identities and motion descriptions across observations; it is perception continuity, not memory, authority, persistence, event posting, or a second screen schema. |
 | `Dispatcher/Actions/FileSystemActions.swift` | Shared local path resolution for file/git/repo actions; expands `~` before absolute/relative normalization and canonical sandbox validation |
 | `SwiftToolDispatcher+ContextTraceTools.swift` | Context/turn trace inspection tools; `recent_trace_summary` reads the current bounded `turn_traces` day ledger and can scope to the injected chat session |
 | `SwiftToolDispatcher+SwarmTools.swift` | Swarm/run tools |
@@ -754,7 +1075,8 @@ Tool families belong here:
 | `SwiftToolDispatcher+CloudConnectorTools.swift` | Bounded Gmail, Google Calendar, and Notion reads plus Google refresh-token persistence under the dispatcher's exact data root |
 | `SwiftToolDispatcher+MCP.swift` | MCP bridge name parsing and live MCP calls |
 | `SwiftToolDispatcher+ExternalConnectors.swift` | Connector-specific helper seams such as X fallback |
-| `SwiftToolDispatcher+AgentBridgeTools.swift` | `time_now`, `claude_message`, `codex_message`, `omp_message`, invoke helpers, and the agent-scoped builder conversation-reference contract. A reference is only a wire handle over canonical Codex app-server history or the existing Claude/OMP topic pointer; this layer owns no transcript/session store and never conflates the builder conversation with the originating Agent chat session. All three asynchronous wake helpers delegate subprocess lifecycle to `MacControl.SystemProcessAdapter`; this file retains only builder-specific environment, timeout, and receipt interpretation. A matching durable Codex inbox row suppresses another helper launch only after consumed/read evidence proves that an earlier wake was accepted; an identical unconsumed row retries the helper so append-before-wake failures cannot become lost work. |
+| `SwiftToolDispatcher+AgentBridgeTools.swift` | `time_now`, `claude_message`, `codex_message`, `omp_message`, invoke helpers, and the agent-scoped builder conversation-reference contract. A reference is only a wire handle over canonical Codex app-server history or the existing Claude/OMP topic pointer; this layer owns no transcript/session store and never conflates the builder conversation with the originating Agent chat session. An opt-in `pair_reviewer` bit travels with Codex/Claude implementation dispatches and is part of inbox idempotency; ordinary notes remain unchanged. The immediate tool receipt exposes only `reviewerPairRequested`, because a skipped or failed wake proves no builder or reviewer was actually paired. All three asynchronous wake helpers delegate subprocess lifecycle to `MacControl.SystemProcessAdapter`; this file retains only builder-specific environment, timeout, and receipt interpretation. A matching durable Codex inbox row suppresses another helper launch only after consumed/read evidence proves that an earlier wake was accepted; an identical unconsumed row retries the helper so append-before-wake failures cannot become lost work. |
+| `script/codex_thread_wakeup.js` | Durable Codex wake queue consumption and completion watcher admission. Queue/inbox mutations retain short global filesystem locks; execution uses hashed canonical per-conversation lane locks, preserves FIFO within a lane, and admits at most four lane operations globally through filesystem slots. Fresh work derives a lane from its durable message/correlation identity and identity-free work fails closed to one serial lane. For an explicitly review-paired implementation dispatch, the routed prompt tells the builder to pair exactly one reviewer immediately, give that reviewer the committed SHA, receive findings back, and retain ownership of fixes; the same narrow contract is emitted by the Claude wake helper. A queued wake is stale-recovered in place only after 15 minutes plus two dead/unlisted owning-turn probes five seconds apart; live or uncertain old turns remain untouched, and recovery preserves message/order identity with a receipt. |
 | `AgentBridgeRuntime.swift` | One deterministic owner for bundled wakeup-helper lookup, Finder-safe local Codex/Claude/OMP/Node discovery, child-process environment construction, and structural bridge readiness; it never owns authentication or verification |
 | `SwiftToolDispatcher+SubprocessSupport.swift` | Shared subprocess latches, timeout, bounded pipe buffers |
 | `SwiftToolDispatcher+BuilderTools.swift` | shell/bash/git/apply_patch/tests/build/install tool execution; on a fresh Mac with no selected developer directory, the shared Process environment suppresses Apple's interactive Command Line Tools prompt so `/usr/bin` toolchain shims fail honestly instead of opening installer UI |
@@ -821,7 +1143,9 @@ authority.
 - User-facing memory prose must stay clean. Dates/timestamps belong in metadata unless the date is part of the fact.
 - Persona source: `persona/SOUL.md`, `persona/VOICE.md`, `persona/GROWTH.md`, generated `persona/USER.md`, and `persona/skills/bodies/`.
 - Chat history: chat JSONL/session stores under app data; session search and continuity recall are lazy. `PersistenceCore/ChatSessionIndexFile.swift` is the strict shared `chat/sessions.json` decoder for mutation boundaries: only a missing file is fresh state, while unreadable, empty, malformed, non-array, or mixed-row files fail closed before Mac, Telegram, Slack, iCloud, retention, message, or backup writers mutate data. `ChatSessionIndexReconciler` is bounded restart recovery under that same index lock: it scans at most 256 regular non-symlink transcript files and 32 MiB, prioritizes missing-index orphans, validates message/session identity, adds only absent index rows, and reports damaged rows without rewriting transcript bytes.
-- Turn traces: `PersistenceCore/TurnTracePersistLane` owns `data/turn_traces/<day>.jsonl`; `TurnTraceRecentReader` is the bounded diagnostic reader. Payloads are bounded per leaf and at 12 KiB as a whole; an oversized payload becomes an explicit digest/preview summary that retains lifecycle identity. The daily ledger trims under the append flock from 12 MiB to the newest whole rows fitting 8 MiB, with no polling owner. XCTest/SwiftPM helper processes never write the live lane. The legacy aggregate `data/traces/events.jsonl` remains a separate action/compatibility ledger and is not authoritative for session turn inspection.
+- Turn traces: `PersistenceCore/TurnTracePersistLane` owns `data/turn_traces/<day>.jsonl`; `TurnTraceRecentReader` is the bounded diagnostic reader. Payloads are bounded per leaf and at 12 KiB as a whole; an oversized payload becomes an explicit digest/preview summary that retains lifecycle identity. The daily ledger trims under the append flock from 12 MiB to the newest whole rows fitting 8 MiB, with no polling owner. XCTest/SwiftPM helper processes never write the live lane. The legacy aggregate `data/traces/events.jsonl` remains a separate action/compatibility ledger and is not authoritative for session turn inspection; all of its writers use PersistenceCore's path-owned append, which crosses a 4 MiB soft trigger before retaining the newest 5,000 whole rows under the common flock.
+- Harness benchmark history: `data/harness/benchmark/runs.jsonl` retains the newest 5,000 runs exactly after every append through the same path-owned PersistenceCore boundary.
+- Builder audit receipts: `ChatOrchestration/SwiftToolDispatcher+BuilderTools.swift` retains the newest 500 UUID-named JSON receipts by modification time with a filename tie-break. When a receipt ages out, matching `<uuid>-*` sidecars age out with it. Pruning is best-effort after the new receipt lands; failures leave tool success semantics unchanged and surface as `audit_error` plus a restrained log.
 - Installed skills: `PersistenceCore/InstalledSkillInventory.swift` merges clean runtime registry entries with runtime bodies and the one resolved canonical persona skill shelf, retaining the stable registry id needed for body resolution. `list_skills`, `read_skill`, pointer sync, the Mac UI, and `capabilities.summary` resolve that same app-only/dev persona root instead of reconstructing it from the data-root parent. `save_skill` reuses `SwiftNativeSkillsClient.createSkill`, then immediately reconciles the dispatcher's exact-root MemoryV2 pointer and writes the shared sync receipt; Mac mutations and launch call the same reconciler. Missing optional shelves remain healthy diagnostics, while existing disabled/draft runtime rows suppress automatic recall. Bodies remain lazy, and no path teaches the model private storage formats or grants guidance any tool/trust authority.
 - Desk: `PersistenceCore/DeskStore.swift` owns the append-only hierarchy. Self-authored pursuit origin is the identity-neutral `agent` role; legacy private-name rows decode compatibly but all new/re-encoded writes use `agent`. Terminal parents require terminal descendants, children cannot reopen beneath terminal ancestors, and launch reconciliation repairs older contradictions by appending ordinary `set_status` ops rather than rewriting the op log or `desk_state.json`. Desk and GitHub Command store appends emit process-local invalidation tokens; the Mac Desk independently watches both canonical ops files through kqueue so out-of-process CLI writes also refresh without polling.
 - GitHub Watcher: `PersistenceCore/GitHubCommandStore.swift` remains the sole append/reducer/state owner. The stored actionable event key binds canonical GitHub evidence, including GraphQL review-thread identity and unresolved generation or the bounded identity of a new external PR conversation comment. An actionable key updates Desk and claims one durable deduplicated Apple notification; it never starts or resumes Codex, a provider, a tool, a checkout, or repository work. `GitHubCommandRuntime` deliberately has no dispatch dependency or sender seam, and the general dispatcher no longer recognizes a privileged `github-command` working-directory surface. Ordinary GitHub inspection and `codex_message` remain available only through an explicit user/Agent turn and remote-verified repository selection. Legacy dispatch records and completion callbacks remain decode-compatible for work already in flight before this cutover, but launch recovery cannot resume them. Its optional `causalTransitionEvidence` observes the existing single-pass replay and emits only bounded SHA-256 identities, state names, operation classes, and expected next-evidence classes. It is a read-only offline/shadow projection: no second ledger, action authority, provider call, or prompt path.
@@ -841,6 +1165,13 @@ authority.
   modification time. Rewrites preserve malformed physical rows byte-for-byte,
   all-invalid nonempty input is an error, and the hard 1,000-row retention gives
   newest active/nonterminal cards priority before terminal/malformed history.
+- Memory maintenance health is projected through
+  `memory/hygiene_last_run.json`. A staged consolidation is compatible with a
+  healthy organism reading only when its exact `consolidationRunId` has a
+  readable, timestamp-valid `applied` or `applied_prior` receipt; write and
+  launch reconciliation then converge the hygiene receipt to `completed`.
+  Missing, malformed, failed, mismatched, or unrelated receipts remain
+  unhealthy and preserve their candidate state.
 - Provider tokens/OAuth state: NativeAgent-owned provider stores under `data/providers/` and connector auth stores. The GitHub PAT is owned by `GitHubCredentialStore` in the macOS Keychain; `connectors/github/auth.json` and `oauth_tokens/github.json` contain non-secret metadata only after read-once migration. The system vault uses an interaction-disabled `LAContext`, and XCTest/SwiftPM helpers are refused before any Security.framework call, so background runtime work and tests never open password UI or borrow the operator's live token.
 - Data-root construction: defaults exist only at outer production factories.
   Once a provider, context, Browser, TriggerScheduler, Workflow, cognition, or
@@ -882,6 +1213,15 @@ Do not create parallel `data/persona/Agent`, `data/memory/USER.md`, installer se
 Do not bypass these from Mac UI, iOS, Telegram, Slack, local bridge, Workshop execution, scheduler jobs, or app-native actions.
 
 ## Chat Context Rules
+
+Session selection compares the existing retained turn lifecycle across its
+awaited transcript load. A local turn that advances or finishes during that
+load keeps its newer rows and receipt; selecting the requested conversation
+still succeeds without applying the stale snapshot. Unchanged loads continue
+to apply the authoritative fetched transcript.
+Detached chat rechecks that same lifecycle and stream ownership after both
+message and receipt awaits, so a later result cannot overwrite a newer turn's
+rows, receipt or freshness status. Genuine read failures remain visible.
 
 - Stable cache layout is persona/pins plus the current lazy tool
   contract/catalog. Put that prefix before volatile recall, rendered history,

@@ -596,6 +596,41 @@ struct CognitionEventDrivenAcceleratedProofTests {
         #expect(!diagnostics.hasMeasurementGap)
     }
 
+    @Test("physiology submission bursts retain one bounded FIFO and durable loss evidence")
+    func physiologySubmissionBurstIsBoundedOrderedAndLossHonest() async throws {
+        let root = try temporaryRoot("bounded-physiology-submission")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clock = AcceleratedCognitionClock(Date(timeIntervalSince1970: 6_000_000))
+        let blocker = CognitionPhysiologyDeadlineBlocker()
+        let order = CognitionPhysiologyDeadlineLogCapture()
+        let recorder = acceleratedRecorder(root: root, runtime: "bounded-fifo", clock: clock)
+        let runtime = makeRuntime(root: root, clock: clock, recorder: recorder)
+        await runtime.bootstrap()
+        await runtime.flushPendingMicrocycleForProof()
+        _ = await runtime.installedPhysiologySoakReport()
+
+        await runtime.submitPhysiologyForProof { _ in await blocker.wait() }
+        await blocker.waitUntilBlocked()
+        let limit = NativeCognitionRuntime.maximumPendingPhysiologySubmissions
+        for index in 0..<(limit + 20) {
+            await runtime.submitPhysiologyForProof { _ in order.append(String(index)) }
+        }
+        #expect(await runtime.pendingPhysiologySubmissions == limit)
+        #expect(await runtime.physiologySubmissionQueue.count == limit - 1)
+        #expect(await runtime.pendingPhysiologySubmissionLoss == 21)
+        #expect(order.snapshot().isEmpty)
+
+        await blocker.release()
+        let report = try #require(await runtime.installedPhysiologySoakReport())
+        #expect(order.snapshot() == (0..<(limit - 1)).map(String.init))
+        #expect(await runtime.pendingPhysiologySubmissions == 0)
+        #expect(await runtime.physiologySubmissionQueue.isEmpty)
+        #expect(await runtime.physiologySubmissionTail == nil)
+        #expect(report.recorderDroppedRecordCount == 21)
+        #expect(report.claimBlockers.contains("recorder backpressure dropped evidence"))
+        #expect((await recorder.diagnostics()).totalDropped == 21)
+    }
+
     @Test("a wedged physiology submission cannot hold the drain barrier forever")
     func wedgedPhysiologySubmissionBailsOutAtDeadline() async throws {
         let root = try temporaryRoot("wedged-physiology-submission")
@@ -617,6 +652,12 @@ struct CognitionEventDrivenAcceleratedProofTests {
         await runtime.submitPhysiologyForProof { _ in
             await blocker.wait()
         }
+        await blocker.waitUntilBlocked()
+        let abandonedWorker = try #require(await runtime.physiologySubmissionTail)
+        let executed = CognitionPhysiologyDeadlineLogCapture()
+        for index in 0..<3 {
+            await runtime.submitPhysiologyForProof { _ in executed.append("old-\(index)") }
+        }
 
         let wallClock = ContinuousClock()
         let started = wallClock.now
@@ -624,6 +665,8 @@ struct CognitionEventDrivenAcceleratedProofTests {
         let elapsed = started.duration(to: wallClock.now)
 
         #expect(report != nil)
+        #expect(report?.claimBlockers.contains("physiology submission barrier did not complete") == true)
+        #expect(report?.recorderDroppedRecordCount == 4)
         // 10s, not 2s: the claim is "the 0.05s drain deadline won, not the
         // indefinitely-wedged submission" — any finite bound with headroom
         // proves that, while a 2s bound loses to scheduler noise under
@@ -634,10 +677,13 @@ struct CognitionEventDrivenAcceleratedProofTests {
             $0.contains("PHYSIOLOGY BAIL-OUT") && $0.contains("deadline")
         })
 
-        // Release the deliberately non-cooperative loser. Its stale generation
-        // cannot decrement or clear any later submission tail.
+        // A fresh worker can finish while the old active operation remains
+        // wedged. When it finally returns, no abandoned queued closure may run.
+        await runtime.submitPhysiologyForProof { _ in executed.append("new") }
+        #expect(await runtime.installedPhysiologySoakReport() != nil)
         await blocker.release()
-        await runtime.submitPhysiologyForProof { _ in }
+        await abandonedWorker.value
+        #expect(executed.snapshot() == ["new"])
         #expect(await runtime.installedPhysiologySoakReport() != nil)
         #expect((await runtime.deadlineBailoutCountsForProof()).physiologyDrain == 1)
     }
@@ -789,6 +835,7 @@ struct CognitionEventDrivenAcceleratedProofTests {
 private actor CognitionPhysiologyDeadlineBlocker {
     private var released = false
     private var waiter: CheckedContinuation<Void, Never>?
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
 
     func wait() async {
         if released { return }
@@ -797,8 +844,16 @@ private actor CognitionPhysiologyDeadlineBlocker {
                 continuation.resume()
             } else {
                 waiter = continuation
+                let pending = blockedWaiters
+                blockedWaiters.removeAll()
+                for waiting in pending { waiting.resume() }
             }
         }
+    }
+
+    func waitUntilBlocked() async {
+        if waiter != nil { return }
+        await withCheckedContinuation { blockedWaiters.append($0) }
     }
 
     func release() {

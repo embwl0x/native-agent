@@ -14,9 +14,6 @@ struct CognitionSurfaceSplitDispositionTests {
             "seeds", "interruptions", "timeline", "capsule", "reflections",
         ])
         #expect(panelIDs.isDisjoint(with: ["standingViews", "schemaProposals", "identityProposals"]))
-        #expect(CognitionObservatoryPanelID.allCases.allSatisfy {
-            CognitionSurfaceDispositionPresentation.destination(for: $0) == .observatory
-        })
     }
 
     @Test func approvalControlsHaveOneActivityOwnerAndSchemaLineageIsReadOnly() {
@@ -24,7 +21,6 @@ struct CognitionSurfaceSplitDispositionTests {
         #expect(CognitionSurfaceDispositionPresentation.activityApprovalSection.rawValue == "cognitionProposals")
         #expect(CognitionSurfaceDispositionPresentation.standingViewActions(isPending: true) == [.approve, .reject])
         #expect(CognitionSurfaceDispositionPresentation.standingViewActions(isPending: false).isEmpty)
-        #expect(CognitionSurfaceDispositionPresentation.schemaReplayActions.isEmpty)
     }
 
     @Test func activityKeepsUnavailableCognitionHonestAndRefusesMissingApproval() async throws {

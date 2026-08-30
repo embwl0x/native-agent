@@ -479,7 +479,13 @@ public struct WorkshopPump: Sendable {
             case .tick, .daily, .weekly: break
             default: return false
             }
-            return isDue(item.cadence.nextRefreshAt, now: now)
+            // The Desk owner permits one owner-cadence attempt per item/day.
+            // Pre-filter that exact admission rule here: otherwise a short
+            // cadence remains due after its first daily attempt, acquires and
+            // releases the shared lease, and retries a reservation the store
+            // must refuse until midnight.
+            return !item.workAttempts.contains(where: { $0.day == today })
+                && isDue(item.cadence.nextRefreshAt, now: now)
         }
         if let picked = userDue.min(by: { lhs, rhs in
             lessRecentlyWorked(lhs.cadence.nextRefreshAt, rhs.cadence.nextRefreshAt, tieBreak: (lhs.alias, rhs.alias))
@@ -528,7 +534,10 @@ public struct WorkshopPump: Sendable {
                 || item.cadence.mode == .daily
                 || item.cadence.mode == .weekly
         }
-        if !eligiblePursuits.isEmpty || !ownerCadenceItems.isEmpty {
+        let eligibleOwnerCadenceItems = ownerCadenceItems.filter { item in
+            !item.workAttempts.contains(where: { $0.day == today })
+        }
+        if !eligiblePursuits.isEmpty || !eligibleOwnerCadenceItems.isEmpty {
             if globalToday >= SwiftNativeDeskStore.maxWorkSessionsGlobalPerDay {
                 candidates.append(nextUTCDateBoundary(after: now))
             } else if selectDueItem(from: state, now: now) != nil {
@@ -538,15 +547,17 @@ public struct WorkshopPump: Sendable {
                 candidates.append(nextUTCWorkshopWindow(after: now))
             }
         }
-        for item in state.items where !item.isPursuit && !item.status.isTerminal {
-            guard item.cadence.mode == .tick
-                    || item.cadence.mode == .daily
-                    || item.cadence.mode == .weekly,
-                  let raw = item.cadence.nextRefreshAt,
-                  let due = DeskClock.parseISO(raw),
-                  due > now
-            else { continue }
-            candidates.append(due)
+        let nextDay = nextUTCDateBoundary(after: now)
+        for item in ownerCadenceItems {
+            let cadenceDue = item.cadence.nextRefreshAt.flatMap(DeskClock.parseISO)
+            if item.workAttempts.contains(where: { $0.day == today }) {
+                // A cadence can become due again minutes after completion,
+                // while its canonical one-per-day admission does not reopen
+                // until the UTC Desk day changes. Sleep until the later seam.
+                candidates.append(max(cadenceDue ?? nextDay, nextDay))
+            } else if let cadenceDue, cadenceDue > now {
+                candidates.append(cadenceDue)
+            }
         }
         return candidates.min()
     }

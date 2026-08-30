@@ -20,20 +20,32 @@ actor GitHubCommandRuntime {
     private let observationLoader: ObservationLoader
     private let notificationSender: NotificationSender
     private let outcomeObserver: OutcomeObserver
+    private let residentStateLoader: @Sendable () async throws -> [GitHubCommandItem]
     private var residentOutcomeFingerprints: [String: String] = [:]
     private var residentOutcomeBaselinePrimed = false
+    /// Both launch branches require the same baseline before they can safely
+    /// recover credentials or start connector loops. `liveState()` suspends,
+    /// so a boolean guard alone is reentrant and permits duplicate full-store
+    /// reductions. Every concurrent caller awaits this one in-flight read.
+    private var residentOutcomeBaselineTask: Task<[GitHubCommandItem], Error>?
+    private var residentOutcomeBaselineLoadCount = 0
 
     init(
         dataRoot: URL,
         observationLoader: @escaping ObservationLoader,
         notificationSender: @escaping NotificationSender,
-        outcomeObserver: @escaping OutcomeObserver = { _ in }
+        outcomeObserver: @escaping OutcomeObserver = { _ in },
+        residentStateLoader: (@Sendable () async throws -> [GitHubCommandItem])? = nil
     ) {
-        self.store = GitHubCommandStore(dataRoot: dataRoot)
+        let store = GitHubCommandStore(dataRoot: dataRoot)
+        self.store = store
         self.dataRoot = dataRoot
         self.observationLoader = observationLoader
         self.notificationSender = notificationSender
         self.outcomeObserver = outcomeObserver
+        self.residentStateLoader = residentStateLoader ?? {
+            try await store.liveState().items
+        }
     }
 
     static func live(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> GitHubCommandRuntime {
@@ -75,10 +87,33 @@ actor GitHubCommandRuntime {
     /// is compared against this baseline and only that transition is emitted.
     func replayResidentStateAtLaunch() async {
         guard !residentOutcomeBaselinePrimed else { return }
+        let task: Task<[GitHubCommandItem], Error>
+        let ownsTask: Bool
+        if let inFlight = residentOutcomeBaselineTask {
+            task = inFlight
+            ownsTask = false
+        } else {
+            residentOutcomeBaselineLoadCount += 1
+            let loader = residentStateLoader
+            let created = Task { try await loader() }
+            residentOutcomeBaselineTask = created
+            task = created
+            ownsTask = true
+        }
         do {
-            seedOutcomeBaseline(try await store.liveState().items)
+            let items = try await task.value
+            if !residentOutcomeBaselinePrimed {
+                seedOutcomeBaseline(items)
+            }
         } catch {
             NSLog("github_command: resident replay failed: \(error.localizedDescription)")
+        }
+        // Only the caller that installed this task clears it. On a failed
+        // load, a waiter may resume before the owner; letting that waiter clear
+        // the slot would allow a third caller to start a duplicate retry while
+        // the owner is still unwinding the first attempt.
+        if ownsTask {
+            residentOutcomeBaselineTask = nil
         }
     }
 
@@ -170,6 +205,7 @@ actor GitHubCommandRuntime {
     /// Test seam: how many full `liveState()` replay cycles this runtime has
     /// actually performed.
     func _testConnectorReplayCount() -> Int { connectorReplayCount }
+    func _testResidentBaselineLoadCount() -> Int { residentOutcomeBaselineLoadCount }
 
     /// Legacy compatibility for callbacks from work that was already in flight
     /// before GitHub Command became watcher-only. This path cannot create or

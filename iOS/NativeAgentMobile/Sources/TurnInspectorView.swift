@@ -131,6 +131,8 @@ struct TurnInspectorView: View {
         }
         .navigationTitle("Turn Inspector")
         .macSyncErrorBanner()
+        // E6: freshness of the Mac snapshot behind these turns.
+        .macSnapshotFreshnessBadge()
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {

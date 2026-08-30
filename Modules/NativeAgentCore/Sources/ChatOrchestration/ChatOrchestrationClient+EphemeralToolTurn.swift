@@ -1,6 +1,14 @@
 import Foundation
 import NativeAgentCore
+import PersistenceCore
 import TrustCenter
+
+/// An engine-owned incomplete terminal, not a provider/transport failure.
+/// Preserve the existing reply for the caller's ordinary retained-output cap.
+public struct EphemeralToolTurnIncomplete: Error, Sendable {
+    public let output: String
+    public let reason: String
+}
 
 extension SwiftNativeChatOrchestrationClient {
     /// Executes a one-shot tool-capable turn without creating chat session state.
@@ -16,7 +24,9 @@ extension SwiftNativeChatOrchestrationClient {
         persona: String? = nil,
         autonomyResolver: (any AutonomyResolver)? = nil,
         providerID: String? = nil,
+        serviceTierOverride: String? = nil,
         verifiedSessionId: String? = nil,
+        requireCompleted: Bool = false,
         surface: String
     ) async throws -> ChatResponse {
         // P2-3: fold before anything derives from it (projection session id,
@@ -48,7 +58,9 @@ extension SwiftNativeChatOrchestrationClient {
             providerId: providerID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 ? providerID
                 : baseContext.providerId,
-            serviceTier: baseContext.serviceTier,
+            // nil preserves existing callers. A captured standard tier is
+            // passed explicitly as "default", never nil/fresh-surface fallback.
+            serviceTier: serviceTierOverride ?? baseContext.serviceTier,
             toolsAvailable: baseContext.toolsAvailable,
             systemPrompt: baseContext.systemPrompt,
             userMessage: baseContext.userMessage,
@@ -63,6 +75,11 @@ extension SwiftNativeChatOrchestrationClient {
         // The synthetic identity is request-scoped and creates no chat session
         // or transcript owner.
         let projectionSessionId = "ephemeral:\(surface):\(runId)"
+        // Lazy native tools still require a verified request identity even
+        // though this path intentionally creates no chat-session row. The
+        // synthetic identity expires with the request and grants no authority
+        // beyond the resolver/membrane already supplied by the caller.
+        let toolSessionId = verifiedSessionId ?? projectionSessionId
         let cognitiveProjection = await prepareCognitiveTurnProjection(
             surface: surface,
             userMessage: message,
@@ -94,7 +111,7 @@ extension SwiftNativeChatOrchestrationClient {
                 securityCenter: SwiftNativeSecurityCenter(dataRoot: dataRoot),
                 hasFiler: approvalFiler != nil,
                 approvalTimeoutSeconds: approvalTimeoutSeconds,
-                verifiedSessionId: verifiedSessionId,
+                verifiedSessionId: toolSessionId,
                 // W2/W3-FIX-R2 1 — same inbox-backed injection approval check
                 // as the ordinary chat chain; a narrower resolver must not mean
                 // a weaker approval root.
@@ -104,20 +121,28 @@ extension SwiftNativeChatOrchestrationClient {
         } else {
             gated = makeTracedGatedDispatcher(
                 fileAccess: fileAccess,
-                verifiedSessionId: verifiedSessionId
+                verifiedSessionId: toolSessionId
             )
         }
-        let result = try await LLMCallContext.$turnActiveTools.withValue(requestTools) {
+        // Temporary workers still own a real execution identity. Bind their
+        // own run rather than leaving traces unknown or inheriting the parent
+        // turn's ID; this creates no chat session or additional trace store.
+        let result = try await TurnTraceContext.$bus.withValue(turnTraceBus) {
+        try await TurnTraceContext.$turnId.withValue(runId) {
+        try await LLMCallContext.$turnActiveTools.withValue(requestTools) {
             try await engine.executeTurnWithToolLoop(
                 surface: surface,
                 userMessage: message,
                 sessionId: nil,
+                toolSessionId: toolSessionId,
                 runId: runId,
                 maxIterations: toolLoopMaxIterations(for: surface),
                 llm: llm,
                 tools: gated,
                 preBuiltContext: projectedContext
             )
+        }
+        }
         }
         // R-F1: commit the projection only after the provider accepted the turn
         // (a throw above skips this, leaving the suppress window unconsumed).
@@ -127,6 +152,12 @@ extension SwiftNativeChatOrchestrationClient {
             userMessage: message,
             sessionId: projectionSessionId
         )
+        if requireCompleted, result.completionState != .completed {
+            throw EphemeralToolTurnIncomplete(
+                output: result.reply,
+                reason: "worker tool turn ended without a completed final reply; retained output is partial and attempted effects remain unverified"
+            )
+        }
         let generatedAttachments = ChatGeneratedImageArtifacts.attachments(
             from: result.toolDispatches,
             dataRoot: dataRoot

@@ -793,26 +793,12 @@ extension NativeClient {
                     }
                 }
             }
-            let status = Self.jsonString(result, "status") ?? "succeeded"
-            // W2/W3-FIX-R2 3 — this preview is written into the APPROVAL
-            // RECORD's executedAction and into the chat receipt, and the record
-            // is `remoteResolvable` (it syncs to iOS and is echoed to Telegram).
-            // An `ax_act` result carries `element.value` / `post_state.value` —
-            // the string that was just typed into the field. Redact by tool
-            // before anything persists it.
-            let preview = approvalResultPreview(
-                MacInjectionResultRedaction.redacted(tool: replay.toolName, result: result)
-            )
+            let receipt = Self.chatToolApprovalExecutionReceipt(
+                toolName: replay.toolName, surface: replay.surface, result: result)
             try? await annotateApprovalExecution(
                 id: rec.id,
-                executedAction: .object([
-                    "op": .string("chat_tool_approval_replay"),
-                    "tool": .string(replay.toolName),
-                    "surface": .string(replay.surface),
-                    "status": .string(status),
-                    "resultPreview": .string(preview),
-                ]),
-                detail: "\(replay.toolName) executed after approval: \(preview)",
+                executedAction: receipt.action,
+                detail: "\(replay.toolName) executed after approval: \(receipt.preview)",
                 root: dataRoot)
             if let refreshed = try? await SwiftNativeApprovalInbox(root: dataRoot).get(rec.id) {
                 await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot)
@@ -854,15 +840,33 @@ extension NativeClient {
 
         let resultStatus = jsonString(executedAction, "status") ?? "succeeded"
         let normalizedStatus = resultStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let resultClass: ChatToolOutcome.ExactResultClass? = {
+            if let raw = jsonString(executedAction, "resultClass"),
+               let recorded = ChatToolOutcome.ExactResultClass(rawValue: raw) {
+                return recorded
+            }
+            // Legacy execution annotations retained status, not the original
+            // result envelope. That typed field is the available evidence;
+            // diagnostic prose and a clipped preview cannot reconstruct it.
+            guard let status = jsonString(executedAction, "status") else { return nil }
+            return ChatToolOutcome.exactResultClass(.object(["status": .string(status)]))
+        }()
         let ok = ![
             "failed", "error", "denied", "rejected", "canceled", "cancelled",
             "blocked", "outcome_unknown",
         ].contains(normalizedStatus)
         let resultPreview = jsonString(executedAction, "resultPreview")
             .map(TurnTraceRedactor.redactText)
-        let statusSummary = ok
-            ? "Completed after approval (\(rec.id)); status=\(normalizedStatus)."
-            : "Failed after approval (\(rec.id)); status=\(normalizedStatus)."
+        let outcomeDescription: String
+        switch resultClass {
+        case .unknown: outcomeDescription = "Outcome unconfirmed"
+        case .cancelled: outcomeDescription = "Cancelled"
+        case .timeout: outcomeDescription = "Timed out"
+        case .failed: outcomeDescription = "Failed"
+        case .succeeded: outcomeDescription = "Completed"
+        case nil: outcomeDescription = ok ? "Completed" : "Failed"
+        }
+        let statusSummary = "\(outcomeDescription) after approval (\(rec.id)); status=\(normalizedStatus)."
         let summary = resultPreview.map { "\(statusSummary) Result: \($0)" } ?? statusSummary
         let path = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
@@ -887,6 +891,16 @@ extension NativeClient {
                     guard case .object(let object) = rows[index] else { return nil }
                     return object
                 } ?? [:]
+                var metadata: [String: JSONValue] = [
+                    "kind": .string("tool_use"),
+                    "toolName": .string(replay.toolName),
+                    "inputJSON": .string(inputJSON),
+                    "resultSummary": .string(summary),
+                    "ok": .bool(ok),
+                    "approvalId": .string(rec.id),
+                    "postApproval": .bool(true),
+                ]
+                if let resultClass { metadata["resultClass"] = .string(resultClass.rawValue) }
                 let row: JSONValue = .object([
                     "id": priorObject["id"] ?? .string(UUID().uuidString.lowercased()),
                     "sessionId": .string(safeSessionID),
@@ -895,15 +909,7 @@ extension NativeClient {
                     "createdAt": priorObject["createdAt"] ?? .string(now),
                     "source": .string(replay.surface),
                     "runId": .string("approval-\(rec.id)"),
-                    "metadata": .object([
-                        "kind": .string("tool_use"),
-                        "toolName": .string(replay.toolName),
-                        "inputJSON": .string(inputJSON),
-                        "resultSummary": .string(summary),
-                        "ok": .bool(ok),
-                        "approvalId": .string(rec.id),
-                        "postApproval": .bool(true),
-                    ]),
+                    "metadata": .object(metadata),
                 ])
                 if let existingIndex {
                     // A narrowly recoverable pre-dispatch failure can later
@@ -922,6 +928,31 @@ extension NativeClient {
         } catch {
             NSLog("[approvals] outcome receipt persist failed for \(rec.id): \(error)")
         }
+    }
+
+    /// The actual replay writer's projection, shared with injected fixtures.
+    /// Preserve only the canonical outcome tag from the original status-bearing
+    /// result before the privacy-safe preview is clipped; never persist raw data.
+    static func chatToolApprovalExecutionReceipt(
+        toolName: String,
+        surface: String,
+        result: JSONValue
+    ) -> (action: JSONValue, preview: String) {
+        // Approval records sync across surfaces. Tool-specific redaction must
+        // remove literal values typed by ax_act before general redaction/caps.
+        let preview = approvalResultPreview(
+            MacInjectionResultRedaction.redacted(tool: toolName, result: result))
+        var action: [String: JSONValue] = [
+            "op": .string("chat_tool_approval_replay"),
+            "tool": .string(toolName),
+            "surface": .string(surface),
+            "status": .string(jsonString(result, "status") ?? "succeeded"),
+            "resultPreview": .string(preview),
+        ]
+        if case .object(let object) = result, case .string? = object["status"] {
+            action["resultClass"] = .string(ChatToolOutcome.exactResultClass(result).rawValue)
+        }
+        return (.object(action), preview)
     }
 
     private static func approvalEffectDigest(_ payload: JSONValue) -> String {

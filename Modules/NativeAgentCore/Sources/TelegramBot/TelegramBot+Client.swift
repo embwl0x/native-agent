@@ -226,6 +226,13 @@ extension SwiftNativeTelegramBot {
         let response: URLResponse
         do {
             (data, response) = try await session.data(for: req)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            // URLSession reports cooperative task cancellation as NSURLError
+            // -999. Preserve that signal so a normal app shutdown is not
+            // misclassified as a Telegram outage by the poll loop.
+            throw CancellationError()
         } catch {
             throw TelegramBotError.unavailable
         }
@@ -442,7 +449,7 @@ extension SwiftNativeTelegramBot {
             return """
             Telegram tools use the same Swift chat tool loop and app-wide permissions as the Mac app.
             Tool and skill progress is surfaced in Telegram while the assistant works.
-            Available controls: /status /new /reset /session /clear /compact /provider /model /think /brain /persona /remember /note /scratch /help
+            Available controls: \(TelegramCommandRegistry.commands.map { "/\($0.command)" }.joined(separator: " "))
             """
         default:
             // Not a base command — the caller falls through to the

@@ -122,11 +122,17 @@ private actor CallRecorder {
 private final class RecordingPersistence: PersistenceCoreProtocol, @unchecked Sendable {
     let recorder: CallRecorder
     let inner = SwiftNativePersistenceCore()
-    init(recorder: CallRecorder) { self.recorder = recorder }
+    let afterRead: (@Sendable (URL, JSONValue) async -> Void)?
+    init(recorder: CallRecorder, afterRead: (@Sendable (URL, JSONValue) async -> Void)? = nil) {
+        self.recorder = recorder
+        self.afterRead = afterRead
+    }
 
     func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue {
         await recorder.append("readJSON:\(path.lastPathComponent)")
-        return await inner.readJSON(path, defaultValue: defaultValue)
+        let value = await inner.readJSON(path, defaultValue: defaultValue)
+        await afterRead?(path, value)
+        return value
     }
     func writeJSON(_ value: JSONValue, to path: URL) async throws {
         await recorder.append("writeJSON:\(path.lastPathComponent)")
@@ -1457,6 +1463,51 @@ struct SwiftNativeWorkshopRunnerReadTests {
         #expect(hist.last?.id == "m02")          // m21..m02 is 20 entries; m01,m00 dropped
     }
 
+    @Test func statusSnapshotReadsEachRecordOnceAndPreservesFiltersAndCap() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let p = SwiftNativePersistenceCore()
+        let calls = CallRecorder()
+        let runner = SwiftNativeWorkshopRunner(root: root, persistence: RecordingPersistence(recorder: calls))
+        for i in 0..<22 {
+            let key = String(format: "%02d", i)
+            try await seedQueueWorkshopExecution(runner: runner, persistence: p, id: "m\(key)", status: "completed", createdAt: "2026-01-\(key)", updatedAt: "2026-02-\(key)")
+        }
+        for status in ["queued", "running", "blocked_on_approval", "unknown"] {
+            try await seedQueueWorkshopExecution(runner: runner, persistence: p, id: status, status: status, createdAt: "2026-01-30", updatedAt: "2026-02-28")
+        }
+        let snapshot = await runner.listStatusSnapshot()
+        #expect(await calls.snapshot().count == 26)
+        #expect(Set(snapshot.active.map(\.id)) == ["queued", "running", "blocked_on_approval"])
+        #expect(snapshot.recent.count == 20)
+        #expect(snapshot.recent.first?.id == "m21")
+        #expect(snapshot.recent.last?.id == "m02")
+        #expect(Set(snapshot.active.map(\.id)).isDisjoint(with: snapshot.recent.map(\.id)))
+    }
+
+    @Test func statusSnapshotDoesNotReadTransitioningRecordIntoBothSections() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let p = SwiftNativePersistenceCore()
+        let calls = CallRecorder()
+        let persistence = RecordingPersistence(recorder: calls) { path, value in
+            guard case .object(var record) = value, record["status"] == .string("running") else { return }
+            record["status"] = .string("completed")
+            do { try await p.writeJSON(.object(record), to: path) }
+            catch { Issue.record("failed to simulate concurrent completion: \(error)") }
+        }
+        let runner = SwiftNativeWorkshopRunner(root: root, persistence: persistence)
+        try await seedQueueWorkshopExecution(runner: runner, persistence: p, id: "changing", status: "running", createdAt: "2026-01-01", updatedAt: "2026-01-01")
+        let first = await runner.listStatusSnapshot()
+        #expect(first.active.map(\.id) == ["changing"])
+        #expect(first.recent.isEmpty)
+        #expect(await calls.snapshot().count == 1)
+        let second = await runner.listStatusSnapshot()
+        #expect(second.active.isEmpty)
+        #expect(second.recent.map(\.id) == ["changing"])
+        #expect(await calls.snapshot().count == 2, "each call is fresh, not cached")
+    }
+
     @Test func getWorkshopExecutionReturnsRecordAndNilForMissing() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1667,12 +1718,13 @@ struct SwiftNativeWorkshopRunnerWriteTests {
 
     // MARK: cancel
 
-    @Test func cancelFlipsStatusAndPersists() async throws {
+    @Test(arguments: ["queued", "running", "blocked_on_approval"])
+    func cancelFlipsStatusAndPersists(status: String) async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let p = SwiftNativePersistenceCore()
         let runner = SwiftNativeWorkshopRunner(executorAvailable: true, root: root, persistence: p, planner: ThrowingWorkshopPlannerLLM(), now: fixedNow())
-        try await seedQueueWorkshopExecution(runner: runner, persistence: p, id: "m1", status: "running")
+        try await seedQueueWorkshopExecution(runner: runner, persistence: p, id: "m1", status: status)
 
         let rec = try await runner.cancel(executionId: "m1")
         #expect(rec.status == "cancelled")
@@ -1709,6 +1761,37 @@ struct SwiftNativeWorkshopRunnerWriteTests {
         let events = try await runner.readTimeline("m1")
         let cancelled = events.compactMap { obj($0) }.filter { str($0["event"]) == "cancelled" }
         #expect(cancelled.isEmpty, "already-cancelled cancel must not append a timeline event")
+    }
+
+    @Test(arguments: ["completed", "failed", "cancelled"])
+    func staleCancelPreservesSettledOutcomeAndReceipts(status: String) async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let p = SwiftNativePersistenceCore()
+        let runner = SwiftNativeWorkshopRunner(root: root, persistence: p, now: fixedNow())
+        try await seedQueueWorkshopExecution(
+            runner: runner, persistence: p, id: "m1", status: "running",
+            result: .object(["summary": .string("exact outcome evidence")])
+        )
+        // The caller observed running, then the execution settled before its
+        // cancellation arrived at the canonical locked mutation owner.
+        let stale = try #require(await runner.getWorkshopExecution("m1"))
+        #expect(stale.status == "running")
+        let settled = try #require(try await runner.updateWorkshopExecution(
+            WorkshopExecutionUpdate(id: "m1", status: status)
+        ))
+        try await p.appendJSONL(.object(["event": .string(status)]), to: runner.timelinePath("m1"))
+        let recordBefore = try Data(contentsOf: runner.executionRecordPath("m1"))
+        let timelineBefore = try Data(contentsOf: runner.timelinePath("m1"))
+        let activityBefore = try Data(contentsOf: runner.activityPath)
+
+        let cancelled = try await runner.cancel(executionId: stale.id)
+        #expect(cancelled.status == status)
+        #expect(cancelled.updatedAt == settled.updatedAt)
+        #expect(cancelled.result == settled.result)
+        #expect(try Data(contentsOf: runner.executionRecordPath("m1")) == recordBefore)
+        #expect(try Data(contentsOf: runner.timelinePath("m1")) == timelineBefore)
+        #expect(try Data(contentsOf: runner.activityPath) == activityBefore)
     }
 
     @Test func cancelMissingWorkshopExecutionThrows() async throws {
@@ -2053,6 +2136,101 @@ struct WorkshopExecutionWriteParityGateTests {
 
     // MARK: (a) missionPolicy gate
 
+    @Test(arguments: [
+        "{broken", "[]", "null", "\"policy\"",
+        "{\"missionPolicy\":false}",
+        "{\"missionPolicy\":{\"enabled\":\"false\"}}",
+        "{\"workshopPolicy\":{\"enabled\":\"false\"}}",
+        "{\"developerMode\":\"true\"}",
+        "{\"developerMode\":[]}", "{\"developerMode\":null}", "{\"developerMode\":1}",
+    ])
+    func malformedSavedPolicyRefusesSubmitAndUpdateWithoutEffects(saved: String) async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let p = SwiftNativePersistenceCore()
+        let calls = CallRecorder()
+        let planner = RecordingWorkshopPlannerLLM { _ in
+            await calls.append("planner")
+            throw WorkshopExecutionError.plannerFailure("must not reach planner")
+        }
+        let runner = SwiftNativeWorkshopRunner(root: root, persistence: p, planner: planner)
+        try await seedQueueWorkshopExecution(runner: runner, persistence: p, id: "existing", status: "running")
+        let recordBefore = try Data(contentsOf: runner.executionRecordPath("existing"))
+        let bytes = Data(saved.utf8)
+        try await p.writeDataAtomicDurable(bytes, to: runner.trustPolicyPath)
+        do {
+            _ = try await runner.submit(spec: WorkshopExecutionSpec(title: "T", objective: "O"))
+            Issue.record("damaged policy must not admit a submission")
+        } catch let error as WorkshopExecutionError {
+            guard case .persistenceFailure(let reason) = error else {
+                Issue.record("expected unavailable authority, got \(error)"); return
+            }
+            #expect(reason.contains("saved trust policy is unavailable"))
+        }
+        do {
+            _ = try await runner.updateWorkshopExecution(WorkshopExecutionUpdate(id: "existing", status: "completed"))
+            Issue.record("damaged policy must not mutate or silently fall through")
+        } catch let error as WorkshopExecutionError {
+            guard case .persistenceFailure(let reason) = error else {
+                Issue.record("expected unavailable authority, got \(error)"); return
+            }
+            #expect(reason.contains("saved trust policy is unavailable"))
+        }
+        #expect(await calls.snapshot().isEmpty)
+        #expect(try Data(contentsOf: runner.trustPolicyPath) == bytes)
+        #expect(try Data(contentsOf: runner.executionRecordPath("existing")) == recordBefore)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: runner.executionRecordsRoot.path) == ["existing"])
+        #expect(!FileManager.default.fileExists(atPath: runner.activityPath.path))
+        #expect(!FileManager.default.fileExists(atPath: runner.timelinePath("existing").path))
+    }
+
+    @Test func unreadableSavedPolicyIsNotMissingBootstrap() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = SwiftNativeWorkshopRunner(root: root, planner: ThrowingWorkshopPlannerLLM())
+        // A directory at the exact authority path is deterministically unreadable
+        // as a policy file, including under elevated test users.
+        try FileManager.default.createDirectory(at: runner.trustPolicyPath, withIntermediateDirectories: true)
+        await #expect(throws: WorkshopExecutionError.self) {
+            _ = try await runner.submit(spec: WorkshopExecutionSpec(title: "T", objective: "O"))
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: runner.trustPolicyPath.path).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: runner.executionRecordsRoot.path))
+        #expect(!FileManager.default.fileExists(atPath: runner.activityPath.path))
+    }
+
+    @Test(arguments: [false, true], ["missionPolicy", "workshopPolicy"])
+    func fullMacNeverExpiresPreservesSubmitAndUpdate(developerMode: Bool, policyKey: String) async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let p = SwiftNativePersistenceCore()
+        let runner = SwiftNativeWorkshopRunner(root: root, persistence: p, planner: ThrowingWorkshopPlannerLLM())
+        // No Developer Mode prerequisite: the ordinary enabled Workshop path
+        // works with it off. With it on, retain the existing explicit override.
+        let policy: JSONValue = .object([
+            "permissionLevel": .string("full_mac_os"),
+            "fullMacNeverExpires": .bool(true),
+            "fullMacExpiresAt": .string("never"),
+            "developerMode": .bool(developerMode),
+            "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+            policyKey: .object(["enabled": .bool(!developerMode)]),
+        ])
+        try await p.writeJSON(policy, to: runner.trustPolicyPath)
+        let saved = try Data(contentsOf: runner.trustPolicyPath)
+        // Workshop does not own surface admission; once admitted, origin
+        // metadata must not create an extra remote-surface fence here.
+        let submitted = try await runner.submit(spec: WorkshopExecutionSpec(
+            title: "T", objective: "O", triggerSource: "telegram:123"
+        ))
+        #expect(submitted.record.status == "queued")
+        #expect(submitted.record.triggerSource == "telegram:123")
+        let updated = try #require(try await runner.updateWorkshopExecution(
+            WorkshopExecutionUpdate(id: submitted.record.id, status: "completed")
+        ))
+        #expect(updated.status == "completed")
+        #expect(try Data(contentsOf: runner.trustPolicyPath) == saved)
+    }
+
     @Test func submitAllowedWhenNoTrustPolicyFile() async throws {
         // Fresh root, no policy file → default_trust_policy() has
         // missionPolicy.enabled = true → submit ALLOWED (parity + no regression).
@@ -2061,6 +2239,11 @@ struct WorkshopExecutionWriteParityGateTests {
         let runner = SwiftNativeWorkshopRunner(executorAvailable: true, root: root, planner: ThrowingWorkshopPlannerLLM())
         let result = try await runner.submit(spec: WorkshopExecutionSpec(title: "T", objective: "O"))
         #expect(result.record.status == "queued")
+        let updated = try #require(try await runner.updateWorkshopExecution(
+            WorkshopExecutionUpdate(id: result.record.id, status: "completed")
+        ))
+        #expect(updated.status == "completed")
+        #expect(!FileManager.default.fileExists(atPath: runner.trustPolicyPath.path))
     }
 
     @Test func submitRefusedWhenWorkshopPolicyDisabled() async throws {

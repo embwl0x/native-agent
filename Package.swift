@@ -207,6 +207,7 @@ let package = Package(
                 // tests need the type in scope to pin default-OFF behaviour.
                 .product(name: "ActivityWatch", package: "NativeAgentCore"),
                 .product(name: "NativeAgentShared", package: "NativeAgentShared"),
+                .product(name: "NativeAgentSharedTestSupport", package: "NativeAgentShared"),
                 "NativeAgentChromeRelayCore",
             ],
             path: "tests/NativeAgentAppTests"

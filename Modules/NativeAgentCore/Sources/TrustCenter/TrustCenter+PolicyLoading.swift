@@ -69,6 +69,16 @@ extension SwiftNativeTrustCenter {
     public nonisolated static func validateAuthorityPolicyShape(
         _ policy: [String: JSONValue]
     ) throws {
+        // Developer Mode is optional rather than a defaults-schema key, but
+        // it is still explicit authority. A truthy string/array must never
+        // substitute for the operator's boolean selection.
+        if let developerMode = policy["developerMode"] {
+            guard case .bool = developerMode else {
+                throw TrustCenterError.underlying(
+                    "saved trust policy field developerMode must be a JSON boolean"
+                )
+            }
+        }
         let objectPaths: [[String]] = [
             [WorkshopPolicyBlockVocabulary.wireKey],
             // Wave 4 read-both: a saved policy carrying the FUTURE spelling is

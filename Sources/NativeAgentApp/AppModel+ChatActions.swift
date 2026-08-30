@@ -193,22 +193,59 @@ extension AppModel {
     @MainActor
     @discardableResult
     func clearActiveChatMessages() async -> AppMutationResult {
+        await clearActiveChatMessages(
+            clear: { [client] in try await client.clearChatMessages(sessionId: $0) },
+            loadMessages: { [client] in try await client.getChatMessages(sessionId: $0) },
+            loadSessions: { [client] in try await client.getChatSessions() }
+        )
+    }
+
+    @MainActor
+    func clearActiveChatMessages(
+        clear: (String) async throws -> EmptyResponse,
+        loadMessages: (String) async throws -> [ChatMessage],
+        loadSessions: () async throws -> [ChatSession]
+    ) async -> AppMutationResult {
         let clearingSessionID = activeChatSessionId
         guard !clearingSessionID.isEmpty else {
             statusText = "Clear failed: no active chat session"
             return .failure(statusText)
         }
+        var transcriptCleared = false
         do {
-            _ = try await client.clearChatMessages(sessionId: clearingSessionID)
+            _ = try await clear(clearingSessionID)
+            transcriptCleared = true
             // The durable writer completed for this exact id. A user can select
             // another chat while this await is suspended; never clear that
-            // newer transcript optimistically.
-            setChatMessages([], for: clearingSessionID)
+            // newer transcript optimistically. Reload also retains a real new
+            // append that landed after the clear instead of hiding it with [].
+            let lifecycleBeforeReload = chatTurnLifecycle(for: clearingSessionID)
+            let messages = try await loadMessages(clearingSessionID)
+            let lifecycleAfterReload = chatTurnLifecycle(for: clearingSessionID)
+            if !streamingSessions.contains(clearingSessionID),
+               lifecycleAfterReload == nil || lifecycleAfterReload == lifecycleBeforeReload {
+                setChatMessages(messages, for: clearingSessionID)
+            }
+            chatSessions = try await loadSessions()
             statusText = "Chat messages cleared"
             publishChatSnapshot()
             return .success(statusText)
+        } catch let error as ChatMessageClearError {
+            let lifecycleBeforeReload = chatTurnLifecycle(for: clearingSessionID)
+            if let actual = try? await loadMessages(clearingSessionID) {
+                let lifecycleAfterReload = chatTurnLifecycle(for: clearingSessionID)
+                if !streamingSessions.contains(clearingSessionID),
+                   lifecycleAfterReload == nil || lifecycleAfterReload == lifecycleBeforeReload {
+                    setChatMessages(actual, for: clearingSessionID)
+                }
+            }
+            statusText = error.localizedDescription
+            publishChatSnapshot()
+            return .failure(statusText)
         } catch {
-            statusText = "Clear failed: \(error.localizedDescription)"
+            statusText = transcriptCleared
+                ? "Messages were cleared, but conversation refresh failed: \(error.localizedDescription)"
+                : "Clear failed: \(error.localizedDescription)"
             return .failure(statusText)
         }
     }
@@ -1092,6 +1129,15 @@ extension AppModel {
             )
             return
         }
+        // Retain only the accepted local request and its preceding conversation
+        // row. If routing fails before the core writes the user, an unchanged
+        // canonical tail can prove that this request still needs persistence.
+        let originalUserBubble = ChatMessage(
+            id: userTurnId, sessionId: requestSessionId, role: "user", content: userContent
+        )
+        let originalRequestPredecessor = chatMessages(for: requestSessionId)
+            .last(where: { $0.role == "user" || $0.role == "assistant" })
+
         // PATCH-2026-05-13: parallel-sessions — track the bubble id, the
         // user-turn id, and the live-delta buffer per session so
         // selectChatSession can restore both the prompt and the streaming
@@ -1115,9 +1161,7 @@ extension AppModel {
         // the kickoff drives the LLM but is never shown or persisted (paired with
         // suppressUserAppend below), so only the agent's greeting lands.
         if !hideUserBubble {
-            var userBubble = ChatMessage(sessionId: requestSessionId, role: "user", content: userContent)
-            userBubble.id = userTurnId
-            appendChatMessage(userBubble, to: requestSessionId)
+            appendChatMessage(originalUserBubble, to: requestSessionId)
         }
         var streamingBubble = ChatMessage(sessionId: requestSessionId, role: "assistant", content: "")
         streamingBubble.id = bubbleId
@@ -1548,7 +1592,17 @@ extension AppModel {
                         inputHadAttachments: !attachments.isEmpty
                     )
                 )
-                appendChatMessage(errorBubble, to: requestSessionId)
+                if !hideUserBubble, let freshOnError,
+                   let restored = Self.restoredUnpersistedChatRequest(
+                    originalUser: originalUserBubble,
+                    predecessor: originalRequestPredecessor,
+                    notice: errorBubble,
+                    canonicalMessages: freshOnError
+                   ) {
+                    setChatMessages(restored, for: requestSessionId)
+                } else {
+                    appendChatMessage(errorBubble, to: requestSessionId)
+                }
             }
             chatSessions = (try? await client.getChatSessions()) ?? chatSessions
         }
@@ -1565,6 +1619,29 @@ extension AppModel {
     /// fix Z, 2026-06-14). Without this they flash for one frame then vanish on
     /// the async `.chatTurnCompleted` reload.
     static let syntheticErrorIDPrefix = "na-synthetic-error-"
+
+    /// Restore a failed request only when canonical IDs prove that its user row
+    /// was never appended. A prior unanswered user is not this request, even if
+    /// its text is identical. Unknown/advanced snapshots keep the existing path.
+    static func restoredUnpersistedChatRequest(
+        originalUser: ChatMessage,
+        predecessor: ChatMessage?,
+        notice: ChatMessage,
+        canonicalMessages: [ChatMessage]
+    ) -> [ChatMessage]? {
+        guard let sessionID = originalUser.sessionId, !sessionID.isEmpty,
+              notice.sessionId == sessionID,
+              originalUser.role == "user",
+              notice.id.hasPrefix(syntheticErrorIDPrefix),
+              notice.metadata != nil else { return nil }
+        var unpersistedNotice = notice
+        unpersistedNotice.metadata?.syntheticUserRowPersisted = false
+        let local = [predecessor].compactMap { $0 } + [originalUser, unpersistedNotice]
+        guard let snapshot = MacChatRetrySnapshot.capture(
+            target: unpersistedNotice, messages: local, sessionId: sessionID, isSyntheticNotice: true
+        ), snapshot.matchesCanonical(canonicalMessages) else { return nil }
+        return canonicalMessages + [originalUser, unpersistedNotice]
+    }
 
     /// A persisted assistant row counts as a real, completed reply only if it is
     /// NOT a partial/cancelled truncation. persistPartialIfNeeded

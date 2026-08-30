@@ -92,6 +92,106 @@ struct ChromeControlRuntimeTests {
         #expect(cleanup["closeCreatedTab"] == .bool(false))
     }
 
+    @Test("A response cannot settle a different requested effect")
+    func mismatchedResponseActionClosesTheChannel() async throws {
+        let runtime = ChromeControlRuntime(
+            socketPath: "/tmp/nativeagent-chrome-correlation-\(UUID().uuidString).sock",
+            manageNativeHostRegistration: false,
+            authority: { true }
+        )
+        var descriptors: [Int32] = [0, 0]
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+        await runtime.installAcceptedDescriptorForTesting(descriptors[0])
+        let peer = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
+        let framer = NativeMessagingFramer()
+
+        let fixture = Task.detached {
+            guard let requestData = try framer.readMessage(from: peer),
+                  case .object(let request) = try JSONValue.parse(requestData),
+                  case .string(let requestID)? = request["id"] else {
+                throw ChromeControlRuntimeError.invalidResponse
+            }
+            let response = JSONValue.object([
+                "version": .int(1), "type": .string("response"), "id": .string(requestID),
+                "action": .string("lease.acquire"), "ok": .bool(true),
+                "result": .object(["leaseId": .string("wrong-effect")]),
+            ])
+            try framer.writeMessage(response.serializedData(pretty: false), to: peer)
+        }
+
+        await #expect(throws: ChromeControlRuntimeError.invalidResponse) {
+            _ = try await runtime.perform(.snapshot, payload: ["leaseId": .string("lease-fixture")])
+        }
+        try await fixture.value
+        await #expect(throws: ChromeControlRuntimeError.disconnected) {
+            _ = try await runtime.perform(.snapshot, payload: ["leaseId": .string("lease-fixture")])
+        }
+    }
+
+    @Test("Unconfirmed mutations report unknown outcomes while read deadlines remain read failures")
+    func dispatchedMutationTimeoutAndDisconnectStayHonest() async throws {
+        var descriptors: [Int32] = [0, 0]
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+        let channel = ChromeControlChannel(descriptor: descriptors[0], requestTimeout: .milliseconds(100))
+        await channel.start()
+        let peer = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
+        let framer = NativeMessagingFramer()
+
+        await #expect(throws: ChromeControlRuntimeError.outcomeUnknown(
+            action: ChromeControlEffect.fill.rawValue,
+            reason: ChromeControlRuntimeError.requestTimedOut.localizedDescription
+        )) {
+            _ = try await channel.request(action: .fill, payload: [:])
+        }
+        let fill = try #require(try framer.readMessage(from: peer))
+        guard case .object(let fillRequest) = try JSONValue.parse(fill) else {
+            throw ChromeControlRuntimeError.invalidResponse
+        }
+        #expect(fillRequest["action"] == .string(ChromeControlEffect.fill.rawValue))
+
+        await #expect(throws: ChromeControlRuntimeError.requestTimedOut) {
+            _ = try await channel.request(action: .snapshot, payload: [:])
+        }
+        _ = try #require(try framer.readMessage(from: peer))
+
+        let disconnect = Task.detached {
+            _ = try #require(try framer.readMessage(from: peer))
+            try peer.close()
+        }
+        await #expect(throws: ChromeControlRuntimeError.outcomeUnknown(
+            action: ChromeControlEffect.click.rawValue,
+            reason: ChromeControlRuntimeError.disconnected.localizedDescription
+        )) {
+            _ = try await channel.request(action: .click, payload: [:])
+        }
+        try await disconnect.value
+    }
+
+    @Test("Cancelling delayed Chrome typing revokes its lease without closing the tab")
+    func cancelledTypingReleasesItsLeaseWithoutClosingTheTab() async throws {
+        var descriptors: [Int32] = [0, 0]
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+        let channel = ChromeControlChannel(descriptor: descriptors[0])
+        await channel.start()
+        let peer = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
+        let framer = NativeMessagingFramer()
+        let typing = Task {
+            try await channel.request(action: .type, payload: ["leaseId": .string("lease-cancel")])
+        }
+        _ = try await Task.detached { try #require(try framer.readMessage(from: peer)) }.value
+        typing.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await typing.value }
+        let cleanupData = try #require(try framer.readMessage(from: peer))
+        guard case .object(let cleanup) = try JSONValue.parse(cleanupData),
+              case .object(let payload)? = cleanup["payload"] else {
+            throw ChromeControlRuntimeError.invalidResponse
+        }
+        #expect(cleanup["action"] == .string("lease.release"))
+        #expect(payload["leaseId"] == .string("lease-cancel"))
+        #expect(payload["closeCreatedTab"] == .bool(false))
+        await channel.shutdown(releaseLeases: false)
+    }
+
     @Test("Native-host manifest pins the exact extension origin")
     func registrationIsExact() throws {
         let home = FileManager.default.temporaryDirectory

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 
 /// Incremental output from a rebuildable non-file Context source projection.
 /// Providers compare their current source of truth with `previousSources` and
@@ -45,6 +46,11 @@ public protocol ContextCompiledProjectionProvider: Sendable {
     /// rebuilt. Empty keeps legacy/test providers launch-only.
     var invalidationNamespaces: Set<String> { get }
 
+    /// Exact canonical file whose changes this projection consumes. A staged
+    /// candidate under another root is not a mutation of the live source.
+    /// Nil preserves namespace-only consumers and unlocated legacy events.
+    var invalidationSourceURL: URL? { get }
+
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult
@@ -53,6 +59,14 @@ public protocol ContextCompiledProjectionProvider: Sendable {
 public extension ContextCompiledProjectionProvider {
     var projectionIdentifier: String { String(reflecting: Self.self) }
     var invalidationNamespaces: Set<String> { [] }
+    var invalidationSourceURL: URL? { nil }
+
+    func isInvalidated(by change: DerivedSourceChange) -> Bool {
+        guard change.semantic, invalidationNamespaces.contains(change.namespace) else { return false }
+        guard let invalidationSourceURL, let locator = change.canonicalLocator else { return true }
+        return invalidationSourceURL.standardizedFileURL
+            == URL(fileURLWithPath: locator).standardizedFileURL
+    }
 }
 
 public typealias ContextCompiledProjectionProviding = ContextCompiledProjectionProvider

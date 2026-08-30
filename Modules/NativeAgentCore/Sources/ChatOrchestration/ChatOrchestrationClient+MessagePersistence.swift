@@ -29,8 +29,12 @@ public enum ChatTranscriptToolMessageKind {
     /// status, or an empty identifier remains an ordinary tool receipt: it
     /// must not surface an actionable approval card without an authority.
     public static func pendingApprovalID(in resultSummary: String) -> String? {
-        guard let value = try? JSONValue.parse(Data(resultSummary.utf8)),
-              case .object(let object) = value,
+        guard let value = try? JSONValue.parse(Data(resultSummary.utf8)) else { return nil }
+        return pendingApprovalID(in: value)
+    }
+
+    static func pendingApprovalID(in value: JSONValue) -> String? {
+        guard case .object(let object) = value,
               case .string("waiting_approval")? = object["status"],
               case .string(let rawID)? = object["approvalId"] ?? object["approval_id"]
         else { return nil }
@@ -465,6 +469,9 @@ extension SwiftNativeChatOrchestrationClient {
         // `resultSummary` can echo the value an `ax_act` wrote;
         // `boundedRedactedToolReceipt` only catches secret-SHAPED strings, and
         // a password is not shaped like anything. Redact by TOOL first.
+        // Approval detection already requires the original envelope. Share that
+        // one parse with the exact outcome tag before rendering a bounded body.
+        let originalResult = try? JSONValue.parse(Data(resultSummary.utf8))
         let safeInputJSON = Self.boundedRedactedToolReceipt(
             Self.injectionRedactedArgJSON(tool: toolName, json: inputJSON),
             maximumCharacters: Self.persistedToolInputMaximumCharacters,
@@ -508,7 +515,7 @@ extension SwiftNativeChatOrchestrationClient {
             "source": .string(messageSource),
         ]
         if let runId { record["runId"] = .string(runId) }
-        let pendingApprovalID = ChatTranscriptToolMessageKind.pendingApprovalID(in: resultSummary)
+        let pendingApprovalID = originalResult.flatMap { ChatTranscriptToolMessageKind.pendingApprovalID(in: $0) }
         var metadata: [String: JSONValue] = [
             "kind": .string(
                 pendingApprovalID == nil
@@ -525,6 +532,14 @@ extension SwiftNativeChatOrchestrationClient {
             // same durable identifier, so the inline card never loses its
             // transition to a settled tool receipt.
             metadata["approvalId"] = .string(pendingApprovalID)
+        }
+        // Preserve only the existing classifier's exact outcome tag before
+        // receipt clipping/redaction can remove the envelope's status. `ok`
+        // remains transport success; no-status legacy results stay unchanged.
+        if let result = originalResult,
+           case .object(let object) = result,
+           case .string? = object["status"] {
+            metadata["resultClass"] = .string(ChatToolOutcome.exactResultClass(result).rawValue)
         }
         record["metadata"] = .object(metadata)
         // Locked: see appendPartial — protects against the compactor/distiller
@@ -832,17 +847,35 @@ extension SwiftNativeChatOrchestrationClient {
                         "regenerate replacement target is not an assistant message"
                     )
                 }
-                guard index == rows.indices.last else {
+                // Retry may already have persisted its own tool receipts. They
+                // are not a newer conversational turn, but must stay ahead of
+                // its final answer. No foreign or untyped trailing row qualifies.
+                let onlyOwnRetryReceipts = rows[(index + 1)...].allSatisfy { row in
+                    guard let runId, !runId.isEmpty,
+                          case .object(let object) = row,
+                          object["role"] == .string("tool"),
+                          object["runId"] == .string(runId),
+                          object["sessionId"] == .string(sessionId),
+                          case .string(let rowID)? = object["id"], !rowID.isEmpty,
+                          case .object(let metadata)? = object["metadata"],
+                          case .string(let toolName)? = metadata["toolName"], !toolName.isEmpty,
+                          case .string(let kind)? = metadata["kind"]
+                    else { return false }
+                    return kind == ChatTranscriptToolMessageKind.toolUse
+                        || kind == ChatTranscriptToolMessageKind.approvalPending
+                }
+                guard onlyOwnRetryReceipts else {
                     throw ChatOrchestrationError.underlying(
                         "regenerate replacement target is no longer the transcript tail"
                     )
                 }
                 let priorTurnTraceID = Self.messageTurnTraceID(in: rows[index])
                 var replaced = rows
-                replaced[index] = messageRow
+                replaced.remove(at: index)
+                replaced.append(messageRow)
                 try Self.writeJSONLAtomically(replaced, to: path)
                 // A replacement is row-count neutral by construction: one row
-                // swapped in place of exactly one match. `writeJSONLAtomically`
+                // replaces exactly one match, after its receipts. `writeJSONLAtomically`
                 // emits one non-blank line per row, which is precisely what
                 // `countJSONLLines` counts.
                 ChatTranscriptLineCountCache.shared.record(count: replaced.count, at: path)
@@ -868,6 +901,22 @@ extension SwiftNativeChatOrchestrationClient {
                 // `appendJSONLDurable` writes exactly one serialized line plus "\n".
                 ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
                 return nil
+            }
+        }
+        if role == "user" {
+            do {
+                _ = try await OutcomeFeedbackStore(
+                    dataRoot: dataRoot,
+                    persistence: persistence,
+                    clock: { persistedAt }
+                ).recordConversationContinuation(
+                    sessionID: safeSessionId,
+                    reactionMessageID: messageId
+                )
+            } catch {
+                // The user row is already durable state. Reaction learning is
+                // additive evidence and cannot roll the user's message back.
+                NSLog("OutcomeFeedbackStore: continuation receipt failed: \(error)")
             }
         }
         // This receipt means exactly one thing: the locked canonical transcript
@@ -1240,35 +1289,10 @@ extension SwiftNativeChatOrchestrationClient {
             metadata[CognitiveSubstrate.replyCharacterCountMetadataKey] =
                 .int(Int64(redactedSummary.count))
         }
-        // Chat workload class comes from surface provenance, never from topic
-        // words. An ordinary user asking about the scheduler/doctor/observatory
-        // is still a live turn. Verified out-of-band bridge origin makes
-        // bounded content markers eligible to classify diagnostic traffic as
-        // debug/verification; the runtime then carries that class through the
-        // correlated run to tools and reply.
-        let classificationSignals: [String]
-        if normalizedRole == "user", let origin, Self.isTrustedBridgeOrigin(origin) {
-            // Content markers are eligible only behind a server-bound bridge
-            // lane. This is transport provenance, not a claim inferred from
-            // prose supplied by the human.
-            // The synthetic prefix keeps the existing Codex debug classifier
-            // behavior without trusting prose supplied by a Mac user.
-            classificationSignals = [
-                source,
-                origin.surface,
-                origin.agent.map { "[from: \($0), via bridge]" } ?? "",
-                redactedSummary,
-            ]
-        } else if normalizedRole == "user" {
-            classificationSignals = [source]
-        } else {
-            classificationSignals = [source, redactedSummary]
-        }
-        let inferredTurnKind = CognitiveTurnKind.inferred(fromSignals: classificationSignals)
-        let turnKind: CognitiveTurnKind = switch inferredTurnKind {
-        case .debug, .verification: inferredTurnKind
-        case .live, .system: .live
-        }
+        let turnKind = Self.cognitiveMessageTurnKind(
+            role: normalizedRole, source: source,
+            redactedContent: redactedSummary, origin: origin
+        )
         let subject: CognitiveSubjectReference
         if normalizedRole == "assistant", kind == .assistantTurnCompleted {
             subject = CognitiveSubjectReference(
@@ -1302,6 +1326,45 @@ extension SwiftNativeChatOrchestrationClient {
             turnKind: turnKind,
             metadata: metadata
         ))
+    }
+
+    /// One workload-class boundary for accepted events and their capsules.
+    /// Capsule preparation must not reinterpret admitted live prose as debug.
+    nonisolated static func cognitiveMessageTurnKind(
+        role: String,
+        source: String,
+        redactedContent: String,
+        origin: ChatMessageOrigin?
+    ) -> CognitiveTurnKind {
+        // Chat workload class comes from surface provenance, never from topic
+        // words. An ordinary user asking about the scheduler/doctor/observatory
+        // is still a live turn. Verified out-of-band bridge origin makes
+        // bounded content markers eligible to classify diagnostic traffic as
+        // debug/verification; the runtime then carries that class through the
+        // correlated run to tools and reply.
+        let classificationSignals: [String]
+        if role == "user", let origin, Self.isTrustedBridgeOrigin(origin) {
+            // Content markers are eligible only behind a server-bound bridge
+            // lane. This is transport provenance, not a claim inferred from
+            // prose supplied by the human.
+            // The synthetic prefix keeps the existing Codex debug classifier
+            // behavior without trusting prose supplied by a Mac user.
+            classificationSignals = [
+                source,
+                origin.surface,
+                origin.agent.map { "[from: \($0), via bridge]" } ?? "",
+                redactedContent,
+            ]
+        } else if role == "user" {
+            classificationSignals = [source]
+        } else {
+            classificationSignals = [source, redactedContent]
+        }
+        let inferredTurnKind = CognitiveTurnKind.inferred(fromSignals: classificationSignals)
+        return switch inferredTurnKind {
+        case .debug, .verification: inferredTurnKind
+        case .live, .system: .live
+        }
     }
 
     private static func isTrustedBridgeOrigin(_ origin: ChatMessageOrigin) -> Bool {
@@ -1541,11 +1604,6 @@ extension SwiftNativeChatOrchestrationClient {
         return digest.map { String(format: "%02x", $0) }.joined().prefix(12).description
     }
 
-    private nonisolated static func stringValue(_ value: JSONValue) -> String? {
-        if case .string(let string) = value { return string }
-        return nil
-    }
-
     private func syncSessionIndex(
         sessionId: String,
         role: String,
@@ -1651,7 +1709,11 @@ extension SwiftNativeChatOrchestrationClient {
             // `pruneArchive` stats the whole archive tier on every pass, and
             // that part IS invisible to the prompt. Throttling belongs there,
             // in PersistenceCore, not at this call site.
-            _ = try? ChatSessionRetention.enforce(dataRoot: dataRoot, now: retentionClock())
+            ChatSessionRetention.enforceBestEffort(
+                dataRoot: dataRoot,
+                now: retentionClock(),
+                context: "ChatOrchestrationClient.syncSessionIndex"
+            )
         }
     }
 

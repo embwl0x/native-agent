@@ -54,6 +54,10 @@ struct MemoryHygieneReport: Codable, Hashable {
     var distilledFactsAdded: Int?
     var decayedMemories: Int?
     var proposalHygiene: MemoryProposalHygiene?
+    /// Exact gated-consolidation run represented by this maintenance receipt.
+    /// It prevents an unrelated historical success from clearing a newly
+    /// staged or failed maintenance state.
+    var consolidationRunId: String?
     /// F2: surfaced by readHygieneLastRun — ISO8601 of the next cadence-driven
     /// run (weekly: createdAt + 7d, matching the runner's card-staging
     /// cadence). nil if no last-run anchor is on disk.

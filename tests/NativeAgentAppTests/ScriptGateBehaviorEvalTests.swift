@@ -26,8 +26,95 @@ struct ScriptGateBehaviorEvalTests {
     private func makeEvalsFixture() throws -> (root: URL, stubs: URL, swiftLog: URL, envLog: URL) {
         let root = try ScriptFenceEval.makeTempDir("evals")
         try ScriptFenceEval.copyScript("script/evals.sh", into: root)
+        try ScriptFenceEval.copyScript("script/evals_ledger_merge.swift", into: root)
         let swiftLog = root.appendingPathComponent("swift-invocations.log")
         let envLog = root.appendingPathComponent("step-env.log")
+
+        // Package-relative Tests/... refs are resolved against real files.
+        // This changed-file fixture must own the test it expects to select;
+        // a ledger mention alone is deliberately not executable evidence.
+        try ScriptFenceEval.write(
+            "import Testing\nstruct DirectEvalTests { @Test func directFixture() {} }\n",
+            to: root.appendingPathComponent("Tests/DirectEvalTests.swift"))
+
+        try ScriptFenceEval.write("""
+        {
+          "surfaces": [
+            {
+              "fence": "fixture.root",
+              "id": "fixture.alpha",
+              "where": "Sources/Alpha.swift:10 alpha production route",
+              "coverage": [{"ref": "tests/NativeAgentAppTests/ZetaEvalTests.swift:20 zeta", "tier": "test"}]
+            },
+            {
+              "fence": "fixture.root",
+              "id": "fixture.beta",
+              "where": "Sources/Alpha.swift:30 beta production route",
+              "coverage": [{"ref": "tests/NativeAgentAppTests/ZetaEvalTests.swift:40 zetaAgain", "tier": "test"}]
+            },
+            {
+              "fence": "fixture.core",
+              "id": "fixture.core",
+              "where": "Modules/NativeAgentCore/Sources/CoreOwner.swift:7 core route",
+              "coverage": [{"ref": "Modules/NativeAgentCore/Tests/CoreOwnerTests.swift:12 coreOwner", "tier": "test"}]
+            },
+            {
+              "fence": "fixture.direct",
+              "id": "fixture.directTest",
+              "where": "Sources/Elsewhere.swift:1",
+              "coverage": [{"ref": "Tests/DirectEvalTests.swift:5 direct", "tier": "test"}]
+            },
+            {
+              "fence": "fixture.shell",
+              "id": "fixture.shellOnly",
+              "where": "script/only.sh:1 shell-only behavior",
+              "coverage": [{"ref": "tests/scripts/only_test.sh:4", "tier": "test"}]
+            },
+            {
+              "fence": "fixture.timer",
+              "id": "fixture.timerManifest",
+              "where": "script/timer_inventory.tsv:1 timer manifest",
+              "coverage": [{"ref": "executable: script/check_timer_inventory.swift", "tier": "smoke"}]
+            },
+            {
+              "fence": "fixture.feed",
+              "id": "fixture.mobileSnapshotCache",
+              "where": "Sources/MobileSnapshotCache.swift:1 mobile snapshot cache",
+              "coverage": [{"ref": "tests/NativeAgentAppTests/MobileSnapshotCacheEvalTests.swift:10 cache", "tier": "test"}]
+            },
+            {
+              "fence": "fixture.tiers",
+              "id": "fixture.smokeSwift",
+              "where": "script/smoke-owner.sh:1 smoke-tier route",
+              "coverage": [{"ref": "tests/NativeAgentAppTests/SmokeTierEvalTests.swift:10 smoke", "tier": "smoke"}]
+            },
+            {
+              "fence": "fixture.tiers",
+              "id": "fixture.benchSwift",
+              "where": "script/bench-owner.sh:1 bench-tier route",
+              "coverage": [{"ref": "tests/NativeAgentAppTests/BenchTierEvalTests.swift:10 bench", "tier": "bench"}]
+            },
+            {
+              "fence": "fixture.tiers",
+              "id": "fixture.replaySwift",
+              "where": "script/replay-owner.sh:1 replay-tier route",
+              "coverage": [{"ref": "tests/NativeAgentAppTests/ReplayTierEvalTests.swift:10 replay", "tier": "turn-replay"}]
+            },
+            {
+              "fence": "fixture.shell",
+              "id": "fixture.executableShell",
+              "where": "script/shell-owner.sh:1 executable shell route",
+              "coverage": [{"ref": "executable: tests/scripts/fixture_check.sh", "tier": "smoke"}]
+            },
+            {
+              "fence": "core.memory",
+              "id": "feed.memory.sqlite",
+              "where": "Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+Storage.swift:607 (<dataRoot>/memory/memory.sqlite)",
+              "coverage": [{"ref": "executable: tests/scripts/agent_instrument_test.sh", "tier": "smoke"}]
+            }
+          ]
+        }
+        """, to: root.appendingPathComponent("docs/evals/ledger.json"))
 
         // Stub sub-scripts. Each records itself into the same env log so a
         // step's environment is observable from the outside.
@@ -44,6 +131,15 @@ struct ScriptGateBehaviorEvalTests {
         // evals.sh names this path for the instrument step; it is never read by
         // the stub, but the step target must exist for a faithful fixture.
         try ScriptFenceEval.write("// stub\n", to: root.appendingPathComponent("script/agent_instrument.swift"))
+        try ScriptFenceEval.write(
+            "#!/bin/bash\necho \"check_timer_inventory.swift|ARGS=$*\" >> \"$STEP_ENV_LOG\"\necho 'timer inventory checked'\nexit ${STUB_TIMER_EXIT:-0}\n",
+            to: root.appendingPathComponent("script/check_timer_inventory.swift"), executable: true)
+        try ScriptFenceEval.write(
+            "#!/bin/bash\necho \"fixture_check.sh|ARGS=$*\" >> \"$STEP_ENV_LOG\"\nexit ${STUB_SHELL_CHECK_EXIT:-0}\n",
+            to: root.appendingPathComponent("tests/scripts/fixture_check.sh"), executable: true)
+        try ScriptFenceEval.write(
+            "#!/bin/bash\necho \"agent_instrument_test.sh|ARGS=$*\" >> \"$STEP_ENV_LOG\"\nexit ${STUB_INSTRUMENT_SMOKE_EXIT:-0}\n",
+            to: root.appendingPathComponent("tests/scripts/agent_instrument_test.sh"), executable: true)
 
         let stubs = root.appendingPathComponent("stubs", isDirectory: true)
         let swiftStub = """
@@ -54,7 +150,10 @@ struct ScriptGateBehaviorEvalTests {
         for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
         if [ -n "$out" ]; then printf '# instrument\\n**Health** — window 7d\\nBOOM: everything fine\\n' > "$out"; fi
         case " $* " in
-          *" ${STUB_SWIFT_FAIL_PATTERN:-__never_matches__} "*) exit 3 ;;
+          *" ${STUB_SWIFT_FAIL_PATTERN:-__never_matches__} "*) echo "fixture test failure for ${STUB_SWIFT_FAIL_PATTERN}"; exit 3 ;;
+        esac
+        case " $* " in
+          *" ${STUB_ZERO_TEST_PATTERN:-__never_matches__} "*) echo "Test run with 0 tests passed"; exit 0 ;;
         esac
         if [ "$1" = "test" ] && [ "${STUB_ZERO_TESTS:-0}" = "1" ]; then
           echo "Test run with 0 tests passed"
@@ -66,11 +165,59 @@ struct ScriptGateBehaviorEvalTests {
         try ScriptFenceEval.write(swiftStub, to: stubs.appendingPathComponent("swift"), executable: true)
         let gitStub = """
         #!/bin/bash
-        echo deadbee
+        args="$*"
+        case "$args" in
+          *" rev-parse --verify --quiet "*)
+            [ "${STUB_GIT_INVALID:-0}" = "1" ] && exit 1
+            echo 0123456789abcdef0123456789abcdef01234567
+            ;;
+          *" diff-tree "*) printf '%s\n' "${STUB_CHANGED_FILES:-README.md}" ;;
+          *" rev-parse --short HEAD"*) echo deadbee ;;
+          *) echo deadbee ;;
+        esac
         exit 0
         """
         try ScriptFenceEval.write(gitStub, to: stubs.appendingPathComponent("git"), executable: true)
         return (root, stubs, swiftLog, envLog)
+    }
+
+    private func makeDocsOnlyEvalsFixture()
+        throws -> (root: URL, stubs: URL, swiftLog: URL, envLog: URL)
+    {
+        let fixture = try makeEvalsFixture()
+        try ScriptFenceEval.write("""
+        [
+          {
+            "fence": "scripts",
+            "fragment": {
+              "ranRun": "fixture",
+              "uncertain": [],
+              "surfaces": [
+                {
+                  "id": "fixture.docsOnly",
+                  "kind": "cli",
+                  "where": "script/evals.sh:1",
+                  "coverage": []
+                }
+              ]
+            },
+            "critic": {"missed": [], "disputed": []}
+          }
+        ]
+        """, to: fixture.root.appendingPathComponent("docs/evals/phase1-fragments.json"))
+        let merge = try ScriptFenceEval.run(
+            "/usr/bin/env", [
+                "swift", fixture.root.appendingPathComponent("script/evals_ledger_merge.swift").path,
+                fixture.root.appendingPathComponent("docs/evals/phase1-fragments.json").path,
+                "--out", fixture.root.appendingPathComponent("docs/evals").path,
+            ],
+            cwd: fixture.root,
+            environment: ScriptFenceEval.environment(stubDir: nil),
+            timeout: 60)
+        guard merge.status == 0 else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: merge.combined])
+        }
+        return fixture
     }
 
     private func runEvals(_ fixture: (root: URL, stubs: URL, swiftLog: URL, envLog: URL),
@@ -80,6 +227,7 @@ struct ScriptGateBehaviorEvalTests {
             "SWIFT_INVOCATION_LOG": fixture.swiftLog.path,
             "STEP_ENV_LOG": fixture.envLog.path,
             "TMPDIR": fixture.root.appendingPathComponent("tmp").path,
+            "NATIVEAGENT_EVALS_CHANGED_SWIFT": "/usr/bin/swift",
         ]
         try FileManager.default.createDirectory(
             at: fixture.root.appendingPathComponent("tmp"), withIntermediateDirectories: true)
@@ -100,7 +248,10 @@ struct ScriptGateBehaviorEvalTests {
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let result = try runEvals(fixture)
         #expect(!result.timedOut)
-        let names = ["smoke", "instrument", "turn-replay", "range-bench-L1", "ledger-keeper"]
+        let names = [
+            "smoke", "instrument", "turn-replay", "range-bench-L1", "ledger-keeper",
+            "total-surface-contract",
+        ]
         for name in names {
             #expect(result.stdout.contains("✔ \(name)"), Comment(rawValue: "step \(name) did not run/pass:\n\(result.combined)"))
         }
@@ -137,10 +288,229 @@ struct ScriptGateBehaviorEvalTests {
         let fixture = try makeEvalsFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let result = try runEvals(fixture, extraEnv: ["STUB_ZERO_TESTS": "1"])
-        #expect(result.status == 3, Comment(rawValue: result.combined))
+        #expect(result.status == 4, Comment(rawValue: result.combined))
         #expect(result.stdout.contains("✘ turn-replay"))
         #expect(result.stdout.contains("✘ range-bench-L1"))
         #expect(result.stdout.contains("✘ ledger-keeper"))
+        #expect(result.stdout.contains("✘ total-surface-contract"))
+    }
+
+    @Test func changedModeSelectsExactLedgerFiltersOnceInStableOrder() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "Sources/Alpha.swift\nModules/NativeAgentCore/Sources/CoreOwner.swift\nTests/DirectEvalTests.swift",
+        ])
+        #expect(result.status == 0, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("WE'RE GOOD"), Comment(rawValue: result.stdout))
+        let invocations = try String(contentsOf: fixture.swiftLog, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        let filters = invocations.compactMap { line -> String? in
+            let parts = line.split(separator: " ").map(String.init)
+            guard let index = parts.firstIndex(of: "--filter"), index + 1 < parts.count else { return nil }
+            return parts[index + 1]
+        }
+        #expect(filters == ["CoreOwnerTests", "DirectEvalTests", "ZetaEvalTests", "EvalCoverageLedger", "TotalSurfaceContract"],
+                Comment(rawValue: "unexpected selection/order/dedupe: \(filters)\n\(result.combined)"))
+        #expect(!result.stdout.contains("smoke"))
+        #expect(!result.stdout.contains("turn-replay"))
+        #expect(result.stdout.components(separatedBy: "--filter ZetaEvalTests").count - 1 == 1)
+    }
+
+    @Test func changedModeRunsMappedSmokeChecksAndSnapshotCacheCoverageInStableOrder() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "script/timer_inventory.tsv\nSources/MobileSnapshotCache.swift",
+        ])
+        #expect(result.status == 0, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("SELECTED: root --filter MobileSnapshotCacheEvalTests"))
+        #expect(result.stdout.contains("SELECTED: executable script/check_timer_inventory.swift"))
+        let rootSelection = try #require(result.stdout.range(of: "SELECTED: root --filter MobileSnapshotCacheEvalTests"))
+        let scriptSelection = try #require(result.stdout.range(of: "SELECTED: executable script/check_timer_inventory.swift"))
+        #expect(rootSelection.lowerBound < scriptSelection.lowerBound)
+        let scriptInvocations = try String(contentsOf: fixture.envLog, encoding: .utf8)
+        #expect(scriptInvocations.contains("check_timer_inventory.swift|ARGS="))
+        #expect(result.stdout.contains("WE'RE GOOD"))
+    }
+
+    @Test func changedModeRoutesEveryExecutableTierAndShellCheckInStableOrder() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "script/smoke-owner.sh\nscript/bench-owner.sh\nscript/replay-owner.sh\nscript/shell-owner.sh",
+        ])
+        #expect(result.status == 0, Comment(rawValue: result.combined))
+        let selected = result.stdout.split(separator: "\n").map(String.init)
+            .filter { $0.contains("SELECTED:") }
+        #expect(selected == [
+            "  SELECTED: root --filter BenchTierEvalTests",
+            "  SELECTED: root --filter ReplayTierEvalTests",
+            "  SELECTED: root --filter SmokeTierEvalTests",
+            "  SELECTED: executable tests/scripts/fixture_check.sh",
+        ], Comment(rawValue: selected.joined(separator: "\n")))
+        let scriptInvocations = try String(contentsOf: fixture.envLog, encoding: .utf8)
+        #expect(scriptInvocations.contains("fixture_check.sh|ARGS="))
+        #expect(result.stdout.contains("WE'RE GOOD"))
+    }
+
+    @Test func changedModeShellFailurePreservesExitAndReverseMapsItsSurface() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "script/shell-owner.sh",
+            "STUB_SHELL_CHECK_EXIT": "9",
+        ])
+        #expect(result.status == 9, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("BROKE: fixture.executableShell (script/shell-owner.sh:1 executable shell route)"))
+        #expect(result.stdout.contains("command exit: 9"))
+    }
+
+    @Test func changedModeEvalBookkeepingRunsCanonicalMergeKeeperAndSeal() throws {
+        let fixture = try makeDocsOnlyEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "docs/evals/phase1-fragments.json\ndocs/evals/ledger.json\ndocs/evals/COVERAGE.md\ndocs/evals/behavior-remap-residue-2026-08-26.json",
+        ])
+        #expect(result.status == 0, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("✔ canonical-merge"))
+        #expect(result.stdout.contains("✔ ledger-keeper"))
+        #expect(result.stdout.contains("✔ total-surface-contract"))
+        #expect(result.stdout.contains("DOCS-ONLY: keeper+seal+merge green, nothing executable touched"))
+        #expect(!result.stdout.contains("NO MAPPED EXECUTABLE REFS"))
+    }
+
+    @Test func changedModeDocsOnlyFailsOnStaleGenerationAndNeverCoversMixedChanges() throws {
+        let stale = try makeDocsOnlyEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: stale.root) }
+        let staleLedger = stale.root.appendingPathComponent("docs/evals/ledger.json")
+        try ScriptFenceEval.write(
+            try String(contentsOf: staleLedger, encoding: .utf8)
+                .replacingOccurrences(of: "fixture.docsOnly", with: "fixture.stale"),
+            to: staleLedger)
+        let staleResult = try runEvals(stale, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "docs/evals/ledger.json",
+        ])
+        #expect(staleResult.status == 1, Comment(rawValue: staleResult.combined))
+        #expect(staleResult.stdout.contains("✘ canonical-merge"))
+        #expect(!staleResult.stdout.contains("DOCS-ONLY:"))
+
+        let mixed = try makeDocsOnlyEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: mixed.root) }
+        let mixedResult = try runEvals(mixed, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "docs/evals/ledger.json\nSources/Unmapped.swift",
+        ])
+        #expect(mixedResult.status == 1, Comment(rawValue: mixedResult.combined))
+        #expect(mixedResult.stdout.contains("NO MAPPED EXECUTABLE REFS"))
+        #expect(!mixedResult.stdout.contains("DOCS-ONLY:"))
+        #expect(!mixedResult.stdout.contains("canonical-merge"))
+
+        let generalDocs = try makeDocsOnlyEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: generalDocs.root) }
+        let docsResult = try runEvals(generalDocs, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "docs/README.md",
+        ])
+        #expect(docsResult.status == 1, Comment(rawValue: docsResult.combined))
+        #expect(!docsResult.stdout.contains("DOCS-ONLY:"))
+    }
+
+    @Test func changedModeReportsMappedSmokeCheckFailureWithoutHidingItsExit() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "script/timer_inventory.tsv",
+            "STUB_TIMER_EXIT": "7",
+        ])
+        #expect(result.status == 7, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("BROKE: fixture.timerManifest (script/timer_inventory.tsv:1 timer manifest)"))
+        #expect(result.stdout.contains("command exit: 7"))
+        #expect(result.stdout.contains("timer inventory checked"))
+        #expect(!result.stdout.contains("WE'RE GOOD"))
+    }
+
+    @Test func changedModeAlwaysRunsContractsAndFailsHonestlyWhenNothingMaps() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "README.md",
+        ])
+        #expect(result.status == 1, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("NO MAPPED EXECUTABLE REFS"))
+        #expect(result.stdout.contains("✔ ledger-keeper"))
+        #expect(result.stdout.contains("✔ total-surface-contract"))
+        #expect(result.stdout.contains("NOT GOOD: 1 failure(s)"))
+        #expect(!result.stdout.contains("WE'RE GOOD"))
+    }
+
+    @Test func changedModeRejectsMissingAndMalformedCommitsClearly() throws {
+        let missing = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: missing.root) }
+        let missingResult = try runEvals(missing, args: ["--changed"])
+        #expect(missingResult.status == 2)
+        #expect(missingResult.stderr.contains("--changed requires a commit SHA"))
+
+        let malformed = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: malformed.root) }
+        let malformedResult = try runEvals(malformed, args: ["--changed", "not-a-sha"], extraEnv: [
+            "STUB_GIT_INVALID": "1",
+        ])
+        #expect(malformedResult.status == 2)
+        #expect(malformedResult.stderr.contains("changed-mode planning failed"))
+        #expect(malformedResult.stderr.contains("malformed commit SHA 'not-a-sha'"))
+    }
+
+    @Test func changedModeZeroTestFilterFailsClosedAndNamesEveryMappedSurface() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "Sources/Alpha.swift",
+            "STUB_ZERO_TEST_PATTERN": "ZetaEvalTests",
+        ])
+        #expect(result.status == 1, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("BROKE: fixture.alpha (Sources/Alpha.swift:10 alpha production route)"))
+        #expect(result.stdout.contains("BROKE: fixture.beta (Sources/Alpha.swift:30 beta production route)"))
+        let alpha = try #require(result.stdout.range(of: "BROKE: fixture.alpha"))
+        let beta = try #require(result.stdout.range(of: "BROKE: fixture.beta"))
+        #expect(alpha.lowerBound < beta.lowerBound, "multiple surfaces were not printed deterministically")
+        #expect(result.stdout.contains("no non-zero executed-test count found"))
+        #expect(result.stdout.contains("command exit: 0"))
+    }
+
+    @Test func changedModePreservesMappedFailureDiagnosticsAndReportsUnmappedGateFailure() throws {
+        let mapped = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: mapped.root) }
+        let mappedResult = try runEvals(mapped, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "Sources/Alpha.swift",
+            "STUB_SWIFT_FAIL_PATTERN": "ZetaEvalTests",
+        ])
+        #expect(mappedResult.status == 3, Comment(rawValue: mappedResult.combined))
+        #expect(mappedResult.stdout.contains("BROKE: fixture.alpha"))
+        #expect(mappedResult.stdout.contains("fixture test failure for ZetaEvalTests"),
+                "the underlying Swift failure was hidden")
+        #expect(mappedResult.stdout.contains("command exit: 3"))
+
+        let unmapped = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: unmapped.root) }
+        let unmappedResult = try runEvals(unmapped, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "Sources/Alpha.swift",
+            "STUB_SWIFT_FAIL_PATTERN": "TotalSurfaceContract",
+        ])
+        #expect(unmappedResult.status == 3, Comment(rawValue: unmappedResult.combined))
+        #expect(unmappedResult.stdout.contains("UNMAPPED FAILURE: total-surface-contract"))
+        #expect(unmappedResult.stdout.contains("fixture test failure for TotalSurfaceContract"))
+    }
+
+    @Test func changedModeRejectsAffectedSurfaceWithoutASwiftPMCoverageRef() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "script/only.sh",
+        ])
+        #expect(result.status == 1, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("UNMAPPED SURFACE: fixture.shellOnly (script/only.sh:1 shell-only behavior)"))
+        #expect(result.stdout.contains("NO MAPPED EXECUTABLE REFS"))
+        #expect(result.stdout.contains("✔ ledger-keeper"))
+        #expect(result.stdout.contains("✔ total-surface-contract"))
     }
 
     /// scripts.evals.flag.live — the ledger row's stated failure mode (the live

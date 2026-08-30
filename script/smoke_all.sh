@@ -31,14 +31,18 @@ echo "[smoke] persona hygiene"
 "$ROOT/script/check_persona_skill_hygiene.swift" --repo "$ROOT"
 
 echo "[smoke] Swift build"
-swift build --package-path "$ROOT"
+swift build --force-resolved-versions --skip-update --package-path "$ROOT"
 
 dispatch_json() {
   local tool="$1"
   local input="$2"
   local output
-  output="$(swift run --package-path "$ROOT/Modules/NativeAgentCore" chat-drive \
-    dispatch "$tool" "$input")"
+  output="$(swift run --force-resolved-versions --skip-update --package-path "$ROOT/Modules/NativeAgentCore" chat-drive \
+    dispatch "$tool" "$input")" || {
+    local status=$?
+    echo "[smoke] $tool dispatch failed (exit $status)" >&2
+    return "$status"
+  }
   # chat-drive prints one human-readable header before the JSON result.  Do
   # not let an exit-zero executable with a malformed or empty payload count as
   # a successful native-tool smoke.
@@ -54,8 +58,12 @@ dispatch_json_at_root() {
   local tool="$2"
   local input="$3"
   local output
-  output="$(NATIVE_AGENT_DATA_ROOT="$data_root" swift run --package-path "$ROOT/Modules/NativeAgentCore" chat-drive \
-    dispatch "$tool" "$input")"
+  output="$(NATIVE_AGENT_DATA_ROOT="$data_root" swift run --force-resolved-versions --skip-update --package-path "$ROOT/Modules/NativeAgentCore" chat-drive \
+    dispatch "$tool" "$input")" || {
+    local status=$?
+    echo "[smoke] $tool dispatch failed (exit $status)" >&2
+    return "$status"
+  }
   printf '%s\n' "$output" | awk -v marker="=== $tool returned ===" '
     $0 == marker { found = 1; next }
     found { print }
@@ -126,13 +134,18 @@ require_desk_nag_enabled_receipt() {
 }
 
 echo "[smoke] Native tool dispatch: get_persona_doc"
-dispatch_json get_persona_doc '{"doc":"SOUL"}' | require_persona_document
+# Check execution before parsing: pipeline parser failures must not replace
+# the original command exit, including inside the handle substitution below.
+SMOKE_RESULT="$(dispatch_json get_persona_doc '{"doc":"SOUL"}')"
+require_persona_document <<<"$SMOKE_RESULT"
 
 echo "[smoke] Native tool dispatch: list_skills"
-dispatch_json list_skills '{}' | require_skill_manifest
+SMOKE_RESULT="$(dispatch_json list_skills '{}')"
+require_skill_manifest <<<"$SMOKE_RESULT"
 
 echo "[smoke] Native memory recall"
-dispatch_json recall_memory '{"query":"the user","limit":3}' | require_memory_recall_receipt
+SMOKE_RESULT="$(dispatch_json recall_memory '{"query":"the user","limit":3}')"
+require_memory_recall_receipt <<<"$SMOKE_RESULT"
 
 # Desk mutations are lazy tools, so this is deliberately the real chat-drive
 # route: load the visible tools into one durable session, write a seed item,
@@ -146,20 +159,22 @@ trap cleanup_desk_smoke_root EXIT
 DESK_SMOKE_SESSION="smoke-desk"
 
 echo "[smoke] Native Desk mutation lane"
-dispatch_json_at_root "$DESK_SMOKE_ROOT" tool_load \
-  "{\"session_id\":\"$DESK_SMOKE_SESSION\",\"names\":[\"desk_add_item\",\"desk_close\",\"desk_nag_control\"]}" \
-  | require_desk_tool_load_receipt
-DESK_SMOKE_HANDLE="$(dispatch_json_at_root "$DESK_SMOKE_ROOT" desk_add_item \
-  "{\"session_id\":\"$DESK_SMOKE_SESSION\",\"kind\":\"plan\",\"project\":\"smoke\",\"title\":\"Native Desk smoke close\"}" \
-  | require_desk_created_handle)"
+SMOKE_RESULT="$(dispatch_json_at_root "$DESK_SMOKE_ROOT" tool_load \
+  "{\"session_id\":\"$DESK_SMOKE_SESSION\",\"names\":[\"desk_add_item\",\"desk_close\",\"desk_nag_control\"]}")"
+require_desk_tool_load_receipt <<<"$SMOKE_RESULT"
+SMOKE_RESULT="$(dispatch_json_at_root "$DESK_SMOKE_ROOT" desk_add_item \
+  "{\"session_id\":\"$DESK_SMOKE_SESSION\",\"kind\":\"plan\",\"project\":\"smoke\",\"title\":\"Native Desk smoke close\"}")"
+DESK_SMOKE_HANDLE="$(require_desk_created_handle <<<"$SMOKE_RESULT")"
 DESK_CLOSE_INPUT="$(jq -cn --arg session "$DESK_SMOKE_SESSION" --arg handle "$DESK_SMOKE_HANDLE" \
   '{session_id: $session, handle: $handle, outcome_summary: "smoke verified durable close"}')"
-dispatch_json_at_root "$DESK_SMOKE_ROOT" desk_close "$DESK_CLOSE_INPUT" | require_desk_close_receipt
-dispatch_json_at_root "$DESK_SMOKE_ROOT" desk_read \
-  "{\"session_id\":\"$DESK_SMOKE_SESSION\"}" | require_desk_closed_projection
-dispatch_json_at_root "$DESK_SMOKE_ROOT" desk_nag_control \
-  "{\"session_id\":\"$DESK_SMOKE_SESSION\",\"action\":\"enable\",\"scope_kind\":\"global\"}" \
-  | require_desk_nag_enabled_receipt
+SMOKE_RESULT="$(dispatch_json_at_root "$DESK_SMOKE_ROOT" desk_close "$DESK_CLOSE_INPUT")"
+require_desk_close_receipt <<<"$SMOKE_RESULT"
+SMOKE_RESULT="$(dispatch_json_at_root "$DESK_SMOKE_ROOT" desk_read \
+  "{\"session_id\":\"$DESK_SMOKE_SESSION\"}")"
+require_desk_closed_projection <<<"$SMOKE_RESULT"
+SMOKE_RESULT="$(dispatch_json_at_root "$DESK_SMOKE_ROOT" desk_nag_control \
+  "{\"session_id\":\"$DESK_SMOKE_SESSION\",\"action\":\"enable\",\"scope_kind\":\"global\"}")"
+require_desk_nag_enabled_receipt <<<"$SMOKE_RESULT"
 
 if [[ "$LIVE" -eq 1 ]]; then
   APP_BUNDLE="${NATIVE_AGENT_INSTALLED_APP:-$HOME/Applications/NativeAgent.app}"

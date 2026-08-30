@@ -190,7 +190,7 @@ private func postureSnapshot(
     #expect(json["approved_reflex_biases"] == nil)
 }
 
-@Test func postureLabelsApprovedBiasSampleWhenReviewQueueConsumesCandidateSnapshot() async throws {
+@Test func postureKeepsApprovedBiasesWhenReviewQueueIsFull() async throws {
     let date = Date(timeIntervalSince1970: 7_000)
     let pending = (0..<9).map { index in
         OrganismReflexCandidate(
@@ -237,13 +237,13 @@ private func postureSnapshot(
 
     #expect(snapshot.reflexSummary.reviewRequiredCount == 9)
     #expect(snapshot.reflexSummary.approvedLowRiskCount == 5)
-    #expect(snapshot.reflexCandidates.count == 12)
-    #expect(posture.approvedReflexBiases.count == 3)
-    #expect(posture.approvedReflexBiasSampleCount == 3)
+    #expect(snapshot.reflexCandidates.count == 14)
+    #expect(posture.approvedReflexBiases.count == 5)
+    #expect(posture.approvedReflexBiasSampleCount == 5)
     #expect(posture.approvedLowRiskReflexTotalCount == 5)
-    #expect(posture.approvedReflexBiasesAreSampled)
+    #expect(!posture.approvedReflexBiasesAreSampled)
     #expect(!posture.reviewSignals.contains { $0.contains("reflex candidate") })
-    #expect(rendered.contains("approved_low_risk_reflex_biases: sample 3 of 5"))
+    #expect(rendered.contains("approved_low_risk_reflex_biases: complete 5 of 5"))
     #expect(rendered.contains("approved_low_risk_reflex: Soft preference"))
 
     guard case .object(let json) = posture.toolResultJSON(tool: "look", surface: "mac") else {
@@ -252,8 +252,8 @@ private func postureSnapshot(
     }
     #expect(json["review_required_reflex_count"] == .int(9))
     #expect(json["approved_low_risk_reflex_total_count"] == .int(5))
-    #expect(json["approved_reflex_bias_sample_count"] == .int(3))
-    #expect(json["approved_reflex_biases_are_sampled"] == .bool(true))
+    #expect(json["approved_reflex_bias_sample_count"] == .int(5))
+    #expect(json["approved_reflex_biases_are_sampled"] == .bool(false))
     #expect(json["directives"] == nil)
     #expect(json["review_signals"] == nil)
     #expect(json["approved_reflex_biases"] == nil)

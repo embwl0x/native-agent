@@ -2,6 +2,13 @@ import Testing
 import Foundation
 @testable import PersistenceCore
 
+private actor PotentialLineCapHookCounter {
+    private var count = 0
+
+    func increment() { count += 1 }
+    func value() -> Int { count }
+}
+
 // MARK: - U5 W-G (2026-06-11): enforceJSONLLineCap
 
 @Suite("enforceJSONLLineCap")
@@ -130,7 +137,77 @@ struct JSONLLineCapTests {
     @Test func securityAuditTriggerKeepsAppendWorkBoundedBeforeRotation() {
         #expect(JSONLLineCaps.securityAudit > 0)
         #expect(JSONLLineCaps.securityAuditTrimTriggerBytes > JSONLLineCaps.securityAudit)
-        #expect(JSONLLineCaps.securityAuditTrimTriggerBytes == 32 * 1024 * 1024)
+        // F5 (2026-08-28): 32 MiB never fired on the live ledger (23 MiB at
+        // 1.65x the row cap); 16 MiB makes the trigger reachable.
+        #expect(JSONLLineCaps.securityAuditTrimTriggerBytes == 16 * 1024 * 1024)
+    }
+
+    @Test func pathOwnedPoliciesResolveTraceAndHarnessBenchmark() {
+        let root = URL(fileURLWithPath: "/tmp/nativeagent-jsonl-policy")
+        let tracePath = root.appendingPathComponent("traces/events.jsonl")
+        let benchmarkPath = root.appendingPathComponent("harness/benchmark/runs.jsonl")
+        let otherPath = root.appendingPathComponent("misc/events.jsonl")
+
+        let trace = jsonlPathOwnedCapPolicy(for: tracePath)
+        #expect(trace?.maxLines == JSONLLineCaps.traceEvents)
+        #expect(trace?.trimWhenBytesExceed == JSONLLineCaps.traceTrimTriggerBytes)
+
+        let benchmark = jsonlPathOwnedCapPolicy(for: benchmarkPath)
+        #expect(benchmark?.maxLines == JSONLLineCaps.harnessBenchmarkRuns)
+        #expect(benchmark?.trimWhenBytesExceed == nil)
+
+        #expect(jsonlPathOwnedCapPolicy(for: otherPath) == nil)
+    }
+
+    @Test func pathOwnedAppendRejectsUnregisteredNearMissWithoutWriting() async {
+        let root = tmpFile().deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let nearMiss = root.appendingPathComponent("trace/events.jsonl")
+
+        await #expect(throws: JSONLPathOwnedAppendError.self) {
+            try await appendPathOwnedJSONL(
+                .object(["i": .int(1)]),
+                to: nearMiss,
+                using: SwiftNativePersistenceCore(),
+                logLabel: "JSONLLineCapTests.nearMiss"
+            )
+        }
+        #expect(!FileManager.default.fileExists(atPath: nearMiss.path))
+    }
+
+    @Test func pathOwnedTraceAppendRestoresNewestWindowAfterSoftTrigger() async throws {
+        let root = tmpFile().deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tracePath = root.appendingPathComponent("traces/events.jsonl")
+        try FileManager.default.createDirectory(
+            at: tracePath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let padding = String(repeating: "x", count: 900)
+        let seeded = (0...JSONLLineCaps.traceEvents).map {
+            #"{"i":\#($0),"padding":"\#(padding)"}"#
+        }.joined(separator: "\n") + "\n"
+        try Data(seeded.utf8).write(to: tracePath)
+
+        try await appendPathOwnedJSONL(
+            .object(["i": .int(Int64(JSONLLineCaps.traceEvents + 1))]),
+            to: tracePath,
+            using: SwiftNativePersistenceCore(),
+            logLabel: "JSONLLineCapTests.trace"
+        )
+
+        let rows = try String(contentsOf: tracePath, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+        #expect(rows.count == JSONLLineCaps.traceEvents)
+        let first = try JSONValue.parse(Data(rows[0].utf8))
+        let last = try JSONValue.parse(Data(rows[rows.count - 1].utf8))
+        guard case .object(let firstObject) = first,
+              case .object(let lastObject) = last else {
+            Issue.record("path-owned trace rotation did not preserve whole JSON rows")
+            return
+        }
+        #expect(firstObject["i"] == .int(2))
+        #expect(lastObject["i"] == .int(Int64(JSONLLineCaps.traceEvents + 1)))
     }
 
     @Test func concurrentCappedAppendsSerializeThroughRotation() async throws {
@@ -172,6 +249,31 @@ struct JSONLLineCapTests {
         let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
         let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
         #expect((perms & 0o777) == 0o600)
+    }
+
+    @Test func preTrimEvidenceHookSharesTheAmortizedCapCadence() async throws {
+        let path = tmpFile()
+        defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+        let counter = PotentialLineCapHookCounter()
+        JSONLCapCheckCounter.shared._testReset()
+
+        for id in 0..<5 {
+            try await appendJSONLCapped(
+                .object(["id": .int(Int64(id))]),
+                to: path,
+                using: SwiftNativePersistenceCore(),
+                maxLines: 100,
+                logLabel: "JSONLLineCapTests.preTrimHook",
+                trimWhenBytesExceed: 1_000_000,
+                capCheckStride: 4,
+                beforePotentialLineCap: { await counter.increment() }
+            )
+        }
+
+        #expect(
+            await counter.value() == 2,
+            "the evidence hook should run on append 1 and stride+1, not every append"
+        )
     }
 
     /// L7 (2026-08-01 audit): `appendJSONLCapped(takeLock: true)` used to
@@ -236,6 +338,55 @@ struct JSONLLineCapTests {
                 "\(relativePath) must not perform an exact full-feed scan per append"
             )
         }
+    }
+
+    @Test func traceAndBenchmarkWriters_usePathOwnedChokepoint() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let relativePaths = [
+            "Modules/NativeAgentCore/Sources/Browser/Browser+OperationStore.swift",
+            "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatCompactionDistiller.swift",
+            "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatSessionAutocompactor.swift",
+            "Modules/NativeAgentCore/Sources/MCPDispatcher/MCPDispatcher.swift",
+            "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatToolDispatchTrace.swift",
+            "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+MemoryTools.swift",
+            "Modules/NativeAgentCore/Sources/ChatOrchestration/ToolPreloadHeuristics.swift",
+            "Modules/NativeAgentCore/Sources/ChatOrchestration/TurnPlanning.swift",
+            "Modules/NativeAgentCore/Sources/Dispatcher/Dispatcher.swift",
+            "Modules/NativeAgentCore/Sources/ProviderRouting/LLMCallTelemetry.swift",
+            "Modules/NativeAgentCore/Sources/ProviderRouting/LLMClient+Real.swift",
+            "Modules/NativeAgentCore/Sources/Research/Research+ActivityTrace.swift",
+            "Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+Media.swift",
+            "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift",
+            "Modules/NativeAgentCore/Sources/TrustCenter/CapabilityCatalog.swift",
+            "Sources/NativeAgentApp/NativeClient+ImprovementOps.swift",
+            "Sources/NativeAgentApp/NativeClient+Improvements.swift",
+        ]
+        for relativePath in relativePaths {
+            let source = try String(
+                contentsOf: repoRoot.appendingPathComponent(relativePath),
+                encoding: .utf8
+            )
+            let chokepointCalls = source.components(separatedBy: "appendPathOwnedJSONL(").count - 1
+            #expect(
+                chokepointCalls == 1,
+                "\(relativePath) must have exactly one path-owned JSONL chokepoint call"
+            )
+        }
+        let browserSource = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Modules/NativeAgentCore/Sources/Browser/Browser+OperationStore.swift"
+            ),
+            encoding: .utf8
+        )
+        #expect(
+            browserSource.contains("to: tracesPath, label: \"Browser.trace\",\n                maxLines: JSONLLineCaps.traceEvents,\n                usesPathOwnedCap: true"),
+            "Browser trace projection must select the path-owned branch"
+        )
     }
 
     // MARK: - LEDGER: core.persistence.enforceJSONLLineCap.nonUTF8SkipPath

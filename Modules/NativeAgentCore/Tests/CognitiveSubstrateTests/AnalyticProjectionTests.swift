@@ -423,6 +423,33 @@ struct AnalyticProjectionTests {
                 "an Observatory preview must remain pure")
     }
 
+    @Test("explicit live capsule provenance survives diagnostic topic words")
+    func explicitLiveCapsuleClassPreservesPresentationAndLegacyDiagnostics() async throws {
+        let start = Date(timeIntervalSince1970: 78_000)
+        let mind = substrate(clock: Clock(start))
+        await mind.ingest(event(
+            .userMessageReceived, summary: "A warm steady turn", at: start, id: "class-seed"
+        ))
+        var request = CognitiveCapsuleRequest(
+            surface: "chat",
+            userMessage: "Explain verification ping messages from codex.",
+            sessionId: "codex-health-discussion",
+            mode: .inject
+        )
+        #expect(request.resolvedTurnKind == .verification)
+        #expect(await mind.prepareFrozenCapsulePresentation(request, at: start) == nil)
+        request.turnKind = .live
+        #expect(await mind.prepareCapsule(request) != nil)
+        let live = try #require(await mind.prepareFrozenCapsulePresentation(request, at: start))
+        #expect(live.presentationCommit != nil)
+
+        request.turnKind = .debug
+        #expect(await mind.prepareFrozenCapsulePresentation(request, at: start) == nil)
+        request.allowNonLiveProjection = true
+        let debug = try #require(await mind.prepareFrozenCapsulePresentation(request, at: start))
+        #expect(debug.presentationCommit == nil)
+    }
+
     @Test("expired seeds disappear from every live read before maintenance")
     func expiredSeedsAreAbsentAcrossReadBoundaries() async throws {
         let start = Date(timeIntervalSince1970: 80_000)

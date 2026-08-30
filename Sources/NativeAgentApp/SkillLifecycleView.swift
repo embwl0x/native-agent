@@ -143,7 +143,9 @@ enum SkillReviewInstallPresentation {
 
     static func successMessage(for receipt: SkillReviewInstallReceipt) -> String {
         let verb = receipt.confirmedState == "active" ? "is now active" : "is installed"
-        return "‘\(receipt.confirmedName)’ \(verb) and available to recall."
+        // This receipt proves the registry state, not that a manifest-only
+        // package has a canonical body or a discoverable memory pointer.
+        return "‘\(receipt.confirmedName)’ \(verb)."
     }
 }
 

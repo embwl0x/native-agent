@@ -245,12 +245,66 @@ struct TurnInspectorModelTests {
         #expect(parsed.skipped == 3, "three malformed rows skipped (blank line not counted)")
     }
 
+    @Test func replay_parse_still_bounds_hand_edited_payloads() throws {
+        let oversized = String(repeating: "x", count: TurnTraceEvent.maxPayloadStringChars + 500)
+        let row = try JSONValue.object([
+            "turnId": .string("manual-row"),
+            "ts": .string("2026-08-29T10:00:00.000Z"),
+            "kind": .string("tool.dispatch"),
+            "payload": .object(["detail": .string(oversized)]),
+        ]).serialize(pretty: false)
+
+        let parsed = TurnTraceReplayReader.parse(row)
+
+        let event = try #require(parsed.events.first)
+        guard case .object(let payload) = event.payload,
+              case .string(let detail)? = payload["detail"] else {
+            Issue.record("bounded replay payload was not preserved as an object")
+            return
+        }
+        #expect(detail.count < oversized.count)
+        #expect(detail.contains("chars]"))
+    }
+
     @Test func replay_read_absent_file_is_empty_not_error() {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("nope-\(UUID().uuidString).jsonl")
         let parsed = TurnTraceReplayReader.read(url)
         #expect(parsed.events.isEmpty)
         #expect(parsed.skipped == 0)
+    }
+
+    @Test func replay_read_reuses_unchanged_file_and_invalidates_on_append() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("turn-trace-cache-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let key = url.resolvingSymlinksInPath().path
+        TurnTraceReplayReader.replayCache.forget(key: key)
+
+        let firstLine = try event(turn: "A", kind: "llm.call", tsOffset: 0)
+            .jsonRow.serialize(pretty: false) + "\n"
+        try Data(firstLine.utf8).write(to: url)
+        let before = TurnTraceReplayReader.replayCache._testStats(key: key)
+        let cold = TurnTraceReplayReader.read(url)
+        let warm = TurnTraceReplayReader.read(url)
+        let cached = TurnTraceReplayReader.replayCache._testStats(key: key)
+
+        #expect(cold.events == warm.events)
+        #expect(cached.misses - before.misses == 1)
+        #expect(cached.hits - before.hits == 1)
+
+        let secondLine = try event(turn: "B", kind: "memory.commit", tsOffset: 1)
+            .jsonRow.serialize(pretty: false) + "\n"
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(secondLine.utf8))
+        try handle.close()
+
+        let changed = TurnTraceReplayReader.read(url)
+        let invalidated = TurnTraceReplayReader.replayCache._testStats(key: key)
+        #expect(changed.events.count == 2)
+        #expect(invalidated.misses - cached.misses == 1)
+        TurnTraceReplayReader.replayCache.forget(key: key)
     }
 
     // MARK: 6. store lifecycle — no leaked subscriptions

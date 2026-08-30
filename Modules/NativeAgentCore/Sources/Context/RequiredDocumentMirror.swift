@@ -190,6 +190,9 @@ public struct StablePromptKernelKey: Hashable, Comparable, Sendable {
 /// must remain outside this value.
 public struct StablePromptKernel: Sendable, Equatable {
     public let key: StablePromptKernelKey
+    /// Selection captured by the builder of this published kernel, not the
+    /// preference observed after asynchronous compilation. Nil means default.
+    public let requestedPersonaOverride: String?
     public let renderedPrompt: String
     public let includedDocumentIDs: [RequiredDocumentID]
     public let tokenCount: Int
@@ -201,13 +204,15 @@ public struct StablePromptKernel: Sendable, Equatable {
         key: StablePromptKernelKey,
         renderedPrompt: String,
         includedDocumentIDs: [RequiredDocumentID],
-        tokenCount: Int
+        tokenCount: Int,
+        requestedPersonaOverride: String? = nil
     ) throws {
         guard tokenCount >= 0 else {
             throw RequiredDocumentMirrorError.negativeKernelTokenCount
         }
 
         self.key = key
+        self.requestedPersonaOverride = requestedPersonaOverride
         self.renderedPrompt = renderedPrompt
         self.includedDocumentIDs = includedDocumentIDs
         self.tokenCount = tokenCount
@@ -219,12 +224,13 @@ public struct StablePromptKernel: Sendable, Equatable {
         )
         self.logicalByteCount = try ContextLogicalByteAccounting.checkedSum(
             [
-                48,
+                64,
                 key.personaID.rawValue.utf8.count,
                 key.surfaceVariant.rawValue.utf8.count,
                 key.sourceFingerprint.utf8.count,
                 renderedPrompt.utf8.count,
                 includedIDBytes,
+                requestedPersonaOverride?.utf8.count ?? 0,
             ],
             overflowError: RequiredDocumentMirrorError.logicalByteOverflow
         )

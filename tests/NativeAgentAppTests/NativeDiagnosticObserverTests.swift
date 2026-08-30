@@ -144,6 +144,12 @@ struct NativeDiagnosticObserverTests {
             beforeProjection: { await projectionGate.waitBeforeProjection() }
         )
         let subscription = await observer.subscribe(capacity: 1)
+        let dropNotice = Task { () -> Int? in
+            for await count in subscription.dropCounts where count >= 7 {
+                return count
+            }
+            return nil
+        }
         let turnID = TurnTraceContext.mintTurnId()
 
         // Receive exactly one priming row, then keep the consumer alive without
@@ -188,6 +194,8 @@ struct NativeDiagnosticObserverTests {
             ))
         }
         #expect(await subscription.dropCount() == 7)
+        #expect(await dropNotice.value == 7,
+                "terminal burst loss must wake diagnostics without a polling timer")
 
         await persistReceipt.waitForCount(10) // prime + nine burst rows
         let reader = TurnTraceRecentReader(dataRootOverride: root)

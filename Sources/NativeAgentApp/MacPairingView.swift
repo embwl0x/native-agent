@@ -72,13 +72,13 @@ struct MacPairingView: View {
                 // S.2: screenshot/sharing warning
                 HStack(spacing: 8) {
                     Image(systemName: "lock.shield.fill").foregroundStyle(.orange)
-                    Text("This QR code and key are SECRETS. Don't screenshot, share, or photograph them — anyone with this key can sign messages to your Mac.")
+                    Text("This pairing key is a SECRET. Don't screenshot, share, or photograph it — anyone with this key can sign messages to your Mac.")
                         .font(.caption).foregroundStyle(.orange)
                 }
                 .padding(10)
                 .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
 
-                Text("Scan this QR code from the NativeAgent iOS app to enable secure iCloud sync. Without pairing, iOS messages are rejected.")
+                Text("Copy the key below, then paste it into NativeAgent on your iPhone or iPad (Pair with Mac -> Pairing key from Mac Settings) to enable secure iCloud sync. Without pairing, iOS messages are rejected.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
 
@@ -102,18 +102,23 @@ struct MacPairingView: View {
                 }
 
                 if let qr = qrImage {
-                    Image(nsImage: qr)
-                        .resizable()
-                        .interpolation(.none)
-                        .frame(width: 240, height: 240)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 4)
-                                .stroke(Color.gray.opacity(0.3), lineWidth: 1)
-                        )
+                    VStack(alignment: .leading, spacing: 6) {
+                        Image(nsImage: qr)
+                            .resizable()
+                            .interpolation(.none)
+                            .frame(width: 240, height: 240)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                            )
+                        Text("The NativeAgent iPhone app does not scan a QR code yet — pair by pasting the key below.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Or paste this key into iOS manually:")
+                    Text("Paste this key into NativeAgent on iOS:")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     HStack {
@@ -175,7 +180,7 @@ struct MacPairingView: View {
                     Button("Regenerate", role: .destructive) { regenerateSecret() }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("This invalidates the current pairing — all paired iOS devices will need to re-pair with the new QR code.")
+                    Text("This invalidates the current pairing — you will need to paste the new key into every paired iPhone and iPad.")
                 }
 
                 Spacer()

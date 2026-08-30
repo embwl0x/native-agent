@@ -651,6 +651,7 @@ public final class AnthropicAdapter: LLMAdapter {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "anthropic")")))
                     return
                 }
+                defer { bytes.task.cancel() }
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if status == 429 {
                     // A3.4: honor Retry-After (header is available pre-drain).

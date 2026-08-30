@@ -5,20 +5,53 @@
 #   script/evals.sh --ui       + strict user-mode eval (black-box AX walk of the installed app)
 #   script/evals.sh --ios      + required iOS simulator unit/eval suites
 #   script/evals.sh --full     complete Swift suites + required iOS + exact verified install
+#   script/evals.sh --changed <sha>  tests only ledger-mapped surfaces touched by one commit
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"  # every tier assumes repo cwd (chat-drive resolves the DEV data root from here; run-anywhere)
-LIVE=0; UI=0; IOS=0; FULL=0
-for a in "$@"; do case "$a" in --live) LIVE=1;; --ui) UI=1;; --ios) IOS=1;; --full) FULL=1; IOS=1;; -h|--help) sed -n 2,8p "$0"; exit 0;; *) echo "unknown option: $a" >&2; exit 2;; esac; done
+LIVE=0; UI=0; IOS=0; FULL=0; CHANGED_SHA=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --live) LIVE=1; shift;;
+    --ui) UI=1; shift;;
+    --ios) IOS=1; shift;;
+    --full) FULL=1; IOS=1; shift;;
+    --changed)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then echo "--changed requires a commit SHA" >&2; exit 2; fi
+      CHANGED_SHA="$2"; shift 2;;
+    -h|--help) sed -n 2,9p "$0"; exit 0;;
+    *) echo "unknown option: $1" >&2; exit 2;;
+  esac
+done
+if [ -n "$CHANGED_SHA" ] && { [ "$LIVE" = 1 ] || [ "$UI" = 1 ] || [ "$IOS" = 1 ] || [ "$FULL" = 1 ]; }; then
+  echo "--changed cannot be combined with --live, --ui, --ios, or --full" >&2
+  exit 2
+fi
 OUT="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-evals.XXXXXX")"
-fails=0; t0=$(date +%s)
+fails=0; changed_exit_code=0; t0=$(date +%s)
 step() { # name, cmd...
   local name="$1"; shift; local s=$(date +%s)
   if "$@" > "$OUT/$name.log" 2>&1; then printf '  ✔ %-34s %4ss\n' "$name" "$(( $(date +%s) - s ))"
   else printf '  ✘ %-34s %4ss  → %s\n' "$name" "$(( $(date +%s) - s ))" "$OUT/$name.log"; fails=$((fails+1)); fi
 }
 has_nonzero_test_count() {
-  grep -Eq '(^|[^0-9])[1-9][0-9]* tests?' "$1"
+  # Discovery/build chatter is not execution proof. Accept only framework
+  # completion summaries or the iOS runners checked xcresult receipt.
+  awk '
+    /^[[:space:]]*Executed [0-9]+ tests?, with ([0-9]+ tests? skipped and )?[0-9]+ failures?([[:space:]]|$)/ {
+      total=$2; skipped=0; failed=$5
+      if ($6 ~ /^tests?$/ && $7 == "skipped") { skipped=$5; failed=$9 }
+      if (failed !~ /^[0-9]+$/ || failed > 0) bad=1
+      else if (total > skipped) found=1
+    }
+    /^[^[:alnum:]]*Test run with [0-9]+ tests?( in [0-9]+ suites?)? passed([[:space:]]|$)/ {
+      line=$0; sub(/^.*Test run with /,"",line); split(line,fields," ")
+      if (fields[1] > 0) found=1
+    }
+    /^[^[:alnum:]]*Test run with [0-9]+ tests?.*failed/ { bad=1 }
+    /^\[test-ios\] passed: [1-9][0-9]* passed, [0-9]+ skipped, [0-9]+ expected failures, [1-9][0-9]* discovered$/ { found=1 }
+    END { exit(found && !bad ? 0 : 1) }
+  ' "$1"
 }
 test_step() { # A green command that selected zero tests is a failure.
   local name="$1"; shift; local s=$(date +%s); local log="$OUT/$name.log"
@@ -28,6 +61,79 @@ test_step() { # A green command that selected zero tests is a failure.
     if ! has_nonzero_test_count "$log"; then printf '\n[evals] no non-zero executed-test count found\n' >> "$log"; fi
     printf '  ✘ %-34s %4ss  → %s\n' "$name" "$(( $(date +%s) - s ))" "$log"; fails=$((fails+1))
   fi
+}
+changed_failure() { # package-label, filter, step-name, log
+  local package_label="$1" filter="$2" name="$3" log="$4" found=0
+  while IFS=$'\t' read -r mapped_package mapped_filter surface_id where_text fence; do
+    if [ "$mapped_package" = "$package_label" ] && [ "$mapped_filter" = "$filter" ]; then
+      printf '    BROKE: %s (%s)\n' "$surface_id" "$where_text"
+      found=1
+    fi
+  done < "$OUT/changed-mappings.tsv"
+  if [ "$found" = 0 ]; then
+    printf '    UNMAPPED FAILURE: %s (%s --filter %s)\n' "$name" "$package_label" "$filter"
+  fi
+  printf '    diagnostic: %s\n' "$log"
+  sed -n '1,80p' "$log" | sed 's/^/      /'
+}
+changed_test_step() { # name, package-label, filter, cmd...
+  local name="$1" package_label="$2" filter="$3"; shift 3
+  local s=$(date +%s) log="$OUT/$name.log" rc=0
+  "$@" > "$log" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && has_nonzero_test_count "$log"; then
+    printf '  ✔ %-34s %4ss\n' "$name" "$(( $(date +%s) - s ))"
+    return 0
+  fi
+  if ! has_nonzero_test_count "$log"; then printf '\n[evals] no non-zero executed-test count found\n' >> "$log"; fi
+  printf '\n[evals] command exit: %s\n' "$rc" >> "$log"
+  printf '  ✘ %-34s %4ss  → %s\n' "$name" "$(( $(date +%s) - s ))" "$log"
+  fails=$((fails+1))
+  if [ "$changed_exit_code" = 0 ]; then
+    if [ "$rc" = 0 ]; then changed_exit_code=1; else changed_exit_code="$rc"; fi
+  fi
+  changed_failure "$package_label" "$filter" "$name" "$log"
+  return 1
+}
+changed_script_step() { # name, script-path, cmd...
+  local name="$1" script_path="$2"; shift 2
+  local s=$(date +%s) log="$OUT/$name.log" rc=0
+  "$@" > "$log" 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then
+    printf '  ✔ %-34s %4ss\n' "$name" "$(( $(date +%s) - s ))"
+    return 0
+  fi
+  printf '\n[evals] command exit: %s\n' "$rc" >> "$log"
+  printf '  ✘ %-34s %4ss  → %s\n' "$name" "$(( $(date +%s) - s ))" "$log"
+  fails=$((fails+1))
+  [ "$changed_exit_code" = 0 ] && changed_exit_code="$rc"
+  changed_failure "script" "$script_path" "$name" "$log"
+  return 1
+}
+is_eval_bookkeeping_path() {
+  case "$1" in
+    docs/evals/phase1-fragments.json|docs/evals/coverage-overrides.json|docs/evals/coverage-campaigns.json|docs/evals/ledger.json|docs/evals/COVERAGE.md|docs/evals/total-coverage-surface-ids.json|docs/evals/behavior-coverage-conveyor-*-surface-ids.json|docs/evals/behavior-remap-residue-*.json) return 0;;
+    *) return 1;;
+  esac
+}
+changed_docs_merge_step() {
+  local name=canonical-merge s=$(date +%s) log="$OUT/canonical-merge.log"
+  local rendered="$OUT/canonical-merge"
+  mkdir -p "$rendered"
+  local rc=0
+  "$CHANGED_SWIFT" "$ROOT/script/evals_ledger_merge.swift" \
+    "$ROOT/docs/evals/phase1-fragments.json" --out "$rendered" > "$log" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && cmp -s "$rendered/ledger.json" "$ROOT/docs/evals/ledger.json" \
+      && cmp -s "$rendered/COVERAGE.md" "$ROOT/docs/evals/COVERAGE.md"; then
+    printf '  ✔ %-34s %4ss\n' "$name" "$(( $(date +%s) - s ))"
+    return 0
+  fi
+  [ "$rc" = 0 ] && printf '\n[evals] generated ledger/COVERAGE differ from canonical merge\n' >> "$log"
+  printf '\n[evals] command exit: %s\n' "$rc" >> "$log"
+  printf '  ✘ %-34s %4ss  → %s\n' "$name" "$(( $(date +%s) - s ))" "$log"
+  fails=$((fails+1))
+  [ "$changed_exit_code" = 0 ] && changed_exit_code=$([ "$rc" = 0 ] && echo 1 || echo "$rc")
+  sed -n '1,80p' "$log" | sed 's/^/      /'
+  return 1
 }
 full_source_digest() {
   local file
@@ -49,6 +155,69 @@ full_install_and_verify() {
   touch "$OUT/full-install-ready"
 }
 echo "evals — $(git -C "$ROOT" rev-parse --short HEAD) — $(date '+%Y-%m-%d %H:%M')   (logs: $OUT)"
+if [ -n "$CHANGED_SHA" ]; then
+  CHANGED_SWIFT="${NATIVEAGENT_EVALS_CHANGED_SWIFT:-swift}"
+  if ! "$CHANGED_SWIFT" "$ROOT/script/evals_ledger_merge.swift" changed-plan \
+      --repo "$ROOT" --ledger "$ROOT/docs/evals/ledger.json" --sha "$CHANGED_SHA" \
+      --selections "$OUT/changed-selections.tsv" --mappings "$OUT/changed-mappings.tsv" \
+      --unmapped "$OUT/changed-unmapped.tsv" --changed-files "$OUT/changed-files.txt" \
+      > "$OUT/changed-plan.log" 2>&1; then
+    echo "[evals] changed-mode planning failed for '$CHANGED_SHA':" >&2
+    sed 's/^/  /' "$OUT/changed-plan.log" >&2
+    exit 2
+  fi
+
+  echo "changed files:"
+  sed 's/^/  /' "$OUT/changed-files.txt"
+  docs_only=1
+  while IFS= read -r changed_file; do
+    [ -z "$changed_file" ] && continue
+    is_eval_bookkeeping_path "$changed_file" || docs_only=0
+  done < "$OUT/changed-files.txt"
+  [ -s "$OUT/changed-files.txt" ] || docs_only=0
+  awk -F '\t' '!seen[$5 FS $3]++ {printf "  IMPLICATED: %s/%s (%s)\n", $5, $3, $4}' \
+    "$OUT/changed-mappings.tsv"
+  selected_count=$(awk 'END{print NR+0}' "$OUT/changed-selections.tsv")
+  if [ "$selected_count" = 0 ] && [ "$docs_only" = 0 ]; then
+    echo "  NO MAPPED EXECUTABLE REFS: this commit selects no ledger-backed test or smoke check"
+    fails=$((fails+1))
+    [ "$changed_exit_code" = 0 ] && changed_exit_code=1
+  fi
+  while IFS=$'\t' read -r surface_id where_text fence; do
+    [ -z "$surface_id" ] && continue
+    printf '  UNMAPPED SURFACE: %s (%s) — no executable coverage ref\n' "$surface_id" "$where_text"
+    fails=$((fails+1))
+    [ "$changed_exit_code" = 0 ] && changed_exit_code=1
+  done < "$OUT/changed-unmapped.tsv"
+
+  index=0
+  while IFS=$'\t' read -r package_label package_path filter; do
+    [ -z "$filter" ] && continue
+    index=$((index+1)); name=$(printf 'changed-%03d' "$index")
+    if [ "$package_label" = "script" ]; then
+      printf '  SELECTED: executable %s\n' "$filter"
+      changed_script_step "$name" "$filter" "$ROOT/$filter" || true
+    else
+      printf '  SELECTED: %s --filter %s\n' "$package_label" "$filter"
+      changed_test_step "$name" "$package_label" "$filter" \
+        swift test --force-resolved-versions --skip-update --package-path "$ROOT/$package_path" --filter "$filter" || true
+    fi
+  done < "$OUT/changed-selections.tsv"
+  if [ "$docs_only" = 1 ]; then
+    changed_docs_merge_step || true
+  fi
+  changed_test_step ledger-keeper root EvalCoverageLedger \
+    swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "EvalCoverageLedger" || true
+  changed_test_step total-surface-contract root TotalSurfaceContract \
+    swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "TotalSurfaceContract" || true
+
+  echo
+  if [ "$fails" = 0 ] && [ "$docs_only" = 1 ]; then
+    echo "DOCS-ONLY: keeper+seal+merge green, nothing executable touched"
+  elif [ "$fails" = 0 ]; then echo "WE'RE GOOD"; else echo "NOT GOOD: $fails failure(s)"; fi
+  echo "$(( $(date +%s) - t0 ))s total, $fails failure(s)"
+  exit "$changed_exit_code"
+fi
 FULL_SOURCE_BEFORE=""
 [ "$FULL" = 1 ] && FULL_SOURCE_BEFORE="$(full_source_digest)"
 step smoke              "$ROOT/script/smoke_all.sh"
@@ -58,13 +227,24 @@ if [ "$FULL" = 1 ]; then
   # root.  Its artifact belongs to this run's temporary directory, never data.
   step feed-coverage swift "$ROOT/script/feed_coverage_eval.swift" --data-root "$ROOT/data" --days 7 --out "$OUT/feed-coverage.md"
   step full-swift-suite "$ROOT/script/test.sh" --require-ios
-  step full-install-verified full_install_and_verify
+  if [ "$fails" = 0 ]; then
+    step full-install-verified full_install_and_verify
+  else
+    # Accumulating diagnostics must not install a candidate whose prerequisite
+    # checks failed or were interrupted. Keep their original failure count and
+    # logs; this dependent action is blocked, never a successful skip.
+    printf '[evals] BLOCKED: install requires every preceding full-mode check to pass (%s failure(s))\n' "$fails" \
+      > "$OUT/full-install-verified.log"
+    printf '  ✘ %-34s %4ss  → BLOCKED by failed prerequisites; %s\n' \
+      "full-install-verified" 0 "$OUT/full-install-verified.log"
+  fi
 else
-  test_step turn-replay        swift test --package-path "$ROOT" --filter "TurnReplayBench"
-  test_step range-bench-L1     swift test --package-path "$ROOT" --filter "PersonalityRangeBench"
-  test_step ledger-keeper      swift test --package-path "$ROOT" --filter "EvalCoverageLedger"
+  test_step turn-replay        swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "TurnReplayBench"
+  test_step range-bench-L1     swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "PersonalityRangeBench"
+  test_step ledger-keeper      swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "EvalCoverageLedger"
+  test_step total-surface-contract swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "TotalSurfaceContract"
 fi
-[ "$LIVE" = 1 ] && NATIVEAGENT_RANGE_BENCH_LIVE=1 NATIVEAGENT_RANGE_BENCH_PERSONA_ROOT="$ROOT/persona" test_step range-bench-live swift test --package-path "$ROOT" --filter "scenario2_theRange"
+[ "$LIVE" = 1 ] && NATIVEAGENT_RANGE_BENCH_LIVE=1 NATIVEAGENT_RANGE_BENCH_PERSONA_ROOT="$ROOT/persona" test_step range-bench-live swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "scenario2_theRange"
 [ "$IOS" = 1 ] && [ "$FULL" = 0 ] && test_step ios-simulator "$ROOT/script/test_ios.sh" --require
 if [ "$UI" = 1 ]; then
   if [ "$FULL" = 0 ] || [ -f "$OUT/full-install-ready" ]; then

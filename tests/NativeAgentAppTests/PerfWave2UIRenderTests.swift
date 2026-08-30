@@ -446,6 +446,15 @@ struct SelfImprovementEqualityGateTests {
 @MainActor
 struct WhatsRunningCoalescingTests {
 
+    @Test func latest_snapshot_gate_rejects_an_older_completion() {
+        var gate = LatestSnapshotRefreshGate()
+        let older = gate.begin()
+        let newer = gate.begin()
+
+        #expect(!gate.isCurrent(older))
+        #expect(gate.isCurrent(newer))
+    }
+
     private func status(
         attempt: TimeInterval,
         success: TimeInterval?,
@@ -507,6 +516,8 @@ struct WhatsRunningCoalescingTests {
     @Test func loadWhatsRunning_gates_both_the_snapshot_and_the_status() throws {
         let source = try AppSourceScraping.appSource("AppModel+HealthEmbeddings.swift")
         let body = try #require(AppSourceScraping.looseFunctionBody(named: "loadWhatsRunning", in: source))
+        #expect(body.contains("let refreshGeneration = whatsRunningRefreshGate.begin()"))
+        #expect(body.contains("guard whatsRunningRefreshGate.isCurrent(refreshGeneration) else { return }"))
         #expect(body.contains("if whatsRunning != fetched { whatsRunning = fetched }"),
                 "the whatsRunning snapshot lost its equality gate")
         #expect(body.contains("staleFlagOnlyStatusToStore"),

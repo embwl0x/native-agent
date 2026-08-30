@@ -101,6 +101,68 @@ struct ChatSidebarSections {
     }
 }
 
+struct ChatSidebarProjection {
+    let sections: ChatSidebarSections
+    let pinnedTabs: [ChatSession]
+}
+
+/// Chat messages stream at token cadence, while the session rail usually does
+/// not change at all. Keep its decoded pins, search filter, dictionaries, and
+/// partition behind an exact-input cache so a transcript delta only rebuilds
+/// the transcript. Arrays are retained copy-on-write and compared exactly;
+/// there is no hash-collision or stale-row shortcut.
+@MainActor
+final class ChatSidebarProjectionCache {
+    private var sessions: [ChatSession]?
+    private var pinnedRaw = ""
+    private var search = ""
+    private var cached = ChatSidebarProjection(
+        sections: .init(pinned: [], unpinned: []),
+        pinnedTabs: []
+    )
+    private(set) var rebuildCount = 0
+
+    func project(
+        sessions newSessions: [ChatSession],
+        pinnedRaw newPinnedRaw: String,
+        search newSearch: String
+    ) -> ChatSidebarProjection {
+        if sessions == newSessions,
+           pinnedRaw == newPinnedRaw,
+           search == newSearch {
+            return cached
+        }
+
+        let query = newSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let visible = query.isEmpty ? newSessions : newSessions.filter {
+            $0.title.lowercased().contains(query)
+                || ($0.lastMessagePreview ?? "").lowercased().contains(query)
+        }
+        let pinnedIDs = MacPinnedChatSessionStore.decode(newPinnedRaw)
+        let pinnedTabs: [ChatSession]
+        if pinnedIDs.isEmpty {
+            pinnedTabs = []
+        } else {
+            let byID = Dictionary(
+                newSessions.map { ($0.id, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            pinnedTabs = pinnedIDs.compactMap { byID[$0] }
+        }
+
+        let result = ChatSidebarProjection(
+            sections: ChatSidebarSections.split(visible: visible, orderedPinned: pinnedTabs),
+            pinnedTabs: pinnedTabs
+        )
+        sessions = newSessions
+        pinnedRaw = newPinnedRaw
+        search = newSearch
+        cached = result
+        rebuildCount += 1
+        return result
+    }
+}
+
 /// The identity SwiftUI uses for a sidebar row.  Section membership is part
 /// of the identity on purpose: moving a session between Pinned and Recent
 /// must destroy the old lazy row rather than recycle its local view state.
@@ -116,6 +178,35 @@ struct ChatSidebarSessionRowIdentity: Hashable, Sendable {
     init(sessionID: String, pinned: Bool) {
         self.sessionID = sessionID
         self.section = pinned ? .pinned : .recent
+    }
+}
+
+/// D4 (2026-08-28): the auto-read triggers, lifted off ChatView's root body.
+///
+/// Read-aloud has to watch three token-rate signals (a new message, the tail
+/// message's growing content, and the turn ending). Hanging those on the root
+/// body made every streamed delta a dependency of the WHOLE Chat screen — the
+/// session rail included. This view renders nothing and exists only to own
+/// those three dependencies; `onChanged` is `speakLatestAssistantIfReady`,
+/// whose own gate (ChatVoiceAutoReadGate) is unchanged, so the firing
+/// CONDITIONS are identical to before the move.
+struct ChatReadAloudObserver: View {
+    @Environment(AppModel.self) private var appModel
+    var onChanged: () -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+            .onChange(of: appModel.chatMessages.count) {
+                onChanged()
+            }
+            .onChange(of: appModel.chatMessages.last?.content) {
+                if !appModel.isBusy { onChanged() }
+            }
+            .onChange(of: appModel.isBusy) {
+                if !appModel.isBusy { onChanged() }
+            }
     }
 }
 
@@ -219,11 +310,12 @@ struct ChatView: View {
     // destructive button action cannot race into duplicate clears.
     @State var clearConfirmation = ChatClearConfirmationState()
     // Capability store supplies dynamic slash-command suggestions and dispatch metadata.
-    @State var capabilitiesStore = CapabilitiesStore()
+    @State var capabilitiesStore = CapabilitiesStore.shared
     // PATCH-Phase7b: tool dispatch sheet + in-flight plan
     @State var showToolInputForm = false
     @State var currentDispatchPlan: DispatchArgPlan? = nil
     @State var scrollCoordinator = ChatScrollCoordinator()
+    @State var sidebarProjectionCache = ChatSidebarProjectionCache()
     /// Per-session cursor prevents a tab switch from overwriting the marker
     /// for a response that is still arriving in another conversation.
     @State var lastAutoReadMessageIds: [String: String] = [:]
@@ -231,6 +323,12 @@ struct ChatView: View {
     /// auto-read must not mistake old history for a newly appended reply.
     @State var autoReadPrimedSessionIds: Set<String> = []
     @State var pinnedSessionDropTargeted = false
+    /// D1: `hasAnyUsableProvider()` stats credential files on disk, so it must
+    /// not be called from `body` (which re-runs at token rate). Cached here and
+    /// refreshed at the three moments the answer can change for this view:
+    /// appearing, switching session, and a provider being connected. Starts
+    /// TRUE so a working machine can never flash the connect prompt.
+    @State var hasUsableProvider = true
     /// Fences overlapping "Go to" tasks. A route may need to refresh the
     /// session index before selection; an older click must not resume after a
     /// newer click and become the newest AppModel selection request.
@@ -267,48 +365,12 @@ struct ChatView: View {
         return hasher.finalize()
     }
 
-    var filteredSessions: [ChatSession] {
-        let query = sessionSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return appModel.chatSessions }
-        return appModel.chatSessions.filter {
-            $0.title.lowercased().contains(query) ||
-                ($0.lastMessagePreview ?? "").lowercased().contains(query)
-        }
-    }
-
-    var pinnedSessionIds: [String] {
-        decodedPinnedSessionIds()
-    }
-
-    var pinnedSessions: [ChatSession] {
-        let ids = pinnedSessionIds
-        // H5: skip the dictionary build entirely in the (common) no-pins case.
-        // `uniquingKeysWith` because `Dictionary(uniqueKeysWithValues:)` traps
-        // on a duplicate id, and nothing upstream guarantees the session list
-        // is id-unique.
-        guard !ids.isEmpty else { return [] }
-        let byId = Dictionary(
-            appModel.chatSessions.map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
+    var sidebarProjection: ChatSidebarProjection {
+        sidebarProjectionCache.project(
+            sessions: appModel.chatSessions,
+            pinnedRaw: pinnedChatSessionIdsRaw,
+            search: sessionSearch
         )
-        return ids.compactMap { byId[$0] }
-    }
-
-    // sidebar-density 2026-08-10: the sidebar shows pinned sessions in their
-    // own section (pin ORDER, matching the tab strip) with everything else
-    // below. Both sections respect the live search filter.
-    var filteredPinnedSidebarSessions: [ChatSession] {
-        ChatSidebarSections.split(
-            visible: filteredSessions,
-            orderedPinned: pinnedSessions
-        ).pinned
-    }
-
-    var filteredUnpinnedSidebarSessions: [ChatSession] {
-        ChatSidebarSections.split(
-            visible: filteredSessions,
-            orderedPinned: pinnedSessions
-        ).unpinned
     }
 
     // 658.14: kept off the body so ChatView's already-maximal body expression
@@ -398,11 +460,18 @@ struct ChatView: View {
             sessionSidebar
             Divider()
             chatColumn
+            // D4: the three token-rate read-aloud triggers used to hang off
+            // THIS view's modifier chain, so every streamed delta re-evaluated
+            // `chatMessages.last?.content` alongside the whole root body (and
+            // the session rail with it). They now live in a zero-size observer
+            // that owns those dependencies by itself.
+            ChatReadAloudObserver(onChanged: speakLatestAssistantIfReady)
         }
         .navigationTitle("Chat")
         .onAppear {
             voiceOutput.nativeBaseURL = appModel.nativeBaseURL
             prunePinnedSessions()
+            hasUsableProvider = appModel.hasAnyUsableProvider()
             // H5: pick up whatever draft this session already holds (a prefill
             // that landed while Chat was off-screen, or our own last commit).
             adoptDraft(for: appModel.activeChatSessionId)
@@ -421,7 +490,6 @@ struct ChatView: View {
         }
         // Seed CapabilitiesStore when chat view appears (TTL-gated, no-op if fresh).
         .task {
-            capabilitiesStore = CapabilitiesStore()
             await capabilitiesStore.refresh()
             // First-run: agent greets the user once a provider is connected.
             // Idempotent + self-gating; safe to call from multiple triggers.
@@ -433,6 +501,7 @@ struct ChatView: View {
             // updated) active id, so the text lands where it was typed.
             commitDraft()
             adoptDraft(for: newSessionId)
+            hasUsableProvider = appModel.hasAnyUsableProvider()
             Task { await appModel.maybeSendFirstRunGreeting() }
         }
         // H5: the only channel by which text written OUTSIDE the composer
@@ -452,20 +521,17 @@ struct ChatView: View {
         .onChange(of: appModel.chatProvider) {
             // Catches the case where the user skipped the provider step at
             // onboarding and connected an LLM later in Settings.
+            hasUsableProvider = appModel.hasAnyUsableProvider()
             Task { await appModel.maybeSendFirstRunGreeting() }
         }
-        .onChange(of: appModel.chatMessages.count) {
-            speakLatestAssistantIfReady()
-        }
-        .onChange(of: appModel.chatMessages.last?.content) {
-            if !appModel.isBusy {
-                speakLatestAssistantIfReady()
-            }
-        }
-        .onChange(of: appModel.isBusy) {
-            if !appModel.isBusy {
-                speakLatestAssistantIfReady()
-            }
+        // D1 review fix: readiness can change WITHOUT chatProvider changing
+        // (credentials added for the already-selected provider in Settings).
+        // Any window regaining key — e.g. returning from the Settings window —
+        // re-derives it, so the connect prompt can never sit stale while the
+        // user is looking at Chat.
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSWindow.didBecomeKeyNotification)) { _ in
+            hasUsableProvider = appModel.hasAnyUsableProvider()
         }
         .onChange(of: chatSessionIdsFingerprint) {
             prunePinnedSessions()
@@ -535,10 +601,16 @@ struct ChatView: View {
 
             ScrollView {
                 LazyVStack(spacing: 4) {
-                    let pinnedRows = filteredPinnedSidebarSessions
-                    let recentRows = filteredUnpinnedSidebarSessions
+                    let sections = sidebarProjection.sections
+                    let pinnedRows = sections.pinned
+                    let recentRows = sections.unpinned
                     if pinnedRows.isEmpty && recentRows.isEmpty {
-                        Text("No matching sessions")
+                        Text(
+                            ChatSessionListEmptyStatePresentation.message(
+                                totalSessionCount: appModel.chatSessions.count,
+                                searchQuery: sessionSearch
+                            )
+                        )
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -591,10 +663,22 @@ struct ChatView: View {
         let pinState: SessionRow.PinState = isPinned
             ? .pinned(onUnpin: { unpinSession(session.id) })
             : .unpinned
+        let selectSession: () -> Void = {
+            // While this row is editing its title, clicks belong to the
+            // TextField — re-selecting would steal focus mid-rename.
+            guard !renaming else { return }
+            // Selecting another row cancels the current edit. Both pointer
+            // and accessibility activation must use this same path; a
+            // disappearing editor must never commit a half-typed title.
+            if renamingSessionId != nil { renamingSessionId = nil }
+            renameTitle = session.title
+            Task { await appModel.selectChatSession(session) }
+        }
         SessionRow(
             session: session,
             selected: session.id == appModel.activeChatSessionId,
             pinState: pinState,
+            onSelect: selectSession,
             renaming: renaming,
             onRenameBegin: { renamingSessionId = session.id },
             onRenameEnd: { title in
@@ -603,20 +687,7 @@ struct ChatView: View {
             }
         )
             .contentShape(Rectangle())
-            .onTapGesture {
-                // While this row is editing its title, clicks belong to the
-                // TextField — re-selecting would steal focus mid-rename.
-                guard !renaming else { return }
-                // Clicking any other row while an editor is open CANCELS
-                // that edit (the vanishing TextField's onDisappear ends it
-                // without committing) — required because macOS never moves
-                // first responder to a non-focusable row, so a focus-loss
-                // commit can't fire; committing here would be
-                // indistinguishable from a scroll-recycle commit.
-                if renamingSessionId != nil { renamingSessionId = nil }
-                renameTitle = session.title
-                Task { await appModel.selectChatSession(session) }
-            }
+            .onTapGesture(perform: selectSession)
             // detached-chat-windows Phase 1 W1.3: AppKit drag
             // source replaces SwiftUI .onDrag so we can detect
             // "dropped on desktop" via NSDraggingSource and
@@ -665,7 +736,7 @@ struct ChatView: View {
                     }
                 }
             }
-            .help("Hover for rename · drag into chat to pin · right-click for more")
+            .help("\(session.displayTitle)\n\nHover for rename · drag into chat to pin · right-click for more")
             // Live-verified 2026-08-10: when a session moves between the
             // Pinned and Recent sections, the LazyVStack can hand back a
             // recycled row still wearing the OLD section's appearance (pin
@@ -743,9 +814,12 @@ struct ChatView: View {
                     .padding(.horizontal)
                     .padding(.bottom, 6)
 
-                if !pinnedSessions.isEmpty || pinnedSessionDropTargeted {
+                // D4: one decode + one dictionary build for the strip, instead
+                // of one for the emptiness test and another for the rows.
+                let pinnedTabs = sidebarProjection.pinnedTabs
+                if !pinnedTabs.isEmpty || pinnedSessionDropTargeted {
                     PinnedSessionTabStrip(
-                        sessions: pinnedSessions,
+                        sessions: pinnedTabs,
                         activeSessionId: appModel.activeChatSessionId,
                         runningSessionIds: appModel.pinnedTabRunningSessionIDs,
                         dropTargeted: pinnedSessionDropTargeted,
@@ -782,20 +856,33 @@ struct ChatView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
                             if appModel.chatMessages.isEmpty {
-                                // PATCH-2026-05-09: chat-ux-polish — persona-aware empty state + suggestion chips
-                                ChatEmptyState(
-                                    personaName: appModel.agentDisplayName,
-                                    onSuggestion: { suggestion in
-                                        ChatEmptyStateSuggestionAction.apply(
-                                            suggestion,
-                                            model: appModel,
-                                            activeSessionID: appModel.activeChatSessionId,
-                                            draftText: &draftText,
-                                            draftSessionID: &draftSessionId
-                                        )
+                                switch ChatEmptyStateMode.mode(
+                                    hasUsableProvider: hasUsableProvider
+                                ) {
+                                case .connectProvider:
+                                    // D1: never invite a message that can only
+                                    // dead-end. Send the user to Providers first.
+                                    ChatProviderConnectEmptyState {
+                                        _ = NativeAgentAppCoordinator.shared
+                                            .request(.sidebar(.providers))
                                     }
-                                )
-                                .frame(minHeight: 360)
+                                    .frame(minHeight: 360)
+                                case .suggestions:
+                                    // PATCH-2026-05-09: chat-ux-polish — persona-aware empty state + suggestion chips
+                                    ChatEmptyState(
+                                        personaName: appModel.agentDisplayName,
+                                        onSuggestion: { suggestion in
+                                            ChatEmptyStateSuggestionAction.apply(
+                                                suggestion,
+                                                model: appModel,
+                                                activeSessionID: appModel.activeChatSessionId,
+                                                draftText: &draftText,
+                                                draftSessionID: &draftSessionId
+                                            )
+                                        }
+                                    )
+                                    .frame(minHeight: 360)
+                                }
                             } else {
                                 let sessionBusy = appModel.isBusy && appModel.currentChatTaskSessionId == appModel.activeChatSessionId
                                 // Main and detached chat share the exact grouped
@@ -1171,7 +1258,7 @@ struct ChatView: View {
                     let screenCaptureAllowed = appModel.trustPolicy?.multimodalPolicy?.screen_capture == true
                     let activeSessionIsRunning = appModel.isBusy || appModel.isChatStreaming
                     let canSend = !isCapturing
-                        && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && (ChatTranscriptPresentation.hasVisibleText(text)
                             || !pendingAttachments.isEmpty)
 
                     MacChatComposerControlStrip(
@@ -1180,6 +1267,8 @@ struct ChatView: View {
                         screenCaptureDisabled: activeSessionIsRunning || isCapturing || !screenCaptureAllowed,
                         pendingAttachmentCount: pendingAttachments.count,
                         isRunning: activeSessionIsRunning,
+                        hasQueuedTurns: !appModel.queuedChatTurns(for: appModel.activeChatSessionId).isEmpty,
+                        isQueuePaused: appModel.isChatQueuePaused(appModel.activeChatSessionId),
                         canSend: canSend,
                         onToggleVoice: toggleVoice,
                         onCaptureScreen: captureScreen,
@@ -1200,7 +1289,7 @@ struct ChatView: View {
                         .italic(voiceInput.isListening)
                         .onSubmit { send() }
                         .onChange(of: voiceInput.transcript) { _, newVal in
-                            if !newVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            if ChatTranscriptPresentation.hasVisibleText(newVal) {
                                 text = composeVoiceDraft(newVal)
                             }
                         }
@@ -1210,7 +1299,7 @@ struct ChatView: View {
                                 let hasArgsAlready = afterSlash.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
                                 let firstToken = afterSlash.components(separatedBy: .whitespacesAndNewlines).first ?? afterSlash
                                 let lowerToken = firstToken.lowercased()
-                                let dynamicCommandNames = capabilitiesStore.slashCommandTools().map(\.name)
+                                let dynamicCommandNames = capabilitiesStore.slashCommandNames
                                 let prefixMatch = !hasArgsAlready && (
                                     lowerToken.isEmpty
                                     || ChatSlashCommandRegistry.commandNames.contains { $0.hasPrefix(lowerToken) }

@@ -21,19 +21,22 @@ public enum LegacyContextReceiptFeed {
         public var removed: Int
         public var failedRemovals: Int
         public var unavailable: Bool
+        public var removedArtifactPaths: [String]
 
         public init(
             discovered: Int = 0,
             protected: Int = 0,
             removed: Int = 0,
             failedRemovals: Int = 0,
-            unavailable: Bool = false
+            unavailable: Bool = false,
+            removedArtifactPaths: [String] = []
         ) {
             self.discovered = discovered
             self.protected = protected
             self.removed = removed
             self.failedRemovals = failedRemovals
             self.unavailable = unavailable
+            self.removedArtifactPaths = removedArtifactPaths
         }
     }
 
@@ -146,7 +149,10 @@ public enum LegacyContextReceiptFeed {
                     try fm.removeItem(at: candidate.url)
                     return true
                 }
-                if removed { report.removed += 1 }
+                if removed {
+                    report.removed += 1
+                    report.removedArtifactPaths.append("context/\(candidate.url.lastPathComponent)")
+                }
             } catch {
                 report.failedRemovals += 1
             }

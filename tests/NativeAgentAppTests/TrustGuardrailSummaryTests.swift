@@ -104,6 +104,46 @@ struct TrustGuardrailSummaryTests {
     // MARK: - Autonomy
 
     @Test
+    func activeFullMacSummaryUsesEffectiveAutonomyAndKeepsExceptions() {
+        var p = policy(
+            permissionLevel: "full_mac_os",
+            autonomyDefault: "workspace_autonomous",
+            outsideWorkspaceDefault: "allow"
+        )
+        p.fullMacNeverExpires = true
+        for expiresAt in ["never", "2099-01-01T00:00:00Z"] {
+            p.fullMacNeverExpires = expiresAt == "never"
+            p.fullMacExpiresAt = expiresAt
+            let rows = TrustGuardrailSummary.rows(policy: p, accessMode: "full")
+            let autonomy = row(rows, "autonomy")
+            #expect(autonomy.value == "Full Mac autonomy active")
+            #expect(autonomy.detail.contains("outside your workspaces"))
+            #expect(autonomy.detail.contains("trusted remote surfaces"))
+            #expect(autonomy.detail.contains("External sends, explicit tool blocks, and protected system actions keep their own checks"))
+            #expect(row(rows, "external_send").value == "Asks before sending")
+        }
+    }
+
+    @Test
+    func inactiveExpiredOrMalformedFullMacNeverClaimsActiveAutonomy() {
+        var p = policy(
+            permissionLevel: "full_mac_os",
+            autonomyDefault: "workspace_autonomous",
+            outsideWorkspaceDefault: "allow"
+        )
+        for expiresAt: String? in [nil, "2020-01-01T00:00:00Z", "not-a-date"] {
+            p.fullMacExpiresAt = expiresAt
+            let rows = TrustGuardrailSummary.rows(policy: p, accessMode: "full")
+            #expect(row(rows, "autonomy").value == "Acts alone in your workspaces")
+        }
+        p.permissionLevel = "balanced"
+        p.filePolicy?.outsideWorkspaceDefault = "deny"
+        p.fullMacNeverExpires = true
+        let rows = TrustGuardrailSummary.rows(policy: p, accessMode: "workspace")
+        #expect(row(rows, "autonomy").value == "Acts alone in your workspaces")
+    }
+
+    @Test
     func autonomyRowTracksEachAutonomyDefault() {
         let supervised = TrustGuardrailSummary.rows(policy: policy(), accessMode: "auto")
         #expect(row(supervised, "autonomy").value == "Asks you first")

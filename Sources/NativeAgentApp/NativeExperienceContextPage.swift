@@ -98,13 +98,12 @@ struct NativeExperienceContextPage: View {
             events = NativeExperienceReadModels.recentTurnEvents()
             guard showDiagnostics else { return }
             let subscription = await NativeDiagnosticObserver.shared.subscribe()
-            // Poll independently of received events: the final event of a
-            // burst can be the one the projection dropped, so an event-driven
-            // refresh would leave the omission warning at zero forever.
+            // Loss has its own event-driven stream because the final event of
+            // a burst can itself be omitted from the projection. This lands
+            // the warning without waking the mounted page four times a second.
             let dropMonitor = Task {
-                while !Task.isCancelled {
-                    liveDiagnosticDrops = await subscription.dropCount()
-                    try? await Task.sleep(for: .milliseconds(250))
+                for await count in subscription.dropCounts {
+                    liveDiagnosticDrops = count
                 }
             }
             defer { dropMonitor.cancel() }

@@ -118,13 +118,22 @@ public struct VisionPerceptionCompiler: Sendable {
         image: CGImage,
         using recognizer: some VisionTextRecognizing,
         appName: String? = nil,
-        windowTitle: String? = nil
+        windowTitle: String? = nil,
+        excludedRegions: [VisionRect] = []
     ) throws -> VisionPercept {
+        try Task.checkCancellation()
         let imageSize = VisionSize(width: Double(image.width), height: Double(image.height))
+        // Foreground window pixels are not evidence about the captured app.
+        // Remove them before text/colour/saliency fusion and temporal identity,
+        // not merely from the final motor list. Coordinates are image-local.
+        func isVisible(_ rect: VisionRect) -> Bool {
+            !excludedRegions.contains { $0.intersection(rect).area > 0 }
+        }
         guard let grid = VisionPixelGrid.sample(
             image: image,
             longAxisSamples: config.colorRegion.gridLongAxisSamples
         ) else { throw VisionPerceptionError.undecodableImage }
+        try Task.checkCancellation()
 
         var notes: [String] = []
 
@@ -132,18 +141,24 @@ public struct VisionPerceptionCompiler: Sendable {
         //    string can reach a label, a readout, a handle fingerprint or a
         //    glance line. There is no downstream path that sees raw OCR text.
         let textResult = try VisionTextLayer.recognize(
-            image: image, using: recognizer, config: config.text
+            image: image, using: recognizer, config: config.text,
+            ignoredForRefinement: excludedRegions
         )
+        try Task.checkCancellation()
         if textResult.tileFailures > 0 {
             notes.append(
                 "\(textResult.tileFailures) OCR tile pass(es) failed and their text was not "
                     + "recovered — tiny-text recall may be reduced this frame"
             )
         }
-        let redactedTexts = VisionTextRedaction.redact(
+        let allRedactedTexts = VisionTextRedaction.redact(
             boxes: textResult.boxes, imageSize: imageSize, config: config.redaction
         )
-        let texts = Array(zip(textResult.boxes, redactedTexts))
+        // Preserve redaction's whole-frame caption context before excluding
+        // foreign-window text from the app's percept.
+        let texts = Array(zip(textResult.boxes, allRedactedTexts)).filter { isVisible($0.0.rect) }
+        let visibleTextBoxes = texts.map(\.0)
+        let redactedTexts = texts.map(\.1)
         if redactedTexts.contains(where: \.secret) {
             notes.append("\(redactedTexts.filter(\.secret).count) recognized string(s) redacted")
         }
@@ -154,7 +169,7 @@ public struct VisionPerceptionCompiler: Sendable {
             notes.append("colour-region layer hit its \(config.colorRegion.maxCandidates)-candidate cap")
         }
         let bandCandidates = VisionTextBandLayer.rowCandidates(
-            from: textResult.boxes, config: config.textBand
+            from: visibleTextBoxes, config: config.textBand
         )
 
         // A colour region that IS a recognized string, or that sits INSIDE
@@ -164,20 +179,31 @@ public struct VisionPerceptionCompiler: Sendable {
         // 9×9 filled near-square, which the role layer will happily read as a
         // checkbox unless it is dropped here.
         let colorCandidates = colorResult.candidates.filter { candidate in
-            !textResult.boxes.contains { box in
+            isVisible(candidate.rect) && !visibleTextBoxes.contains { box in
                 box.rect.iou(candidate.rect) >= config.glyphRunIoU
                     || candidate.rect.coverage(by: box.rect) >= config.glyphInsetCoverage
             }
         }
 
-        var candidates = merge(colorCandidates + bandCandidates)
+        var candidates = merge(colorCandidates + bandCandidates.filter { isVisible($0.rect) })
 
         // 4. ELEMENT LAYER (c) saliency — rank, and add what (a)+(b) missed.
-        if let salience, let regions = try? salience.salientRegions(in: image) {
-            candidates = VisionSaliencyLayer.fold(
-                salient: regions, into: candidates, imageSize: imageSize, config: config.saliency
-            )
+        try Task.checkCancellation()
+        if let salience {
+            do {
+                let regions = try salience.salientRegions(in: image).filter { isVisible($0.rect) }
+                try Task.checkCancellation()
+                candidates = VisionSaliencyLayer.fold(
+                    salient: regions, into: candidates, imageSize: imageSize, config: config.saliency
+                )
+            } catch {
+                if error is CancellationError { throw error }
+                try Task.checkCancellation()
+                // Saliency is additive: an ordinary failure retains text and
+                // colour evidence, but cancellation must not publish a frame.
+            }
         }
+        candidates = candidates.filter { isVisible($0.rect) }
         let considered = candidates.count
         if candidates.count > config.maxAffordances {
             notes.append(
@@ -294,7 +320,9 @@ public struct VisionPerceptionCompiler: Sendable {
                 ambiguous: ambiguous,
                 destructiveRisk: VisionRoleGuess.isDestructive(label: draft.label?.display ?? ""),
                 salience: draft.candidate.salience,
-                visualContrast: draft.fill.map { abs($0 - colorResult.backgroundLuminance) }
+                visualContrast: draft.fill.map { abs($0 - colorResult.backgroundLuminance) },
+                visualColor: draft.candidate.fillColor?.name,
+                visualShape: draft.candidate.visualShape
             ))
         }
 
@@ -364,6 +392,7 @@ public struct VisionPerceptionCompiler: Sendable {
             ambiguousHandles: rows.filter { $0.handleAmbiguity != nil }.count
         )
 
+        try Task.checkCancellation()
         return VisionPercept(
             percept: percept,
             rows: rows,
@@ -379,9 +408,9 @@ public struct VisionPerceptionCompiler: Sendable {
             frameSize: imageSize,
             textTiled: textResult.tiled,
             textTilingReason: textResult.tilingReason,
-            recognizedStrings: textResult.boxes.count,
-            recognizedText: zip(redactedTexts, textResult.boxes).map {
-                VisionRecognizedText(text: $0.0, confidence: $0.1.confidence)
+            recognizedStrings: visibleTextBoxes.count,
+            recognizedText: zip(redactedTexts, visibleTextBoxes).map {
+                VisionRecognizedText(text: $0.0, confidence: $0.1.confidence, rect: $0.1.rect)
             },
             notes: notes
         )
@@ -408,7 +437,9 @@ public struct VisionPerceptionCompiler: Sendable {
                     // certainty out of two weak signals.
                     boundsConfidence: min(0.9, max(merged.boundsConfidence, candidate.boundsConfidence) + 0.08),
                     fillLuminance: merged.fillLuminance ?? candidate.fillLuminance,
-                    salience: max(merged.salience, candidate.salience)
+                    salience: max(merged.salience, candidate.salience),
+                    fillColor: merged.fillColor ?? candidate.fillColor,
+                    visualShape: merged.visualShape ?? candidate.visualShape
                 )
             } else {
                 kept.append(candidate)

@@ -63,53 +63,21 @@ func runKindVocabularyHasOnlyItsRecordedSurfaceDifference() {
     #expect(RunKindVocabulary.displayName("mission", on: .iOS) == "Workshop")
 }
 
-// MARK: - New Desk Task: one constant, two readers
+// MARK: - New Desk Task: failure stays inline, success dismisses
 
-/// `NewWorkshopTaskSheet.submit()` decides whether to dismiss (and therefore
-/// whether to keep the user's typed title/objective) by testing
-/// `appModel.statusText.hasPrefix("Desk task creation failed")`. The producer
-/// of that string lives in another file. Reword the producer and the sheet
-/// dismisses on failure, claiming a task that was never created.
-///
-/// Mutation proof: changing the producer's message to "Could not create the
-/// desk task: …" fails this test.
-@Test("the New Task sheet's failure prefix is exactly what its producer writes")
-func newTaskSheetFailurePrefixMatchesItsProducer() throws {
-    let sheet = try AppSourceScraping.appSource("WorkshopHubView.swift")
-    let model = try AppSourceScraping.appSource("AppModel+WorkshopPolicy.swift")
-
-    // The reader's prefix, taken from the source rather than restated here.
-    guard let prefixRange = sheet.range(of: "statusText.hasPrefix(\"") else {
-        Issue.record("the sheet no longer infers success from a statusText prefix — re-pin this test on the new contract")
-        return
-    }
-    let rest = sheet[prefixRange.upperBound...]
-    guard let end = rest.firstIndex(of: "\"") else {
-        Issue.record("could not read the sheet's failure prefix")
-        return
-    }
-    let failurePrefix = String(rest[..<end])
-    #expect(!failurePrefix.isEmpty)
-
-    // The producer's failure line must start with it…
-    let failureBody = try AppSourceScraping.functionBody(named: "createWorkshopTask", in: model)
-    guard let failureLiteral = failureBody.range(of: "statusText = \"\(failurePrefix)") else {
-        Issue.record("no failure statusText in createWorkshopTask starts with `\(failurePrefix)` — the sheet now dismisses on failure and eats the user's text")
-        return
-    }
-    #expect(failureLiteral.lowerBound < failureBody.endIndex)
-
-    // …and the SUCCESS line must not, or the sheet would never dismiss.
-    for line in failureBody.split(separator: "\n") {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("statusText = \""),
-              let open = trimmed.range(of: "statusText = \"") else { continue }
-        let message = String(trimmed[open.upperBound...])
-        let isFailureLine = message.hasPrefix(failurePrefix)
-        let mentionsFailure = message.lowercased().contains("fail")
-        #expect(isFailureLine == mentionsFailure,
-                "statusText line `\(message)` classifies as failure=\(isFailureLine) but reads as failure=\(mentionsFailure)")
-    }
+@Test("New Desk Task presentation keeps failures inline and still dismisses on success")
+func newTaskPresentationSeparatesInlineFailuresFromDismissal() {
+    #expect(NewDeskTaskPresentation.inlineError(from: NewDeskTaskPresentation.successStatus) == nil)
+    #expect(
+        NewDeskTaskPresentation.inlineError(
+            from: NewDeskTaskPresentation.failureStatus("trust store unavailable")
+        ) == "Couldn’t create this task. trust store unavailable"
+    )
+    #expect(
+        NewDeskTaskPresentation.inlineError(
+            from: NewDeskTaskPresentation.failureStatus("")
+        ) == "Couldn’t create this task. Try again."
+    )
 }
 
 /// The only Create-Task entry point posts a notification whose presenter lives

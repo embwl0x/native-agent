@@ -156,19 +156,19 @@ private final class SystemMacAttentionObservation: MacAttentionObservation, @unc
     deinit { stop() }
 }
 
-private final class MacAttentionEventCoalescer: @unchecked Sendable {
+final class MacAttentionEventCoalescer: @unchecked Sendable {
     private let lock = NSLock()
-    private var lastPointerEmission = Date.distantPast
+    private var lastPointerEmissionUptime = -Double.infinity
     private let minimumPointerInterval: TimeInterval = 1.0 / 30.0
 
-    func shouldEmit(kind: MacAttentionActivityKind, at date: Date) -> Bool {
+    func shouldEmit(kind: MacAttentionActivityKind, atUptime uptime: TimeInterval) -> Bool {
         guard kind == .pointerMoved || kind == .pointerDragged else { return true }
         lock.lock()
         defer { lock.unlock() }
-        guard date.timeIntervalSince(lastPointerEmission) >= minimumPointerInterval else {
+        guard uptime - lastPointerEmissionUptime >= minimumPointerInterval else {
             return false
         }
-        lastPointerEmission = date
+        lastPointerEmissionUptime = uptime
         return true
     }
 }
@@ -209,7 +209,12 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
                 default: return nil
                 }
                 let date = Date()
-                guard coalescer.shouldEmit(kind: kind, at: date) else { return nil }
+                // Receipt time may jump when the system clock is adjusted;
+                // elapsed-time throttling must keep observing physical input.
+                guard coalescer.shouldEmit(
+                    kind: kind,
+                    atUptime: ProcessInfo.processInfo.systemUptime
+                ) else { return nil }
                 var pointerX: Double?
                 var pointerY: Double?
                 if kind != .keyboardActivity, let cgEvent = event.cgEvent {
@@ -357,9 +362,11 @@ public actor MacAttentionSessionStore {
     private struct Waiter {
         let after: Int64
         let continuation: CheckedContinuation<Void, Never>
+        let timeoutTask: Task<Void, Never>
     }
 
     private let screenViewStore: MacScreenViewStore
+    private let waitSleep: @Sendable (Int) async throws -> Void
     private var session: Session?
     private var observation: (any MacAttentionObservation)?
     private var expiryTask: Task<Void, Never>?
@@ -367,12 +374,21 @@ public actor MacAttentionSessionStore {
 
     public init(screenViewStore: MacScreenViewStore) {
         self.screenViewStore = screenViewStore
+        self.waitSleep = { try await Task.sleep(for: .milliseconds($0)) }
+    }
+
+    init(screenViewStore: MacScreenViewStore, waitSleep: @escaping @Sendable (Int) async throws -> Void) {
+        self.screenViewStore = screenViewStore
+        self.waitSleep = waitSleep
     }
 
     deinit {
         observation?.stop()
         expiryTask?.cancel()
-        for waiter in waiters.values { waiter.continuation.resume() }
+        for waiter in waiters.values {
+            waiter.timeoutTask.cancel()
+            waiter.continuation.resume()
+        }
     }
 
     @discardableResult
@@ -392,7 +408,7 @@ public actor MacAttentionSessionStore {
         let expiresAt = now.addingTimeInterval(TimeInterval(duration))
         session = Session(id: id, startedAt: now, expiresAt: expiresAt)
         observation = eventSource.start { [weak self] activity in
-            Task { await self?.record(activity) }
+            Task { await self?.record(activity, sessionId: id) }
         }
         expiryTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(duration))
@@ -486,8 +502,10 @@ public actor MacAttentionSessionStore {
         return .allowed
     }
 
-    private func record(_ activity: MacAttentionActivity) async {
-        guard var current = session else { return }
+    /// Removing a monitor cannot retract an already queued callback. Each
+    /// callback belongs to the session that installed it, never its successor.
+    func record(_ activity: MacAttentionActivity, sessionId: String) async {
+        guard var current = session, current.id == sessionId else { return }
         if activity.occurredAt >= current.expiresAt {
             stopInternal()
             await screenViewStore.invalidate()
@@ -503,6 +521,7 @@ public actor MacAttentionSessionStore {
         // additionally invokes human takeover; app activation requires a
         // refresh without falsely claiming the human caused it.
         await screenViewStore.invalidate()
+        guard session?.id == sessionId else { return }
         resumeReadyWaiters(sequence: current.sequence)
     }
 
@@ -534,11 +553,14 @@ public actor MacAttentionSessionStore {
                     continuation.resume()
                     return
                 }
-                waiters[id] = Waiter(after: sequence, continuation: continuation)
-                Task { [weak self] in
-                    try? await Task.sleep(for: .milliseconds(timeoutMilliseconds))
+                let timeoutTask = Task { [weak self, waitSleep] in
+                    do {
+                        try await waitSleep(timeoutMilliseconds)
+                        try Task.checkCancellation()
+                    } catch { return }
                     await self?.resumeWaiter(id: id)
                 }
+                waiters[id] = Waiter(after: sequence, continuation: continuation, timeoutTask: timeoutTask)
             }
         } onCancel: {
             Task { await owner.resumeWaiter(id: id) }
@@ -547,7 +569,9 @@ public actor MacAttentionSessionStore {
     }
 
     private func resumeWaiter(id: UUID) {
-        waiters.removeValue(forKey: id)?.continuation.resume()
+        guard let waiter = waiters.removeValue(forKey: id) else { return }
+        waiter.timeoutTask.cancel()
+        waiter.continuation.resume()
     }
 
     private func resumeReadyWaiters(sequence: Int64) {
@@ -573,8 +597,11 @@ public actor MacAttentionSessionStore {
         expiryTask?.cancel()
         expiryTask = nil
         session = nil
-        let continuations = waiters.values.map(\.continuation)
+        let pending = Array(waiters.values)
         waiters.removeAll()
-        for continuation in continuations { continuation.resume() }
+        for waiter in pending {
+            waiter.timeoutTask.cancel()
+            waiter.continuation.resume()
+        }
     }
 }

@@ -94,7 +94,23 @@ extension BackgroundLoopsAssembly {
     /// deterministic text.
     static let morningBriefSynthesisTimeout: TimeInterval = 120
 
-    static func makeMorningBriefSynthesizer() -> MorningBriefSynthesizer {
+    static func makeMorningBriefSynthesizer(
+        runTurn: @escaping @Sendable (String) async throws -> String = { prompt in
+            let client = makeNativeAgentAppChatOrchestrationClient(profile: .background)
+            let response = try await client.runEphemeralToolTurn(
+                message: prompt,
+                fileAccess: "read_only",
+                surface: WorkshopSurfaceVocabulary.canonical
+            )
+            return response.output
+        },
+        deadlineSleep: @escaping @Sendable (TimeInterval) async throws -> Void = { interval in
+            try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+        },
+        failureMarker: @escaping @Sendable (String) -> Void = { marker in
+            NSLog("%@", marker)
+        }
+    ) -> MorningBriefSynthesizer {
         return { request in
             let blueprint = NativeExperienceCatalogs.blueprints.first { $0.id == .morningBriefing }
             let objective = blueprint?.payload["objective"].flatMap { value -> String? in
@@ -108,22 +124,19 @@ extension BackgroundLoopsAssembly {
                 requiredTools: tools
             )
             do {
-                return try await withBoundedMorningBriefTurn {
-                    let client = makeNativeAgentAppChatOrchestrationClient()
-                    let response = try await client.runEphemeralToolTurn(
-                        message: prompt,
-                        fileAccess: "read_only",
-                        surface: WorkshopSurfaceVocabulary.canonical
-                    )
-                    let output = response.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                return try await withBoundedMorningBriefTurn(deadlineSleep: deadlineSleep) {
+                    let response = try await runTurn(prompt)
+                    let output = response.trimmingCharacters(in: .whitespacesAndNewlines)
                     return output.isEmpty ? nil : output
                 }
             } catch {
                 // FAIL-OPEN, NOT SILENT: nil restores the deterministic brief,
                 // and the reason is on the record. A brief that lost its lead
                 // is still true; a scheduler tick that threw is not.
-                NSLog("[morning-brief] synthesis turn failed (%@) — falling back to deterministic brief",
-                      String(describing: error))
+                failureMarker(
+                    "[morning-brief] synthesis turn failed (\(String(describing: error))) "
+                    + "— falling back to deterministic brief"
+                )
                 return nil
             }
         }
@@ -132,12 +145,13 @@ extension BackgroundLoopsAssembly {
     /// Races the turn against a deadline. The loser is cancelled, so a wedged
     /// provider call cannot outlive the brief that asked for it.
     private static func withBoundedMorningBriefTurn(
+        deadlineSleep: @escaping @Sendable (TimeInterval) async throws -> Void,
         _ body: @escaping @Sendable () async throws -> String?
     ) async throws -> String? {
         try await withThrowingTaskGroup(of: String?.self) { group in
             group.addTask { try await body() }
             group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(morningBriefSynthesisTimeout * 1_000_000_000))
+                try await deadlineSleep(morningBriefSynthesisTimeout)
                 throw CancellationError()
             }
             defer { group.cancelAll() }
@@ -229,7 +243,7 @@ struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
             triggerScheduler.workshopExecutionsPath,
             // Idle triggers derive their exact crossing from max(updatedAt).
             dataRoot.appendingPathComponent("chat/sessions.json"),
-        ])
+        ], loopId: loopId)
     }
 
     func nextMeaningfulDeadline(after now: Date) async -> Date? {

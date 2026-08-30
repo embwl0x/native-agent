@@ -504,7 +504,7 @@ public enum MemoryFactExtractor {
 /// high-precision regex extractor, adds the broader Swift fact fallback
 /// ("I like/prefer/value/want..."), and opportunistically merges Apple
 /// Foundation Models facts only when they return inside a short budget.
-public struct SemanticAdaptiveFactExtractor: AdaptiveFactExtractor {
+public struct SemanticAdaptiveFactExtractor: AdaptiveFactExtractionReporting {
     private let foundationTimeoutNanoseconds: UInt64
     private let ruleExtractor: RuleBasedFactExtractor
 
@@ -514,8 +514,12 @@ public struct SemanticAdaptiveFactExtractor: AdaptiveFactExtractor {
     }
 
     public func extract(userMessage: String, assistantMessage: String) async -> [AdaptiveCandidate] {
+        await extractWithReport(userMessage: userMessage, assistantMessage: assistantMessage).candidates
+    }
+
+    public func extractWithReport(userMessage: String, assistantMessage: String) async -> AdaptiveExtractionReport {
         let raw = Self.userAuthoredExtractionText(from: userMessage)
-        guard !raw.isEmpty else { return [] }
+        guard !raw.isEmpty else { return .init(candidates: [], semanticStatus: .emptyInput) }
 
         var out: [AdaptiveCandidate] = []
         var seen: [String: Int] = [:]
@@ -554,7 +558,11 @@ public struct SemanticAdaptiveFactExtractor: AdaptiveFactExtractor {
             from: raw,
             timeoutNanoseconds: foundationTimeoutNanoseconds
         )
-        for fact in modelFacts {
+        var semanticCandidates: Set<String> = []
+        for fact in modelFacts.facts {
+            if let clean = MemoryFactQuality.cleanedCanonicalCandidate(Self.candidate(from: fact)) {
+                semanticCandidates.insert(clean.content.lowercased())
+            }
             emit(Self.candidate(from: fact))
         }
 
@@ -562,10 +570,12 @@ public struct SemanticAdaptiveFactExtractor: AdaptiveFactExtractor {
             emit(candidate)
         }
 
-        return out.sorted { lhs, rhs in
+        let sorted = out.sorted { lhs, rhs in
             if lhs.score != rhs.score { return lhs.score > rhs.score }
             return lhs.content < rhs.content
         }
+        return AdaptiveExtractionReport(candidates: sorted, semanticStatus: modelFacts.status,
+                                        semanticCandidateCount: semanticCandidates.count)
     }
 
     /// Surface adapters may prepend quoted reply context to the actual user
@@ -609,21 +619,27 @@ public struct SemanticAdaptiveFactExtractor: AdaptiveFactExtractor {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func foundationFacts(from text: String, timeoutNanoseconds: UInt64) async -> [ExtractedFact] {
-        guard AppleFoundationModelsAdapter.isAvailable, timeoutNanoseconds > 0 else { return [] }
-        return await withTaskGroup(of: [ExtractedFact].self, returning: [ExtractedFact].self) { group in
+    private struct FoundationResult: Sendable {
+        let facts: [ExtractedFact]
+        let status: MemorySemanticExtractionStatus
+    }
+
+    private static func foundationFacts(from text: String, timeoutNanoseconds: UInt64) async -> FoundationResult {
+        guard timeoutNanoseconds > 0 else { return .init(facts: [], status: .disabled) }
+        guard AppleFoundationModelsAdapter.isAvailable else { return .init(facts: [], status: .unavailable) }
+        return await withTaskGroup(of: FoundationResult.self, returning: FoundationResult.self) { group in
             group.addTask {
                 do {
-                    return try await AppleFoundationModelsAdapter.extractFacts(from: text)
+                    return .init(facts: try await AppleFoundationModelsAdapter.extractFacts(from: text), status: .succeeded)
                 } catch {
-                    return []
+                    return .init(facts: [], status: .failed)
                 }
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                return []
+                return .init(facts: [], status: .timedOut)
             }
-            let first = await group.next() ?? []
+            let first = await group.next() ?? .init(facts: [], status: .failed)
             group.cancelAll()
             return first
         }

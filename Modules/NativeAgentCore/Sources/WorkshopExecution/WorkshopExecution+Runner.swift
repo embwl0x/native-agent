@@ -3,6 +3,7 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import TrustCenter
 
 // MARK: - SwiftNative impl
 
@@ -87,6 +88,19 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         workshopExecutionDir(id).appendingPathComponent("receipts", isDirectory: true)
     }
 
+    /// Execution ids are persisted as directory names. Keep every public
+    /// lookup/mutation rooted to one canonical directory component.
+    /// Record readers also require the stored id to equal that component;
+    /// payload identity must never redirect execution or receipt ownership.
+    nonisolated static func isSafeExecutionID(_ id: String) -> Bool {
+        !id.isEmpty
+            && id != "."
+            && id != ".."
+            && !id.contains("/")
+            && !id.contains("\\")
+            && !id.contains("\0")
+    }
+
     // WAVE 41 W01 (REOPEN §6.220-rd2 #1) — write-side parity helpers.
     //
     // Mac native execution writes (submit/create, update) MUST mirror the three
@@ -100,10 +114,8 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     //   (c) the Activity feed row (`Runtime.record_activity`, the retired daemon
     //       L5288-L5308) the legacy create/update handlers emit so the Mac
     //       Activity view shows execution events.
-    // These read/append plain JSON files co-located with the daemon under the
-    // SAME data root, so the WorkshopExecution module stays self-contained (no new
-    // TrustCenter inter-module dependency — same in-module-trust-gate pattern
-    // MultimodalTTS uses, Package.swift comment L79-L86).
+    // Execution state stays under the same data root. Saved authority is read
+    // by TrustCenter's checked owner so corrupt policy cannot bootstrap work.
 
     /// `Runtime.trust_path`: `<root>/trust/policy.json`.
     nonisolated var trustPolicyPath: URL {
@@ -133,13 +145,19 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// falls through to. The gate only ever REFUSES when a saved policy
     /// explicitly sets `missionPolicy.enabled = false` (and developerMode is
     /// not set) — exactly the daemon's 403 condition.
-    private func workshopExecutionsAllowed() async -> Bool {
-        let raw = await persistence.readJSON(trustPolicyPath, defaultValue: .null)
-        guard case .object(let policy) = raw else {
-            // No saved policy → default_trust_policy(): missionPolicy.enabled = true.
-            return true
+    private func workshopExecutionsAllowed() async throws -> Bool {
+        // Reuse the authority owner's checked read: only a missing file may
+        // bootstrap. A damaged saved policy is unavailable, not permission to
+        // submit work or fall through to a legacy update path. The checked
+        // projection preserves valid saved Workshop/Developer Mode values.
+        let trust = SwiftNativeTrustCenter(dataRoot: root, persistence: persistence, clock: now)
+        do {
+            return Self.workshopPolicyAllows(try await trust.loadTrustPolicyChecked())
+        } catch {
+            throw WorkshopExecutionError.persistenceFailure(
+                "saved trust policy is unavailable: \(error)"
+            )
         }
-        return Self.workshopPolicyAllows(policy)
     }
 
     /// SINGLE SOURCE OF TRUTH for the missionPolicy half of
@@ -479,7 +497,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // request with an empty objective would return `missing_objective` (400)
         // where the daemon returns `forbidden` (403). Default-safe: a fresh root
         // with no saved policy is ALLOWED (default_trust_policy enabled=true).
-        guard await workshopExecutionsAllowed() else {
+        guard try await workshopExecutionsAllowed() else {
             throw WorkshopExecutionError.forbidden("Workshop execution is disabled by trust policy")
         }
 
@@ -748,8 +766,7 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // Execution ids become a single directory component below the
         // selected Workshop root. Refuse path syntax at the canonical owner,
         // not only at a CLI wrapper, so every cancel caller stays root-bound.
-        guard trimmed != ".", trimmed != "..",
-              !trimmed.contains("/"), !trimmed.contains("\\"), !trimmed.contains("\0") else {
+        guard Self.isSafeExecutionID(trimmed) else {
             throw WorkshopExecutionError.invalidRequest("executionId must be a single path component")
         }
         let executionRecordJSON = executionRecordPath(trimmed)
@@ -765,18 +782,19 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         }
 
         // Mutate-under-flock. Returns the post-cancel record AND whether a
-        // timeline event needs appending (skip the append on the idempotent
-        // already-cancelled no-op, matching Python's early `return execution`).
+        // timeline event needs appending. A stale cancellation must not
+        // rewrite an outcome that settled before this lock was acquired.
         let work: @Sendable () async throws -> (record: WorkshopExecutionRecord, didCancel: Bool) = { [persistence] in
             let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
-            guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else {
+            guard case .object(let obj) = raw,
+                  case .string(let gotId)? = obj["id"], gotId == trimmed else {
                 // Mirror Python's `if execution is None: raise ValueError(...)`.
                 throw WorkshopExecutionError.invalidRequest("Workshop execution not found: \(trimmed)")
             }
             var record = SwiftNativeWorkshopRunner.recordFromJSON(obj)
-            // Idempotency: already-cancelled → silent
-            // no-op, return the unchanged record, NO new timeline event.
-            if record.status == "cancelled" {
+            // Cancellation cannot undo completed effects or replace a failed
+            // outcome. Return settled truth without another write or event.
+            if ["completed", "failed", "cancelled"].contains(record.status) {
                 return (record, false)
             }
             record.status = "cancelled"
@@ -864,15 +882,15 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     // the flock, same rationale as cancel().
     public func updateWorkshopExecution(_ patch: WorkshopExecutionUpdate) async throws -> WorkshopExecutionRecord? {
         let id = patch.id.trimmingCharacters(in: .whitespacesAndNewlines)
-        if id.isEmpty {
-            // Empty id never matches a queue execution; return nil so callers
+        if !Self.isSafeExecutionID(id) {
+            // Unsafe ids never match a queue execution; return nil so callers
             // surface Unknown/unsupported through the Swift path.
             return nil
         }
         // WAVE 41 W01 (a) missionPolicy gate: when missionPolicy is off, skip
         // the queue bridge so the native writer never runs against a disabled
         // policy. Default-safe (fresh root -> allowed).
-        guard await workshopExecutionsAllowed() else {
+        guard try await workshopExecutionsAllowed() else {
             return nil
         }
         let executionRecordJSON = executionRecordPath(id)
@@ -890,7 +908,8 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
         // `if changed:` save gate). nil record == not a queue execution.
         let work: @Sendable () async throws -> (record: WorkshopExecutionRecord, changed: Bool)? = { [persistence] in
             let raw = await persistence.readJSON(executionRecordJSON, defaultValue: .null)
-            guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else {
+            guard case .object(let obj) = raw,
+                  case .string(let gotId)? = obj["id"], gotId == id else {
                 // Not a queue execution → nil, daemon falls through to legacy.
                 return nil
             }
@@ -1049,10 +1068,13 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     }
 
     /// `TaskQueue.get`. Reads
-    /// <queue>/<id>/mission.json, returns nil when absent or malformed.
+    /// <queue>/<id>/mission.json, returns nil when absent, malformed, or
+    /// carrying an id that does not match its containing directory.
     public func getWorkshopExecution(_ executionId: String) async -> WorkshopExecutionRecord? {
+        guard Self.isSafeExecutionID(executionId) else { return nil }
         let raw = await persistence.readJSON(executionRecordPath(executionId), defaultValue: .null)
-        guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else {
+        guard case .object(let obj) = raw,
+              case .string(let gotId)? = obj["id"], gotId == executionId else {
             return nil
         }
         return Self.recordFromJSON(obj)
@@ -1064,8 +1086,10 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// gpt-5.5 finding #1: use this (not getMission(...)?.toJSON()) so `plan`
     /// is emitted verbatim.
     public func getWorkshopExecutionWireJSON(_ executionId: String) async -> JSONValue? {
+        guard Self.isSafeExecutionID(executionId) else { return nil }
         let raw = await persistence.readJSON(executionRecordPath(executionId), defaultValue: .null)
-        guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else {
+        guard case .object(let obj) = raw,
+              case .string(let gotId)? = obj["id"], gotId == executionId else {
             return nil
         }
         return Self.readJSONForWorkshopExecution(obj)
@@ -1075,12 +1099,17 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// dicts in file order; missing file -> []; malformed lines skipped. The
     /// `readJSONL` impl matches Python's semantics exactly.
     public func readTimeline(_ executionId: String) async throws -> [JSONValue] {
-        try await persistence.readJSONL(timelinePath(executionId))
+        guard Self.isSafeExecutionID(executionId) else {
+            throw WorkshopExecutionError.invalidRequest(
+                "executionId must be a single path component"
+            )
+        }
+        return try await persistence.readJSONL(timelinePath(executionId))
     }
 
     /// `TaskQueue._scan_all`: every <queue>/<id>/
-    /// subdir with a parseable mission.json carrying a non-empty `id`.
-    /// Malformed / id-less mission.json entries are skipped (Python's broad
+    /// subdir with a parseable mission.json whose `id` matches the directory.
+    /// Malformed / mismatched mission.json entries are skipped (Python's broad
     /// `except` at L428).
     private func scanAllQueueWorkshopExecutions() async -> [(record: WorkshopExecutionRecord, raw: [String: JSONValue])] {
         let fm = FileManager.default
@@ -1096,7 +1125,8 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
             guard isDir else { continue }
             let mp = ExecutionRecordFile.resolve(in: sub, fileManager: fm)
             let raw = await persistence.readJSON(mp, defaultValue: .null)
-            guard case .object(let obj) = raw, case .string(let gotId)? = obj["id"], !gotId.isEmpty else {
+            guard case .object(let obj) = raw,
+                  case .string(let gotId)? = obj["id"], gotId == sub.lastPathComponent else {
                 continue
             }
             out.append((Self.recordFromJSON(obj), obj))
@@ -1115,17 +1145,34 @@ public actor SwiftNativeWorkshopRunner: WorkshopRunnerClient {
     /// _scan_all order); we preserve _scan_all (directory) order to match —
     /// the `active=true` query branch of GET /v1/missions.
     public func listActive() async -> [WorkshopExecutionRecord] {
-        let live: Set<String> = ["queued", "running", "blocked_on_approval"]
-        return await scanAllQueueWorkshopExecutions().filter { live.contains($0.record.status) }.map(\.record)
+        Self.activeRecords(await scanAllQueueWorkshopExecutions().map(\.record))
     }
 
     /// `TaskQueue.list_history`: terminal executions,
     /// sorted by updated_at DESC, capped at 20 — the `active=false` query
     /// branch of GET /v1/missions.
     public func listHistory() async -> [WorkshopExecutionRecord] {
+        Self.recentRecords(await scanAllQueueWorkshopExecutions().map(\.record))
+    }
+
+    /// One observed set for the status tool's active/recent sections. Each
+    /// record is read once, so a transition cannot put that record in both
+    /// sections. This is not an atomic cross-record snapshot: independent
+    /// executions can still change while the directory scan is in progress.
+    public func listStatusSnapshot() async -> (active: [WorkshopExecutionRecord], recent: [WorkshopExecutionRecord]) {
+        let records = await scanAllQueueWorkshopExecutions().map(\.record)
+        return (Self.activeRecords(records), Self.recentRecords(records))
+    }
+
+    private nonisolated static func activeRecords(_ records: [WorkshopExecutionRecord]) -> [WorkshopExecutionRecord] {
+        let live: Set<String> = ["queued", "running", "blocked_on_approval"]
+        return records.filter { live.contains($0.status) }
+    }
+
+    private nonisolated static func recentRecords(_ records: [WorkshopExecutionRecord]) -> [WorkshopExecutionRecord] {
         let done: Set<String> = ["completed", "failed", "cancelled"]
-        let filtered = await scanAllQueueWorkshopExecutions().filter { done.contains($0.record.status) }
-        return Array(filtered.sorted { $0.record.updatedAt > $1.record.updatedAt }.prefix(20).map(\.record))
+        let filtered = records.filter { done.contains($0.status) }
+        return Array(filtered.sorted { $0.updatedAt > $1.updatedAt }.prefix(20))
     }
 
     /// Legacy flat store: the

@@ -215,31 +215,18 @@ extension NativeClient {
     }
 
     func getModelPreferences(dataRoot: URL) async throws -> SurfaceModelPreferencesResponse {
-        let path = dataRoot
-            .appendingPathComponent("providers", isDirectory: true)
-            .appendingPathComponent("surfaces.json")
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return SurfaceModelPreferencesResponse(preferences: []) }
-
-        let preferences = obj.keys.sorted().compactMap { surface -> SurfaceModelPreferenceEntry? in
-            let raw = obj[surface]
-            if let inner = raw as? [String: Any] {
-                let model = inner["model"] as? String ?? ""
-                guard !model.isEmpty else { return nil }
-                let effort = inner["reasoningEffort"] as? String ?? inner["reasoning_effort"] as? String ?? ""
-                let serviceTier = inner["serviceTier"] as? String ?? inner["service_tier"] as? String
-                return SurfaceModelPreferenceEntry(
-                    surface: surface,
-                    model: model,
-                    reasoningEffort: effort,
-                    serviceTier: serviceTier
-                )
-            }
-            if let flat = raw as? String, !flat.isEmpty {
-                return SurfaceModelPreferenceEntry(surface: surface, model: flat, reasoningEffort: "")
-            }
-            return nil
+        // UI and mobile snapshots must expose the same recovered preferences
+        // as execution. Damaged existing authority is unavailable, not a
+        // successful empty projection that replaces the phone's last-good one.
+        let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshot()
+        let preferences = snapshot.preferences.keys.sorted().compactMap { surface -> SurfaceModelPreferenceEntry? in
+            guard let preference = snapshot.preferences[surface] else { return nil }
+            return SurfaceModelPreferenceEntry(
+                surface: surface,
+                model: preference.model,
+                reasoningEffort: preference.reasoningEffort,
+                serviceTier: preference.serviceTier
+            )
         }
         return SurfaceModelPreferencesResponse(preferences: preferences)
     }
@@ -504,13 +491,38 @@ extension NativeClient {
         // ChatMessage.init(from:) which already lifts every field including
         // ChatMessageMetadata.
         let decoder = JSONDecoder.nativeAgent
-        let coMessages = try await reader.messages(forSessionId: safeSessionId)
+        let history = try await reader.messagesWithStats(forSessionId: safeSessionId)
+        // Prompt history intentionally tolerates damaged rows, but an empty
+        // result caused by a failed read is not a successfully loaded UI
+        // transcript. Propagate that failure to transactional session selection
+        // so it keeps the previous conversation instead of replacing it.
+        guard history.stats.mode != "read_failed" else {
+            throw NSError(
+                domain: "NativeClient.ChatHistory", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The saved conversation could not be read. Its data was left unchanged."]
+            )
+        }
+        let rejectedRows = history.stats.malformedRowCount + history.stats.invalidShapeRowCount
+        guard !history.messages.isEmpty || rejectedRows == 0 else {
+            throw NSError(
+                domain: "NativeClient.ChatHistory", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "The saved conversation has no readable messages (\(rejectedRows) damaged rows). Its data was left unchanged."]
+            )
+        }
+        // Missing/empty new sessions remain valid, and mixed transcripts keep
+        // their readable rows under the existing tolerant reader contract.
+        let coMessages = history.messages
         return coMessages.map { co -> ChatMessage in
             if let extras = co.extras,
                case .object = extras,
                let data = try? extras.serializedData(pretty: false),
                var decoded = try? decoder.decode(ChatMessage.self, from: data) {
-                if decoded.sessionId == nil { decoded.sessionId = safeSessionId }
+                // A fork keeps its source rows byte-for-byte, including their
+                // original session IDs. This UI projection belongs to the
+                // requested transcript; actions on an inherited row must not
+                // jump back to the source conversation. Recorded metadata and
+                // on-disk provenance remain untouched.
+                decoded.sessionId = safeSessionId
                 return decoded
             }
             return ChatMessage(
@@ -607,7 +619,11 @@ extension NativeClient {
             sessions.insert(rowToInsert, at: 0)
             let out = try ChatSessionIndexFile.serializedData(for: sessions)
             try out.write(to: sessionsPath, options: .atomic)
-            _ = try? ChatSessionRetention.enforce(dataRoot: dataRoot, now: Date())
+            ChatSessionRetention.enforceBestEffort(
+                dataRoot: dataRoot,
+                now: Date(),
+                context: "NativeClient.createChatSession"
+            )
         }
         return try JSONDecoder.nativeAgent.decode(ChatSession.self, from: sessionData)
     }

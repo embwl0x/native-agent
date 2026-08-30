@@ -12,8 +12,8 @@ import TrustCenter
 /// trace recorder below must classify failures IDENTICALLY to the persisted
 /// tool rows — two heuristics would let a dispatch persist as failed in chat
 /// history yet trace as ok in events.jsonl.
-enum ChatToolOutcome {
-    enum ExactResultClass: String, Sendable, Equatable {
+public enum ChatToolOutcome {
+    public enum ExactResultClass: String, Sendable, Equatable {
         case succeeded
         case failed
         case cancelled
@@ -62,11 +62,22 @@ enum ChatToolOutcome {
     /// consequence paths. Unlike `outputLooksSuccessful`, this never treats a
     /// missing status as success. Pending transport, approval, partial, and
     /// ambiguous envelopes stay unknown.
-    static func exactResultClass(_ output: JSONValue) -> ExactResultClass {
+    public static func exactResultClass(_ output: JSONValue) -> ExactResultClass {
         if MCPInvocationOutcome.classify(response: output).providerToolResultIsError {
             return .failed
         }
-        guard case .object(let object) = output else { return .unknown }
+        // Native in-process tools such as read_file and list_dir return their
+        // terminal value directly. Reaching this boundary with a string,
+        // array, number, or boolean means dispatch completed; thrown failures
+        // have already taken the error path above this classifier. Treating
+        // every direct value as unknown made successful perception turns look
+        // unverified in Agent's outcome evidence. JSON null alone carries no
+        // terminal information and remains unknown. Object envelopes continue
+        // through the strict status/error rules below, so accepted, queued,
+        // approval, and external-effect states are not promoted.
+        guard case .object(let object) = output else {
+            return output == .null ? .unknown : .succeeded
+        }
         if case .bool(true)? = object["dryRun"] ?? object["dry_run"] {
             return .unknown
         }
@@ -298,35 +309,20 @@ enum ChatToolOutcome {
 /// NativeClient.appendCapabilityPackTrace):
 ///   {id, kind, title, status, payload, createdAt} with ISO8601 createdAt.
 final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
-    /// Cap mirrors the bounded notification-inbox items.jsonl trim: tail-keep
-    /// under the same flock acquisition as the append.
-    static let maxTraceLines = 5000
-    /// A trim requires a whole-file read, so it runs opportunistically:
-    /// every Nth append process-wide, or immediately once the file size
-    /// passes `trimByteTrigger` — not on every append.
-    private static let defaultTrimCheckInterval = 32
-    private static let trimByteTrigger = 4 * 1024 * 1024
-    private static let counterLock = NSLock()
-    // nonisolated(unsafe): every access is guarded by counterLock.
-    nonisolated(unsafe) private static var appendCounter = 0
-
     private let inner: any ToolDispatchClient
     private let dataRoot: URL
     private let tracesPath: URL
     private let persistence = SwiftNativePersistenceCore()
-    private let trimCheckInterval: Int
 
     init(
         inner: any ToolDispatchClient,
-        dataRoot: URL,
-        trimCheckInterval: Int = ChatToolDispatchTracer.defaultTrimCheckInterval
+        dataRoot: URL
     ) {
         self.inner = inner
         self.dataRoot = dataRoot
         self.tracesPath = dataRoot
             .appendingPathComponent("traces", isDirectory: true)
             .appendingPathComponent("events.jsonl")
-        self.trimCheckInterval = max(1, trimCheckInterval)
     }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -585,55 +581,16 @@ final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
             ]),
             "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
         ])
-        let counterTripped: Bool = {
-            Self.counterLock.lock()
-            defer { Self.counterLock.unlock() }
-            Self.appendCounter &+= 1
-            return Self.appendCounter % trimCheckInterval == 0
-        }()
         do {
-            try await persistence.withFileLock(tracesPath) { [persistence, tracesPath] in
-                try await persistence.appendJSONL(row, to: tracesPath)
-                if counterTripped || Self.fileSize(tracesPath) > Self.trimByteTrigger {
-                    Self.trimLocked(tracesPath, keepLast: Self.maxTraceLines)
-                }
-            }
+            try await appendPathOwnedJSONL(
+                row,
+                to: tracesPath,
+                using: persistence,
+                logLabel: "ChatToolDispatchTracer"
+            )
         } catch {
             FileHandle.standardError.write(
                 Data("ChatToolDispatchTracer: trace append failed (\(tool)): \(error)\n".utf8)
-            )
-        }
-    }
-
-    private static func fileSize(_ path: URL) -> Int {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
-            return 0
-        }
-        return (attrs[.size] as? NSNumber)?.intValue ?? 0
-    }
-
-    /// Tail-trim to `keepLast` physical lines. Caller MUST hold the
-    /// events.jsonl flock — the read-trim-replace is not atomic on its own.
-    /// Best-effort: failures leave the (oversized but valid) file in place.
-    private static func trimLocked(_ path: URL, keepLast: Int) {
-        guard let data = try? Data(contentsOf: path),
-              let text = String(data: data, encoding: .utf8) else { return }
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        if lines.last?.isEmpty == true { lines.removeLast() }
-        guard lines.count > keepLast else { return }
-        let trimmed = lines.suffix(keepLast).joined(separator: "\n") + "\n"
-        // Fixed-path tmp: remove on every exit path so a replaceItemAt
-        // failure doesn't strand a stale sibling (state-lifecycle hygiene;
-            // same shape as the bounded notification-inbox ledger).
-        let tmp = path.appendingPathExtension("tmp")
-        defer { try? FileManager.default.removeItem(at: tmp) }
-        guard let out = trimmed.data(using: .utf8) else { return }
-        do {
-            try out.write(to: tmp, options: .atomic)
-            _ = try FileManager.default.replaceItemAt(path, withItemAt: tmp)
-        } catch {
-            FileHandle.standardError.write(
-                Data("ChatToolDispatchTracer: trace trim failed: \(error)\n".utf8)
             )
         }
     }

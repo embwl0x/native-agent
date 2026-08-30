@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 import NativeAgentShared
+import NativeAgentSharedTestSupport
 @testable import NativeAgentMobile
 
 @MainActor
@@ -73,7 +74,9 @@ final class UIIntegrityContractTests: XCTestCase {
 
         XCTAssertFalse(pairing.contains("[Your Name]"))
         XCTAssertFalse(bridge.contains("[Your Name]"))
-        XCTAssertTrue(pairing.contains("Settings → Apple Account"))
+        XCTAssertTrue(pairing.contains("does not scan a QR code yet"))
+        XCTAssertTrue(pairing.contains("copy the pairing key"))
+        XCTAssertTrue(pairing.contains("Settings -> Apple Account"))
         XCTAssertTrue(bridge.contains("Settings → Apple Account"))
     }
 
@@ -102,12 +105,17 @@ final class UIIntegrityContractTests: XCTestCase {
         XCTAssertTrue(theme.contains("@Environment(\\.accessibilityReduceMotion)"))
     }
 
-    func testSkillsAndToolsShareOnePrimaryDestination() throws {
+    func testDeskIsPrimaryAndSkillsAndToolsShareOneMoreDestination() throws {
         let content = try Self.source("ContentView.swift")
+        let advanced = try Self.source("AdvancedView.swift")
         let combined = try Self.source("SkillsToolsView.swift")
         let toolSnapshot = try Self.source("iCloudSyncEngine+Snapshots.swift")
 
-        XCTAssertTrue(content.contains("SkillsToolsView()"))
+        XCTAssertTrue(content.contains("MobileDeskView()"))
+        XCTAssertTrue(content.contains("Label(\"Desk\", systemImage: \"rectangle.3.group\")"))
+        XCTAssertFalse(content.contains("Label(\"Skills\", systemImage:"))
+        XCTAssertTrue(advanced.contains("SkillsToolsView(embedInNavigationStack: false)"))
+        XCTAssertTrue(advanced.contains("Label(\"Skills & Tools\", systemImage: \"puzzlepiece.extension\")"))
         XCTAssertFalse(content.contains("SkillLifecycleView()\n                .tabItem"))
         XCTAssertTrue(combined.contains("case skills = \"Skills\""))
         XCTAssertTrue(combined.contains("case tools = \"Tools\""))
@@ -311,7 +319,8 @@ final class UIIntegrityContractTests: XCTestCase {
         let sender = try Self.body(of: "sendSelection", keyword: "private func", in: providers)
         XCTAssertTrue(sender.contains("ProviderSelectionRollbackPresentation.rollback("))
         XCTAssertTrue(sender.contains("requestedModel[surface] = restored.modelID"))
-        XCTAssertTrue(sender.contains("selectionGeneration[surface] == requestGeneration"))
+        XCTAssertTrue(sender.contains("ProviderSelectionRollbackPresentation.acceptReceipt("))
+        XCTAssertTrue(sender.contains("currentGeneration: selectionGeneration[surface] ?? 0"))
     }
 
     func testWaitingRemoteActionsExplicitlyIdentifyTheirLocalOnlyApprovalState() throws {
@@ -363,15 +372,27 @@ final class UIIntegrityContractTests: XCTestCase {
         XCTAssertEqual(AppEmptyStateKind.empty.statusLabel, "No current items")
         XCTAssertEqual(AppEmptyStateKind.unavailable.statusLabel, "Data unavailable")
         XCTAssertEqual(
-            MobileDeskEmptyStatePresentation.state(isRefreshing: true, syncError: nil),
+            MobileDeskEmptyStatePresentation.state(
+                hasAttemptedLoad: false,
+                isRefreshing: false,
+                loadError: nil
+            ),
             .loading
         )
         XCTAssertEqual(
-            MobileDeskEmptyStatePresentation.state(isRefreshing: false, syncError: "Desk snapshot missing"),
+            MobileDeskEmptyStatePresentation.state(
+                hasAttemptedLoad: true,
+                isRefreshing: false,
+                loadError: "Desk snapshot missing"
+            ),
             .unavailable("Desk snapshot missing")
         )
         XCTAssertEqual(
-            MobileDeskEmptyStatePresentation.state(isRefreshing: false, syncError: "  "),
+            MobileDeskEmptyStatePresentation.state(
+                hasAttemptedLoad: true,
+                isRefreshing: false,
+                loadError: "  "
+            ),
             .empty
         )
 

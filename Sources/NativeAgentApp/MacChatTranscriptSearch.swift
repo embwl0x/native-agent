@@ -172,8 +172,15 @@ final class MacChatTranscriptSearchController {
 
     @ObservationIgnored private var documents: [MacChatTranscriptSearchDocument] = []
     @ObservationIgnored private var sourceSessionID = ""
+    @ObservationIgnored private var sourceRevision: UInt = 0
     @ObservationIgnored private var searchGeneration: UInt = 0
     @ObservationIgnored private var searchTask: Task<Void, Never>?
+    typealias SearchOperation = @Sendable (String, [MacChatTranscriptSearchDocument]) async -> MacChatTranscriptSearchResponse?
+    @ObservationIgnored private let search: SearchOperation
+
+    init(search: @escaping SearchOperation = MacChatTranscriptSearchController.searchOffMainActor) {
+        self.search = search
+    }
 
     var selectedMessageID: String? {
         guard let selectedIndex = cursor.selectedIndex, results.indices.contains(selectedIndex) else {
@@ -182,7 +189,9 @@ final class MacChatTranscriptSearchController {
         return results[selectedIndex].messageID
     }
 
-    var canNavigate: Bool { phase == .results && !results.isEmpty }
+    // Same-query results remain useful while a newer transcript snapshot scans.
+    // A query/session change clears them before starting its own search.
+    var canNavigate: Bool { !results.isEmpty }
 
     var statusText: String {
         switch phase {
@@ -206,7 +215,8 @@ final class MacChatTranscriptSearchController {
             reset(for: sessionID)
         }
         documents = MacChatTranscriptSearch.documents(from: messages)
-        scheduleSearch(preserving: selectedMessageID)
+        sourceRevision &+= 1
+        scheduleSearch()
     }
 
     /// Streaming changes only the last row. Updating that projection in O(1)
@@ -214,14 +224,14 @@ final class MacChatTranscriptSearchController {
     /// removals, compaction, and session changes still use `replaceSource`.
     func replaceLastMessage(_ message: ChatMessage?, ordinal: Int, sessionID: String) {
         guard sourceSessionID == sessionID else { return }
-        let previousSelection = selectedMessageID
         let previousDocument = documents.last?.ordinal == ordinal ? documents.last : nil
         let replacement = message.flatMap { MacChatTranscriptSearch.document(from: $0, ordinal: ordinal) }
         guard previousDocument != replacement else { return }
 
         if previousDocument != nil { documents.removeLast() }
         if let replacement { documents.append(replacement) }
-        scheduleSearch(preserving: previousSelection)
+        sourceRevision &+= 1
+        scheduleSearch()
     }
 
     func setQuery(_ newValue: String) {
@@ -231,7 +241,7 @@ final class MacChatTranscriptSearchController {
         results = []
         totalMatchCount = 0
         cursor = MacChatTranscriptSearchCursor(resultCount: 0)
-        scheduleSearch(preserving: nil)
+        scheduleSearch(restarting: true)
     }
 
     @discardableResult
@@ -250,7 +260,9 @@ final class MacChatTranscriptSearchController {
 
     func reset(for sessionID: String) {
         searchTask?.cancel()
+        searchTask = nil
         searchGeneration &+= 1
+        sourceRevision &+= 1
         sourceSessionID = sessionID
         documents = []
         query = ""
@@ -260,13 +272,13 @@ final class MacChatTranscriptSearchController {
         cursor = MacChatTranscriptSearchCursor(resultCount: 0)
     }
 
-    private func scheduleSearch(preserving preferredMessageID: String?) {
-        searchTask?.cancel()
-        searchGeneration &+= 1
-        let generation = searchGeneration
-        let rawQuery = query
-        let currentDocuments = documents
-        let bounded = MacChatTranscriptSearch.boundedQuery(rawQuery)
+    private func scheduleSearch(restarting: Bool = false) {
+        if restarting {
+            searchTask?.cancel()
+            searchTask = nil
+            searchGeneration &+= 1
+        }
+        let bounded = MacChatTranscriptSearch.boundedQuery(query)
 
         guard !bounded.isEmpty else {
             phase = .idle
@@ -276,27 +288,49 @@ final class MacChatTranscriptSearchController {
             return
         }
 
+        // Source updates coalesce into the active pass instead of restarting
+        // its deadline on every token. Only a changed query restarts debounce.
+        guard searchTask == nil else { return }
+        let generation = searchGeneration
+        let rawQuery = query
         phase = .searching
         searchTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(120))
-            guard !Task.isCancelled else { return }
-            let worker = Task.detached(priority: .userInitiated) {
-                MacChatTranscriptSearch.searchCancellable(
-                    query: rawQuery,
-                    documents: currentDocuments
-                )
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(120))
+                guard !Task.isCancelled, let self,
+                      generation == self.searchGeneration else { return }
+                let revision = self.sourceRevision
+                let response = await self.search(rawQuery, self.documents)
+                guard !Task.isCancelled, generation == self.searchGeneration else { return }
+                guard let response else {
+                    self.searchTask = nil
+                    return
+                }
+                // The reader may have navigated during the scan. Anchor to
+                // that latest selection, not the one at refresh submission.
+                self.apply(response, preserving: self.selectedMessageID)
+                guard revision != self.sourceRevision else {
+                    self.searchTask = nil
+                    return
+                }
+                // A mutation during this scan queues one more sequential pass.
+                // Mutations during that pass can queue another; no finite tail
+                // is lost and scans never overlap within a query generation.
             }
-            let response = await withTaskCancellationHandler {
-                await worker.value
-            } onCancel: {
-                worker.cancel()
-            }
-            guard !Task.isCancelled,
-                  let response,
-                  let self,
-                  generation == self.searchGeneration
-            else { return }
-            self.apply(response, preserving: preferredMessageID)
+        }
+    }
+
+    nonisolated private static func searchOffMainActor(
+        query: String,
+        documents: [MacChatTranscriptSearchDocument]
+    ) async -> MacChatTranscriptSearchResponse? {
+        let worker = Task.detached(priority: .userInitiated) {
+            MacChatTranscriptSearch.searchCancellable(query: query, documents: documents)
+        }
+        return await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
         }
     }
 

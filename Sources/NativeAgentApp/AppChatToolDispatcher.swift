@@ -7,6 +7,7 @@ import MacIntegration
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
+import ProviderRouting
 import TrustCenter
 import WorkshopExecution
 
@@ -507,7 +508,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "full"
         let innerCatalog = try await inner.dispatch(tool: "tool_catalog", input: input, surface: surface)
-        let names = try await listAvailableTools()
+        let internalNames = try await listAvailableTools()
+        let names = SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(internalNames)).sorted()
         var obj: [String: JSONValue]
         if case .object(let base) = innerCatalog {
             obj = base
@@ -534,6 +536,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ? []
             : await activeToolsStore.load(sessionId: sessionId).activeTools
         let turnScoped = LLMCallContext.turnActiveTools ?? []
+        let modelVisibleTurnScoped = SwiftToolDispatcher.modelVisibleCatalogToolNames(turnScoped)
         let sessionActive = persistedActive.union(turnScoped)
         let appNameSet = Set(Self.appToolNames)
         let loadedAppTools = appNameSet.intersection(sessionActive)
@@ -562,12 +565,6 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
 
         var capabilityRows: [JSONValue] = []
         capabilityRows.reserveCapacity(rows.count)
-        let sideEffectCapabilities: Set<String> = [
-            "approval_stage", "app_data_write", "evolution_apply_trigger",
-            "evolution_write", "external_send", "file_write", "mac_control",
-            "money", "network_write", "notification", "outside_app_data_write",
-            "shell", "skill_write", "system_control",
-        ]
         for row in rows {
             guard case .object(var rowObj) = row,
                   case .string(let name)? = rowObj["name"] else {
@@ -590,9 +587,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             rowObj["autonomy"] = .string(envelope.autonomyLevel)
             rowObj["effective_autonomy"] = .string(effectiveAutonomy)
             rowObj["autonomy_source"] = .string("trust_center")
-            rowObj["side_effects"] = .bool(
-                !sideEffectCapabilities.isDisjoint(with: envelope.capabilities)
-            )
+            rowObj["side_effects"] = .bool(envelope.hasSideEffects)
             rowObj["available_now"] = .bool(envelope.decision != .block)
             rowObj["input_schema"] = rowObj["parameters"] ?? .object([:])
             capabilityRows.append(.object(rowObj))
@@ -623,7 +618,13 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         obj["health_tools"] = .array(Self.healthToolNames.map { .string($0) })
         obj["organism_tools"] = .array(Self.organismToolNames.map { .string($0) })
         obj["currently_loaded"] = .array(loadedNames.sorted().map { .string($0) })
-        obj["turn_active_tools"] = .array(turnScoped.sorted().map { .string($0) })
+        obj["turn_active_tools"] = .array(modelVisibleTurnScoped.sorted().map { .string($0) })
+        for key in ["mac_app_available_tools", "mac_app_policy_locked_tools"] {
+            let filtered = SwiftToolDispatcher.modelVisibleCatalogToolNames(
+                Set(Self.jsonStringArray(obj[key]))
+            )
+            obj[key] = .array(filtered.sorted().map { .string($0) })
+        }
         obj["discovery_only_tools"] = .array(discoveryNames.sorted().map { .string($0) })
         obj["available_tools"] = .array(names.map { .string($0) })
         obj["tools"] = .array(rows)
@@ -1258,12 +1259,12 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ),
             LLMToolSchema(
                 name: "doctor_status",
-                description: "Run NativeAgent's read-only Doctor checks without repairs and return the bounded check results. Use this to verify runtime, storage, persona, memory, iCloud, and installed-app health.",
+                description: "Run NativeAgent's read-only Doctor checks without repairs and return the bounded check results. The global status keeps every warning visible; active_path_status separately reports the path serving this turn, while maintenance_status covers dormant or aggregate integration upkeep only when the active provider is independently confirmed ready.",
                 parametersJSON: params(properties: [], required: [])
             ),
             LLMToolSchema(
                 name: "telegram_status",
-                description: "Return a bounded read-only summary of NativeAgent's Telegram configuration and live poller health. Tokens, chat IDs, user IDs, and message contents are never returned.",
+                description: "Return a bounded read-only summary of NativeAgent's Telegram configuration, live poller health, and diagnostic-ledger freshness. Historical error and policy-block counts are explicitly separated from unrecovered errors. Tokens, chat IDs, user IDs, and message contents are never returned.",
                 parametersJSON: params(properties: [], required: [])
             ),
             LLMToolSchema(
@@ -1410,7 +1411,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ),
             LLMToolSchema(
                 name: "browser.chrome_type",
-                description: "Append text sequentially to an editable non-password node from the exact current Chrome snapshot. Returns one outcome receipt and never retries an ambiguous dispatch.",
+                description: "Append text sequentially to an editable non-password node from the exact current Chrome snapshot. Runs up to 20 seconds or the remaining lease and returns exact Unicode progress. For partial completion, observe a fresh snapshot and continue only the remaining text; never resend the original full text blindly.",
                 parametersJSON: params(
                     properties: [
                         ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
@@ -1775,7 +1776,43 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     private static func defaultDoctorStatusProvider() async throws -> JSONValue {
-        let report = try await NativeClient(baseURL: "").runDoctor(repair: false)
+        let client = NativeClient(baseURL: "")
+        let report = try await client.runDoctor(repair: false)
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        let surface = ChatTurnRuntimeContext.current?.surface ?? "chat"
+        let router = SwiftNativeProviderRouting(
+            dataRoot: dataRoot,
+            surfacesPathOverride: dataRoot
+                .appendingPathComponent("providers", isDirectory: true)
+                .appendingPathComponent("surfaces.json"),
+            activeProviderPathOverride: dataRoot
+                .appendingPathComponent("providers", isDirectory: true)
+                .appendingPathComponent("active.json")
+        )
+        let configuredProviderID = try? await router.checkedRoutingSnapshot().activeProviders
+        let activeProviderID = ChatTurnRuntimeContext.current?.providerID
+            ?? configuredProviderID.flatMap { ProviderRoutingSurfaceLookup.value($0, surface) }
+        let providers = try? await client.listProviders(
+            dataRoot: dataRoot,
+            authEnvironment: ProcessInfo.processInfo.environment
+        )
+        let activeProviderReady = activeProviderID.flatMap { providerID in
+            providers?
+                .first(where: { $0.provider_id == providerID })
+                .map { $0.auth_status.state.lowercased() == "ready" }
+        }
+        return doctorStatusEnvelope(
+            report: report,
+            activeProviderID: activeProviderID,
+            activeProviderReady: activeProviderReady
+        )
+    }
+
+    static func doctorStatusEnvelope(
+        report: DoctorReport,
+        activeProviderID: String?,
+        activeProviderReady: Bool?
+    ) -> JSONValue {
         let checks = report.checks.map { check in
             JSONValue.object([
                 "id": .string(check.id),
@@ -1785,16 +1822,67 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 "repair_available": .bool(check.repair?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false),
             ])
         }
+        let maintenanceIDs = Set(["oauth_token_expiry"])
+        let activeProviderIsReady = activeProviderReady == true
+        let maintenanceChecks = report.checks.filter { check in
+            if maintenanceIDs.contains(check.id) { return true }
+            return check.id == "live.providers"
+                && check.status.lowercased() == "warn"
+                && activeProviderIsReady
+        }
+        let maintenanceCheckIDs = Set(maintenanceChecks.map(\.id))
+        let activeChecks = report.checks.filter { !maintenanceCheckIDs.contains($0.id) }
+        let activePathStatus = NativeClient.doctorRollup(activeChecks.map(\.status))
+        let maintenanceStatus = NativeClient.doctorRollup(maintenanceChecks.map(\.status))
+        let providerStatus: String = switch activeProviderReady {
+        case true: "ready"
+        case false: "not_ready"
+        case nil: "unknown"
+        }
         return .object([
             "status": .string(report.status),
-            "repaired": .bool(false),
+            "active_path_status": .string(activePathStatus),
+            "maintenance_status": .string(maintenanceStatus),
+            "active_provider_id": activeProviderID.map(JSONValue.string) ?? .null,
+            "active_provider_status": .string(providerStatus),
+            "status_scope_note": .string("status is the global Doctor rollup; active_path_status is the independently classified path serving this surface; maintenance warnings remain visible in checks"),
+            "repaired": .bool(report.repaired),
             "check_count": .int(Int64(checks.count)),
+            "active_path_check_count": .int(Int64(activeChecks.count)),
+            "maintenance_check_count": .int(Int64(maintenanceChecks.count)),
+            "maintenance_check_ids": .array(maintenanceChecks.map { .string($0.id) }),
             "checks": .array(checks),
         ])
     }
 
     private static func defaultTelegramStatusProvider() async throws -> JSONValue {
         let status = try await NativeClient(baseURL: "").getTelegramStatus()
+        return telegramStatusEnvelope(status: status, now: Date())
+    }
+
+    static func telegramStatusEnvelope(status: TelegramStatus, now: Date) -> JSONValue {
+        let lastSuccessfulPoll = telegramDiagnosticDate(status.lastPollAt)
+        let datedErrors = status.errors.compactMap { event in
+            telegramDiagnosticDate(event.at).map { (event.at, $0) }
+        }
+        let datedBlocked = status.blocked.compactMap { event in
+            telegramDiagnosticDate(event.at).map { (event.at, $0) }
+        }
+        let errorsAfterLastSuccessfulPoll = lastSuccessfulPoll.map { pollAt in
+            datedErrors.filter { $0.1 > pollAt }.count
+        }
+        let latestError = datedErrors.max(by: { $0.1 < $1.1 })
+        let latestBlocked = datedBlocked.max(by: { $0.1 < $1.1 })
+        let errorHistoryStatus: String
+        if status.actionableError != nil {
+            errorHistoryStatus = "active_error"
+        } else if let errorsAfterLastSuccessfulPoll, errorsAfterLastSuccessfulPoll > 0 {
+            errorHistoryStatus = "newer_than_last_successful_poll"
+        } else if status.errors.isEmpty {
+            errorHistoryStatus = "empty"
+        } else {
+            errorHistoryStatus = "recovered_history"
+        }
         var object: [String: JSONValue] = [
             "status": .string(status.isOperational ? "ok" : "attention"),
             "enabled": .bool(status.enabled),
@@ -1806,6 +1894,13 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             "recent_receipt_ledger_entries": .int(Int64(status.receipts.count)),
             "recent_blocked_ledger_entries": .int(Int64(status.blocked.count)),
             "recent_error_ledger_entries": .int(Int64(status.errors.count)),
+            "error_history_status": .string(errorHistoryStatus),
+            "error_entries_since_last_successful_poll": errorsAfterLastSuccessfulPoll
+                .map { .int(Int64($0)) } ?? .null,
+            "error_entries_with_unreadable_timestamp": .int(Int64(status.errors.count - datedErrors.count)),
+            "blocked_history_status": .string(status.blocked.isEmpty ? "empty" : "historical_policy_events"),
+            "blocked_entries_with_unreadable_timestamp": .int(Int64(status.blocked.count - datedBlocked.count)),
+            "ledger_scope_note": .string("error and blocked ledger counts are bounded history, not current failure counts; active_error and errors since the last successful poll carry current-health meaning; blocked rows are policy decisions, not transport failures"),
             "active_error": .bool(status.actionableError != nil),
             "poll_retry_transient": .bool(status.isTransientPollInterruption),
             "consecutive_poll_failures": .int(Int64(status.pollBackoffFailures ?? 0)),
@@ -1814,6 +1909,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         object["reasoning_effort"] = status.reasoningEffort.map { .string($0) } ?? .null
         object["last_seen_at"] = status.lastSeenAt.map { .string($0) } ?? .null
         object["last_reply_at"] = status.lastReplyAt.map { .string($0) } ?? .null
+        object["last_successful_poll_at"] = status.lastPollAt.map { .string($0) } ?? .null
+        object["latest_error_at"] = latestError.map { .string($0.0) } ?? .null
+        object["latest_error_age_seconds"] = latestError.map {
+            .int(Int64(max(0, now.timeIntervalSince($0.1))))
+        } ?? .null
+        object["latest_blocked_at"] = latestBlocked.map { .string($0.0) } ?? .null
+        object["latest_blocked_age_seconds"] = latestBlocked.map {
+            .int(Int64(max(0, now.timeIntervalSince($0.1))))
+        } ?? .null
         object["last_error"] = status.lastError.map {
             .string(NativeAppSecretRedactor.redactText(String($0.prefix(600))))
         } ?? .null
@@ -1827,6 +1931,13 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             ])
         }
         return .object(object)
+    }
+
+    private static func telegramDiagnosticDate(_ raw: String?) -> Date? {
+        guard let raw else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
     }
 
     private static func encodableJSON<T: Encodable>(_ value: T) throws -> JSONValue {
@@ -1936,7 +2047,8 @@ func makeNativeAgentAppToolDispatchClient(
     denyExternalMcp: Bool = false,
     enforceAppAutonomy: Bool = true,
     swarmApprovalFiler: (any ApprovalFiler)? = nil,
-    dataRoot: URL = PersistenceCore.defaultDataRoot()
+    dataRoot: URL = PersistenceCore.defaultDataRoot(),
+    innerTools: (any ToolDispatchClient)? = nil
 ) -> any ToolDispatchClient {
     let usesLiveAppBody = dataRoot == PersistenceCore.defaultDataRoot()
     let activeToolsStore: ActiveToolsStore = usesLiveAppBody
@@ -1948,7 +2060,10 @@ func makeNativeAgentAppToolDispatchClient(
     let evolutionBridge: (any EvolutionToolBridge)? = includeEvolutionBridge
         ? EvolutionToolBridgeImpl(dataRoot: dataRoot)
         : nil
-    let inner = SwiftToolDispatcher(
+    // Keep the injection seam below AppChatToolDispatcher. Hermetic boundary
+    // tests can replace the core tool body without bypassing app-owned
+    // interception, SecurityCenter, or the bridge factory's wrapper order.
+    let inner: any ToolDispatchClient = innerTools ?? SwiftToolDispatcher(
         dataRoot: dataRoot,
         activeToolsStore: activeToolsStore,
         allowProcessGlobalTools: usesLiveAppBody,
@@ -1984,6 +2099,27 @@ func makeNativeAgentAppToolDispatchClient(
                     model = try? await ExternalSendMotorActionReadModelProvider(
                         dataRoot: dataRoot
                     ).motorActionReadModel(actionId: reference.ownerActionID)
+                case .agentBridge:
+                    let row = DelegationStatusProjector().allJobs(now: Date()).first {
+                        $0.id == reference.ownerActionID
+                    }
+                    if let row {
+                        model = BackgroundLoopsAssembly.delegationJobSnapshot(from: row)
+                            .motorActionReadModel()
+                    } else {
+                        // The durable inbox receipt can become visible a few
+                        // milliseconds before the wake-job writer. Preserve
+                        // the exact owner identity without inventing progress.
+                        model = MotorActionReadModel(
+                            domain: "agent_bridge",
+                            actionIdentity: reference.actionIdentity,
+                            phase: .waitingExternal,
+                            domainState: "accepted",
+                            verification: .pending,
+                            expectedNextEvidence: "A canonical bridge job record tied to this message id.",
+                            updatedAt: nil
+                        )
+                    }
                 case .browser:
                     // BrowserActionRunner already rereads the Browser owner
                     // and returns its canonical consequence to cognition.
@@ -2020,7 +2156,7 @@ func makeNativeAgentAppToolDispatchClient(
 /// `ClaudeBridgeDenyDispatcher` intentionally stays outermost: external MCP
 /// names are rejected before they can probe TrustCenter or the inner catalog.
 func makeNativeAgentBridgeToolDispatchClient(
-    baseTools: (any ToolDispatchClient)? = nil,
+    appInnerTools: (any ToolDispatchClient)? = nil,
     fileAccess: String = "read_only",
     approvalFiler: (any ApprovalFiler)? = nil,
     approvalTimeoutSeconds: Double = 30,
@@ -2028,10 +2164,11 @@ func makeNativeAgentBridgeToolDispatchClient(
     trust: (any AutonomyResolver)? = nil,
     verifiedSessionId: String? = nil
 ) -> any ToolDispatchClient {
-    let tools = baseTools ?? makeNativeAgentAppToolDispatchClient(
+    let tools = makeNativeAgentAppToolDispatchClient(
         includeEvolutionBridge: NativeAgentAppChatSurfaceProfile.bridge.includesEvolutionBridge,
         denyExternalMcp: false,
-        dataRoot: dataRoot
+        dataRoot: dataRoot,
+        innerTools: appInnerTools
     )
     let gated = makeGatedToolDispatchClient(
         tools: tools,
@@ -2045,13 +2182,14 @@ func makeNativeAgentBridgeToolDispatchClient(
     return ClaudeBridgeDenyDispatcher(inner: gated)
 }
 
-func makeNativeAgentAppChatOrchestrationClient(
+private func makeNativeAgentAppChatOrchestrationClient(
     includeEvolutionBridge: Bool = true,
     denyExternalMcp: Bool = false,
     approvalFiler: (any ApprovalFiler)? = nil,
+    toolLoopMaxIterations: Int? = nil,
+    turnWallClockSeconds: TimeInterval? = nil,
     dataRoot: URL = PersistenceCore.defaultDataRoot()
 ) -> SwiftNativeChatOrchestrationClient {
-    let usesLiveAppBody = dataRoot == PersistenceCore.defaultDataRoot()
     let tools = makeNativeAgentAppToolDispatchClient(
         includeEvolutionBridge: includeEvolutionBridge,
         denyExternalMcp: denyExternalMcp,
@@ -2064,10 +2202,35 @@ func makeNativeAgentAppChatOrchestrationClient(
         swarmApprovalFiler: approvalFiler,
         dataRoot: dataRoot
     )
+    return makeNativeAgentAppChatOrchestrationClient(
+        tools: tools,
+        approvalFiler: approvalFiler,
+        toolLoopMaxIterations: toolLoopMaxIterations,
+        turnWallClockSeconds: turnWallClockSeconds,
+        dataRoot: dataRoot
+    )
+}
+
+/// Bind any purpose-built dispatcher to the same app-owned mind/body assembly
+/// used by Mac, iOS, Telegram, Slack, bridge, and background turns. Restricted
+/// Workshop dispatchers keep their own smaller tool inventory while cognition,
+/// ContextFlow, memory projection, and provider lifecycle remain one shared
+/// contract instead of being rebuilt at each caller. Public first-run safety
+/// stays with the canonical ContextFlow and cognition owners.
+func makeNativeAgentAppChatOrchestrationClient(
+    tools: any ToolDispatchClient,
+    approvalFiler: (any ApprovalFiler)? = nil,
+    toolLoopMaxIterations: Int? = nil,
+    turnWallClockSeconds: TimeInterval? = nil,
+    dataRoot: URL = PersistenceCore.defaultDataRoot()
+) -> SwiftNativeChatOrchestrationClient {
+    let usesLiveAppBody = dataRoot == PersistenceCore.defaultDataRoot()
     let cognition = usesLiveAppBody ? NativeCognitionRuntime.shared : nil
     return makeChatOrchestrationClient(
         tools: tools,
         dataRoot: dataRoot,
+        toolLoopMaxIterations: toolLoopMaxIterations,
+        turnWallClockSeconds: turnWallClockSeconds,
         approvalFiler: approvalFiler,
         cognitiveObserver: cognition,
         cognitiveContextProvider: cognition,
@@ -2076,10 +2239,7 @@ func makeNativeAgentAppChatOrchestrationClient(
         // App-side memory-record → atom-id translation; owner string stays here.
         memoryAtomTranslator: usesLiveAppBody
             ? NativeContextFlowRuntime.memoryRecordAtomID(forRecordID:)
-            : nil,
-        publicSafeMode: NativeAgentPublicSafety.isPublicSafeMode(
-            environment: ProcessInfo.processInfo.environment
-        )
+            : nil
     )
 }
 
@@ -2089,13 +2249,20 @@ func makeNativeAgentAppChatOrchestrationClient(
     approvalFiler: (any ApprovalFiler)? = nil,
     dataRoot: URL = PersistenceCore.defaultDataRoot()
 ) -> SwiftNativeChatOrchestrationClient {
-    makeNativeAgentAppChatOrchestrationClient(
+    let resolvedApprovalFiler: (any ApprovalFiler)? = approvalFiler
+        ?? (profile.filesApprovalsByDefault
+            ? NativeAgentChatApprovalFiler(dataRoot: dataRoot)
+            : nil)
+    return makeNativeAgentAppChatOrchestrationClient(
         includeEvolutionBridge: profile.includesEvolutionBridge,
         denyExternalMcp: profile.deniesExternalMCP,
-        // Every user conversation surface gets the same durable nonblocking
-        // ApprovalInbox projection. Telegram supplies its specialized wrapper
-        // for inline buttons; all other profiles use the shared app filer.
-        approvalFiler: approvalFiler ?? NativeAgentChatApprovalFiler(dataRoot: dataRoot),
+        // User conversation surfaces get the same durable nonblocking inbox.
+        // Telegram supplies its inline-button wrapper. Background execution
+        // has no user at the trigger and therefore fails confirm-tier work
+        // closed unless a caller explicitly supplies a filer.
+        approvalFiler: resolvedApprovalFiler,
+        toolLoopMaxIterations: profile.toolLoopMaxIterations,
+        turnWallClockSeconds: profile.turnWallClockSeconds,
         dataRoot: dataRoot
     )
 }

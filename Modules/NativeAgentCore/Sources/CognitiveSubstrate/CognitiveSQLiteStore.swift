@@ -38,14 +38,20 @@ struct CognitiveReceiptWrite: Sendable, Equatable {
 }
 
 /// Minimum newest rows retained from each active or migration-compatible
-/// artifact family before generic age-based pruning may spend that family. The
-/// totals fit beneath the default artifact cap; if a caller supplies a smaller
-/// cap, the hard cap still wins deterministically after every unprotected row
-/// has been spent.
+/// artifact family before generic age-based pruning may spend that family.
+///
+/// BOUNDED WORST CASE — protection is an eviction ORDERING, never a veto.
+/// pruneArtifacts always deletes exactly `count - cap` rows (protected rows sort
+/// last, but they are still spent once the unprotected supply runs out), so the
+/// table is bounded at `cap` no matter how many families are listed here or how
+/// lopsidedly they fill. Floors sum to 624 against the live artifact cap of 604
+/// (`artifactCap` = 128 seeds + 256 nodes + 128 seeds + 2 reflections × 14 + 64):
+/// deliberately ABOVE the cap, which under a full-of-protected-rows worst case
+/// costs the lowest-priority family its floor and still lands the table on 604.
 private let cognitiveProtectedArtifactMinimums: [String: Int] = [
-    "affect": 1,
-    "disposition": 1,
-    "emotional_consolidation": 1,
+    "affect": 32,
+    "disposition": 32,
+    "emotional_consolidation": 32,
     "thought_seed": 128,
     "episode": 64,
     "schema_proposal": 64,
@@ -56,6 +62,33 @@ private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "developmental_timeline": 128,
     "reflection_receipt": 32,
     "experiment": 20,
+]
+
+/// Minimum newest rows retained from critical receipt families before generic
+/// FIFO trimming may spend them. Live stores are overwhelmingly microcycle
+/// noise (9,051 of 9,910 rows on 2026-08-28), so preservation here is about
+/// keeping the rare "why did her mind change?" trail — reflection, emotional
+/// consolidation, replay, workshop — available once the table reaches the cap.
+///
+/// BOUNDED WORST CASE — like the artifact floors, this is an eviction ORDERING,
+/// never a veto. pruneReceipts always deletes exactly `count - (cap - slack)`
+/// rows, so the table lands on `cap - slack` after every trim regardless of how
+/// much protected mass exists; protection only decides WHICH rows go. Floors
+/// sum to 8 × 32 = 256 rows against the default cap of 10,000 (slack 256, trim
+/// target 9,744), i.e. 2.6% of the table — every floor is satisfiable at once
+/// with 9,488 rows still free for FIFO. If a caller supplies a cap below 256
+/// the hard cap still wins and the lowest-priority floors are spent.
+private let cognitiveProtectedReceiptMinimums: [String: Int] = [
+    "reflection.persona_context": 32,
+    "reflection.persona_load_failed": 32,
+    "reflection.skipped": 32,
+    "emotional_consolidation": 32,
+    "replay.integration": 32,
+    // A pending reconciliation is UNFINISHED work, not history: trimming it
+    // silently drops replay evidence that was never integrated (8 live rows).
+    "replay.reconciliation_pending": 32,
+    "workshop.pursuit_proposed": 32,
+    "workshop.pursuit_proposal_refused": 32,
 ]
 
 struct CognitiveArtifactFamilyLoad: Sendable, Equatable {
@@ -335,24 +368,11 @@ public actor CognitiveSQLiteStore {
                 maxArtifacts: maxArtifacts,
                 protectedMinimums: cognitiveProtectedArtifactMinimums
             )
-            let receiptCap = max(0, maxReceipts)
-            let receiptCount = try Int.fetchOne(
-                db, sql: "SELECT COUNT(*) FROM cognitive_receipts"
-            ) ?? 0
-            if receiptCount > receiptCap {
-                let slack = min(256, max(1, receiptCap / 4))
-                try db.execute(
-                    sql: """
-                    DELETE FROM cognitive_receipts
-                    WHERE id IN (
-                        SELECT id FROM cognitive_receipts
-                        ORDER BY created_at ASC, id ASC
-                        LIMIT MAX((SELECT COUNT(*) FROM cognitive_receipts) - ?, 0)
-                    )
-                    """,
-                    arguments: [max(0, receiptCap - slack)]
-                )
-            }
+            _ = try Self.pruneReceipts(
+                db,
+                maxReceipts: maxReceipts,
+                protectedMinimums: cognitiveProtectedReceiptMinimums
+            )
         }
     }
 
@@ -428,7 +448,11 @@ public actor CognitiveSQLiteStore {
             for receipt in receipts {
                 try Self.insertReceipt(db, kind: receipt.kind, payload: receipt.payload, at: now)
             }
-            try Self.pruneReceipts(db, maxReceipts: maxReceipts)
+            _ = try Self.pruneReceipts(
+                db,
+                maxReceipts: maxReceipts,
+                protectedMinimums: cognitiveProtectedReceiptMinimums
+            )
         }
     }
 
@@ -553,7 +577,7 @@ public actor CognitiveSQLiteStore {
                 rows = try Row.fetchAll(
                     db,
                     sql: """
-                    SELECT payload_json FROM cognitive_receipts
+                    SELECT id, payload_json FROM cognitive_receipts
                     WHERE kind LIKE ?
                     ORDER BY created_at DESC, id ASC
                     LIMIT ?
@@ -564,16 +588,15 @@ public actor CognitiveSQLiteStore {
                 rows = try Row.fetchAll(
                     db,
                     sql: """
-                    SELECT payload_json FROM cognitive_receipts
+                    SELECT id, payload_json FROM cognitive_receipts
                     ORDER BY created_at DESC, id ASC
                     LIMIT ?
                     """,
                     arguments: [bounded]
                 )
             }
-            return rows.compactMap { row in
-                guard let raw: String = row["payload_json"] else { return nil }
-                return Self.parseJSON(raw)
+            return try rows.map { row in
+                try Self.receiptPayload(from: row)
             }
         }
     }
@@ -604,18 +627,22 @@ public actor CognitiveSQLiteStore {
                     arguments: [bounded]
                 )
             }
-            return rows.compactMap { row in
-                guard let rawId: String = row["id"],
-                      let id = UUID(uuidString: rawId),
+            return try rows.map { row in
+                let rowID: String = row["id"] ?? "<unknown>"
+                guard let id = UUID(uuidString: rowID),
                       let kind: String = row["kind"],
-                      let rawPayload: String = row["payload_json"],
-                      let createdAt: Double = row["created_at"] else {
-                    return nil
+                      let createdAt: Double = row["created_at"],
+                      createdAt.isFinite else {
+                    throw CognitiveSQLiteReadError.malformedRow(
+                        table: "cognitive_receipts",
+                        id: rowID,
+                        detail: "one or more required fields are invalid"
+                    )
                 }
                 return CognitiveReceiptRecord(
                     id: id,
                     kind: kind,
-                    payload: Self.parseJSON(rawPayload),
+                    payload: try Self.receiptPayload(from: row),
                     createdAt: Date(timeIntervalSince1970: createdAt)
                 )
             }
@@ -675,21 +702,11 @@ public actor CognitiveSQLiteStore {
             // every subsequent prune would churn a delete + a "prune" receipt into
             // the recent-receipts view (gpt-5.5 review, 2026-07-02). With slack,
             // trimming fires a few times a day instead of every persist.
-            let receiptCap = max(0, maxReceipts)
-            let receiptSlack = min(256, max(1, receiptCap / 4))
-            if receiptsBefore > receiptCap {
-                try db.execute(
-                    sql: """
-                    DELETE FROM cognitive_receipts
-                    WHERE id IN (
-                        SELECT id FROM cognitive_receipts
-                        ORDER BY created_at ASC, id ASC
-                        LIMIT MAX((SELECT COUNT(*) FROM cognitive_receipts) - ?, 0)
-                    )
-                    """,
-                    arguments: [max(0, receiptCap - receiptSlack)]
-                )
-            }
+            _ = try Self.pruneReceipts(
+                db,
+                maxReceipts: maxReceipts,
+                protectedMinimums: cognitiveProtectedReceiptMinimums
+            )
             let nodesAfter = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_nodes") ?? 0
             let artifactsAfter = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_artifacts") ?? 0
             let receiptsAfter = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_receipts") ?? 0
@@ -895,22 +912,67 @@ public actor CognitiveSQLiteStore {
         )
     }
 
-    private static func pruneReceipts(_ db: Database, maxReceipts: Int) throws {
+    private struct ReceiptPruneRow {
+        var id: String
+        var kind: String
+        var createdAt: Double
+    }
+
+    @discardableResult
+    private static func pruneReceipts(
+        _ db: Database,
+        maxReceipts: Int,
+        protectedMinimums: [String: Int]
+    ) throws -> Int {
         let cap = max(0, maxReceipts)
         let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_receipts") ?? 0
-        guard count > cap else { return }
+        guard count > cap else { return 0 }
         let slack = min(256, max(1, cap / 4))
+        let targetCount = max(0, cap - slack)
+        let rows = try Row.fetchAll(
+            db,
+            sql: "SELECT id, kind, created_at FROM cognitive_receipts"
+        ).compactMap { row -> ReceiptPruneRow? in
+            guard let id: String = row["id"],
+                  let kind: String = row["kind"],
+                  let createdAt: Double = row["created_at"] else { return nil }
+            return ReceiptPruneRow(id: id, kind: kind, createdAt: createdAt)
+        }
+
+        var protectedIDs: Set<String> = []
+        for (kind, minimum) in protectedMinimums where minimum > 0 {
+            let family = rows
+                .filter { $0.kind == kind }
+                .sorted(by: receiptProtectionOrder)
+            protectedIDs.formUnion(family.prefix(minimum).map(\.id))
+        }
+
+        let victims = rows.sorted { lhs, rhs in
+            let lhsProtected = protectedIDs.contains(lhs.id)
+            let rhsProtected = protectedIDs.contains(rhs.id)
+            if lhsProtected != rhsProtected { return !lhsProtected }
+            let lhsPriority = receiptEvictionPriority(lhs.kind)
+            let rhsPriority = receiptEvictionPriority(rhs.kind)
+            if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+            if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+            return lhs.id < rhs.id
+        }.prefix(max(0, count - targetCount)).map(\.id)
+        guard !victims.isEmpty else { return 0 }
+        let placeholders = Array(repeating: "?", count: victims.count).joined(separator: ",")
         try db.execute(
-            sql: """
-            DELETE FROM cognitive_receipts
-            WHERE id IN (
-                SELECT id FROM cognitive_receipts
-                ORDER BY created_at ASC, id ASC
-                LIMIT MAX((SELECT COUNT(*) FROM cognitive_receipts) - ?, 0)
-            )
-            """,
-            arguments: [max(0, cap - slack)]
+            sql: "DELETE FROM cognitive_receipts WHERE id IN (\(placeholders))",
+            arguments: StatementArguments(victims)
         )
+        return victims.count
+    }
+
+    private static func receiptProtectionOrder(_ lhs: ReceiptPruneRow, _ rhs: ReceiptPruneRow) -> Bool {
+        if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
+        return lhs.id < rhs.id
+    }
+
+    private static func receiptEvictionPriority(_ kind: String) -> Int {
+        kind == "microcycle" ? 0 : 1
     }
 
     private static func insertReceipt(
@@ -1118,6 +1180,26 @@ public actor CognitiveSQLiteStore {
         }
     }
 
+    private static func receiptPayload(from row: Row) throws -> JSONValue {
+        let id: String = row["id"] ?? "<unknown>"
+        guard let raw: String = row["payload_json"] else {
+            throw CognitiveSQLiteReadError.malformedRow(
+                table: "cognitive_receipts",
+                id: id,
+                detail: "payload_json is missing"
+            )
+        }
+        do {
+            return try parseJSONStrict(raw)
+        } catch {
+            throw CognitiveSQLiteReadError.malformedRow(
+                table: "cognitive_receipts",
+                id: id,
+                detail: "payload_json is not valid JSON"
+            )
+        }
+    }
+
     private static func node(from row: Row) throws -> CognitiveNode {
         let rowID: String = row["id"] ?? "<unknown>"
         guard let idRaw: String = row["id"],
@@ -1187,10 +1269,6 @@ public actor CognitiveSQLiteStore {
 
     static func jsonString(_ value: JSONValue) -> String {
         (try? value.serialize(pretty: false)) ?? "null"
-    }
-
-    static func parseJSON(_ raw: String) -> JSONValue {
-        (try? JSONValue.parse(Data(raw.utf8))) ?? .null
     }
 
     private static func parseJSONStrict(_ raw: String) throws -> JSONValue {

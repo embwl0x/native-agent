@@ -14,13 +14,20 @@ enum TestGitHubCredentialVaultError: Error {
 final class TestGitHubCredentialVault: GitHubCredentialVault, @unchecked Sendable {
     private let lock = NSLock()
     private var values: [String: String] = [:]
+    private var reads = 0
     var failReads = false
     var failWrites = false
 
     func read(service: String, account: String) throws -> String? {
         lock.lock(); defer { lock.unlock() }
+        reads += 1
         if failReads { throw TestGitHubCredentialVaultError.readFailed }
         return values["\(service)|\(account)"]
+    }
+
+    func readCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return reads
     }
 
     func write(_ token: String, service: String, account: String) throws {
@@ -47,6 +54,33 @@ final class TestGitHubCredentialVault: GitHubCredentialVault, @unchecked Sendabl
             "\(GitHubCredentialStore.keychainService)|\(GitHubCredentialStore.credentialAccount(dataRoot: dataRoot))"
         ]
     }
+}
+
+@Test func githubRequestScopeResolvesCredentialOnce() async throws {
+    let root = try githubCredentialTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let token = "ghp_" + "requestscopefixtureabcdefghijklmnopqrstuvwxyz"
+    let vault = TestGitHubCredentialVault()
+    vault.seed(token, dataRoot: root)
+    let store = GitHubCredentialStore(vault: vault)
+
+    let resolved = try await GitHubConnectorActions.withResolvedToken(
+        dataRoot: root,
+        credentialStore: store
+    ) {
+        let first = try await GitHubConnectorActions.requestToken(
+            explicitToken: nil,
+            dataRoot: root
+        )
+        let second = try await GitHubConnectorActions.requestToken(
+            explicitToken: nil,
+            dataRoot: root
+        )
+        return [first, second]
+    }
+
+    #expect(resolved == [token, token])
+    #expect(vault.readCount() == 1)
 }
 
 @Test func systemGitHubCredentialVaultIsNonInteractiveAndRefusesTheTestHarness() throws {

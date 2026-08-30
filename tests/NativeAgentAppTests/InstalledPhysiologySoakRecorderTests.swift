@@ -120,6 +120,82 @@ struct InstalledPhysiologySoakRecorderTests {
         #expect(lossReport.claimBlockers.contains("recorder backpressure dropped evidence"))
     }
 
+    @Test("in-flight retries and new arrivals share the exact recorder bound")
+    func inFlightRetriesStayBoundedWithoutLosingAcceptedRows() async throws {
+        let root = try temporaryRoot("inflight-retry-bound")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clock = PhysiologyTestClock(Date(timeIntervalSince1970: 2_170_000_000))
+        let persistence = GatedRetryPhysiologyPersistence(failingAttempts: 3)
+        let runtimeID = "inflight-retry-runtime"
+        let recorder = InstalledPhysiologySoakRecorder(
+            dataRoot: root,
+            runtimeInstanceID: runtimeID,
+            evidenceClass: .generatedAccelerated,
+            now: { clock.now() },
+            processSampler: { .init(
+                systemUptimeSeconds: 1, userCPUSeconds: 0, systemCPUSeconds: 0,
+                interruptWakeups: 0, packageIdleWakeups: 0
+            ) },
+            store: InstalledPhysiologySoakStore(dataRoot: root, persistence: persistence),
+            coalescingDelayNanoseconds: 60_000_000_000
+        )
+        await recorder.recordRuntimeStarted(reason: "test")
+        for index in 1..<128 {
+            await recorder.recordCognitiveEvent(
+                event(id: "before-\(index)", at: clock.now()),
+                scheduledSignalCount: UInt64(index), acceptanceMilliseconds: 0.1
+            )
+        }
+        let drain = Task { await recorder.flush() }
+        try await waitUntil { await persistence.blockedAttempt() == 1 }
+        let inFlight = await recorder.diagnostics()
+        #expect(inFlight.pending == 128)
+        #expect(inFlight.hasMeasurementGap)
+
+        // The first 128 rows remain in flight. Only 128 of these arrivals
+        // fit, and restoring the failed batch must preserve those newer rows.
+        for index in 0..<148 {
+            await recorder.recordCognitiveEvent(
+                event(id: "during-\(index)", at: clock.now()),
+                scheduledSignalCount: UInt64(index + 128), acceptanceMilliseconds: 0.1
+            )
+        }
+        #expect(await recorder.diagnostics().pending == 256)
+        #expect(await recorder.diagnostics().totalDropped == 20)
+        await persistence.releaseFailure()
+
+        for attempt in 2...3 {
+            try await waitUntil { await persistence.blockedAttempt() == attempt }
+            #expect(await recorder.diagnostics().pending == 256)
+            for index in 0..<15 {
+                await recorder.recordCognitiveEvent(
+                    event(id: "retry-\(attempt)-\(index)", at: clock.now()),
+                    scheduledSignalCount: 256, acceptanceMilliseconds: 0.1
+                )
+            }
+            #expect(await recorder.diagnostics().pending == 256)
+            await persistence.releaseFailure()
+        }
+        #expect(await drain.value)
+        let recovered = await recorder.diagnostics()
+        #expect(recovered.pending == 0)
+        #expect(recovered.totalDropped == 50)
+        #expect(recovered.totalWriteFailures == 3)
+        #expect(recovered.lastError == nil)
+        let records = try persistedRecords(root: root, runtime: runtimeID)
+        #expect(records.count == 257)
+        #expect(records.map(\.sequence) == Array(UInt64(1)...257))
+        #expect(await persistence.persistedSequenceOrder() == Array(1...257))
+        #expect(Set(records.map(\.eventID)).count == 257)
+        #expect(records.dropLast().allSatisfy { $0.kind != .recorderLoss })
+        #expect(records.last?.kind == .recorderLoss)
+        #expect(records.last?.droppedRecordCount == 50)
+        let report = await recorder.report()
+        #expect(report.recorderDroppedRecordCount == 50)
+        #expect(report.sequenceGapCount == 0)
+        #expect(report.claimBlockers.contains("recorder backpressure dropped evidence"))
+    }
+
     @Test("termination flush and later launch distinguish clean stop from crash")
     func restartAccounting() async throws {
         let root = try temporaryRoot("restart")
@@ -458,6 +534,44 @@ private actor FlakyPhysiologyPersistence: PersistenceCoreProtocol {
     func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] { [] }
     func readJSONL(_ path: URL) async throws -> [JSONValue] { [] }
     func attemptCount() -> Int { attempts }
+}
+
+private actor GatedRetryPhysiologyPersistence: PersistenceCoreProtocol {
+    private let failingAttempts: Int
+    private let native = SwiftNativePersistenceCore()
+    private var attempts = 0
+    private var blocked = 0
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var persistedSequences: [Int64] = []
+
+    init(failingAttempts: Int) { self.failingAttempts = failingAttempts }
+
+    func readJSON(_ path: URL, defaultValue: JSONValue) async -> JSONValue { defaultValue }
+    func writeJSON(_ value: JSONValue, to path: URL) async throws {}
+    func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] { [] }
+    func readJSONL(_ path: URL) async throws -> [JSONValue] { [] }
+
+    func appendJSONL(_ record: JSONValue, to path: URL) async throws {
+        attempts += 1
+        if attempts <= failingAttempts {
+            blocked = attempts
+            await withCheckedContinuation { waiter = $0 }
+            throw NSError(domain: "GatedRetryPhysiologyPersistence", code: attempts)
+        }
+        try await native.appendJSONL(record, to: path)
+        if case .object(let fields) = record, case .int(let sequence)? = fields["sequence"] {
+            persistedSequences.append(sequence)
+        }
+    }
+
+    func blockedAttempt() -> Int { blocked }
+    func persistedSequenceOrder() -> [Int64] { persistedSequences }
+
+    func releaseFailure() {
+        blocked = 0
+        waiter?.resume()
+        waiter = nil
+    }
 }
 
 private actor BlockingAppendPhysiologyPersistence: PersistenceCoreProtocol {

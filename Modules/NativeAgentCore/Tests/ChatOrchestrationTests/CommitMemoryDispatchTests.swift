@@ -3,6 +3,7 @@ import Foundation
 @testable import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
+import MemoryV2
 
 // MARK: - commit_memory dispatcher-surface tests
 //
@@ -56,6 +57,7 @@ struct CommitMemoryDispatchTests {
         // MemoryV2Tests/CorrectionLineageTests).
         #expect(props["corrects"] != nil)
         #expect(props["correction_reason"] != nil)
+        #expect(props["context_topics"] != nil)
         // confidence/importance carry the JSON Schema number type.
         if case .object(let conf)? = props["confidence"] {
             #expect(conf["type"] == .string("number"))
@@ -88,6 +90,54 @@ struct CommitMemoryDispatchTests {
         await #expect(throws: (any Error).self) {
             _ = try await dispatcher.impl_commit_memory(input: ["kind": .string("note")])
         }
+    }
+
+    @Test func malformedTopicScopeIsRejectedBeforeMemoryWrite() async throws {
+        let dispatcher = hermeticDispatcher()
+        for value in [JSONValue.array([]), .array([.int(1)]), .array([.string(" ")]), .string("project")] {
+            await #expect(throws: (any Error).self) {
+                _ = try await dispatcher.impl_commit_memory(input: [
+                    "text": .string("The greenhouse schedule is dusk."), "kind": .string("correction"),
+                    "context_topics": value,
+                ])
+            }
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func duplicateCorrectionKeepsExistingFactAndReportsNoSelfCorrection(normalizedVariant: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("commit-self-correction-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(dataRoot: root)
+        let memory = SwiftNativeMemoryV2(embedder: MockEmbeddingProvider(), storage: MemoryStorageBridge(storage: storage))
+        let dispatcher = SwiftToolDispatcher(dataRoot: root, memoryV2: memory, allowProcessGlobalTools: false)
+        let text = "The orchard gate opens at dusk."
+        let original = try await memory.store(content: text, source: "chat.commit_memory")
+        let before = try #require(try await storage.memory(id: original.id))
+        let result = try await dispatcher.impl_commit_memory(input: [
+            "text": .string(normalizedVariant ? "THE ORCHARD GATE OPENS AT DUSK!" : text),
+            "corrects": .string(original.id),
+            "kind": .string("correction"),
+        ])
+        guard case .object(let payload) = result,
+              case .object(let correction)? = payload["correction"] else {
+            Issue.record("missing correction receipt")
+            return
+        }
+        #expect(payload["status"] == .string("ok"))
+        #expect(payload["id"] == .string(original.id))
+        #expect(correction["applied"] == .bool(false))
+        #expect(correction["note"] == .string("The saved text resolved to the same existing memory. No self-correction was applied; this call did not retire that record."))
+        let after = try #require(try await storage.memory(id: original.id))
+        #expect(after.content == before.content)
+        #expect(after.lifecycle == before.lifecycle)
+        #expect(after.status == "active")
+        if case .object(let metadata)? = after.metadata {
+            #expect(metadata["corrected_by"] == nil)
+            #expect(metadata["correction_history"] == nil)
+        }
+        let hits = try await storage.recallByKeyword(queryText: "orchard gate", topK: 5)
+        #expect(hits.map(\.memory.id) == [original.id])
     }
 
     // SecurityCenter risk profiling for commit_memory is asserted in

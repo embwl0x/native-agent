@@ -452,18 +452,11 @@ public actor DispatchLedger {
             "createdAt": .string(entry.createdAt),
         ]
         let record: JSONValue = .object(envelope)
-        // A5.5(d): traces/events.jsonl is a MULTI-writer feed. The
-        // ProviderRouting LLM adapter and Research trace writer cap it to
-        // activityEvents (5000); this dispatch co-writer used to append
-        // UNBOUNDED under the same flock. Route through the shared capped
-        // append (it takes the same flock) so every co-writer trims to the
-        // identical newest-N invariant.
         do {
-            try await appendJSONLCapped(
+            try await appendPathOwnedJSONL(
                 record,
                 to: ledgerPath,
                 using: persistence,
-                maxLines: JSONLLineCaps.activityEvents,
                 logLabel: "DispatchLedger"
             )
         } catch {

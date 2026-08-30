@@ -43,6 +43,59 @@ func systemHealthSummary_coldLaunchIsUnknown() {
 }
 
 @MainActor
+@Test("the toolbar reuses live health-card evidence without requiring a duplicate Doctor run")
+func systemHealthSummary_usesHealthCardFallback() {
+    let model = AppModel()
+    model.healthCard = HealthCard(
+        overall: "error",
+        subsystems: [
+            HealthCardSubsystem(
+                id: "runtime", label: "Runtime", status: "error", detail: "offline",
+                fixAction: nil
+            ),
+            HealthCardSubsystem(
+                id: "storage", label: "Storage", status: "warn", detail: "large",
+                fixAction: nil
+            ),
+        ],
+        createdAt: nil
+    )
+
+    #expect(model.doctorReport == nil)
+    #expect(model.systemHealthSummary == .error(count: 1))
+
+    model.healthCard = HealthCard(
+        overall: "warn",
+        subsystems: [
+            HealthCardSubsystem(
+                id: "storage", label: "Storage", status: "warn", detail: "large",
+                fixAction: nil
+            ),
+        ],
+        createdAt: nil
+    )
+    #expect(model.systemHealthSummary == .warn(count: 1))
+}
+
+@MainActor
+@Test("an explicit Doctor result outranks the health-card fallback")
+func systemHealthSummary_prefersDoctorResult() {
+    let model = AppModel()
+    model.healthCard = HealthCard(
+        overall: "error",
+        subsystems: [
+            HealthCardSubsystem(
+                id: "runtime", label: "Runtime", status: "error", detail: "old",
+                fixAction: nil
+            ),
+        ],
+        createdAt: nil
+    )
+    model.doctorReport = report(["ok"])
+    #expect(model.systemHealthSummary == .ok)
+}
+
+@MainActor
 @Test("a failing check outranks warnings and reports the fail count, not the total")
 func systemHealthSummary_failOutranksWarnAndCountsOnlyFails() {
     let model = AppModel()
@@ -141,4 +194,32 @@ func healthPill_colorNeverDisagreesWithTheSummary() throws {
     #expect(source.contains("let summary = appModel.systemHealthSummary"))
     #expect(source.contains("let label = label(for: summary)"))
     #expect(source.contains("let statusColor = color(for: summary)"))
+}
+
+@Test("health-card reads publish only their newest request")
+func healthCardRefreshRejectsOlderCompletions() throws {
+    let source = try AppSourceScraping.appSource("AppModel+HealthEmbeddings.swift")
+    let body = try #require(
+        AppSourceScraping.looseFunctionBody(named: "loadHealthCard", in: source)
+    )
+
+    #expect(body.contains("let healthGeneration = healthCardRefreshGate.begin()"))
+    #expect(body.contains("healthCardRefreshGate.isCurrent(healthGeneration)"))
+    #expect(body.contains("guard !Task.isCancelled else { return }"))
+}
+
+@Test("chat health chip never renders unknown evidence as healthy or checking")
+func chatHealthChipKeepsUnknownSeparateFromHealthy() {
+    #expect(HealthCardPillStatus.make(overall: nil) == .notChecked)
+    #expect(HealthCardPillStatus.make(overall: nil).label == "Not checked")
+    #expect(HealthCardPillStatus.make(overall: " OK ") == .healthy)
+    #expect(HealthCardPillStatus.make(overall: "warn") == .warning)
+    #expect(HealthCardPillStatus.make(overall: "error") == .issue)
+
+    for value in ["unknown", "", "unavailable", "future_status"] {
+        let state = HealthCardPillStatus.make(overall: value)
+        #expect(state == .unknown)
+        #expect(state.label == "Unknown")
+        #expect(state.emoji == "○")
+    }
 }

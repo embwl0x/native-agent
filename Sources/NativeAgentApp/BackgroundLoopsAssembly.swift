@@ -386,12 +386,23 @@ enum BackgroundLoopsAssembly {
             // material remote change means no state write and no notification.
             makeGitHubTrackingLoop(dataRoot: dataRoot),
         ]
-        if let tele = makeTelegramPollLoopIfConfigured(dataRoot: dataRoot) {
-            loops.append(tele)
-        }
-        if let slack = makeSlackSocketModeLoopIfConfigured(dataRoot: dataRoot) {
-            loops.append(slack)
-        }
+        // C8: an unconfigured surface registers a `.skipped` PLACEHOLDER
+        // rather than vanishing, so the lane is visible (and, after the
+        // dormancy bound, flagged) in Doctor instead of silently absent.
+        loops.append(
+            makeTelegramPollLoopIfConfigured(dataRoot: dataRoot)
+                ?? unconfiguredLanePlaceholder(
+                    loopId: "telegram_poll",
+                    reason: telegramUnconfiguredReason
+                )
+        )
+        loops.append(
+            makeSlackSocketModeLoopIfConfigured(dataRoot: dataRoot)
+                ?? unconfiguredLanePlaceholder(
+                    loopId: "slack_socket_mode",
+                    reason: slackUnconfiguredReason
+                )
+        )
         return loops
     }
 }

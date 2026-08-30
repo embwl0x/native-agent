@@ -27,6 +27,7 @@ public enum GitHubConnectorError: Error, Sendable, Equatable, LocalizedError {
 
 public enum GitHubConnectorActions {
     private static let baseURL = URL(string: "https://api.github.com")!
+    @TaskLocal private static var scopedRequestToken: String?
 
     public static func status(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
         _ = input
@@ -240,6 +241,27 @@ public enum GitHubConnectorActions {
         return token
     }
 
+    /// Resolve the Keychain credential once for a bounded multi-request
+    /// operation. Task-local inheritance carries it through nested async calls
+    /// without persisting or process-caching the secret beyond that operation.
+    static func withResolvedToken<Result>(
+        dataRoot: URL,
+        credentialStore: GitHubCredentialStore = .shared,
+        operation: @Sendable () async throws -> Result
+    ) async throws -> Result {
+        if scopedRequestToken != nil {
+            return try await operation()
+        }
+        let token = try await loadToken(dataRoot: dataRoot, credentialStore: credentialStore)
+        return try await $scopedRequestToken.withValue(token, operation: operation)
+    }
+
+    static func requestToken(explicitToken: String?, dataRoot: URL) async throws -> String {
+        if let explicitToken { return explicitToken }
+        if let scopedRequestToken { return scopedRequestToken }
+        return try await loadToken(dataRoot: dataRoot)
+    }
+
     public static func tokenPaths(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> [URL] {
         GitHubCredentialStore.metadataPaths(dataRoot: dataRoot)
     }
@@ -332,12 +354,7 @@ public enum GitHubConnectorActions {
         token explicitToken: String? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async throws -> Any {
-        let token: String
-        if let explicitToken {
-            token = explicitToken
-        } else {
-            token = try await loadToken(dataRoot: dataRoot)
-        }
+        let token = try await requestToken(explicitToken: explicitToken, dataRoot: dataRoot)
         // Closed back-off window: fail locally instead of adding load to a
         // throttle we already provoked (secondary-rate circuit breaker).
         if let remaining = await GitHubRateLimitGate.shared.cooldownRemaining() {

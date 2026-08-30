@@ -106,6 +106,7 @@ public actor MemoryConsolidator {
     /// MemoryV2+ConsolidationGate.swift for the full pipeline.
     public func consolidateGated() async throws -> GatedConsolidationOutcome {
         let dataRoot = MemoryConsolidationGate.deriveDataRoot(storagePath: storage.path)
+        await backfillTombstoneEmbeddings(dataRoot: dataRoot)
         return try await MemoryConsolidationGate.run(
             liveStorage: storage,
             dataRoot: dataRoot,
@@ -113,6 +114,31 @@ public actor MemoryConsolidator {
             probeSet: probeSet,
             now: now
         )
+    }
+
+    /// Give the semantic forget-gate its missing keys. Tombstones written by
+    /// the ordinary delete path carry no embedding, so `matchesTombstone`
+    /// (which selects `embedding IS NOT NULL`) simply cannot see them. This is
+    /// the one periodic pass that already holds BOTH the live store and an
+    /// embedder, so the backfill rides along here rather than growing its own
+    /// scheduler. It runs BEFORE the gate takes its candidate snapshot, and is
+    /// bounded per pass so a legacy backlog drains gradually — no startup or
+    /// consolidation stall.
+    ///
+    /// Best-effort by design: consolidation is the caller's actual job, and a
+    /// cold or failed embedder must not block it. The next pass retries.
+    private func backfillTombstoneEmbeddings(dataRoot: URL) async {
+        let effectiveEmbedder: any EmbeddingProvider =
+            embedder ?? ManagedEmbeddingProvider(dataRoot: dataRoot)
+        do {
+            let filled = try await storage.backfillTombstoneEmbeddings(using: effectiveEmbedder)
+            if filled > 0 {
+                logger.info("tombstone embedding backfill: filled \(filled, privacy: .public)")
+            }
+        } catch {
+            logger.error(
+                "tombstone embedding backfill failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Legacy-shaped adapter over consolidateGated(): every existing

@@ -82,4 +82,78 @@ struct DeskApprovalsRefreshAndErrorBehaviorEvalTests {
         #expect(state.approvals.isEmpty)
         #expect(state.errorText == "Approvals couldn't load. approval store unavailable")
     }
+
+    @Test("the initial approval summary cannot claim an empty inbox before a successful read")
+    @MainActor func uncheckedAndKnownEmptyAreDifferent() async {
+        let state = ApprovalLoadState()
+        #expect(!state.hasLoadedSnapshot)
+        #expect(state.summaryTitle == "Checking approvals…")
+        #expect(await state.reload { [] })
+        #expect(state.hasLoadedSnapshot)
+        #expect(state.summaryTitle == "No actions need approval")
+    }
+
+    @Test("retry keeps its prior failure visible until the replacement read succeeds")
+    @MainActor func retryRetainsFailureEvidence() async {
+        let state = ApprovalLoadState()
+        #expect(await state.reload { [] })
+        #expect(!(await state.reload { throw Self.readerFailure("offline") }))
+        #expect(state.summaryTitle == "Approval refresh failed")
+        var continuation: CheckedContinuation<[ApprovalRequest], Never>?
+        let retry = Task { @MainActor in
+            await state.reload { await withCheckedContinuation { continuation = $0 } }
+        }
+        while continuation == nil { await Task.yield() }
+        #expect(state.isRefreshing)
+        #expect(state.refreshErrorText?.contains("offline") == true)
+        #expect(state.summaryTitle == "Approval refresh failed")
+        state.clearActionError()
+        #expect(state.refreshErrorText != nil)
+        continuation?.resume(returning: [])
+        #expect(await retry.value)
+        #expect(!state.isRefreshing)
+        #expect(state.refreshErrorText == nil)
+    }
+
+    @Test("an older read cannot overwrite a newer unavailable result or clear its warning")
+    @MainActor func olderSuccessCannotHideNewerFailure() async {
+        let state = ApprovalLoadState()
+        var continuation: CheckedContinuation<[ApprovalRequest], Never>?
+        let oldRead = Task { @MainActor in
+            await state.reload { await withCheckedContinuation { continuation = $0 } }
+        }
+        while continuation == nil { await Task.yield() }
+        #expect(!(await state.reload { throw Self.readerFailure("newer failure") }))
+        continuation?.resume(returning: [])
+        #expect(!(await oldRead.value))
+        #expect(!state.hasLoadedSnapshot)
+        #expect(state.summaryTitle == "Approval status unavailable")
+        #expect(state.refreshErrorText?.contains("newer failure") == true)
+    }
+
+    @Test("older failures and canceled reads cannot replace the current successful snapshot")
+    @MainActor func outdatedFailureAndCancellationCannotPublish() async {
+        let state = ApprovalLoadState()
+        var continuation: CheckedContinuation<[ApprovalRequest], any Error>?
+        let oldRead = Task { @MainActor in
+            await state.reload { try await withCheckedThrowingContinuation { continuation = $0 } }
+        }
+        while continuation == nil { await Task.yield() }
+        #expect(await state.reload { [] })
+        continuation?.resume(throwing: Self.readerFailure("old failure"))
+        #expect(!(await oldRead.value))
+        #expect(state.refreshErrorText == nil)
+
+        continuation = nil
+        let canceledRead = Task { @MainActor in
+            await state.reload { try await withCheckedThrowingContinuation { continuation = $0 } }
+        }
+        while continuation == nil { await Task.yield() }
+        canceledRead.cancel()
+        continuation?.resume(throwing: CancellationError())
+        #expect(!(await canceledRead.value))
+        #expect(!state.isRefreshing)
+        #expect(state.summaryTitle == "No actions need approval")
+        #expect(state.refreshErrorText == nil)
+    }
 }

@@ -56,15 +56,25 @@ struct SettingsViewFull: View {
 
             Section("Mac") {
                 if let health = store.health {
-                    LabeledContent("Status") {
-                        Text(health.ok ? "Online" : "Offline")
+                    LabeledContent("Health snapshot") {
+                        Text(health.ok ? "Reported healthy" : "Reported issue")
                             .foregroundStyle(health.ok ? .green : .red)
                     }
                     LabeledContent("App", value: health.app)
                     LabeledContent("Version", value: health.version)
                     LabeledContent("Uptime", value: SettingsMacHealthPresentation.uptimeText(health.uptimeSeconds))
+                    if !store.availableFields.contains(.health) {
+                        Text("The latest health snapshot could not be read. Showing the last known report.")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                    }
+                    Text("Current reachability is shown in Connection below.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else if store.isLoading {
+                    ProgressView("Loading health snapshot…")
                 } else {
-                    Text("Health data will appear after iCloud sync.")
+                    Text("Health snapshot unavailable. Refresh after iCloud sync completes.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -104,14 +114,15 @@ struct SettingsViewFull: View {
                     // snapshots afterward: the control promises an iCloud
                     // refresh, not merely a secret-rotation check.
                     Task {
+                        guard !isForceRefreshing else { return }
                         isForceRefreshing = true
                         defer { isForceRefreshing = false }
 
                         let pairingMaterialChanged = await pairingStore.refreshFromKVS()
-                        await store.refresh()
+                        let settingsOutcome = await store.refresh()
                         repairResult = SettingsICloudRefreshPresentation.statusText(
                             pairingMaterialChanged: pairingMaterialChanged,
-                            snapshotError: iCloudSyncEngine.shared.syncError
+                            snapshotError: settingsOutcome.feedbackMessage
                         )
                     }
                 } label: {
@@ -264,22 +275,68 @@ final class SettingsStore: ObservableObject {
     @Published var health: RuntimeHealth?
     @Published var isLoading = false
     @Published var error: String?
+    @Published private(set) var availableFields: Set<SettingsSnapshotRefreshOutcome.Field> = []
+    @Published private(set) var hasCompletedRefresh = false
+    private var refreshTask: Task<SettingsSnapshotRefreshOutcome, Never>?
+    private let refreshSnapshot: @MainActor () async -> SettingsSnapshotRefreshOutcome
 
-    func refresh() async {
+    init(
+        refreshSnapshot: @escaping @MainActor () async -> SettingsSnapshotRefreshOutcome = {
+            await iCloudSyncEngine.shared.refreshSettingsSnapshot()
+        }
+    ) {
+        self.refreshSnapshot = refreshSnapshot
+    }
+
+    @discardableResult
+    func refresh() async -> SettingsSnapshotRefreshOutcome {
+        if let refreshTask { return await refreshTask.value }
         isLoading = true
-        await iCloudSyncEngine.shared.refreshSettingsSnapshot()
-        let sync = iCloudSyncEngine.shared
-        trustPolicy = sync.trustPolicy
-        // PATCH-2026-05-09: surface synced personality in Settings store.
-        personality = sync.personality
-        personalitySnapshotSyncedAt = sync.lastSyncAt
-        connectors = sync.connectors
-        health = sync.health
-        isLoading = false
+        let task = Task { @MainActor in
+            let outcome = await refreshSnapshot()
+            error = outcome.feedbackMessage
+            hasCompletedRefresh = true
+            guard outcome.state != .superseded else { return outcome }
+            let sync = iCloudSyncEngine.shared
+            availableFields = outcome.availableFields
+            trustPolicy = sync.trustPolicy
+            // A partial read has no per-file source timestamp. Do not borrow
+            // an unrelated global sync receipt to make Personality newer.
+            personality = sync.personality
+            if outcome.availableFields.contains(.personality) {
+                personalitySnapshotSyncedAt = outcome.state == .refreshed ? sync.lastSyncAt : nil
+            }
+            connectors = sync.connectors
+            health = sync.health
+            return outcome
+        }
+        refreshTask = task
+        defer {
+            refreshTask = nil
+            isLoading = false
+        }
+        return await task.value
     }
 }
 
 // MARK: - Personality detail (read-only; edits via inbox)
+
+enum SettingsSnapshotContentPresentation: Equatable {
+    case loading, unavailable, empty, content, stale
+
+    static func state(
+        hasContent: Bool,
+        fieldAvailable: Bool,
+        isLoading: Bool,
+        hasCompletedRefresh: Bool
+    ) -> Self {
+        if hasContent {
+            return hasCompletedRefresh && !fieldAvailable ? .stale : .content
+        }
+        if isLoading || !hasCompletedRefresh { return .loading }
+        return fieldAvailable ? .empty : .unavailable
+    }
+}
 
 enum PersonalitySnapshotPresentation {
     static func state(
@@ -317,6 +374,11 @@ struct PersonalityDetailView: View {
     var body: some View {
         List {
             if let p = store.personality {
+                if store.hasCompletedRefresh, !store.availableFields.contains(.personality) {
+                    Label("Personality could not be refreshed. Showing the last known profile.", systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
                 let snapshotState = PersonalitySnapshotPresentation.state(
                     lastSyncedAt: store.personalitySnapshotSyncedAt
                 )
@@ -359,16 +421,21 @@ struct PersonalityDetailView: View {
                     // not in a detached section below.
                     Text("Mirrored from the Mac. Edit in the Mac app's Personality view.")
                 }
+            } else if store.isLoading || !store.hasCompletedRefresh {
+                ProgressView("Loading Personality…")
             } else {
-                ContentUnavailableView(
-                    "Personality Not Synced",
+                AppEmptyState(
+                    title: "Personality unavailable",
                     systemImage: "person.crop.circle",
-                    description: Text("Personality data will appear after iCloud sync with Mac.")
+                    kind: .unavailable,
+                    description: "The personality snapshot could not be read. Keep the Mac app open and try again.",
+                    action: ("Try Again", "arrow.clockwise", { Task { await store.refresh() } })
                 )
             }
         }
         .navigationTitle("Personality")
         .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await store.refresh() }
     }
 }
 
@@ -645,18 +712,45 @@ enum ConnectorHealthPresentation: Equatable {
 struct ConnectorsView: View {
     @ObservedObject var store: SettingsStore
 
+    private var presentation: SettingsSnapshotContentPresentation {
+        .state(
+            hasContent: !store.connectors.isEmpty,
+            fieldAvailable: store.availableFields.contains(.connectors),
+            isLoading: store.isLoading,
+            hasCompletedRefresh: store.hasCompletedRefresh
+        )
+    }
+
     var body: some View {
         List {
-            if store.connectors.isEmpty {
+            switch presentation {
+            case .loading:
+                ProgressView("Loading connectors…")
+            case .unavailable:
                 AppEmptyState(
-                    title: "No connectors",
+                    title: "Connectors unavailable",
                     systemImage: "point.3.connected.trianglepath.dotted",
                     kind: .unavailable,
-                    description: "Connector status will appear after iCloud sync."
+                    description: "The connector snapshot could not be read. Keep the Mac app open and try again.",
+                    action: ("Try Again", "arrow.clockwise", { Task { await store.refresh() } })
                 )
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
-            } else {
+            case .empty:
+                AppEmptyState(
+                    title: "No connectors",
+                    systemImage: "point.3.connected.trianglepath.dotted",
+                    kind: .empty,
+                    description: "The Mac has not published any connectors. Configure them in the Mac app's Connectors view."
+                )
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            case .content, .stale:
+                if presentation == .stale {
+                    Label("Connectors could not be refreshed. Showing the last known rows.", systemImage: "exclamationmark.triangle")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
                 ForEach(store.connectors) { connector in
                     let health = ConnectorHealthPresentation.resolve(
                         enabled: connector.enabled,
@@ -687,5 +781,6 @@ struct ConnectorsView: View {
         }
         .navigationTitle("Connectors")
         .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await store.refresh() }
     }
 }

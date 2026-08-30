@@ -960,6 +960,10 @@ public enum OrganismGeneratedSleepRecalibrator {
 }
 
 public struct OrganismCapabilityBelief: Sendable, Equatable, Identifiable {
+    public enum EvidenceBasis: String, Sendable, Equatable {
+        case cumulativeOutcomes = "cumulative_outcomes"
+        case legacyBodyConfidence = "legacy_body_confidence"
+    }
     public var id: String { kind.rawValue }
     public var kind: OrganismPredictionKind
     public var successLikelihood: Double
@@ -969,6 +973,29 @@ public struct OrganismCapabilityBelief: Sendable, Equatable, Identifiable {
     public var expiredEvidenceCount: Int
     public var freshness: Double
     public var lastEvidenceAt: Date?
+    public var evidenceBasis: EvidenceBasis
+
+    public init(
+        kind: OrganismPredictionKind,
+        successLikelihood: Double,
+        uncertainty: Double,
+        evidenceCount: Int,
+        resolvedEvidenceCount: Int,
+        expiredEvidenceCount: Int,
+        freshness: Double,
+        lastEvidenceAt: Date? = nil,
+        evidenceBasis: EvidenceBasis
+    ) {
+        self.kind = kind
+        self.successLikelihood = successLikelihood.clamped01()
+        self.uncertainty = uncertainty.clamped01()
+        self.evidenceCount = max(0, evidenceCount)
+        self.resolvedEvidenceCount = max(0, resolvedEvidenceCount)
+        self.expiredEvidenceCount = max(0, expiredEvidenceCount)
+        self.freshness = freshness.clamped01()
+        self.lastEvidenceAt = lastEvidenceAt
+        self.evidenceBasis = evidenceBasis
+    }
 }
 
 /// A calibrated self-read over the predictive body. Beta smoothing prevents a
@@ -985,15 +1012,28 @@ public enum OrganismCapabilitySelfModel {
             let evidence = ledger.predictions.values.filter { $0.kind == kind }
             let resolved = evidence.filter { $0.status == .satisfied || $0.status == .violated }
             let expired = evidence.filter { $0.status == .expired }
-            let successes = resolved.filter { $0.status == .satisfied }.count
-            let failures = resolved.filter { $0.status == .violated }.count
-            let posterior = Double(successes + 1) / Double(successes + failures + 2)
-            let resolutionUncertainty = 1 / sqrt(Double(resolved.count + 1))
-            let missingEvidencePenalty = evidence.isEmpty
+            let cumulative = ledger.outcomeCountsByKind?[kind.rawValue]
+            let bodyPrior = bodyConfidence(for: kind, in: ledger.bodyConfidence)
+            let expiredCount = cumulative?.expired ?? expired.count
+            // Eight pseudo-observations preserve the pre-counter body model as
+            // a bounded prior while real per-kind outcomes take over.
+            let priorStrength = 8.0
+            let posterior = cumulative.map {
+                (Double($0.satisfied) + bodyPrior * priorStrength)
+                    / (Double($0.satisfied + $0.violated) + priorStrength)
+            } ?? bodyPrior
+            let resolvedCount = cumulative.map { $0.satisfied + $0.violated } ?? resolved.count
+            let evidenceCount = cumulative.map { $0.satisfied + $0.violated + $0.expired }
+                ?? evidence.count
+            let resolutionUncertainty = 1 / sqrt(Double(resolvedCount + 1))
+            let missingEvidencePenalty = evidenceCount == 0
                 ? 0
-                : Double(expired.count) / Double(evidence.count)
-            let uncertainty = max(resolutionUncertainty, missingEvidencePenalty)
-            let last = evidence.map(\.lastUpdatedAt).max()
+                : Double(expiredCount) / Double(evidenceCount)
+            let uncertainty = max(
+                cumulative == nil ? 0.5 : 0,
+                max(resolutionUncertainty, missingEvidencePenalty)
+            )
+            let last = cumulative?.lastEvidenceAt ?? evidence.map(\.lastUpdatedAt).max()
             let freshness = last.map {
                 OrganismAnalyticDecay(
                     valueAtAnchor: 1,
@@ -1005,12 +1045,26 @@ public enum OrganismCapabilitySelfModel {
                 kind: kind,
                 successLikelihood: (posterior).clamped01(),
                 uncertainty: (uncertainty).clamped01(),
-                evidenceCount: evidence.count,
-                resolvedEvidenceCount: resolved.count,
-                expiredEvidenceCount: expired.count,
+                evidenceCount: evidenceCount,
+                resolvedEvidenceCount: resolvedCount,
+                expiredEvidenceCount: expiredCount,
                 freshness: (freshness).clamped01(),
-                lastEvidenceAt: last
+                lastEvidenceAt: last,
+                evidenceBasis: cumulative == nil ? .legacyBodyConfidence : .cumulativeOutcomes
             )
+        }
+    }
+
+    private static func bodyConfidence(
+        for kind: OrganismPredictionKind,
+        in confidence: OrganismBodyConfidence
+    ) -> Double {
+        switch kind {
+        case .toolCompletion: confidence.toolPath
+        case .providerCompletion: confidence.providerPath
+        case .phoneDelivery: confidence.phonePath
+        case .approvalResolution: confidence.approvalPath
+        case .workflowAdvance: confidence.workflowPath
         }
     }
 }

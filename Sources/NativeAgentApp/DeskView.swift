@@ -14,11 +14,12 @@ import WorkshopExecution
 // Sectioned Desk (User, 2026-07-11: "it just shows up like her regular desk did
 // — make it into sections"). Directed executions are one lane on the Desk, so
 // this surface tells its story top-to-bottom by urgency and ownership:
-//   1. Waiting on you    — approval-blocked executions + blocked/flagged items
-//   2. In progress       — queued/running directed executions
-//   3. Her pursuits      — origin=agent self-pursuits, in her own words
-//   4. The board         — User/system items, family-grouped as before
-//   5. Recently finished — terminal items + recent terminal executions
+//   1. Live Activity     — recent `.now` ops only; absent when quiet
+//   2. Waiting on you    — approval-blocked executions + blocked/flagged items
+//   3. In progress       — delegation families + directed executions
+//   4. Her pursuits      — origin=agent self-pursuits, in her own words
+//   5. The board         — User/system items, family-grouped as before
+//   6. Recently finished — terminal items + recent terminal executions
 
 /// A lane's read outcome — the honesty primitive this surface borrows from
 /// `WorkshopReceiptsState` (WorkshopObservatoryPanel.swift:237). `.rows([])`
@@ -116,12 +117,17 @@ enum DeskExecutionInProgressCount: Equatable, Sendable {
 
     init(
         executionsLane: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>,
-        renderedBenchCount: Int
+        deskItemsLane: DeskLaneState<DeskItem>? = nil,
+        renderedBenchCount: Int,
+        renderedProgramFamilyCount: Int = 0
     ) {
         if let reason = executionsLane.unavailableReason {
             self = .unavailable(reason)
+        } else if let reason = deskItemsLane?.unavailableReason {
+            self = .unavailable(reason)
         } else {
-            self = .measured(max(0, renderedBenchCount))
+            self = .measured(
+                max(0, renderedBenchCount) + max(0, renderedProgramFamilyCount))
         }
     }
 
@@ -563,12 +569,32 @@ struct DeskGitHubPortfolioStrip {
             renderedItems: renderedItems
         )
     }
+
+    /// The top-level section count follows the same rendered/eligible slices
+    /// as the rows and portfolio pills. In particular, capped resolved history
+    /// contributes only its visible cap, never the hidden global total.
+    static func headerCount(items: [GitHubCommandItem]) -> Int? {
+        let count = DeskGitHubBucket.allCases.reduce(into: 0) { result, bucket in
+            result += presentation(for: bucket, items: items).renderedCount
+        }
+        return count > 0 ? count : nil
+    }
 }
 
 struct DeskView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var items: [DeskItem] = []
+    /// The same successful/unavailable Desk read expressed through the shared
+    /// lane-honesty primitive. Existing board rows remain retained on a failed
+    /// refresh, while freshness-sensitive Live Activity and program families
+    /// fail closed instead of presenting retained rows as current.
+    @State private var deskItemsLane: DeskLaneState<DeskItem> = .rows([])
+    @State private var deskGeneratedTs: String?
+    /// Updated only by the existing event/deadline reloader. This gives the
+    /// pure freshness projection an explicit clock without adding a SwiftUI
+    /// polling timeline.
+    @State private var deskPresentationNow = Date()
     // One listAll() scan, sliced client-side — the runner's listActive/
     // listHistory whitelists would make an unknown/corrupt status (e.g. a
     // future "retrying") vanish from BOTH sections. Nothing on this surface
@@ -651,7 +677,9 @@ struct DeskView: View {
         DeskGitHubNeedsUserCount(githubLane: githubLane)
     }
     private var laneUnavailable: Bool {
-        executionsLane.unavailableReason != nil || githubLane.unavailableReason != nil
+        deskItemsLane.unavailableReason != nil
+            || executionsLane.unavailableReason != nil
+            || githubLane.unavailableReason != nil
     }
 
     private var dataRoot: URL { PersistenceCore.defaultDataRoot() }
@@ -723,7 +751,20 @@ struct DeskView: View {
     private var inProgressExecutionCount: DeskExecutionInProgressCount {
         DeskExecutionInProgressCount(
             executionsLane: executionsLane,
-            renderedBenchCount: benchExecutions.count)
+            deskItemsLane: deskItemsLane,
+            renderedBenchCount: benchExecutions.count,
+            renderedProgramFamilyCount: programFamilies.count)
+    }
+
+    private var liveActivity: DeskLiveActivityPresentation.State {
+        DeskLiveActivityPresentation.make(
+            deskItems: deskItemsLane,
+            generatedTs: deskGeneratedTs,
+            now: deskPresentationNow)
+    }
+
+    private var programFamilies: [DeskProgramFamilyPresentation.Family] {
+        DeskProgramFamilyPresentation.families(from: deskItemsLane)
     }
 
     private var approvalExecutions: [WorkshopExecution.WorkshopExecutionRecord] {
@@ -762,11 +803,14 @@ struct DeskView: View {
             ToolbarItem(placement: .primaryAction) {
                 Button { showingPalette = true } label: { Image(systemName: "command") }
                     .help("Find or act on a desk item (\u{2318}K)")
+                    .accessibilityLabel("Find or act on a Desk item")
+                    .accessibilityHint("Opens Desk commands and search")
                     .keyboardShortcut("k", modifiers: .command)
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { Task { await refreshFromToolbar() } } label: { Image(systemName: "arrow.clockwise") }
                     .help("Refresh the desk")
+                    .accessibilityLabel("Refresh Desk")
             }
         }
         .sheet(isPresented: $showingPalette) {
@@ -829,6 +873,7 @@ struct DeskView: View {
                 case .clear:
                     emptyState
                 case .populated:
+                    liveActivitySection
                     countersStrip
                     attentionSection
                     githubCommandSection
@@ -1043,6 +1088,7 @@ struct DeskView: View {
                         .help("Add a note (n)")
                     Button { clearInteraction() } label: { Image(systemName: "xmark") }
                         .help("Clear the selection (esc)")
+                        .accessibilityLabel("Clear Desk selection")
                 }
                 .disabled(actionFlight.isInFlight)
                 if showingDeferOptions { deferOptionsRow(item) }
@@ -1132,6 +1178,7 @@ struct DeskView: View {
                 Spacer(minLength: 0)
                 Button { actionNotice = nil } label: { Image(systemName: "xmark") }
                     .buttonStyle(.naFeel).foregroundStyle(.tertiary)
+                    .accessibilityLabel(notice.isError ? "Dismiss Desk error" : "Dismiss Desk confirmation")
             }
             .padding(10)
             .background(
@@ -1290,7 +1337,7 @@ struct DeskView: View {
     /// the motor timestamp is a GitHubCommandItem field, not this type's).
     private func ageDays(_ item: DeskItem) -> Int? {
         guard let date = Self.parseISO(item.updatedAt) else { return nil }
-        return Int(Date().timeIntervalSince(date) / 86_400)
+        return Int(deskPresentationNow.timeIntervalSince(date) / 86_400)
     }
 
     /// Rot = WATCH items untouched past the threshold, minus blocked/flagged
@@ -1303,6 +1350,95 @@ struct DeskView: View {
         watchItems.filter {
             $0.status != .blocked && $0.status != .flag
                 && (ageDays($0) ?? 0) >= Self.staleThresholdDays
+        }
+    }
+
+    // MARK: Live Activity — present only while real Desk ops are recent
+
+    @ViewBuilder
+    private var liveActivitySection: some View {
+        switch liveActivity {
+        case .quiet:
+            // Quiet is intentionally zero-height: no idle badge, empty card,
+            // or "nothing happening" theater at the top of the Desk.
+            EmptyView()
+        case .unavailable(let notice):
+            sectionHeader("Live Activity", systemImage: "waveform.path.ecg")
+            laneUnavailableNotice(title: notice.title, detail: notice.detail)
+        case .rows(let content):
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "waveform.path.ecg")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.blue)
+                    Text(DeskSectionHeaderPresentation.label(
+                        "Live Activity", count: content.eligibleRowCount))
+                        .font(.headline)
+                    Spacer(minLength: 8)
+                    if content.isStale {
+                        Label(content.asOfText, systemImage: "clock.badge.exclamationmark")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.12), in: Capsule())
+                    } else {
+                        Text(content.asOfText)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                ForEach(content.rows) { row in
+                    liveActivityRow(row)
+                }
+
+                if content.overflowCount > 0 {
+                    Text("+\(content.overflowCount) more")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 30)
+                }
+            }
+            .padding(12)
+            .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+            .accessibilityElement(children: .contain)
+        }
+    }
+
+    private func liveActivityRow(_ row: DeskLiveActivityPresentation.Row) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: row.assigneeSymbol)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.blue)
+                .frame(width: 20, height: 20)
+                .help(row.assignee)
+                .accessibilityLabel("Assigned to \(row.assignee)")
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(row.summary)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(2)
+                    Spacer(minLength: 8)
+                    Text(row.lastUpdateText)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                if let progress = row.progress {
+                    HStack(spacing: 8) {
+                        ProgressView(value: Double(progress.done), total: Double(progress.total))
+                            .progressViewStyle(.linear)
+                        Text("\(progress.done)/\(progress.total)")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        if let note = progress.note {
+                            Text(note)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.tail)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1321,12 +1457,16 @@ struct DeskView: View {
         }
     }
 
+    @ViewBuilder
     private func triageCounter(_ label: String, count: Int?, tint: Color?,
                                symbol: String, target: String,
                                unavailableReason: String? = nil) -> some View {
         let active = (count ?? 0) > 0
         let accent = active ? (tint ?? .primary) : Color.secondary
-        return VStack(alignment: .leading, spacing: 2) {
+        let accessibilityText = count.map { "\(label): \($0)" }
+            ?? unavailableReason.map { "\(label) count unavailable: \($0)" }
+            ?? "\(label): count unavailable"
+        let counter = VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 5) {
                 Image(systemName: symbol).font(.caption2)
                 Text(label).font(.caption)
@@ -1347,9 +1487,21 @@ struct DeskView: View {
             in: RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
         .naInteractive(radius: 8)
-        .onTapGesture { if active { scrollTarget = target } }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(label): \(count)")
+        .accessibilityLabel(accessibilityText)
+
+        if active {
+            Button {
+                scrollTarget = target
+            } label: {
+                counter
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(accessibilityText)
+            .accessibilityHint("Moves to the matching Desk items")
+        } else {
+            counter
+        }
     }
 
     /// C6: User's nag switch, in the UI. It shipped controllable ONLY through the
@@ -1365,6 +1517,9 @@ struct DeskView: View {
         }
         .buttonStyle(.naFeel)
         .help("Nagging — what pings you, and when")
+        .accessibilityLabel("Nag settings")
+        .accessibilityValue(nagAccessibilityValue)
+        .accessibilityHint("Shows what can ping you and when")
         .popover(isPresented: $showingNagsPanel, arrowEdge: .bottom) {
             DeskNagsPanel(
                 items: items,
@@ -1380,12 +1535,17 @@ struct DeskView: View {
         DeskItemPresentation.nagBellSymbol(config: nagConfig, now: Date())
     }
 
+    private var nagAccessibilityValue: String {
+        if nagConfig.isMuted(now: Date()) { return "Muted" }
+        return nagConfig.enabled ? "On" : "Off"
+    }
+
     private func sectionHeader(_ title: String, count: Int? = nil, systemImage: String) -> some View {
         HStack(spacing: 6) {
             Image(systemName: systemImage)
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
-            Text(count.map { "\(title)  ·  \($0)" } ?? title)
+            Text(DeskSectionHeaderPresentation.label(title, count: count))
                 .font(.headline).foregroundStyle(.secondary)
         }
         .padding(.top, 4)
@@ -1524,7 +1684,10 @@ struct DeskView: View {
         // Always visible (User, 2026-07-12: "this is just my window into
         // checking on what she's got with human eyes") — a monitoring surface
         // that hides itself when quiet reads as missing, not as quiet.
-        sectionHeader("GitHub Watcher", systemImage: "eye")
+        sectionHeader(
+            "GitHub Watcher",
+            count: DeskGitHubPortfolioStrip.headerCount(items: githubItems),
+            systemImage: "eye")
         switch DeskHonestyPresentation.githubLane(githubLane) {
         case .unavailable(let notice):
             laneUnavailableNotice(title: notice.title, detail: notice.detail)
@@ -1665,30 +1828,21 @@ struct DeskView: View {
     private func ghStatePill(_ item: GitHubCommandItem) -> some View {
         let pill = DeskGitHubStatePillPresentation.pill(for: item)
         return Text(pill.label)
-            .capsuleTag(ghStatePillColor(pill.tone))
+            .capsuleTag(statusColor(pill.tone))
     }
 
-    private func ghStatePillColor(_ tone: DeskGitHubStatePillPresentation.Tone) -> Color {
-        switch tone {
-        case .warning: return .orange
-        case .working: return .blue
-        case .checking: return .teal
-        case .neutral: return .gray
-        case .failure: return .red
-        case .success: return .green
-        }
-    }
-
-    // MARK: section 2 — in progress (directed execution engine)
+    // MARK: section 2 — in progress (delegation programs + directed execution)
 
     @ViewBuilder
     private var benchSection: some View {
-        sectionHeader("In progress", count: benchExecutions.isEmpty ? nil : benchExecutions.count,
+        let renderedCount = programFamilies.count + benchExecutions.count
+        sectionHeader("In progress", count: renderedCount == 0 ? nil : renderedCount,
                       systemImage: "hammer")
             .id("sec-bench")
-        switch DeskHonestyPresentation.executionLane(
-            executionsLane,
-            hasRenderedBenchRows: !benchExecutions.isEmpty
+        switch DeskHonestyPresentation.inProgressLane(
+            executions: executionsLane,
+            deskItems: deskItemsLane,
+            hasRenderedRows: renderedCount > 0
         ) {
         case .unavailable(let notice):
             laneUnavailableNotice(title: notice.title, detail: notice.detail)
@@ -1697,8 +1851,73 @@ struct DeskView: View {
                 .font(.callout).foregroundStyle(.tertiary)
                 .padding(.leading, 4)
         case .rows:
+            ForEach(programFamilies) { family in
+                programFamilyView(family)
+            }
             ForEach(benchExecutions, id: \.id) { executionRow($0) }
         }
+    }
+
+    /// Delegation families are intentionally glance-only. `laneOf` selects
+    /// these rows for presentation but creates no Desk selection, mutation,
+    /// sequencing, archive, or expansion relationship.
+    private func programFamilyView(_ family: DeskProgramFamilyPresentation.Family) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "square.stack.3d.up")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(family.parentTitle)
+                        .font(.body.weight(.semibold))
+                        .lineLimit(1)
+                    if family.parentSummary != family.parentTitle {
+                        Text(family.parentSummary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2).truncationMode(.tail)
+                    }
+                }
+                Spacer(minLength: 8)
+                Text("\(family.lanes.count) lane\(family.lanes.count == 1 ? "" : "s")")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.primary.opacity(0.06), in: Capsule())
+            }
+
+            ForEach(family.lanes) { lane in
+                programLaneRow(lane)
+            }
+        }
+        .padding(.vertical, 9).padding(.horizontal, 10)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func programLaneRow(_ lane: DeskProgramFamilyPresentation.Lane) -> some View {
+        HStack(spacing: 7) {
+            Label(lane.assignee, systemImage: lane.assigneeSymbol)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Circle()
+                .fill(statusColor(DeskStatusTonePresentation.tone(for: lane.status)))
+                .frame(width: 7, height: 7)
+                .accessibilityLabel(DeskItemPresentation.statusLabel(lane.status))
+            Text(lane.title)
+                .font(.callout)
+                .lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 8)
+            if let progress = lane.progress {
+                ProgressView(value: Double(progress.done), total: Double(progress.total))
+                    .progressViewStyle(.linear)
+                    .frame(width: 72)
+                Text("\(progress.done)/\(progress.total)")
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.leading, 18)
     }
 
     private func executionRow(_ exec: WorkshopExecution.WorkshopExecutionRecord) -> some View {
@@ -1752,15 +1971,8 @@ struct DeskView: View {
 
     private func executionPill(_ status: String) -> some View {
         let pill = DeskExecutionPresentation.pill(for: status)
-        let color: Color = switch pill.tone {
-        case .info: .blue
-        case .warning: .orange
-        case .success: .green
-        case .danger: .red
-        case .neutral: .gray
-        }
         return Text(pill.label)
-            .capsuleTag(color)
+            .capsuleTag(statusColor(pill.tone))
     }
 
     // MARK: section 3 — her pursuits (volition surface, in her own words)
@@ -2227,17 +2439,16 @@ struct DeskView: View {
 
     private func statusPill(_ status: DeskStatus) -> some View {
         Text(DeskItemPresentation.statusLabel(status))
-            .capsuleTag(statusColor(status))
+            .capsuleTag(statusColor(DeskStatusTonePresentation.tone(for: status)))
     }
 
-    private func statusColor(_ status: DeskStatus) -> Color {
-        switch status {
-        case .now: .blue
-        case .next: .teal
-        case .blocked: .red
-        case .flag: .orange
-        case .done: .green
-        case .todo, .watch, .canceled: .gray
+    private func statusColor(_ tone: DeskPresentationTone) -> Color {
+        switch tone {
+        case .info: .blue
+        case .warning: .orange
+        case .success: .green
+        case .danger: .red
+        case .neutral: .gray
         }
     }
 
@@ -2250,7 +2461,7 @@ struct DeskView: View {
     /// the status pill's job.
     @ViewBuilder
     private func freshnessText(_ item: DeskItem) -> some View {
-        let freshness = DeskItemPresentation.freshness(for: item, now: Date())
+        let freshness = DeskItemPresentation.freshness(for: item, now: deskPresentationNow)
         if freshness.isStale {
             Text(freshness.text)
                 .font(.caption2.weight(.semibold))
@@ -2264,14 +2475,7 @@ struct DeskView: View {
     }
 
     private func relativeTime(_ iso: String) -> String {
-        guard let date = Self.parseISO(iso) else { return "unknown" }
-        let seconds = max(0, Date().timeIntervalSince(date))
-        switch seconds {
-        case ..<90: return "just now"
-        case ..<3600: return "\(Int(seconds / 60))m ago"
-        case ..<86_400: return "\(Int(seconds / 3600))h ago"
-        default: return "\(Int(seconds / 86_400))d ago"
-        }
+        DeskRelativeTimePresentation.text(forISO: iso, now: deskPresentationNow)
     }
 
     private static func parseISO(_ raw: String) -> Date? {
@@ -2289,6 +2493,7 @@ struct DeskView: View {
         // publishes nothing at all — not its items, not its lanes, not its
         // error — because a partial publish is the same stomp in slow motion.
         let token = loadGate.begin()
+        DeskLiveReloader.shared.traceEvent("load begin token=\(token)")
         let snapshot = await Task.detached(priority: .userInitiated) {
             let deskState: DeskState?
             let deskError: String?
@@ -2327,9 +2532,14 @@ struct DeskView: View {
                 aliasByHandle: aliases
             )
         }.value
+        DeskLiveReloader.shared.traceEvent("load snapshot done token=\(token) cancelled=\(Task.isCancelled) accepts=\(loadGate.accepts(token))")
         guard !Task.isCancelled, loadGate.accepts(token) else { return false }
+        let presentationNow = Date()
+        deskPresentationNow = presentationNow
         if let state = snapshot.deskState {
             items = state.items
+            deskItemsLane = .rows(state.items)
+            deskGeneratedTs = state.generatedTs
             // Plan and alias map are replaced ATOMICALLY with the items they
             // describe — a stale plan against fresh items would name blockers
             // that no longer exist.
@@ -2338,6 +2548,9 @@ struct DeskView: View {
             loadError = nil
         } else {
             loadError = snapshot.deskError
+            deskItemsLane = .unavailable(DeskLaneState<DeskItem>.boundedReason(
+                snapshot.deskError ?? "The Desk feed could not be read."))
+            deskGeneratedTs = nil
         }
         executionsLane = snapshot.executions
         githubLane = snapshot.githubItems
@@ -2345,6 +2558,14 @@ struct DeskView: View {
         // failed still "reported" (the error banner owns the surface), and the
         // empty-state gate already excludes loadError/lane-unavailable.
         hasLoadedOnce = true
+        // One exact semantic deadline through the existing reloader: either
+        // the generated snapshot crosses five minutes or the oldest relevant
+        // active row crosses thirty. This is not a polling cadence.
+        let activity = DeskLiveActivityPresentation.make(
+            deskItems: deskItemsLane,
+            generatedTs: deskGeneratedTs,
+            now: presentationNow)
+        DeskLiveReloader.shared.scheduleRefresh(at: activity.nextRefreshAt)
         return true
     }
 

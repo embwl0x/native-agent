@@ -199,11 +199,11 @@ public enum ProviderPathBeliefProjector {
     public static func project(
         evidence: [ProviderPathEvidence],
         now: Date,
-        halfLife: TimeInterval = 30 * 60,
+        halfLife: TimeInterval = 2 * 60 * 60,
         staleAfter: TimeInterval = 6 * 60 * 60,
         maximumEvidence: Int = 32
     ) -> ProviderPathBeliefProjection {
-        let boundedHalfLife = halfLife.isFinite ? max(1, halfLife) : 30 * 60
+        let boundedHalfLife = halfLife.isFinite ? max(1, halfLife) : 2 * 60 * 60
         let boundedStaleAfter = staleAfter.isFinite
             ? max(boundedHalfLife, staleAfter)
             : 6 * 60 * 60

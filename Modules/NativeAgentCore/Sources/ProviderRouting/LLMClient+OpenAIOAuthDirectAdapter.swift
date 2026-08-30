@@ -413,6 +413,7 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         } catch {
                             throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
                         }
+                        defer { bytes.task.cancel() }
                         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                         if status == 401 {
                             if attempt == 0 {

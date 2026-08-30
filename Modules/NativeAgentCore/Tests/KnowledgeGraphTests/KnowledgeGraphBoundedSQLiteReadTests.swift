@@ -144,6 +144,66 @@ struct KnowledgeGraphBoundedSQLiteReadTests {
         #expect(first["id"] == .string("zzzz-exact"))
     }
 
+    /// gpt-5.5 review HIGH (2026-08-28): the SQL prefilter's recency ordering
+    /// runs BEFORE the candidate LIMIT, so a future-dated or malformed
+    /// `last_seen` must not be allowed to rank as "freshest" — it would evict
+    /// valid rows from the window entirely, and the Swift reranker would never
+    /// get the chance to score them 0. Stage 1 must enforce the same invariant
+    /// stage 2 does.
+    ///
+    /// Every row here matches in the SAME class (needle in the summary, never
+    /// the name), so the match-class bucket is constant and the recency term is
+    /// the only thing deciding who survives the cap.
+    @Test("future and malformed last_seen cannot evict a valid row before the LIMIT")
+    func clampedRecencyOrderingProtectsValidRowsAtTheCandidateCap() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let now = ISO8601DateFormatter().date(from: "2026-08-28T00:00:00Z")!
+        try await f.pool.write { db in
+            // Exactly enough junk to fill the whole candidate window on its own.
+            for index in 0..<KnowledgeGraphStore.sqliteSearchCandidateLimit {
+                // Half far-future timestamps, half unparseable text — both sort
+                // ABOVE any real ISO date under a raw `last_seen DESC`.
+                let lastSeen = index.isMultiple(of: 2)
+                    ? "2099-01-01T00:00:00Z"
+                    : "not a date at all"
+                try db.execute(sql: """
+                    INSERT INTO kg_entities
+                      (id, name, type, summary, aliases_json, mention_count,
+                       first_seen, last_seen, provenance, metadata_json)
+                    VALUES (?, 'Common', 'concept', 'Needle appears weakly here',
+                            '[]', 1, NULL, ?, 'test', NULL)
+                    """, arguments: [String(format: "junk-%04d", index), lastSeen])
+            }
+            // One honest, genuinely recent row — same match class as the junk.
+            try db.execute(sql: """
+                INSERT INTO kg_entities
+                  (id, name, type, summary, aliases_json, mention_count,
+                   first_seen, last_seen, provenance, metadata_json)
+                VALUES ('zzzz-valid', 'Common', 'concept', 'Needle appears weakly here',
+                        '[]', 1, NULL, '2026-08-27T00:00:00Z', 'test', NULL)
+                """)
+        }
+
+        let envelope = try await KnowledgeGraphStore.searchFromMemoryV2(
+            memoryDir: f.directory, jsonImportPath: nil, query: "Needle", now: now
+        )
+        guard case .object(let object) = envelope,
+              case .array(let results)? = object["results"] else {
+            Issue.record("search envelope malformed")
+            return
+        }
+        let ids = results.compactMap { value -> String? in
+            guard case .object(let o) = value,
+                  case .string(let id)? = o["id"] else { return nil }
+            return id
+        }
+        // Survived the cap despite being outnumbered by the entire window...
+        #expect(ids.contains("zzzz-valid"))
+        // ...and ranks first, because it is the only row with a usable date.
+        #expect(ids.first == "zzzz-valid")
+    }
+
     @Test("oversized search is refused before SQL construction")
     func oversizedSearchIsRefused() async throws {
         let f = try fixture()

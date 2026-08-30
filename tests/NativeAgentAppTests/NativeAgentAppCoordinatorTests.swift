@@ -7,7 +7,7 @@ import Testing
 struct NativeAgentAppCoordinatorTests {
     @Test("process services bootstrap once when configured before launch")
     func processServicesBootstrapOnceConfiguredBeforeLaunch() {
-        let calls = CallCounter(size: 5)
+        let calls = CallCounter(size: 4)
         let coordinator = makeCoordinator()
         coordinator.configureProcessBootstrap(dependencies(calls: calls))
 
@@ -15,19 +15,19 @@ struct NativeAgentAppCoordinatorTests {
         coordinator.applicationDidFinishLaunching()
         coordinator.configureProcessBootstrap(dependencies(calls: calls))
 
-        #expect(calls.values == Array(repeating: 1, count: 5))
+        #expect(calls.values == Array(repeating: 1, count: 4))
     }
 
     @Test("process services bootstrap once when launch arrives before injection")
     func processServicesBootstrapOnceConfiguredAfterLaunch() {
-        let calls = CallCounter(size: 5)
+        let calls = CallCounter(size: 4)
         let coordinator = makeCoordinator()
 
         coordinator.applicationDidFinishLaunching()
         coordinator.configureProcessBootstrap(dependencies(calls: calls))
         coordinator.configureProcessBootstrap(dependencies(calls: calls))
 
-        #expect(calls.values == Array(repeating: 1, count: 5))
+        #expect(calls.values == Array(repeating: 1, count: 4))
     }
 
     @Test("routes queued before mount are delivered once in order")
@@ -232,8 +232,7 @@ struct NativeAgentAppCoordinatorTests {
             restoreDetachedChats: { calls.increment(0) },
             startPermissionSync: { calls.increment(1) },
             wireGlobalHotkey: { calls.increment(2) },
-            warmEmbeddings: { calls.increment(3) },
-            runInitialDoctor: { calls.increment(4) }
+            warmEmbeddings: { calls.increment(3) }
         )
     }
 

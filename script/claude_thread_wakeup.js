@@ -64,17 +64,20 @@ const KILL_GRACE_MS = 2000;
 // run and lands only at completion. A watchdog keyed on it fires on every
 // healthy job.
 //
-// So progress is measured from evidence the child itself cannot fake while
-// wedged: CPU time accumulated across its process tree. A blocked/hung process
-// burns no CPU; a thinking or tool-running session always does.
+// So progress is measured from Claude's canonical session transcript. Every
+// model/tool movement is appended there even when the runner is blocked on a
+// network or MCP call and burns no measurable CPU. CPU is deliberately NOT a
+// liveness signal: two healthy production wakes (EB8CAE49 and 9F7A24F3) were
+// killed while their transcripts advanced because their short-lived workers
+// fell between `ps` samples.
 //
 // WHY 600s and not 180s: a legitimately quiet stretch is longer than it looks.
 // One long model response, or a nested worker dispatch (gpt-5.5 reviews run
 // ~5 min), sits near 0% CPU blocked on a socket read the whole time. 180s has
 // NEGATIVE margin against known-good behavior and would reproduce the exact
 // failure this watchdog exists to prevent. 600s keeps ~2x margin over the
-// worst observed legitimate quiet period while still killing a wedged job 6x
-// faster than the ceiling.
+// worst observed legitimate quiet period while still killing a transcript-
+// silent job 6x faster than the ceiling.
 const DEFAULT_STALL_SECONDS = 600;
 const STALL_SAMPLE_MS = 15_000;
 const STDOUT_CAP = 512 * 1024;
@@ -254,7 +257,7 @@ function pidAlive(pid) {
     process.kill(value, 0);
     return true;
   } catch (error) {
-    return Boolean(error && error.code === "EPERM");
+    return !error || error.code !== "ESRCH";
   }
 }
 
@@ -389,6 +392,9 @@ async function acquireTopicLock(slug, waitMs, ownerMeta) {
       // queued wake. Under load this tiny release/acquire window used to turn
       // an honestly serialized second wake into rejected_topic_busy.
       if (!inspectedLock || !fs.existsSync(lockDir)) continue;
+      if (ownerMeta && ownerMeta.recoveryOnly) {
+        return { acquired: false, lockDir, reason: "lock_busy", inFlight: owner, waitedMs: Date.now() - startedMs, release() {} };
+      }
       // Queue behind a live owner: wait out its advertised deadline + margin.
       // No advertised deadline (pre-metadata lock) -> the base wait applies.
       let deadline = baseDeadline;
@@ -459,15 +465,10 @@ function ownsClaim(jobPath, claimId) {
 /// takeover is conceivable; omit it only for writes by the claimant before it
 /// hands off, or for settled-job bookkeeping (replay).
 ///
-/// There is a small TOCTOU window between the claimId read and the atomic
-/// rename. It is ACCEPTABLE because takeover requires that every recorded
-/// owner pid be provably dead (ESRCH), and the one takeover path with no pid
-/// to check (an unreadable job) is guarded by a claim-write grace on the
-/// file's mtime — so a live writer cannot be dispossessed while it is
-/// running. The CAS exists to fence the writer that came back from the dead
-/// (Mac sleep, SIGSTOP'd process resumed, pid reuse), and for that a
-/// read-verify immediately before each externally-visible act is exactly the
-/// guarantee we need.
+/// Recovery may replace only a durably unstarted claim whose recorded owners
+/// are dead, under the existing topic lock. Running/unreadable claims are not
+/// takeover targets. A failed durable write returns null; callers must not
+/// start effects merely because an in-memory merged record was constructed.
 function updateJob(jobPath, patch, claimId) {
   let record = null;
   try {
@@ -477,7 +478,7 @@ function updateJob(jobPath, patch, claimId) {
     if (!record || record.claimId !== claimId) return null;
   }
   const merged = { ...(record || {}), ...patch, updatedAt: nowISO() };
-  try { writeJSONAtomic(jobPath, merged); } catch {}
+  try { writeJSONAtomic(jobPath, merged); } catch { return null; }
   return merged;
 }
 
@@ -512,10 +513,9 @@ function recordOrphanedClaim({ jobPath, claimId, payload, stage }) {
   };
 }
 
-/// Liveness beacon. The job file is the dedup marker AND the recovery handle,
-/// so a runner that dies must be *detectably* dead: pid + a heartbeat that a
-/// live runner keeps refreshing. Without this, a crash/sleep between
-/// state:"running" and settle poisons the messageId forever.
+/// Liveness beacon. The job file is the dedup marker AND the recovery handle.
+/// A dead runner is observable, but that observation alone never proves that
+/// its effects are safe to repeat.
 function startHeartbeat(jobPath, claimId) {
   if (!jobPath) return { stop() {}, lost() { return false; } };
   const intervalMs = Math.max(250, envNumber("NATIVE_AGENT_CLAUDE_WAKE_HEARTBEAT_MS", DEFAULT_HEARTBEAT_MS));
@@ -557,7 +557,7 @@ function jobHeartbeatAgeMs(job) {
 }
 
 function renameJobAside(jobPath) {
-  const stale = `${jobPath}.stale-${Math.floor(Date.now() / 1000)}`;
+  const stale = `${jobPath}.stale-${crypto.randomUUID()}`;
   try {
     fs.renameSync(jobPath, stale);
     return stale;
@@ -727,16 +727,18 @@ function deliveryMarker(messageId) {
 /// answered by that store — never by whether the HTTP response came back in
 /// time. Returns "present" | "absent" | "unreadable"; "absent" is only
 /// meaningful because the store file itself was readable.
-function confirmDeliveryViaSessionStore(sessionId, messageId) {
+function confirmDeliveryViaSessionStore(sessionId, messageId, expectedCompletionText) {
   const id = String(sessionId || "");
   if (!id || !messageId || !/^[A-Za-z0-9._:-]+$/.test(id)) return "unreadable";
+  const marker = deliveryMarker(messageId);
+  if (typeof expectedCompletionText !== "string" || !expectedCompletionText.includes("[claude-wake]")
+      || !expectedCompletionText.includes(marker)) return "unreadable";
   let content;
   try {
     content = fs.readFileSync(path.join(messageStoreDir(), `${id}.jsonl`), "utf8");
   } catch {
     return "unreadable";
   }
-  const marker = deliveryMarker(messageId);
   let sawMalformedLine = false;
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;
@@ -744,12 +746,11 @@ function confirmDeliveryViaSessionStore(sessionId, messageId) {
     try { row = JSON.parse(line); } catch { sawMalformedLine = true; continue; }
     if (!line.includes(marker)) continue;
     const text = row && typeof row.content === "string" ? row.content : "";
-    // The marker must sit inside a real completion row — "[claude-wake]" and
-    // the marker in the same row's content — so a stray quotation of the
-    // phrase elsewhere in the transcript cannot confirm an undelivered
-    // completion. (A row QUOTING our full completion still counts, correctly:
-    // she cannot quote what she never received.)
-    if (text.includes("[claude-wake]") && text.includes(marker)) return "present";
+    // One admitted message can first receive a topic-busy rejection and later
+    // complete on an explicit same-ID retry. The shared marker is not proof
+    // THIS result landed. Compare the retained result verbatim, accepting the
+    // exact prefix added by ClaudeBridge.handleMessage (and legacy raw rows).
+    if (text === expectedCompletionText || text === `[from: claude, via bridge] ${expectedCompletionText}`) return "present";
   }
   // A malformed line means the store was mid-write (or damaged) when we read
   // it — the missing row could BE the truncated one. "Absent" must mean the
@@ -769,10 +770,16 @@ function formatPrompt(payload, jobPath) {
   if (payload.queuedAt) lines.push(`Queued at: ${payload.queuedAt}`);
   if (payload.inboxPath) lines.push(`Durable inbox: ${payload.inboxPath}`);
   lines.push("", "--- message from Agent ---", String(payload.text || ""), "--- end message ---", "");
+  if (payload.pairReviewer === true) {
+    lines.push(
+      "PAIRED REVIEW: At the start of this implementation task, pair exactly one reviewer through Claude's normal reviewer/subagent facility. You remain the builder and owner. Once commit authority is available, finish the coherent change and commit it before review, then send that reviewer the exact committed SHA to inspect. Findings return to you; fix valid findings yourself, commit the fixes, and have the same reviewer inspect the resulting SHA before you report the final candidate. This one persistent reviewer is the review contract for this task: do not create reviewer waves, and do not hand implementation to the reviewer.",
+      ""
+    );
+  }
   lines.push(
     "Do the work in this session. There is no human in this loop, so do not block waiting for input mid-task. If you genuinely need a decision or answer from Agent, END your turn with that question as your final message — it reaches her as the completion event, and her reply RESUMES this same session with full context. Ask-and-end is the supported pattern; idle waiting is not.",
-    "You are the FULL Claude (User's directive, 2026-07-25): your standard operating doctrine applies here exactly as in User's own sessions — orchestrate, dispatch swarm workers for build-sized tasks, put every implementation diff through gpt-5.5 review, verify before you assert. The sonnet-swarm and gpt-swarm MCPs are available.",
-    "LIVENESS (2026-08-22): this session is supervised by a stall watchdog that measures your process tree's CPU. Dispatch swarm workers with the *_dispatch_async variants and poll them every 1–3 minutes (each poll is observable activity); never sit in one synchronous tool call for more than a few minutes, and never end a turn idle-waiting. Wake 7FAB386B was killed mid-build for exactly this.",
+    "Follow the current delegated brief and applicable current AGENTS.md instructions. The latest user-requested scope and workflow govern this work; this bridge adds no authority to create extra workers, reviewer waves, model overrides, publication, or follow-up tasks. Use delegation or review when the current brief or applicable instructions authorize it, preserving any explicitly requested worker count and model. You own the result and integration of any authorized subagent work; report evidence, remaining blockers, and uncertain effects honestly.",
+    "LIVENESS: this session is supervised by a stall watchdog that reads Claude's canonical session transcript. Normal model, tool, and MCP progress is visible without busywork. If you genuinely need Agent, end with the question; do not idle-wait inside the turn.",
     "COMMIT HOLD (User's standing order, 2026-07-25): this wake session is under a commit hold. Build, test, deploy locally, and verify all you need — but do NOT `git commit` or `git push` in ANY repository while the hold stands. Your finish-all-the-way doctrine explicitly stops at the commit for wake sessions: report the verified diff (files, test results, live proofs) as your completion instead, and the pipeline's verification step commits it. The hold is released ONLY by the release file" + (jobPath ? ` at ${path.join(path.dirname(path.dirname(jobPath)), "wake-releases", path.basename(jobPath))}` : " (your job record's filename under the sibling wake-releases/ directory)") + " — check that it EXISTS immediately before any commit; if it is absent the hold stands (the job record's own hold fields are informational mirrors, not authority). If your work is verified and you believe it should ship, END your turn saying exactly that — release is User's, Agent's, or the interactive Claude's call, never this session's.",
     "Your FINAL message is what crosses back to Agent as the completion receipt — always end with a real answer, including when the task failed or needed no changes. A completed session with an empty reply is a failure, not evidence."
   );
@@ -798,6 +805,10 @@ function formatCompletionForAgent(result, payload) {
     lines.push(
       "Claude's session exited cleanly (exit 0) but produced NO output. There is no reply to relay — treat this as a failed wake, not as a silent success."
     );
+  } else if (result.reason === "continuation_unavailable") {
+    lines.push("The explicitly requested conversation could not be resumed. No fresh conversation was started. Inspect the original conversation pointer/transcript before explicitly choosing how to continue; this job must not be automatically rerun as new work.");
+    if (result.stderrTail) lines.push("", "stderr tail:", result.stderrTail);
+    if (result.reply) lines.push("", "partial stdout:", result.reply);
   } else if (result.reason === "rejected_topic_busy" || result.reason === "topic_lock_unavailable") {
     // Defect 3 contract: a topic collision is REJECTED loudly, by id — never
     // silently downgraded to a fresh context-free session.
@@ -813,7 +824,7 @@ function formatCompletionForAgent(result, payload) {
     lines.push(`Claude's wake FAILED: ${result.reason}`);
     if (result.stalled) {
       lines.push(
-        "The runner was killed by the STALL watchdog, not at its deadline: its process tree burned no CPU for the whole stall window, so the session was wedged rather than slow. SIGTERM then SIGKILL after 2s — its exit is CONFIRMED. Any partial stdout below is everything it produced."
+        "The runner was killed by the STALL watchdog, not at its deadline: Claude's canonical session transcript did not advance for the whole stall window. SIGTERM then SIGKILL after 2s — its exit is CONFIRMED. Any partial stdout below is everything it produced."
       );
     } else if (result.timedOut) {
       lines.push(
@@ -826,19 +837,6 @@ function formatCompletionForAgent(result, payload) {
   return lines.join("\n");
 }
 
-/// Cumulative CPU milliseconds burned by `rootPid` and every descendant.
-///
-/// This is the stall watchdog's liveness evidence. It is deliberately a
-/// WHOLE-TREE sum: `claude` spends most of a wake blocked while its children
-/// (builds, tests, dispatched workers) do the actual burning, so sampling the
-/// direct child alone would read a busy session as idle.
-///
-/// Returns null when the tree cannot be sampled at all. null means "no
-/// evidence", which is NOT the same as "no progress" — the sampler SKIPS a null
-/// sample (the stall clock neither advances nor resets on it), so an unreadable
-/// `ps` can never be the basis for a kill. Sustained unreadability therefore
-/// defers the stall verdict to the hard deadline — accepted (gpt-5.5 NIT,
-/// 2026-08-22) over the alternative of killing on missing evidence.
 /// Every pid in `rootPid`'s tree, root first. Used to kill the whole tree, not
 /// just the direct child: `claude` spawns descendants that INHERIT its stdout
 /// pipe, and a surviving descendant holds that pipe open so node's `close`
@@ -847,11 +845,6 @@ function formatCompletionForAgent(result, payload) {
 function processTreePids(rootPid) {
   const tree = walkProcessTree(rootPid);
   return tree ? tree.order : [];
-}
-
-function processTreeCpuMs(rootPid) {
-  const tree = walkProcessTree(rootPid);
-  return tree ? tree.cpuMs : null;
 }
 
 function walkProcessTree(rootPid) {
@@ -894,73 +887,49 @@ function walkProcessTree(rootPid) {
   return { cpuMs: total, order, perPid };
 }
 
-/// Per-pid CPU of the live tree, or null when `ps` could not be read.
-function processTreeCpuByPid(rootPid) {
-  const tree = walkProcessTree(rootPid);
-  return tree ? tree.perPid : null;
+/// Exact canonical transcript path for one Claude session. Claude derives its
+/// project directory by replacing non path-name characters in the absolute cwd
+/// with `-`; the explicit path override is a narrow end-to-end test seam.
+function claudeTranscriptPath(cwd, sessionId) {
+  const override = process.env.NATIVE_AGENT_CLAUDE_WAKE_TRANSCRIPT_PATH;
+  if (override) return override;
+  const safeId = path.basename(String(sessionId || ""));
+  if (!safeId || safeId !== String(sessionId || "")) return null;
+  const projectKey = path.resolve(cwd).replace(/[^A-Za-z0-9_-]/g, "-");
+  const projectsRoot = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_PROJECTS_DIR ||
+    path.join(os.homedir(), ".claude", "projects");
+  return path.join(projectsRoot, projectKey, `${safeId}.jsonl`);
 }
 
-/// MONOTONIC progress over a process tree whose members come and go.
-///
-/// The sum of CPU over the CURRENTLY LIVE tree is not monotonic: when a heavy
-/// grandchild exits (a `swift test` run worth hundreds of CPU-seconds), the sum
-/// DROPS by everything it burned, and a watchdog that ratchets a high-water
-/// mark then sees "no advance" until the survivors re-accumulate that much —
-/// which light work (edits, greps, short test filters) never does inside the
-/// stall window. That is exactly how wake 7FAB386B (2026-08-22) was killed as
-/// "stalled_after_600s" while its dispatched worker was provably busy every
-/// minute (transcript d2725762: builds and tests until the SIGKILL at 11:13Z).
-///
-/// This accumulator keeps every pid's last-seen CPU and RETIRES it into a
-/// running total when the pid disappears (or is reused with a lower count), so
-/// `total` only ever grows and "advanced" means the tree did new work since the
-/// last sample — including a brand-new pid with 0 ms so far, which is work
-/// starting. Pure and injectable: feed it Map<pid, cpuMs> samples.
-class TreeCpuProgress {
+/// Read only filesystem metadata: transcript contents can contain secrets and
+/// never belong in a liveness record. `missing` means no canonical movement has
+/// appeared; `unreadable` means the observer lacks evidence and must fail open
+/// to the hard deadline rather than kill on uncertainty.
+function transcriptSnapshot(cwd, sessionId) {
+  const file = claudeTranscriptPath(cwd, sessionId);
+  if (!file) return { state: "unreadable" };
+  try {
+    const stat = fs.statSync(file);
+    return { state: "present", path: file, bytes: stat.size, mtimeMs: stat.mtimeMs };
+  } catch (error) {
+    return error && error.code === "ENOENT"
+      ? { state: "missing", path: file }
+      : { state: "unreadable", path: file };
+  }
+}
+
+class TranscriptProgress {
   constructor() {
-    this.lastSeen = new Map();
-    this.retiredMs = 0;
-    this.lastTotal = null;
+    this.last = null;
   }
 
-  /// - Returns {total, advanced, newPids, retiredPids}; `advanced` is false
-  ///   only when nothing in the tree changed since the previous sample.
-  observe(perPid) {
-    if (!(perPid instanceof Map)) return null;
-    const newPids = [];
-    const retiredPids = [];
-    for (const [pid, prev] of this.lastSeen) {
-      const now = perPid.get(pid);
-      if (now === undefined) {
-        this.retiredMs += prev;
-        retiredPids.push(pid);
-        this.lastSeen.delete(pid);
-      } else if (now < prev) {
-        // pid reused by a new process: the old one's work is retired, the
-        // new one starts from its own count.
-        this.retiredMs += prev;
-        retiredPids.push(pid);
-        newPids.push(pid);
-        this.lastSeen.set(pid, now);
-      }
-    }
-    for (const [pid, ms] of perPid) {
-      if (!this.lastSeen.has(pid)) {
-        newPids.push(pid);
-        this.lastSeen.set(pid, ms);
-      } else {
-        this.lastSeen.set(pid, ms);
-      }
-    }
-    let live = 0;
-    for (const ms of this.lastSeen.values()) live += ms;
-    const total = this.retiredMs + live;
-    const advanced = this.lastTotal == null
-      || total > this.lastTotal
-      || newPids.length > 0
-      || retiredPids.length > 0;
-    this.lastTotal = total;
-    return { total, advanced, newPids, retiredPids };
+  observe(snapshot) {
+    if (!snapshot || snapshot.state !== "present") return null;
+    const advanced = this.last == null
+      || snapshot.bytes !== this.last.bytes
+      || snapshot.mtimeMs !== this.last.mtimeMs;
+    this.last = snapshot;
+    return { advanced, bytes: snapshot.bytes, mtimeMs: snapshot.mtimeMs };
   }
 }
 
@@ -985,7 +954,7 @@ function parseCpuTimeMs(raw) {
 /// Spawn `claude -p` and settle EXACTLY once. Four racers can finish this
 /// run — the exit handler, the deadline watchdog, the stall watchdog, and a
 /// spawn error — and any double-settle would double-post a completion to Agent.
-function runClaude({ prompt, sessionArgs, cwd, timeoutSeconds, stallSeconds, onProgress }) {
+function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallSeconds, onProgress }) {
   return new Promise((resolve) => {
     const started = Date.now();
     const binOverride = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN;
@@ -1071,41 +1040,44 @@ function runClaude({ prompt, sessionArgs, cwd, timeoutSeconds, stallSeconds, onP
     }, timeoutSeconds * 1000);
     if (timeoutTimer.unref) timeoutTimer.unref();
 
-    // Stall watchdog. Progress is CPU burned by the child's whole process tree
-    // (see processTreeCpuMs). Any advance resets the clock and is reported via
-    // onProgress so the job record carries a liveness fact distinct from the
-    // runner's own heartbeat.
+    // Stall watchdog. Progress is canonical Claude transcript movement. Any
+    // append resets the clock even when the child is blocked and burns no CPU.
     const stallMs = Number(stallSeconds) > 0 ? Number(stallSeconds) * 1000 : 0;
     if (stallMs > 0) {
-      // Progress is MONOTONIC tree CPU (see TreeCpuProgress): exited members
-      // keep the work they burned, new members count as work starting. The
-      // live-sum ratchet this replaced killed a busy wake on 2026-08-22.
-      const progress = new TreeCpuProgress();
-      const first = processTreeCpuByPid(child.pid);
-      if (first) progress.observe(first);
+      const progress = new TranscriptProgress();
+      const first = transcriptSnapshot(cwd, sessionId);
+      if (first.state === "present") progress.observe(first);
       let lastAdvanceAt = Date.now();
+      let observationReadable = first.state !== "unreadable";
       const sampleMs = Math.max(
         250,
         Math.min(envNumber("NATIVE_AGENT_CLAUDE_WAKE_STALL_SAMPLE_MS", STALL_SAMPLE_MS), stallMs)
       );
       stallTimer = setInterval(() => {
         if (settled) return;
-        const perPid = processTreeCpuByPid(child.pid);
-        // A sample we could not take is not evidence of death. Skip it and let
-        // the next one decide, rather than letting an unreadable `ps` kill a
-        // healthy job.
-        if (perPid == null) return;
-        const sample = progress.observe(perPid);
+        const snapshot = transcriptSnapshot(cwd, sessionId);
+        if (snapshot.state === "unreadable") {
+          observationReadable = false;
+          return;
+        }
+        observationReadable = true;
+        const sample = progress.observe(snapshot);
         if (sample && sample.advanced) {
           lastAdvanceAt = Date.now();
           if (typeof onProgress === "function") {
-            try { onProgress({ cpuMs: sample.total, at: new Date(lastAdvanceAt).toISOString() }); } catch {}
+            try {
+              onProgress({
+                transcriptBytes: sample.bytes,
+                transcriptMtimeMs: sample.mtimeMs,
+                at: new Date(lastAdvanceAt).toISOString(),
+              });
+            } catch {}
           }
           return;
         }
-        if (Date.now() - lastAdvanceAt >= stallMs) {
-          // If the deadline already fired, that is the true cause; a no-CPU
-          // child sitting in the 2s kill grace must not be relabelled a stall.
+        if (observationReadable && Date.now() - lastAdvanceAt >= stallMs) {
+          // If the deadline already fired, that is the true cause; a transcript-
+          // silent child in the 2s kill grace must not be relabelled a stall.
           if (timedOut) { clearInterval(stallTimer); return; }
           stalled = true;
           clearInterval(stallTimer);
@@ -1156,7 +1128,18 @@ function classify(run, timeoutSeconds, stallSeconds) {
   return { ...base, status: "completed", reason: null };
 }
 
+function missingCompletionOrigin(sessionId) {
+  if (typeof sessionId === "string" && sessionId.trim()) return null;
+  return {
+    status: "blocked", reason: "missing_origin_session", deliveryAttempted: false,
+    note: "Completion retained without posting. Identify the original Agent session and inspect this job before explicitly delivering the saved result; do not rerun the worker or guess from the current chat.",
+  };
+}
+
 function postBridgeMessage(text, sessionId) {
+  const missingOrigin = missingCompletionOrigin(sessionId);
+  if (missingOrigin) return Promise.resolve(missingOrigin);
+  sessionId = sessionId.trim();
   if (process.env.NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN === "1") {
     return Promise.resolve({
       status: "dry_run",
@@ -1306,6 +1289,14 @@ function postBridgeMessage(text, sessionId) {
 async function runWakeJob(payload, jobPath, claimId) {
   ensureDirs();
   const slug = topicSlug(payload.topic);
+  const original = readJob(jobPath);
+  if (!original || original.claimId !== claimId) return recordOrphanedClaim({ jobPath, claimId, payload, stage: "runner_start" });
+  if (!["claimed", "dispatching", "queued"].includes(original.state)) {
+    return { status: "skipped", reason: "execution_already_admitted", messageId: payload.messageId, jobPath };
+  }
+  if (!updateJob(jobPath, { state: "queued", pid: process.pid, runnerPid: process.pid }, claimId)) {
+    return recordOrphanedClaim({ jobPath, claimId, payload, stage: "queue_admission" });
+  }
   const heartbeat = startHeartbeat(jobPath, claimId);
   const timeoutSeconds = resolveTimeoutSeconds(payload);
   const stallSeconds = resolveStallSeconds(payload);
@@ -1388,6 +1379,7 @@ async function rejectWakeTopicBusy(payload, jobPath, slug, claimId, lock) {
     bridge: {
       status: bridge.status,
       reason: bridge.reason || null,
+      ...(bridge.reason === "missing_origin_session" ? { deliveryAttempted: false, note: bridge.note } : {}),
       httpStatus: bridge.httpStatus == null ? null : bridge.httpStatus,
       ackMode: bridge.ackMode || null,
     },
@@ -1404,7 +1396,7 @@ async function rejectWakeTopicBusy(payload, jobPath, slug, claimId, lock) {
     receiptId: receipt.id,
     completedAt: nowISO(),
     deliveryLost: false,
-    completionText: null,
+    completionText: bridge.reason === "missing_origin_session" ? completionText : null,
   }, claimId);
   const envelope = {
     status: outcome.status,
@@ -1433,6 +1425,8 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
 
   const attempts = [];
   const pointer = readSessionPointer(slug);
+  const requireExistingConversation = payload.requireExistingConversation === true;
+  const continuationUnavailable = requireExistingConversation && !pointer;
   const hadPointerAtStart = pointer !== null;
   let activePointer = pointer;
   let selfHeal = null;
@@ -1447,7 +1441,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     // the RUNNER's clock zero for this attempt; deadlineAt is when the
     // watchdog will SIGTERM it. Judged from these, never from createdAt.
     const startedAt = nowISO();
-    updateJob(jobPath, {
+    const admission = updateJob(jobPath, {
       state: "running",
       startedAt,
       deadlineAt: new Date(Date.parse(startedAt) + timeoutSeconds * 1000).toISOString(),
@@ -1455,21 +1449,43 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
       // that is merely long from one that is overdue to be killed.
       stallSeconds: stallSeconds || null,
       progressAt: null,
+      progressSource: null,
+      progressCpuMs: null,
+      progressTranscriptBytes: null,
+      progressTranscriptMtimeMs: null,
       attemptSessionId: sessionId,
       attemptSessionMode: isNewSession ? "new" : "resume",
     }, claimId);
+    if (!admission) {
+      return {
+        status: "failed", reason: "execution_admission_unrecorded", exitCode: null,
+        durationMs: 0, timedOut: false, stalled: false, reply: "", stderrTail: "",
+        sessionId, sessionMode: isNewSession ? "new" : "resume", cwd,
+      };
+    }
     // progressAt is the CHILD's liveness, deliberately distinct from
     // heartbeatAt (which only proves the runner is alive).
-    const onProgress = ({ at, cpuMs }) => {
-      updateJob(jobPath, { progressAt: at, progressCpuMs: cpuMs }, claimId);
+    const onProgress = ({ at, transcriptBytes, transcriptMtimeMs }) => {
+      updateJob(jobPath, {
+        progressAt: at,
+        progressSource: "claude_transcript",
+        progressTranscriptBytes: transcriptBytes,
+        progressTranscriptMtimeMs: transcriptMtimeMs,
+      }, claimId);
     };
-    const run = await runClaude({ prompt, sessionArgs, cwd, timeoutSeconds, stallSeconds, onProgress });
+    const run = await runClaude({
+      prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallSeconds, onProgress,
+    });
     const result = classify(run, timeoutSeconds, stallSeconds);
     return { ...result, sessionId, sessionMode: isNewSession ? "new" : "resume", cwd };
   };
 
-  let outcome = await attempt(activePointer);
-  attempts.push({
+  let outcome = continuationUnavailable ? {
+    status: "failed", reason: "continuation_unavailable", exitCode: null, signal: null,
+    durationMs: 0, timedOut: false, stalled: false, reply: "", stderrTail: "",
+    sessionId: null, sessionMode: "resume_unavailable", cwd: null,
+  } : await attempt(activePointer);
+  if (!continuationUnavailable) attempts.push({
     sessionId: outcome.sessionId,
     sessionMode: outcome.sessionMode,
     status: outcome.status,
@@ -1483,6 +1499,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
   // one. A timeout, an auth failure, or any other nonzero exit leaves the
   // pointer exactly where it is.
   if (
+    !requireExistingConversation &&
     activePointer &&
     outcome.status === "failed" &&
     !outcome.timedOut &&
@@ -1512,6 +1529,13 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     });
   }
 
+  // An explicit continuation may not silently become a fresh conversation,
+  // even when the provider proves that its old session no longer exists.
+  if (requireExistingConversation && activePointer && outcome.status === "failed"
+      && !outcome.timedOut && !outcome.stalled && sessionGone(outcome.stderrTail)) {
+    outcome = { ...outcome, reason: "continuation_unavailable" };
+  }
+
   // A brand-new session is only worth pinning once it actually produced a
   // turn — recording a session id that never came up would poison the topic
   // pointer with an unresumable id.
@@ -1532,7 +1556,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
   // a pointer must end with that thread either resumed or explicitly healed
   // aside — a null pointerPath here means the thread was silently dropped,
   // which is Defect 3's damage shape. Loud in the receipt, never swallowed.
-  const pointerIntegrity = hadPointerAtStart && !selfHeal && pointerPath === null
+  const pointerIntegrity = continuationUnavailable ? "continuation_unavailable" : hadPointerAtStart && !selfHeal && pointerPath === null
     ? "violated_thread_pointer_dropped"
     : "ok";
 
@@ -1563,7 +1587,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
   // absence to persist past the settle grace.
   let sessionStoreCheck = null;
   if (bridge.status === "unknown") {
-    sessionStoreCheck = confirmDeliveryViaSessionStore(payload.sessionId, payload.messageId);
+    sessionStoreCheck = confirmDeliveryViaSessionStore(payload.sessionId, payload.messageId, completionText);
     if (sessionStoreCheck === "present") {
       bridge.status = "delivered";
       bridge.reason = "confirmed_by_session_store";
@@ -1599,17 +1623,17 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     bridge: {
       status: bridge.status,
       reason: bridge.reason || null,
+      ...(bridge.reason === "missing_origin_session" ? { deliveryAttempted: false, note: bridge.note } : {}),
       httpStatus: bridge.httpStatus == null ? null : bridge.httpStatus,
       ackMode: bridge.ackMode || null,
       url: process.env.NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN === "1" ? null : bridgeURL(),
     },
     sessionStoreCheck,
-    // A completed reply that never reached Agent is the one thing we must
-    // never lose: the job file is kept (it always is — it is also the dedup
-    // record) and the failure is written into the receipt so recovery has
-    // something to read. Only a PROVEN failure counts — "unknown" must never
-    // read as lost, or the replay double-delivers a message that landed.
-    deliveryLost: bridge.status === "failed" && outcome.status === "completed",
+    // Every terminal result matters, including stopped/failed work and its
+    // partial evidence. Delivery truth is independent of execution success.
+    // Only a PROVEN transport failure counts as lost; unknown must never arm
+    // a replay merely because the worker itself failed.
+    deliveryLost: bridge.status === "failed",
   };
   try {
     appendJSONL(DELIVERIES_PATH, receipt);
@@ -1633,13 +1657,11 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
       completedAt: nowISO(),
       // Recovery handle: a later arrival of the same messageId can REPLAY this
       // delivery verbatim instead of re-running (or worse, silently dropping)
-      // Claude's answer. An UNKNOWN delivery also keeps the text — not for
-      // replay (unknown never replays) but so a later settle-against-the-store
-      // can arm one if the store proves absence.
+      // Claude's terminal result, including failure/partial evidence. An
+      // UNKNOWN delivery also keeps the text — not for immediate replay,
+      // but so the existing later store-settlement can reconcile it.
       deliveryLost: receipt.deliveryLost,
-      completionText: (receipt.deliveryLost || (bridge.status === "unknown" && outcome.status === "completed"))
-        ? completionText
-        : null,
+      completionText: bridge.status === "delivered" || bridge.status === "dry_run" ? null : completionText,
       sessionStoreCheck,
       // Clock zero for the absent-settle grace: absence may only arm a
       // replay once it has persisted past this stamp + the grace.
@@ -1777,6 +1799,12 @@ async function replayLostDelivery(jobPath, job) {
 async function replayLostDeliveryLocked(jobPath, job) {
   const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
   const sessionId = job.agentSessionId || (job.payload && job.payload.sessionId) || null;
+  const missingOrigin = missingCompletionOrigin(sessionId);
+  if (missingOrigin) {
+    updateJob(jobPath, { bridgeStatus: "blocked", bridgeReason: missingOrigin.reason, deliveryLost: false });
+    return { status: "blocked", reason: missingOrigin.reason, delivery: "claude_thread_wakeup",
+      messageId, jobPath, bridge: missingOrigin, deliveryLost: false, note: missingOrigin.note };
+  }
   const settleDelivered = (check) => {
     updateJob(jobPath, {
       bridgeStatus: "delivered",
@@ -1801,7 +1829,7 @@ async function replayLostDeliveryLocked(jobPath, job) {
   // late-landing row (or a racing present-settlement by another duplicate)
   // must beat a stale "absent" observation — replaying a completion that
   // landed double-delivers it.
-  if (confirmDeliveryViaSessionStore(sessionId, messageId) === "present") {
+  if (confirmDeliveryViaSessionStore(sessionId, messageId, job.completionText) === "present") {
     return settleDelivered("present");
   }
 
@@ -1826,7 +1854,7 @@ async function replayLostDeliveryLocked(jobPath, job) {
       // kept — because an absent read here races THIS replay's own append.
       // The next arrival routes through settle_unknown, whose grace lets a
       // persisted absence re-arm honestly.
-      const check = confirmDeliveryViaSessionStore(sessionId, messageId);
+      const check = confirmDeliveryViaSessionStore(sessionId, messageId, job.completionText);
       if (check === "present") return settleDelivered(check);
       updateJob(jobPath, {
         bridgeStatus: "unknown",
@@ -1886,7 +1914,7 @@ async function replayLostDeliveryLocked(jobPath, job) {
 async function settleUnknownDelivery(jobPath, job) {
   const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
   const sessionId = job.agentSessionId || (job.payload && job.payload.sessionId) || null;
-  const check = confirmDeliveryViaSessionStore(sessionId, messageId);
+  const check = confirmDeliveryViaSessionStore(sessionId, messageId, job.completionText);
   const base = {
     delivery: "claude_thread_wakeup",
     messageId,
@@ -1927,10 +1955,21 @@ async function settleUnknownDelivery(jobPath, job) {
   return { ...base, status: "skipped", reason: "duplicate", note: "unknown_unresolved" };
 }
 
-/// What to do when the O_EXCL claim loses. The job file is the dedup marker,
-/// but it must also be a RECOVERY handle: a runner that died mid-flight (crash,
-/// SIGKILL, Mac sleep) previously poisoned its messageId permanently.
-async function resolveExistingJob(jobPath, payload) {
+function knownUnstartedWake(job) {
+  const rejectedBeforeExecution = job && job.schemaVersion === 2
+    && job.state === "settled" && job.status === "failed" && job.reason === "rejected_topic_busy";
+  return job && job.schemaVersion >= 2
+    && typeof job.claimId === "string" && job.claimId
+    && (["claimed", "queued", "spawn_failed"].includes(job.state) || rejectedBeforeExecution)
+    && !job.startedAt && !job.attemptSessionId && !job.progressAt
+    && (job.attempts == null || (Array.isArray(job.attempts) && job.attempts.length === 0))
+    && job.payload && job.payload.messageId === job.messageId
+    && typeof job.payload.text === "string" && job.payload.text.trim();
+}
+
+/// A duplicate may recover proven-unstarted work or reconcile delivery, never
+/// infer no effects from a dead process, old heartbeat, or unreadable record.
+async function resolveExistingJob(jobPath, payload, makeClaimRecord) {
   const job = readJob(jobPath);
   if (!job) {
     // Unreadable claim: usually corrupt — but a FRESH unreadable file is a
@@ -1942,10 +1981,24 @@ async function resolveExistingJob(jobPath, payload) {
     if (mtimeMs && Date.now() - mtimeMs < writeGraceMs) {
       return { action: "duplicate", job: null, note: "claimMidWrite" };
     }
-    return { action: "takeover", stalePath: renameJobAside(jobPath), reason: "job_unreadable" };
+    return { action: "duplicate", job: null, note: "execution_outcome_unknown" };
+  }
+  if (job.messageId !== payload.messageId) {
+    // The old sanitizer cut UTF-16 units, unlike the Swift producer's graphemes.
+    // Both IDs share the existing 120-unit filename: never adopt/replay a legacy
+    // claim, since distinct accepted IDs may have collapsed into that old ID.
+    const legacyId = payload.messageId.slice(0, 160);
+    return { action: "duplicate", job, note: legacyId !== payload.messageId && job.messageId === legacyId
+      ? "legacy_message_id_ambiguous" : "message_id_conflict" };
+  }
+  if (job.state === "settled" && job.bridgeReason === "missing_origin_session") {
+    return { action: "duplicate", job, note: "missing_origin_session" };
   }
 
-  if (job.state === "settled") {
+  // A current-schema topic-busy rejection never admitted Claude execution.
+  // An explicit resend may recover it through the same dead-owner/CAS path;
+  // its original rejection and delivery receipt remain in the archived job.
+  if (job.state === "settled" && !knownUnstartedWake(job)) {
     if (job.deliveryLost === true && typeof job.completionText === "string" && job.completionText) {
       return { action: "replay", job };
     }
@@ -1958,10 +2011,6 @@ async function resolveExistingJob(jobPath, payload) {
       return { action: "settle_unknown", job };
     }
     return { action: "duplicate", job };
-  }
-
-  if (job.state === "spawn_failed") {
-    return { action: "takeover", stalePath: renameJobAside(jobPath), reason: "runner_spawn_failed" };
   }
 
   const ownerPid = Number(job.pid);
@@ -1991,7 +2040,7 @@ async function resolveExistingJob(jobPath, payload) {
   // parent claimed with its own pid, spawned the detached child, and died
   // before it could record runnerPid. Nothing on disk names the live child, so
   // give that window a bounded grace before believing the job is orphaned.
-  if (!hasRunnerPid) {
+  if (!hasRunnerPid && !knownUnstartedWake(job)) {
     const graceMs = envNumber("NATIVE_AGENT_CLAUDE_WAKE_SPAWN_GRACE_MS", DEFAULT_SPAWN_GRACE_MS);
     const createdMs = Date.parse((job && job.createdAt) || "");
     const createdAgeMs = Number.isFinite(createdMs) ? Date.now() - createdMs : Infinity;
@@ -2008,7 +2057,27 @@ async function resolveExistingJob(jobPath, payload) {
     }
   }
 
-  return { action: "takeover", stalePath: renameJobAside(jobPath), reason: "runner_pid_dead", ownerPid, ageMs };
+  if (!knownUnstartedWake(job) || !Number.isInteger(ownerPid) || ownerPid <= 0) {
+    return { action: "duplicate", job, note: "execution_outcome_unknown", ownerPid, ageMs };
+  }
+  // Serialize the read/rename/reclaim under the EXISTING conversation lock.
+  // A second retry must re-read our new claim rather than rename it using a
+  // stale snapshot of the dead predecessor. Never wait behind active work.
+  const lock = await acquireTopicLock(topicSlug(job.payload.topic), 0, { messageId: payload.messageId, recoveryOnly: true });
+  if (!lock.acquired) return { action: "duplicate", job, note: "recovery_in_progress" };
+  try {
+    const fresh = readJob(jobPath);
+    if (!fresh || fresh.claimId !== job.claimId || !knownUnstartedWake(fresh)
+        || pidAlive(fresh.pid) || (fresh.runnerPid && pidAlive(fresh.runnerPid))) {
+      return { action: "duplicate", job: fresh, note: "claim_changed" };
+    }
+    const replacement = makeClaimRecord(fresh.payload);
+    const stalePath = renameJobAside(jobPath);
+    if (!stalePath || !claimJob(jobPath, replacement)) {
+      return { action: "duplicate", job: readJob(jobPath), note: "claim_changed" };
+    }
+    return { action: "reclaimed", stalePath, reason: "unstarted_owner_dead", ownerPid, ageMs, claimId: replacement.claimId, payload: fresh.payload };
+  } finally { lock.release(); }
 }
 
 /// Structural ping-pong guard. The prompt preamble asks Agent not to auto-fire
@@ -2051,7 +2120,7 @@ function sanitizePayload(raw) {
   const payload = raw && typeof raw === "object" ? raw : {};
   const clean = {
     messageId: typeof payload.messageId === "string" && payload.messageId.trim() !== ""
-      ? payload.messageId.trim().slice(0, 160)
+      ? payload.messageId.trim()
       : crypto.randomUUID(),
     text: typeof payload.text === "string" ? payload.text : "",
     priority: ["info", "important", "urgent"].includes(String(payload.priority || "").toLowerCase())
@@ -2066,6 +2135,18 @@ function sanitizePayload(raw) {
   if (typeof payload.inboxPath === "string" && payload.inboxPath) clean.inboxPath = payload.inboxPath;
   if (typeof payload.sessionId === "string" && payload.sessionId) clean.sessionId = payload.sessionId;
   if (typeof payload.cwd === "string" && payload.cwd) clean.cwd = payload.cwd;
+  if (Number.isInteger(payload.producerSchemaVersion) && payload.producerSchemaVersion > 0) {
+    clean.producerSchemaVersion = payload.producerSchemaVersion;
+  }
+  if (typeof payload.producerSourceRevision === "string"
+      && /^[0-9a-f]{40}$/i.test(payload.producerSourceRevision)) {
+    clean.producerSourceRevision = payload.producerSourceRevision.toLowerCase();
+  }
+  if (payload.pairReviewer === true) clean.pairReviewer = true;
+  if (payload.requireExistingConversation === true) clean.requireExistingConversation = true;
+  if (typeof payload.deskHandle === "string" && /^desk_[A-Za-z0-9-]+$/.test(payload.deskHandle)) {
+    clean.deskHandle = payload.deskHandle;
+  }
   // 0 survives sanitization: it is the explicit "disable the stall watchdog"
   // signal, not a missing value.
   if (Number.isFinite(Number(payload.stallSeconds)) && Number(payload.stallSeconds) >= 0) {
@@ -2092,11 +2173,15 @@ function inlineMode() {
 
 /// The child carries the claimId in its argv: it is the token that proves the
 /// job file on disk is still the one this process was spawned to run.
-function spawnDetachedRunner(jobPath, claimId) {
+async function spawnDetachedRunner(jobPath, claimId) {
   const child = spawn(process.execPath, [__filename, "--run", jobPath, "--claim", String(claimId || "")], {
     detached: true,
     stdio: "ignore",
     env: { ...process.env },
+  });
+  await new Promise((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
   });
   child.unref();
   return child.pid || null;
@@ -2137,7 +2222,16 @@ async function main() {
     return;
   }
 
-  const payload = sanitizePayload(raw);
+  let payload = sanitizePayload(raw);
+  // Match the producer's 160-character bound without rewriting accepted IDs.
+  // Stop counting at the bound; direct-helper oversize input never claims work.
+  let messageIdCharacters = 0;
+  for (const _ of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(payload.messageId)) {
+    if (++messageIdCharacters > 160) {
+      jsonOut({ status: "skipped", reason: "message_id_too_long", note: "Message ID exceeds the producer's 160-character bound. No work was admitted; supply a valid explicit ID." });
+      return;
+    }
+  }
   if (!payload.text) {
     jsonOut({ status: "skipped", reason: "missing_text", messageId: payload.messageId });
     return;
@@ -2154,7 +2248,7 @@ async function main() {
     return;
   }
 
-  const slug = topicSlug(payload.topic);
+  let slug = topicSlug(payload.topic);
   const rateLimit = topicRateLimit(slug, payload.messageId);
   if (rateLimit) {
     jsonOut({
@@ -2178,10 +2272,11 @@ async function main() {
   // Every subsequent write by the winner is gated on it, so a resurrected
   // predecessor can prove — from the job file alone — that it lost.
   let claimId = null;
-  const claimRecord = () => {
+  const claimRecord = (acceptedPayload = payload) => {
     claimId = crypto.randomUUID();
     return {
-      messageId: payload.messageId,
+      schemaVersion: 2,
+      messageId: acceptedPayload.messageId,
       createdAt: nowISO(),
       // Explicit alias of createdAt: the O_EXCL create IS the claim. Kept as
       // its own field so readers never have to know that equivalence —
@@ -2192,9 +2287,9 @@ async function main() {
       state: "claimed",
       claimId,
       pid: process.pid,
-      topicSlug: slug,
-      timeoutSeconds: resolveTimeoutSeconds(payload),
-      stallSeconds: resolveStallSeconds(payload) || null,
+      topicSlug: topicSlug(acceptedPayload.topic),
+      timeoutSeconds: resolveTimeoutSeconds(acceptedPayload),
+      stallSeconds: resolveStallSeconds(acceptedPayload) || null,
       // Commit hold (task #49, User 2026-07-25): every wake session starts
       // held — build/test/verify and REPORT, but no git commit/push until
       // User, Agent, or the interactive Claude releases this job. Two
@@ -2205,15 +2300,15 @@ async function main() {
       commitPolicy: "hold",
       holdReleasedAt: null,
       holdReleasedBy: null,
-      payload,
+      payload: acceptedPayload,
     };
   };
 
   let claimed;
   let takeover = null;
-  // Two attempts at most: the second only happens after we renamed a provably
-  // dead job aside.
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  // Claim once. Duplicate recovery performs its exact replacement while
+  // holding the topic lock, never in a later unprotected retry iteration.
+  do {
     try {
       claimed = claimJob(jobPath, claimRecord());
     } catch (error) {
@@ -2227,7 +2322,7 @@ async function main() {
     }
     if (claimed) break;
 
-    const resolution = await resolveExistingJob(jobPath, payload);
+    const resolution = await resolveExistingJob(jobPath, payload, claimRecord);
     if (resolution.action === "replay") {
       jsonOut(await replayLostDelivery(jobPath, resolution.job));
       return;
@@ -2236,29 +2331,42 @@ async function main() {
       jsonOut(await settleUnknownDelivery(jobPath, resolution.job));
       return;
     }
-    if (resolution.action === "takeover" && attempt === 0) {
+    if (resolution.action === "reclaimed") {
       takeover = {
         reason: resolution.reason,
         stalePath: resolution.stalePath || null,
         previousPid: resolution.ownerPid == null ? null : resolution.ownerPid,
         heartbeatAgeMs: resolution.ageMs == null ? null : resolution.ageMs,
       };
-      continue;
+      claimed = true;
+      claimId = resolution.claimId;
+      payload = resolution.payload;
+      slug = topicSlug(payload.topic);
+      break;
     }
     jsonOut({
-      status: "skipped",
-      reason: "duplicate",
+      status: resolution.note === "missing_origin_session" ? "blocked" : "skipped",
+      reason: ["execution_outcome_unknown", "missing_origin_session", "legacy_message_id_ambiguous"].includes(resolution.note) ? resolution.note : "duplicate",
       delivery: "claude_thread_wakeup",
       messageId: payload.messageId,
       // Why we deferred: `staleHeartbeat` means a live pid held it past the
       // stale threshold (we refuse to race it); `spawnGrace` means the
       // parent/child handoff window is still open.
       note: resolution.note || null,
+      ...(resolution.note === "missing_origin_session" ? { bridge: missingCompletionOrigin(null), deliveryLost: false } : {}),
+      ...(resolution.note === "execution_outcome_unknown" ? {
+        executionOutcome: "unknown",
+        guidance: "The original job is preserved. Its effects may already have occurred; inspect its receipt and conversation before explicitly authorizing new work.",
+      } : {}),
+      ...(resolution.note === "legacy_message_id_ambiguous" ? {
+        executionOutcome: "unknown",
+        guidance: "A preserved legacy job used a truncated message ID that may represent different accepted work. No execution or delivery was retried. Inspect that job and its originating conversation before explicitly authorizing new work; do not blindly resend.",
+      } : {}),
       heartbeatAgeMs: resolution.ageMs == null ? null : resolution.ageMs,
       jobPath,
     });
     return;
-  }
+  } while (false);
   if (!claimed) {
     jsonOut({
       status: "skipped",
@@ -2281,32 +2389,13 @@ async function main() {
   // Production: hand the long-running turn to a detached child and report the
   // claim immediately. The Swift caller's helper deadline is measured in
   // seconds; Claude's turn is measured in minutes.
+  if (!updateJob(jobPath, { state: "dispatching" }, claimId)) {
+    jsonOut({ status: "failed", reason: "dispatch_admission_unrecorded", messageId: payload.messageId, jobPath });
+    return;
+  }
+  let pid;
   try {
-    const pid = spawnDetachedRunner(jobPath, claimId);
-    // Record the runner pid ONLY. The detached child owns `state` and the
-    // heartbeat (it may already have settled by now, and a parent write of
-    // state:"running" would rewind a settled job — which reads as a crashed
-    // runner and invites a spurious takeover re-run).
-    // `pid` is repointed at the runner so a duplicate arriving in the window
-    // before the child's first heartbeat sees a LIVE owner, not the exited
-    // foreground claimer.
-    // Claim-gated like every other write: if the child already settled and a
-    // later arrival took the job over, the parent must not stamp its runner pid
-    // onto somebody else's claim. Recording runnerPid ALSO closes the
-    // spawn-grace window — from here on the child is nameable on disk.
-    updateJob(jobPath, { runnerPid: pid, pid: pid || process.pid, heartbeatAt: nowISO() }, claimId);
-    jsonOut({
-      status: "sent",
-      delivery: "claude_thread_wakeup",
-      mode: "detached",
-      messageId: payload.messageId,
-      topic: payload.topic,
-      topicSlug: slug,
-      runnerPid: pid,
-      jobPath,
-      receiptPath: DELIVERIES_PATH,
-      ...(takeover ? { takeover } : {}),
-    });
+    pid = await spawnDetachedRunner(jobPath, claimId);
   } catch (error) {
     updateJob(jobPath, { state: "spawn_failed", error: String((error && error.message) || error) }, claimId);
     jsonOut({
@@ -2316,7 +2405,16 @@ async function main() {
       jobPath,
       error: String((error && error.message) || error),
     });
+    return;
   }
+  // The child publishes its own PID/phase before attempting work. No parent
+  // write after spawn can overwrite a fast child's running or settled record.
+  jsonOut({
+    status: "sent", delivery: "claude_thread_wakeup", mode: "detached",
+    messageId: payload.messageId, topic: payload.topic, topicSlug: slug,
+    runnerPid: pid, jobPath, receiptPath: DELIVERIES_PATH,
+    ...(takeover ? { takeover } : {}),
+  });
 }
 
 if (require.main === module) {
@@ -2338,9 +2436,9 @@ module.exports = {
   redactDiagnosticText,
   resolveTimeoutSeconds,
   resolveStallSeconds,
-  processTreeCpuMs,
-  processTreeCpuByPid,
-  TreeCpuProgress,
+  claudeTranscriptPath,
+  transcriptSnapshot,
+  TranscriptProgress,
   runWakeJob,
   sanitizePayload,
   resolveCwd,

@@ -89,6 +89,7 @@ struct SchemaMigrationLadderTests {
         "v5_memory_lifecycle",
         "v6_embedding_epochs",
         "v7_temporal_evidence",
+        "v8_kg_memory_index",
     ]
 
     /// Write a memory.sqlite that looks like a v1-era install: v1 tables, rows,

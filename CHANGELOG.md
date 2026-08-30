@@ -4,6 +4,12 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.4 — integrated computer use, recall, and delegation (2026-08-30)
+
+Natural visual navigation and coordinated input, bounded relevant recall,
+stronger conversation continuity, exact delegated-request tracking, and
+runtime/evaluation reliability. Full notes: `docs/release-notes/0.4.4.md`.
+
 ## 0.3.9 — trust, quiet, and a denser cockpit (2026-08-10)
 
 Credential trust: a fresh install no longer silently adopts an existing

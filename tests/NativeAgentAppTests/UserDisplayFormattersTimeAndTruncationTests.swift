@@ -82,6 +82,13 @@ func chatTimestamp_usesSharedParserForBothWireShapesAndPreservesGarbage() throws
     #expect(UserDisplayFormatters.chatTimestamp("garbage", calendar: calendar) == "garbage")
 }
 
+@Test
+func chatVisibleTextCheck_shortCircuitsWhitespaceWithoutTrimmingCopies() {
+    #expect(!ChatTranscriptPresentation.hasVisibleText(" \n\t"))
+    #expect(ChatTranscriptPresentation.hasVisibleText("  hello  "))
+    #expect(ChatTranscriptPresentation.hasVisibleText("🙂"))
+}
+
 // MARK: - String.truncated (backs the 5 chat/observatory truncation sites)
 
 @Test

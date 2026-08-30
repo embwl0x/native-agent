@@ -491,7 +491,11 @@ struct KnowledgeGraphView: View {
                             .frame(minWidth: 300)
 
                             if let entity = selectedEntity {
-                                KGEntityDetailView(entity: entity, api: api)
+                                KGEntityDetailView(
+                                    entity: entity, api: api,
+                                    selectableEntityIDs: displayedEntityIDs,
+                                    onSelectEntity: selectRelatedEntity
+                                )
                                     .frame(minWidth: 300)
                             } else {
                                 NativeEmptyState(title: "Tap a node", detail: "", systemImage: "hand.tap")
@@ -572,13 +576,26 @@ struct KnowledgeGraphView: View {
             .frame(minWidth: 200, idealWidth: 260)
 
             if let entity = selectedEntity {
-                KGEntityDetailView(entity: entity, api: api)
+                KGEntityDetailView(
+                    entity: entity, api: api,
+                    selectableEntityIDs: displayedEntityIDs,
+                    onSelectEntity: selectRelatedEntity
+                )
                     .frame(minWidth: 300)
             } else {
                 NativeEmptyState(title: "Select an entity", detail: "", systemImage: "hand.tap")
                     .frame(minWidth: 300)
             }
         }
+    }
+
+    private func selectRelatedEntity(_ id: String) {
+        // Recheck the current filters at activation, not just when the row
+        // rendered. A vanished destination must not clear the current detail.
+        guard let destination = KnowledgeGraphPresentation.reconciledSelection(
+            id, visibleIDs: displayedEntityIDs
+        ) else { return }
+        selectedId = destination
     }
 
 }

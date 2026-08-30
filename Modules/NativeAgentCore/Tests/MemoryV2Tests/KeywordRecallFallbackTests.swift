@@ -106,4 +106,28 @@ struct KeywordRecallFallbackTests {
         )
         #expect(hits.count == 1)
     }
+
+    @Test(arguments: ["CAFÉ", "MÜNCHEN", "ΑΘΉΝΑ"], [false, true])
+    func unicodeCasePrefilterMatchesBM25AndPreservesCanonicalBytes(term: String, persistentRoot: Bool) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("keyword-unicode-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store: MemoryStorage
+        if persistentRoot {
+            store = try MemoryStorage(dataRoot: root)
+        } else {
+            store = try MemoryStorage()
+        }
+        let content = "The orchard visit notes mention \(term)."
+        _ = try await store.insertMemory(StoredMemory(id: "unicode", content: content, source: "chat"))
+        let query = term.lowercased()
+        let lexical = MemoryRecallScoring.normalizedBM25Scores(query: query, documents: [content])
+        #expect(lexical.first.map { $0 > 0 } == true)
+        let hits = try await store.recallByKeyword(queryText: query, topK: 5, persona: nil)
+        #expect(hits.map(\.memory.id) == ["unicode"])
+        #expect(hits.first?.memory.content == content)
+        let stored = try #require(try await store.memory(id: "unicode"))
+        #expect(Data(stored.content.utf8) == Data(content.utf8))
+        let cold = try await store.recall(embedding: [0, 0], queryText: query, topK: 5, persona: nil)
+        #expect(cold.map(\.memory.id) == ["unicode"])
+    }
 }

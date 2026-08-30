@@ -156,6 +156,29 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
         self = decoded
     }
 
+    func promotingReactionEvidence() -> Self {
+        var states = dimensionStates
+        states["reaction"] = .observed
+        return Self(
+            turnID: turnID,
+            messageID: messageID,
+            sessionID: sessionID,
+            surface: surface,
+            observedAt: observedAt,
+            responsePersistence: responsePersistence,
+            contextGenerationID: contextGenerationID,
+            contextSelectionReceiptID: contextSelectionReceiptID,
+            providerID: providerID,
+            providerModel: providerModel,
+            reasoningEffort: reasoningEffort,
+            turnElapsedMs: turnElapsedMs,
+            tools: tools,
+            motorActions: motorActions,
+            dimensionStates: states,
+            interventionAssignment: interventionAssignment
+        )
+    }
+
     public static func make(
         turnID rawTurnID: String?,
         messageID rawMessageID: String,
@@ -189,7 +212,8 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
             )
         }
         var seenMotorReferences = Set<String>()
-        let motorReferences = Array((result?.toolDispatches ?? []).prefix(64)).compactMap {
+        let boundedDispatches = Array((result?.toolDispatches ?? []).prefix(64))
+        let motorReferences = boundedDispatches.compactMap {
             dispatch -> ResponseOutcomeMotorReference? in
             guard let reference = motorReference(dispatch: dispatch) else { return nil }
             let key = "\(reference.domain)|\(reference.actionID)"
@@ -213,7 +237,10 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
                     : (toolReferences.allSatisfy { $0.resultClass != "unknown" }
                         ? .observed : .unverified)),
             "motor": motorReferences.isEmpty
-                ? (toolReferences.isEmpty ? .notApplicable : .unknown)
+                ? (boundedDispatches.contains(where: {
+                    ToolCausalBoundary.hasCanonicalMotorOwner(tool: $0.name)
+                        || ToolCausalBoundary.isExternalProtocolTool($0.name)
+                }) ? .unknown : .notApplicable)
                 : aggregateMotorEvidence(motorReferences.map(\.verification)),
             "reaction": .unknown,
         ]
@@ -441,7 +468,7 @@ public struct OutcomeDimensionStateAudit: Sendable, Equatable {
             "status": .string(
                 sourceStatus != "measured"
                     ? sourceStatus
-                    : (absentObservations > 0 || !permanentlyNonterminalDimensions.isEmpty
+                    : (absentObservations > 0 || !rankedLeads.isEmpty
                         ? "degraded" : "ok")
             ),
             "source_status": .string(sourceStatus),
@@ -478,10 +505,19 @@ public struct OutcomeDimensionStateAudit: Sendable, Equatable {
         let dark = distributions.compactMap { dimension, counts -> String? in
             guard present > 0 else { return nil }
             let dominant = max(counts[.unknown, default: 0], counts[.censored, default: 0])
-            return Double(dominant) / Double(present) > 0.95 ? dimension : nil
+            return dominant == present ? dimension : nil
         }.sorted()
         let absent = observations.count - present
         var leads = dark.map { "\($0): this dimension has no promoter wired" }
+        for (dimension, counts) in distributions where !dark.contains(dimension) && present > 0 {
+            let terminal = counts[.observed, default: 0]
+                + counts[.verified, default: 0]
+                + counts[.notApplicable, default: 0]
+            if Double(terminal) / Double(present) < 0.05 {
+                leads.append("\(dimension): terminal evidence is sparse (\(terminal)/\(present))")
+            }
+        }
+        leads.sort()
         if absent > 0 {
             leads.insert(
                 "outcome observation absent on \(absent) of \(observations.count) assistant rows",
@@ -547,13 +583,15 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
         }
 
         let history = SessionHistoryReader(dataRoot: dataRoot)
+        let reactionKeys = try await OutcomeFeedbackStore(dataRoot: dataRoot)
+            .reactionEvidenceKeys()
         var observations: [ResponseOutcomeObservationV2?] = []
         for (url, _) in candidates {
             let sessionID = url.deletingPathExtension().lastPathComponent
             let messages = try await history.messages(
                 forSessionId: sessionID
             )
-            for message in messages where message.role == "assistant" {
+            for (index, message) in messages.enumerated() where message.role == "assistant" {
                 if let since {
                     let formatter = ISO8601DateFormatter()
                     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -567,9 +605,60 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
                     observations.append(nil)
                     continue
                 }
-                observations.append(ResponseOutcomeObservationV2(jsonValue: raw))
+                let observation = ResponseOutcomeObservationV2(jsonValue: raw)
+                if let observation,
+                   reactionKeys.contains(OutcomeReactionEvidenceKey(
+                    sessionID: observation.sessionID,
+                    messageID: observation.messageID,
+                    turnID: observation.turnID
+                   )) || Self.hasCanonicalContinuation(
+                    after: index,
+                    in: messages,
+                    anchoredTo: observation
+                   ) {
+                    observations.append(observation.promotingReactionEvidence())
+                } else {
+                    observations.append(observation)
+                }
             }
         }
         return .make(observations)
+    }
+
+    /// Read-side migration for outcomes written before continuation receipts
+    /// existed. An immediately following durable user row in the same
+    /// canonical transcript proves only that the conversation continued; it
+    /// does not infer sentiment or whether the answer was good. This gives
+    /// historical outcome health an honest eligible cohort without rewriting
+    /// old transcripts or manufacturing feedback events.
+    private static func hasCanonicalContinuation(
+        after assistantIndex: Int,
+        in messages: [ChatMessage],
+        anchoredTo observation: ResponseOutcomeObservationV2
+    ) -> Bool {
+        let nextIndex = assistantIndex + 1
+        let requestIndex = assistantIndex - 1
+        guard messages.indices.contains(requestIndex),
+              messages.indices.contains(nextIndex) else { return false }
+        let request = messages[requestIndex]
+        let next = messages[nextIndex]
+        guard request.role == "user",
+              next.role == "user",
+              case .object(let requestRow)? = request.extras,
+              requestRow["role"] == .string("user"),
+              requestRow["sessionId"] == .string(observation.sessionID),
+              case .string(let requestRunID)? = requestRow["runId"],
+              case .object(let assistantRow)? = messages[assistantIndex].extras,
+              assistantRow["role"] == .string("assistant"),
+              assistantRow["sessionId"] == .string(observation.sessionID),
+              assistantRow["runId"] == .string(requestRunID),
+              case .object(let row)? = next.extras,
+              row["role"] == .string("user"),
+              row["sessionId"] == .string(observation.sessionID),
+              case .string(let reactionMessageID)? = row["id"],
+              OutcomeTraceIdentity.normalized(reactionMessageID) != nil else {
+            return false
+        }
+        return true
     }
 }

@@ -107,6 +107,92 @@ private func organismSignal(
     #expect(updated.vigilance < start.vigilance)
 }
 
+@Test(arguments: [ProviderPathBeliefState.uncertain, .stale, .unobserved])
+func providerUnknownBodyEvidenceDoesNotManufactureChemistry(_ state: ProviderPathBeliefState) {
+    let now = Date(timeIntervalSince1970: 100_000)
+    let evidence: [ProviderPathEvidence] = state == .unobserved ? [] : [
+        ProviderPathEvidence(
+            evidenceID: "successful-call",
+            observedAt: state == .stale ? now.addingTimeInterval(-7 * 3_600) : now,
+            outcome: .succeeded
+        ),
+    ]
+    let belief = ProviderPathBeliefProjector.project(evidence: evidence, now: now)
+    #expect(belief.state == state)
+    let healthy = BodySchema.neutral
+    let unknown = OrganismBodySchemaSampler.bodySchema(
+        from: OrganismBodyRead(providersAvailable: true, providerPathBelief: belief),
+        previous: healthy,
+        now: now
+    )
+    #expect(!unknown.providersHealthy) // Conservative compatibility/posture stays intact.
+    let initial = ChemicalState(vigilance: 0.2, coherence: 0.45, confidence: 0.6)
+    let afterUnknown = OrganismChemistry.integrating(
+        bodySchema: unknown, previous: healthy, into: initial
+    )
+    let afterHealthy = OrganismChemistry.integrating(
+        bodySchema: healthy, previous: unknown, into: afterUnknown
+    )
+    #expect(afterUnknown == initial)
+    #expect(afterHealthy == initial)
+
+    // Actual successful calls can remain statistically uncertain. Refreshing
+    // that projection after each outcome must not repeatedly subtract coherence.
+    var body = unknown
+    var chemistry = initial
+    for _ in 0..<12 {
+        let success = OrganismChemistry.applying(
+            signal: organismSignal(.providerSucceeded), to: chemistry, bodySchema: body
+        )
+        chemistry = OrganismChemistry.integrating(
+            bodySchema: unknown, previous: success.bodySchema, into: success.chemicalState
+        )
+        body = unknown
+    }
+    #expect(chemistry.coherence == initial.coherence)
+
+    let failure = OrganismChemistry.applying(
+        signal: organismSignal(.providerFailed), to: initial, bodySchema: unknown
+    )
+    #expect(failure.chemicalState.coherence < initial.coherence)
+    #expect(failure.chemicalState.vigilance > initial.vigilance)
+}
+
+@Test func providerKnownBodyFailureAndLegacyTransitionsStillAffectChemistry() {
+    let now = Date(timeIntervalSince1970: 100_000)
+    let brittleBelief = ProviderPathBeliefProjector.project(
+        evidence: (0..<8).map {
+            ProviderPathEvidence(evidenceID: "failed-\($0)", observedAt: now, outcome: .failed)
+        },
+        now: now
+    )
+    #expect(brittleBelief.state == .brittle)
+    let typedFailure = OrganismBodySchemaSampler.bodySchema(
+        from: OrganismBodyRead(providersAvailable: true, providerPathBelief: brittleBelief),
+        now: now
+    )
+    let legacyFailure = OrganismBodySchemaSampler.bodySchema(
+        from: OrganismBodyRead(providersHealthy: false), now: now
+    )
+    let initial = ChemicalState(vigilance: 0.2, coherence: 0.45, confidence: 0.6)
+    for failure in [typedFailure, legacyFailure] {
+        let affected = OrganismChemistry.integrating(
+            bodySchema: failure, previous: .neutral, into: initial
+        )
+        #expect(affected.coherence == initial.coherence - 0.02)
+        #expect(affected.vigilance == initial.vigilance + 0.08)
+        #expect(affected.confidence == initial.confidence - 0.04)
+        #expect(OrganismChemistry.integrating(
+            bodySchema: failure, previous: failure, into: affected
+        ) == affected)
+        let recovered = OrganismChemistry.integrating(
+            bodySchema: .neutral, previous: failure, into: affected
+        )
+        #expect(recovered.vigilance < affected.vigilance)
+        #expect(recovered.confidence > affected.confidence)
+    }
+}
+
 @Test func resourcePressureRaisesFatigue() async throws {
     let result = OrganismChemistry.applying(
         signal: organismSignal(
@@ -208,7 +294,7 @@ private func organismSignal(
 
     #expect(snapshot.bodySchema.resourcePressure == .critical)
     #expect(snapshot.chemicalState.fatigue < 0.8)
-    #expect(snapshot.projectedBodyLine == "- Body: resources feel tight; keep the next move lightweight.")
+    #expect(snapshot.projectedBodyLine == "- Body: the Mac is under thermal or low-power pressure; keep the next move lightweight.")
 }
 
 @Test func exportSettlesLiveStateAndUsesCurrentTimestamp() async throws {

@@ -253,8 +253,6 @@ public actor SwiftNativeContextClient: ContextClient {
     /// Injectable for the test that mints `<uuid>` so it is deterministic; the
     /// production envelope `id` is a fresh UUID per call (Python `uuid.uuid4()`).
     private let makeEventID: @Sendable () -> String
-    private var lastLegacyReceiptPruneAt: Date?
-    private let legacyReceiptPruneInterval: TimeInterval = 24 * 3_600
 
     public init(
         now: @escaping @Sendable () -> Date = { Date() },
@@ -369,7 +367,6 @@ public actor SwiftNativeContextClient: ContextClient {
     // MARK: - GET /v1/context/latest
 
     public func latestContextReceipt(sessionId: String) async -> JSONValue? {
-        await pruneLegacyReceiptFeedIfDue()
         // get_chat_messages(session_id, limit=80): returns [] if the session is
         // unknown, else tail_jsonl(path, 80, max_bytes=1MB). We approximate the
         // session-existence guard by checking sessions.json; an unknown session
@@ -511,27 +508,19 @@ public actor SwiftNativeContextClient: ContextClient {
         }
     }
 
-    /// Bounded maintenance for daemon-written compatibility files. The reader
-    /// discovers every session-referenced run before pruning, so old fossils
-    /// disappear without deleting a receipt that this route could still return.
-    private func pruneLegacyReceiptFeedIfDue() async {
-        let current = now()
-        if let lastLegacyReceiptPruneAt,
-           current.timeIntervalSince(lastLegacyReceiptPruneAt) < legacyReceiptPruneInterval {
-            return
-        }
+    /// Bounded maintenance for daemon-written compatibility files. Mounted
+    /// maintenance owns this call so a context read never performs a directory
+    /// sweep or deletion as a side effect.
+    public func pruneLegacyReceipts(
+        at current: Date = Date()
+    ) async -> LegacyContextReceiptFeed.RetentionReport {
         let protected = await protectedLegacyReceiptRunIDs()
-        let report = await LegacyContextReceiptFeed.prune(
+        return await LegacyContextReceiptFeed.prune(
             dataRoot: dataRoot,
             protectedRunIDs: protected,
             now: current,
             persistence: store
         )
-        if report.unavailable {
-            NSLog("[Context] legacy receipt retention unavailable; leaving compatibility files untouched")
-            return
-        }
-        lastLegacyReceiptPruneAt = current
     }
 
     private func protectedLegacyReceiptRunIDs() async -> Set<String> {

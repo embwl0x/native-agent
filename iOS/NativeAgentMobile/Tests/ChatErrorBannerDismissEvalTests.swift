@@ -21,8 +21,22 @@ final class ChatErrorBannerDismissEvalTests: XCTestCase {
     func testChatBannerUsesTheStoreDismissalBoundaryAndAccessibleControl() throws {
         let source = try MobileEvalSources.mobileSource("ChatView.swift")
         let chat = try XCTUnwrap(MobileEvalSources.blockBody(named: "ChatView", keyword: "struct", in: source))
+        let chatError = try XCTUnwrap(
+            MobileEvalSources.blockBody(named: "let error = store.errorBanner", keyword: "if", in: chat)
+        )
+        let banner = try XCTUnwrap(
+            MobileEvalSources.blockBody(named: "MobileChatIssueBanner", keyword: "struct", in: source)
+        )
 
-        XCTAssertTrue(chat.contains("store.dismissErrorBanner()"))
-        XCTAssertTrue(chat.contains("accessibilityLabel(\"Dismiss chat error\")"))
+        // The screen supplies the outcome-specific name and store boundary;
+        // the shared banner owns the actual accessible dismiss control.
+        XCTAssertTrue(chatError.contains("MobileChatIssueBanner("))
+        XCTAssertTrue(chatError.contains("message: error"))
+        XCTAssertTrue(chatError.contains("dismissLabel: \"Dismiss chat error\""))
+        XCTAssertTrue(chatError.contains("onDismiss: { store.dismissErrorBanner() }"))
+        XCTAssertTrue(banner.contains("Button(action: onDismiss)"))
+        XCTAssertTrue(banner.contains(".accessibilityLabel(dismissLabel)"))
+        XCTAssertTrue(banner.contains(".frame(width: 44, height: 44)"))
+        XCTAssertTrue(banner.contains(".accessibilityElement(children: .contain)"))
     }
 }

@@ -512,8 +512,27 @@ public enum MemoryConsolidationGate {
             // short-circuit would otherwise skip forever. Re-annotate from
             // the receipt's contents when the annotation is missing.
             if FileManager.default.fileExists(atPath: receiptPath(dataRoot: dataRoot, runId: runId).path) {
-                if record.status == "resolved", record.executedAction == nil,
-                   let receipt = readReceipt(dataRoot: dataRoot, runId: runId) {
+                guard let receipt = readReceipt(dataRoot: dataRoot, runId: runId) else {
+                    // Presence alone is not terminal proof. Preserve the
+                    // candidate and fail closed so a corrupt or cross-run
+                    // receipt cannot silently settle an approved swap.
+                    outcomes.append(.failed(
+                        runId: runId,
+                        reason: "terminal receipt unreadable or mismatched"
+                    ))
+                    continue
+                }
+                // Older binaries wrote the terminal consolidation receipt but
+                // left hygiene_last_run.json at `staged`. Re-drive the
+                // canonical health projection on every reconciliation so that
+                // crash-window and upgrade recovery converge too.
+                reconcileAppliedMaintenanceTruth(
+                    dataRoot: dataRoot,
+                    runId: runId,
+                    status: receipt.status,
+                    at: receipt.at
+                )
+                if record.status == "resolved", record.executedAction == nil {
                     await annotateApproval(
                         dataRoot: dataRoot, id: record.id,
                         executedAction: .object([
@@ -749,6 +768,7 @@ public enum MemoryConsolidationGate {
                 detail: "consolidation swap applied — live store replaced by the approved "
                     + "candidate; pre-swap backup at \(backupPath); \(projections.detail)")
             cleanupCandidate(dataRoot: dataRoot, runId: runId)
+            sweepBackups(dataRoot: dataRoot)
             logger.info("consolidation swap \(runId, privacy: .public): APPLIED (backup at \(backupPath, privacy: .public))")
             return .applied(runId: runId, backupPath: backupPath)
         } catch {
@@ -816,6 +836,7 @@ public enum MemoryConsolidationGate {
             namespace: "memory-v2",
             stableID: "consolidation-\(runId)",
             operation: .reconcile,
+            canonicalLocator: livePath.standardizedFileURL.path,
             reason: "memory_consolidation_projection_rebuild"
         ))
         return MemoryProjectionReconciliationSummary(
@@ -951,6 +972,73 @@ public enum MemoryConsolidationGate {
         return dir.path
     }
 
+    /// Pre-swap backups accumulate one full store copy per applied swap and
+    /// nothing ever removed them. RETENTION (union, not intersection): a
+    /// backup survives if it is among the newest `keepNewest` OR younger than
+    /// `maxAge`. Only the two together bound the directory — newest-N alone
+    /// discards a recent burst's history, age alone keeps nothing after a
+    /// long idle stretch.
+    ///
+    /// Dated from the directory NAME (`pre-consolidation-<ts>-<suffix>`, UTC
+    /// and lexicographically sortable). A directory whose name does not parse
+    /// is never counted and never deleted — an unknown age is not an old age.
+    /// Best-effort: a failed removal is logged, never thrown.
+    static let backupRetentionKeepNewest = 5
+    static let backupRetentionMaxAge: TimeInterval = 30 * 24 * 60 * 60
+
+    @discardableResult
+    static func sweepBackups(
+        dataRoot: URL,
+        now: Date = Date(),
+        keepNewest: Int = backupRetentionKeepNewest,
+        maxAge: TimeInterval = backupRetentionMaxAge
+    ) -> [String] {
+        let root = dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("backups", isDirectory: true)
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: root.path) else { return [] }
+        // Newest first; ties broken by name so the order is total.
+        let dated: [(name: String, date: Date)] = names
+            .compactMap { name in
+                guard let date = backupDirectoryDate(name) else { return nil }
+                return (name, date)
+            }
+            .sorted {
+                if $0.date != $1.date { return $0.date > $1.date }
+                return $0.name > $1.name
+            }
+        var removed: [String] = []
+        for (index, entry) in dated.enumerated() {
+            guard index >= keepNewest else { continue }
+            // Boundary: exactly `maxAge` old is still WITHIN the window.
+            guard now.timeIntervalSince(entry.date) > maxAge else { continue }
+            do {
+                try fm.removeItem(at: root.appendingPathComponent(entry.name, isDirectory: true))
+                removed.append(entry.name)
+            } catch {
+                logger.error("consolidation backup sweep: could not remove \(entry.name, privacy: .public): \(String(describing: error), privacy: .public)")
+            }
+        }
+        if !removed.isEmpty {
+            logger.info("consolidation backup sweep: removed \(removed.count, privacy: .public) backup(s), kept \(dated.count - removed.count, privacy: .public)")
+        }
+        return removed
+    }
+
+    /// `pre-consolidation-<yyyyMMdd'T'HHmmss'Z'>-<suffix>` → its stamp.
+    static func backupDirectoryDate(_ name: String) -> Date? {
+        let prefix = "pre-consolidation-"
+        guard name.hasPrefix(prefix) else { return nil }
+        let rest = name.dropFirst(prefix.count)
+        guard let dash = rest.firstIndex(of: "-") else { return nil }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        return fmt.date(from: String(rest[rest.startIndex..<dash]))
+    }
+
     /// SQLite online backup source → dest (full copy, consistent snapshot).
     static func onlineBackup(from source: URL, to dest: URL) throws {
         var sourceConfig = Configuration()
@@ -971,6 +1059,11 @@ public enum MemoryConsolidationGate {
     // tombstones, sorted by id. DELIBERATELY EXCLUDES use_count and
     // last_used_at: recall access bumps must not invalidate a staged
     // candidate (the swap carries those signals over instead).
+    // Proposal metadata IS canonical evidence: repeated observations update
+    // supporting sessions, recurrence, and confidence without changing status
+    // or resolved_at. Excluding it lets an approved stale candidate overwrite
+    // newer corroboration. Existing pre-metadata fingerprints fail the normal
+    // integrity check safely and require a newly staged candidate.
     // 2026-07-21 audit fix: INCLUDES embedding_epoch per row and the
     // memory_embedding_state row. An epoch ACTIVATION between stage and
     // approve rewrites embedding/embedding_epoch WITHOUT touching updated_at
@@ -1019,12 +1112,14 @@ public enum MemoryConsolidationGate {
             hasher.update(data: Data(line.utf8))
         }
         let proposals = try Row.fetchAll(db, sql: """
-            SELECT id, status, COALESCE(resolved_at, '') AS resolved, content
+            SELECT id, status, COALESCE(resolved_at, '') AS resolved, content,
+                   COALESCE(metadata_json, '') AS meta
             FROM main.proposals ORDER BY id
         """)
         for row in proposals {
             let line = "P|\(row["id"] as String? ?? "")|\(row["status"] as String? ?? "")|"
-                + "\(row["resolved"] as String? ?? "")|\(row["content"] as String? ?? "")\n"
+                + "\(row["resolved"] as String? ?? "")|\(row["content"] as String? ?? "")|"
+                + "\(row["meta"] as String? ?? "")\n"
             hasher.update(data: Data(line.utf8))
         }
         let tombstones = try Row.fetchAll(
@@ -1115,12 +1210,17 @@ public enum MemoryConsolidationGate {
     /// receipt is absent or unparseable (repair is best-effort).
     static func readReceipt(
         dataRoot: URL, runId: String
-    ) -> (status: String, backupPath: String?, reason: String?)? {
+    ) -> (status: String, at: String, backupPath: String?, reason: String?)? {
         guard let data = try? Data(contentsOf: receiptPath(dataRoot: dataRoot, runId: runId)),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let status = obj["status"] as? String else { return nil }
+              let receiptRunId = obj["run_id"] as? String,
+              receiptRunId == runId,
+              let status = obj["status"] as? String,
+              let at = obj["at"] as? String,
+              Self.parseISO8601(at) != nil else { return nil }
         return (
             status: status,
+            at: at,
             backupPath: obj["backup_path"] as? String,
             reason: obj["reason"] as? String
         )
@@ -1130,10 +1230,11 @@ public enum MemoryConsolidationGate {
         dataRoot: URL, runId: String, status: String,
         approvalId: String?, backupPath: String?, reason: String?
     ) {
+        let receiptAt = Self.iso8601(Date())
         let receipt: JSONValue = .object([
             "run_id": .string(runId),
             "status": .string(status),
-            "at": .string(Self.iso8601(Date())),
+            "at": .string(receiptAt),
             "approval_id": approvalId.map { .string($0) } ?? .null,
             "backup_path": backupPath.map { .string($0) } ?? .null,
             "reason": reason.map { .string($0) } ?? .null,
@@ -1143,8 +1244,68 @@ public enum MemoryConsolidationGate {
                 at: receiptsDir(dataRoot: dataRoot), withIntermediateDirectories: true)
             try receipt.serializedData(pretty: true)
                 .write(to: receiptPath(dataRoot: dataRoot, runId: runId), options: .atomic)
+            if status == "applied" || status == "applied_prior" {
+                reconcileAppliedMaintenanceTruth(
+                    dataRoot: dataRoot,
+                    runId: runId,
+                    status: status,
+                    at: receiptAt
+                )
+            }
         } catch {
             logger.error("consolidation receipt write failed for \(runId, privacy: .public): \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Project a terminal, fully reconciled consolidation onto the shared
+    /// maintenance-health receipt. `hygiene_last_run.json` is the canonical
+    /// body/UI health input, so leaving its prior `staged` value behind after
+    /// an approved swap makes healthy memory look permanently degraded.
+    ///
+    /// Existing malformed bytes are preserved and remain fail-closed. The
+    /// exact applied consolidation receipt remains the compatibility proof,
+    /// and a later reconciliation pass retries this projection.
+    static func reconcileAppliedMaintenanceTruth(
+        dataRoot: URL,
+        runId: String,
+        status: String,
+        at: String
+    ) {
+        guard status == "applied" || status == "applied_prior",
+              let appliedAt = Self.parseISO8601(at)
+        else { return }
+        let path = dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("hygiene_last_run.json")
+        var object: [String: Any] = [:]
+        if FileManager.default.fileExists(atPath: path.path) {
+            guard let data = try? Data(contentsOf: path),
+                  let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                logger.error("consolidation health projection refused unreadable hygiene receipt for \(runId, privacy: .public)")
+                return
+            }
+            object = existing
+        }
+        object["id"] = (object["id"] as? String) ?? "consolidation-\(runId)"
+        object["status"] = "completed"
+        object["reason"] = status == "applied_prior"
+            ? "approved consolidation was already applied and its projections were reconciled"
+            : "approved consolidation applied and its projections were reconciled"
+        object["version"] = (object["version"] as? String) ?? "swift-memory-v2-consolidator"
+        object["createdAt"] = at
+        object["nextScheduled"] = Self.iso8601(appliedAt.addingTimeInterval(7 * 24 * 60 * 60))
+        object["consolidationRunId"] = runId
+        do {
+            try FileManager.default.createDirectory(
+                at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try JSONSerialization.data(
+                withJSONObject: object,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            try data.write(to: path, options: .atomic)
+        } catch {
+            logger.error("consolidation health projection failed for \(runId, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -1329,7 +1490,7 @@ public enum MemoryConsolidationGate {
         return kind
     }
 
-    static func runId(of payload: JSONValue) -> String? {
+    public static func runId(of payload: JSONValue) -> String? {
         guard case .object(let obj) = payload,
               case .string(let runId)? = obj["run_id"] else { return nil }
         return runId
@@ -1351,5 +1512,14 @@ public enum MemoryConsolidationGate {
         let fmt = ISO8601DateFormatter()
         fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return fmt.string(from: date)
+    }
+
+    static func parseISO8601(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        return standard.date(from: value)
     }
 }

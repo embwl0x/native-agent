@@ -108,6 +108,35 @@ struct RuntimeBridgeBehaviorEvalTests {
         let changed = try card()
         #expect(changed["status"] as? String == "unread")
         #expect((changed["detail"] as? String)?.contains("second failure") == true)
+
+        // A proven recovery retires the actionable card, but marks that the
+        // archive was automatic so the same error in a NEW episode resurfaces.
+        // An older durable completion cannot close a newer failure card.
+        #expect(await BackgroundLoopsManager.resolveLoopFailureNotice(
+            dataRoot: root, loopId: "desk_notify",
+            healthyAt: Date(timeIntervalSince1970: 1_000_000),
+            now: Date(timeIntervalSince1970: 2_000_000_000)
+        ))
+        #expect(try card()["status"] as? String == "unread")
+
+        #expect(await BackgroundLoopsManager.resolveLoopFailureNotice(
+            dataRoot: root, loopId: "desk_notify",
+            healthyAt: Date(timeIntervalSince1970: 2_000_000_000),
+            now: Date(timeIntervalSince1970: 2_000_000_000)
+        ))
+        let recovered = try card()
+        #expect(recovered["status"] as? String == "archived")
+        #expect(recovered["resolved_reason"] as? String == "loop_recovered")
+        #expect(recovered["resolved_health_at"] != nil)
+
+        await BackgroundLoopsManager.fileLoopFailureNotice(
+            dataRoot: root,
+            loopId: "desk_notify",
+            error: "second failure"
+        )
+        let recurred = try card()
+        #expect(recurred["status"] as? String == "unread")
+        #expect(recurred["resolved_reason"] == nil)
     }
 
     @Test("heartbeat assembly reads its checklist from the supplied root and makes absence explicit")

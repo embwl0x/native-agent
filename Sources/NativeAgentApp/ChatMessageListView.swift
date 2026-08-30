@@ -27,13 +27,17 @@ struct MessageGroup: Identifiable {
 }
 
 enum ChatTranscriptPresentation {
+    static func hasVisibleText(_ text: String) -> Bool {
+        text.contains { !$0.isWhitespace }
+    }
+
     static func liveToolGroupID(
         groups: [MessageGroup],
         isStreaming: Bool,
         lastMessage: ChatMessage?
     ) -> String? {
         let assistantStarted = lastMessage?.role == "assistant"
-            && lastMessage?.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            && lastMessage.map { hasVisibleText($0.content) } == true
         guard isStreaming, !assistantStarted else { return nil }
         return groups.last(where: { $0.isToolGroup })?.id
     }
@@ -299,9 +303,14 @@ final class RenderAudit: @unchecked Sendable {
 // (count + last id).
 private final class _MessageGroupCache: @unchecked Sendable {
     static let shared = _MessageGroupCache()
+    private struct StableKey: Equatable {
+        var count: Int
+        var lastID: String?
+        var lastRole: String?
+    }
     private struct Slot {
-        var key: String
-        var stableKey: String
+        var stableKey: StableKey
+        var lastMessage: ChatMessage?
         var groups: [MessageGroup]
     }
     // chat-smoothness phase 1: one slot PER SESSION (FIFO-capped) — a detached
@@ -318,16 +327,17 @@ private final class _MessageGroupCache: @unchecked Sendable {
         // single key missed on EVERY delta tick, re-walking the whole list
         // ~20x/sec. Same shape + grown content now patches the cached last
         // group in place (O(1)) instead.
-        let stableKey = "\(sessionId):\(messages.count):\(messages.last?.id ?? ""):\(messages.last?.role ?? "")"
-        // Include the complete last-row display value, not only content length.
-        // Equal-length text replacement and metadata-only status updates must
-        // invalidate the row, while the stable key still enables the O(1)
-        // streaming-assistant patch below.
-        let key = "\(stableKey):\(messages.last?.hashValue ?? 0)"
+        // Keep the token-rate discriminator structural. The former String key
+        // interpolated the shape and then hashed the COMPLETE growing message
+        // on every delta, turning one long reply into quadratic total hashing
+        // work. The assistant patch below already replaces the exact tail row,
+        // so neither a content hash nor an allocated composite key is needed.
+        let stableKey = StableKey(
+            count: messages.count,
+            lastID: messages.last?.id,
+            lastRole: messages.last?.role
+        )
         lock.lock(); defer { lock.unlock() }
-        if let slot = slots[sessionId], slot.key == key {
-            return slot.groups
-        }
         // Fast path is assistant-only: only the streaming assistant bubble's
         // content ever grows in place, and _compute's visibility rules
         // (e.g. hiding "[tool:" system rows) can change with CONTENT for other
@@ -340,8 +350,17 @@ private final class _MessageGroupCache: @unchecked Sendable {
             var patched = lastGroup
             patched.messages[0] = last
             slot.groups[slot.groups.count - 1] = patched
-            slot.key = key
+            slot.lastMessage = last
             slots[sessionId] = slot
+            return slot.groups
+        }
+        // Non-streaming re-renders still receive an exact tail comparison.
+        // This preserves equal-length content and metadata invalidation without
+        // a collision-prone hash. (Interior rows are immutable in the live
+        // transcript contract; wholesale reloads carry a different tail.)
+        if let slot = slots[sessionId],
+           slot.stableKey == stableKey,
+           slot.lastMessage == messages.last {
             return slot.groups
         }
         RenderAudit.bump("grouper.compute")
@@ -352,7 +371,11 @@ private final class _MessageGroupCache: @unchecked Sendable {
                 slots.removeValue(forKey: slotOrder.removeFirst())
             }
         }
-        slots[sessionId] = Slot(key: key, stableKey: stableKey, groups: computed)
+        slots[sessionId] = Slot(
+            stableKey: stableKey,
+            lastMessage: messages.last,
+            groups: computed
+        )
         return computed
     }
 }
@@ -1107,7 +1130,7 @@ struct MessageBubble: View {
     /// Whether this is the last assistant message in the list (enables Regenerate action)
     var isLastAssistant: Bool = false
 
-    @State private var voiceOutput = VoiceOutputController()
+    @State private var voiceOutput = VoiceOutputController.sharedMessagePlayback
     @Environment(AppModel.self) private var appModel
     @State private var showJSONSheet = false
     @State private var bubbleToast: String? = nil
@@ -1117,6 +1140,12 @@ struct MessageBubble: View {
         message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
     private var isUser: Bool { normalizedRole == "user" }
+    private var speechOwnerID: String {
+        "message:\(message.sessionId ?? "unknown"):\(message.id)"
+    }
+    private var isReadingThisMessage: Bool {
+        voiceOutput.isSpeaking(ownerID: speechOwnerID)
+    }
 
     private var messageProvenance: MacChatMessageProvenance? {
         MacChatMessageProvenance.make(
@@ -1141,6 +1170,15 @@ struct MessageBubble: View {
 
     var body: some View {
         let _ = RenderAudit.bump("bubble.body")
+        // One immutable projection per bubble pass. These were four separate
+        // computed-property reads, each of which partitioned the full
+        // attachment array twice. The streaming tail also built a trimmed copy
+        // of the entire growing reply merely to test for visible content.
+        let attachments = ChatAttachmentPresentation.partition(
+            message.metadata?.attachments ?? []
+        )
+        let hasVisibleContent = ChatTranscriptPresentation.hasVisibleText(message.content)
+        let timestamp = UserDisplayFormatters.chatTimestamp(message.createdAt)
         HStack(alignment: .bottom, spacing: NativeAgentSpacing.sm) {
             if isUser { Spacer(minLength: 60) }
 
@@ -1177,15 +1215,15 @@ struct MessageBubble: View {
 
                 // Message content bubble
                 VStack(alignment: isUser ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
-                    if !trimmedContent.isEmpty {
+                    if hasVisibleContent {
                         renderedMessageText
-                    } else if localImageAttachments.isEmpty && nonImageAttachments.isEmpty {
+                    } else if attachments.localImages.isEmpty && attachments.chips.isEmpty {
                         Text(" ")
                     }
-                    ForEach(localImageAttachments, id: \.id) { attachment in
+                    ForEach(attachments.localImages, id: \.id) { attachment in
                         MessageLocalImageAttachmentView(attachment: attachment)
                     }
-                    ForEach(nonImageAttachments, id: \.id) { attachment in
+                    ForEach(attachments.chips, id: \.id) { attachment in
                         MessageAttachmentChipView(attachment: attachment)
                     }
                 }
@@ -1224,7 +1262,7 @@ struct MessageBubble: View {
                             Button {
                                 toggleReadAloud()
                             } label: {
-                                Label(voiceOutput.isSpeaking ? "Stop reading" : "Read aloud", systemImage: voiceOutput.isSpeaking ? "speaker.slash" : "speaker.wave.2")
+                                Label(isReadingThisMessage ? "Stop reading" : "Read aloud", systemImage: isReadingThisMessage ? "speaker.slash" : "speaker.wave.2")
                             }
                         }
 
@@ -1301,7 +1339,7 @@ struct MessageBubble: View {
                 // layout permanently; the text overflow-draws into the
                 // inter-bubble gap (where the inserted row used to render) and
                 // only its opacity tracks hover.
-                Text(displayTimestamp)
+                Text(timestamp)
                     .font(NativeAgentFont.tag)
                     .foregroundStyle(.tertiary)
                     // Yield to bubbleToast below — both draw into the same
@@ -1351,9 +1389,8 @@ struct MessageBubble: View {
         // them in the bubble toast. Cleared after showing so a repeat failure
         // re-fires.
         .onChange(of: voiceOutput.errorMessage) {
-            if let msg = voiceOutput.errorMessage {
+            if let msg = voiceOutput.consumeError(ownerID: speechOwnerID) {
                 showBubbleToast(msg)
-                voiceOutput.errorMessage = nil
             }
         }
     }
@@ -1367,7 +1404,7 @@ struct MessageBubble: View {
     }
 
     private func toggleReadAloud() {
-        if voiceOutput.isSpeaking {
+        if isReadingThisMessage {
             voiceOutput.stop()
             return
         }
@@ -1375,7 +1412,8 @@ struct MessageBubble: View {
         Task {
             await voiceOutput.speak(
                 text: message.content,
-                resolution: VoiceOutputModeSelection.resolve(for: appModel.trustPolicy)
+                resolution: VoiceOutputModeSelection.resolve(for: appModel.trustPolicy),
+                ownerID: speechOwnerID
             )
         }
     }
@@ -1447,31 +1485,10 @@ struct MessageBubble: View {
         }
     }
 
-    private var trimmedContent: String {
-        message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
     private var messageNeedsRetry: Bool {
         message.metadata?.error?.isEmpty == false
             || message.metadata?.partial == true
             || message.metadata?.cancelled == true
-    }
-
-    private var displayTimestamp: String {
-        UserDisplayFormatters.chatTimestamp(message.createdAt)
-    }
-
-    private var localImageAttachments: [PersistedAttachment] {
-        ChatAttachmentPresentation.partition(message.metadata?.attachments ?? []).localImages
-    }
-
-    /// Sweep R4 C14: everything the image branch above filters OUT used to
-    /// render NOTHING — attach a PDF and the bubble was blank. These get a
-    /// compact chip so the transcript still shows what was sent. Deliberately
-    /// includes image-typed rows with no local path: the bytes are gone, but
-    /// the fact that an image was attached is not.
-    private var nonImageAttachments: [PersistedAttachment] {
-        ChatAttachmentPresentation.partition(message.metadata?.attachments ?? []).chips
     }
 
     private func postFeedback(messageId: String, rating: String) {

@@ -10,9 +10,14 @@ final class ChatToastQueue {
     private var queue: [String] = []
     private var recentKeys: [(key: String, at: Date)] = []
     private let displayDuration: TimeInterval
+    @ObservationIgnored private let visibleEntryDidChange: @MainActor @Sendable (String?) -> Void
 
-    init(displayDuration: TimeInterval = 2.0) {
+    init(
+        displayDuration: TimeInterval = 2.0,
+        visibleEntryDidChange: @escaping @MainActor @Sendable (String?) -> Void = { _ in }
+    ) {
         self.displayDuration = max(0, displayDuration)
+        self.visibleEntryDidChange = visibleEntryDidChange
     }
 
     /// `deduplicating: false` is for the chat composer sink: every call there
@@ -39,11 +44,16 @@ final class ChatToastQueue {
 
     private func advance() {
         guard !queue.isEmpty else { return }
-        current = queue.removeFirst()
+        setVisibleEntry(queue.removeFirst())
         DispatchQueue.main.asyncAfter(deadline: .now() + displayDuration) {
-            self.current = nil
+            self.setVisibleEntry(nil)
             self.advance()
         }
+    }
+
+    private func setVisibleEntry(_ entry: String?) {
+        current = entry
+        visibleEntryDidChange(entry)
     }
 
     private func normalizedKey(_ value: String) -> String {

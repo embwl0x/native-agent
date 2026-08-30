@@ -109,12 +109,16 @@ private final class DualTransportScriptedLLM: StreamingLLMClient, MessagesStream
     }
 
     private let scripts: [[String]]
+    private let onProviderCall: @Sendable () -> Void
     private let lock = NSLock()
     private var _promptCalls: [PromptCall] = []
     private var _messagesCalls: [MessagesCall] = []
     private var _serveIndex = 0
 
-    init(scripts: [[String]]) { self.scripts = scripts }
+    init(scripts: [[String]], onProviderCall: @escaping @Sendable () -> Void = {}) {
+        self.scripts = scripts
+        self.onProviderCall = onProviderCall
+    }
 
     var promptCalls: [PromptCall] {
         lock.lock(); defer { lock.unlock() }
@@ -146,6 +150,7 @@ private final class DualTransportScriptedLLM: StreamingLLMClient, MessagesStream
         ))
         let chunks = nextScript()
         lock.unlock()
+        onProviderCall()
         return AsyncThrowingStream { continuation in
             Task {
                 for c in chunks { continuation.yield(c) }
@@ -171,6 +176,7 @@ private final class DualTransportScriptedLLM: StreamingLLMClient, MessagesStream
         ))
         let chunks = nextScript()
         lock.unlock()
+        onProviderCall()
         return AsyncThrowingStream { continuation in
             Task {
                 for c in chunks { continuation.yield(.textDelta(c)) }
@@ -222,6 +228,51 @@ private struct CompatObservation {
     let persistedRows: [[String]]
     let llm: DualTransportScriptedLLM
     let finalElapsedMs: Int?
+    let finalProviderCallCount: Int?
+}
+
+private final class TextCompatManualMonotonicClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func now() -> UInt64 { lock.withLock { value } }
+
+    func advance(seconds: TimeInterval) {
+        lock.withLock { value += UInt64(seconds * 1_000_000_000) }
+    }
+}
+
+private final class TextCompatCountingCatalogTools: ToolDispatchClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var namesReadCount = 0
+    private var schemasReadCount = 0
+    private let schema = LLMToolSchema(
+        name: "read_file",
+        description: "Read a file",
+        parametersJSON: Data(#"{"type":"object"}"#.utf8)
+    )
+
+    var catalogReadCounts: (names: Int, schemas: Int) {
+        lock.withLock { (namesReadCount, schemasReadCount) }
+    }
+
+    func dispatch(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        .string("probe")
+    }
+
+    func listAvailableTools() async throws -> [String] {
+        lock.withLock { namesReadCount += 1 }
+        return [schema.name]
+    }
+
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
+        lock.withLock { schemasReadCount += 1 }
+        return [schema]
+    }
 }
 
 private func boolPayload(_ event: TurnTraceEvent, _ key: String) -> Bool? {
@@ -256,7 +307,8 @@ private func runCompatScenario(
     reasoningEffort: String = "high",
     suppressUserAppend: Bool = false,
     wedgeToolTranscriptDirectory: Bool = false,
-    turnTraceBus: TurnTraceBus = .shared
+    turnTraceBus: TurnTraceBus = .shared,
+    onProviderCall: @escaping @Sendable () -> Void = {}
 ) async throws -> CompatObservation {
     let root = try makeTempRoot(tag)
     if writeAuth { try writeOAuthFixture(root) }
@@ -268,7 +320,7 @@ private func runCompatScenario(
         )
     }
     let llm = UnusedLLM()
-    let dual = DualTransportScriptedLLM(scripts: scripts)
+    let dual = DualTransportScriptedLLM(scripts: scripts, onProviderCall: onProviderCall)
     let streaming: any StreamingLLMClient = promptOnlyClient
         ? MockStreamingLLMClient(chunks: scripts.first ?? [])
         : dual
@@ -296,6 +348,7 @@ private func runCompatScenario(
     var deltas: [String] = []
     var finalReply: String?
     var finalElapsedMs: Int?
+    var finalProviderCallCount: Int?
     var toolUses: [String] = []
     var toolResults: [String] = []
     var notices: [(kind: String, text: String)] = []
@@ -310,7 +363,10 @@ private func runCompatScenario(
             ) {
                 switch event {
                 case .delta(let s): deltas.append(s)
-                case .final(let r): finalReply = r.reply; finalElapsedMs = r.elapsedMs
+                case .final(let r):
+                    finalReply = r.reply
+                    finalElapsedMs = r.elapsedMs
+                    finalProviderCallCount = r.providerCallCount
                 case .toolUse(let name, _): toolUses.append(name)
                 case .toolResult(let name, _): toolResults.append(name)
                 case .error(let m): errors.append(m)
@@ -328,8 +384,65 @@ private func runCompatScenario(
         errors: errors,
         persistedRows: readPersistedRoleContent(root, sessionId: sessionId),
         llm: dual,
-        finalElapsedMs: finalElapsedMs
+        finalElapsedMs: finalElapsedMs,
+        finalProviderCallCount: finalProviderCallCount
     )
+}
+
+@Test
+func textCompatWholeTurnBudget_usesExistingExhaustionTerminalWithoutSleeping() async throws {
+    let clock = TextCompatManualMonotonicClock()
+    let marker = #"<tool_use id="budget-1" name="read_file">{"path":"probe.txt"}</tool_use>"#
+    let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
+
+    let observation = try await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
+        try await runCompatScenario(
+            tag: "whole-turn-budget",
+            scripts: [[marker], ["must not start"]],
+            tools: MockToolDispatchClient(scripted: ["read_file": .string("probe")]),
+            grownPromptCompat: false,
+            // 601 > the 600s interactive ceiling (was 181 vs the old 180s;
+            // 57c5703a raised the ceiling without touching this advance, so
+            // the budget never tripped and the second script iteration ran).
+            onProviderCall: { clock.advance(seconds: 601) }
+        )
+    }
+
+    #expect(observation.errors.isEmpty)
+    #expect(observation.llm.messagesCalls.count == 1)
+    #expect(observation.finalProviderCallCount == 1)
+    #expect(observation.toolUses == ["read_file"])
+    #expect(observation.toolResults == ["read_file"])
+    #expect(
+        observation.finalReply == ToolLoopExhaustion.fallbackReply(
+            iterationLimit: ToolLoopBudget.defaultIterations(for: "chat"),
+            dispatchCount: 1,
+            providerRounds: 1,
+            wallClockElapsedSeconds: 601
+        )
+    )
+}
+
+@Test
+func textCompatCatalogPreload_reusesSchemaWalkForTwoTotalCatalogReads() async throws {
+    let tools = TextCompatCountingCatalogTools()
+
+    let observation = try await runCompatScenario(
+        tag: "catalog-seed",
+        scripts: [["catalog ready"]],
+        tools: tools,
+        grownPromptCompat: false
+    )
+
+    #expect(observation.errors.isEmpty)
+    #expect(observation.finalReply == "catalog ready")
+    #expect(observation.llm.messagesCalls.count == 1)
+    let counts = tools.catalogReadCounts
+    // Before A3 this path performed preload schemas + context names + context
+    // schemas (3 walks). The exact-scope seed removes only the redundant
+    // context schema build, leaving the independent names walk intact.
+    #expect(counts.names == 1)
+    #expect(counts.schemas == 1)
 }
 
 // MARK: - Ledger eval: chat.textCompat.appendOnlyMessagesEligibility
@@ -660,8 +773,10 @@ func textCompatQA3_multiCallIteration_singleResultsMessage_equivalent() async th
     )
     expectShapeEquivalent(new, old, scenario: "QA3")
     #expect(new.finalReply == "both done")
-    // Serial dispatch order preserved (this path's own loop is serial by
-    // shipped design — item 9 does not fork its dispatch semantics).
+    // INDEX order preserved. Since A1 (2026-08-28) these two parallel-safe
+    // calls dispatch CONCURRENTLY through the shared group runner, so this is
+    // no longer a statement about serial execution — it is the order contract
+    // that survives it (see TextCompatParallelDispatchTests).
     #expect(new.toolUses == ["read_file", "recall_memory"])
 
     // ONE appended user message carries BOTH results, in dispatch order.

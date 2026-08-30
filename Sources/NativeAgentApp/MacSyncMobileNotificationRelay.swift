@@ -3,6 +3,17 @@ import NativeAgentShared
 import PersistenceCore
 
 enum MacSyncMobileNotificationRelay {
+    private enum PushTokenStoreError: LocalizedError {
+        case invalidTopLevel(path: URL, expected: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidTopLevel(let path, let expected):
+                return "Existing push-token store \(path.lastPathComponent) is not a \(expected); registration was not changed."
+            }
+        }
+    }
+
     static func storePushToken(
         deviceId: String,
         token: String,
@@ -14,27 +25,29 @@ enum MacSyncMobileNotificationRelay {
         let path = dataRoot
             .appendingPathComponent("notifications", isDirectory: true)
             .appendingPathComponent("push_tokens.json")
-        try? FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
         let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let current = await persistence.readJSON(path, defaultValue: .object([:]))
-            var root: [String: JSONValue]
-            if case .object(let object) = current {
-                root = object
-            } else {
-                root = [:]
-            }
+        let legacyPath = dataRoot
+            .appendingPathComponent("mobile_push", isDirectory: true)
+            .appendingPathComponent("tokens.json")
+        // One registration owns both projections. Separate per-file locks can
+        // interleave two rotations of the same APNs token and leave canonical
+        // and compatibility stores naming different devices. Reading both
+        // before either write also makes malformed existing authority
+        // fail-closed instead of silently replacing it with a one-row store.
+        let registrationLock = dataRoot
+            .appendingPathComponent("notifications", isDirectory: true)
+            .appendingPathComponent("push-token-registration")
+        try await persistence.withFileLock(registrationLock) {
+            var root = try readObjectStore(path)
+            var rows = try readArrayStore(legacyPath)
             // A push token is one device credential. When APNs reassigns or a
             // restored phone presents an existing token under a new device id,
             // retain only the newest owner in BOTH canonical and compatibility
             // stores; otherwise fan-out can target a stale device identity.
-            for (existingDeviceID, value) in root where existingDeviceID != deviceId {
-                guard case .object(let existing) = value,
-                      jsonString(existing["token"]) == token else { continue }
-                root.removeValue(forKey: existingDeviceID)
+            root = root.filter { existingDeviceID, value in
+                guard existingDeviceID != deviceId,
+                      case .object(let existing) = value else { return true }
+                return jsonString(existing["token"]) != token
             }
             var entry: [String: JSONValue] = [:]
             entry["deviceId"] = .string(deviceId)
@@ -44,46 +57,44 @@ enum MacSyncMobileNotificationRelay {
             entry["bundleId"] = .string(bundleId)
             entry["lastSeen"] = .string(now)
             root[deviceId] = .object(entry)
-            try await persistence.writeJSON(.object(root), to: path)
-        }
-
-        let legacyPath = dataRoot
-            .appendingPathComponent("mobile_push", isDirectory: true)
-            .appendingPathComponent("tokens.json")
-        try? FileManager.default.createDirectory(
-            at: legacyPath.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try await persistence.withFileLock(legacyPath) {
-            let current = await persistence.readJSON(legacyPath, defaultValue: .array([]))
-            var rows: [JSONValue]
-            if case .array(let array) = current {
-                rows = array
-            } else {
-                rows = []
-            }
-            let entry: [String: JSONValue] = [
+            let legacyEntry: [String: JSONValue] = [
                 "deviceId": .string(deviceId),
                 "token": .string(token),
                 "environment": .string(environment),
                 "bundleId": .string(bundleId),
                 "updatedAt": .string(now),
             ]
-            var replaced = false
-            for index in rows.indices {
-                guard case .object(let row) = rows[index] else { continue }
+            // Remove every stale match before appending the one current owner.
+            // Replacing rows in place preserved pre-existing duplicates.
+            rows.removeAll { value in
+                guard case .object(let row) = value else { return false }
                 let existingDeviceId = jsonString(row["deviceId"]) ?? jsonString(row["device_id"])
                 let existingToken = jsonString(row["token"])
-                if existingDeviceId == deviceId || existingToken == token {
-                    rows[index] = .object(entry)
-                    replaced = true
-                }
+                return existingDeviceId == deviceId || existingToken == token
             }
-            if !replaced {
-                rows.append(.object(entry))
-            }
+            rows.append(.object(legacyEntry))
+
+            try await persistence.writeJSON(.object(root), to: path)
             try await persistence.writeJSON(.array(rows), to: legacyPath)
         }
+    }
+
+    private static func readObjectStore(_ path: URL) throws -> [String: JSONValue] {
+        guard FileManager.default.fileExists(atPath: path.path) else { return [:] }
+        let value = try JSONValue.parse(Data(contentsOf: path))
+        guard case .object(let object) = value else {
+            throw PushTokenStoreError.invalidTopLevel(path: path, expected: "JSON object")
+        }
+        return object
+    }
+
+    private static func readArrayStore(_ path: URL) throws -> [JSONValue] {
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        let value = try JSONValue.parse(Data(contentsOf: path))
+        guard case .array(let array) = value else {
+            throw PushTokenStoreError.invalidTopLevel(path: path, expected: "JSON array")
+        }
+        return array
     }
 
     @discardableResult

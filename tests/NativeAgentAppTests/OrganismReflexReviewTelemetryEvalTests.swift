@@ -8,16 +8,17 @@ import Testing
 // Ledger row: telemetry.organism_debug/organism_reflex_review
 //
 // The debug route's event is the audit link between a durable organism reflex
-// receipt and the bounded bridge event ring. These checks use the real event
-// payload and BridgeEvent encoding, then pin the route that sends that payload
-// to the actual publisher. They deliberately distinguish a receipt-backed
+// receipt and the bounded bridge event ring. These checks execute the same two
+// production emitters used by the endpoint and inspect the real ring without a
+// listener or live runtime. They deliberately distinguish a receipt-backed
 // review from disabled, unavailable, and durable-write failure outcomes.
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Suite("Organism reflex review telemetry", .serialized)
 struct OrganismReflexReviewTelemetryEvalTests {
-    @Test("receipt-backed reviews publish an attributable bounded event")
-    func receiptBackedReviewEvent() throws {
+    @Test("production emitters preserve exact kind payload and redaction contracts")
+    func productionEmittersPreserveRoutingAndRedaction() throws {
+        let bridge = ClaudeBridge()
         let reviewedAt = Date(timeIntervalSince1970: 1_700_000_000)
         let telemetry = ClaudeBridge.OrganismReflexReviewTelemetry(
             candidateID: "  candidate-17  ",
@@ -45,19 +46,36 @@ struct OrganismReflexReviewTelemetryEvalTests {
         #expect(payload["source"] as? String == "organism_debug_bridge")
         #expect(payload["failureDetail"] is NSNull)
 
-        let event = ClaudeBridge.BridgeEvent(
-            seq: 17,
-            timestamp: reviewedAt,
-            kind: "organism_reflex_review",
-            payload: payload
+        bridge.publishOrganismDebugEvent(
+            status: "active",
+            scenario: "provider_brittle",
+            ttlSeconds: 37
         )
-        #expect(JSONSerialization.isValidJSONObject(event.asJSON))
-        #expect(event.asJSON["kind"] as? String == "organism_reflex_review")
-        #expect(event.asJSON["receiptId"] as? String == "receipt-17")
+        bridge.publishOrganismReflexReviewEvent(telemetry)
+
+        let events = bridge.recentEventPayloads()
+        #expect(events.count == 2)
+        #expect(events[0]["seq"] as? UInt64 == 1)
+        #expect(events[0]["kind"] as? String == "organism_debug")
+        #expect(Set(events[0].keys) == ["seq", "timestamp", "kind", "status", "scenario", "ttlSeconds"])
+        #expect(events[0]["status"] as? String == "active")
+        #expect(events[0]["scenario"] as? String == "provider_brittle")
+        #expect(events[0]["ttlSeconds"] as? Int == 37)
+
+        #expect(events[1]["seq"] as? UInt64 == 2)
+        #expect(events[1]["kind"] as? String == "organism_reflex_review")
+        #expect(Set(events[1].keys) == Set(payload.keys).union(["seq", "timestamp", "kind"]))
+        #expect(events[1]["receiptId"] as? String == "receipt-17")
+        #expect(events[1]["mutationRecorded"] as? Bool == true)
+        #expect(events[1]["source"] as? String == "organism_debug_bridge")
+        #expect(events[1]["pattern"] == nil)
+        #expect(events[1]["note"] == nil)
+        #expect(JSONSerialization.isValidJSONObject(events))
     }
 
     @Test("disabled unavailable and failed reviews remain non-mutations with bounded payloads")
     func adverseReviewOutcomes() {
+        let bridge = ClaudeBridge()
         let tooLongID = "  " + String(repeating: "c", count: 500)
         let tooLongFailure = String(repeating: "x", count: 900)
         let outcomes: [(OrganismReflexReviewApplyStatus, Int)] = [
@@ -92,7 +110,23 @@ struct OrganismReflexReviewTelemetryEvalTests {
             #expect(payload["status"] as? String == status.rawValue)
             #expect(JSONSerialization.isValidJSONObject(payload))
             #expect(ClaudeBridge.organismReflexReviewHTTPStatus(for: status) == expectedHTTPStatus)
+            bridge.publishOrganismReflexReviewEvent(telemetry)
         }
+
+        let events = bridge.recentEventPayloads()
+        #expect(events.count == outcomes.count)
+        #expect(events.map { $0["seq"] as? UInt64 } == [1, 2, 3, 4, 5, 6])
+        #expect(events.allSatisfy { $0["kind"] as? String == "organism_reflex_review" })
+        #expect(events.allSatisfy { $0["mutationRecorded"] as? Bool == false })
+        #expect(events.allSatisfy { $0["receiptId"] is NSNull && $0["reviewedAt"] is NSNull })
+
+        // A failed review is telemetry, not a publisher failure: the next
+        // unrelated organism event must still enter the ring in sequence.
+        bridge.publishOrganismDebugEvent(status: "cleared")
+        let afterFailure = bridge.recentEventPayloads()
+        #expect(afterFailure.last?["seq"] as? UInt64 == 7)
+        #expect(afterFailure.last?["kind"] as? String == "organism_debug")
+        #expect(Set(afterFailure.last?.keys.map { $0 } ?? []) == ["seq", "timestamp", "kind", "status"])
     }
 
     @Test("debug route publishes the typed outcome before reporting success")
@@ -102,8 +136,23 @@ struct OrganismReflexReviewTelemetryEvalTests {
 
         #expect(route.contains("runtime.applyOrganismReflexReview("))
         #expect(!route.contains("runtime.reviewOrganismReflexCandidate("))
-        #expect(route.contains("self.publishEvent(kind: \"organism_reflex_review\", payload: telemetry.payload)"))
-        #expect(route.contains("guard telemetry.mutationRecorded else"))
+        #expect(AppSourceScraping.occurrences(
+            of: "self.publishOrganismDebugEvent(",
+            in: route
+        ) == 4)
+        for status in ["reset", "settled", "cleared"] {
+            #expect(AppSourceScraping.occurrences(
+                of: "self.publishOrganismDebugEvent(status: \"\(status)\")",
+                in: route
+            ) == 1)
+        }
+        let reviewPublication = try #require(
+            route.range(of: "self.publishOrganismReflexReviewEvent(telemetry)")
+        )
+        let mutationRecordedGuard = try #require(
+            route.range(of: "guard telemetry.mutationRecorded else")
+        )
+        #expect(reviewPublication.lowerBound < mutationRecordedGuard.lowerBound)
         #expect(route.contains("\"status\": \"not_reviewed\""))
     }
 }

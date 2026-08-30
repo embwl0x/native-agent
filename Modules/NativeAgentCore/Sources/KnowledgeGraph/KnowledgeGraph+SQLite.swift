@@ -53,6 +53,18 @@ extension KnowledgeGraphStore {
     public static let sqliteIncidentEdgeLimit = 2_000
     public static let sqliteCompleteSnapshotRelationshipLimit = 100_000
 
+    /// The "now" the SQL recency ordering compares `last_seen` against, rendered
+    /// in the same ISO-8601 shape the indexer writes so the comparison is a
+    /// plain lexicographic one. Stored values carry either a `Z` or a `+00:00`
+    /// suffix; those differ only after the seconds field, so ordering by string
+    /// agrees with ordering by instant everywhere except a sub-second tie, which
+    /// no ranking decision rests on.
+    static func orderingTimestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
     /// Load from `<memoryDir>/memory.sqlite` (kg_entities + kg_relationships).
     /// If the tables are empty AND `jsonImportPath` exists AND the sentinel
     /// `<memoryDir>/.kg_migrated_to_sqlite_v1` is missing, ingest the JSON
@@ -160,7 +172,8 @@ extension KnowledgeGraphStore {
     public static func searchFromMemoryV2(
         memoryDir: URL,
         jsonImportPath: URL?,
-        query: String
+        query: String,
+        now: Date = Date()
     ) async throws -> JSONValue {
         let qLower = query.lowercased()
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -196,8 +209,29 @@ extension KnowledgeGraphStore {
                 // before applying the candidate cap. Ordering only by id could
                 // discard an exact name match merely because its id sorted
                 // after 2,000 weaker summary/token matches.
+                //
+                // B5 (2026-08-28): the recency term sits BETWEEN the match-class
+                // bucket and `id`, so it can only reorder rows the matcher
+                // already considers equally good — never promote a weaker match
+                // class. Its real job is the candidate cap: when a generic query
+                // matches more than `sqliteSearchCandidateLimit` rows, the rows
+                // that survive into the Swift reranker are now the recently seen
+                // ones instead of whichever ids happened to sort first.
+                //
+                // The CASE is load-bearing, not decoration (gpt-5.5 review HIGH,
+                // 2026-08-28). A raw `last_seen DESC` ranks FUTURE and MALFORMED
+                // timestamps as the freshest rows in the store, and it does so
+                // BEFORE the LIMIT — so junk can evict valid candidates from the
+                // window entirely, and the Swift reranker never gets to apply
+                // its `recencyScore == 0` rule to them. Stage 1 must therefore
+                // enforce the same invariant stage 2 does. Folding NULL and
+                // `last_seen > now` to '' sorts both as oldest under DESC, which
+                // also catches non-parseable junk: text like "not a date" is
+                // lexicographically greater than any ISO year, so it lands in
+                // the same clamped bucket rather than at the top.
                 arguments.append(qLower)
                 arguments.append(qLower)
+                arguments.append(Self.orderingTimestamp(now))
                 arguments.append(sqliteSearchCandidateLimit)
                 let rows = try Row.fetchAll(db, sql: """
                     SELECT id, name, type, summary, aliases_json, mention_count,
@@ -208,7 +242,12 @@ extension KnowledgeGraphStore {
                         WHEN instr(\(nameHaystack), ?) > 0 THEN 0
                         WHEN instr(\(haystack), ?) > 0 THEN 1
                         ELSE 2
-                    END, id
+                    END,
+                    CASE
+                        WHEN last_seen IS NULL OR last_seen > ? THEN ''
+                        ELSE last_seen
+                    END DESC,
+                    id
                     LIMIT ?
                     """, arguments: StatementArguments(arguments))
                 let values = rows.compactMap(entityValue)
@@ -226,7 +265,9 @@ extension KnowledgeGraphStore {
                     edges: []
                 )
                 return .object([
-                    "results": .array(candidates.searchEntities(query))
+                    // Both ranking stages share ONE clock, so a row can never be
+                    // "fresh" to the prefilter and "future" to the reranker.
+                    "results": .array(candidates.searchEntities(query, now: now))
                 ])
             }
         }

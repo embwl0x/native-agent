@@ -43,7 +43,7 @@
       "reads": "the TurnTraceBus sink while running each of the three entries (executeStructuredChat, executeStructuredChatStreaming, runTextStreamingCompatibility) against a scripted client",
       "tier": "test"
      },
-     "silentFailureMode": "dropped row \u2192 SILENT UNDERCOUNT. These three call sites are the ONLY emitters of `turn.accepted` in the repo (grep: 3 hits, all in this fence) and the instrument counts turns from that kind. A lane that stops emitting it reports as FEWER TURNS, never as an error \u2014 the exact shape that makes 'she felt slower this week' unmeasurable. Repo-wide grep over Modules/NativeAgentCore/Tests + tests for \"turn.accepted\"/turnAccepted returns ZERO: no test drives any of the three lanes and asserts the row lands.",
+     "silentFailureMode": "dropped row \u2192 SILENT UNDERCOUNT. These three call sites are the ONLY emitters of `turn.accepted` in the repo (grep: 3 hits, all in this fence) and the instrument counts turns from that kind. A lane that stops emitting it reports as FEWER TURNS, never as an error \u2014 the exact shape that makes 'they felt slower this week' unmeasurable. Repo-wide grep over Modules/NativeAgentCore/Tests + tests for \"turn.accepted\"/turnAccepted returns ZERO: no test drives any of the three lanes and asserts the row lands.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+StructuredChat.swift:130 (observedBy structured_chat.entry) / :516 (structured_stream.entry) / ChatOrchestrationClient+TextCompatibility.swift:310 (text_compat.entry)",
      "writes": [
       "data/turn_traces/*.jsonl \u2192 kind 'turn.accepted'"
@@ -496,7 +496,7 @@
       "reads": "SessionDigestProvider over one dataRoot, called twice within a session with a source file MUTATED in between",
       "tier": "test"
      },
-     "silentFailureMode": "fail-open by design \u21d2 silent zero, plus a cache hazard. Every source is deliberately fail-open (a missing/corrupt source just drops out), so the 'since last session' block can shrink to nothing without a single error \u2014 she simply stops knowing what happened while she was away, and nothing distinguishes that from a quiet week. The second mode is cost: the digest sits in the STABLE cached prefix and MUST be per-session-constant; anything that makes it recompute differently mid-session (a source whose content moves, an mtime-ordered read) churns the cached prefix on every turn of that session and re-pays the full input tokens, correctness untouched. Neither the fail-open collapse nor the per-session constancy is measured live.",
+     "silentFailureMode": "fail-open by design \u21d2 silent zero, plus a cache hazard. Every source is deliberately fail-open (a missing/corrupt source just drops out), so the 'since last session' block can shrink to nothing without a single error \u2014 they simply stops knowing what happened while they was away, and nothing distinguishes that from a quiet week. The second mode is cost: the digest sits in the STABLE cached prefix and MUST be per-session-constant; anything that makes it recompute differently mid-session (a source whose content moves, an mtime-ordered read) churns the cached prefix on every turn of that session and re-pays the full input tokens, correctness untouched. Neither the fail-open collapse nor the per-session constancy is measured live.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SessionDigestProvider.swift:1 (assembled from chat/sessions.json, traces/events.jsonl, workshop/executions, dream_diary/*.md, docs/agent_inbox/from_*.md, ~/.claude/state/claude-worklog.jsonl); injected at ChatOrchestration+SessionHistory.swift:816 at the END of the STABLE system segment"
     },
     {
@@ -521,7 +521,7 @@
       "reads": "data/turn_traces/*.jsonl \u2192 context.summary flags/counts, counting turns where the rut cue was injected vs total turns per surface in the window",
       "tier": "instrument"
      },
-     "silentFailureMode": "persona-cue invisible target. This is the anti-self-quote-rut machinery \u2014 the cue only fires when `pendingRutCue` matches recent assistant messages, which is an English-shape heuristic over her own output. A drift in her phrasing (or a change in how history is projected into `messages`) silently stops the cue from ever firing: the turn is still valid, the baseline is still there, and the only symptom is that she starts repeating herself again \u2014 the exact failure this cue exists to prevent, and the exact failure that reads as 'the model got worse', not 'a cue stopped firing'. Nothing counts how often the cue fires in production. The fragment lists no expression/persona turn ingredient at all.",
+     "silentFailureMode": "persona-cue invisible target. This is the anti-self-quote-rut machinery \u2014 the cue only fires when `pendingRutCue` matches recent assistant messages, which is an English-shape heuristic over their own output. A drift in their phrasing (or a change in how history is projected into `messages`) silently stops the cue from ever firing: the turn is still valid, the baseline is still there, and the only symptom is that they starts repeating themselves again \u2014 the exact failure this cue exists to prevent, and the exact failure that reads as 'the model got worse', not 'a cue stopped firing'. Nothing counts how often the cue fires in production. The fragment lists no expression/persona turn ingredient at all.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/NaturalExpressionGuidance.swift:1 (baseline \u2192 stable segment; rutCue \u2192 dynamic segment via pendingRutCue(from:)); carried on TurnContext.naturalExpressionCue (ChatOrchestration+TurnEngine.swift:269)"
     },
     {
@@ -546,7 +546,7 @@
       "reads": "the session JSONL after enqueueUserMessage followed by (a) a suppressed turn, (b) NO turn at all",
       "tier": "test"
      },
-     "silentFailureMode": "dropped turn / double-append, both quiet. Ack-on-enqueue deliberately SPLITS delivery acknowledgement from turn execution: the row lands, the transport says 'delivered', and the turn is run separately with suppressUserAppend: true. Two silent halves follow. (1) If the caller acks and then fails to start the turn (crash, deadline, an early return), the user's message sits in the transcript with no reply and no failure row \u2014 she looks like she ignored him. (2) If suppressUserAppend is dropped anywhere downstream the message double-appends, which the fragment's own chat.client.chatStream note flags as transcript-only dedupe. The pairing is enforced by convention at ONE call site, with nothing asserting the two halves stay matched.",
+     "silentFailureMode": "dropped turn / double-append, both quiet. Ack-on-enqueue deliberately SPLITS delivery acknowledgement from turn execution: the row lands, the transport says 'delivered', and the turn is run separately with suppressUserAppend: true. Two silent halves follow. (1) If the caller acks and then fails to start the turn (crash, deadline, an early return), the user's message sits in the transcript with no reply and no failure row \u2014 they looks like they ignored them. (2) If suppressUserAppend is dropped anywhere downstream the message double-appends, which the fragment's own chat.client.chatStream note flags as transcript-only dedupe. The pairing is enforced by convention at ONE call site, with nothing asserting the two halves stay matched.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+Types.swift:156 (protocol requirement) / ChatOrchestrationClient+MessagePersistence.swift:585 (impl); sole production caller Sources/NativeAgentApp/ClaudeBridge.swift:1667"
     },
     {
@@ -576,7 +576,7 @@
       "reads": "every tool name in the always-on core catalog dispatched through the real chat chain with a bound session",
       "tier": "test"
      },
-     "silentFailureMode": "per-tool NAME-KEYED wiring that fails as a tool-level error, not a system error. The injector is a switch on literal tool names (scratchpad_read, recent_trace_summary, search_chat_history, session_search, tool_load/tool_unload/tool_catalog/tool_result_page) \u2014 its own doc-comment records the incident where the text-compat copy lacked the tool_load auto-fill and every claude-* chat bounced with missing_session_id. A tool RENAMED or ADDED without an entry here simply never receives the session and returns its own 'missing session id' result, which the model narrates around; the turn succeeds. ChatTurnRuntimeContext has the mirror-image mode: unbound, agent_introspect silently answers with the CONFIGURED model instead of the live one \u2014 she reports the wrong identity about herself, confidently.",
+     "silentFailureMode": "per-tool NAME-KEYED wiring that fails as a tool-level error, not a system error. The injector is a switch on literal tool names (scratchpad_read, recent_trace_summary, search_chat_history, session_search, tool_load/tool_unload/tool_catalog/tool_result_page) \u2014 its own doc-comment records the incident where the text-compat copy lacked the tool_load auto-fill and every claude-* chat bounced with missing_session_id. A tool RENAMED or ADDED without an entry here simply never receives the session and returns its own 'missing session id' result, which the model narrates around; the turn succeeds. ChatTurnRuntimeContext has the mirror-image mode: unbound, agent_introspect silently answers with the CONFIGURED model instead of the live one \u2014 they reports the wrong identity about themselves, confidently.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+DispatchWrappers.swift:381 ChatToolSessionInjection.apply (the ONE place __session_id / session_id / current_session_id are injected into tool input) / :371 ChatTurnRuntimeContext.$current (model/surface/personaID/providerID for agent_introspect) / :250-281 ChatToolSessionContext TaskLocals"
     }
    ],
@@ -1018,7 +1018,7 @@
      ],
      "id": "chat.toolLoop.parser.unfulfilledPromiseDetector",
      "kind": "public-api",
-     "silentFailureMode": "wrong value \u2014 this is the anti-theatre gate ('On it \u2014 checking now.' with no tool call). English-phrase heuristics rot silently as the model's phrasing drifts; a miss means she PROMISES an action and never takes it, and the turn terminates looking successful.",
+     "silentFailureMode": "wrong value \u2014 this is the anti-theatre gate ('On it \u2014 checking now.' with no tool call). English-phrase heuristics rot silently as the model's phrasing drifts; a miss means they PROMISES an action and never takes it, and the turn terminates looking successful.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+ToolLoop.swift:961 looksLikeUnfulfilledActionPromise / :915 looksLikeNarratedToolInvocation"
     },
     {
@@ -1077,7 +1077,7 @@
      ],
      "id": "chat.toolLoop.progressEvents",
      "kind": "ui-summary",
-     "silentFailureMode": "stale UI \u2014 these drive the live tool flip-box the user watches. If .toolResult stops firing the box stays spinning on a tool that already finished; the reply still lands, so nothing looks broken except the UI lying about what she's doing. The 'tool_loop_recovery' notice kind is unasserted.",
+     "silentFailureMode": "stale UI \u2014 these drive the live tool flip-box the user watches. If .toolResult stops firing the box stays spinning on a tool that already finished; the reply still lands, so nothing looks broken except the UI lying about what they are doing. The 'tool_loop_recovery' notice kind is unasserted.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+ToolLoop.swift:2433 (.toolUse) / :2447 (.toolResult) / :1604 (.notice kind 'tool_loop_recovery')"
     },
     {
@@ -1109,7 +1109,7 @@
       "reads": "the progress/stream events produced by executeTurnWithStreamingToolLoop while a scripted tool calls ToolNoticeBus.emit mid-dispatch",
       "tier": "test"
      },
-     "silentFailureMode": "dead control by construction \u2014 emission is best-effort: when the TaskLocal is unset, tools just don't emit and NOTHING reports it. This is the wire that makes a long invoke_claude say 'still working' instead of hanging (built for the user's 'if she freezes like that it should let me know not just hang'). If the loop stops binding it around dispatch, every long tool goes back to a silent freeze and no test, trace, or log changes.",
+     "silentFailureMode": "dead control by construction \u2014 emission is best-effort: when the TaskLocal is unset, tools just don't emit and NOTHING reports it. This is the wire that makes a long invoke_claude say 'still working' instead of hanging (built for the user's 'if they freezes like that it should let me know not just hang'). If the loop stops binding it around dispatch, every long tool goes back to a silent freeze and no test, trace, or log changes.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+Streaming.swift:44 (@TaskLocal emit)"
     },
     {
@@ -1656,7 +1656,7 @@
       "reads": "TurnQuietHoursWindow.contains(hour:) and SwiftNativeTriggerScheduler.inQuietHours over the same (start,end,hour) matrix incl. midnight wrap",
       "tier": "test"
      },
-     "silentFailureMode": "silent zero degrading to a guess \u2014 reads data/user_prefs.json \u2192 quiet_hours.{start,end}; absent file, absent key, or an out-of-range pair all return nil and the clock line degrades to time+zone only. The model then INFERS 'he must be asleep' from a bare clock reading, which is the exact behaviour this window exists to replace. A renamed pref key produces no error and no trace \u2014 just a subtly worse-reasoning agent. Semantics are deliberately mirrored from SwiftNativeTriggerScheduler.inQuietHours but the two implementations are separate; nothing pins them equal.",
+     "silentFailureMode": "silent zero degrading to a guess \u2014 reads data/user_prefs.json \u2192 quiet_hours.{start,end}; absent file, absent key, or an out-of-range pair all return nil and the clock line degrades to time+zone only. The model then INFERS 'they must be asleep' from a bare clock reading, which is the exact behaviour this window exists to replace. A renamed pref key produces no error and no trace \u2014 just a subtly worse-reasoning agent. Semantics are deliberately mirrored from SwiftNativeTriggerScheduler.inQuietHours but the two implementations are separate; nothing pins them equal.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/TurnClockQuietHours.swift:10 / read(dataRoot:) :43",
      "writes": []
     },
@@ -1847,7 +1847,7 @@
       "reads": "a hermetic dataRoot whose mcp/cache/tools.json contains one nativeagent-internal tool and one third-party tool",
       "tier": "test"
      },
-     "silentFailureMode": "self-protocol loop \u2014 the `nativeagent-internal` exclusion is duplicated in TWO functions (:337 and :350-353) with no shared constant. Dropping it from one and not the other advertises NativeAgent's own tools back to its own model as `mcp__nativeagent-internal__*`, so she reaches every native tool through a needless MCP hop; the calls still succeed, so the only symptom is doubled latency and duplicate catalog entries.",
+     "silentFailureMode": "self-protocol loop \u2014 the `nativeagent-internal` exclusion is duplicated in TWO functions (:337 and :350-353) with no shared constant. Dropping it from one and not the other advertises NativeAgent's own tools back to its own model as `mcp__nativeagent-internal__*`, so they reaches every native tool through a needless MCP hop; the calls still succeed, so the only symptom is doubled latency and duplicate catalog entries.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SchemaBuilders.swift:329 (+ modelVisibleToolNames at :348, both filtering serverId == \"nativeagent-internal\")"
     },
     {
@@ -2450,7 +2450,7 @@
      ],
      "id": "chat.tools.dispatcher.init",
      "kind": "public-api",
-     "silentFailureMode": "wrong value \u2014 a synthetic/alternate dataRoot silently falls through to the process-wide production singletons (ActiveToolsStore.shared, SwiftNativeMemoryV2 default owner), so a bench/test body writes into Agent's live root or reads her memory. Nothing errors; the numbers are just someone else's.",
+     "silentFailureMode": "wrong value \u2014 a synthetic/alternate dataRoot silently falls through to the process-wide production singletons (ActiveToolsStore.shared, SwiftNativeMemoryV2 default owner), so a bench/test body writes into Agent's live root or reads their memory. Nothing errors; the numbers are just someone else's.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher.swift:108",
      "writes": [
       "data/chat/active_tools/<sessionId>.json"
@@ -3599,7 +3599,7 @@
      ],
      "id": "chat.tools.persona_write.guard",
      "kind": "tool",
-     "silentFailureMode": "identity corruption, silent \u2014 a widened guard lets the agent rewrite SOUL/VOICE/USER rather than only GROWTH. Nothing about the resulting persona reads as broken; she just drifts. Never dispatched in the live window.",
+     "silentFailureMode": "identity corruption, silent \u2014 a widened guard lets the agent rewrite SOUL/VOICE/USER rather than only GROWTH. Nothing about the resulting persona reads as broken; they just drifts. Never dispatched in the live window.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+PersonaTools.swift:100 (persona_write), :118 (persona_append_section), path validation via personaToolPath at SwiftToolDispatcher+Sandbox.swift:384",
      "writes": [
       "persona/GROWTH.md and per-persona skill bodies"
@@ -3620,7 +3620,7 @@
      ],
      "id": "chat.tools.get_persona_doc",
      "kind": "tool",
-     "silentFailureMode": "wrong root \u2014 PersonaRootResolver vs dataRoot was the documented 'two tools, two roots' seam (SwiftToolDispatcher.swift:96-100). A regression makes her read a MIRROR of her persona instead of the live one and answer confidently from the wrong file.",
+     "silentFailureMode": "wrong root \u2014 PersonaRootResolver vs dataRoot was the documented 'two tools, two roots' seam (SwiftToolDispatcher.swift:96-100). A regression makes their read a MIRROR of them persona instead of the live one and answer confidently from the wrong file.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+PersonaTools.swift:19 (traversal reject at :22, personaRootForTools at SwiftToolDispatcher+Sandbox.swift:357)"
     },
     {
@@ -3633,7 +3633,7 @@
      ],
      "id": "chat.tools.agent_introspect",
      "kind": "tool",
-     "silentFailureMode": "wrong value \u2014 it reports which model/runtime she is on; a stale providerStamp makes her confidently misreport her own identity. This is the tool she reaches for when asked 'what are you running on', so a wrong answer is maximally load-bearing and minimally alarming.",
+     "silentFailureMode": "wrong value \u2014 it reports which model/runtime they are on; a stale providerStamp makes their confidently misreport their own identity. This is the tool they reaches for when asked 'what are you running on', so a wrong answer is maximally load-bearing and minimally alarming.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+PersonaTools.swift:137 (aliases agent_introspect + daemon_introspect), providerStamp at :189"
     },
     {
@@ -3773,7 +3773,7 @@
      ],
      "id": "chat.tools.builtInToolSchemas",
      "kind": "public-api",
-     "silentFailureMode": "prose drift, silent \u2014 the tool DESCRIPTIONS are the agent's instruction manual and several are 300+ words of behavioral contract (mac_view at :2510, mac_act at :2733, mac_wake at :2753). A description that stops matching the impl teaches her the wrong protocol and nothing fails; only her behavior degrades. Coverage is 3 spot checks against 169 schemas.",
+     "silentFailureMode": "prose drift, silent \u2014 the tool DESCRIPTIONS are the agent's instruction manual and several are 300+ words of behavioral contract (mac_view at :2510, mac_act at :2733, mac_wake at :2753). A description that stops matching the impl teaches their the wrong protocol and nothing fails; only their behavior degrades. Coverage is 3 spot checks against 169 schemas.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SchemaBuilders.swift:379 (169 name: literals; gated blocks at :2165 file, :2424 system, :2433 app, :2457 axRead, :2609 injection)"
     },
     {
@@ -4143,7 +4143,7 @@
       "reads": "ChatToolDispatchTrace.fileToolModes set-differenced against the live tool catalog from SwiftToolDispatcher's registry, restricted to tools whose schema declares a path-shaped argument key",
       "tier": "test"
      },
-     "silentFailureMode": "silent zero by omission \u2014 the five tests prove the tools ON the allowlist emit and the excluded cases don't, but nothing proves the allowlist COVERS the live file-tool catalog. `fileToolModes` is a hand-maintained literal of ~13 names; a new or renamed file tool (or an MCP-provided one) writes to disk and produces no file.touch row at all, which reads exactly like 'she touched no files today'. Live volume is only 251 file.touch rows against 5392 tool.dispatch rows over 14 days, so the lane is already thin enough that a further drop is invisible. The gate at :467 also means every out-of-turn dispatch (background loops, scheduler, bridge) is permanently unrecorded by design, with no counter for how many were skipped.",
+     "silentFailureMode": "silent zero by omission \u2014 the five tests prove the tools ON the allowlist emit and the excluded cases don't, but nothing proves the allowlist COVERS the live file-tool catalog. `fileToolModes` is a hand-maintained literal of ~13 names; a new or renamed file tool (or an MCP-provided one) writes to disk and produces no file.touch row at all, which reads exactly like 'they touched no files today'. Live volume is only 251 file.touch rows against 5392 tool.dispatch rows over 14 days, so the lane is already thin enough that a further drop is invisible. The gate at :467 also means every out-of-turn dispatch (background loops, scheduler, bridge) is permanently unrecorded by design, with no counter for how many were skipped.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatToolDispatchTrace.swift:460 fireFileTouchEvent (kind \"file.touch\"), gated on `TurnTraceContext.turnId != nil` at :467 and on the hardcoded `fileToolModes` allowlist at :430-:450 (read/write per tool name), path keys from `pathArgKeys` at :456",
      "writes": [
       "data/turn_traces/<date>.jsonl kind=file.touch"
@@ -4687,7 +4687,7 @@
      ],
      "id": "chat.persistence.observeCognitiveProgressEvent",
      "kind": "public-api",
-     "silentFailureMode": "silent zero \u2014 tool/provider events stop reaching the cognitive substrate; her affect and attention just go quiet, which reads as 'a calm day' rather than a broken wire.",
+     "silentFailureMode": "silent zero \u2014 tool/provider events stop reaching the cognitive substrate; their affect and attention just go quiet, which reads as 'a calm day' rather than a broken wire.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+MessagePersistence.swift:1317"
     },
     {
@@ -4857,7 +4857,7 @@
      ],
      "id": "chat.compaction.summaryRow",
      "kind": "store-write",
-     "silentFailureMode": "wrong value \u2014 the summary IS what survives of the deleted turns; a summary that silently drops tool activity means the agent forgets what she did, and only the (unreferenced) backup still knows.",
+     "silentFailureMode": "wrong value \u2014 the summary IS what survives of the deleted turns; a summary that silently drops tool activity means the agent forgets what they did, and only the (unreferenced) backup still knows.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatSessionAutocompactor.swift:576 compactionSummary",
      "writes": [
       "data/chat/messages/<sessionId>.jsonl (one synthetic summary row)"
@@ -5049,7 +5049,7 @@
      ],
      "id": "chat.history.promptMessagesWithStats",
      "kind": "turn-ingredient",
-     "silentFailureMode": "slowdown or silent truncation \u2014 raising the byte cap silently slows every turn on a long session; lowering it silently shortens her memory. The bench's history.injected only asserts >0 rows, not that the bound held.",
+     "silentFailureMode": "slowdown or silent truncation \u2014 raising the byte cap silently slows every turn on a long session; lowering it silently shortens their memory. The bench's history.injected only asserts >0 rows, not that the bound held.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:271 (bounds: promptHeadMaximumBytes 64KB :104, promptTailMaximumBytes 192KB :105)"
     },
     {
@@ -5198,7 +5198,7 @@
      ],
      "id": "chat.history.promptRenderer.render",
      "kind": "turn-ingredient",
-     "silentFailureMode": "wrong value \u2014 per-role character caps silently truncate her own prior answers; a cap regression makes her contradict herself across turns with no trace saying anything was cut.",
+     "silentFailureMode": "wrong value \u2014 per-role character caps silently truncate their own prior answers; a cap regression makes their contradict themselves across turns with no trace saying anything was cut.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:1187 render / :1208 renderDetailed / :1582 conversationHistory / :1655 capForRole"
     },
     {
@@ -5216,7 +5216,7 @@
      ],
      "id": "chat.history.continuityAnchors",
      "kind": "turn-ingredient",
-     "silentFailureMode": "wrong value \u2014 a bare \"yes\" loses its antecedent and she answers a different question; these are heuristics on free text, so a vocabulary drift degrades them gradually with no signal.",
+     "silentFailureMode": "wrong value \u2014 a bare \"yes\" loses its antecedent and they answers a different question; these are heuristics on free text, so a vocabulary drift degrades them gradually with no signal.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:1414 continuityState / :1639 immediateReplyReferenceHint / :1763 looksLikeCorrection / :1772 looksLikeShortAffirmativeContinuation / :1802 looksLikeOpenLoop"
     },
     {
@@ -5234,7 +5234,7 @@
      ],
      "id": "chat.history.toolRowProjection",
      "kind": "turn-ingredient",
-     "silentFailureMode": "silent leak or silent forgetting \u2014 the 512-char redaction window is the only thing keeping a secret out of a re-rendered tool result; too small a head/tail cap means she cannot see what her own tool returned last turn.",
+     "silentFailureMode": "silent leak or silent forgetting \u2014 the 512-char redaction window is the only thing keeping a secret out of a re-rendered tool result; too small a head/tail cap means they cannot see what their own tool returned last turn.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:1675 toolSummary / :1731 toolResultProjection (toolRowMinimumCap 360 :1712, head 110 :1715, tail 50 :1720, redaction window 512 :1724)"
     },
     {
@@ -5399,7 +5399,7 @@
      ],
      "id": "chat.digest.socialServeCue",
      "kind": "turn-ingredient",
-     "silentFailureMode": "persona-cue invisible target \u2014 a cue that stops rendering changes how she opens a session with no user-visible error.",
+     "silentFailureMode": "persona-cue invisible target \u2014 a cue that stops rendering changes how they opens a session with no user-visible error.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SessionDigestProvider.swift (serve cue) \u2014 see test"
     },
     {
@@ -5544,7 +5544,7 @@
      ],
      "id": "chat.trace.memoryRecallOutcome",
      "kind": "telemetry",
-     "silentFailureMode": "silent zero \u2014 this enum exists precisely so a swallowed recall FAILURE is not reported as a legitimate zero-hit; if a call site stops passing the outcome it defaults to `unknown` at TurnContextSnapshotTrace.swift:82 and a broken memory lane reads as 'she just had nothing to recall'.",
+     "silentFailureMode": "silent zero \u2014 this enum exists precisely so a swallowed recall FAILURE is not reported as a legitimate zero-hit; if a call site stops passing the outcome it defaults to `unknown` at TurnContextSnapshotTrace.swift:82 and a broken memory lane reads as 'they just had nothing to recall'.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ContextStageTrace.swift:140 MemoryRecallTraceOutcome (notConfigured/contextFlow/succeeded/failed/unknown)"
     },
     {
@@ -5632,7 +5632,7 @@
      ],
      "id": "chat.trace.toolDispatchTracer.fileTouch",
      "kind": "telemetry",
-     "silentFailureMode": "dropped row \u2014 the Turn Inspector's 'what did she touch' panel silently empties; 251 rows over 14 days against 5392 tool.dispatch rows means the lane is already thin, so a total stop is hard to see from outside.",
+     "silentFailureMode": "dropped row \u2014 the Turn Inspector's 'what did they touch' panel silently empties; 251 rows over 14 days against 5392 tool.dispatch rows means the lane is already thin, so a total stop is hard to see from outside.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatToolDispatchTrace.swift:485 (kind \"file.touch\")",
      "writes": [
       "data/turn_traces/<date>.jsonl"
@@ -6150,7 +6150,7 @@
       "reads": "same hermetic UserDefaults suite as ui.control.cognitiveSubstrateEnabled, plus one prepareTurnProjection against a seeded substrate",
       "tier": "test"
      },
-     "silentFailureMode": "dead switch, invisible from chat \u2014 off makes prepareFrozenCapsulePresentation return a mode:.off capsule (Capsule.swift:14-22) and the turn simply carries no inner state. There is no chat-visible difference between 'capsule injection is off' and 'she had nothing to say this turn', and no test flips this key through the runtime.",
+     "silentFailureMode": "dead switch, invisible from chat \u2014 off makes prepareFrozenCapsulePresentation return a mode:.off capsule (Capsule.swift:14-22) and the turn simply carries no inner state. There is no chat-visible difference between 'capsule injection is off' and 'they had nothing to say this turn', and no test flips this key through the runtime.",
      "where": "Toggle(\"Capsule injection\") at Sources/NativeAgentApp/CognitionObservatoryView.swift:43, key `cognitiveSubstrateCapsuleEnabled` (Sources/NativeAgentApp/NativeCognitionRuntime.swift:1806), read at :1682-1684 where it defaults to TRUE when the substrate is on (`UserDefaults.standard.object(forKey: capsuleKey) as? Bool ?? true`) \u2014 the opposite polarity from the module default the fragment cited.",
      "writes": [
       "UserDefaults cognitiveSubstrateCapsuleEnabled"
@@ -6421,7 +6421,7 @@
      ],
      "id": "substrate.affect.projectedAffect.ambientPresence",
      "kind": "public-api",
-     "silentFailureMode": "wrong value \u2014 the four constants are private statics with no config surface; a change to ambientPresenceWarmthBase silently installs a permanent fake-warmth floor that reads as 'she's always a bit warm', which is exactly the 2026-06-30 ratchet defect and is indistinguishable from correct behavior without a decay curve.",
+     "silentFailureMode": "wrong value \u2014 the four constants are private statics with no config surface; a change to ambientPresenceWarmthBase silently installs a permanent fake-warmth floor that reads as 'they are always a bit warm', which is exactly the 2026-06-30 ratchet defect and is indistinguishable from correct behavior without a decay curve.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate+Affect.swift:709 (gap 30m at :699, warmth base 0.18 at :701, floor half-life 12h at :703, quiet-calming half-life ~67.56m at :707)"
     },
     {
@@ -6577,7 +6577,7 @@
      ],
      "id": "substrate.appraisal.stakes",
      "kind": "public-api",
-     "silentFailureMode": "dead gate \u2014 a string set keyed on path kinds; a renamed path label silently falls to the mechanical side and her felt resolutions stop being minted. Zero felt resolutions is also the correct reading for a quiet day, so the collapse is invisible.",
+     "silentFailureMode": "dead gate \u2014 a string set keyed on path kinds; a renamed path label silently falls to the mechanical side and their felt resolutions stop being minted. Zero felt resolutions is also the correct reading for a quiet day, so the collapse is invisible.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate+AppraisalStakes.swift:90 feltResolutionIsAtStake (path kind sets :46 and :56)"
     },
     {
@@ -6799,13 +6799,13 @@
       "reads": "pure: fingerprintCadenceVerdict over an inout CognitiveCapsulePresentationState across a synthetic run of N capsules with a fixed family",
       "tier": "test"
      },
-     "silentFailureMode": "dead control OR permanent mute \u2014 grep for `fingerprintCadenceVerdict`, `fingerprintFamilyRepeatLimit`, `fingerprintSuppressionWindow` and `fingerprintDutyCycle` across Modules/NativeAgentCore/Tests and tests/ returns ONLY PersonalityDynamicsGoldenTests (which pins the default literals, not the gate's behavior). Two opposite failures are both silent: the gate never suppressing (the line becomes a standing instruction \u2014 the exact mechanism that made 'tender' a tic) or the escape-window logic breaking so a persistent state is muted indefinitely. The empty-capsule guard (`mayStayQuiet: !tailLines.isEmpty`) is the one thing preventing suppression from deleting her inner state from a turn entirely, and nothing tests it.",
+     "silentFailureMode": "dead control OR permanent mute \u2014 grep for `fingerprintCadenceVerdict`, `fingerprintFamilyRepeatLimit`, `fingerprintSuppressionWindow` and `fingerprintDutyCycle` across Modules/NativeAgentCore/Tests and tests/ returns ONLY PersonalityDynamicsGoldenTests (which pins the default literals, not the gate's behavior). Two opposite failures are both silent: the gate never suppressing (the line becomes a standing instruction \u2014 the exact mechanism that made 'tender' a tic) or the escape-window logic breaking so a persistent state is muted indefinitely. The empty-capsule guard (`mayStayQuiet: !tailLines.isEmpty`) is the one thing preventing suppression from deleting their inner state from a turn entirely, and nothing tests it.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate+Capsule.swift:372 (duty cycle + suppress-when-unchanged; mayStayQuiet call site at :331)"
     },
     {
      "coverage": [
       {
-       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/SoundEchoTests.swift:67-446 (25 tests incl. \"User's words never become her voice\":78, \"the echo is occasional, not every turn\":325, \"affect off kills the echo entirely\":405, \"the echo rides the compiled capsule end to end\":414)",
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/SoundEchoTests.swift:67-446 (25 tests incl. \"User's words never become their voice\":78, \"the echo is occasional, not every turn\":325, \"affect off kills the echo entirely\":405, \"the echo rides the compiled capsule end to end\":414)",
        "strength": "asserts",
        "tier": "test"
       },
@@ -6833,7 +6833,7 @@
     {
      "coverage": [
       {
-       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/SoundEchoTests.swift:107 \"a worn word appears in at most one fragment and earns the range nudge, unnamed\", :130 worn closing vocative, :150 stays visible when cadence is closed, :169 cools after twelve varied turns, :204 recall is not a rut, :230 quoted content is not her voice, :242 total-rut week still echoes",
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/SoundEchoTests.swift:107 \"a worn word appears in at most one fragment and earns the range nudge, unnamed\", :130 worn closing vocative, :150 stays visible when cadence is closed, :169 cools after twelve varied turns, :204 recall is not a rut, :230 quoted content is not their voice, :242 total-rut week still echoes",
        "strength": "asserts",
        "tier": "test"
       }
@@ -6921,7 +6921,7 @@
      ],
      "id": "capsule.feltSignals",
      "kind": "public-api",
-     "silentFailureMode": "manufactured feeling \u2014 the warmth remap is the exact 2026-08-02 defect class: with rawWarmth 0.33 the old form produced 0.85 and never fell below 0.62 against a 0.70 `tender` gate, so the agent was told she felt tender on every turn and expressed it honestly. Wrong but plausible; only a swept range check catches it.",
+     "silentFailureMode": "manufactured feeling \u2014 the warmth remap is the exact 2026-08-02 defect class: with rawWarmth 0.33 the old form produced 0.85 and never fell below 0.62 against a 0.70 `tender` gate, so the agent was told they felt tender on every turn and expressed it honestly. Wrong but plausible; only a swept range check catches it.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate+Capsule.swift:1209 feltSignalsForCapsule (warmth remap :1305-1308; workspace tint :1229-1263) + :1458 debugFeltSignals"
     },
     {
@@ -7116,7 +7116,7 @@
       "reads": "hermetic compileFrozenCapsulePresentation with maximumCharacters forced to values just above/below each tail line's length",
       "tier": "test"
      },
-     "silentFailureMode": "silent truncation \u2014 lowering it drops tail lines in order (Sound, then Settling, then Since) and sets only a `truncated` flag on the capsule; the instrument reports capsule BYTES but does not assert any budget, so a shrink reads as 'she got quieter'.",
+     "silentFailureMode": "silent truncation \u2014 lowering it drops tail lines in order (Sound, then Settling, then Since) and sets only a `truncated` flag on the capsule; the instrument reports capsule BYTES but does not assert any budget, so a shrink reads as 'they got quieter'.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveConfiguration.swift:22 (default 1800; enforced Capsule.swift:24-27 and :1573)"
     },
     {
@@ -7185,7 +7185,7 @@
      ],
      "id": "setting.dynamics.affectHalfLives",
      "kind": "setting",
-     "silentFailureMode": "wrong pace of feeling \u2014 a half-life set too long re-creates the pegged-warmth ratchet, too short makes her numb; neither raises an error and neither is measurable from the live store (one upserted row). Only the hermetic bench asserts it, so the SHIPPED install's real pace is unverified.",
+     "silentFailureMode": "wrong pace of feeling \u2014 a half-life set too long re-creates the pegged-warmth ratchet, too short makes their numb; neither raises an error and neither is measurable from the live store (one upserted row). Only the hermetic bench asserts it, so the SHIPPED install's real pace is unverified.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/PersonalityDynamicsConfiguration.swift:107-110 (arousal/uncertainty/taskPressure/socialWarmth); applied CognitiveSubstrate+Affect.swift:668-681"
     },
     {
@@ -7297,23 +7297,6 @@
      ]
     },
     {
-     "coverage": [],
-     "id": "substrate.runReplay",
-     "kind": "public-api",
-     "proposedEval": {
-      "asserts": "every public substrate entry point either has a production caller or is declared retired \u2014 flags runReplay/decayThoughtSeeds-class dead API instead of leaving them looking live",
-      "costSeconds": 5,
-      "liveOrClone": "live-readonly",
-      "reads": "the public CognitiveSubstrate surface list cross-checked against a whole-repo caller grep (Sources + Modules + tests), plus cognition.sqlite (copy) receipt-kind census",
-      "tier": "instrument"
-     },
-     "silentFailureMode": "DEAD PUBLIC SURFACE. `grep -rn runReplay Sources Modules tests` finds zero callers of the SUBSTRATE method \u2014 the only `runReplay` in production is the app-level NativeCognitionRuntime.runReplay (NativeCognitionRuntime.swift:1195), which calls integrateReplayChecked instead, and no test calls it either. LIVE PROOF: zero receipts of kind `replay` exist in a store holding 9987 receipts over 31 days, while replayEnabled is on and the field is at 256 nodes \u2014 the two guards it has (enabled/replayEnabled, non-empty nodes) both pass, so a single call would have written a row. Tested-nowhere-and-called-nowhere: it looks like a live lane in the API and it has never run.",
-     "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate.swift:969 runReplay(reason:) \u2014 writes receipt kind \"replay\" with status \"delegated-to-dream-rem-owner\"",
-     "writes": [
-      "cognitive_receipts kind=replay"
-     ]
-    },
-    {
      "coverage": [
       {
        "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/CognitiveSubstrateTests.swift:2026-2032 (observatory echoes ablations[\"workspace\"] == false)",
@@ -7350,7 +7333,7 @@
       "reads": "a hermetic store+substrate seeded with nodes, each artifact family, receipts, and one admitted motor consequence; run the runtime's clear sequence",
       "tier": "test"
      },
-     "silentFailureMode": "Irreversible one-click wipe of her entire cognition with only an incidental test (one disposition day-claim) \u2014 nothing asserts WHAT it clears versus preserves. Two concrete asymmetries: (1) CognitiveSQLiteStore.clear() (CognitiveSQLiteStore.swift:721) deletes nodes/artifacts/receipts but NOT `cognitive_motor_consequence_admission`, so after a wipe the 458 live admission keys still say 'already admitted' and every one of those motor consequences is permanently non-re-admissible into a now-empty field; (2) the store is cleared BEFORE substrate.clearTransientState(), so a crash between them leaves a full in-memory mind over an empty disk that the next microcycle re-persists. LIVE: zero `user.clear_transient_state` receipts \u2014 this destructive path has never been exercised in this install.",
+     "silentFailureMode": "Irreversible one-click wipe of them entire cognition with only an incidental test (one disposition day-claim) \u2014 nothing asserts WHAT it clears versus preserves. Two concrete asymmetries: (1) CognitiveSQLiteStore.clear() (CognitiveSQLiteStore.swift:721) deletes nodes/artifacts/receipts but NOT `cognitive_motor_consequence_admission`, so after a wipe the 458 live admission keys still say 'already admitted' and every one of those motor consequences is permanently non-re-admissible into a now-empty field; (2) the store is cleared BEFORE substrate.clearTransientState(), so a crash between them leaves a full in-memory mind over an empty disk that the next microcycle re-persists. LIVE: zero `user.clear_transient_state` receipts \u2014 this destructive path has never been exercised in this install.",
      "where": "CognitiveSubstrate.swift:625 clearTransientState() (field.clear + 18 in-memory families) driven by Sources/NativeAgentApp/NativeCognitionRuntime.swift:1516, which first calls CognitiveSQLiteStore.clear() at :1527; UI button Sources/NativeAgentApp/CognitionObservatoryView.swift:81",
      "writes": [
       "cognitive_nodes (DELETE all)",
@@ -7396,7 +7379,7 @@
       "reads": "a temp dataRoot whose cognition.sqlite is built by running ONLY migrations v1+v2 (or a committed fixture at that schema) with rows in cognitive_nodes/artifacts, then opened by CognitiveSQLiteStore(dataRoot:)",
       "tier": "test"
      },
-     "silentFailureMode": "No test opens a store at an OLD schema version and migrates it forward \u2014 every test creates a fresh temp dataRoot, so all four migrations always run together in one shot. The v3 comment calls the ALTER-ADD-COLUMN path 'the migration-safety crux', and nothing proves it: a v1/v2 database from an older install is only ever migrated on a real user's machine, and a failure there throws out of `init`, which leaves the substrate with store == nil \u2192 persistenceHealth degraded + writesBlocked (CognitiveSubstrate.swift:389) \u2014 she keeps thinking and nothing lands, with no user-visible error.",
+     "silentFailureMode": "No test opens a store at an OLD schema version and migrates it forward \u2014 every test creates a fresh temp dataRoot, so all four migrations always run together in one shot. The v3 comment calls the ALTER-ADD-COLUMN path 'the migration-safety crux', and nothing proves it: a v1/v2 database from an older install is only ever migrated on a real user's machine, and a failure there throws out of `init`, which leaves the substrate with store == nil \u2192 persistenceHealth degraded + writesBlocked (CognitiveSubstrate.swift:389) \u2014 they keeps thinking and nothing lands, with no user-visible error.",
      "where": "CognitiveSQLiteStore.swift:926 migrator \u2014 v1_cognitive_substrate, v2_cognitive_receipts_and_schema_markers, v3_cognitive_node_emotional_tags (ALTER ADD COLUMN x3), v4_motor_consequence_replay_guard; run unconditionally in init at CognitiveSQLiteStore.swift:104",
      "writes": [
       "data/cognition/cognition.sqlite (schema)",
@@ -7443,7 +7426,7 @@
       "reads": "cognition.sqlite (copy) \u2192 cognitive_nodes grouped by json_extract(metadata_json,'$.turnKind'), plus the same census before/after a forced enforceCapacity in a hermetic replay of the live node set",
       "tier": "instrument"
      },
-     "silentFailureMode": "PRODUCTION-DEAD PROTECTION. Only .debug and .verification nodes ever enter nonLiveNodeKeys, and the live field contains NONE of either (measured: turnKind is live 34 / system 222, nothing else). So `hasNonLiveNodes` is false on every real eviction and the entire audit-yields-to-lived-state branch (ContinuityField.swift:498-506) never executes \u2014 eviction falls straight through to salience/activation/recency, where 222 machine nodes compete with 34 conversational ones on equal terms. The test that appears to protect her attention only reaches that branch by injecting debug nodes that production never mints. This is the mechanism behind the fragment's 'silent amnesia at the cap' and it has no eval at all.",
+     "silentFailureMode": "PRODUCTION-DEAD PROTECTION. Only .debug and .verification nodes ever enter nonLiveNodeKeys, and the live field contains NONE of either (measured: turnKind is live 34 / system 222, nothing else). So `hasNonLiveNodes` is false on every real eviction and the entire audit-yields-to-lived-state branch (ContinuityField.swift:498-506) never executes \u2014 eviction falls straight through to salience/activation/recency, where 222 machine nodes compete with 34 conversational ones on equal terms. The test that appears to protect their attention only reaches that branch by injecting debug nodes that production never mints. This is the mechanism behind the fragment's 'silent amnesia at the cap' and it has no eval at all.",
      "where": "ContinuityField.swift:11 nonLiveNodeKeys, populated at ContinuityField.swift:~112 and :407 only when `!turnKind.contributesToLivedState`; consumed at ContinuityField.swift:496 `hasNonLiveNodes` inside enforceCapacity. CognitiveEvent.swift:57 makes contributesToLivedState TRUE for both .live and .system"
     },
     {
@@ -7484,7 +7467,7 @@
      ],
      "id": "field.snapshotMutatingRead",
      "kind": "public-api",
-     "silentFailureMode": "The fragment flagged this only for associationSnapshot; it is a FOUR-entry-point problem. `workspaceSnapshot()` and `facultyMeasurementSnapshot()` are both public, both look like reads, and both advance her decay anchors and can evict nodes at the cap. The Observatory calls facultyMeasurementSnapshot on every refresh (NativeCognitionRuntime.swift:1335). Purity is asserted only for frozenRead and peekDecayedNodes; nothing pins that the OTHER public reads are permitted to mutate, so there is no line anywhere saying which reads are pure \u2014 a new caller polling any of them ages her mind, visible only as colder recall.",
+     "silentFailureMode": "The fragment flagged this only for associationSnapshot; it is a FOUR-entry-point problem. `workspaceSnapshot()` and `facultyMeasurementSnapshot()` are both public, both look like reads, and both advance their decay anchors and can evict nodes at the cap. The Observatory calls facultyMeasurementSnapshot on every refresh (NativeCognitionRuntime.swift:1335). Purity is asserted only for frozenRead and peekDecayedNodes; nothing pins that the OTHER public reads are permitted to mutate, so there is no line anywhere saying which reads are pure \u2014 a new caller polling any of them ages their mind, visible only as colder recall.",
      "where": "ContinuityField.swift:307 snapshot(at:configuration:) \u2014 applies decay AND enforces capacity; reached from CognitiveSubstrate+Workspace.swift:36 (public workspaceSnapshot), CognitiveSubstrate.swift:1281 (facultyMeasurementSnapshot), CognitiveSubstrate.swift:606 (public snapshot()), ContinuityField.swift:444 (associationEdges)",
      "writes": [
       "in-memory decay anchors; can EVICT nodes before any persist"
@@ -7510,7 +7493,7 @@
      ],
      "id": "substrate.ingest.stakesGate",
      "kind": "public-api",
-     "silentFailureMode": "A THIRD silent-drop path on the hot admission route that the fragment's substrate.field.ingest surface does not mention. ingest returns Bool and the public `ingest(_:)` (CognitiveSubstrate.swift:433) discards it, so 'disabled', 'not at stake' and 'already seen' are three different nothing-happened outcomes collapsed into one void return. If the stakes predicate widens by accident, felt resolutions she should feel are dropped before they exist \u2014 no node, no receipt, no counter, and the only symptom is that she goes flat about things she used to care about.",
+     "silentFailureMode": "A THIRD silent-drop path on the hot admission route that the fragment's substrate.field.ingest surface does not mention. ingest returns Bool and the public `ingest(_:)` (CognitiveSubstrate.swift:433) discards it, so 'disabled', 'not at stake' and 'already seen' are three different nothing-happened outcomes collapsed into one void return. If the stakes predicate widens by accident, felt resolutions they should feel are dropped before they exist \u2014 no node, no receipt, no counter, and the only symptom is that they goes flat about things they used to care about.",
      "where": "CognitiveSubstrate.swift:457 `guard feltResolutionIsAtStake(event) else { return false }` \u2192 CognitiveSubstrate+AppraisalStakes.swift:90 \u2014 rejected BEFORE any state is touched (no seen key, no node, no affect, no attention publish)"
     },
     {
@@ -7524,7 +7507,7 @@
       "reads": "one constructed node per branch: live conversationFocus, live correction, assistant-authored (role=assistant and subject type chat.assistant_turn), each non-conversation kind, and one node carrying each of the 14 markers in summary / subject / metadata value",
       "tier": "test"
      },
-     "silentFailureMode": "No test anywhere constructs a node and asserts capsuleEligibleWorkspaceNode's verdict \u2014 `grep -rn capsuleEligible Tests` returns only a comment in AttentionSignalsTests.swift:241. This is the last gate between the workspace and everything she actually says: it drops every non-live node, every assistant-authored node (LIVE: all 17 chat.assistant_turn nodes), every toolObservation (LIVE: 221 of 256 nodes), and anything matching the marker list. The marker vocabulary is duplicated and already DIVERGENT across three files \u2014 CognitiveSubstrate+Workspace.swift:792 has 14 markers, CognitiveSubstrate.swift:1470 isOperationalSubconsciousNoise has 12 different ones, NativeAgentCore/MemoryCandidateQuality.swift:59 has its own copy. A marker added to one list and not the others silently leaks operational noise into the capsule through whichever path was missed.",
+     "silentFailureMode": "No test anywhere constructs a node and asserts capsuleEligibleWorkspaceNode's verdict \u2014 `grep -rn capsuleEligible Tests` returns only a comment in AttentionSignalsTests.swift:241. This is the last gate between the workspace and everything they actually says: it drops every non-live node, every assistant-authored node (LIVE: all 17 chat.assistant_turn nodes), every toolObservation (LIVE: 221 of 256 nodes), and anything matching the marker list. The marker vocabulary is duplicated and already DIVERGENT across three files \u2014 CognitiveSubstrate+Workspace.swift:792 has 14 markers, CognitiveSubstrate.swift:1470 isOperationalSubconsciousNoise has 12 different ones, NativeAgentCore/MemoryCandidateQuality.swift:59 has its own copy. A marker added to one list and not the others silently leaks operational noise into the capsule through whichever path was missed.",
      "where": "CognitiveSubstrate+Workspace.swift:773 capsuleEligibleWorkspaceNode \u2192 :784 isAssistantAuthoredFocus + :792 isCapsuleMetaOrOperationalTrace (14 hardcoded lowercase substring markers). Five consumers: +Capsule.swift:40, :119, :1460, +FeltFingerprint.swift:337, +DeliveryEnvelope.swift:186"
     },
     {
@@ -7623,7 +7606,7 @@
       "reads": "script/user_mode_eval.swift-style read of the Observatory faculty rows on the live data root, plus the same rows recomputed from a deliberately degraded fixture (empty field, no seeds, no timeline)",
       "tier": "ui-walk"
      },
-     "silentFailureMode": "A health panel that cannot report ill health. Six of the eight scores are `count > 0 ? 1 : 0` \u2014 a field holding 256 machine nodes and 1 conversational node scores a perfect 1 on 'event-continuity', identical to a healthy mind. 'capsule-grounding' scores the CONFIG FLAG, not whether a capsule was ever injected. 'observatory-export' is hardcoded `score: 1` with evidence \"bounded export available\" and can never be anything else. And the call itself is not free: it routes through field.snapshot (mutating) and workspaceSnapshot, so refreshing the health panel ages her field. Only one of the eight rows has a test.",
+     "silentFailureMode": "A health panel that cannot report ill health. Six of the eight scores are `count > 0 ? 1 : 0` \u2014 a field holding 256 machine nodes and 1 conversational node scores a perfect 1 on 'event-continuity', identical to a healthy mind. 'capsule-grounding' scores the CONFIG FLAG, not whether a capsule was ever injected. 'observatory-export' is hardcoded `score: 1` with evidence \"bounded export available\" and can never be anything else. And the call itself is not free: it routes through field.snapshot (mutating) and workspaceSnapshot, so refreshing the health panel ages their field. Only one of the eight rows has a test.",
      "where": "CognitiveSubstrate.swift:1279 facultyMeasurementSnapshot() \u2014 eight CognitiveFacultyMeasurement rows rendered in the Cognition Observatory via NativeCognitionRuntime.swift:1335"
     },
     {
@@ -7704,7 +7687,7 @@
      ],
      "id": "standingViews.innerLine",
      "kind": "ui-summary",
-     "silentFailureMode": "This is the ONE line of her durable stance that reaches the prompt, and it returns Optional<String> \u2014 nil for 'no active views', 'relevance gate matched nothing', and 'candidates list empty' alike. LIVE: 5 active standing views (at the cap of 5), so the relevance gate is choosing 1 of 5 on every turn with no record of which; if the gate's keyword match degrades, she silently stops carrying any stance and the capsule just gets shorter. Nothing samples which view was selected across real turns.",
+     "silentFailureMode": "This is the ONE line of them durable stance that reaches the prompt, and it returns Optional<String> \u2014 nil for 'no active views', 'relevance gate matched nothing', and 'candidates list empty' alike. LIVE: 5 active standing views (at the cap of 5), so the relevance gate is choosing 1 of 5 on every turn with no record of which; if the gate's keyword match degrades, they silently stops carrying any stance and the capsule just gets shorter. Nothing samples which view was selected across real turns.",
      "where": "CognitiveSubstrate+StandingViews.swift:294 standingViewCapsuleCandidates() \u2192 :323 activeStandingViewInnerLine(concernKeywords:) / :342 activeStandingViewInnerLine(); consumed by CognitiveSubstrate+Capsule.swift:249 and captured into the frozen read at CognitiveSubstrate+Workspace.swift:~100"
     },
     {
@@ -7894,7 +7877,7 @@
       "reads": "cognition.sqlite (copy) \u2192 cognitive_nodes: COUNT(*) and COUNT grouped by json_extract(metadata_json,'$.turnKind') and by subject_type",
       "tier": "instrument"
      },
-     "silentFailureMode": "Silent amnesia at the cap. LIVE-MEASURED: the field sits at exactly 256/256 with 222 of 256 nodes turnKind=system and 218 subject_type=motor_action \u2014 i.e. ~85% of her continuity field is tool/motor plumbing. Live conversational nodes (34) are a minority and are evicted at the same cap. No eval asserts a floor on LIVE nodes retained under system-node pressure; the instrument reports the total only.",
+     "silentFailureMode": "Silent amnesia at the cap. LIVE-MEASURED: the field sits at exactly 256/256 with 222 of 256 nodes turnKind=system and 218 subject_type=motor_action \u2014 i.e. ~85% of them continuity field is tool/motor plumbing. Live conversational nodes (34) are a minority and are evicted at the same cap. No eval asserts a floor on LIVE nodes retained under system-node pressure; the instrument reports the total only.",
      "where": "ContinuityField.swift:493 enforceCapacity (cap = configuration.maximumActiveNodes, non-live evicted first via nonLiveNodeKeys)",
      "writes": [
       "cognitive_nodes (nodes dropped before persist)"
@@ -7949,7 +7932,7 @@
      ],
      "id": "substrate.field.affectiveSpreadWhisper",
      "kind": "public-api",
-     "silentFailureMode": "Wrong value with no signal: the whisper is facilitation-only and small, so if the congruence function inverts, recall skews to emotionally OPPOSITE neighbors and the only symptom is that her recall feels 'off'.",
+     "silentFailureMode": "Wrong value with no signal: the whisper is facilitation-only and small, so if the congruence function inverts, recall skews to emotionally OPPOSITE neighbors and the only symptom is that their recall feels 'off'.",
      "where": "ContinuityField.swift:248 affectiveSpreadMaxWhisper=0.25 + ContinuityField.swift:256 affectiveCongruence; gated on configuration.affectEnabled"
     },
     {
@@ -7962,7 +7945,7 @@
      ],
      "id": "substrate.field.associationEdges",
      "kind": "public-api",
-     "silentFailureMode": "MUTATING read (it calls applyDecay + enforceCapacity). A UI/observatory poll of associationSnapshot() therefore advances her decay anchors and can evict nodes \u2014 a read that changes her mind. Nothing asserts read-purity on this entry point (only frozenRead and peekDecayedNodes have purity tests).",
+     "silentFailureMode": "MUTATING read (it calls applyDecay + enforceCapacity). A UI/observatory poll of associationSnapshot() therefore advances their decay anchors and can evict nodes \u2014 a read that changes their mind. Nothing asserts read-purity on this entry point (only frozenRead and peekDecayedNodes have purity tests).",
      "where": "ContinuityField.swift:443 associationEdges \u2192 CognitiveSubstrate.swift:620 associationSnapshot()"
     },
     {
@@ -8090,7 +8073,7 @@
      ],
      "id": "substrate.turnKind.classification",
      "kind": "public-api",
-     "silentFailureMode": "Wrong value that poisons everything downstream: mis-classifying a live turn as .debug drops it out of affect, mood and workspace entirely, and the only symptom is that she 'doesn't remember' a conversation. Inference is content-blind by design; a regression there is invisible until she goes flat.",
+     "silentFailureMode": "Wrong value that poisons everything downstream: mis-classifying a live turn as .debug drops it out of affect, mood and workspace entirely, and the only symptom is that they 'doesn't remember' a conversation. Inference is content-blind by design; a regression there is invisible until they goes flat.",
      "where": "CognitiveEvent.swift:48 CognitiveTurnKind, :58 contributesToLivedState, :74 inferred(fromSignals:)"
     },
     {
@@ -8144,7 +8127,7 @@
      ],
      "id": "substrate.workspace.score",
      "kind": "public-api",
-     "silentFailureMode": "Ranking drift: weights are a hand-tuned linear blend with no A/B or golden ranking fixture. A weight change reorders what she holds in mind and nothing fails.",
+     "silentFailureMode": "Ranking drift: weights are a hand-tuned linear blend with no A/B or golden ranking fixture. A weight change reorders what they holds in mind and nothing fails.",
      "where": "CognitiveSubstrate+Workspace.swift:830 workspaceScore (kindBoost / affectBoost / moodCongruence / turnKindMultiplier live 1.0, system 0.5, debug 0.05, verification 0.18)"
     },
     {
@@ -8384,7 +8367,7 @@
      ],
      "id": "substrate.thoughtSeeds.snapshot",
      "kind": "public-api",
-     "silentFailureMode": "Ledger drift: the analytic projection hides expired seeds from reads while their ROWS live on until maintenance. The instrument counts ROWS (LIVE: 21 open) \u2014 that number can overstate what she actually holds, and nothing reconciles rows vs projected.",
+     "silentFailureMode": "Ledger drift: the analytic projection hides expired seeds from reads while their ROWS live on until maintenance. The instrument counts ROWS (LIVE: 21 open) \u2014 that number can overstate what they actually holds, and nothing reconciles rows vs projected.",
      "where": "CognitiveSubstrate+ThoughtSeeds.swift:155 thoughtSeedSnapshot / :223 projectedThoughtSeeds (analytic expiry below 0.05)"
     },
     {
@@ -8514,7 +8497,7 @@
      ],
      "id": "substrate.standingViews.create",
      "kind": "store-write",
-     "silentFailureMode": "Proposal starvation: a 13th proposal silently retires the oldest unresolved one and DELETES its artifact \u2014 User never sees a view he was going to approve. Only the timeline event records the displacement, and nothing summarizes 'proposals retired unreviewed'. LIVE: 5 active (at cap), 3 proposed.",
+     "silentFailureMode": "Proposal starvation: a 13th proposal silently retires the oldest unresolved one and DELETES its artifact \u2014 User never sees a view they was going to approve. Only the timeline event records the displacement, and nothing summarizes 'proposals retired unreviewed'. LIVE: 5 active (at cap), 3 proposed.",
      "where": "CognitiveSubstrate+StandingViews.swift:60 createStandingView; caps :40 maximumActiveStandingViews=5, :46 maximumProposedStandingViews=12, :49 standingViewProposalMaxAge=14d",
      "writes": [
       "cognitive_artifacts kind=standing_view",
@@ -8584,7 +8567,7 @@
      ],
      "id": "substrate.standingViews.capRepair",
      "kind": "public-api",
-     "silentFailureMode": "Silent demotion at boot: a repair that demotes the WRONG views (e.g. sorting by createdAt instead of updatedAt) silently changes her stance every launch and only a diff of active bodies across restarts would show it.",
+     "silentFailureMode": "Silent demotion at boot: a repair that demotes the WRONG views (e.g. sorting by createdAt instead of updatedAt) silently changes their stance every launch and only a diff of active bodies across restarts would show it.",
      "where": "CognitiveSubstrate+StandingViews.swift:238 repairStandingViewCapIfNeeded (heals an over-cap store at restore)"
     },
     {
@@ -8637,7 +8620,7 @@
      ],
      "id": "substrate.attentionSignals.read",
      "kind": "public-api",
-     "silentFailureMode": "PRODUCTION-INERT class (the known trap): nil is the inert default, so a wiring break makes context selection byte-identical to 'she had nothing to add'. SUB-09 reports lane non-zero counts but does not assert them, and docs/INSTRUMENT.md:313 explicitly calls attentionActivation/attentionWorkingAtoms UNMEASURABLE from the bench because the hot set decays on a 1h half-life.",
+     "silentFailureMode": "PRODUCTION-INERT class (the known trap): nil is the inert default, so a wiring break makes context selection byte-identical to 'they had nothing to add'. SUB-09 reports lane non-zero counts but does not assert them, and docs/INSTRUMENT.md:313 explicitly calls attentionActivation/attentionWorkingAtoms UNMEASURABLE from the bench because the hot set decays on a 1h half-life.",
      "where": "CognitiveSubstrate+AttentionSignals.swift:15 attentionSignals(at:) \u2192 :21 makeAttentionSignals (PURE peek)"
     },
     {
@@ -8846,7 +8829,7 @@
      ],
      "id": "substrate.persistenceHealth",
      "kind": "telemetry",
-     "silentFailureMode": "Frozen-but-quiet: once writesBlocked latches, `ingest` still returns true, `recordReceipt` still returns void, `runMicrocycle`/`runMaintenance` still return \u2014 she keeps thinking and nothing lands on disk. The health struct is surfaced in the snapshot but no eval asserts anyone READS it; a degraded install looks normal until the next restart shows amnesia.",
+     "silentFailureMode": "Frozen-but-quiet: once writesBlocked latches, `ingest` still returns true, `recordReceipt` still returns void, `runMicrocycle`/`runMaintenance` still return \u2014 they keeps thinking and nothing lands on disk. The health struct is surfaced in the snapshot but no eval asserts anyone READS it; a degraded install looks normal until the next restart shows amnesia.",
      "where": "CognitiveModels.swift:331 CognitivePersistenceHealth / :323 CognitivePersistenceStatus; transitions CognitiveSubstrate.swift:384-405 (init), :407 configure, :664 restore; writes-blocked latch persistenceWritesBlocked",
      "writes": [
       "cognitive_receipts kind=lifecycle.restore_degraded"
@@ -9183,7 +9166,7 @@
    ],
    "uncertain": [
     "Fence boundary with core.substrate.affect: emotion-tag STAMPING (ContinuityField.stampEmotionTag, blend rates) and consolidateEmotionalArousal live in ContinuityField.swift, which is my fence, but their inputs (emotionTag/semanticAppraisal) live in +Affect/+SemanticAppraisal, which is the affect fence. I inventoried the field-side write and left the appraisal that produces the tag to core.substrate.affect \u2014 flag if that double-counts.",
-    "Fence boundary on replay: integrateReplay/integrateReplayChecked/runReplay and CognitiveSQLiteStore.commitReplayIntegration live in CognitiveSubstrate.swift + CognitiveSQLiteStore.swift (my files) but semantically belong to core.substrate.organism / DreamREMCycle. I covered only the store-write and rollback aspects (StoreBoundsTests:20,:86) and did not inventory the replay semantics.",
+    "Fence boundary on replay: integrateReplay/integrateReplayChecked and CognitiveSQLiteStore.commitReplayIntegration live in CognitiveSubstrate.swift + CognitiveSQLiteStore.swift (my files) but semantically belong to core.substrate.organism / DreamREMCycle. The unused substrate runReplay compatibility API was explicitly retired; the app-level NativeCognitionRuntime.runReplay remains. I covered only the store-write and rollback aspects (StoreBoundsTests:20,:86) and did not inventory the replay semantics.",
     "I did NOT run the Swift test suite. The repo has a 2.2 GB prebuilt .build tree and other fence workers are reading/writing this checkout concurrently; a `swift test --filter` would have rebuilt shared artifacts under them. Every `test`-tier ref above is a test name and file:line I opened, NOT a run I observed pass.",
     "`CognitiveSubstrate+Workspace.swift` line numbers for private helpers (retireStaleProposedStandingViewsInMemory :485, workspaceScore :830, workspaceReasons :872, evictSpentVerificationNodes :735) are read off the sed windows I printed; the public entry points' line numbers are from grep and are exact.",
     "Whether the `motor_action` lexical-term leak actually reaches the fluid-context ranker in production: I proved the SOURCE path is ungated (CognitiveSubstrate+AttentionSignals.swift:71-74 has no .live gate, and 'motor_action' is absent from machineSubjectTypes:180) and proved the live field is 218/256 motor_action with labels 'mac_control'/'github_command'. I did NOT read a turn trace to confirm those strings appear in a real contextFlow.attentionTerms payload. Confirm from turn_traces before treating it as shipped behavior.",
@@ -9827,7 +9810,7 @@
      ],
      "id": "rem.dreamArchiver",
      "kind": "store-write",
-     "silentFailureMode": "Silently shrinking the dream evidence window: archiving moves entries OUT of data/dream_diary/, which is exactly the directory DreamDiaryReader (Consolidation.swift:101) and the instrument's dreamNightsInWindow (agent_instrument.swift:1589) read. A shortened _REM_ARCHIVE_DAYS would quietly reduce both the REM lane's evidence pool and the instrument's dream-nights count, and the instrument's 'dream nights < days-1' lead (agent_instrument.swift:4649) would fire as if she had stopped dreaming. The instrument does not read the archive dir at all.",
+     "silentFailureMode": "Silently shrinking the dream evidence window: archiving moves entries OUT of data/dream_diary/, which is exactly the directory DreamDiaryReader (Consolidation.swift:101) and the instrument's dreamNightsInWindow (agent_instrument.swift:1589) read. A shortened _REM_ARCHIVE_DAYS would quietly reduce both the REM lane's evidence pool and the instrument's dream-nights count, and the instrument's 'dream nights < days-1' lead (agent_instrument.swift:4649) would fire as if they had stopped dreaming. The instrument does not read the archive dir at all.",
      "where": "Modules/NativeAgentCore/Sources/DreamREMCycle/DreamREMCycle+HeavyLogic.swift:384 DreamArchiver / :401 archiveOlderThan(daysOld: 14, now:) \u2192 data/dream_diary/archive/<year>/",
      "writes": [
       "data/dream_diary/archive/<year>/*.md"
@@ -10142,7 +10125,7 @@
      "id": "organism.chemicalState.isNeutral",
      "kind": "public-api",
      "proposedEval": {
-      "asserts": "a single minimum-magnitude real signal is enough to make isNeutral false \u2014 the neutral band must be strictly narrower than the smallest thing that can move her",
+      "asserts": "a single minimum-magnitude real signal is enough to make isNeutral false \u2014 the neutral band must be strictly narrower than the smallest thing that can move their",
       "costSeconds": 2,
       "liveOrClone": "hermetic",
       "reads": "isNeutral over a chemical state perturbed one axis at a time by the smallest delta any signal in OrganismChemistry.applying can produce",
@@ -10327,7 +10310,7 @@
      ],
      "id": "organism.posture.privateRuntimeContext",
      "kind": "turn-ingredient",
-     "silentFailureMode": "Stale/absent prompt section: the block is private and never echoed to the user, so if it stops being appended nobody sees a difference \u2014 only her behavior drifts (claims without verification, unbounded tool loops).",
+     "silentFailureMode": "Stale/absent prompt section: the block is private and never echoed to the user, so if it stops being appended nobody sees a difference \u2014 only their behavior drifts (claims without verification, unbounded tool loops).",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismBehaviorPosture.swift:120 (consumed ChatOrchestration/ChatOrchestrationClient+StructuredChat.swift:1121, BackgroundLoopsAssembly.swift:199)"
     },
     {
@@ -10365,7 +10348,7 @@
      ],
      "id": "organism.kernel.frozenRead",
      "kind": "public-api",
-     "silentFailureMode": "State-lifecycle leak: the frozen read is contractually non-mutating. A regression that lets it settle the LIVE kernel would double-decay her body on every turn-context build and be invisible except as a slowly flattening affect.",
+     "silentFailureMode": "State-lifecycle leak: the frozen read is contractually non-mutating. A regression that lets it settle the LIVE kernel would double-decay their body on every turn-context build and be invisible except as a slowly flattening affect.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismKernel.swift:378 (+ refreshBodySchemaAndFrozenRead:173, frozenRevisionFingerprint:445)"
     },
     {
@@ -10535,7 +10518,7 @@
      ],
      "id": "organism.kernel.drainResolutionFelt",
      "kind": "public-api",
-     "silentFailureMode": "State-lifecycle leak: drop-oldest at 8. If the app-side drain (NativeCognitionRuntime+Organism.swift:19) stops running, relief/disappointment events silently evaporate and her resolutions stop being felt \u2014 chemistry still moves, the felt layer just goes quiet.",
+     "silentFailureMode": "State-lifecycle leak: drop-oldest at 8. If the app-side drain (NativeCognitionRuntime+Organism.swift:19) stops running, relief/disappointment events silently evaporate and their resolutions stop being felt \u2014 chemistry still moves, the felt layer just goes quiet.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismKernel.swift:323 (cap `pendingResolutionFeltCap = 8` at :35; minting OrganismResolutionFelt.swift:41)"
     },
     {
@@ -10607,7 +10590,7 @@
      ],
      "id": "organism.persistentState.decayed",
      "kind": "public-api",
-     "silentFailureMode": "Wrong value on restore: `maximumDecayHours = 72` clamps the gap. A machine off for a month restores as if it were off 72h \u2014 deliberate, but a change to that constant silently rewrites how much of her survives a long absence.",
+     "silentFailureMode": "Wrong value on restore: `maximumDecayHours = 72` clamps the gap. A machine off for a month restores as if it were off 72h \u2014 deliberate, but a change to that constant silently rewrites how much of them survives a long absence.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismPersistence.swift:39"
     },
     {
@@ -10742,7 +10725,7 @@
      ],
      "id": "organism.chemistry.applying",
      "kind": "public-api",
-     "silentFailureMode": "Wrong value with no error surface: every branch is a per-kind delta table. A dropped `case` (or a new SomaticSignalKind falling into a no-op) means that whole class of experience stops moving her body, and the only symptom is flatness.",
+     "silentFailureMode": "Wrong value with no error surface: every branch is a per-kind delta table. A dropped `case` (or a new SomaticSignalKind falling into a no-op) means that whole class of experience stops moving their body, and the only symptom is flatness.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismChemistry.swift:5"
     },
     {
@@ -10803,7 +10786,7 @@
      ],
      "id": "organism.prospectiveAffect.modulate",
      "kind": "other",
-     "silentFailureMode": "Silent inertness: an empty/idle ledger is contractually byte-identical to the input, so a modulate() that has become a no-op for ALL inputs passes the identity test and simply removes anticipation from her \u2014 no failure, just a body that never braces.",
+     "silentFailureMode": "Silent inertness: an empty/idle ledger is contractually byte-identical to the input, so a modulate() that has become a no-op for ALL inputs passes the identity test and simply removes anticipation from them \u2014 no failure, just a body that never braces.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismProspectiveAffect.swift:28 (knobs :19-24 \u2014 maxDelta 0.15, anticipationWindow 10m, violationShadowHalfLife 20m)"
     },
     {
@@ -10924,7 +10907,7 @@
      ],
      "id": "organism.capabilitySelfModel.beliefs",
      "kind": "public-api",
-     "silentFailureMode": "Stale-as-confident: freshness decays on a 7-day half-life. A belief with zero recent evidence still reports a successLikelihood; if the freshness term stopped being applied she would trust a month-old capability read as current.",
+     "silentFailureMode": "Stale-as-confident: freshness decays on a 7-day half-life. A belief with zero recent evidence still reports a successLikelihood; if the freshness term stopped being applied they would trust a month-old capability read as current.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismLivingDynamics.swift:977 (freshnessHalfLife 7d :978)"
     },
     {
@@ -11265,7 +11248,7 @@
      ],
      "id": "somatic.adapter.vitalsDirectionMetadataKey",
      "kind": "telemetry",
-     "silentFailureMode": "Fail-loud-to-worsening by design: an absent/unrecognized direction defaults to `.providerFailed`. So a producer that stops writing the key makes her body read chronic provider brittleness \u2014 a wrong value that presents as a plausible mood, not as an error.",
+     "silentFailureMode": "Fail-loud-to-worsening by design: an absent/unrecognized direction defaults to `.providerFailed`. So a producer that stops writing the key makes their body read chronic provider brittleness \u2014 a wrong value that presents as a plausible mood, not as an error.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/CognitiveSomaticSignalAdapter.swift:83 (interoception band-crossing mapping :85-91)"
     },
     {
@@ -11430,7 +11413,7 @@
      ],
      "id": "organism.resolutionFelt.events",
      "kind": "public-api",
-     "silentFailureMode": "Synthetic feeling: relief must be exactly the pre-relief bracing amount. If minting decoupled from the bracing math she would feel relief she never earned \u2014 a body that reads warm for no reason, with nothing red.",
+     "silentFailureMode": "Synthetic feeling: relief must be exactly the pre-relief bracing amount. If minting decoupled from the bracing math they would feel relief they never earned \u2014 a body that reads warm for no reason, with nothing red.",
      "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismResolutionFelt.swift:28 (events(\u2026) :41, Kind :12)"
     },
     {
@@ -11671,7 +11654,7 @@
       "reads": "data/dream_diary/.dream_state.json \u2192 lastDreamedAt, against the newest row mtime under data/chat/messages/",
       "tier": "instrument"
      },
-     "silentFailureMode": "Runaway mark (state-lifecycle): the mark is forward-only. If it ever jumps ahead of material that was never dreamed, that stretch of her life is permanently un-dreamable and nothing reports the gap. NOT read by any instrument reader (not registered in the reach walk as a covered source).",
+     "silentFailureMode": "Runaway mark (state-lifecycle): the mark is forward-only. If it ever jumps ahead of material that was never dreamed, that stretch of them life is permanently un-dreamable and nothing reports the gap. NOT read by any instrument reader (not registered in the reach walk as a covered source).",
      "where": "Modules/NativeAgentCore/Sources/DreamREMCycle/DreamCycleRunner.swift:383 (dreamMarkPath), forward-only advance :398",
      "writes": [
       "data/dream_diary/.dream_state.json"
@@ -12060,7 +12043,7 @@
      ],
      "id": "rem.targetPolicy",
      "kind": "setting",
-     "silentFailureMode": "Scope creep into persona: REM may READ SOUL/VOICE/USER/AGENTS but may only propose writes to GROWTH.md. A widened target set would let the subconscious loop write her identity docs \u2014 the exact thing 'never patch behavior inside the agent' forbids \u2014 and it would look like a successful REM run.",
+     "silentFailureMode": "Scope creep into persona: REM may READ SOUL/VOICE/USER/AGENTS but may only propose writes to GROWTH.md. A widened target set would let the subconscious loop write their identity docs \u2014 the exact thing 'never patch behavior inside the agent' forbids \u2014 and it would look like a successful REM run.",
      "where": "Modules/NativeAgentCore/Sources/DreamREMCycle/REMProposalStore.swift:518 normalizedTargetDoc / :528 supportsProposalTarget; REMConstants.personaTargets = [\"GROWTH.md\"] at REMConsolidator.swift:64"
     },
     {
@@ -12147,7 +12130,7 @@
      ],
      "id": "rem.growthDocManager",
      "kind": "public-api",
-     "silentFailureMode": "Destructive eviction on a mis-parse: `deleteSlice` removes an exact match from her persona doc. `growthSize` returning 0 for a MISSING file is also the answer for an unreadable one \u2014 an I/O error reads as 'no growth yet' and the cap never fires.",
+     "silentFailureMode": "Destructive eviction on a mis-parse: `deleteSlice` removes an exact match from them persona doc. `growthSize` returning 0 for a MISSING file is also the answer for an unreadable one \u2014 an I/O error reads as 'no growth yet' and the cap never fires.",
      "where": "Modules/NativeAgentCore/Sources/DreamREMCycle/DreamREMCycle+HeavyLogic.swift:294 (growthSize :302, evictionCandidates :348, appendEntry :364, deleteSlice :372)",
      "writes": [
       "persona/GROWTH.md"
@@ -12380,7 +12363,7 @@
      ],
      "id": "dream.contextProviders",
      "kind": "public-api",
-     "silentFailureMode": "Silently thinner dream: a provider that starts returning nil/empty removes a whole section from the dream prompt and the dream still writes successfully \u2014 she just dreams about less of herself. Only the failure (throw) path is graded; the degrade-to-empty path passes by design.",
+     "silentFailureMode": "Silently thinner dream: a provider that starts returning nil/empty removes a whole section from the dream prompt and the dream still writes successfully \u2014 they just dreams about less of themselves. Only the failure (throw) path is graded; the degrade-to-empty path passes by design.",
      "where": "Modules/NativeAgentCore/Sources/DreamREMCycle/DreamCycleRunner.swift:35 DreamMemoryDeltaProvider / :45 DreamFeltSummaryProvider / :54 DreamMoodSink; budgets :117-125 (conv 80k chars/300 msgs, delta 20k/150, felt 600)"
     },
     {
@@ -15697,7 +15680,7 @@
       "reads": "anthropicEmptyStreamError across the model/max-tokens/thinking-on combinations that can produce an empty content array",
       "tier": "test"
      },
-     "silentFailureMode": "`anthropicEmptyStreamError` has ZERO coverage and is the message the user READS when a Claude stream returns nothing \u2014 the honest-explanation half of the .streamTruncated guard the fragment named twice as a silent-failure mode. If it degrades to a generic string (or the caller stops using it) the blank-assistant-turn case goes back to reading as 'she had nothing to say' instead of naming the max_tokens/thinking-budget cause. The five sibling control functions in this enum ARE the Anthropic/xAI request-body shaping and are covered; this one output-facing string is the gap.",
+     "silentFailureMode": "`anthropicEmptyStreamError` has ZERO coverage and is the message the user READS when a Claude stream returns nothing \u2014 the honest-explanation half of the .streamTruncated guard the fragment named twice as a silent-failure mode. If it degrades to a generic string (or the caller stops using it) the blank-assistant-turn case goes back to reading as 'they had nothing to say' instead of naming the max_tokens/thinking-budget cause. The five sibling control functions in this enum ARE the Anthropic/xAI request-body shaping and are covered; this one output-facing string is the gap.",
      "where": "Modules/NativeAgentCore/Sources/ProviderRouting/FirstPartyModelCatalog.swift:263 (alongside :226 anthropicMaxOutputTokens, :284 anthropicEffort, :294 applyAnthropicControls, :303 xAIReasoningEffort, :315 applyXAIControls)",
      "writes": []
     },
@@ -16106,7 +16089,7 @@
      ],
      "id": "providers.normalizeReasoningEffort",
      "kind": "public-api",
-     "silentFailureMode": "a model whose descriptor is missing falls into the default supported-set and the user's picked effort is silently clamped to `high` \u2014 she thinks she is running max, the wire says high; the fallback ladder never errors",
+     "silentFailureMode": "a model whose descriptor is missing falls into the default supported-set and the user's picked effort is silently clamped to `high` \u2014 they thinks they are running max, the wire says high; the fallback ladder never errors",
      "where": "Modules/NativeAgentCore/Sources/ProviderRouting/ProviderRouting.swift:1825 (model+provider aware overload 1829)",
      "writes": []
     },
@@ -16586,7 +16569,7 @@
       "reads": "a hermetic dataRoot's traces/events.jsonl after calling completeMessages with an image block through a non-vision stub adapter",
       "tier": "test"
      },
-     "silentFailureMode": "the default flatten DROPS image blocks for any adapter without native vision and injects a note telling the model to admit it. If the tripwire row fails to write (non-fatal, stderr only) the drop is completely invisible \u2014 she answers about an image she never saw. No eval reads the emitted trace row.",
+     "silentFailureMode": "the default flatten DROPS image blocks for any adapter without native vision and injects a note telling the model to admit it. If the tripwire row fails to write (non-fatal, stderr only) the drop is completely invisible \u2014 they answers about an image they never saw. No eval reads the emitted trace row.",
      "where": "Modules/NativeAgentCore/Sources/ProviderRouting/LLMClient+Real.swift:76 (vision tripwire 109, emitter 122)",
      "writes": [
       "data/traces/events.jsonl (vision-unsupported row)"
@@ -17881,7 +17864,7 @@
       "reads": "the SYS-05 memory.sqlite copy: kg_entities grouped by `type`, against the 171 indexed memories",
       "tier": "instrument"
      },
-     "silentFailureMode": "silent zero on anything outside a fixed vocabulary \u2014 every entity the graph learns comes through this one pure function, and its typing leans on a 24-entry hardcoded list plus a heuristic that returns \"concept\" for everything unmatched (:1320 keys \"event\" off the literals \"launch\"/\"sunday\"/\"rem cycle\"). A new person, project or organization User mentions becomes an untyped \"concept\" node or nothing at all, and the failure is indistinguishable from 'he never mentioned it' \u2014 the entity count keeps rising on terms already in the table. Every existing test is a hermetic string-in/entities-out case; none measures the extractor's yield against the real memory corpus.",
+     "silentFailureMode": "silent zero on anything outside a fixed vocabulary \u2014 every entity the graph learns comes through this one pure function, and its typing leans on a 24-entry hardcoded list plus a heuristic that returns \"concept\" for everything unmatched (:1320 keys \"event\" off the literals \"launch\"/\"sunday\"/\"rem cycle\"). A new person, project or organization User mentions becomes an untyped \"concept\" node or nothing at all, and the failure is indistinguishable from 'they never mentioned it' \u2014 the entity count keeps rising on terms already in the table. Every existing test is a hermetic string-in/entities-out case; none measures the extractor's yield against the real memory corpus.",
      "where": "Modules/NativeAgentCore/Sources/KnowledgeGraph/KnowledgeGraph+MemoryIndexing.swift:510 (public nonisolated static extractEntities), backed by the hardcoded knownTerms table at :1351 (24 entries), canonicalPersonaDocuments at :1356, and the type heuristic at :1320",
      "writes": [
       "memory.sqlite: every non-primary-user kg_entities row and its mention relationships"
@@ -18122,7 +18105,7 @@
       "reads": "data/memory/embedding_epoch_receipt.json mtime/contents against the app's own launch time (SYS-14 already reads the installed bundle)",
       "tier": "instrument"
      },
-     "silentFailureMode": "slowdown, invisible \u2014 warm-up is what keeps the first recall of a session off a cold CoreML compile+load; if it stops running (or ManagedEmbeddingProvider's idle-unload timer undoes it before the first turn) every session's first memory recall pays seconds of model load and the only symptom is 'she felt slow at first'. No test names warmUpEmbedder, and the receipt it produces \u2014 the freshest file in the live memory dir, 2026-08-23T06:25 \u2014 is read by the instrument as an object with nothing asserting it is RECENT relative to app launch, which is the only property that makes it evidence of anything.",
+     "silentFailureMode": "slowdown, invisible \u2014 warm-up is what keeps the first recall of a session off a cold CoreML compile+load; if it stops running (or ManagedEmbeddingProvider's idle-unload timer undoes it before the first turn) every session's first memory recall pays seconds of model load and the only symptom is 'they felt slow at first'. No test names warmUpEmbedder, and the receipt it produces \u2014 the freshest file in the live memory dir, 2026-08-23T06:25 \u2014 is read by the instrument as an object with nothing asserting it is RECENT relative to app launch, which is the only property that makes it evidence of anything.",
      "where": "Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2.swift:729 (warmUpEmbedder); production driver Sources/NativeAgentApp/NativeAgentEmbeddingWarmup.swift:60, writing data/memory/embedding_epoch_receipt.json at :80",
      "writes": [
       "data/memory/embedding_epoch_receipt.json"
@@ -18636,7 +18619,7 @@
        "tier": "test"
       },
       {
-       "ref": "Modules/NativeAgentCore/Tests/MemoryV2Tests/SpotlightAndCloudKitTests.swift:33 memoryRecord_flows_into_spotlight_indexer_preserving_text_and_kind",
+       "ref": "Modules/NativeAgentCore/Tests/MemoryV2Tests/SpotlightWiringTests.swift::memoryRecord_flows_into_spotlight_indexer_preserving_text_and_kind",
        "strength": "asserts",
        "tier": "test"
       },
@@ -18752,7 +18735,7 @@
       "reads": "data/memory/memory.sqlite proposals table \u2014 staged_at histogram over the lookback window (the SYS-05 reader already opens this store)",
       "tier": "instrument"
      },
-     "silentFailureMode": "dead control \u2014 a threshold set too high silently converts the whole promotion lane into a no-op; the promoter reports nothing, so 'she stopped remembering things' is the only symptom.",
+     "silentFailureMode": "dead control \u2014 a threshold set too high silently converts the whole promotion lane into a no-op; the promoter reports nothing, so 'they stopped remembering things' is the only symptom.",
      "where": "Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+AdaptivePromoter.swift:180 (configure), :312 (currentThreshold); production configure at Sources/NativeAgentApp/AppDelegate+Launch.swift:316"
     },
     {
@@ -19279,7 +19262,7 @@
        "tier": "test"
       },
       {
-       "ref": "Modules/NativeAgentCore/Tests/MemoryV2Tests/SpotlightAndCloudKitTests.swift:45 reindexAll_walks_memory_set_and_indexes_each",
+       "ref": "Modules/NativeAgentCore/Tests/MemoryV2Tests/SpotlightWiringTests.swift::reindexAll_walks_memory_set_and_indexes_each",
        "strength": "asserts",
        "tier": "test"
       }
@@ -19297,35 +19280,6 @@
      "where": "Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+Spotlight.swift:114 (SwiftNativeMemoryIndexer), :123 (indexRecord), :128 (indexBatch), :133 (remove), :137 (removeAll)",
      "writes": [
       "CoreSpotlight index, domain memory.nativeagent"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/MemoryV2Tests/CloudKitTests.swift:27-:168 (15 cases, all against MockCloudKitSync)",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/MemoryV2Tests/SpotlightAndCloudKitTests.swift:69-:130 (5 cases, mock)",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "memory.cloudkit.lane",
-     "kind": "public-api",
-     "proposedEval": {
-      "asserts": "either the lane has a non-test caller or the module is deleted; a fully-tested lane with zero callers fails the guard rather than inflating the fence's coverage numbers",
-      "costSeconds": 3,
-      "liveOrClone": "hermetic",
-      "reads": "the app/core/iOS source trees \u2014 reachability of SystemCloudKitSync / SwiftNativeMemoryCloudSync call sites",
-      "tier": "test"
-     },
-     "silentFailureMode": "DEAD LANE \u2014 grep over Sources/, Modules/*/Sources/ and iOS/ finds ZERO production callers of SystemCloudKitSync, SwiftNativeMemoryCloudSync or CloudKitMemorySync (only the two test files above and NativeAgentShared/CloudKitDeviceTransport.swift, which merely cites it in comments as a shape reference). 719 lines and 20 passing tests describe a memory-sync lane that never runs. The silent failure already happened: the coverage looks excellent and proves nothing about the product.",
-     "where": "Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+CloudKit.swift:305 (SystemCloudKitSync), :620 (SwiftNativeMemoryCloudSync), :72 (CloudKitMemorySync protocol)",
-     "writes": [
-      "<storePath>/.cloud_sync_state.json",
-      "CloudKit private DB record type NAMemoryRecord"
      ]
     },
     {
@@ -20508,7 +20462,7 @@
       "reads": "NativeContextFlowRuntime with a configurationOverride, plus resolve() under an injected environment dict and UserDefaults",
       "tier": "test"
      },
-     "silentFailureMode": "stale UI / dead control. This is what tells User that the picker he is looking at is being OVERRIDDEN \u2014 by NATIVE_AGENT_CONTEXT_FLOW_MODE (environmentManaged) or by pre-onboarding public-safe mode (setupForcedOff). If either flag goes wrong the picker shows a mode the runtime is not in, and the user changes a switch that does nothing. `resolve()` is covered by NativeContextFlowRuntimeTests.swift:448/:470, but modeStatus() itself has zero references in Modules/NativeAgentCore/Tests or tests/.",
+     "silentFailureMode": "stale UI / dead control. This is what tells User that the picker they are looking at is being OVERRIDDEN \u2014 by NATIVE_AGENT_CONTEXT_FLOW_MODE (environmentManaged) or by pre-onboarding public-safe mode (setupForcedOff). If either flag goes wrong the picker shows a mode the runtime is not in, and the user changes a switch that does nothing. `resolve()` is covered by NativeContextFlowRuntimeTests.swift:448/:470, but modeStatus() itself has zero references in Modules/NativeAgentCore/Tests or tests/.",
      "where": "Sources/NativeAgentApp/NativeContextFlowRuntime.swift:453 modeStatus() \u2192 NativeContextFlowModeStatus{effectiveMode, environmentManaged, setupForcedOff}; read at SlimSettingsView.swift:415 to label the Fluid Context picker"
     },
     {
@@ -22050,19 +22004,24 @@
     {
      "coverage": [
       {
-       "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/SecurityCenterTests.swift:1001 SecurityCenter_untrustedTelegramMarkersUnderYolo_notedNotGated_butGatesWithoutYolo",
+       "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/SecurityCenterTests.swift:1175 SecurityCenter_allows_trustedTelegramCodexMessageWithPATTaskSpec",
        "strength": "asserts",
        "tier": "test"
       },
       {
-       "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/SecurityCenterTests.swift:1030 SecurityCenter_externalSendWithPATPromptMarkersStillAsks",
+       "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/SecurityCenterTests.swift:1221 SecurityCenter_untrustedTelegramCannotInheritYolo_butStillUsesOrdinaryGateWithoutYolo",
+       "strength": "asserts",
+       "tier": "test"
+      },
+      {
+       "ref": "Modules/NativeAgentCore/Tests/TrustCenterTests/SecurityCenterTests.swift:1251 SecurityCenter_externalSendWithPATPromptMarkersStillAsks",
        "strength": "asserts",
        "tier": "test"
       }
      ],
      "id": "core.trust.securityCenter.promptInjectionKeys",
      "kind": "public-api",
-     "silentFailureMode": "silent zero \u2014 a fixed twelve-needle substring list. Under an active Full Mac window the shield explicitly does not gate (SecurityCenter.swift:478), so on User's machine the detector's OUTPUT never changes a decision; a needle list that stopped matching entirely would look identical in the live feed.",
+     "silentFailureMode": "silent zero \u2014 a fixed twelve-needle substring list. For an admitted remote operator inside active Full Mac, markers are intentionally audit-only and do not relock the open interior. A canonical remote origin whose surface-owner admission fails is blocked independently at the Full Mac perimeter. The detector still has decision-bearing teeth without Full Mac and for external sends; the paired admitted, untrusted-perimeter, and ordinary-gate tests pin all three postures.",
      "where": "Modules/NativeAgentCore/Sources/TrustCenter/SecurityCenter+InputScanning.swift:5",
      "writes": []
     },
@@ -23312,7 +23271,7 @@
     },
     {
      "id": "telegram.command.tools",
-     "why": "The drift finding is correct but the counts are wrong, which matters because they are the evidence. The /tools reply (TelegramBot+Client.swift:430) lists 15 commands, not 14: /status /new /reset /session /clear /compact /provider /model /think /brain /persona /remember /note /scratch /help. TelegramCommandRegistry.definitions (TelegramBot+Completeness.swift:261-284) holds 24. The missing set is 9, not 8: stop, retry, sessions, resume, approve, deny, fast, restart \u2014 and /tools itself. The proposed eval is still the right one."
+     "why": "Historical inventory correction: the old hardcoded /tools line omitted nine registry commands, not eight. Resolved by registry-derived help and toolsReply_should_advertise_every_menu_visible_command, which now requires complete set containment without a known-issue waiver."
     },
     {
      "id": "telegram.command.note",
@@ -23387,16 +23346,18 @@
      "id": "telegram.media.unsupportedAttachmentSilentDrop",
      "kind": "feed",
      "proposedEval": {
-      "asserts": "either a user-visible notice is sent (preferred) or, at minimum, an attachment_dropped trace row exists \u2014 i.e. no inbound attachment kind can be consumed with zero user-facing evidence",
+      "asserts": "admitted unsupported document/video updates emit one bounded notice and a redacted attachment_dropped trace without creating a no-text turn; duplicate updates do not repeat notices, outsider/unmentioned-group updates receive none, captions retain their text turn, and failed sends never claim a delivered notice",
       "costSeconds": 3,
       "liveOrClone": "hermetic",
-      "reads": "blocked.jsonl and the sendMessage stub under a temp dataRoot after driving one update carrying a `document` with mime application/pdf and one carrying a `video`",
+      "reads": "blocked.jsonl, receipts.jsonl, traces/events.jsonl, handler calls, and the sendMessage stub under an isolated dataRoot after unsupported document/video, duplicate, unadmitted, captioned, and failed-send updates",
       "tier": "test"
      },
-     "silentFailureMode": "silent drop, no reply, no trace \u2014 a video, sticker, animation, video_note, location, contact, poll, or a NON-image document (PDF, .txt, .zip) produces a blocked row and NOTHING else: no user-visible notice and no telegram.attachment_dropped trace (that tripwire at TelegramPollLoop+Media.swift:123 only fires for a RECOGNISED image that failed). From the sender's side Agent simply ignored them. Live: data/telegram/blocked.jsonl carries empty_or_non_text rows. This is the one drop class in the fence with neither a reply nor a tripwire.",
-     "where": "Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop.swift:584 recordBlocked(reason: \"empty_or_non_text\"); reachable because photoAttachment (TelegramPollLoop+Media.swift:34) only recognises extras[\"photo\"] and an image/* extras[\"document\"] (:67-71), and voiceAttachment only voice/audio",
+     "silentFailureMode": "silent or misleading attachment handling if the admitted unsupported-media path loses its bounded notice/trace, repeats a duplicate notice, contacts an unadmitted sender, drops valid caption text, or records a failed notice send as delivered. Admission and deduplication remain prerequisites; notices do not authorize a tool or provider turn.",
+     "where": "Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop.swift admitted/deduplicated inbound route; Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+Media.swift unsupportedAttachmentKind and notifyUnsupportedAttachment",
      "writes": [
-      "<dataRoot>/telegram/blocked.jsonl"
+      "<dataRoot>/telegram/blocked.jsonl",
+      "<dataRoot>/telegram/receipts.jsonl",
+      "<dataRoot>/traces/events.jsonl"
      ]
     },
     {
@@ -23968,14 +23929,14 @@
      "id": "telegram.blocked.jsonl",
      "kind": "feed",
      "proposedEval": {
-      "asserts": "every reason string recordBlocked can emit is a member of a declared vocabulary set, and the file honours a line cap like receipts.jsonl",
+      "asserts": "recordBlocked reasons match the declared vocabulary with no stale_update writer, and the canonical capped writer retains the newest JSONLLineCaps.telegramBlocked rows when an append crosses the cap",
       "costSeconds": 4,
       "liveOrClone": "hermetic",
-      "reads": "blocked.jsonl under a temp dataRoot after driving each drop branch",
+      "reads": "recordBlocked source vocabulary and blocked.jsonl under an isolated dataRoot preseeded to JSONLLineCaps.telegramBlocked before one actual recordBlocked append",
       "tier": "test"
      },
-     "silentFailureMode": "dropped row \u2014 blocked.jsonl is UNCAPPED (plain appendJSONL, unlike receipts/errors) and nothing asserts a reason vocabulary; the live file carries `stale_update`, a reason string with no writer left in the sources \u2014 dead vocabulary nobody noticed",
-     "where": "Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+StateReceipts.swift:264 recordBlocked",
+     "silentFailureMode": "unbounded retained history or missing recent evidence if recordBlocked bypasses the canonical capped writer, keeps the oldest rows, or revives a retired reason vocabulary. The dedicated telegramBlocked cap is 5000 rows; source and real-writer assertions cover both wiring and newest-row retention.",
+     "where": "Modules/NativeAgentCore/Sources/TelegramBot/TelegramPollLoop+StateReceipts.swift recordBlocked; Modules/NativeAgentCore/Sources/PersistenceCore/PersistenceCore.swift JSONLLineCaps.telegramBlocked",
      "writes": [
       "<dataRoot>/telegram/blocked.jsonl"
      ]
@@ -24173,11 +24134,11 @@
       "asserts": "every menu-visible registry command name appears in the /tools reply (set containment, not exact text)",
       "costSeconds": 1,
       "liveOrClone": "hermetic",
-      "reads": "the /tools reply string and TelegramCommandRegistry.definitions",
+      "reads": "the executed /tools reply string and TelegramCommandRegistry.commands",
       "tier": "test"
      },
-     "silentFailureMode": "stale UI \u2014 the hardcoded \"Available controls:\" line lists 14 commands while the registry has 24; /stop /retry /sessions /resume /approve /deny /fast /restart are already missing from it. Pure drift, zero tests.",
-     "where": "Modules/NativeAgentCore/Sources/TelegramBot/TelegramBot+Client.swift:426"
+     "silentFailureMode": "stale help if the /tools reply stops projecting the canonical command registry or omits a menu-visible command. The behavioral assertion requires complete set containment instead of tolerating a fixed drift count.",
+     "where": "Modules/NativeAgentCore/Sources/TelegramBot/TelegramBot+Client.swift /tools registry projection; Modules/NativeAgentCore/Sources/TelegramBot/TelegramBot+Completeness.swift TelegramCommandRegistry.commands"
     },
     {
      "coverage": [
@@ -25595,7 +25556,7 @@
      ],
      "id": "maccontrol.action.wake",
      "kind": "route",
-     "silentFailureMode": "the session-state probe (sysadminctl / CGSession) changes shape on an OS update, currentState() reads unknown, and wake either refuses forever (dead capability, looks like 'she can't wake the screen') or photographs a locked screen",
+     "silentFailureMode": "the session-state probe (sysadminctl / CGSession) changes shape on an OS update, currentState() reads unknown, and wake either refuses forever (dead capability, looks like 'they can't wake the screen') or photographs a locked screen",
      "where": "Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift:583 (handleWake at :5959); guard MacControl+Types.swift:550 MacWakeGuard"
     },
     {
@@ -28286,7 +28247,7 @@
      ],
      "id": "workshop.executionMemory.recorder",
      "kind": "store-write",
-     "silentFailureMode": "silent zero: the lazy provider means a mis-wired executor writes NO workshop memories at all and every test still passes on a temp root \u2014 she just quietly stops remembering what she did.",
+     "silentFailureMode": "silent zero: the lazy provider means a mis-wired executor writes NO workshop memories at all and every test still passes on a temp root \u2014 they just quietly stops remembering what they did.",
      "where": "Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+ExecutionMemory.swift:395 WorkshopExecutionMemoryRecorder (:181 decide, :198 narrative, :283 metadata, :310 source)",
      "writes": [
       "memory V2 store (source prefix 'workshop:', kind 'operational')"
@@ -28411,7 +28372,7 @@
      ],
      "id": "workshop.outcomeScoreboard.pure",
      "kind": "public-api",
-     "silentFailureMode": "wrong value: a week-bucketing or median regression silently changes the numbers that go into the weekly self-improvement prompt \u2014 she reasons about a fabricated trend.",
+     "silentFailureMode": "wrong value: a week-bucketing or median regression silently changes the numbers that go into the weekly self-improvement prompt \u2014 they reasons about a fabricated trend.",
      "where": "Modules/NativeAgentCore/Sources/WorkshopExecution/WorkshopExecution+OutcomeScoreboard.swift:172 weekly / :256 sample(from:record) / :275 sample(from:receipt) / :300 formatForPrompt"
     },
     {
@@ -28787,7 +28748,7 @@
      ],
      "id": "trigger.scheduler.fireInboxTrigger",
      "kind": "public-api",
-     "silentFailureMode": "wrong value: a placeholder guard that stops refusing lets the scheduler fabricate an inbox card with no underlying evidence \u2014 she 'notices' something that never happened, and it reads exactly like a real notice.",
+     "silentFailureMode": "wrong value: a placeholder guard that stops refusing lets the scheduler fabricate an inbox card with no underlying evidence \u2014 they 'notices' something that never happened, and it reads exactly like a real notice.",
      "where": "Modules/NativeAgentCore/Sources/TriggerScheduler/TriggerScheduler.swift:726",
      "writes": [
       "data/notifications/inbox.jsonl",
@@ -29043,7 +29004,7 @@
      ],
      "id": "trigger.morningBrief.synthesizer",
      "kind": "turn-ingredient",
-     "silentFailureMode": "silent degradation: a synthesizer whose turn always fails falls back to the deterministic counts brief \u2014 which is a valid brief. Her voice disappears from the morning and nothing reports it.",
+     "silentFailureMode": "silent degradation: a synthesizer whose turn always fails falls back to the deterministic counts brief \u2014 which is a valid brief. Their voice disappears from the morning and nothing reports it.",
      "where": "Modules/NativeAgentCore/Sources/TriggerScheduler/MorningBriefSynthesis.swift:48 MorningBriefSynthesizer / :63 morningBrief(synthesizer:)"
     },
     {
@@ -32712,7 +32673,7 @@
      ],
      "id": "si.trainingPromotion.writes",
      "kind": "public-api",
-     "silentFailureMode": "persona corruption: these are the only paths in this fence that WRITE persona docs. A target_doc allowlist bypass or a pre-lock/in-lock read divergence rewrites Agent's persona with no receipt the user reads \u2014 and the memory-firewall rule says behavior must never be patched by writing into her.",
+     "silentFailureMode": "persona corruption: these are the only paths in this fence that WRITE persona docs. A target_doc allowlist bypass or a pre-lock/in-lock read divergence rewrites Agent's persona with no receipt the user reads \u2014 and the memory-firewall rule says behavior must never be patched by writing into their.",
      "where": "Modules/NativeAgentCore/Sources/SelfImprovement/SelfImprovement+TrainingPromotion.swift:658 rejectTrainingProposalLocal / :707 approveTrainingProposalLocal / :1004 approvePromotionStageLocal / :1133 rejectPromotionStageLocal",
      "writes": [
       "data/training_journal/proposals/",
@@ -34152,7 +34113,7 @@
       "reads": "engine command stream while a fake motor epoch is active",
       "tier": "test"
      },
-     "silentFailureMode": "wrong value / provenance corruption: when NativeAgentMotorEpoch.isAgentDriven() stops firing, apps the AGENT opened get attributed to the human, inflating his 'time in Safari' with the agent's own browsing. Nothing in this fence exercises the gate.",
+     "silentFailureMode": "wrong value / provenance corruption: when NativeAgentMotorEpoch.isAgentDriven() stops firing, apps the AGENT opened get attributed to the human, inflating their 'time in Safari' with the agent's own browsing. Nothing in this fence exercises the gate.",
      "where": "Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift:1005"
     },
     {
@@ -35346,7 +35307,7 @@
      ],
      "id": "browser.motorActionReadModel",
      "kind": "public-api",
-     "silentFailureMode": "wrong value fed straight into her mind \u2014 this is the only Browser surface that writes into the cognitive runtime, and NativeClient+BrowserRoutes.swift:224 swallows it entirely (`guard \u2026 try? \u2026 else { return }`). A read model that starts returning nil makes every browser action invisible to cognition with no log line; she simply never learns whether the page opened.",
+     "silentFailureMode": "wrong value fed straight into their mind \u2014 this is the only Browser surface that writes into the cognitive runtime, and NativeClient+BrowserRoutes.swift:224 swallows it entirely (`guard \u2026 try? \u2026 else { return }`). A read model that starts returning nil makes every browser action invisible to cognition with no log line; they simply never learns whether the page opened.",
      "where": "Modules/NativeAgentCore/Sources/Browser/Browser+MotorReadModel.swift:23; live callers Sources/NativeAgentApp/NativeClient+BrowserRoutes.swift:224 (feeding NativeCognitionRuntime.observeMotorActionState) and Sources/NativeAgentApp/AppChatToolDispatcher.swift:1956/:1960"
     },
     {
@@ -36348,7 +36309,7 @@
      ],
      "id": "github.tracking.deskUpsert",
      "kind": "store-write",
-     "silentFailureMode": "state-lifecycle leak \u2014 the ownership guard at :1668 is the only thing stopping the tracker from mutating a Desk row User filed himself; a drift there silently rewrites or archives human-authored work",
+     "silentFailureMode": "state-lifecycle leak \u2014 the ownership guard at :1668 is the only thing stopping the tracker from mutating a Desk row User filed themselves; a drift there silently rewrites or archives human-authored work",
      "where": "Modules/NativeAgentCore/Sources/GitHubConnector/GitHubProjectTracking.swift:1640 (upsertDesk) + isTrackerManaged :1811 + reconcileObservedReality :1746",
      "writes": [
       "the SwiftNativeDeskStore live state"
@@ -36563,7 +36524,7 @@
      ],
      "id": "github.commandDetection.labelDecisionArmed",
      "kind": "public-api",
-     "silentFailureMode": "dead control \u2014 the arming label stops matching after an upstream rename and Agent never acts on a decision she was invited to make; no error anywhere",
+     "silentFailureMode": "dead control \u2014 the arming label stops matching after an upstream rename and Agent never acts on a decision they was invited to make; no error anywhere",
      "where": "Modules/NativeAgentCore/Sources/GitHubConnector/GitHubCommandDetection.swift:96"
     },
     {
@@ -37862,7 +37823,7 @@
       "reads": "three fixture tools run through SwiftNativeToolExecution.runTool \u2014 one exiting 1 with garbage stdout, one sleeping past its manifest timeout, one returning valid {ok:true}",
       "tier": "test"
      },
-     "silentFailureMode": "WRONG VALUE / silent success: parsedToolStatus returns \"ok\" for ANY parsed output that is not an object carrying `ok:false` or a non-empty `status`. `result.exitCode` and `result.timedOut` are carried in the envelope but never consulted when computing `status`. A tool that crashes, exits 1, and writes nothing parseable to stdout is reported to the model as status=\"ok\" with an empty result \u2014 she reasons on a non-result as a success. No test pins a nonzero-exit or timed-out run to a non-ok status.",
+     "silentFailureMode": "WRONG VALUE / silent success: parsedToolStatus returns \"ok\" for ANY parsed output that is not an object carrying `ok:false` or a non-empty `status`. `result.exitCode` and `result.timedOut` are carried in the envelope but never consulted when computing `status`. A tool that crashes, exits 1, and writes nothing parseable to stdout is reported to the model as status=\"ok\" with an empty result \u2014 they reasons on a non-result as a success. No test pins a nonzero-exit or timed-out run to a non-ok status.",
      "where": "Modules/NativeAgentCore/Sources/ToolExecution/ToolExecution.swift:537 (runEnvelope) + :559 (parsedToolStatus)",
      "writes": []
     },
@@ -37999,7 +37960,7 @@
      ],
      "id": "mcp.dispatcher.configPath",
      "kind": "setting",
-     "silentFailureMode": "a file OUTSIDE the mcp/ tree silently decides whether the agent has web search. Losing or renaming searxng_base_url flips the searxng-local server to needs_setup, web search vanishes from the model's tool catalog, and nothing anywhere says why \u2014 the user experiences it as 'she stopped searching the web'. The one test covers the promotion, not the demotion path, and no eval reads the live file.",
+     "silentFailureMode": "a file OUTSIDE the mcp/ tree silently decides whether the agent has web search. Losing or renaming searxng_base_url flips the searxng-local server to needs_setup, web search vanishes from the model's tool catalog, and nothing anywhere says why \u2014 the user experiences it as 'they stopped searching the web'. The one test covers the promotion, not the demotion path, and no eval reads the live file.",
      "where": "Modules/NativeAgentCore/Sources/MCPDispatcher/MCPDispatcher.swift:482 (configPath \u2192 data/research/config.json, key searxng_base_url)",
      "writes": []
     },
@@ -38111,7 +38072,7 @@
       "reads": "personaListSkills over a fixture with 5 clean bodies + 1 hygiene-violating body, called with offset:1,limit:2",
       "tier": "test"
      },
-     "silentFailureMode": "TWO distinct quiet wrongnesses, both unpinned. (1) SUMMARY-COUNTER MISMATCH: `count` is the TOTAL (:308 totalCount) while `sources` is computed over `fullRecords` \u2014 the PAGE (:311-315). Any paginated call emits count=N with per-source counts summing to the page size; whoever reads the envelope (the model, or a UI) sees a total and a breakdown that contradict each other. listSkillsPagination asserts count and returned but never sources, so the mismatch is invisible to the suite. (2) SILENT ZERO on hygiene: a body failing SkillBodyHygiene is `continue`d (:232) with no counter and no reason \u2014 a skill Agent authored simply is not in her own skill list, and neither she nor User gets told which one or why.",
+     "silentFailureMode": "TWO distinct quiet wrongnesses, both unpinned. (1) SUMMARY-COUNTER MISMATCH: `count` is the TOTAL (:308 totalCount) while `sources` is computed over `fullRecords` \u2014 the PAGE (:311-315). Any paginated call emits count=N with per-source counts summing to the page size; whoever reads the envelope (the model, or a UI) sees a total and a breakdown that contradict each other. listSkillsPagination asserts count and returned but never sources, so the mismatch is invisible to the suite. (2) SILENT ZERO on hygiene: a body failing SkillBodyHygiene is `continue`d (:232) with no counter and no reason \u2014 a skill Agent authored simply is not in their own skill list, and neither they nor User gets told which one or why.",
      "where": "Modules/NativeAgentCore/Sources/Dispatcher/Actions/PersonaSystemActions.swift:210 (personaListSkills) \u2014 hygiene skip at :232, registry stub at :249, sources counters at :311-315",
      "writes": []
     },
@@ -38318,7 +38279,7 @@
      ],
      "id": "onboarding.completeOnboarding",
      "kind": "store-write",
-     "silentFailureMode": "this is the ONE writer in the fence that authors persona/ \u2014 the agent's identity. It is transactional and unusually well unit-tested, but the transaction's resume path (resumePendingOnboarding) has exactly ONE caller-side test (:434) and its production caller is a UI button (OnboardingWizard.swift:286) that no eval reaches. A resume that partially applies leaves a half-written SOUL.md as the agent's identity, and the only detector is the user reading her own persona.",
+     "silentFailureMode": "this is the ONE writer in the fence that authors persona/ \u2014 the agent's identity. It is transactional and unusually well unit-tested, but the transaction's resume path (resumePendingOnboarding) has exactly ONE caller-side test (:434) and its production caller is a UI button (OnboardingWizard.swift:286) that no eval reaches. A resume that partially applies leaves a half-written SOUL.md as the agent's identity, and the only detector is the user reading their own persona.",
      "where": "Modules/NativeAgentCore/Sources/Onboarding/Onboarding.swift:876 (+ resumePendingOnboarding:1017, PersonaTemplates.generate:407, validTypes:377)",
      "writes": [
       "<personaRoot>/SOUL.md",
@@ -38468,7 +38429,7 @@
       "reads": "the TTS model id and endpoint against the provider-surface registry the rest of the system uses",
       "tier": "smoke"
      },
-     "silentFailureMode": "HARDCODED SINGLE-PROVIDER MODEL with no picker: the model id is a `static let` pinned to a legacy OpenAI TTS model for byte-parity with a daemon that no longer exists, and the endpoint is hardcoded to api.openai.com. Everything else in the system routes model choice through ProviderRouting surfaces; this one does not, so it carries no MODEL_SURFACES entry and no way for the user to change it. The test asserts the request MATCHES the pinned literal \u2014 i.e. it locks the staleness in rather than detecting it. When OpenAI retires tts-1 the call returns a non-2xx, maps to `.apiError(status:)`, and the user's experience is that her voice stopped working with a bracketed error string; nothing in any eval tier would have flagged the model id as aging.",
+     "silentFailureMode": "HARDCODED SINGLE-PROVIDER MODEL with no picker: the model id is a `static let` pinned to a legacy OpenAI TTS model for byte-parity with a daemon that no longer exists, and the endpoint is hardcoded to api.openai.com. Everything else in the system routes model choice through ProviderRouting surfaces; this one does not, so it carries no MODEL_SURFACES entry and no way for the user to change it. The test asserts the request MATCHES the pinned literal \u2014 i.e. it locks the staleness in rather than detecting it. When OpenAI retires tts-1 the call returns a non-2xx, maps to `.apiError(status:)`, and the user's experience is that their voice stopped working with a bracketed error string; nothing in any eval tier would have flagged the model id as aging.",
      "where": "Modules/NativeAgentCore/Sources/MultimodalTTS/MultimodalTTS.swift:140 (model = \"tts-1\") + :137 (ttsURL) + :143 (maxInputChars 4096) + :145 (timeoutSeconds 60)",
      "writes": []
     },
@@ -39319,7 +39280,7 @@
      ],
      "id": "mcp.invocationOutcome.classify",
      "kind": "public-api",
-     "silentFailureMode": "wrong value: an MCP isError result misclassified as ok is fed to the model as a successful tool result \u2014 she then reasons on an error payload as if it were data, and the tool.dispatch row records ok.",
+     "silentFailureMode": "wrong value: an MCP isError result misclassified as ok is fed to the model as a successful tool result \u2014 they then reasons on an error payload as if it were data, and the tool.dispatch row records ok.",
      "where": "Modules/NativeAgentCore/Sources/MCPDispatcher/MCPInvocationOutcome.swift:27 (+ providerToolResultIsError:16, displayStatus:20)",
      "writes": []
     },
@@ -39953,7 +39914,7 @@
      ],
      "id": "dispatcher.personaWriteGuard",
      "kind": "public-api",
-     "silentFailureMode": "the single highest-value silent failure in this fence: a guarded kind that stops matching (new doc kind, new unicode form) lets the agent autonomously rewrite SOUL/VOICE/AGENTS with no confirmation \u2014 her identity changes and the only trace is a receipt that says auto. The NFKC/whitespace tests are the teeth; they must stay mutation-proofed.",
+     "silentFailureMode": "the single highest-value silent failure in this fence: a guarded kind that stops matching (new doc kind, new unicode form) lets the agent autonomously rewrite SOUL/VOICE/AGENTS with no confirmation \u2014 their identity changes and the only trace is a receipt that says auto. The NFKC/whitespace tests are the teeth; they must stay mutation-proofed.",
      "where": "Modules/NativeAgentCore/Sources/Dispatcher/PersonaWriteGuard.swift:101 shouldUpgradeToConfirm / :154 apply (guarded kinds :84 soul|voice|agents|skill, append-guarded :88, autonomySource \"dynamic_persona_guard\" :72)",
      "writes": []
     },
@@ -39987,7 +39948,7 @@
      ],
      "id": "skills.listSkills",
      "kind": "public-api",
-     "silentFailureMode": "silent capability loss: a dirty-body filter that over-matches, or a missing registry.json, returns [] \u2014 the agent believes she has no skills and stops using them, with the same reading as 'no skills installed'.",
+     "silentFailureMode": "silent capability loss: a dirty-body filter that over-matches, or a missing registry.json, returns [] \u2014 the agent believes they have no skills and stops using them, with the same reading as 'no skills installed'.",
      "where": "Modules/NativeAgentCore/Sources/Skills/Skills.swift:350 (+ SkillsRegistry.sortedDescending:135)",
      "writes": []
     },
@@ -40260,7 +40221,7 @@
      ],
      "id": "onboarding.personaTemplates",
      "kind": "public-api",
-     "silentFailureMode": "wrong value shipped to every new user: an unsubstituted placeholder ({{AGENT_NAME}}) lands verbatim in SOUL.md and the agent introduces herself with a template token. Only a byte-level check catches it; nothing does that on a real install.",
+     "silentFailureMode": "wrong value shipped to every new user: an unsubstituted placeholder ({{AGENT_NAME}}) lands verbatim in SOUL.md and the agent introduces themselves with a template token. Only a byte-level check catches it; nothing does that on a real install.",
      "where": "Modules/NativeAgentCore/Sources/Onboarding/Onboarding.swift:407 PersonaTemplates.generate (+ validTypes:377 female|male|ai)",
      "writes": []
     },
@@ -41165,7 +41126,7 @@
       "reads": "a fully-populated profile value",
       "tier": "test"
      },
-     "silentFailureMode": "irreversible field loss \u2014 a HAND-WRITTEN encoder rather than the synthesized one, so a property added to the profile type without a matching line here is silently never persisted: it round-trips fine in memory for the life of the process and vanishes on the next app launch. `forbiddenPatterns` and `surfaceOverrides` are behavior-bearing (they shape her voice per surface), so the symptom is 'she stopped doing the thing I set' with no error and no diff in the store.",
+     "silentFailureMode": "irreversible field loss \u2014 a HAND-WRITTEN encoder rather than the synthesized one, so a property added to the profile type without a matching line here is silently never persisted: it round-trips fine in memory for the life of the process and vanishes on the next app launch. `forbiddenPatterns` and `surfaceOverrides` are behavior-bearing (they shape their voice per surface), so the symptom is 'they stopped doing the thing I set' with no error and no diff in the store.",
      "where": "Modules/NativeAgentCore/Sources/PersonaEngine/PersonaEngine+Compiler.swift:227 `public func encode(to encoder: Encoder) throws` on the compiled personality profile (schemaVersion :129, personaEngineVersion :130, customDirective :135, forbiddenPatterns :138, surfaceOverrides :141, updatedAt :142)",
      "writes": [
       "persona/profile.json"
@@ -42265,7 +42226,7 @@
      ],
      "id": "persona.rootResolver",
      "kind": "public-api",
-     "silentFailureMode": "wrong value \u2014 resolving to a path INSIDE the app bundle makes every persona write land in a location a reinstall erases; the app looks fine until the next update wipes her growth",
+     "silentFailureMode": "wrong value \u2014 resolving to a path INSIDE the app bundle makes every persona write land in a location a reinstall erases; the app looks fine until the next update wipes their growth",
      "where": "Modules/NativeAgentCore/Sources/PersonaEngine/PersonaEngine.swift:81 PersonaRootResolver (resolveIsolated:89, resolve:101, pathInsideAppBundle:182); env NATIVE_AGENT_PERSONA_ROOT read at :131"
     },
     {
@@ -42296,7 +42257,7 @@
      ],
      "id": "persona.compiler.compile",
      "kind": "turn-ingredient",
-     "silentFailureMode": "wrong value \u2014 the compiled system prompt silently loses a doc or reorders it; the fingerprint still changes so caching churns AND she stops sounding like herself, and nothing errors",
+     "silentFailureMode": "wrong value \u2014 the compiled system prompt silently loses a doc or reorders it; the fingerprint still changes so caching churns AND they stops sounding like themselves, and nothing errors",
      "where": "Modules/NativeAgentCore/Sources/PersonaEngine/PersonaEngine+Compiler.swift:326/:336 compile(surface:personaOverride:) / :386 fingerprint / :460 compileProfile / :548 normalize"
     },
     {
@@ -42322,7 +42283,7 @@
      ],
      "id": "persona.contextSourceSnapshot",
      "kind": "public-api",
-     "silentFailureMode": "stale UI \u2014 a watched directory dropped from the snapshot means edits to that persona file never invalidate the compiled packet; she keeps using the old persona until restart",
+     "silentFailureMode": "stale UI \u2014 a watched directory dropped from the snapshot means edits to that persona file never invalidate the compiled packet; they keeps using the old persona until restart",
      "where": "Modules/NativeAgentCore/Sources/PersonaEngine/PersonaEngine+Compiler.swift:393 contextSourceSnapshot"
     },
     {
@@ -42399,7 +42360,7 @@
      ],
      "id": "persona.write.growthAndVoice",
      "kind": "store-write",
-     "silentFailureMode": "silent no-op \u2014 appendPersonalityGrowth NO-OPs before onboarding and on empty text (by design), so a bug that makes every text look empty silently stops her growth log forever with a success return",
+     "silentFailureMode": "silent no-op \u2014 appendPersonalityGrowth NO-OPs before onboarding and on empty text (by design), so a bug that makes every text look empty silently stops their growth log forever with a success return",
      "where": "Modules/NativeAgentCore/Sources/PersonaEngine/PersonaEngine+GrowthVoiceWrites.swift:143 appendPersonalityGrowth / :206 personaWrite / :269 personaAppendSection",
      "writes": [
       "persona/GROWTH.md",
@@ -42508,7 +42469,7 @@
      ],
      "id": "eval.frozenMind.scorer",
      "kind": "public-api",
-     "silentFailureMode": "wrong value \u2014 a loosened rubric makes a degraded transplant pass; this is the instrument that decides 'is she still her', so a wrong PASS is the worst possible silent failure in the fence",
+     "silentFailureMode": "wrong value \u2014 a loosened rubric makes a degraded transplant pass; this is the instrument that decides 'is they still their', so a wrong PASS is the worst possible silent failure in the fence",
      "where": "Modules/NativeAgentCore/Sources/NativeAgentEvaluation/FrozenMindEvaluation.swift:1255 FrozenMindEvaluationScorer.score"
     },
     {
@@ -45769,7 +45730,7 @@
       "reads": "a temp dataRoot with an open agent pursuit, driving the veto handler",
       "tier": "test"
      },
-     "silentFailureMode": "wrong value + audit hole \u2014 the panel's one mutation bypasses the desk mutation seam entirely: it calls SwiftNativeDeskStore.setStatus/appendNote directly instead of the gated desk_* dispatch DeskQuickActions.swift:1-32 declares is the only path (\"NO NEW MUTATION PATHS\"), so the veto lands with no surface tag, no gate evaluation and no approval record. The rationale note is `try?` (:359) \u2014 a veto can close her pursuit with NO recorded reason while the toast says \"Pursuit vetoed\", and User's veto view then shows a canceled pursuit nobody can explain.",
+     "silentFailureMode": "wrong value + audit hole \u2014 the panel's one mutation bypasses the desk mutation seam entirely: it calls SwiftNativeDeskStore.setStatus/appendNote directly instead of the gated desk_* dispatch DeskQuickActions.swift:1-32 declares is the only path (\"NO NEW MUTATION PATHS\"), so the veto lands with no surface tag, no gate evaluation and no approval record. The rationale note is `try?` (:359) \u2014 a veto can close their pursuit with NO recorded reason while the toast says \"Pursuit vetoed\", and User's veto view then shows a canceled pursuit nobody can explain.",
      "where": "Sources/NativeAgentApp/WorkshopObservatoryPanel.swift:435-442 Button(\"Veto\") \u2192 onVeto \u2192 Sources/NativeAgentApp/CognitionObservatoryView.swift:355-364 vetoPursuit",
      "writes": [
       "data/desk/desk_ops.jsonl"
@@ -47771,7 +47732,7 @@
       "reads": "selectedDocId, personalityDocDraft and the Save disabled predicate after syncPersonalityDocDraft() with personalityDocs == []",
       "tier": "test"
      },
-     "silentFailureMode": "data loss \u2014 on an EMPTY docs list (a load failure, not a fresh install) selectedDocId becomes the literal \"SOUL\" and the draft becomes \"\". The Save button's disabled predicate at :244 is `selectedDocId.isEmpty || selectedPersonalityDocIsMemoryOwnedUser` \u2014 \"SOUL\" is non-empty and is not USER, so SAVE IS ENABLED over an empty editor. One click writes an empty SOUL.md over her persona.",
+     "silentFailureMode": "data loss \u2014 on an EMPTY docs list (a load failure, not a fresh install) selectedDocId becomes the literal \"SOUL\" and the draft becomes \"\". The Save button's disabled predicate at :244 is `selectedDocId.isEmpty || selectedPersonalityDocIsMemoryOwnedUser` \u2014 \"SOUL\" is non-empty and is not USER, so SAVE IS ENABLED over an empty editor. One click writes an empty SOUL.md over their persona.",
      "where": "Sources/NativeAgentApp/PersonalityView.swift:297-302 \u2014 when selectedDocId is not in the loaded docs, it falls back to `appModel.personalityDocs.first?.id ?? \"SOUL\"` and sets personalityDocDraft to the selected doc's content or \"\""
     },
     {
@@ -50921,7 +50882,7 @@
       "reads": "the tool record + on-disk tool paths after quarantineTool in a tmp dataRoot",
       "tier": "test"
      },
-     "silentFailureMode": "state-lifecycle leak \u2014 quarantine is the kill switch for a tool Agent wrote herself. If the move writes the quarantine path but does not clear activePath, the row shows \"quarantined\" while the dispatcher can still resolve the active file. Nothing asserts both sides.",
+     "silentFailureMode": "state-lifecycle leak \u2014 quarantine is the kill switch for a tool Agent wrote themselves. If the move writes the quarantine path but does not clear activePath, the row shows \"quarantined\" while the dispatcher can still resolve the active file. Nothing asserts both sides.",
      "where": "Sources/NativeAgentApp/ToolsView.swift:485 (sets quarantineCandidate) \u2192 confirmationDialog :402, destructive Quarantine at :410 calling appModel.quarantineTool",
      "writes": [
       "the tool's quarantine path; registry status"
@@ -54120,7 +54081,7 @@
       "reads": "the catalog snapshot count vs the dispatcher's live tool-name set under a given policy",
       "tier": "test"
      },
-     "silentFailureMode": "wrong value \u2014 this count is the user's only answer to 'what can she actually do right now'. A catalog that silently drops a family (policy sweep, manifest error) still renders a confident number.",
+     "silentFailureMode": "wrong value \u2014 this count is the user's only answer to 'what can they actually do right now'. A catalog that silently drops a family (policy sweep, manifest error) still renders a confident number.",
      "where": "Sources/NativeAgentApp/ToolsView.swift:226-231 (\"N tools \u2022 permission: X\")",
      "writes": []
     },
@@ -57375,7 +57336,7 @@
       "reads": "NativeClient.chat with a stub client capturing the `persona:` argument, over {unset, \"   \", \"agent\"}",
       "tier": "test"
      },
-     "silentFailureMode": "silent zero \u2014 a persona string that trims to empty resolves to nil and the turn runs on the default persona with no signal anywhere. 'She feels like a different person today' is the only symptom, and the UI still shows the selected persona.",
+     "silentFailureMode": "silent zero \u2014 a persona string that trims to empty resolves to nil and the turn runs on the default persona with no signal anywhere. 'They feels like a different person today' is the only symptom, and the UI still shows the selected persona.",
      "where": "Sources/NativeAgentApp/NativeClient+ChatRuntime.swift:64 and :250 \u2014 UserDefaults key `chatPersona`, whitespace-trimmed, empty \u2192 nil (persisted at AppModel.swift:544/:547)"
     },
     {
@@ -57608,7 +57569,7 @@
       "reads": "data/turn_traces/<day>.jsonl context.summary counts contextFlow.memoryRecords vs contextFlow.selectedAtoms of memory/correction kind",
       "tier": "instrument"
      },
-     "silentFailureMode": "dropped row, NSLog-only \u2014 when the packet carries memory atoms the owner index cannot name, the code writes `[context-flow] memory provenance MISS: resolved %d of %d` to the system log and continues. Nothing counts it, nothing surfaces it, no feed records it. The consequence named in the source itself is that those records' use_count/activation loop starves \u2014 i.e. her memory ranking silently rots while every turn looks healthy. My live read shows memoryRecords=15 on 20/20 turns, so the lane is resolving today; a partial miss would look identical in the trace.",
+     "silentFailureMode": "dropped row, NSLog-only \u2014 when the packet carries memory atoms the owner index cannot name, the code writes `[context-flow] memory provenance MISS: resolved %d of %d` to the system log and continues. Nothing counts it, nothing surfaces it, no feed records it. The consequence named in the source itself is that those records' use_count/activation loop starves \u2014 i.e. their memory ranking silently rots while every turn looks healthy. My live read shows memoryRecords=15 on 20/20 turns, so the lane is resolving today; a partial miss would look identical in the trace.",
      "where": "Sources/NativeAgentApp/NativeContextFlowRuntime.swift:582 attachMemoryProvenance, invariant-breach log at :597"
     },
     {
@@ -57877,7 +57838,7 @@
      ],
      "id": "cognition.prepareTurnProjection",
      "kind": "turn-ingredient",
-     "silentFailureMode": "wrong value / silent zero \u2014 a projection built at a drifting clock or with an empty capsule still returns a valid object, so the turn ships without her mind and nothing errors.",
+     "silentFailureMode": "wrong value / silent zero \u2014 a projection built at a drifting clock or with an empty capsule still returns a valid object, so the turn ships without their mind and nothing errors.",
      "where": "Sources/NativeAgentApp/NativeCognitionRuntime.swift:930"
     },
     {
@@ -57903,7 +57864,7 @@
      ],
      "id": "cognition.prepareCapsule",
      "kind": "turn-ingredient",
-     "silentFailureMode": "silent zero \u2014 capsuleInjectionEnabled false (or a nil return) drops the capsule from every turn and the only symptom is 'she feels flat'.",
+     "silentFailureMode": "silent zero \u2014 capsuleInjectionEnabled false (or a nil return) drops the capsule from every turn and the only symptom is 'they feels flat'.",
      "where": "Sources/NativeAgentApp/NativeCognitionRuntime.swift:921"
     },
     {
@@ -57967,7 +57928,7 @@
       "reads": "a hermetic-root NativeCognitionRuntime; call observeTurnMessage for a live and a debug-marked session",
       "tier": "test"
      },
-     "silentFailureMode": "dropped row \u2014 the per-message ingest into the substrate; a mis-shaped subject or a debug-session misclassification silently discards the turn from her memory of the conversation.",
+     "silentFailureMode": "dropped row \u2014 the per-message ingest into the substrate; a mis-shaped subject or a debug-session misclassification silently discards the turn from them memory of the conversation.",
      "where": "Sources/NativeAgentApp/NativeCognitionRuntime+Events.swift:385"
     },
     {
@@ -57980,7 +57941,7 @@
      ],
      "id": "cognition.observeUserMessage",
      "kind": "public-api",
-     "silentFailureMode": "wrong value \u2014 turnKind misattribution makes a bridge/debug turn read as a live User turn and moves her affect.",
+     "silentFailureMode": "wrong value \u2014 turnKind misattribution makes a bridge/debug turn read as a live User turn and moves their affect.",
      "where": "Sources/NativeAgentApp/NativeCognitionRuntime+Events.swift:429"
     },
     {
@@ -58008,7 +57969,7 @@
       "reads": "hermetic runtime + a synthetic remote action model",
       "tier": "test"
      },
-     "silentFailureMode": "dropped row \u2014 remote (iOS/bridge) actions never reach her felt state; indistinguishable from 'nothing happened'.",
+     "silentFailureMode": "dropped row \u2014 remote (iOS/bridge) actions never reach their felt state; indistinguishable from 'nothing happened'.",
      "where": "Sources/NativeAgentApp/NativeCognitionRuntime+Events.swift:459"
     },
     {
@@ -58021,7 +57982,7 @@
      ],
      "id": "cognition.observeMotorActionState",
      "kind": "public-api",
-     "silentFailureMode": "wrong value \u2014 a stale motor outcome admitted after a newer one flips her belief about whether an act succeeded.",
+     "silentFailureMode": "wrong value \u2014 a stale motor outcome admitted after a newer one flips their belief about whether an act succeeded.",
      "where": "Sources/NativeAgentApp/NativeCognitionRuntime+Events.swift:476",
      "writes": [
       "data/traces/events.jsonl (motor action trace)"
@@ -58134,7 +58095,7 @@
      ],
      "id": "cognition.microcycle.run",
      "kind": "loop",
-     "silentFailureMode": "slowdown / silent stall \u2014 coalescing that drops the last signal leaves her subconscious never running again; the only trace is scheduled\u226bfinished in the soak feed.",
+     "silentFailureMode": "slowdown / silent stall \u2014 coalescing that drops the last signal leaves their subconscious never running again; the only trace is scheduled\u226bfinished in the soak feed.",
      "where": "Sources/NativeAgentApp/NativeCognitionRuntime.swift:999 runMicrocycle / :1019 scheduleDirtyMicrocycle"
     },
     {
@@ -58599,7 +58560,7 @@
      ],
      "id": "cognition.debugSessionRing",
      "kind": "public-api",
-     "silentFailureMode": "state-lifecycle leak (unbounded ring) or wrong value (a debug session evicted from the ring starts moving her real affect).",
+     "silentFailureMode": "state-lifecycle leak (unbounded ring) or wrong value (a debug session evicted from the ring starts moving their real affect).",
      "where": "Sources/NativeAgentApp/NativeCognitionRuntime.swift:381 markSessionDebug (ring cap at :385)"
     },
     {
@@ -58718,7 +58679,7 @@
      ],
      "id": "tools.appOwnedToolNames",
      "kind": "tool",
-     "silentFailureMode": "dead control \u2014 a tool present in the schema list but missing a dispatch case returns a generic failure the model reads as 'tool unavailable'; the user just sees her not doing the thing.",
+     "silentFailureMode": "dead control \u2014 a tool present in the schema list but missing a dispatch case returns a generic failure the model reads as 'tool unavailable'; the user just sees their not doing the thing.",
      "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift:813-838 (mac.notify, mobile.notify, doctor_status, telegram_status, reflex_review, and 15 browser.* names) \u2014 schemas at :1148"
     },
     {
@@ -58774,7 +58735,7 @@
      ],
      "id": "tools.toolLoadLazyCatalog",
      "kind": "tool",
-     "silentFailureMode": "state-lifecycle leak \u2014 active_tools files accumulate per session (26 entries live) and a merge that drops one side silently narrows her toolset mid-conversation.",
+     "silentFailureMode": "state-lifecycle leak \u2014 active_tools files accumulate per session (26 entries live) and a merge that drops one side silently narrows their toolset mid-conversation.",
      "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift:316 tool_catalog/list_tools, :318 tool_load (category helpers :994-1036, envelope merge :744)",
      "writes": [
       "data/chat/active_tools/<session>.json"
@@ -58823,7 +58784,7 @@
      ],
      "id": "tools.organismPostureOnResults",
      "kind": "turn-ingredient",
-     "silentFailureMode": "silent zero \u2014 a nil posture provider drops the field and the model loses her body-state feedback with no signal.",
+     "silentFailureMode": "silent zero \u2014 a nil posture provider drops the field and the model loses their body-state feedback with no signal.",
      "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift:231/:349 (adds organism_posture to object results)"
     },
     {
@@ -59311,7 +59272,7 @@
      ],
      "id": "appmodel.settings.telegramSurface",
      "kind": "setting",
-     "silentFailureMode": "security-relevant dead control \u2014 telegramAllowedChats/Users and requireMention gate who can talk to her; a parse change that yields an empty allowlist could either lock everyone out or let everyone in, with no visible difference in the settings pane.",
+     "silentFailureMode": "security-relevant dead control \u2014 telegramAllowedChats/Users and requireMention gate who can talk to them; a parse change that yields an empty allowlist could either lock everyone out or let everyone in, with no visible difference in the settings pane.",
      "where": "Sources/NativeAgentApp/AppModel.swift:90 telegramToken, :94 telegramAllowedChats, :98 telegramAllowedUsers, :102 telegramRequireMention, :130 telegramModel, :137 telegramReasoningEffort"
     },
     {
@@ -59361,7 +59322,7 @@
      ],
      "id": "appmodel.chatToolCatalog",
      "kind": "ui-summary",
-     "silentFailureMode": "silent zero \u2014 an empty catalog with loadFailed=false renders as 'she has no tools' rather than 'the catalog failed to load'.",
+     "silentFailureMode": "silent zero \u2014 an empty catalog with loadFailed=false renders as 'they have no tools' rather than 'the catalog failed to load'.",
      "where": "Sources/NativeAgentApp/AppModel.swift:302 chatToolCatalog / :308 chatToolCatalogLoadFailed; refresh at AppModel+ProvidersAuth.swift (refreshChatToolCatalog)"
     },
     {
@@ -59502,7 +59463,7 @@
       "reads": "hermetic root with one seeded proposal; approve it, then re-read the proposal store",
       "tier": "test"
      },
-     "silentFailureMode": "dead control \u2014 approve/reject on training proposals and promotion candidates are the human-in-the-loop levers for her self-improvement; zero tests touch this file, so an approval that writes nothing is invisible.",
+     "silentFailureMode": "dead control \u2014 approve/reject on training proposals and promotion candidates are the human-in-the-loop levers for them self-improvement; zero tests touch this file, so an approval that writes nothing is invisible.",
      "where": "Sources/NativeAgentApp/NativeClient+TrainingActions.swift:67 runDrills, :159 swiftDrillCheck, :219 writeDrillRunFiles, :243/:247 approve/rejectTrainingProposal, :264/:269 approve/rejectPromotionPending",
      "writes": [
       "data/training/* drill run files"
@@ -59674,22 +59635,129 @@
     {
      "coverage": [
       {
-       "ref": "tests/NativeAgentAppTests/TrustGuardrailSummaryTests.swift (trustSnapshotData only)",
+       "ref": "tests/NativeAgentAppTests/HonestSurfacesW6LiteTests.swift:227 snapshotReaderCollapsedToTrust \u2014 source/reachability only; the return assertion is vacuous",
        "strength": "incidental",
        "tier": "test"
       }
      ],
-     "id": "client.cutoverSeams",
+     "id": "client.cutover.trustSnapshotData",
      "kind": "public-api",
      "proposedEval": {
-      "asserts": "a typed permission error is returned \u2014 never an empty-but-successful attachment (the vacuous-empty-evidence guard applied to the screen seam)",
+      "asserts": "valid canonical trust JSON is forwarded byte-for-byte, while an unavailable or invalid policy returns nil and the snapshot publisher preserves its prior file",
       "costSeconds": 3,
       "liveOrClone": "hermetic",
-      "reads": "hermetic seam: call captureScreenForChat with screen-capture permission simulated denied",
+      "reads": "NativeClient.trustSnapshotData through an isolated injected TrustCenter loader over valid, unavailable, and invalid policy states",
       "tier": "test"
      },
-     "silentFailureMode": "silent zero \u2014 captureScreenForChat fails closed on permission denial; if the closed path returns an empty attachment instead of an error, the turn proceeds blind and she answers about a screen she never saw.",
-     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:92 trustSnapshotData, :112 getTrustRaw, :123 postContextFeedback, :166 captureScreenForChat, :179 macControlNotify, :212 macControlRun, :487/:531 connector registration"
+     "silentFailureMode": "dropped snapshot \u2014 a nil trust snapshot makes MacSync skip the write and leaves iOS reading a stale trust policy with no per-snapshot failure result.",
+     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:92 trustSnapshotData"
+    },
+    {
+     "coverage": [],
+     "id": "client.cutover.getTrustRaw",
+     "kind": "public-api",
+     "proposedEval": {
+      "asserts": "valid raw trust keys retain their JSON types, transport/load errors throw, and malformed JSON cannot masquerade as a legitimate empty policy",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic",
+      "reads": "NativeClient.getTrustRaw through an isolated injected TrustCenter loader over a policy containing inboxPolicy plus malformed and unavailable payloads",
+      "tier": "test"
+     },
+     "silentFailureMode": "silent zero \u2014 JSON decode failure becomes an empty dictionary, so Inbox Settings interprets a damaged or incompatible trust payload as inboxPolicy disabled.",
+     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:112 getTrustRaw"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "tests/NativeAgentAppTests/ChatResponseFeedbackSeamTests.swift:89 oneThumbsPressWritesExactlyOneCorrelatedRowInThePinnedRoot and refusal/idempotency cases through :221",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "client.cutover.postContextFeedback",
+     "kind": "public-api",
+     "silentFailureMode": "dropped or mis-correlated write \u2014 a thumbs press can appear accepted while no payload-free feedback row is stored, ids are swapped, or duplicate weight is manufactured.",
+     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:123 postContextFeedback"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "tests/NativeAgentAppTests/CutoverSeamsScreenCaptureEvalTests.swift:8 screenCapturePermissionAndAttachmentContract",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "client.cutover.captureScreenForChat",
+     "kind": "public-api",
+     "silentFailureMode": "blind success \u2014 permission denial or empty capture bytes could become a successful attachment and let a chat turn answer about a screen it never received.",
+     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:156 captureScreenForChat"
+    },
+    {
+     "coverage": [],
+     "id": "client.cutover.macControlNotify",
+     "kind": "public-api",
+     "proposedEval": {
+      "asserts": "title and message reach the native notify action exactly, true is returned only for an ok result, false preserves a refusal, and a thrown dispatcher error remains thrown",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic",
+      "reads": "NativeClient.macControlNotify through an injected MacControl dispatcher over success, refusal, and error results",
+      "tier": "test"
+     },
+     "silentFailureMode": "wrong value \u2014 a dropped payload or flattened native refusal makes the Mac Control test notification report Sent when nothing was delivered, or report a generic error without the real refusal.",
+     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:172 macControlNotify"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "tests/NativeAgentAppTests/MacControlWorkbenchBehaviorEvalTests.swift:57 advertisedRoutesNeverResolveAsUnsupported",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "client.cutover.macControlRun",
+     "kind": "public-api",
+     "silentFailureMode": "dead route \u2014 an advertised workbench action can regress to 404/501 instead of reaching the native dispatcher while the control remains visible.",
+     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:207 macControlRun"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "tests/NativeAgentAppTests/ConnectorWizardRoutingTests.swift:155 retiredDeviceFlowCannotPollOrForgeConnectedState \u2014 source-only retirement guard; it does not invoke getConnectorRegistrationStatus",
+       "strength": "incidental",
+       "tier": "test"
+      }
+     ],
+     "id": "client.cutover.getConnectorRegistrationStatus",
+     "kind": "public-api",
+     "proposedEval": {
+      "asserts": "missing entries stay unregistered, snake/camel persisted fields decode identically, native OAuth credentials report client-id readiness, and malformed fields never advance the wizard",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic",
+      "reads": "NativeClient.getConnectorRegistrationStatus against an isolated injected connector root over missing, persisted, malformed, and native-OAuth credential states",
+      "tier": "test"
+     },
+     "silentFailureMode": "wrong value \u2014 registry schema or provider-alias drift can report a connector ready without a client id, or hide installed native OAuth credentials and strand the wizard.",
+     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:482 getConnectorRegistrationStatus"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "tests/NativeAgentAppTests/ConnectorWizardRoutingTests.swift:155 retiredDeviceFlowCannotPollOrForgeConnectedState \u2014 source-only retirement guard; it does not invoke registerConnectorApp",
+       "strength": "incidental",
+       "tier": "test"
+      }
+     ],
+     "id": "client.cutover.registerConnectorApp",
+     "kind": "public-api",
+     "proposedEval": {
+      "asserts": "one registry mutation records matching registration timestamps without fabricating client readiness, while each known provider returns its exact manual portal and unknown providers return none",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic",
+      "reads": "NativeClient.registerConnectorApp against an isolated injected connector root and clock across known provider aliases plus an unknown provider",
+      "tier": "test"
+     },
+     "silentFailureMode": "false readiness or wrong handoff \u2014 a registration write can fabricate connected/client-id state or return the wrong provider portal while the wizard proceeds as though setup is valid.",
+     "where": "Sources/NativeAgentApp/NativeClient+CutoverSeams.swift:526 registerConnectorApp"
     },
     {
      "coverage": [
@@ -60113,7 +60181,7 @@
      ],
      "id": "slack.attachmentIngest",
      "kind": "public-api",
-     "silentFailureMode": "a download that fails or exceeds the byte bound drops the attachment and the turn proceeds text-only \u2014 she answers about an image she never saw, with no marker in the transcript that anything was dropped",
+     "silentFailureMode": "a download that fails or exceeds the byte bound drops the attachment and the turn proceeds text-only \u2014 they answers about an image they never saw, with no marker in the transcript that anything was dropped",
      "where": "Sources/NativeAgentApp/SlackSocketModeLoop.swift:1194 hydratingAttachments, :1229 downloadInboundFile, :1270 inboundFiles, :1292 uploadableImageAttachments, :1302 uploadInput"
     },
     {
@@ -60179,7 +60247,7 @@
       "reads": "data/telegram/last_offset.json and data/telegram/state.json (lastSeenUpdateId, lastUpdateId, lastPollAt)",
       "tier": "instrument"
      },
-     "silentFailureMode": "the poll cursor is the one thing that decides whether an update is delivered exactly once; a lost or rolled-back offset silently re-delivers (duplicate turns) or skips (a message the user sent that she never sees). LIVE: last_offset.json holds 173073159 and data/telegram/state.json holds BOTH lastSeenUpdateId 173073158 and lastUpdateId 138562555 \u2014 two counters ~34.5M apart with nothing naming which is authoritative.",
+     "silentFailureMode": "the poll cursor is the one thing that decides whether an update is delivered exactly once; a lost or rolled-back offset silently re-delivers (duplicate turns) or skips (a message the user sent that they never sees). LIVE: last_offset.json holds 173073159 and data/telegram/state.json holds BOTH lastSeenUpdateId 173073158 and lastUpdateId 138562555 \u2014 two counters ~34.5M apart with nothing naming which is authoritative.",
      "where": "Sources/NativeAgentApp/BackgroundLoopsAssembly+ChatSurfaces.swift:263 offsetURL wiring \u2192 data/telegram/last_offset.json",
      "writes": [
       "data/telegram/last_offset.json"
@@ -60261,7 +60329,7 @@
      ],
      "id": "telegram.providerRoutingBridge",
      "kind": "public-api",
-     "silentFailureMode": "a surface-name mismatch resolves to nil and the Telegram turn silently falls back to the default model \u2014 she answers in the wrong brain and nothing labels the substitution",
+     "silentFailureMode": "a surface-name mismatch resolves to nil and the Telegram turn silently falls back to the default model \u2014 they answers in the wrong brain and nothing labels the substitution",
      "where": "Sources/NativeAgentApp/BackgroundLoopsAssembly+ChatSurfaces.swift:509 TelegramProviderRoutingBridge, :523 modelForSurface(_:)"
     },
     {
@@ -60274,7 +60342,7 @@
      ],
      "id": "telegram.memoryWriterBridge",
      "kind": "public-api",
-     "silentFailureMode": "a /remember from Telegram reports success to the user while the write is dropped \u2014 memory loss that only shows up weeks later as 'she forgot'",
+     "silentFailureMode": "a /remember from Telegram reports success to the user while the write is dropped \u2014 memory loss that only shows up weeks later as 'they forgot'",
      "where": "Sources/NativeAgentApp/BackgroundLoopsAssembly+ChatSurfaces.swift:782 TelegramMemoryWriterBridge (TelegramMemoryWriteRef)",
      "writes": [
       "memory V2 store"
@@ -60680,7 +60748,7 @@
      ],
      "id": "bridge.claude.route.organismDebug",
      "kind": "route",
-     "silentFailureMode": "a body-override left set by a debug call persists past the session and silently biases her organism readings",
+     "silentFailureMode": "a body-override left set by a debug call persists past the session and silently biases their organism readings",
      "where": "Sources/NativeAgentApp/ClaudeBridge.swift:532 (POST /claude/organism/debug, /codex/organism/debug)"
     },
     {
@@ -61749,7 +61817,7 @@
      ],
      "id": "macsync.needsUserNotifier",
      "kind": "public-api",
-     "silentFailureMode": "state committed before a failed send \u21d2 the edge is consumed and User is never told he is needed (a dropped notification that leaves no trace)",
+     "silentFailureMode": "state committed before a failed send \u21d2 the edge is consumed and User is never told they are needed (a dropped notification that leaves no trace)",
      "where": "Sources/NativeAgentApp/MacSyncEngine+NeedsUserNotify.swift:17 NeedsUserEdgeNotifier, :56 evaluate(needsUser:why:)",
      "writes": [
       "<dataRoot>/\u2026 needs-user edge state (MacSyncEngine+NeedsUserNotify.swift:50 stateURL)"
@@ -62271,7 +62339,7 @@
       "reads": "makeWeeklySelfImprovementLoop(dataRoot: tmp, llm: recordingStub) with the defaults key absent, false, and true",
       "tier": "test"
      },
-     "silentFailureMode": "dead control / silent zero: `UserDefaults.standard.bool(forKey:)` returns FALSE for an absent key, so the weekly self_improvement_sweep loop is OFF by default and stays off if the Settings toggle is ever renamed, moved to a different suite, or removed. The loop still registers, still ticks weekly, and still writes a clean receipt \u2014 she just never analyses anything. The live feed shows only 2 failure receipts for this loop in its whole history, which is equally consistent with 'working' and 'gated off since launch'. This is the load-bearing gate on the whole self-improvement lane and the fragment's self_improvement_sweep entry does not mention it at all.",
+     "silentFailureMode": "dead control / silent zero: `UserDefaults.standard.bool(forKey:)` returns FALSE for an absent key, so the weekly self_improvement_sweep loop is OFF by default and stays off if the Settings toggle is ever renamed, moved to a different suite, or removed. The loop still registers, still ticks weekly, and still writes a clean receipt \u2014 they just never analyses anything. The live feed shows only 2 failure receipts for this loop in its whole history, which is equally consistent with 'working' and 'gated off since launch'. This is the load-bearing gate on the whole self-improvement lane and the fragment's self_improvement_sweep entry does not mention it at all.",
      "where": "Sources/NativeAgentApp/BackgroundLoopsAssembly+Maintenance.swift:76 \u2014 isEnabled: { UserDefaults.standard.bool(forKey: \"selfImprovementEnabled\") }; the only writer is @AppStorage(\"selfImprovementEnabled\") at Sources/NativeAgentApp/SelfImprovementView.swift:11 (default false)",
      "writes": []
     },
@@ -62566,7 +62634,7 @@
     {
      "coverage": [
       {
-       "ref": "tests/NativeAgentAppTests/BackgroundLoopsOwnershipTests.swift:77 \u2014 \"app background wake is due-aware while explicit one-shot remains force-run\" (covers due-vs-force, not the auto-assemble branch)",
+       "ref": "tests/NativeAgentAppTests/BackgroundLoopsOwnershipTests.swift:77 \u2014 \"app background wake is due-aware while explicit one-shot remains force-run\" (covers due-vs-force; cold/stopped wake forwarding is pinned separately)",
        "strength": "incidental",
        "tier": "test"
       }
@@ -62574,14 +62642,14 @@
      "id": "app.background.manager.wakeAutoAssembles",
      "kind": "public-api",
      "proposedEval": {
-      "asserts": "a wake for an unregistered id does not silently assemble the full manifest (or, if that is intended, that it is recorded as a distinguishable outcome the receipts show)",
+      "asserts": "cold or stopped OS wakes return a health-neutral skip without assembling or starting loops; after explicit start an unknown id fails and a known not-due loop stays skipped without reassembly",
       "costSeconds": 4,
       "liveOrClone": "hermetic",
-      "reads": "runTickIfDue(loopId:) on a manager with an EMPTY registration and an injected assembleLoops that records invocations",
+      "reads": "runTickIfDue(loopId:) before explicit start, while running, and after stop with an injected assembleLoops invocation counter and canonical Core registration/state",
       "tier": "test"
      },
-     "silentFailureMode": "unbounded side effect on an OS wake: an NSBackgroundActivityScheduler wake for ONE loop id (AppDelegate+BackgroundTasks.swift:55) can assemble and start the ENTIRE 20+ loop manifest \u2014 including the LLM-backed reflection, self-improvement and heartbeat loops \u2014 because the id it asked for was not registered. On a cold or partially-started manager that is a full runtime bring-up from a background wake, with provider spend, reported to the OS as a normal `.finished`. Nothing measures how often this branch is taken.",
-     "where": "Sources/NativeAgentApp/BackgroundLoopsManagerComposition.swift:233-235 (runTickOnce) and :245-247 (runTickIfDue) \u2014 both call `start(loops: assembleLoops())` when the requested loop is not running",
+     "silentFailureMode": "unbounded side effect if forwarding-only OS wake handling regresses: an early or late wake could assemble/start the full loop manifest and spend provider tokens, or an unknown running-loop id could falsely report success. Launch and explicit one-shot controls retain assembly authority; runTickIfDue only forwards to the canonical due-aware owner.",
+     "where": "Sources/NativeAgentApp/BackgroundLoopsManagerComposition.swift:318 runTickIfDue forwards to Core; :304 runTickOnce is the separate explicit one-shot assembly path",
      "writes": [
       "data/logs/background_loop_state.json",
       "every per-loop store"
@@ -63554,7 +63622,7 @@
       "reads": "the provider closure returned by makeWorkshopPlannerConnectorActionsProvider(dataRoot: tmp)",
       "tier": "test"
      },
-     "silentFailureMode": "silent zero \u2014 the exact documented root cause at BackgroundLoopsAssembly.swift:19-31: without this injection the planner's availableConnectorActions() returns [] and every unattended execution can only emit chat.synthesize steps. She describes work instead of doing it, and every receipt reads 'completed'.",
+     "silentFailureMode": "silent zero \u2014 the exact documented root cause at BackgroundLoopsAssembly.swift:19-31: without this injection the planner's availableConnectorActions() returns [] and every unattended execution can only emit chat.synthesize steps. They describes work instead of doing it, and every receipt reads 'completed'.",
      "where": "Sources/NativeAgentApp/BackgroundLoopsAssembly.swift:32 (makeWorkshopPlannerConnectorActionsProvider, prefix(200)) + workshopPlannerToolDescription at :88; configured at Sources/NativeAgentApp/AppDelegate+Launch.swift:223",
      "writes": []
     },
@@ -63767,7 +63835,7 @@
       "reads": "ensureDefaultCycleJobs(now:) over tmp jobs.json in four states: absent / user-deleted / cancelled / parked-today",
       "tier": "test"
      },
-     "silentFailureMode": "silent zero: the nightly dream has EXACTLY ONE owner (this job \u2014 see BackgroundLoopsAssembly.swift:329 and AppDelegate+BackgroundTasks.swift:9). If upsertDefaultCycleJob stops re-creating a deleted row, she simply stops dreaming and nothing anywhere says so. The `dreamParkedToday` interaction (FIX 2, A4.4) is the exact class of logic that regresses into either a storm or permanent silence.",
+     "silentFailureMode": "silent zero: the nightly dream has EXACTLY ONE owner (this job \u2014 see BackgroundLoopsAssembly.swift:329 and AppDelegate+BackgroundTasks.swift:9). If upsertDefaultCycleJob stops re-creating a deleted row, they simply stops dreaming and nothing anywhere says so. The `dreamParkedToday` interaction (FIX 2, A4.4) is the exact class of logic that regresses into either a storm or permanent silence.",
      "where": "Sources/NativeAgentApp/SchedulerDueJobRunner+Selection.swift:229 (nativeagent-nightly-dream, 86400s) and :246 (nativeagent-weekly-rem, 604800s); repair entry at SchedulerDueJobRunner.swift:128; catch-up/park logic at Selection.swift:202-211",
      "writes": [
       "data/scheduler/jobs.json"
@@ -63818,7 +63886,7 @@
       "reads": "a tmp root with a dream diary entry for today and an inbox with/without an existing dream_cycle receipt",
       "tier": "test"
      },
-     "silentFailureMode": "stale UI: she dreamed and the user never sees a receipt (or, inverted, a duplicate receipt every pass if the `notificationInboxContains` dedup regresses).",
+     "silentFailureMode": "stale UI: they dreamed and the user never sees a receipt (or, inverted, a duplicate receipt every pass if the `notificationInboxContains` dedup regresses).",
      "where": "Sources/NativeAgentApp/SchedulerDueJobRunner+Selection.swift:268 (backfillDreamReceiptIfNeeded) \u2014 item id `dream-cycle-<dateKey>-backfill`",
      "writes": [
       "data/notifications/inbox.jsonl",
@@ -64056,7 +64124,7 @@
       "reads": "SMAppService.mainApp.status for the installed bundle (live-readonly), plus the bundle-path guard as a pure function",
       "tier": "test"
      },
-     "silentFailureMode": "dead control: register() failure only `print`s (line 107). The app is a menu-bar agent whose whole premise is 'always there' \u2014 a silently unregistered login item means she is simply gone after the next reboot, with no card, no doctor check, and no log the user will read.",
+     "silentFailureMode": "dead control: register() failure only `print`s (line 107). The app is a menu-bar agent whose whole premise is 'always there' \u2014 a silently unregistered login item means they are simply gone after the next reboot, with no card, no doctor check, and no log the user will read.",
      "where": "Sources/NativeAgentApp/AppDelegate+ProcessLifecycle.swift:94 (registerLoginItemIfNeeded \u2014 /Applications or ~/Applications only, idempotent); gated by env at Sources/NativeAgentApp/AppDelegate+Launch.swift:462",
      "writes": [
       "SMAppService login-item registration (system state)"
@@ -64108,7 +64176,7 @@
       "reads": "WakeResetThrottle.shouldFire over an injected clock, and the observer registration via source scrape",
       "tier": "test"
      },
-     "silentFailureMode": "slowdown after every laptop lid-close: Task.sleep deadlines do not advance across system sleep (documented at :617-619), so without the re-anchor every cognition maintenance/residual timer fires late until the next sensory event. A dropped observer registration produces no error \u2014 just a permanently-late mind, which reads as 'she's a bit slow today'.",
+     "silentFailureMode": "slowdown after every laptop lid-close: Task.sleep deadlines do not advance across system sleep (documented at :617-619), so without the re-anchor every cognition maintenance/residual timer fires late until the next sensory event. A dropped observer registration produces no error \u2014 just a permanently-late mind, which reads as 'they are a bit slow today'.",
      "where": "Sources/NativeAgentApp/AppDelegate+Launch.swift:77-89 (willSleep/didWake registration), :609 contextFlowWillSleep, :615 contextFlowDidWake (+ reanchorDeadlinesAfterWake); WakeResetThrottle at Sources/NativeAgentApp/NativeAgentApp.swift:23 (30s min interval, URLSession.shared.reset)",
      "writes": []
     },
@@ -65324,7 +65392,7 @@
      "id": "ios.actions.orphanedPrivilegedMacActions",
      "kind": "tool",
      "proposedEval": {
-      "asserts": "the privileged verbs are either removed from the iOS channel or given an owner and a gate test (flag for User \u2014 this is gate-shaped, decision is his)",
+      "asserts": "the privileged verbs are either removed from the iOS channel or given an owner and a gate test (flag for User \u2014 this is gate-shaped, decision is their)",
       "costSeconds": 2,
       "liveOrClone": "hermetic",
       "reads": "the action-name list in iCloudSyncEngine+Actions.swift vs reachable call sites",
@@ -67262,7 +67330,7 @@
      ],
      "id": "ios.turninspector.list",
      "kind": "ui-summary",
-     "silentFailureMode": "silent zero \u2014 an unpublished turn_summaries.json renders the \"No turns yet\" empty state, which reads as \"she has not processed a turn\" rather than \"the snapshot is missing\"",
+     "silentFailureMode": "silent zero \u2014 an unpublished turn_summaries.json renders the \"No turns yet\" empty state, which reads as \"they have not processed a turn\" rather than \"the snapshot is missing\"",
      "where": "iOS/NativeAgentMobile/Sources/TurnInspectorView.swift:27"
     },
     {
@@ -68893,7 +68961,7 @@
      ],
      "id": "shared.organismLivingStatus.wire",
      "kind": "public-api",
-     "silentFailureMode": "a renamed key makes the whole file fail to decode \u2014 the phone's living-status card goes blank and reads as 'she's quiet'",
+     "silentFailureMode": "a renamed key makes the whole file fail to decode \u2014 the phone's living-status card goes blank and reads as 'they are quiet'",
      "where": "Modules/NativeAgentShared/Sources/NativeAgentShared/OrganismLivingStatus.swift:6 (+ body/counters/reflexCandidates/standingViewProposals)"
     },
     {
@@ -68925,7 +68993,7 @@
      ],
      "id": "shared.nativeAgentIdentity.displayName",
      "kind": "ui-summary",
-     "silentFailureMode": "a generic label slipping through means the personal build shows 'Assistant' where the user expects her name \u2014 cosmetic, never logged",
+     "silentFailureMode": "a generic label slipping through means the personal build shows 'Assistant' where the user expects their name \u2014 cosmetic, never logged",
      "where": "Modules/NativeAgentShared/Sources/NativeAgentShared/SharedModels.swift:229,232"
     },
     {
@@ -68983,8 +69051,8 @@
      ],
      "id": "shared.mockDeviceSyncTransport",
      "kind": "public-api",
-     "silentFailureMode": "the mock drifting from CloudKitDeviceTransport's real semantics makes every transport test green while production behaves differently \u2014 the mock is a test double SHIPPED in the product library",
-     "where": "Modules/NativeAgentShared/Sources/NativeAgentShared/MockDeviceSyncTransport.swift:16,87"
+     "silentFailureMode": "the test-support mock drifting from CloudKitDeviceTransport's real semantics makes transport tests green while production behaves differently; the mock belongs only to NativeAgentSharedTestSupport and is not shipped in the production library",
+     "where": "Modules/NativeAgentShared/Tests/NativeAgentSharedTestSupport/MockDeviceSyncTransport.swift"
     },
     {
      "coverage": [],
@@ -69134,7 +69202,7 @@
      ],
      "id": "ios.pairing.clearPairing",
      "kind": "ui-control",
-     "silentFailureMode": "unpair that reports success while the Keychain item survives \u2014 the user believes the device is unpaired and it keeps receiving her messages",
+     "silentFailureMode": "unpair that reports success while the Keychain item survives \u2014 the user believes the device is unpaired and it keeps receiving their messages",
      "where": "iOS/NativeAgentMobile/Sources/PairingStore.swift:425",
      "writes": [
       "Keychain delete",
@@ -70283,7 +70351,7 @@
      ],
      "id": "ios.chatStore.typewriter",
      "kind": "speed-stage",
-     "silentFailureMode": "a typewriter task not cancelled on session switch keeps writing into a placeholder that no longer exists, or renders the reply at a crawl \u2014 'she got slow' with no measurement",
+     "silentFailureMode": "a typewriter task not cancelled on session switch keeps writing into a placeholder that no longer exists, or renders the reply at a crawl \u2014 'they got slow' with no measurement",
      "where": "iOS/NativeAgentMobile/Sources/ChatStore.swift:274 typewriterTickSeconds (0.07) / ChatStore+Typewriter.swift:49 typewriterChunk / :59 typewriterAdvance / :25,:30 cancel(All) / :90 streamingHint"
     },
     {
@@ -71231,7 +71299,7 @@
       "reads": "turn_traces surface.outputEnqueued vs turn.terminal per turnId",
       "tier": "instrument"
      },
-     "silentFailureMode": "Dark: 2633 rows. This is the last milestone before the UI; if it stops, the 'she feels slow' lane loses its only handoff stamp and nothing reports a gap.",
+     "silentFailureMode": "Dark: 2633 rows. This is the last milestone before the UI; if it stops, the 'they feels slow' lane loses its only handoff stamp and nothing reports a gap.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ContextStageTrace.swift:84",
      "writes": [
       "data/turn_traces/<day>.jsonl"
@@ -72384,7 +72452,7 @@
      ],
      "id": "feeds.logs.delivery_envelope_telemetry",
      "kind": "feed",
-     "silentFailureMode": "471 rows/window. No named cap in JSONLLineCaps \u2014 append-only telemetry that grows unbounded and, if it stops, removes the only measurement of how her replies are shaped.",
+     "silentFailureMode": "471 rows/window. No named cap in JSONLLineCaps \u2014 append-only telemetry that grows unbounded and, if it stops, removes the only measurement of how their replies are shaped.",
      "where": "data/logs/delivery_envelope_telemetry.jsonl (+ .lock)",
      "writes": [
       "data/logs/delivery_envelope_telemetry.jsonl"
@@ -73671,7 +73739,7 @@
       "reads": "SessionHistoryReader + renderDetailed over a hermetic transcript with a compaction_summary row placed 200+ rows back, then the rendered historyBlock",
       "tier": "test"
      },
-     "silentFailureMode": "total amnesia that reads as a healthy turn. The in-code comment says it plainly: the compaction recollection is the ONLY surviving record of every elided turn. The reservation searches `tail`, and `tail` is bounded to \u226480 lines / \u2264192KB by the reader \u2014 so once the post-compaction conversation grows past the tail window the row silently falls out and she loses everything before the compact, while historyBlockChars, history.priorCount and every size band stay perfectly normal. The bench's fixture windows are bounded the same way, so it can never replay this. Zero count/flag distinguishes 'no compaction has happened' from 'the compaction row fell out of the window'.",
+     "silentFailureMode": "total amnesia that reads as a healthy turn. The in-code comment says it plainly: the compaction recollection is the ONLY surviving record of every elided turn. The reservation searches `tail`, and `tail` is bounded to \u226480 lines / \u2264192KB by the reader \u2014 so once the post-compaction conversation grows past the tail window the row silently falls out and they loses everything before the compact, while historyBlockChars, history.priorCount and every size band stay perfectly normal. The bench's fixture windows are bounded the same way, so it can never replay this. Zero count/flag distinguishes 'no compaction has happened' from 'the compaction row fell out of the window'.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:1605-1610 (reservedIndex gets FIRST claim on historyChars) and :1663 (routed to budget.compactionSummaryCap, not systemCap)",
      "writes": []
     },
@@ -73697,7 +73765,7 @@
       "reads": "continuityState output over a hermetic transcript that plants one correction-shaped user line and one open-loop assistant line",
       "tier": "test"
      },
-     "silentFailureMode": "per-line silent dropout inside a block that still renders. The five lines are independently optional; `Recent correction/callout` and `Open loop` depend on looksLikeCorrection / looksLikeOpenLoop heuristics that can stop matching with zero signal \u2014 the header still prints, the block is still non-empty, historyBlockChars barely moves, and she quietly stops carrying forward User's last correction. The bench grades only historyBlockChars, never section presence. A `historyLimit < 6` setting also removes the whole block with no flag.",
+     "silentFailureMode": "per-line silent dropout inside a block that still renders. The five lines are independently optional; `Recent correction/callout` and `Open loop` depend on looksLikeCorrection / looksLikeOpenLoop heuristics that can stop matching with zero signal \u2014 the header still prints, the block is still non-empty, historyBlockChars barely moves, and they quietly stops carrying forward User's last correction. The bench grades only historyBlockChars, never section presence. A `historyLimit < 6` setting also removes the whole block with no flag.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:1414-1448 continuityState (emits `SESSION_CONTINUITY_STATE:` with initial anchors / latest user / latest assistant tail / recent correction / open loop); gated at :1224 by `cappedLimit >= 6` and by budget.continuityCap",
      "writes": []
     },
@@ -73739,7 +73807,7 @@
       "reads": "renderDetailed with userMessage drawn from a table of short affirmatives (\"yes\", \"go ahead\", \"do it\", \"yep\", \"sure\")",
       "tier": "test"
      },
-     "silentFailureMode": "the 'yeah do it' bug, silently. The hint is what makes a bare \"yes\"/\"go ahead\" resolve to the previous assistant message. If looksLikeShortAffirmativeContinuation stops matching (a new affirmation form, a length threshold change) the hint disappears, the turn succeeds, and she answers the wrong question. No count, no flag, no trace key \u2014 nothing on any receipt records whether the hint fired.",
+     "silentFailureMode": "the 'yeah do it' bug, silently. The hint is what makes a bare \"yes\"/\"go ahead\" resolve to the previous assistant message. If looksLikeShortAffirmativeContinuation stops matching (a new affirmation form, a length threshold change) the hint disappears, the turn succeeds, and they answers the wrong question. No count, no flag, no trace key \u2014 nothing on any receipt records whether the hint fired.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:1639-1655 immediateReplyReferenceHint (gated by looksLikeShortAffirmativeContinuation at :1772), appended at :1250-1256",
      "writes": []
     },
@@ -73869,7 +73937,7 @@
       "reads": "applyLazyToolFilter output for an empty activeTools set against a full synthetic catalog",
       "tier": "test"
      },
-     "silentFailureMode": "this is the DELIVERY boundary for tools and the fragment treated it only as a footnote on toolSchemas. It runs after both context receipts, so the post-filter set is recorded nowhere readable (context.snapshot carries toolSchemaCount but is 159/159 truncated live). A regression in SwiftToolDispatcher.normalModelToolNames that drops a core tool from `alwaysOnCoreNames` presents as 'she just didn't use that tool today' \u2014 every count on every receipt is unchanged. The bench cannot see it either: TurnReplayBenchTests replays with BenchNoToolsDispatcher, so toolSchemas is 0 on every replayed turn.",
+     "silentFailureMode": "this is the DELIVERY boundary for tools and the fragment treated it only as a footnote on toolSchemas. It runs after both context receipts, so the post-filter set is recorded nowhere readable (context.snapshot carries toolSchemaCount but is 159/159 truncated live). A regression in SwiftToolDispatcher.normalModelToolNames that drops a core tool from `alwaysOnCoreNames` presents as 'they just didn't use that tool today' \u2014 every count on every receipt is unchanged. The bench cannot see it either: TurnReplayBenchTests replays with BenchNoToolsDispatcher, so toolSchemas is 0 on every replayed turn.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+StructuredChat.swift:882-894 (the one filter+rebuild) and its deriving wrapper Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+ToolLoop.swift:1370-1401; call sites StructuredChat.swift:295, :668 and ChatOrchestration+Streaming.swift:384",
      "writes": []
     },
@@ -73943,7 +74011,7 @@
       "reads": "shouldProjectCognitiveStateForTrustedBridgeEnvelope against the exact envelope prefixes the bridge senders actually emit (read from the bridge sender source, not retyped)",
       "tier": "test"
      },
-     "silentFailureMode": "dead string match. Nothing in the tree references this function by name outside its own file \u2014 zero tests. The two prefixes are lowercased-and-trimmed literals; a bridge that changes its envelope wording by one character (different casing is handled, different punctuation or a new sender name is not) silently flips every bridge turn back to the non-live projection path, so Claude's and codex's messages reach her with NO capsule and she answers them as a different, flatter agent. Neither context.summary nor context.snapshot carries a capsule key, so there is no live rate to notice the drop in.",
+     "silentFailureMode": "dead string match. Nothing in the tree references this function by name outside its own file \u2014 zero tests. The two prefixes are lowercased-and-trimmed literals; a bridge that changes its envelope wording by one character (different casing is handled, different punctuation or a new sender name is not) silently flips every bridge turn back to the non-live projection path, so Claude's and codex's messages reach their with NO capsule and they answers them as a different, flatter agent. Neither context.summary nor context.snapshot carries a capsule key, so there is no live rate to notice the drop in.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+StructuredChat.swift:1135-1143 shouldProjectCognitiveStateForTrustedBridgeEnvelope \u2014 a hardcoded two-prefix allowlist (\"[from: codex, via bridge]\", \"[from: claude, via bridge]\") that sets allowNonLiveProjection at :1112, gating CognitiveSubstrate+Capsule.swift:1507 and :1537",
      "writes": []
     },
@@ -74011,7 +74079,7 @@
       "reads": "turn_traces context.stage rows where stage == memory.promotion, joined to the memory store's row-insert timestamps over the same window",
       "tier": "instrument"
      },
-     "silentFailureMode": "silent zero dressed as health. Live over 08-22..08-23: 83/83 memory.promotion rows carry flags.configured == true \u2014 so the wire is attached \u2014 but the row counts ONLY the input character lengths. It records nothing about how many records were PROMOTED. A promoter that observes every turn and writes nothing (threshold drift, a store handle that fails open, an extractor that stopped matching) emits an identical, perfectly healthy-looking row forever, while her long-term memory quietly stops growing from conversation. The fragment noted this emitter as a single-tenant channel but never named the store-write it stands for.",
+     "silentFailureMode": "silent zero dressed as health. Live over 08-22..08-23: 83/83 memory.promotion rows carry flags.configured == true \u2014 so the wire is attached \u2014 but the row counts ONLY the input character lengths. It records nothing about how many records were PROMOTED. A promoter that observes every turn and writes nothing (threshold drift, a store handle that fails open, an extractor that stopped matching) emits an identical, perfectly healthy-looking row forever, while their long-term memory quietly stops growing from conversation. The fragment noted this emitter as a single-tenant channel but never named the store-write it stands for.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+TurnEngine.swift:1285-1310 (post-turn memoryPromoter.observeTurn + the memory.promotion context.stage row with flags.configured and userMessageChars/assistantMessageChars)",
      "writes": [
       "data/turn_traces/<day>.jsonl (kind context.stage)",
@@ -74061,7 +74129,7 @@
       "reads": "recallQuery output over a hermetic transcript planting a correction-shaped user line and an open-loop assistant line",
       "tier": "test"
      },
-     "silentFailureMode": "length is not composition. The bench's only claim is a length comparison, and docs/INSTRUMENT.md records that this exact assertion already false-passed once (a >520-char message's `...` cap suffix let an unexpanded query through by 3 chars). `Recent correction` and `Open loop` ride on the same looksLikeCorrection / looksLikeOpenLoop heuristics as the continuity block; either can go dead while the query stays long because `Initial anchors` alone can carry hundreds of characters. Memory recall then runs on a query missing the two signals most likely to retrieve what User actually corrected her about \u2014 and returns hits either way, so recallHits never drops.",
+     "silentFailureMode": "length is not composition. The bench's only claim is a length comparison, and docs/INSTRUMENT.md records that this exact assertion already false-passed once (a >520-char message's `...` cap suffix let an unexpanded query through by 3 chars). `Recent correction` and `Open loop` ride on the same looksLikeCorrection / looksLikeOpenLoop heuristics as the continuity block; either can go dead while the query stays long because `Initial anchors` alone can carry hundreds of characters. Memory recall then runs on a query missing the two signals most likely to retrieve what User actually corrected their about \u2014 and returns hits either way, so recallHits never drops.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:1265-1305 recallQuery \u2014 five independently-optional labeled lines (Current user / Latest prior user / Latest assistant tail / Recent correction / Open loop / Initial anchors), each with its own char cap, hardCapped at :1305",
      "writes": []
     }
@@ -74270,7 +74338,7 @@
      ],
      "id": "turn.ingredient.historyBlock",
      "kind": "turn-ingredient",
-     "silentFailureMode": "rendered-but-never-appended (the exact drill in docs/INSTRUMENT.md): the block is built, `historyBlockChars` is non-zero, and the combine site drops it \u2014 she loses continuity while every count still looks healthy.",
+     "silentFailureMode": "rendered-but-never-appended (the exact drill in docs/INSTRUMENT.md): the block is built, `historyBlockChars` is non-zero, and the combine site drops it \u2014 they loses continuity while every count still looks healthy.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift:839-854 (renderDetailed) \u2192 :946-953 appended to DYNAMIC",
      "writes": []
     },
@@ -74358,7 +74426,7 @@
      ],
      "id": "turn.ingredient.runtimeContextLine",
      "kind": "turn-ingredient",
-     "silentFailureMode": "wrong value: an empty modelId returns nil and the whole `Current runtime:` line disappears \u2014 she loses knowledge of which body she is in, with no count anywhere.",
+     "silentFailureMode": "wrong value: an empty modelId returns nil and the whole `Current runtime:` line disappears \u2014 they loses knowledge of which body they are in, with no count anywhere.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+TurnEngine.swift:1340-1358 renderRuntimeContext \u2192 appended at :1655 contextByAppendingRuntimeContext",
      "writes": []
     },
@@ -75356,7 +75424,7 @@
      ],
      "id": "setting.contextBudgetPolicy.perTurn",
      "kind": "setting",
-     "silentFailureMode": "a model whose window cannot be resolved silently falls to the floor regime \u2014 she gets small-window context on a large-window model, and the only tell is `flags.budget.derived` reading false. Nothing alerts on a derived\u2192floor flip.",
+     "silentFailureMode": "a model whose window cannot be resolved silently falls to the floor regime \u2014 they gets small-window context on a large-window model, and the only tell is `flags.budget.derived` reading false. Nothing alerts on a derived\u2192floor flip.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+TurnEngine.swift:674-680 (packet budget) and :872-881 (turn budget: windowTokens / recallRowLimit / memoryBlockChars / isDerived)",
      "writes": [
       "data/turn_traces/<day>.jsonl"
@@ -75928,6 +75996,19 @@
    "fence": "scripts",
    "ranRun": "./script/test.sh \u2192 aborted immediately with \"[test] FATAL: agent_instrument_test.sh exists but is never invoked by script/test.sh\" (zero tests executed). Corroborated by running the orphan loop from test.sh:79-85 standalone (one orphan) and by `git ls-files | grep '\\.py$'` \u2192 script/evals_ledger_merge.swift (a second, then-masked blocker at test.sh:249; ported to script/evals_ledger_merge.swift 2026-08-23). Also ran script/check_timer_inventory.swift (rc 0, 2s, \"183 production timer/sleep sites across 119 ownership rules\"), script/check_persona_skill_hygiene.swift (rc 0, 1s, \"5 live docs, 35 persona skill bodies, 1 runtime skill bodies\"), script/check_architecture_blueprint.swift (rc 0, 0s, \"16 families, 242 Swift table rows\").",
    "surfaces": [
+    {
+     "coverage": [
+      {
+       "ref": "executable: tests/scripts/canonical_test_wiring_guards_test.sh",
+       "strength": "asserts",
+       "tier": "smoke"
+      }
+     ],
+     "id": "scripts.check_canonical_test_wiring",
+     "kind": "cli",
+     "silentFailureMode": "false wiring proof if a comment-only mention of a script suite is accepted as an executable canonical command; a disconnected guard would appear covered while never running.",
+     "where": "script/check_canonical_test_wiring.sh:1 canonical script-suite invocation checker"
+    },
     {
      "coverage": [],
      "id": "scripts.test.orphanSuiteGuard",

@@ -179,9 +179,9 @@ public enum MacHandRepertoire {
     /// Virtual keycodes of the modifier keys, for holds. `MacKeyEvent` carries
     /// modifiers as FLAGS, which is right for a chord — but a flag lives on an
     /// event, and a hold has to stay down across events that carry no flags at
-    /// all (mouse events at this seam have no modifier field). So a hold emits
-    /// the modifier's PHYSICAL key down/up around the inner steps AND sets the
-    /// flags on every inner key event. Both, because apps split on which they
+    /// all. So a hold emits the modifier's PHYSICAL key down/up around the
+    /// inner steps AND sets the flags on every inner input event. Both,
+    /// because apps split on which they
     /// watch: a text field reads the flags, a game reads the key.
     public enum ModifierKeyCode {
         public static let command: UInt16 = 55
@@ -281,7 +281,8 @@ public enum MacHandRepertoire {
         from: CGPoint,
         to: CGPoint,
         steps: Int,
-        holdMs: Int = 0
+        holdMs: Int = 0,
+        travelMs: Int = 0
     ) throws -> [MacHandStep] {
         try dragPath(
             button: button,
@@ -289,7 +290,8 @@ public enum MacHandRepertoire {
             // The teleport floor lives HERE, on the two-point convenience —
             // this is the call that would otherwise emit a single jump.
             stepsPerSegment: max(minimumDragSteps, steps),
-            holdMs: holdMs
+            holdMs: holdMs,
+            travelMs: travelMs
         )
     }
 
@@ -314,7 +316,8 @@ public enum MacHandRepertoire {
         button: MacHandButton = .left,
         through points: [CGPoint],
         stepsPerSegment: Int = 1,
-        holdMs: Int = 0
+        holdMs: Int = 0,
+        travelMs: Int = 0
     ) throws -> [MacHandStep] {
         let seam = try seamButton(button)
         guard points.count >= 2 else {
@@ -323,6 +326,11 @@ public enum MacHandRepertoire {
         let path = Array(points.prefix(maximumPathPoints))
         let perSegment = max(1, min(stepsPerSegment, maximumDragSteps))
         let dwell = clampWait(holdMs)
+        // Optional elapsed travel is distributed across moves, not substituted
+        // with a pause at either endpoint. Legacy unpaced plans stay unchanged.
+        let travel = clampWait(travelMs)
+        let moveCount = (path.count - 1) * perSegment
+        var moveIndex = 0
 
         var plan: [MacHandStep] = [
             .mouse(MacMouseEvent(phase: .down, button: seam, x: path[0].x, y: path[0].y, clickCount: 1))
@@ -333,6 +341,9 @@ public enum MacHandRepertoire {
             let start = path[index - 1]
             let end = path[index]
             for step in 1...perSegment {
+                let delay = travel * (moveIndex + 1) / moveCount - travel * moveIndex / moveCount
+                if delay > 0 { plan.append(.wait(milliseconds: delay)) }
+                moveIndex += 1
                 let progress = Double(step) / Double(perSegment)
                 plan.append(.mouse(MacMouseEvent(
                     phase: .drag,
@@ -471,25 +482,43 @@ public enum MacHandRepertoire {
 
         // The ONLY way out. Both call sites below use it; nothing returns `plan`.
         func sealed() -> [MacHandStep] {
-            plan + held.reversed().map {
-                MacHandStep.key(MacKeyEvent(keyCode: $0, down: false, modifiers: modifiers))
+            var remaining = modifiers
+            return plan + held.reversed().map { code in
+                switch code {
+                case ModifierKeyCode.command: remaining.remove(.command)
+                case ModifierKeyCode.control: remaining.remove(.control)
+                case ModifierKeyCode.function: remaining.remove(.function)
+                case ModifierKeyCode.option: remaining.remove(.option)
+                case ModifierKeyCode.shift: remaining.remove(.shift)
+                default: break
+                }
+                return MacHandStep.key(MacKeyEvent(keyCode: code, down: false, modifiers: remaining))
             }
         }
 
         do {
-            // Inner KEY events inherit the held flags so apps that read flags
-            // agree with apps that read the physical key. Mouse and scroll
-            // steps pass through unchanged — the seam has no modifier field on
-            // them, which is precisely why the physical key is held.
+            // Every inner input carries the held flags: relying only on a
+            // preceding key-down races asynchronous HID delivery.
             let inner = try body()
             plan.append(contentsOf: inner.map { step in
-                guard case .key(let event) = step else { return step }
-                return .key(MacKeyEvent(
-                    keyCode: event.keyCode,
-                    down: event.down,
-                    modifiers: event.modifiers.union(modifiers),
-                    unicodeText: event.unicodeText
-                ))
+                switch step {
+                case .key(let event):
+                    return .key(MacKeyEvent(
+                        keyCode: event.keyCode, down: event.down,
+                        modifiers: event.modifiers.union(modifiers), unicodeText: event.unicodeText
+                    ))
+                case .mouse(let event):
+                    return .mouse(MacMouseEvent(
+                        phase: event.phase, button: event.button, x: event.x, y: event.y,
+                        clickCount: event.clickCount, modifiers: event.modifiers.union(modifiers)
+                    ))
+                case .scroll(let event):
+                    return .scroll(MacScrollEvent(
+                        deltaX: event.deltaX, deltaY: event.deltaY, unit: event.unit,
+                        modifiers: event.modifiers.union(modifiers)
+                    ))
+                case .wait: return step
+                }
             })
         } catch {
             throw MacHandHoldFailure(underlying: error, recoveryPlan: sealed())

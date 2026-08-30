@@ -1050,6 +1050,49 @@ private enum ProviderSurfaceCommitTestFailure: Error {
     )
 }
 
+// MARK: - C9-5: every key a live picker store actually holds is classified
+
+/// C9-5 (upgrade sweep 2026-08-28). Two picker surfaces were reported as
+/// "unknown" — `cognition_cue` and `desk`. Re-checked against the live store
+/// (`data/providers/surfaces.json` + `active.json`, 18 keys): `desk` is a
+/// canonical `MODEL_SURFACES` row and `cognition_cue` is a dated entry in
+/// `RETIRED_MODEL_SURFACE_KEYS`, so NEITHER is unknown today. Nothing pinned
+/// that, though — `unsupportedStoredKeys` had no test asserting it stays empty
+/// for the real key set, so a rename or a dropped retirement note would put a
+/// silent "needs repair" banner in Provider Settings again.
+///
+/// This is that pin: the exact 18 keys on disk, classified.
+@Test func providerSurfaceRowSet_classifiesEveryLiveStoredKey() {
+    let liveStoredKeys: Set<String> = [
+        "autonomy", "chat", "cognition_cue", "cognition_reflection", "compaction", "desk",
+        "diagnostics", "dream", "heartbeat", "ios", "memory", "rem", "self_improvement",
+        "slack", "swarms", "telegram", "training", "workshop",
+    ]
+    let rowSet = ProviderSurfaceRowSet(
+        surfacePreferenceKeys: liveStoredKeys,
+        activeProviderKeys: liveStoredKeys
+    )
+
+    #expect(
+        rowSet.unsupportedStoredKeys.isEmpty,
+        "live picker keys are unclassified: \(rowSet.unsupportedStoredKeys). Either add the surface to MODEL_SURFACES or give it a dated RETIRED_MODEL_SURFACE_KEYS entry."
+    )
+    // `desk` routes; `cognition_cue` is retired-with-a-reason. Both named
+    // explicitly so a future edit cannot flip one without failing here.
+    #expect(MODEL_SURFACES.contains("desk"))
+    #expect(!MODEL_SURFACES.contains("cognition_cue"))
+    #expect(rowSet.retiredStoredKeys == ["cognition_cue"])
+    #expect(RETIRED_MODEL_SURFACE_KEYS["cognition_cue"]?.contains("retired 2026-08-24") == true)
+
+    // Negative control: a genuinely unknown key MUST still surface as
+    // unsupported, so the assertion above means "classified", not "lenient".
+    let withStranger = ProviderSurfaceRowSet(
+        surfacePreferenceKeys: liveStoredKeys.union(["not_a_surface"]),
+        activeProviderKeys: liveStoredKeys
+    )
+    #expect(withStranger.unsupportedStoredKeys == ["not_a_surface"])
+}
+
 // MARK: - P2-3: the `missions` -> `workshop` routing-surface seam
 //
 // Every case below is a MISMATCHED pair on purpose. The picker files on a live

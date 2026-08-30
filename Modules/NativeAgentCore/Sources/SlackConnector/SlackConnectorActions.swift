@@ -79,7 +79,8 @@ public enum SlackConnectorActions {
     public static func postMessage(
         input: [String: JSONValue],
         idempotencyKey: String? = nil,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        tokenOverride: String? = nil
     ) async throws -> JSONValue {
         let channel = string(input["channel"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -104,6 +105,9 @@ public enum SlackConnectorActions {
         if let threadTs, !threadTs.isEmpty {
             body["thread_ts"] = threadTs
         }
+        if let metadata = try messageMetadata(input: input) {
+            body["metadata"] = metadata
+        }
         if let idempotencyKey = idempotencyKey?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !idempotencyKey.isEmpty {
@@ -113,7 +117,8 @@ public enum SlackConnectorActions {
             method: "chat.postMessage",
             httpMethod: "POST",
             jsonBody: body,
-            dataRoot: dataRoot
+            dataRoot: dataRoot,
+            tokenOverride: tokenOverride
         )
         return envelope(
             action: "slack.post_message",
@@ -122,7 +127,11 @@ public enum SlackConnectorActions {
         )
     }
 
-    public static func uploadFile(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func uploadFile(
+        input: [String: JSONValue],
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        tokenOverride: String? = nil
+    ) async throws -> JSONValue {
         let channel = string(input["channel"] ?? input["channel_id"])?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let path = string(input["file_path"] ?? input["path"])?
@@ -163,7 +172,9 @@ public enum SlackConnectorActions {
             form: [
                 "filename": filename,
                 "length": String(data.count),
-            ]
+            ],
+            dataRoot: dataRoot,
+            tokenOverride: tokenOverride
         )
         guard (uploadURLResponse["ok"] as? Bool) == true,
               let rawUploadURL = uploadURLResponse["upload_url"] as? String,
@@ -215,7 +226,9 @@ public enum SlackConnectorActions {
         if let initialComment { completeForm["initial_comment"] = initialComment }
         let completeResponse = try await callForm(
             method: "files.completeUploadExternal",
-            form: completeForm
+            form: completeForm,
+            dataRoot: dataRoot,
+            tokenOverride: tokenOverride
         )
         return envelope(
             action: "slack.upload_file",
@@ -240,9 +253,10 @@ public enum SlackConnectorActions {
         httpMethod: String,
         params: [String: String] = [:],
         jsonBody: [String: Any]? = nil,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        tokenOverride: String? = nil
     ) async throws -> [String: Any] {
-        let token = try loadToken(dataRoot: dataRoot)
+        let token = try resolvedToken(override: tokenOverride, dataRoot: dataRoot)
         let url = try requestURL(method: method, params: httpMethod == "GET" ? params : [:])
         var req = URLRequest(url: url)
         req.httpMethod = httpMethod
@@ -289,9 +303,11 @@ public enum SlackConnectorActions {
 
     private static func callForm(
         method: String,
-        form: [String: String]
+        form: [String: String],
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        tokenOverride: String? = nil
     ) async throws -> [String: Any] {
-        let token = try loadToken()
+        let token = try resolvedToken(override: tokenOverride, dataRoot: dataRoot)
         let url = try requestURL(method: method, params: [:])
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -340,6 +356,24 @@ public enum SlackConnectorActions {
         return url
     }
 
+    static func messageMetadata(input: [String: JSONValue]) throws -> [String: Any]? {
+        guard case .object? = input["metadata"], let metadata = input["metadata"] else { return nil }
+        return try JSONSerialization.jsonObject(with: Data(metadata.serialize(pretty: false).utf8)) as? [String: Any]
+    }
+
+    static func resolvedToken(override: String?, dataRoot: URL) throws -> String {
+        if let override {
+            let token = override.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !token.isEmpty else {
+                throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
+                    NSLocalizedDescriptionKey: "Slack token snapshot is empty"
+                ])
+            }
+            return token
+        }
+        return try loadToken(dataRoot: dataRoot)
+    }
+
     private static func loadToken(dataRoot root: URL = PersistenceCore.defaultDataRoot()) throws -> String {
         let paths = [
             root
@@ -352,11 +386,17 @@ public enum SlackConnectorActions {
         ]
         for path in paths {
             guard let data = try? Data(contentsOf: path),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let token = object["access_token"] as? String,
-                  !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
-            return token.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Keep the delivery boundary aligned with Connectors' auth-state
+            // derivation. Older imports and connector-local auth stores can use
+            // `oauth_token` or `token`; reporting those credentials connected
+            // while the sender rejects them creates a false-ready surface.
+            for key in ["access_token", "oauth_token", "token"] {
+                guard let token = object[key] as? String else { continue }
+                let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
         }
         throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
             NSLocalizedDescriptionKey: "Slack token is not configured. Paste the Slack OAuth token in Connectors > Slack."
@@ -463,7 +503,18 @@ private enum SlackConnectorSecretRedactor {
         case .array(let items):
             return .array(items.map { redactValue($0) })
         case .object(let object):
-            return .object(object.mapValues { redactValue($0) })
+            return .object(object.reduce(into: [:]) { redacted, pair in
+                // `files.getUploadURLExternal` returns a short-lived signed
+                // upload credential. A partial/malformed Slack response can
+                // still flow through the ordinary failure envelope, so scrub
+                // it by field identity even when its value does not resemble a
+                // bot token.
+                if pair.key.lowercased() == "upload_url" {
+                    redacted[pair.key] = .string("[REDACTED_SLACK_UPLOAD_URL]")
+                } else {
+                    redacted[pair.key] = redactValue(pair.value)
+                }
+            })
         default:
             return value
         }

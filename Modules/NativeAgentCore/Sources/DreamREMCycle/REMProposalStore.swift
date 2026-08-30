@@ -91,6 +91,7 @@ public typealias REMApprovalStager = @Sendable (REMProposalRow) async -> String?
 
 public enum REMProposalStoreError: Error, LocalizedError, Equatable {
     case notFound(String)
+    case storeUnavailable(String)
     /// REM proposals are production-supported only as compact GROWTH.md
     /// reflexes. SOUL/VOICE stay read-only REM context.
     case unsupportedTarget(String)
@@ -102,6 +103,8 @@ public enum REMProposalStoreError: Error, LocalizedError, Equatable {
         switch self {
         case .notFound(let id):
             return "REM proposal not found: \(id)"
+        case .storeUnavailable(let detail):
+            return "REM proposal store unavailable: \(detail)"
         case .unsupportedTarget(let target):
             return "REM proposals can only target GROWTH.md, not \(target)"
         case .conflict(let id, let status):
@@ -226,7 +229,22 @@ public struct REMProposalStore: Sendable {
                   basePath.path)
             return nil
         }
-        return rows.compactMap(Self.decodeRowJSON)
+        let decoded = rows.compactMap(Self.decodeRowJSON)
+        guard decoded.count == rows.count else {
+            NSLog("REMProposalStore: base at %@ contains malformed rows — folding feed only",
+                  basePath.path)
+            return nil
+        }
+        return decoded
+    }
+
+    private func requireReadableBaseRows() throws -> [REMProposalRow] {
+        guard let rows = readBaseRows() else {
+            throw REMProposalStoreError.storeUnavailable(
+                "compaction base is unreadable; bytes were preserved"
+            )
+        }
+        return rows
     }
 
     // MARK: Append (dedupe by id)
@@ -347,6 +365,7 @@ public struct REMProposalStore: Sendable {
     @discardableResult
     public func stagePendingApprovals(_ stage: @escaping REMApprovalStager) async throws -> Int {
         try await lockCore.withFileLock(proposalsURL) {
+            _ = try self.requireReadableBaseRows()
             var lines = Self.readLines(self.proposalsURL)
             guard !lines.isEmpty else { return 0 }
             var staged = 0
@@ -372,6 +391,7 @@ public struct REMProposalStore: Sendable {
     /// pipeline pass stages a fresh approval instead of leaving a dead row.
     public func clearApprovalStamp(proposalId: String) async throws {
         try await lockCore.withFileLock(proposalsURL) {
+            _ = try self.requireReadableBaseRows()
             var lines = Self.readLines(self.proposalsURL)
             for i in lines.indices {
                 guard var row = Self.decodeRow(lines[i]), row.id == proposalId else { continue }
@@ -404,6 +424,7 @@ public struct REMProposalStore: Sendable {
     /// that), then flip pending→denied, then rebuild the pins index.
     @discardableResult
     public func applyDenial(proposalId: String, reason: String) async throws -> REMProposalRow {
+        _ = try requireReadableBaseRows()
         guard let current = loadAll().first(where: { $0.id == proposalId }) else {
             throw REMProposalStoreError.notFound(proposalId)
         }
@@ -430,7 +451,8 @@ public struct REMProposalStore: Sendable {
             // A row already folded into the base is TERMINAL (pending rows are
             // never compacted), so it can only be re-targeted idempotently. Match
             // the in-feed idempotency/conflict semantics without touching the feed.
-            if let baseRow = self.loadBaseRows().first(where: { $0.id == proposalId }) {
+            let baseRows = try self.requireReadableBaseRows()
+            if let baseRow = baseRows.first(where: { $0.id == proposalId }) {
                 if baseRow.status == newStatus { return baseRow }
                 throw REMProposalStoreError.conflict(id: proposalId, status: baseRow.status)
             }

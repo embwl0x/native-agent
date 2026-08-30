@@ -7,6 +7,46 @@ import Testing
 
 @Suite("Resident work observation", .serialized)
 struct ResidentWorkObservationEvalTests {
+    @Test("terminal Workshop history does not retain live watchers")
+    func terminalWorkshopHistoryIsNotWatched() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executionRoot = root.appendingPathComponent("workshop/executions", isDirectory: true)
+        let completed = executionRoot.appendingPathComponent("completed/execution.json")
+        let running = executionRoot.appendingPathComponent("running/execution.json")
+        let unreadable = executionRoot.appendingPathComponent("unreadable/execution.json")
+        for record in [completed, running, unreadable] {
+            try FileManager.default.createDirectory(
+                at: record.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        }
+        try Data(#"{"status":"completed"}"#.utf8).write(to: completed)
+        try Data(#"{"status":"running"}"#.utf8).write(to: running)
+        try Data(#"not-json"#.utf8).write(to: unreadable)
+
+        let runtime = NativeContextFlowRuntime(
+            dataRoot: root,
+            configurationOverride: NativeContextFlowConfiguration(mode: .active, budget: .mib32),
+            memoryOverride: SwiftNativeMemoryV2(
+                embedder: MockEmbeddingProvider(dimensions: 32),
+                storage: InMemoryMemoryStorage()
+            )
+        )
+        await runtime.start()
+        defer { Task { await runtime.stop() } }
+
+        let status = try await waitForStatus(runtime) { $0.isWatching }
+        let watchedPaths = Set(status.watchedPaths.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        })
+        #expect(watchedPaths.contains(executionRoot.standardizedFileURL.path))
+        #expect(!watchedPaths.contains(completed.standardizedFileURL.path))
+        #expect(watchedPaths.contains(running.standardizedFileURL.path))
+        #expect(watchedPaths.contains(unreadable.standardizedFileURL.path))
+        await runtime.stop()
+    }
+
     @Test("existing and newly-created Desk feeds produce one invalidation edge")
     func deskFeedCreationAndWriteAreObserved() async throws {
         let root = try temporaryRoot()

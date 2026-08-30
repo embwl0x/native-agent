@@ -293,6 +293,12 @@ public struct CompiledPersonalityProfile: Sendable, Codable, Equatable {
 /// from PersonaEngine.swift is honored — env var, stamped repo, dev repo,
 /// legacy fallback).
 public actor PersonaCompiler {
+    private struct ResolvedCompilation {
+        let packet: PersonalityPacket
+        let personaRoot: URL
+        let activePersonaDirectory: URL?
+    }
+
     /// Internal so `PersonaEngine+CompiledPacket.swift` (same module,
     /// separate file) can reach the engine's personaRoot + dataRoot when
     /// building the daemon-equivalent `/v1/personality/compiled` packet.
@@ -334,9 +340,19 @@ public actor PersonaCompiler {
     /// Override resolution failures fall through to the normal resolver — a
     /// typo can't blank the persona.
     public func compile(surface: String, personaOverride: String?) async throws -> PersonalityPacket {
+        try await resolvedCompilation(
+            surface: surface,
+            personaOverride: personaOverride
+        ).packet
+    }
+
+    private func resolvedCompilation(
+        surface: String,
+        personaOverride: String?
+    ) async throws -> ResolvedCompilation {
         let root = await engine.personaRoot
 
-        let (personaKind, personaId, personaSubdir) = resolveActivePersona(
+        let (personaKind, personaId, personaSubdir) = try resolveActivePersona(
             root: root, personaOverride: personaOverride
         )
 
@@ -344,9 +360,10 @@ public actor PersonaCompiler {
         // persona subdir.
         var activeDocs: [String: String] = [:]
         for id in Self.canonicalDocOrder {
-            if let override = personaSubdir.flatMap({ readDoc(root: $0, id: id) }) {
+            if let personaSubdir,
+               let override = try readDoc(root: personaSubdir, id: id) {
                 activeDocs[id] = override
-            } else if let canonical = readDoc(root: root, id: id) {
+            } else if let canonical = try readDoc(root: root, id: id) {
                 activeDocs[id] = canonical
             }
             // missing → omitted from activeDocs and from the prompt body.
@@ -359,7 +376,7 @@ public actor PersonaCompiler {
                 sections.append("# \(id)\n\(body)")
             }
         }
-        if let surfaceBody = readSurfaceOverride(root: root, surface: surface) {
+        if let surfaceBody = try readSurfaceOverride(root: root, surface: surface) {
             sections.append("Surface guidance for \(surface):\n\(surfaceBody)")
             activeDocs["surface:\(surface)"] = surfaceBody
         }
@@ -371,7 +388,7 @@ public actor PersonaCompiler {
         // Fingerprint — SHA-256 over (sorted ids + their contents + surface).
         let fingerprint = computeFingerprint(activeDocs: activeDocs, surface: surface)
 
-        return PersonalityPacket(
+        let packet = PersonalityPacket(
             surface: surface,
             personaKind: personaKind,
             personaId: personaId,
@@ -380,6 +397,11 @@ public actor PersonaCompiler {
             activeDocs: activeDocs,
             traits: traits,
             extras: nil
+        )
+        return ResolvedCompilation(
+            packet: packet,
+            personaRoot: root,
+            activePersonaDirectory: personaSubdir
         )
     }
 
@@ -394,12 +416,13 @@ public actor PersonaCompiler {
         surface: String,
         personaOverride: String? = nil
     ) async throws -> PersonaContextSourceSnapshot {
-        let packet = try await compile(surface: surface, personaOverride: personaOverride)
-        let root = await engine.personaRoot
-        let (_, _, activeDirectory) = resolveActivePersona(
-            root: root,
+        let resolved = try await resolvedCompilation(
+            surface: surface,
             personaOverride: personaOverride
         )
+        let packet = resolved.packet
+        let root = resolved.personaRoot
+        let activeDirectory = resolved.activePersonaDirectory
         var documents: [PersonaContextDocumentSource] = []
         for (order, id) in Self.canonicalDocOrder.enumerated() {
             guard let content = packet.activeDocs[id] else { continue }
@@ -727,14 +750,10 @@ public actor PersonaCompiler {
     ///   2. Otherwise scan immediate subdirs; pick the first (sorted)
     ///      that contains a marker doc → Custom.
     ///   3. None found → Default / "canonical".
-    private func resolveActivePersona(root: URL) -> (kind: String, id: String, subdir: URL?) {
-        return resolveActivePersona(root: root, personaOverride: nil)
-    }
-
     private func resolveActivePersona(
         root: URL,
         personaOverride: String?
-    ) -> (kind: String, id: String, subdir: URL?) {
+    ) throws -> (kind: String, id: String, subdir: URL?) {
         // 0. Per-turn override (Mac UI chatPersona pick). Trim, then look
         //    for a subdir with at least one marker doc. Misses fall through
         //    to the normal resolver so a typo can't blank the persona.
@@ -753,9 +772,25 @@ public actor PersonaCompiler {
         }
         // 1. active.json
         let activeFile = root.appendingPathComponent("active.json")
-        if let data = try? Data(contentsOf: activeFile),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let name = obj["persona"] as? String, !name.isEmpty {
+        if fileManager.fileExists(atPath: activeFile.path) {
+            let name: String
+            do {
+                let data = try Data(contentsOf: activeFile)
+                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let rawName = object["persona"] as? String,
+                      !rawName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw PersonaEngineError.rootUnreadable(
+                        reason: "active.json must contain a non-empty persona string"
+                    )
+                }
+                name = rawName
+            } catch let error as PersonaEngineError {
+                throw error
+            } catch {
+                throw PersonaEngineError.rootUnreadable(
+                    reason: "cannot read active.json: \(error.localizedDescription)"
+                )
+            }
             let candidate = root.appendingPathComponent(name, isDirectory: true)
             if subdirHasMarker(candidate) {
                 return ("Custom", name, candidate)
@@ -788,18 +823,28 @@ public actor PersonaCompiler {
         return false
     }
 
-    private func readDoc(root: URL, id: String) -> String? {
+    private func readDoc(root: URL, id: String) throws -> String? {
         let url = root.appendingPathComponent("\(id).md")
         guard fileManager.fileExists(atPath: url.path) else { return nil }
-        return try? String(contentsOf: url, encoding: .utf8)
+        return try readPersonaDocument(at: url)
     }
 
-    private func readSurfaceOverride(root: URL, surface: String) -> String? {
+    private func readSurfaceOverride(root: URL, surface: String) throws -> String? {
         let url = root
             .appendingPathComponent("surfaces", isDirectory: true)
             .appendingPathComponent("\(surface).md")
         guard fileManager.fileExists(atPath: url.path) else { return nil }
-        return try? String(contentsOf: url, encoding: .utf8)
+        return try readPersonaDocument(at: url)
+    }
+
+    private func readPersonaDocument(at url: URL) throws -> String {
+        do {
+            return try String(contentsOf: url, encoding: .utf8)
+        } catch {
+            throw PersonaEngineError.rootUnreadable(
+                reason: "cannot read \(url.lastPathComponent): \(error.localizedDescription)"
+            )
+        }
     }
 
     /// Trait parser. Two supported shapes:

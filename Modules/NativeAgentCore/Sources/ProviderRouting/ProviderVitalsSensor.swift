@@ -406,9 +406,14 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
     }
 
     /// Serializable snapshot (counts/timings/band only — no prompt content).
-    public func snapshotJSON() -> JSONValue {
+    /// The generation and state timestamps make restart restore age-bounded;
+    /// without them a months-old degraded band could be mistaken for live
+    /// provider health.
+    public func snapshotJSON(generatedAt: Date = Date()) -> JSONValue {
         var providers: [String: JSONValue] = [:]
-        for v in allVitals() {
+        for key in states.keys.sorted() {
+            guard let state = states[key] else { continue }
+            let v = vitals(key: key, state: state)
             var obj: [String: JSONValue] = [
                 "band": .string(v.band.label),
                 "emaErrorRate": .double(v.emaErrorRate),
@@ -420,12 +425,99 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
             if let b = v.baselineLatencyMs { obj["baselineLatencyMs"] = .double(b) }
             if let t = v.emaTTFTMs { obj["emaTTFTMs"] = .double(t) }
             if let tps = v.emaTokensPerSec { obj["emaTokensPerSec"] = .double(tps) }
+            if let date = state.lastSampleAt { obj["lastSampleAt"] = .string(Self.formatDate(date)) }
+            if let date = v.degradedSince { obj["degradedSince"] = .string(Self.formatDate(date)) }
             providers[v.providerId] = .object(obj)
         }
         return .object([
             "schema": .string("provider.vitals.v1"),
+            "generatedAt": .string(Self.formatDate(generatedAt)),
             "providers": .object(providers),
         ])
+    }
+
+    /// Restore recent provider health at process bootstrap. Invalid rows are
+    /// ignored independently, while an absent/stale/future snapshot restores
+    /// nothing. In-flight lifecycle starts are intentionally never persisted.
+    @discardableResult
+    public func restoreSnapshot(
+        dataRoot: URL? = nil,
+        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
+        now: Date = Date(),
+        maxAge: TimeInterval = 6 * 60 * 60,
+        futureSkewAllowance: TimeInterval = 5 * 60
+    ) async -> Bool {
+        let root = dataRoot ?? PersistenceCore.defaultDataRoot()
+        let path = root
+            .appendingPathComponent("telemetry", isDirectory: true)
+            .appendingPathComponent("provider_vitals.json")
+        let value = await persistence.readJSON(path, defaultValue: .null)
+        guard case .object(let snapshot) = value,
+              case .string("provider.vitals.v1")? = snapshot["schema"],
+              let generatedAt = Self.date(snapshot["generatedAt"]),
+              now.timeIntervalSince(generatedAt) <= max(0, maxAge),
+              generatedAt.timeIntervalSince(now) <= max(0, futureSkewAllowance),
+              case .object(let rows)? = snapshot["providers"] else {
+            return false
+        }
+
+        var restored: [(String, State)] = []
+        restored.reserveCapacity(min(rows.count, configuration.maxTrackedProviders))
+        for (rawKey, value) in rows {
+            let key = normalizedProviderId(rawKey)
+            guard !key.isEmpty,
+                  case .object(let row) = value,
+                  let band = Self.band(row["band"]),
+                  let errorRate = Self.number(row["emaErrorRate"]), errorRate >= 0, errorRate <= 1,
+                  let failures = Self.integer(row["consecutiveFailures"]), failures >= 0,
+                  let samples = Self.integer(row["sampleCount"]), samples >= failures,
+                  let cardActive = Self.boolean(row["cardActive"]) else {
+                continue
+            }
+            let lastSampleAt = Self.optionalDate(row["lastSampleAt"])
+            let degradedSince = Self.optionalDate(row["degradedSince"])
+            guard lastSampleAt != .invalid,
+                  degradedSince != .invalid,
+                  (lastSampleAt.value?.timeIntervalSince(now) ?? 0) <= max(0, futureSkewAllowance),
+                  (degradedSince.value?.timeIntervalSince(now) ?? 0) <= max(0, futureSkewAllowance) else {
+                continue
+            }
+            guard let latency = Self.optionalNonnegativeNumber(row["emaLatencyMs"]),
+                  let baseline = Self.optionalNonnegativeNumber(row["baselineLatencyMs"]),
+                  let ttft = Self.optionalNonnegativeNumber(row["emaTTFTMs"]),
+                  let tokensPerSec = Self.optionalNonnegativeNumber(row["emaTokensPerSec"]) else {
+                continue
+            }
+            var state = State()
+            state.band = band
+            state.emaLatencyMs = latency
+            state.baselineLatencyMs = baseline
+            state.emaTTFTMs = ttft
+            state.emaTokensPerSec = tokensPerSec
+            state.emaErrorRate = errorRate
+            state.consecutiveFailures = failures
+            state.sampleCount = samples
+            state.cardActive = cardActive
+            state.degradedSince = band == .degraded ? (degradedSince.value ?? generatedAt) : nil
+            state.lastSampleAt = lastSampleAt.value
+            restored.append((key, state))
+        }
+
+        restored.sort {
+            if $0.1.cardActive != $1.1.cardActive { return $0.1.cardActive }
+            if $0.1.band != $1.1.band { return $0.1.band > $1.1.band }
+            if $0.1.lastSampleAt != $1.1.lastSampleAt {
+                return ($0.1.lastSampleAt ?? .distantPast) > ($1.1.lastSampleAt ?? .distantPast)
+            }
+            return $0.0 < $1.0
+        }
+        states = Dictionary(
+            restored.prefix(configuration.maxTrackedProviders),
+            uniquingKeysWith: { first, _ in first }
+        )
+        openCallStarts.removeAll(keepingCapacity: true)
+        openCallOrder.removeAll(keepingCapacity: true)
+        return true
     }
 
     /// Off-turn-path snapshot persistence. This is the ONLY disk write in the
@@ -492,6 +584,65 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
 
     private func normalizedProviderId(_ raw: String) -> String {
         String(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().prefix(80))
+    }
+
+    private enum OptionalDate: Equatable {
+        case value(Date?)
+        case invalid
+
+        var value: Date? {
+            guard case .value(let date) = self else { return nil }
+            return date
+        }
+    }
+
+    private static func formatDate(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
+    }
+
+    private static func date(_ value: JSONValue?) -> Date? {
+        guard case .string(let raw)? = value else { return nil }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+
+    private static func optionalDate(_ value: JSONValue?) -> OptionalDate {
+        guard let value else { return .value(nil) }
+        guard let parsed = date(value) else { return .invalid }
+        return .value(parsed)
+    }
+
+    private static func band(_ value: JSONValue?) -> ProviderVitalsBand? {
+        guard case .string(let raw)? = value else { return nil }
+        return ProviderVitalsBand.allCases.first { $0.label == raw }
+    }
+
+    private static func boolean(_ value: JSONValue?) -> Bool? {
+        guard case .bool(let result)? = value else { return nil }
+        return result
+    }
+
+    private static func integer(_ value: JSONValue?) -> Int? {
+        guard case .int(let raw)? = value,
+              raw >= 0,
+              raw <= Int64(Int.max) else { return nil }
+        return Int(raw)
+    }
+
+    private static func number(_ value: JSONValue?) -> Double? {
+        let result: Double
+        switch value {
+        case .double(let raw)?: result = raw
+        case .int(let raw)?: result = Double(raw)
+        default: return nil
+        }
+        return result.isFinite ? result : nil
+    }
+
+    /// `nil` means a valid absent optional value; outer nil means malformed.
+    private static func optionalNonnegativeNumber(_ value: JSONValue?) -> Double?? {
+        guard let value else { return .some(nil) }
+        guard let number = number(value), number >= 0 else { return nil }
+        return .some(number)
     }
 
     private func rememberStart(id: String, at date: Date) {

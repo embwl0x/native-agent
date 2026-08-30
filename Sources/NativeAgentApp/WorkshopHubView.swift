@@ -35,6 +35,12 @@ enum DeskRootRoutePresentation {
     }
 
     static func mode(afterRootRequestFrom _: DeskMode) -> DeskMode { .desk }
+
+    /// D9: "New Task" creates a DESK task. Mounted in every mode it was a
+    /// control the Schedule and Research views do not own and cannot show the
+    /// result of — a button that appears to act on what you are looking at and
+    /// does not. It now exists only where its output lands.
+    static func showsNewTaskAction(in mode: DeskMode) -> Bool { mode == .desk }
 }
 
 struct DeskHubView: View {
@@ -70,17 +76,44 @@ struct DeskHubView: View {
             mode = DeskRootRoutePresentation.mode(afterRootRequestFrom: mode)
         }
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button("New Task", systemImage: "plus.circle") {
-                    // B2.3 follow-up: the sheet itself is presented by ContentView.
-                    // A `.sheet` attached here (NavigationSplitView detail content)
-                    // presents exactly once on macOS — after the first dismiss the
-                    // window never honors a re-present from this attachment point.
-                    // Same notification→ContentView pattern as the command palette.
-                    NotificationCenter.default.post(name: .newWorkshopTaskRequest, object: nil)
+            // The condition wraps the ToolbarItem, not its content: an item
+            // whose builder resolves to nothing still reserves a blank slot.
+            if DeskRootRoutePresentation.showsNewTaskAction(in: mode) {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("New Task", systemImage: "plus.circle") {
+                        // B2.3 follow-up: the sheet itself is presented by ContentView.
+                        // A `.sheet` attached here (NavigationSplitView detail content)
+                        // presents exactly once on macOS — after the first dismiss the
+                        // window never honors a re-present from this attachment point.
+                        // Same notification→ContentView pattern as the command palette.
+                        NotificationCenter.default.post(name: .newWorkshopTaskRequest, object: nil)
+                    }
                 }
             }
         }
+    }
+}
+
+enum NewDeskTaskPresentation {
+    static let successStatus = "Desk task created"
+    private static let failurePrefix = "Desk task creation failed:"
+
+    static func failureStatus(_ detail: String) -> String {
+        let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return failurePrefix }
+        return "\(failurePrefix) \(trimmed)"
+    }
+
+    static func inlineError(from statusText: String) -> String? {
+        guard statusText.hasPrefix(failurePrefix) else { return nil }
+        let detail = statusText.dropFirst(failurePrefix.count)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // The sheet stays open on failure, so this line is the only thing the
+        // person sees. A bare backend detail ("connection lost") reads as a
+        // riddle without the sentence that says what it stopped.
+        return detail.isEmpty
+            ? "Couldn’t create this task. Try again."
+            : "Couldn’t create this task. \(detail)"
     }
 }
 
@@ -95,6 +128,7 @@ struct NewWorkshopTaskSheet: View {
     @State private var title = ""
     @State private var objective = ""
     @State private var submitting = false
+    @State private var errorMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
@@ -107,6 +141,12 @@ struct NewWorkshopTaskSheet: View {
                     .lineLimit(2...5)
             }
             .formStyle(.grouped)
+
+            if let errorMessage {
+                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(NativeAgentFont.label)
+                    .foregroundStyle(.red)
+            }
 
             HStack {
                 Spacer()
@@ -127,6 +167,7 @@ struct NewWorkshopTaskSheet: View {
     private func submit() {
         let nextTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let nextObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        errorMessage = nil
         submitting = true
         Task {
             await appModel.createWorkshopTask(
@@ -134,7 +175,9 @@ struct NewWorkshopTaskSheet: View {
                 objective: nextObjective.isEmpty ? nextTitle : nextObjective
             )
             submitting = false
-            if !appModel.statusText.hasPrefix("Desk task creation failed") {
+            if let inlineError = NewDeskTaskPresentation.inlineError(from: appModel.statusText) {
+                errorMessage = inlineError
+            } else {
                 dismiss()
             }
         }

@@ -39,8 +39,13 @@ public struct VisionAffordanceRow: Sendable, Equatable {
     public let destructiveRisk: Bool
     public let salience: Double
     /// Pixel contrast against the sampled frame background. This describes
-    /// visual prominence without inventing a semantic role or color name.
+    /// visual prominence without inventing a semantic role.
     public let visualContrast: Double?
+    /// Compact perceptual colour evidence such as yellow or blue. This never
+    /// names what the object means.
+    public let visualColor: String?
+    /// Conservative connected-component silhouette: `round` or `square`.
+    public let visualShape: String?
 
     public init(
         handle: String,
@@ -55,7 +60,9 @@ public struct VisionAffordanceRow: Sendable, Equatable {
         ambiguous: String?,
         destructiveRisk: Bool,
         salience: Double,
-        visualContrast: Double? = nil
+        visualContrast: Double? = nil,
+        visualColor: String? = nil,
+        visualShape: String? = nil
     ) {
         self.handle = handle
         self.handleAmbiguity = handleAmbiguity
@@ -70,6 +77,8 @@ public struct VisionAffordanceRow: Sendable, Equatable {
         self.destructiveRisk = destructiveRisk
         self.salience = salience
         self.visualContrast = visualContrast
+        self.visualColor = visualColor
+        self.visualShape = visualShape
     }
 
     /// The clear label, or nil when redaction withheld it / there was none.
@@ -104,6 +113,8 @@ public struct VisionAffordanceRow: Sendable, Equatable {
         }
         if salience > 0 { object["salience"] = .double(salience) }
         if let visualContrast { object["visual_contrast"] = .double(visualContrast) }
+        if let visualColor { object["visual_color"] = .string(visualColor) }
+        if let visualShape { object["visual_shape"] = .string(visualShape) }
         return .object(object)
     }
 }
@@ -186,14 +197,23 @@ public struct VisionAbstainReport: Sendable, Equatable {
 public struct VisionRecognizedText: Sendable, Equatable {
     public let text: VisionRedactedText
     public let confidence: Double
+    /// Source-frame geometry retained for spatial fusion with nearby visual
+    /// evidence. Optional for synthetic callers that have text without a box.
+    public let rect: VisionRect?
 
-    public init(text: VisionRedactedText, confidence: Double) {
+    public init(text: VisionRedactedText, confidence: Double, rect: VisionRect? = nil) {
         self.text = text
         self.confidence = VisionConfidence.clamp(confidence)
+        self.rect = rect
     }
 
     public func toJSON() -> JSONValue {
-        .object(["text": text.json, "confidence": .double(confidence)])
+        var value: [String: JSONValue] = [
+            "text": text.json,
+            "confidence": .double(confidence),
+        ]
+        if let rect { value["bounds"] = rect.toJSON() }
+        return .object(value)
     }
 }
 
@@ -325,7 +345,10 @@ public struct VisionPercept: Sendable, Equatable {
                     ? "query \"\(query)\" matches \(tied) rows equally well — abstaining"
                     : entry.row.ambiguous,
                 destructiveRisk: entry.row.destructiveRisk,
-                salience: entry.row.salience
+                salience: entry.row.salience,
+                visualContrast: entry.row.visualContrast,
+                visualColor: entry.row.visualColor,
+                visualShape: entry.row.visualShape
             )
         }.sorted { $0.confidence.target > $1.confidence.target }
     }

@@ -9,12 +9,59 @@ import PersistenceCore
 // unbounded until caught — receipts trim to the newest maxReceipts on prune.
 @Suite("StoreBounds")
 struct StoreBoundsTests {
+    private let protectedReceiptKinds = [
+        "reflection.persona_context",
+        "emotional_consolidation",
+        "replay.integration",
+        "workshop.pursuit_proposed",
+        "workshop.pursuit_proposal_refused",
+    ]
 
     private func tempDataRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("nativeagent-storebounds-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
+    }
+
+    private func appendReceipts(
+        _ store: CognitiveSQLiteStore,
+        kind: String,
+        count: Int,
+        startingAt base: Date
+    ) async throws {
+        for i in 0..<count {
+            try await store.appendReceipt(
+                kind: kind,
+                payload: .object([
+                    "kind": .string(kind),
+                    "n": .int(Int64(i)),
+                ]),
+                at: base.addingTimeInterval(Double(i)),
+                id: UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", i + Int(base.timeIntervalSince1970))) ?? UUID()
+            )
+        }
+    }
+
+    private func appendArtifacts(
+        _ store: CognitiveSQLiteStore,
+        kind: String,
+        count: Int,
+        startingAt base: Date
+    ) async throws {
+        for i in 0..<count {
+            try await store.upsertArtifact(
+                kind: kind,
+                id: UUID(),
+                status: "current",
+                score: 0.5,
+                payload: .object([
+                    "kind": .string(kind),
+                    "n": .int(Int64(i)),
+                ]),
+                at: base.addingTimeInterval(Double(i))
+            )
+        }
     }
 
     @Test func checkedReplayDoesNotConsumeEvidenceWhenPersistenceIsBlocked() async throws {
@@ -206,6 +253,103 @@ struct StoreBoundsTests {
         #expect(try await store.loadReceiptRecords(kindPrefix: "tick", limit: 100).count == 20)
     }
 
+    @Test func pruneProtectsCriticalReceiptFloorsBeforeGenericFIFO() async throws {
+        let root = try tempDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try CognitiveSQLiteStore(dataRoot: root)
+
+        try await appendReceipts(store, kind: "generic.verification_eviction", count: 32, startingAt: Date(timeIntervalSince1970: 39_999_000))
+        try await appendReceipts(store, kind: "reflection.persona_context", count: 32, startingAt: Date(timeIntervalSince1970: 40_000_000))
+        try await appendReceipts(store, kind: "emotional_consolidation", count: 32, startingAt: Date(timeIntervalSince1970: 40_001_000))
+        try await appendReceipts(store, kind: "replay.integration", count: 32, startingAt: Date(timeIntervalSince1970: 40_002_000))
+        try await appendReceipts(store, kind: "workshop.pursuit_proposed", count: 32, startingAt: Date(timeIntervalSince1970: 40_003_000))
+        try await appendReceipts(store, kind: "workshop.pursuit_proposal_refused", count: 32, startingAt: Date(timeIntervalSince1970: 40_004_000))
+        try await appendReceipts(store, kind: "tick", count: 80, startingAt: Date(timeIntervalSince1970: 40_005_000))
+
+        let result = try await store.prune(maxNodes: 256, maxArtifacts: 600, maxReceipts: 256)
+        #expect(result.deletedReceipts == 80, "cap 256 trims to 192 with slack 64")
+
+        for kind in protectedReceiptKinds {
+            #expect(try await store.loadReceiptRecords(kindPrefix: kind, limit: 64).count == 32, "\(kind) floor must survive")
+        }
+        #expect(try await store.loadReceiptRecords(kindPrefix: "generic.verification_eviction", limit: 64).isEmpty)
+        #expect(try await store.loadReceiptRecords(kindPrefix: "tick", limit: 100).count == 32)
+    }
+
+    /// The reflection/replay families do not end at their happy-path kind. A
+    /// pending reconciliation is UNFINISHED replay work and a persona-load
+    /// failure is the only trace of a reflection that could not run — FIFO used
+    /// to spend both as generic noise. Fills past the cap and pins that the
+    /// floors survive while the unprotected tail is still trimmed to cap − slack.
+    @Test func pruneProtectsPendingAndFailureReceiptsInTheNamedFamilies() async throws {
+        let root = try tempDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try CognitiveSQLiteStore(dataRoot: root)
+
+        try await appendReceipts(store, kind: "reflection.persona_load_failed", count: 32, startingAt: Date(timeIntervalSince1970: 45_000_000))
+        try await appendReceipts(store, kind: "reflection.skipped", count: 32, startingAt: Date(timeIntervalSince1970: 45_001_000))
+        try await appendReceipts(store, kind: "replay.reconciliation_pending", count: 32, startingAt: Date(timeIntervalSince1970: 45_002_000))
+        // Newer than every protected row: a kind-blind FIFO would keep these.
+        try await appendReceipts(store, kind: "tick", count: 80, startingAt: Date(timeIntervalSince1970: 45_003_000))
+
+        // 176 rows, cap 128 → slack 32 → target 96 → 80 trimmed.
+        let result = try await store.prune(maxNodes: 256, maxArtifacts: 600, maxReceipts: 128)
+        #expect(result.deletedReceipts == 80, "cap 128 trims to 96 with slack 32: \(result.deletedReceipts)")
+
+        for kind in ["reflection.persona_load_failed", "reflection.skipped", "replay.reconciliation_pending"] {
+            #expect(try await store.loadReceiptRecords(kindPrefix: kind, limit: 64).count == 32, "\(kind) floor must survive")
+        }
+        #expect(try await store.loadReceiptRecords(kindPrefix: "tick", limit: 200).isEmpty, "unprotected FIFO must still be spent")
+        // Cap enforced overall: 96 retained + the single prune receipt.
+        #expect(try await store.loadReceiptRecords(limit: 400).count == 97)
+    }
+
+    @Test func pruneSpendsMicrocycleReceiptsBeforeOtherUnprotectedKinds() async throws {
+        let root = try tempDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try CognitiveSQLiteStore(dataRoot: root)
+
+        try await appendReceipts(store, kind: "reflection.persona_context", count: 32, startingAt: Date(timeIntervalSince1970: 40_999_000))
+        try await appendReceipts(store, kind: "emotional_consolidation", count: 32, startingAt: Date(timeIntervalSince1970: 41_000_000))
+        try await appendReceipts(store, kind: "replay.integration", count: 32, startingAt: Date(timeIntervalSince1970: 41_001_000))
+        try await appendReceipts(store, kind: "workshop.pursuit_proposed", count: 32, startingAt: Date(timeIntervalSince1970: 41_002_000))
+        try await appendReceipts(store, kind: "workshop.pursuit_proposal_refused", count: 32, startingAt: Date(timeIntervalSince1970: 41_003_000))
+        try await appendReceipts(store, kind: "tick", count: 20, startingAt: Date(timeIntervalSince1970: 41_004_000))
+        try await appendReceipts(store, kind: "microcycle", count: 80, startingAt: Date(timeIntervalSince1970: 41_005_000))
+
+        let result = try await store.prune(maxNodes: 256, maxArtifacts: 600, maxReceipts: 240)
+        #expect(result.deletedReceipts == 80, "cap 240 trims to 180 with slack 60")
+        #expect(try await store.loadReceiptRecords(kindPrefix: "microcycle", limit: 100).isEmpty)
+        #expect(try await store.loadReceiptRecords(kindPrefix: "tick", limit: 100).count == 20)
+        for kind in protectedReceiptKinds {
+            #expect(try await store.loadReceiptRecords(kindPrefix: kind, limit: 64).count == 32, "\(kind) floor must survive")
+        }
+    }
+
+    @Test func protectedReceiptFloorsNeverEscapeTheHardCap() async throws {
+        let root = try tempDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try CognitiveSQLiteStore(dataRoot: root)
+
+        try await appendReceipts(store, kind: "reflection.persona_context", count: 32, startingAt: Date(timeIntervalSince1970: 42_000_000))
+        try await appendReceipts(store, kind: "emotional_consolidation", count: 32, startingAt: Date(timeIntervalSince1970: 42_001_000))
+        try await appendReceipts(store, kind: "replay.integration", count: 32, startingAt: Date(timeIntervalSince1970: 42_002_000))
+        try await appendReceipts(store, kind: "workshop.pursuit_proposed", count: 32, startingAt: Date(timeIntervalSince1970: 42_003_000))
+        try await appendReceipts(store, kind: "workshop.pursuit_proposal_refused", count: 32, startingAt: Date(timeIntervalSince1970: 42_004_000))
+
+        let result = try await store.prune(maxNodes: 256, maxArtifacts: 600, maxReceipts: 96)
+        #expect(result.deletedReceipts == 88, "cap 96 trims to 72 with slack 24")
+
+        let all = try await store.loadReceiptRecords(limit: 200)
+        #expect(all.count == 73, "72 retained rows plus one prune receipt")
+        #expect(all.filter { $0.kind == "prune" }.count == 1)
+        #expect(all.filter { $0.kind == "reflection.persona_context" }.isEmpty)
+        #expect(all.filter { $0.kind == "emotional_consolidation" }.isEmpty)
+        #expect(all.filter { $0.kind == "replay.integration" }.count == 8)
+        #expect(all.filter { $0.kind == "workshop.pursuit_proposed" }.count == 32)
+        #expect(all.filter { $0.kind == "workshop.pursuit_proposal_refused" }.count == 32)
+    }
+
     // MARK: - R2-C (2026-07-09): the receipt-mirror flood that amputated her inner life
 
     /// Receipts must NOT be mirrored into cognitive_artifacts. The old double-write
@@ -358,5 +502,43 @@ struct StoreBoundsTests {
             )
         }
         #expect(try await store.loadArtifacts(kindPrefix: "temporary_noise", limit: 100).count == 2)
+    }
+
+    @Test func globalPruneKeepsThirtyTwoFeltStateArtifactsPerNamedFamilyBeforeNoise() async throws {
+        let root = try tempDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try CognitiveSQLiteStore(dataRoot: root)
+        let base = Date(timeIntervalSince1970: 43_000_000)
+
+        try await appendArtifacts(store, kind: "affect", count: 32, startingAt: base)
+        try await appendArtifacts(store, kind: "disposition", count: 32, startingAt: base.addingTimeInterval(1_000))
+        try await appendArtifacts(store, kind: "emotional_consolidation", count: 32, startingAt: base.addingTimeInterval(2_000))
+        try await appendArtifacts(store, kind: "temporary_noise", count: 80, startingAt: base.addingTimeInterval(3_000))
+
+        let result = try await store.prune(maxNodes: 256, maxArtifacts: 128)
+        #expect(result.deletedArtifacts == 48)
+        #expect(try await store.loadArtifacts(kindPrefix: "affect", limit: 64).count == 32)
+        #expect(try await store.loadArtifacts(kindPrefix: "disposition", limit: 64).count == 32)
+        #expect(try await store.loadArtifacts(kindPrefix: "emotional_consolidation", limit: 64).count == 32)
+        #expect(try await store.loadArtifacts(kindPrefix: "temporary_noise", limit: 100).count == 32)
+    }
+
+    @Test func feltStateArtifactFloorsNeverEscapeTheHardCap() async throws {
+        let root = try tempDataRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try CognitiveSQLiteStore(dataRoot: root)
+        let base = Date(timeIntervalSince1970: 44_000_000)
+
+        try await appendArtifacts(store, kind: "affect", count: 32, startingAt: base)
+        try await appendArtifacts(store, kind: "disposition", count: 32, startingAt: base.addingTimeInterval(1_000))
+        try await appendArtifacts(store, kind: "emotional_consolidation", count: 32, startingAt: base.addingTimeInterval(2_000))
+
+        let result = try await store.prune(maxNodes: 256, maxArtifacts: 64)
+        #expect(result.deletedArtifacts == 32)
+        #expect(try await store.loadArtifacts(kindPrefix: "affect", limit: 64).isEmpty)
+        #expect(try await store.loadArtifacts(kindPrefix: "disposition", limit: 64).count == 32)
+        #expect(try await store.loadArtifacts(kindPrefix: "emotional_consolidation", limit: 64).count == 32)
+        let total = try await store.loadArtifacts(limit: 100)
+        #expect(total.count == 64)
     }
 }

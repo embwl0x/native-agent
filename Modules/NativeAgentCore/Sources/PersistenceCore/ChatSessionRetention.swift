@@ -69,6 +69,22 @@ public enum ChatSessionRetention {
     /// (`chat/archive/sessions.jsonl`); older rows drop on the next pass. One
     /// line per archived session, so this bounds a long-lived, append-only index.
     public static let archivedSessionsIndexMaxLines = 20_000
+    /// F6 (2026-08-28): `chat/session_state/<id>/` holds derived per-session
+    /// state (`digest.txt` from SessionDigestProvider, `provider_usage.json`
+    /// from LLMCallTelemetry). No pruner ever touched it, so archived sessions
+    /// left their state dirs behind forever (1,279 orphans on the live root).
+    /// A dir with no row in `chat/sessions.json` whose newest mtime is older
+    /// than this is removed on the archive-prune pass. Transcripts are never
+    /// touched — this tier is derived state only.
+    public static let sessionStateRetentionSeconds: TimeInterval = 30 * 24 * 60 * 60
+    /// Orphan state dirs removed per prune pass. Bounds a backlog sweep (the
+    /// live root's ~1,300 orphans clear in a handful of passes) so no single
+    /// pass stalls the caller, which runs inside the sessions lock.
+    public static let sessionStatePruneMaxPerPass = 200
+
+    public nonisolated static func defaultBestEffortFailureLogger(_ message: String) {
+        NSLog("%@", message)
+    }
 
     public static func enforce(
         dataRoot: URL,
@@ -165,6 +181,27 @@ public enum ChatSessionRetention {
         }
         report.keptSessions = kept.count
         return report
+    }
+
+    /// Best-effort enforcement for callers whose success path must continue even
+    /// if retention is temporarily unavailable. Failures are logged, never
+    /// silently swallowed.
+    @discardableResult
+    public static func enforceBestEffort(
+        dataRoot: URL,
+        now: Date = Date(),
+        policy: ChatSessionRetentionPolicy = .default,
+        context: String,
+        failureLogger: @escaping @Sendable (String) -> Void = defaultBestEffortFailureLogger
+    ) -> ChatSessionRetentionReport? {
+        do {
+            return try enforce(dataRoot: dataRoot, now: now, policy: policy)
+        } catch {
+            failureLogger(
+                "\(context): ChatSessionRetention.enforce failed at \(dataRoot.path): \(error)"
+            )
+            return nil
+        }
     }
 
     public static func saveMacPinnedChatSessionIds(
@@ -505,13 +542,86 @@ public enum ChatSessionRetention {
         // so taking the lock on a nonexistent index would conjure chat/archive/
         // as a side effect — and "retention rejected, nothing archived" must
         // leave no archive dir behind (pinned by ChatSessionIndexFileTests).
-        guard FileManager.default.fileExists(atPath: sessionsIndex.path) else { return }
-        _ = try? withBoundedTranscriptLock(sessionsIndex) {
-            _ = try enforceJSONLLineCap(
-                at: sessionsIndex,
-                maxLines: archivedSessionsIndexMaxLines
-            )
+        if FileManager.default.fileExists(atPath: sessionsIndex.path) {
+            _ = try? withBoundedTranscriptLock(sessionsIndex) {
+                _ = try enforceJSONLLineCap(
+                    at: sessionsIndex,
+                    maxLines: archivedSessionsIndexMaxLines
+                )
+            }
         }
+
+        // 3. F6: sweep orphaned per-session state dirs. Shares this pass's
+        // throttle: an archival changes the tier stamp, so the sweep runs on
+        // the pass after a session leaves the hot index, and otherwise at most
+        // once per interval.
+        pruneSessionState(dataRoot: dataRoot, now: now)
+    }
+
+    /// Remove `chat/session_state/<id>/` dirs whose session is no longer in
+    /// the live index and whose newest mtime (dir or any immediate child) is
+    /// older than `sessionStateRetentionSeconds`. mtime is the conservative
+    /// proxy for "archived (or abandoned) that long ago": nothing writes to an
+    /// archived session's state dir, and anything touched recently is kept.
+    /// Best-effort and bounded; deletes only derived state, never transcripts.
+    private static func pruneSessionState(dataRoot: URL, now: Date) {
+        let fm = FileManager.default
+        let chatDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
+        let stateDir = chatDir.appendingPathComponent("session_state", isDirectory: true)
+        guard fm.fileExists(atPath: stateDir.path) else { return }
+
+        // Fail closed: prune only against a present, strictly parsed live
+        // index. A missing or malformed `sessions.json` must never read as
+        // "every state dir is an orphan".
+        let sessionsPath = chatDir.appendingPathComponent("sessions.json")
+        guard fm.fileExists(atPath: sessionsPath.path),
+              let rows = try? ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath) else {
+            return
+        }
+        var liveDirNames = Set<String>()
+        for row in rows {
+            guard case .string(let id)? = row["id"],
+                  let safe = NativeAgentChatSessionID.normalizedPathComponent(id) else { continue }
+            liveDirNames.insert(safe)
+        }
+
+        guard let entries = try? fm.contentsOfDirectory(
+            at: stateDir,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let cutoff = now.addingTimeInterval(-sessionStateRetentionSeconds)
+        var removed = 0
+        for entry in entries {
+            if removed >= sessionStatePruneMaxPerPass { break }
+            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                  !liveDirNames.contains(entry.lastPathComponent),
+                  newestModification(in: entry) < cutoff,
+                  (try? fm.removeItem(at: entry)) != nil else { continue }
+            removed += 1
+        }
+    }
+
+    /// Newest mtime among the directory and its immediate children. Undatable
+    /// entries read as `distantFuture` — never delete what we cannot prove is
+    /// old (mirrors the archived-transcript age prune above).
+    private static func newestModification(in directory: URL) -> Date {
+        func mtime(_ url: URL) -> Date {
+            (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? .distantFuture
+        }
+        var newest = mtime(directory)
+        if let children = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: []
+        ) {
+            for child in children {
+                newest = max(newest, mtime(child))
+            }
+        }
+        return newest
     }
 
     // MARK: - Archive-prune throttle (perf wave 2)

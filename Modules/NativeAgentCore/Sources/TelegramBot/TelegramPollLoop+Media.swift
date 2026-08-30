@@ -94,6 +94,33 @@ extension TelegramPollLoop {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Only classify unsupported payloads; supported image/voice owners and
+    /// the original caption remain authoritative for their existing paths.
+    static func unsupportedAttachmentKind(from message: TelegramMessage) -> String? {
+        guard case .object(let extras)? = message.extras else { return nil }
+        if case .object(_)? = extras["video"] { return "video" }
+        if case .object(let document)? = extras["document"],
+           !(_tgJSONString(document["mime_type"]) ?? "").lowercased().hasPrefix("image/") {
+            return "document"
+        }
+        return nil
+    }
+
+    func notifyUnsupportedAttachment(kind: String, update: TelegramUpdate, message: TelegramMessage) async {
+        await emitAttachmentDroppedTrace(
+            kind: kind, reason: "unsupported_attachment_type", chatId: message.chatId, updateId: update.updateId
+        )
+        let notice = "I can't read that \(kind) in Telegram. Please send an image or paste the relevant text."
+        do {
+            try await sendMessage(token, message.chatId, notice)
+            await recordReceipt(kind: "attachment_dropped", update: update, message: message,
+                                text: "", reply: notice)
+        } catch {
+            await recordError(context: "send_unsupported_attachment_notice", error: String(describing: error),
+                              update: update, message: message, text: nil)
+        }
+    }
+
     /// Resolve an image mime from the downloaded file's path suffix (Telegram
     /// `file_path` carries the extension; photos themselves have no mime). Used
     /// when the descriptor's mimeType is nil (the `photo` list path).
@@ -116,7 +143,7 @@ extension TelegramPollLoop {
     /// Emit a `telegram.attachment_dropped` trace to traces/events.jsonl when an
     /// inbound attachment exists but couldn't be processed (download failure,
     /// oversize, unsupported). Mirrors emitMemoryCommitTrace's shape + the
-    /// shared appendJSONLCapped cap discipline. The reason is token-redacted so
+    /// shared path-owned cap discipline. The reason is token-redacted so
     /// the bot token can never leak into a trace; raw image bytes are NEVER
     /// written (only kind + byteSize + reason). This is the tripwire half — the
     /// user-visible reply is sent separately by the caller.
@@ -145,7 +172,7 @@ extension TelegramPollLoop {
         ])
         let persistence = SwiftNativePersistenceCore()
         do {
-            try await appendJSONLCapped(
+            try await appendPathOwnedJSONL(
                 row, to: tracesPath, using: persistence,
                 logLabel: "TelegramPollLoop.attachmentDropped"
             )
@@ -167,4 +194,3 @@ extension TelegramPollLoop {
         return "(I couldn't process that image: \(short). Try resending it.)"
     }
 }
-

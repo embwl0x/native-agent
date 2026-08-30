@@ -90,6 +90,28 @@ public struct OrganismPredictionLimits: Sendable, Equatable {
     public static let defaults = OrganismPredictionLimits()
 }
 
+/// Cumulative, per-capability outcome evidence. Unlike the bounded prediction
+/// reservoir, these counters are not a display sample and therefore remain a
+/// valid basis for Agent's capability self-read after old rows are evicted.
+public struct OrganismPredictionOutcomeCounts: Codable, Sendable, Equatable {
+    public var satisfied: Int
+    public var violated: Int
+    public var expired: Int
+    public var lastEvidenceAt: Date?
+
+    public init(
+        satisfied: Int = 0,
+        violated: Int = 0,
+        expired: Int = 0,
+        lastEvidenceAt: Date? = nil
+    ) {
+        self.satisfied = max(0, satisfied)
+        self.violated = max(0, violated)
+        self.expired = max(0, expired)
+        self.lastEvidenceAt = lastEvidenceAt
+    }
+}
+
 public struct OrganismPredictionSummary: Codable, Sendable, Equatable {
     public var pendingCount: Int
     public var satisfiedCount: Int
@@ -139,6 +161,10 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
     public var bodyConfidence: OrganismBodyConfidence
     public var lastUpdatedAt: Date?
     public var lastViolationAt: Date?
+    /// Added after the original bounded prediction ledger shipped. `nil`
+    /// means historical per-kind totals were never recorded; readers must not
+    /// reinterpret the status-biased legacy reservoir as an outcome sample.
+    public var outcomeCountsByKind: [String: OrganismPredictionOutcomeCounts]?
     /// Round 3 Wave A2: per-path rate stamps for FELT resolutions (relief /
     /// disappointment nodes) — at most one felt event per prediction kind per
     /// hour, so a retry storm can't flood her memory with exhales. Optional:
@@ -155,7 +181,8 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
         strategyCaution: Double = 0,
         bodyConfidence: OrganismBodyConfidence = .neutral,
         lastUpdatedAt: Date? = nil,
-        lastViolationAt: Date? = nil
+        lastViolationAt: Date? = nil,
+        outcomeCountsByKind: [String: OrganismPredictionOutcomeCounts]? = nil
     ) {
         self.predictions = predictions
         self.satisfiedCount = max(0, satisfiedCount)
@@ -166,6 +193,7 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
         self.bodyConfidence = bodyConfidence
         self.lastUpdatedAt = lastUpdatedAt
         self.lastViolationAt = lastViolationAt
+        self.outcomeCountsByKind = outcomeCountsByKind
     }
 
     public static let empty = OrganismPredictionLedger()
@@ -194,6 +222,14 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
 }
 
 public enum OrganismPredictiveBody {
+    public static func predictionID(
+        kind: OrganismPredictionKind,
+        sourceOrgan: String,
+        correlationID: String
+    ) -> String {
+        "pending:\(kind.rawValue):\(canonicalToken(sourceOrgan)):\(canonicalToken(correlationID))"
+    }
+
     public static func applying(
         signal: SomaticSignal,
         to ledger: OrganismPredictionLedger,
@@ -326,6 +362,7 @@ public enum OrganismPredictiveBody {
             prediction.lastUpdatedAt = date
             ledger.predictions[id] = prediction
             ledger.expiredCount += 1
+            recordOutcome(.expired, kind: prediction.kind, at: date, ledger: &ledger)
             // M15 (2026-07-09): an expiry damages bodyConfidence via the violation
             // effect below but never stamped lastViolationAt — so the prospective
             // shadow (modulate reads it) disagreed with the body about whether a
@@ -351,7 +388,12 @@ public enum OrganismPredictiveBody {
             // Correlated source evidence can arrive late. It may still inform
             // generic physiology upstream, but it cannot reopen the prediction
             // at an older epoch or move its due horizon backward.
+            // Lifecycle owners may replay the same durable edge after a
+            // restart. Equality is the same observation, not fresh evidence;
+            // accepting it repeatedly inflated confidence and evidenceCount.
             guard signal.occurredAt >= existing.lastUpdatedAt else { return }
+            if existing.status == .pending,
+               signal.occurredAt == existing.lastUpdatedAt { return }
             existing.status = .pending
             existing.dueAt = dueAt
             existing.confidence = OrganismBodyConfidence.clamp(existing.confidence + 0.04 * signal.intensity)
@@ -381,8 +423,15 @@ public enum OrganismPredictiveBody {
     ) {
         let id = pendingID(kind: kind, signal: signal)
         let existing = ledger.predictions[id]
+        if let existing {
+            guard signal.occurredAt >= existing.lastUpdatedAt else { return }
+            // A replay of the same terminal edge is not new evidence. Keep
+            // equal-time pending→terminal transitions valid: some lifecycle
+            // owners legitimately stamp both phases from one clock sample.
+            if existing.status == .satisfied,
+               signal.occurredAt == existing.lastUpdatedAt { return }
+        }
         var prediction = existing ?? terminalPrediction(kind, signal: signal)
-        guard signal.occurredAt >= prediction.lastUpdatedAt else { return }
         // Round 3 Wave A: measure how BRACED the body was for THIS outcome
         // BEFORE the resolution mutates the prediction — the same math the
         // projection used to hold the breath sizes the exhale. Only a REAL
@@ -397,6 +446,7 @@ public enum OrganismPredictiveBody {
             : 0
         if prediction.status != .satisfied {
             ledger.satisfiedCount += 1
+            recordOutcome(.satisfied, kind: kind, at: signal.occurredAt, ledger: &ledger)
         }
         prediction.status = .satisfied
         prediction.confidence = OrganismBodyConfidence.clamp(prediction.confidence + 0.18 * signal.intensity)
@@ -420,10 +470,16 @@ public enum OrganismPredictiveBody {
         chemicalState: inout ChemicalState
     ) {
         let id = pendingID(kind: kind, signal: signal)
-        var prediction = ledger.predictions[id] ?? terminalPrediction(kind, signal: signal)
-        guard signal.occurredAt >= prediction.lastUpdatedAt else { return }
+        let existing = ledger.predictions[id]
+        if let existing {
+            guard signal.occurredAt >= existing.lastUpdatedAt else { return }
+            if existing.status == .violated,
+               signal.occurredAt == existing.lastUpdatedAt { return }
+        }
+        var prediction = existing ?? terminalPrediction(kind, signal: signal)
         if prediction.status != .violated {
             ledger.violatedCount += 1
+            recordOutcome(.violated, kind: kind, at: signal.occurredAt, ledger: &ledger)
         }
         prediction.status = .violated
         prediction.confidence = OrganismBodyConfidence.clamp(prediction.confidence - 0.20 * signal.intensity)
@@ -549,27 +605,30 @@ public enum OrganismPredictiveBody {
     ) -> OrganismPredictionLedger {
         guard ledger.predictions.count > limits.maximumPredictions else { return ledger }
         var next = ledger
-        let keep = Set(ledger.predictions.values.sorted(by: predictionSort).prefix(limits.maximumPredictions).map(\.id))
+        let keep = Set(OrganismPredictionRetention.bounded(
+            Array(ledger.predictions.values), maximum: limits.maximumPredictions
+        ).map(\.id))
         next.predictions = ledger.predictions.filter { keep.contains($0.key) }
         return next
     }
 
-    private static func predictionSort(_ lhs: OrganismPrediction, _ rhs: OrganismPrediction) -> Bool {
-        if lhs.status != rhs.status {
-            return statusRank(lhs.status) < statusRank(rhs.status)
-        }
-        if lhs.lastUpdatedAt != rhs.lastUpdatedAt { return lhs.lastUpdatedAt > rhs.lastUpdatedAt }
-        if lhs.uncertainty != rhs.uncertainty { return lhs.uncertainty > rhs.uncertainty }
-        return lhs.id < rhs.id
-    }
-
-    private static func statusRank(_ status: OrganismPredictionStatus) -> Int {
+    private static func recordOutcome(
+        _ status: OrganismPredictionStatus,
+        kind: OrganismPredictionKind,
+        at date: Date,
+        ledger: inout OrganismPredictionLedger
+    ) {
+        var all = ledger.outcomeCountsByKind ?? [:]
+        var count = all[kind.rawValue] ?? OrganismPredictionOutcomeCounts()
         switch status {
-        case .pending: return 0
-        case .violated: return 1
-        case .expired: return 2
-        case .satisfied: return 3
+        case .satisfied: count.satisfied += 1
+        case .violated: count.violated += 1
+        case .expired: count.expired += 1
+        case .pending: return
         }
+        count.lastEvidenceAt = max(count.lastEvidenceAt ?? .distantPast, date)
+        all[kind.rawValue] = count
+        ledger.outcomeCountsByKind = all
     }
 
     private static func defaultHorizon(for kind: OrganismPredictionKind) -> TimeInterval {
@@ -583,8 +642,11 @@ public enum OrganismPredictiveBody {
     }
 
     private static func pendingID(kind: OrganismPredictionKind, signal: SomaticSignal) -> String {
-        let correlation = predictionCorrelationID(signal)
-        return "pending:\(kind.rawValue):\(canonicalToken(signal.sourceOrgan)):\(correlation)"
+        predictionID(
+            kind: kind,
+            sourceOrgan: signal.sourceOrgan,
+            correlationID: predictionCorrelationID(signal)
+        )
     }
 
     private static func predictionCorrelationID(_ signal: SomaticSignal) -> String {
@@ -626,5 +688,43 @@ public enum OrganismPredictiveBody {
         }
         let trimmed = output.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         return trimmed.isEmpty ? "unknown" : trimmed
+    }
+}
+
+/// Keeps every pending expectation first, then retains recent terminal
+/// evidence fairly across capability kinds. Status never decides which
+/// terminal outcomes survive: prioritizing violations made the reservoir look
+/// like a failure-rate sample even when lifetime outcomes were overwhelmingly
+/// successful.
+enum OrganismPredictionRetention {
+    static func bounded(
+        _ predictions: [OrganismPrediction],
+        maximum: Int
+    ) -> [OrganismPrediction] {
+        guard maximum > 0 else { return [] }
+        let pending = predictions.filter { $0.status == .pending }.sorted(by: recentFirst)
+        if pending.count >= maximum { return Array(pending.prefix(maximum)) }
+
+        var result = pending
+        var buckets = Dictionary(grouping: predictions.filter { $0.status != .pending }, by: \.kind)
+            .mapValues { $0.sorted(by: recentFirst) }
+        let kinds = OrganismPredictionKind.allCases
+        while result.count < maximum {
+            var appended = false
+            for kind in kinds where result.count < maximum {
+                guard var bucket = buckets[kind], !bucket.isEmpty else { continue }
+                result.append(bucket.removeFirst())
+                buckets[kind] = bucket
+                appended = true
+            }
+            if !appended { break }
+        }
+        return result
+    }
+
+    private static func recentFirst(_ lhs: OrganismPrediction, _ rhs: OrganismPrediction) -> Bool {
+        if lhs.lastUpdatedAt != rhs.lastUpdatedAt { return lhs.lastUpdatedAt > rhs.lastUpdatedAt }
+        if lhs.uncertainty != rhs.uncertainty { return lhs.uncertainty > rhs.uncertainty }
+        return lhs.id < rhs.id
     }
 }

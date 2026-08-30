@@ -93,6 +93,25 @@ func growth_appendsToExisting() async throws {
     #expect(!body.contains("## Entries"))
 }
 
+@Test("appendPersonalityGrowth preserves an unreadable GROWTH.md")
+func growth_refusesUnreadableExistingDocument() async throws {
+    let root = try gvTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let (engine, personaRoot, _) = gvEngine(root)
+    try gvSeedSoul(personaRoot)
+    let growthURL = personaRoot.appendingPathComponent("GROWTH.md")
+    let invalidUTF8 = Data([0xFF, 0xFE, 0xFD])
+    try invalidUTF8.write(to: growthURL)
+
+    await #expect(throws: PersonaWriteError.self) {
+        _ = try await engine.appendPersonalityGrowth(
+            kind: "correction",
+            text: "must not replace authority",
+            sourceRunId: nil
+        )
+    }
+    #expect(try Data(contentsOf: growthURL) == invalidUTF8)
+}
+
 @Test("appendPersonalityGrowth caps cleaned text at 1000 code points")
 func growth_capsAt1000() async throws {
     let root = try gvTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
@@ -228,6 +247,29 @@ func append_createsWhenMissing() async throws {
     #expect(result.backupPath == nil)
     let body = try String(contentsOf: personaRoot.appendingPathComponent("GROWTH.md"), encoding: .utf8)
     #expect(body == "\n\n## T\nC")
+}
+
+@Test("personaAppendSection preserves an unreadable canonical document")
+func append_refusesUnreadableExistingDocument() async throws {
+    let root = try gvTempRoot(); defer { try? FileManager.default.removeItem(at: root) }
+    let (engine, personaRoot, _) = gvEngine(root)
+    let voiceURL = personaRoot.appendingPathComponent("VOICE.md")
+    let invalidUTF8 = Data([0xF5, 0x80, 0x80, 0x80])
+    try invalidUTF8.write(to: voiceURL)
+
+    await #expect(throws: PersonaWriteError.self) {
+        _ = try await engine.personaAppendSection(
+            kind: "voice",
+            title: "Unsafe append",
+            content: "must not replace authority"
+        )
+    }
+    #expect(try Data(contentsOf: voiceURL) == invalidUTF8)
+    let backups = try FileManager.default.contentsOfDirectory(
+        at: personaRoot,
+        includingPropertiesForKeys: nil
+    ).filter { $0.lastPathComponent.hasPrefix("VOICE.md.pre-") }
+    #expect(backups.isEmpty)
 }
 
 @Test("personaAppendSection rejects an empty title and the skill kind (not in append set)")

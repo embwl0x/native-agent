@@ -395,6 +395,7 @@ struct SessionRow: View {
     var session: ChatSession
     var selected: Bool
     var pinState: PinState
+    var onSelect: () -> Void
     var renaming: Bool = false
     var onRenameBegin: (() -> Void)? = nil
     /// nil = rename canceled/no-op; non-nil = commit this cleaned title.
@@ -529,6 +530,13 @@ struct SessionRow: View {
                 .font(.subheadline.weight(selected ? .semibold : .regular))
                 .lineLimit(1)
                 .truncationMode(.tail)
+                // Keep the drag source and pointer hit-testing unchanged,
+                // but expose the same selection action to VoiceOver.
+                .accessibilityLabel(session.displayTitle)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityValue(selected ? "Selected" : "Not selected")
+                .accessibilityHint("Opens this conversation")
+                .accessibilityAction { onSelect() }
         }
     }
 
@@ -760,6 +768,7 @@ private struct PinnedSessionTab: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(PinnedSessionTabPresentation.tabAccessibilityLabel(for: session))
+            .help(session.displayTitle)
             .simultaneousGesture(
                 TapGesture(count: 2).onEnded {
                     beginRename()

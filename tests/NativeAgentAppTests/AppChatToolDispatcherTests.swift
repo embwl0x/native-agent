@@ -73,6 +73,26 @@ private final class StubInnerToolDispatcher: ToolDispatchClient, @unchecked Send
 
 private enum ThrowingToolDispatcherError: Error, Equatable { case failed }
 
+private struct LegacyMacCatalogStub: ToolDispatchClient {
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        .object([
+            "status": .string("ok"),
+            "currently_loaded": .array([.string("mac_focus_app"), .string("act")]),
+            "turn_active_tools": .array([.string("mac_quit_app"), .string("go")]),
+            "mac_app_available_tools": .array([.string("mac_focus_app"), .string("mac_quit_app")]),
+            "mac_app_policy_locked_tools": .array([.string("mac_focus_app")]),
+            "available_tools": .array([.string("mac_focus_app"), .string("act"), .string("tool_catalog")]),
+            "tools": .array([]),
+        ])
+    }
+
+    func listAvailableTools() async throws -> [String] {
+        ["mac_focus_app", "mac_quit_app", "act", "go", "tool_catalog", "tool_load"]
+    }
+
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] { [] }
+}
+
 @Test
 func defaultReflexReviewerUsesConfiguredAgentIdentity() throws {
     let root = FileManager.default.temporaryDirectory
@@ -143,6 +163,7 @@ func appChatToolDispatcherReturnsCanonicalWorkshopAndMacOutcomesToObservers() as
     let workshopID = String(repeating: "a", count: 64)
     let macID = "11111111-1111-4111-8111-111111111111"
     let approvalID = "22222222-2222-4222-8222-222222222222"
+    let bridgeID = "44444444-4444-4444-8444-444444444444"
     let dataRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("AppChatMotorObserver-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: dataRoot) }
@@ -172,6 +193,10 @@ func appChatToolDispatcherReturnsCanonicalWorkshopAndMacOutcomesToObservers() as
                 "status": .string("approval_required"),
                 "approvalId": .string(approvalID),
             ]),
+            "codex_message": .object([
+                "status": .string("queued"),
+                "messageId": .string(bridgeID),
+            ]),
         ]),
         securityCenter: SwiftNativeSecurityCenter(
             dataRoot: dataRoot,
@@ -185,6 +210,7 @@ func appChatToolDispatcherReturnsCanonicalWorkshopAndMacOutcomesToObservers() as
     _ = try await dispatcher.dispatch(tool: "workshop_submit", input: [:], surface: "chat")
     _ = try await dispatcher.dispatch(tool: "mac_focus_app", input: [:], surface: "chat")
     let externalResult = try await dispatcher.dispatch(tool: "agentmail_send", input: [:], surface: "chat")
+    _ = try await dispatcher.dispatch(tool: "codex_message", input: [:], surface: "chat")
     let canonicalApprovalID: String? = {
         guard case .object(let object) = externalResult,
               case .string(let value)? = object["approvalId"] ?? object["approval_id"] else {
@@ -194,8 +220,8 @@ func appChatToolDispatcherReturnsCanonicalWorkshopAndMacOutcomesToObservers() as
     }()
     let references = await capture.references
     #expect(canonicalApprovalID != nil)
-    #expect(references.map(\.domain) == [.workshopExecution, .macControl, .externalSend])
-    #expect(references.map(\.ownerActionID) == [workshopID, macID, canonicalApprovalID].compactMap { $0 })
+    #expect(references.map(\.domain) == [.workshopExecution, .macControl, .externalSend, .agentBridge])
+    #expect(references.map(\.ownerActionID) == [workshopID, macID, canonicalApprovalID, bridgeID].compactMap { $0 })
     #expect(references.allSatisfy {
         $0.actionIdentity == CausalTransitionEvidence.opaqueIdentity($0.ownerActionID)
     })
@@ -314,6 +340,169 @@ func appChatToolDispatcher_exposesAndDispatchesBoundedHealthTools() async throws
         return
     }
     #expect(groups["browser"] != nil)
+}
+
+@Test
+func appChatToolCatalog_doesNotReadvertiseRetiredMacImplementationTools() async throws {
+    let dispatcher = AppChatToolDispatcher(
+        inner: LegacyMacCatalogStub(),
+        enforceAutonomySecurity: false,
+        organismPostureProvider: { nil }
+    )
+
+    let result = try await dispatcher.dispatch(
+        tool: "tool_catalog",
+        input: [:],
+        surface: "chat"
+    )
+
+    let available = Set(jsonStringArray(result, key: "available_tools"))
+    #expect(available.contains("act"))
+    #expect(available.contains("go"))
+    #expect(!available.contains("mac_focus_app"))
+    #expect(!available.contains("mac_quit_app"))
+    let turnActive = Set(jsonStringArray(result, key: "turn_active_tools"))
+    #expect(turnActive.isEmpty)
+    #expect(jsonStringArray(result, key: "mac_app_available_tools").isEmpty)
+    #expect(jsonStringArray(result, key: "mac_app_policy_locked_tools").isEmpty)
+    guard case .object(let object) = result,
+          case .object(let groups)? = object["tool_groups"] else {
+        Issue.record("expected compact tool group index")
+        return
+    }
+    let grouped = groups.values.flatMap { value -> [String] in
+        guard case .array(let values) = value else { return [] }
+        return values.compactMap { if case .string(let name) = $0 { return name } else { return nil } }
+    }
+    #expect(!grouped.contains("mac_focus_app"))
+    #expect(!grouped.contains("mac_quit_app"))
+}
+
+@Test
+func doctorStatusEnvelope_separatesConfirmedActivePathFromDormantMaintenance() {
+    let report = DoctorReport(
+        status: "warn",
+        repaired: false,
+        checks: [
+            DoctorCheck(id: "storage", title: "Storage", status: "ok", detail: "ready", repair: nil),
+            DoctorCheck(id: "oauth_token_expiry", title: "OAuth", status: "warn", detail: "Dormant token expired", repair: nil),
+            DoctorCheck(id: "live.providers", title: "Providers", status: "warn", detail: "One stale historical check", repair: nil),
+        ]
+    )
+
+    let result = AppChatToolDispatcher.doctorStatusEnvelope(
+        report: report,
+        activeProviderID: "openai_oauth_direct",
+        activeProviderReady: true
+    )
+
+    #expect(jsonString(result, key: "status") == "warn")
+    #expect(jsonString(result, key: "active_path_status") == "ok")
+    #expect(jsonString(result, key: "maintenance_status") == "warn")
+    #expect(jsonString(result, key: "active_provider_id") == "openai_oauth_direct")
+    #expect(jsonString(result, key: "active_provider_status") == "ready")
+    #expect(jsonInt(result, key: "active_path_check_count") == 1)
+    #expect(jsonInt(result, key: "maintenance_check_count") == 2)
+    #expect(Set(jsonStringArray(result, key: "maintenance_check_ids")) == ["oauth_token_expiry", "live.providers"])
+}
+
+@Test
+func doctorStatusEnvelope_keepsProviderWarningOnUnconfirmedActivePath() {
+    let report = DoctorReport(
+        status: "warn",
+        repaired: false,
+        checks: [
+            DoctorCheck(id: "storage", title: "Storage", status: "ok", detail: "ready", repair: nil),
+            DoctorCheck(id: "oauth_token_expiry", title: "OAuth", status: "warn", detail: "Dormant token expired", repair: nil),
+            DoctorCheck(id: "live.providers", title: "Providers", status: "warn", detail: "No ready provider", repair: nil),
+        ]
+    )
+
+    let result = AppChatToolDispatcher.doctorStatusEnvelope(
+        report: report,
+        activeProviderID: "openai_oauth_direct",
+        activeProviderReady: false
+    )
+
+    #expect(jsonString(result, key: "active_path_status") == "warn")
+    #expect(jsonString(result, key: "active_provider_status") == "not_ready")
+    #expect(jsonInt(result, key: "active_path_check_count") == 2)
+    #expect(jsonInt(result, key: "maintenance_check_count") == 1)
+    #expect(jsonStringArray(result, key: "maintenance_check_ids") == ["oauth_token_expiry"])
+}
+
+@Test
+func telegramStatusEnvelope_separatesRecoveredLedgerHistoryFromCurrentHealth() throws {
+    let status = TelegramStatus(
+        enabled: true,
+        tokenConfigured: true,
+        allowedChatIds: ["redacted"],
+        allowedUserIds: ["redacted"],
+        requireMention: false,
+        model: "gpt-5.6-sol",
+        reasoningEffort: "high",
+        pollerEnabled: true,
+        lastSeenUpdateId: 12,
+        lastSeenAt: "2026-08-29T10:00:00.000Z",
+        lastReplyAt: "2026-08-29T10:00:10.000Z",
+        lastError: nil,
+        pollBackoffFailures: 0,
+        lastPollAt: "2026-08-29T10:05:00.000Z",
+        lastDiagnosticsClearedAt: nil,
+        voiceTranscription: nil,
+        receipts: [],
+        blocked: [
+            TelegramBlockedEvent(eventId: "b1", at: "2026-08-28T10:00:00.000Z", reason: "policy", chatId: nil, userId: nil, updateId: nil, textPreview: nil),
+        ],
+        errors: [
+            TelegramErrorEvent(eventId: "e1", at: "2026-08-29T10:04:00.000Z", context: "poll", error: "unavailable"),
+        ]
+    )
+    let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T10:06:00Z"))
+
+    let result = AppChatToolDispatcher.telegramStatusEnvelope(status: status, now: now)
+
+    #expect(jsonString(result, key: "status") == "ok")
+    #expect(jsonString(result, key: "error_history_status") == "recovered_history")
+    #expect(jsonInt(result, key: "error_entries_since_last_successful_poll") == 0)
+    #expect(jsonString(result, key: "latest_error_at") == "2026-08-29T10:04:00.000Z")
+    #expect(jsonInt(result, key: "latest_error_age_seconds") == 120)
+    #expect(jsonString(result, key: "blocked_history_status") == "historical_policy_events")
+    #expect(jsonInt(result, key: "latest_blocked_age_seconds") == 86_760)
+    #expect(jsonBool(result, key: "active_error") == false)
+}
+
+@Test
+func telegramStatusEnvelope_doesNotCallPostPollErrorsRecovered() throws {
+    let status = TelegramStatus(
+        enabled: true,
+        tokenConfigured: true,
+        allowedChatIds: [],
+        allowedUserIds: [],
+        requireMention: false,
+        model: nil,
+        reasoningEffort: nil,
+        pollerEnabled: true,
+        lastSeenUpdateId: nil,
+        lastSeenAt: nil,
+        lastReplyAt: nil,
+        lastError: nil,
+        pollBackoffFailures: 0,
+        lastPollAt: "2026-08-29T10:05:00.000Z",
+        lastDiagnosticsClearedAt: nil,
+        voiceTranscription: nil,
+        receipts: [],
+        blocked: [],
+        errors: [
+            TelegramErrorEvent(eventId: "e2", at: "2026-08-29T10:05:30.000Z", context: "send", error: "failed"),
+        ]
+    )
+    let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T10:06:00Z"))
+
+    let result = AppChatToolDispatcher.telegramStatusEnvelope(status: status, now: now)
+
+    #expect(jsonString(result, key: "error_history_status") == "newer_than_last_successful_poll")
+    #expect(jsonInt(result, key: "error_entries_since_last_successful_poll") == 1)
 }
 
 @Test
@@ -812,41 +1001,93 @@ func appChatToolDispatcher_exposesNotificationToolsAndDispatchesMobileNotify() a
     #expect(mac.first?.body == "mac ping")
 }
 
+// Eval coverage ledger — `tools.macIntegrationNotifyGate`.
 @Test
-func appChatToolDispatcher_deniedMobileNotifyNeverStartsDelivery() async throws {
-    let root = try makeDispatcherTestRoot("notify-denied")
+func appChatToolDispatcher_notifyPermissionGateAllowsWriteAndSuppressesBothDeniedEffects() async throws {
+    let root = try makeDispatcherTestRoot("notify-permission-boundary")
     defer { try? FileManager.default.removeItem(at: root) }
     let permissions = MacIntegrationPermissionStore(dataRoot: root)
-    try await permissions.set(
-        integrationId: MacIntegrationID.notifyMobile,
-        read: false,
-        write: false
-    )
+    for integration in [MacIntegrationID.notifyMobile, MacIntegrationID.notifyMac] {
+        try await permissions.set(integrationId: integration, read: false, write: true)
+    }
     let capture = NotificationCapture()
+    let activeToolsStore = ActiveToolsStore(dataRoot: root)
     let dispatcher = AppChatToolDispatcher(
         inner: StubInnerToolDispatcher(),
+        activeToolsStore: activeToolsStore,
+        securityCenter: SwiftNativeSecurityCenter(dataRoot: root),
+        enforceAutonomySecurity: false,
         mobileNotificationSender: { title, body, userInfo in
             await capture.recordMobile(title: title, body: body, userInfo: userInfo)
             return MobileNotificationDeliveryReceipt(
-                bridgeMessageID: "must-not-be-created",
+                bridgeMessageID: "allowed-mobile",
                 bridgeError: nil,
                 apnsReceipts: [],
                 apnsErrors: []
             )
         },
-        macIntegrationPermissionStore: permissions
+        macNotificationSender: { title, body in
+            await capture.recordMac(title: title, body: body)
+            return NativeAgentNotificationPostResult(
+                identifier: "allowed-mac",
+                status: "completed",
+                delivery: "posted_to_macos_notification_center",
+                posted: true,
+                visibleAlertsEnabled: true,
+                authorizationStatus: "authorized",
+                alertSetting: "enabled",
+                soundSetting: "enabled",
+                badgeSetting: "enabled",
+                error: nil
+            )
+        },
+        macIntegrationPermissionStore: permissions,
+        organismPostureProvider: { nil }
     )
 
-    let result = try await dispatcher.dispatch(
+    let allowedMobile = try await dispatcher.dispatch(
         tool: "mobile.notify",
-        input: ["title": .string("Denied"), "message": .string("must not deliver")],
+        input: ["title": .string("Allowed mobile"), "message": .string("deliver once")],
         surface: "telegram"
     )
-    #expect(jsonString(result, key: "status") == "denied")
-    #expect(jsonString(result, key: "reason") == "integration_permission_denied")
-    #expect(jsonString(result, key: "integration") == MacIntegrationID.notifyMobile)
-    #expect(await capture.mobile.isEmpty,
-            "permission denial must return before the injected mobile sender can deliver")
+    let allowedMac = try await dispatcher.dispatch(
+        tool: "mac.notify",
+        input: ["title": .string("Allowed Mac"), "message": .string("deliver once")],
+        surface: "telegram"
+    )
+    #expect(jsonString(allowedMobile, key: "bridgeMessageId") == "allowed-mobile")
+    #expect(jsonString(allowedMac, key: "notificationId") == "allowed-mac")
+    #expect(await capture.mobile.count == 1)
+    #expect(await capture.mac.count == 1)
+
+    // Negative control: read remains enabled while write is revoked. Both
+    // aliases must return the denial envelope before either injected effect.
+    for integration in [MacIntegrationID.notifyMobile, MacIntegrationID.notifyMac] {
+        try await permissions.set(integrationId: integration, read: true, write: false)
+    }
+    let deniedMobile = try await dispatcher.dispatch(
+        tool: "mobile_notify",
+        input: ["title": .string("Denied mobile"), "message": .string("must not deliver")],
+        surface: "telegram"
+    )
+    let deniedMac = try await dispatcher.dispatch(
+        tool: "mac_notify",
+        input: ["title": .string("Denied Mac"), "message": .string("must not deliver")],
+        surface: "telegram"
+    )
+    for (result, integration) in [
+        (deniedMobile, MacIntegrationID.notifyMobile),
+        (deniedMac, MacIntegrationID.notifyMac),
+    ] {
+        #expect(jsonString(result, key: "status") == "denied")
+        #expect(jsonString(result, key: "reason") == "integration_permission_denied")
+        #expect(jsonString(result, key: "integration") == integration)
+        #expect(jsonString(result, key: "mode") == "write")
+    }
+    #expect(await capture.mobile.count == 1,
+            "mobile permission denial must not invoke the injected sender")
+    #expect(await capture.mac.count == 1,
+            "Mac permission denial must not invoke the injected notifier")
 }
 
 @Test
@@ -1720,7 +1961,7 @@ func liveAppChatStream_optInOnly() async throws {
     guard ProcessInfo.processInfo.environment["NATIVE_AGENT_LIVE_APP_CHAT_STREAM_TEST"] == "1" else {
         return
     }
-    let client = makeNativeAgentAppChatOrchestrationClient()
+    let client = makeNativeAgentAppChatOrchestrationClient(profile: .mac)
     let sessionId = "nativeagent-app-test-\(UUID().uuidString.prefix(8))"
     var output = ""
     var finalReply: String?

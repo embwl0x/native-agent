@@ -13,6 +13,65 @@ import PersistenceCore
 // fail-closed on unsigned tools, and reserved built-in names never shadowed.
 @Suite struct RegistryToolActivationTests {
 
+    @Test(arguments: ["inactive", "missing_manifest", "active"], [false, true])
+    func toolLoadRequiresCurrentRegistrySchema(state: String, mixedBuiltIn: Bool) async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "orchard_tool"
+        if state != "missing_manifest" {
+            _ = try seedActiveTool(root, id: id, entrypointBody: "print(\"{}\")")
+        }
+        try writeRegistry(root, records: [[
+            "id": id, "name": id, "status": state == "inactive" ? "disabled" : "active",
+        ]])
+        let dispatcher = SwiftToolDispatcher(dataRoot: root)
+        let session = UUID().uuidString
+        let names = mixedBuiltIn ? [id, "market_status"] : [id]
+        #expect(try await dispatcher.listAvailableTools().contains(id), "name-only discovery remains available")
+        let result = try await dispatcher.impl_tool_load(input: [
+            "session_id": .string(session), "names": .array(names.map(JSONValue.string)),
+        ])
+        guard case .object(let payload) = result else {
+            Issue.record("missing tool-load receipt")
+            return
+        }
+        let expected = (state == "active" ? [id] : []) + (mixedBuiltIn ? ["market_status"] : [])
+        #expect(payload["loaded"] == .array(expected.sorted().map(JSONValue.string)))
+        #expect(payload["loaded_now"] == .array(expected.sorted().map(JSONValue.string)))
+        #expect(payload["not_in_catalog"] == .array([]))
+        #expect(payload["unavailable"] == .array(state == "active" ? [] : [.string(id)]))
+        #expect(payload["status"] == .string(state == "active" ? "loaded" : (mixedBuiltIn ? "partial" : "unavailable")))
+        let active = await dispatcher.activeToolsStore.load(sessionId: session).activeTools
+        #expect(active == Set(expected), "unavailable names must not become persisted readiness")
+        let nextSchemas = try await dispatcher.listAvailableToolSchemas(activeTools: active)
+        #expect(nextSchemas.contains { $0.name == id } == (state == "active"))
+        if mixedBuiltIn { #expect(nextSchemas.contains { $0.name == "market_status" }) }
+    }
+
+    @Test func toolDisabledAfterEarlierLoadIsNotReportedAlreadyActive() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "orchard_tool"
+        _ = try seedActiveTool(root, id: id, entrypointBody: "print(\"{}\")")
+        try writeRegistry(root, records: [["id": id, "status": "active"]])
+        let dispatcher = SwiftToolDispatcher(dataRoot: root)
+        let session = UUID().uuidString
+        let input: [String: JSONValue] = ["session_id": .string(session), "names": .array([.string(id)])]
+        _ = try await dispatcher.impl_tool_load(input: input)
+        let before = await dispatcher.activeToolsStore.load(sessionId: session)
+        try writeRegistry(root, records: [["id": id, "status": "disabled"]])
+        guard case .object(let result) = try await dispatcher.impl_tool_load(input: input) else {
+            Issue.record("missing reload receipt")
+            return
+        }
+        #expect(result["loaded"] == .array([]))
+        #expect(result["already_active"] == .array([]))
+        #expect(result["unavailable"] == .array([.string(id)]))
+        let after = await dispatcher.activeToolsStore.load(sessionId: session)
+        #expect(after.loadedAt == before.loadedAt, "an unavailable reload must not refresh persistence")
+        #expect(!(try await dispatcher.listAvailableToolSchemas(activeTools: after.activeTools).contains { $0.name == id }))
+    }
+
     private func makeRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("RegistryActivation-\(UUID().uuidString)", isDirectory: true)

@@ -622,22 +622,6 @@ struct ProviderSettingsView: View {
         }
     }
 
-    /// Read the per-surface active-provider map from the SAME on-disk file
-    /// the save path writes to: `<dataRoot>/providers/active.json`. Returns
-    /// Missing is empty; damaged authority state throws so the panel retains
-    /// its prior values and reports a failed refresh instead of showing fake
-    /// Codex defaults.
-    ///
-    /// SAVE/READ UNIFICATION (eval E03 fix): the save side
-    /// (`NativeClient.setActiveProvider`) persists to `providers/active.json`
-    /// via flock-protected writeActiveProvider. Reading from
-    /// `trust.providerPolicy.active_per_surface` (the prior path) was an
-    /// independent source that never reflected the new on-disk state, so the
-    /// UI's picker drifted off the actual routing decision after every save.
-    private func fetchLiveActivePerSurface(dataRoot: URL) async throws -> [String: String] {
-        try await NativeClient.readActiveProvidersFromDisk(dataRoot: dataRoot)
-    }
-
     private func requestSetActiveSurface(surface: String, providerId: String) {
         let previous = activeSurface[surface] ?? "codex"
         let previousBrain = SurfaceBrainSelection(
@@ -729,20 +713,6 @@ struct ProviderSettingsView: View {
             activeSurfaceSaveTasks.removeValue(forKey: surface)
             statusText = "Set active failed: \(error.localizedDescription)"
         }
-    }
-
-    // Read the complete per-surface brain selection from the Swift provider
-    // router so Providers shows the same model/Think/Fast values execution uses.
-    private func fetchLiveSurfacePreferences(dataRoot: URL) async throws -> [String: SurfaceBrainSelection] {
-        try await SwiftNativeProviderRouting(dataRoot: dataRoot)
-            .computeModelPreferences()
-            .reduce(into: [String: SurfaceBrainSelection]()) { out, pair in
-                out[pair.key] = SurfaceBrainSelection(
-                    model: pair.value.model,
-                    reasoningEffort: pair.value.reasoningEffort,
-                    fastMode: pair.value.serviceTier == "priority"
-                )
-            }
     }
 
     private func requestSetSurfaceModel(surface: String, model: String) {

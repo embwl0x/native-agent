@@ -325,7 +325,7 @@ struct ChatCompactionDistiller: Sendable {
             "createdAt": .string(ISO8601DateFormatter().string(from: now())),
         ])
         do {
-            try await appendJSONLCapped(
+            try await appendPathOwnedJSONL(
                 row,
                 to: tracesPath,
                 using: persistence,

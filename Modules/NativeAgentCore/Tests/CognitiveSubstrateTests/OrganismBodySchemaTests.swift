@@ -145,6 +145,24 @@ private final class OrganismBodyTestClock: @unchecked Sendable {
     #expect(body.providerPathBelief == stale)
 }
 
+@Test func providerPathBeliefKeepsARecentSuccessfulWorkingSetHealthy() throws {
+    let now = Date(timeIntervalSince1970: 200_000)
+    let belief = ProviderPathBeliefProjector.project(
+        evidence: (0..<32).map { offset in
+            ProviderPathEvidence(
+                evidenceID: "recent-success-\(offset)",
+                observedAt: now.addingTimeInterval(-Double(30 * 60 + offset * 3 * 60)),
+                outcome: .succeeded
+            )
+        },
+        now: now
+    )
+
+    #expect(belief.evidenceCount == 32)
+    #expect(belief.state == .healthy)
+    #expect(belief.bodySchemaProvidersHealthy == true)
+}
+
 @Test func cancelledAndExpiredProviderEvidenceRemainUnknown() throws {
     let now = Date(timeIntervalSince1970: 110_000)
     for outcome in [ProviderPathEvidenceOutcome.cancelled, .expired, .started] {
@@ -399,7 +417,7 @@ private final class OrganismBodyTestClock: @unchecked Sendable {
     )
 
     #expect(body.resourcePressure == .critical)
-    #expect(projection.bodyLine == "- Body: resources feel tight; keep the next move lightweight.")
+    #expect(projection.bodyLine == "- Body: the Mac is under thermal or low-power pressure; keep the next move lightweight.")
 }
 
 @Test func disabledKernelIgnoresBodySchemaRefresh() async throws {

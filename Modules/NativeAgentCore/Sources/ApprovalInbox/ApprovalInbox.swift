@@ -452,7 +452,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
 
     @discardableResult
     public func create(_ body: JSONValue) async throws -> ApprovalRecord {
-        try await runSerialized { [persistence, approvalsPath, clock] in
+        let record = try await runSerialized { [persistence, approvalsPath, clock] in
             try await Self._createImpl(
                 body: body,
                 persistence: persistence,
@@ -460,6 +460,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 now: clock()
             )
         }
+        ApprovalLifecycleBus.fire(.init(phase: .requested, record: record))
+        return record
     }
 
     /// Reentrancy-safe mutation gate: each mutating call wraps its work
@@ -488,7 +490,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         decision: ApprovalDecision,
         provenance: ApprovalResolutionProvenance
     ) async throws -> ApprovalRecord {
-        try await runSerialized { [persistence, approvalsPath, clock] in
+        let record = try await runSerialized { [persistence, approvalsPath, clock] in
             return try await Self._resolveImpl(
                 id: id, decision: decision,
                 provenance: provenance,
@@ -497,6 +499,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 now: clock()
             )
         }
+        ApprovalLifecycleBus.fire(.init(phase: .resolved, record: record))
+        return record
     }
 
     private static func _createImpl(
@@ -777,8 +781,13 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                     "approval store row \(index) has invalid status"
                 )
             }
-            for key in ["remoteResolvable", "localOnly"] where object[key] != nil {
-                guard case .bool = object[key] else {
+            // Retired writers emitted explicit null authority fields on
+            // terminal history. Those rows can no longer grant authority and
+            // remain safe to read; pending rows below still require two exact
+            // booleans. Wrong-typed non-null values remain store corruption.
+            for key in ["remoteResolvable", "localOnly"] {
+                guard let value = object[key], value != .null else { continue }
+                guard case .bool = value else {
                     throw ApprovalInboxError.malformedResponse(
                         "approval store row \(index) has non-boolean \(key)"
                     )
@@ -796,7 +805,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                         "pending approval row \(index) lacks required typed fields"
                     )
                 }
-                guard object["remoteResolvable"] != nil, object["localOnly"] != nil else {
+                guard case .bool? = object["remoteResolvable"],
+                      case .bool? = object["localOnly"] else {
                     throw ApprovalInboxError.malformedResponse(
                         "pending approval row \(index) lacks authority fields"
                     )

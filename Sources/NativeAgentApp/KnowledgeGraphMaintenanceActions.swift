@@ -40,6 +40,41 @@ struct KnowledgeGraphMaintenanceActions {
         return .applied(applied)
     }
 
+    /// B5 (2026-08-28): dry run for the age+provenance stale sweep. Distinct
+    /// from the orphan sweep above — that one asks "is the source memory
+    /// gone?", this one asks "is this entity old AND unattributed?". Both
+    /// halves of the predicate are load-bearing; see
+    /// `sweepStaleUnprovenancedEntities` for why provenance alone would delete
+    /// live August rows.
+    func previewStaleSweep(
+        cutoff: String = SwiftNativeKnowledgeGraphIndexer.staleSweepDefaultCutoff
+    ) async throws -> KnowledgeGraphStaleSweepReport {
+        try await liveIndexer().sweepStaleUnprovenancedEntities(
+            cutoff: cutoff, apply: false
+        )
+    }
+
+    /// Applies only when the candidate set still matches the reviewed one —
+    /// same preview-is-not-permission contract as `applyOrphanSweep`.
+    func applyStaleSweep(
+        cutoff: String = SwiftNativeKnowledgeGraphIndexer.staleSweepDefaultCutoff,
+        expectedCandidateIDs: Set<String>
+    ) async throws -> KnowledgeGraphStaleSweepReport {
+        try await liveIndexer().sweepStaleUnprovenancedEntities(
+            cutoff: cutoff,
+            apply: true,
+            expectedCandidateIDs: expectedCandidateIDs
+        )
+    }
+
+    /// Indexer alone. The stale sweep's predicate reads only `kg_entities`, so
+    /// it never needs the full canonical memory list `liveIndexerAndFacts`
+    /// loads for orphan reconciliation.
+    private func liveIndexer() async throws -> SwiftNativeKnowledgeGraphIndexer {
+        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+        return try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
+    }
+
     private func liveIndexerAndFacts() async throws -> (SwiftNativeKnowledgeGraphIndexer, [KnowledgeGraphMemoryFact]) {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
         let memories = try await storage.listMemories(persona: nil, status: nil, limit: nil)

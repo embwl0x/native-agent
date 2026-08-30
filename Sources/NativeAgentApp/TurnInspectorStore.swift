@@ -30,6 +30,34 @@ enum TurnInspectorLiveDropState: Equatable {
     case unavailable
 }
 
+/// Requested replay dates and displayed evidence have separate provenance.
+/// A slow read may retain useful cards, but never relabel them as the new day.
+enum TurnInspectorReplayPresentation: Equatable {
+    case loading(requested: Date, retained: Date?)
+    case loaded(Date)
+
+    static func resolve(requested: Date, loaded: Date?, isLoading: Bool) -> Self {
+        guard !isLoading, let loaded else { return .loading(requested: requested, retained: loaded) }
+        return .loaded(loaded)
+    }
+
+    var isLoading: Bool {
+        if case .loading = self { return true }
+        return false
+    }
+
+    var statusText: String {
+        switch self {
+        case let .loading(requested, retained):
+            let loading = "Loading replay for \(requested.formatted(date: .abbreviated, time: .omitted))…"
+            guard let retained else { return loading }
+            return "\(loading) Showing the replay loaded for \(retained.formatted(date: .abbreviated, time: .omitted))."
+        case let .loaded(date):
+            return "Showing replay for \(date.formatted(date: .abbreviated, time: .omitted))."
+        }
+    }
+}
+
 // MARK: - Turn Inspector W3 — store (live subscription lifecycle + replay load)
 //
 // Owns the event buffer for the Inspector tab and the lifecycle of the live
@@ -66,6 +94,11 @@ final class TurnInspectorStore {
     private(set) var replaySkipped: Int = 0
     private(set) var replayLoading = false
     private(set) var replayFileExists = true
+    private(set) var replayLoadedDate: Date?
+
+    var replayPresentation: TurnInspectorReplayPresentation {
+        .resolve(requested: replayDate, loaded: replayLoadedDate, isLoading: replayLoading)
+    }
 
     // MARK: Internals
 
@@ -88,6 +121,7 @@ final class TurnInspectorStore {
     /// `dataRootOverride` → the lane resolves the live/overridden root; tests
     /// pass an explicit root.
     private let replayLane: TurnTracePersistLane
+    private let beforeReplayRead: (@Sendable (Date) async -> Void)?
     /// Production consumes the process-wide trace bus. A local bus and a tiny
     /// subscription capacity let the executable eval prove the real
     /// backpressure counter without writing into the resident trace feed.
@@ -96,7 +130,10 @@ final class TurnInspectorStore {
     private let beforeLiveConsumption: (@Sendable (UUID) async -> Void)?
     /// Defaults to the production bus reader. Injection keeps the generation
     /// boundary executable without manufacturing a trace-bus overflow.
-    private let liveDropCountReader: @Sendable (TurnTraceBus, UUID) async -> TurnTraceBus.DropCountRead
+    /// Production receives loss directly from `Subscription.dropCounts` and
+    /// performs no per-event actor query. The optional reader is retained only
+    /// as a deterministic generation-race seam for the focused lifecycle test.
+    private let liveDropCountReader: (@Sendable (TurnTraceBus, UUID) async -> TurnTraceBus.DropCountRead)?
 
     init(
         dataRootOverride: URL? = nil,
@@ -104,9 +141,11 @@ final class TurnInspectorStore {
         liveSubscriptionCapacity: Int = TurnTraceBus.defaultBufferCapacity,
         beforeLiveConsumption: (@Sendable (UUID) async -> Void)? = nil,
         liveDropCountReader: (@Sendable (TurnTraceBus, UUID) async -> Int)? = nil,
-        liveDropCountReadReader: (@Sendable (TurnTraceBus, UUID) async -> TurnTraceBus.DropCountRead)? = nil
+        liveDropCountReadReader: (@Sendable (TurnTraceBus, UUID) async -> TurnTraceBus.DropCountRead)? = nil,
+        beforeReplayRead: (@Sendable (Date) async -> Void)? = nil
     ) {
         self.replayLane = TurnTracePersistLane(dataRootOverride: dataRootOverride)
+        self.beforeReplayRead = beforeReplayRead
         self.liveBus = liveBus
         self.liveSubscriptionCapacity = max(1, liveSubscriptionCapacity)
         self.beforeLiveConsumption = beforeLiveConsumption
@@ -117,9 +156,7 @@ final class TurnInspectorStore {
                 .available(await liveDropCountReader(bus, subscriptionID))
             }
         } else {
-            self.liveDropCountReader = { bus, subscriptionID in
-                await bus.dropCountRead(subscriptionID)
-            }
+            self.liveDropCountReader = nil
         }
     }
 
@@ -160,6 +197,18 @@ final class TurnInspectorStore {
             if let beforeLiveConsumption {
                 await beforeLiveConsumption(sub.id)
             }
+            // Loss is rare; observe its change-only stream rather than asking
+            // the bus actor for a count after every normal trace event.
+            let dropMonitor = Task { [weak self] in
+                for await count in sub.dropCounts {
+                    guard !Task.isCancelled else { break }
+                    await MainActor.run { [weak self] in
+                        guard let self, self.liveGeneration == generation else { return }
+                        self.applyLiveDropRead(.available(count))
+                    }
+                }
+            }
+            defer { dropMonitor.cancel() }
             for await event in sub.stream {
                 if Task.isCancelled { break }
                 let keepGoing = await MainActor.run { [weak self] () -> Bool in
@@ -205,6 +254,10 @@ final class TurnInspectorStore {
 
     private func ingestLive(_ event: TurnTraceEvent, subscriptionId: UUID) {
         appendLive(event)
+        // Only the injected lifecycle-test seam uses the legacy suspended
+        // read path. Production has no reader and therefore no event-driven
+        // query or helper task here.
+        guard liveDropCountReader != nil else { return }
         // Tag the pending poll with the CURRENT generation so a poll queued by a
         // dead subscription can't survive a stop()/restart.
         pendingDropCheck = (subscriptionId, liveGeneration)
@@ -256,7 +309,8 @@ final class TurnInspectorStore {
         dropRefreshInFlightGeneration = generation
         Task { [weak self] in
             guard let self else { return }
-            let read = await self.liveDropCountReader(self.liveBus, id)
+            guard let reader = self.liveDropCountReader else { return }
+            let read = await reader(self.liveBus, id)
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 if self.dropRefreshInFlightGeneration == generation {
@@ -292,6 +346,9 @@ final class TurnInspectorStore {
         cancelPendingCardsRefresh()
         mode = newMode
         if newMode == .replay {
+            // Live cards are not evidence from this replay date. Restore only
+            // the last loaded replay while its refresh is pending.
+            recomputeCards()
             Task { await loadReplay(for: replayDate) }
         } else {
             recomputeCards()
@@ -320,14 +377,17 @@ final class TurnInspectorStore {
         // Resolve the file under the SAME root the live lane writes to.
         let root = replayLane.resolvedDataRoot()
         let url = TurnTraceReplayReader.fileURL(for: date, root: root)
+        let beforeReplayRead = beforeReplayRead
         // Read + parse off the main actor (file can be up to the 20k-line cap).
         let result = await Task.detached(priority: .userInitiated) {
+            if let beforeReplayRead { await beforeReplayRead(date) }
             let exists = FileManager.default.fileExists(atPath: url.path)
             let parsed = TurnTraceReplayReader.read(url)
             return (exists: exists, events: parsed.events, skipped: parsed.skipped)
         }.value
         // A newer load superseded this one while we were reading — discard.
         guard generation == replayGeneration else { return }
+        replayLoadedDate = date
         replayFileExists = result.exists
         replayEvents = result.events
         replaySkipped = result.skipped

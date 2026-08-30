@@ -97,6 +97,28 @@ test("expiry releases a lease and closes only an agent-created tab", async () =>
   assert.equal(value.events.at(-1).payload.reason, "lease_expired");
 });
 
+test("effect-time expiry does not depend on alarm delivery and keeps cleanup available", async () => {
+  const value = fixture();
+  const lease = await value.manager.acquire({ mode: "create", leaseDurationMs: 30_000 });
+  const expiresAt = Date.parse(lease.expiresAt);
+  value.setNow(expiresAt - 1);
+  assert.equal(value.manager.requireForPageAction({ leaseId: lease.leaseId, expectedUserSequence: 0 }).leaseId, lease.leaseId);
+  value.setNow(expiresAt);
+  assert.throws(
+    () => value.manager.requireForPageAction({ leaseId: lease.leaseId, expectedUserSequence: 0 }),
+    (error) => error.code === "lease_expired",
+  );
+  await assert.rejects(
+    value.manager.renew({ leaseId: lease.leaseId, expectedUserSequence: 0 }),
+    (error) => error.code === "lease_expired",
+  );
+  const released = await value.manager.release({ leaseId: lease.leaseId, closeCreatedTab: false });
+  assert.equal(released.released, true);
+  assert.equal(released.tabClosed, false);
+  assert.equal(value.tabs.has(lease.tabId), true);
+  assert.equal(value.session()[LEASE_STORAGE_KEY].length, 0);
+});
+
 test("release never closes an agent-created tab after it becomes active", async () => {
   const value = fixture();
   const lease = await value.manager.acquire({ mode: "create" });

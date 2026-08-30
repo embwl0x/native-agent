@@ -468,6 +468,8 @@ extension NativeClient {
             distilledFactsAdded: obj["distilledFactsAdded"] as? Int,
             decayedMemories: obj["decayedMemories"] as? Int,
             proposalHygiene: nil,
+            consolidationRunId: (obj["consolidationRunId"] as? String)
+                ?? (obj["consolidation_run_id"] as? String),
             nextScheduled: nextScheduled
         )
     }
@@ -499,6 +501,7 @@ extension NativeClient {
                 distilledFactsAdded: nil,
                 decayedMemories: nil,
                 proposalHygiene: MemoryProposalHygiene(rejectedLowValue: nil, nearDuplicates: nil),
+                consolidationRunId: nil,
                 nextScheduled: nextISO
             )
         }

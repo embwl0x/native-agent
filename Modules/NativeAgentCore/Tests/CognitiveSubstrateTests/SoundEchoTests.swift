@@ -49,7 +49,11 @@ struct SoundEchoTests {
         )
     }
 
-    private func substrate(with nodes: [CognitiveNode], affect: Bool = true) async throws -> CognitiveSubstrate {
+    private func substrate(
+        with nodes: [CognitiveNode],
+        affect: Bool = true,
+        dynamics: @escaping @Sendable () -> PersonalityDynamicsConfiguration = { .default }
+    ) async throws -> CognitiveSubstrate {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("nativeagent-echo-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -57,7 +61,8 @@ struct SoundEchoTests {
         try await store.saveNodes(nodes, at: now)
         let s = CognitiveSubstrate(
             configuration: config(affect: affect),
-            dependencies: CognitiveSubstrateDependencies(now: { self.now }, makeUUID: { UUID() }),
+            dependencies: CognitiveSubstrateDependencies(
+                now: { self.now }, makeUUID: { UUID() }, dynamics: dynamics),
             store: store
         )
         try await s.restorePersistentState()
@@ -301,6 +306,42 @@ struct SoundEchoTests {
         #expect(line == nil)
     }
 
+    @Test("reactivating an old turn does not make it a recent voice exemplar")
+    func reactivatedOldTurnDoesNotEcho() async throws {
+        let s = try await substrate(with: [
+            node(summary: "That parrot deserved better and honestly so did the modem.",
+                 subjectType: "chat.assistant_turn",
+                 created: now.addingTimeInterval(-8 * 24 * 60 * 60), lastActivated: now),
+        ])
+        #expect(await s.soundEchoLine(at: now, ignoringCadence: true) == nil)
+    }
+
+    @Test("recent exemplar ranking follows when a turn was spoken, not when recalled")
+    func reactivationDoesNotResetExemplarAge() async throws {
+        let s = try await substrate(with: [
+            node(summary: "Older amber circuits settle beside the lantern.",
+                 subjectType: "chat.assistant_turn",
+                 created: now.addingTimeInterval(-6 * 24 * 60 * 60), lastActivated: now),
+            node(summary: "Recent cedar branches lean across the river.",
+                 subjectType: "chat.assistant_turn",
+                 created: now.addingTimeInterval(-60), lastActivated: now.addingTimeInterval(-60)),
+        ])
+        let line = try #require(await s.soundEchoLine(at: now, ignoringCadence: true))
+        let recent = try #require(line.range(of: "Recent cedar"))
+        let older = try #require(line.range(of: "Older amber"))
+        #expect(recent.lowerBound < older.lowerBound)
+    }
+
+    @Test("future-dated turns stay outside recent voice evidence despite present activation")
+    func futureCreatedTurnDoesNotEcho() async throws {
+        let s = try await substrate(with: [
+            node(summary: "Future copper skies clear above the falcon.",
+                 subjectType: "chat.assistant_turn",
+                 created: now.addingTimeInterval(60), lastActivated: now),
+        ])
+        #expect(await s.soundEchoLine(at: now, ignoringCadence: true) == nil)
+    }
+
     @Test("two fragments max, register-matched to the room, bounded length")
     func twoFragmentsRegisterMatched() async throws {
         // CONTRACT CHANGE 2026-08-02: selection was "warmest wins", which made
@@ -445,5 +486,153 @@ struct SoundEchoTests {
         await s.configure(.disabled)
         let after = await s.compileFrozenCapsule(request, from: read)
         #expect(after == before)
+    }
+
+    private final class DynamicsBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: PersonalityDynamicsConfiguration
+
+        init(_ value: PersonalityDynamicsConfiguration) { self.value = value }
+
+        func read() -> PersonalityDynamicsConfiguration {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+
+        func set(_ value: PersonalityDynamicsConfiguration) {
+            lock.lock()
+            defer { lock.unlock() }
+            self.value = value
+        }
+    }
+
+    @Test("frozen Sound edge evidence uses the captured personality dynamics")
+    func frozenSoundKeepsCapturedEdgeCount() async throws {
+        var original = PersonalityDynamicsConfiguration.default
+        original.soundEchoDutyCycle = 1
+        original.soundRutEdgeSentenceCount = 2
+        let dynamics = DynamicsBox(original)
+        let s = try await substrate(with: [
+            node(summary: "Amber lanterns brighten quietly. Shared resonance returns. Cedar paths unwind.",
+                 subjectType: "chat.assistant_turn"),
+            node(summary: "Brisk rivers curve eastward. Shared resonance returns. Copper skies clear.",
+                 subjectType: "chat.assistant_turn"),
+            node(summary: "Silver falcons circle overhead. Shared resonance returns. Velvet curtains fall.",
+                 subjectType: "chat.assistant_turn"),
+        ], dynamics: { dynamics.read() })
+        let request = CognitiveCapsuleRequest(
+            surface: "chat", userMessage: "stay with that thought", sessionId: "s1", mode: .inject)
+        let read = await s.frozenRead(at: now, currentSessionId: "s1")
+        let before = await s.compileFrozenCapsule(request, from: read)
+        #expect(before.dynamicContext.contains("more range"))
+
+        var updated = original
+        updated.soundRutEdgeSentenceCount = 1
+        dynamics.set(updated)
+        let after = await s.compileFrozenCapsule(request, from: read)
+        #expect(after == before)
+
+        // The changed setting really affects a NEW epoch. Equality above must
+        // come from captured-input isolation, not an inert fixture.
+        let currentRead = await s.frozenRead(at: now, currentSessionId: "s1")
+        let current = await s.compileFrozenCapsule(request, from: currentRead)
+        #expect(current.dynamicContext.contains("- Sound:"))
+        #expect(!current.dynamicContext.contains("more range"))
+    }
+
+    @Test("frozen felt signals retain their captured dynamics while new turns use current values")
+    func frozenFeltSignalsKeepCapturedDynamics() async throws {
+        // Deliberately separated injected values make this an epoch-isolation
+        // proof, not a judgment about appropriate personality or felt wording.
+        var original = PersonalityDynamicsConfiguration.default
+        original.feltWarmthRest = 0.95
+        original.feltWarmthEarnedSpan = 0
+        original.feltWarmthUncertaintyCooling = 0
+        original.personaValenceLift = 0.4
+        let dynamics = DynamicsBox(original)
+        let s = try await substrate(with: [], dynamics: { dynamics.read() })
+        let request = CognitiveCapsuleRequest(
+            surface: "chat", userMessage: "keep this context", sessionId: "s1", mode: .inject)
+        let read = await s.frozenRead(at: now, currentSessionId: "s1")
+        let before = await s.compileFrozenCapsule(request, from: read)
+        #expect(!before.dynamicContext.isEmpty)
+
+        var updated = original
+        updated.feltWarmthRest = 0.1
+        updated.personaValenceLift = 0
+        dynamics.set(updated)
+        let after = await s.compileFrozenCapsule(request, from: read)
+        #expect(after == before)
+
+        let currentRead = await s.frozenRead(at: now, currentSessionId: "s1")
+        let current = await s.compileFrozenCapsule(request, from: currentRead)
+        let live = await s.compileCapsule(request)
+        #expect(current.dynamicContext != before.dynamicContext)
+        #expect(live.dynamicContext == current.dynamicContext)
+    }
+
+    @Test("frozen fingerprint presence keeps its captured intensity floor")
+    func frozenFingerprintKeepsCapturedIntensityFloor() async throws {
+        var original = PersonalityDynamicsConfiguration.default
+        original.feltIntensityFloor = 0
+        original.feltWarmthRest = 0.95
+        original.feltWarmthEarnedSpan = 0
+        original.feltWarmthUncertaintyCooling = 0
+        original.personaValenceLift = 0.4
+        let dynamics = DynamicsBox(original)
+        let s = try await substrate(with: [], dynamics: { dynamics.read() })
+        let request = CognitiveCapsuleRequest(
+            surface: "chat", userMessage: "keep this context", sessionId: "s1", mode: .inject)
+        let read = await s.frozenRead(at: now, currentSessionId: "s1")
+        let before = await s.compileFrozenCapsule(request, from: read)
+        #expect(!before.dynamicContext.isEmpty)
+
+        // Change only the gate, leaving the underlying captured signals alone.
+        // No specific fingerprint wording is part of this consistency contract.
+        var updated = original
+        updated.feltIntensityFloor = 1
+        dynamics.set(updated)
+        let after = await s.compileFrozenCapsule(request, from: read)
+        #expect(after == before)
+
+        let currentRead = await s.frozenRead(at: now, currentSessionId: "s1")
+        let current = await s.compileFrozenCapsule(request, from: currentRead)
+        let live = await s.compileCapsule(request)
+        #expect(current.dynamicContext.isEmpty)
+        #expect(live.dynamicContext == current.dynamicContext)
+    }
+
+    @Test("frozen settling eligibility keeps captured enablement and live reads honor disabling")
+    func frozenSettlingKeepsCapturedEnablement() async throws {
+        let s = try await substrate(with: (0..<4).map { _ in
+            node(summary: "Earlier conversation", subjectType: "chat.user_turn",
+                 valence: -0.6, warmth: 0.2)
+        })
+        let request = CognitiveCapsuleRequest(
+            surface: "chat", userMessage: "I was out of line. I'm sorry.",
+            sessionId: "s1", mode: .inject)
+        let read = await s.frozenRead(at: now, currentSessionId: "s1")
+        let before = await s.compileFrozenCapsule(request, from: read)
+        #expect(before.dynamicContext.contains("- Settling:"))
+
+        await s.configure(.disabled)
+        let after = await s.compileFrozenCapsule(request, from: read)
+        #expect(after == before)
+
+        // Inject the canonical appraisal value to isolate enablement from the
+        // text appraisal mechanism. Omitted flags retain the live-call contract.
+        let incoming = CognitiveSubstrate.AffectAppraisal(valence: 0.2, warmth: 0.2)
+        #expect(await s.settlingLine(
+            mood: read.mood, incoming: incoming, affectEnabled: true) == nil)
+        #expect(await s.settlingLine(
+            mood: read.mood, incoming: incoming, affectEnabled: true,
+            cognitionEnabled: true) != nil)
+        #expect(await s.settlingLine(
+            mood: read.mood, incoming: incoming, affectEnabled: true,
+            cognitionEnabled: false) == nil)
+        let currentRead = await s.frozenRead(at: now, currentSessionId: "s1")
+        let current = await s.compileFrozenCapsule(request, from: currentRead)
+        #expect(current.dynamicContext.isEmpty)
     }
 }

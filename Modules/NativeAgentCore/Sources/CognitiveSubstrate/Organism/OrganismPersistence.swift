@@ -137,8 +137,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         var next = ledger
         next.peripheralUncertainty = OrganismBodyConfidence.clamp(next.peripheralUncertainty * pow(0.84, hours))
         next.strategyCaution = OrganismBodyConfidence.clamp(next.strategyCaution * pow(0.82, hours))
-        next.predictions = Dictionary(uniqueKeysWithValues: next.predictions.values
-            .map { prediction in
+        let decayed = next.predictions.values.map { prediction in
                 var copy = prediction
                 if copy.status == .pending && copy.dueAt < now {
                     copy.status = .expired
@@ -147,12 +146,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
                 copy.uncertainty = OrganismBodyConfidence.clamp(copy.uncertainty * pow(0.94, hours))
                 return copy
             }
-            .sorted {
-                if $0.status != $1.status { return predictionRank($0.status) > predictionRank($1.status) }
-                if $0.lastUpdatedAt != $1.lastUpdatedAt { return $0.lastUpdatedAt > $1.lastUpdatedAt }
-                return $0.id < $1.id
-            }
-            .prefix(limits.maximumPersistedPredictions)
+        next.predictions = Dictionary(uniqueKeysWithValues: OrganismPredictionRetention
+            .bounded(decayed, maximum: limits.maximumPersistedPredictions)
             .map { ($0.id, $0) })
         next.lastUpdatedAt = now
         return next
@@ -183,14 +178,6 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         return lhs.id < rhs.id
     }
 
-    private func predictionRank(_ status: OrganismPredictionStatus) -> Int {
-        switch status {
-        case .pending: return 4
-        case .violated: return 3
-        case .satisfied: return 2
-        case .expired: return 1
-        }
-    }
 }
 
 public struct OrganismPersistenceLimits: Sendable, Equatable {

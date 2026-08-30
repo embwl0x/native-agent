@@ -95,6 +95,45 @@ struct EvalToolReceiptRowTests {
         #expect(metadata["inputJSON"] is String)
         #expect(metadata["resultSummary"] is String)
         #expect(metadata["ok"] as? Bool == true)
+        #expect(metadata["resultClass"] == nil, "no-status receipts retain their legacy metadata")
+    }
+
+    @Test func queuedOutcomeSurvivesReceiptClippingWithoutChangingTransportSuccess() async throws {
+        let root = try tempRoot("queued-clipped")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = "s-queued-clipped"
+        // The status is beyond the persisted body cap, so a reader cannot
+        // recover it by parsing that truncated JSON prefix.
+        let result = "{\"detail\":\"" + String(repeating: "x", count: 9_000)
+            + "\",\"status\":\"queued\"}"
+        try await client(root: root).appendToolMessage(
+            sessionId: session, runId: "queued-run", toolName: "claude_message",
+            inputJSON: "{}", resultSummary: result, ok: true)
+        let metadata = try #require(try lastRow(root, sessionId: session)["metadata"] as? [String: Any])
+        #expect(metadata["ok"] as? Bool == true)
+        #expect(metadata["resultClass"] as? String == ChatToolOutcome.ExactResultClass.unknown.rawValue)
+        let stored = try #require(metadata["resultSummary"] as? String)
+        #expect(stored.contains("truncated in transcript"))
+        #expect(!stored.contains("queued"))
+        #expect((try? JSONValue.parse(Data(stored.utf8))) == nil)
+        let metadataJSON = try JSONValue.parse(JSONSerialization.data(withJSONObject: metadata))
+        guard case .object(let fields) = metadataJSON else {
+            Issue.record("persisted metadata must remain an object")
+            return
+        }
+        #expect(SessionHistoryPromptRenderer.toolSummary(content: "", metadata: fields)
+            .hasPrefix("completion unconfirmed: claude_message:"))
+    }
+
+    @Test func malformedOutcomeDoesNotCreateAResultClass() async throws {
+        let root = try tempRoot("malformed-result")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = "s-malformed-result"
+        try await client(root: root).appendToolMessage(
+            sessionId: session, runId: "malformed-run", toolName: "read_file",
+            inputJSON: "{}", resultSummary: #"{"status":"queued""#, ok: true)
+        let metadata = try #require(try lastRow(root, sessionId: session)["metadata"] as? [String: Any])
+        #expect(metadata["resultClass"] == nil)
     }
 
     // app.chat / ui.chat.transcript.approvalNeverCollapsed

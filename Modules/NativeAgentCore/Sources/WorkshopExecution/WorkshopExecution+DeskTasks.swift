@@ -91,6 +91,38 @@ public struct WorkshopDirectedTaskReceipt: Sendable, Equatable {
     public var rerunCount: Int
     public var triggerSource: String
     public var wasStub: Bool
+    /// Whether the finished execution's claimed outcome was independently
+    /// verified. `nil` is retained for legacy receipts written before this
+    /// distinction existed; those keep their historical scoreboard meaning.
+    public var verificationStatus: WorkshopVerificationStatus?
+
+    public init(
+        handle: String,
+        executionId: String,
+        status: String,
+        summary: String,
+        createdAt: String,
+        completedAt: String,
+        totalSteps: Int,
+        completedSteps: Int,
+        rerunCount: Int,
+        triggerSource: String,
+        wasStub: Bool,
+        verificationStatus: WorkshopVerificationStatus? = nil
+    ) {
+        self.handle = handle
+        self.executionId = executionId
+        self.status = status
+        self.summary = summary
+        self.createdAt = createdAt
+        self.completedAt = completedAt
+        self.totalSteps = totalSteps
+        self.completedSteps = completedSteps
+        self.rerunCount = rerunCount
+        self.triggerSource = triggerSource
+        self.wasStub = wasStub
+        self.verificationStatus = verificationStatus
+    }
 
     public func toJSON() -> JSONValue {
         .object([
@@ -109,6 +141,7 @@ public struct WorkshopDirectedTaskReceipt: Sendable, Equatable {
             "rerunCount": .int(Int64(rerunCount)),
             "triggerSource": .string(triggerSource),
             "wasStub": .bool(wasStub),
+            "verificationStatus": verificationStatus.map { .string($0.rawValue) } ?? .null,
         ])
     }
 
@@ -141,7 +174,9 @@ public struct WorkshopDirectedTaskReceipt: Sendable, Equatable {
             completedSteps: int("completedSteps"),
             rerunCount: int("rerunCount"),
             triggerSource: string("triggerSource") ?? "manual",
-            wasStub: object["wasStub"] == .bool(true)
+            wasStub: object["wasStub"] == .bool(true),
+            verificationStatus: string("verificationStatus")
+                .flatMap(WorkshopVerificationStatus.init(rawValue:))
         )
     }
 }
@@ -184,7 +219,8 @@ public enum WorkshopDeskReceiptBridge {
             completedSteps: record.stepsCompleted.count,
             rerunCount: record.rerunCount,
             triggerSource: record.triggerSource,
-            wasStub: wasStub
+            wasStub: wasStub,
+            verificationStatus: record.verification?.status
         )
 
         do {
@@ -192,7 +228,9 @@ public enum WorkshopDeskReceiptBridge {
                 let existing = try await persistence.readJSONL(receiptPath)
                     .compactMap(WorkshopDirectedTaskReceipt.fromJSON)
                 guard !existing.contains(where: {
-                    $0.executionId == receipt.executionId && $0.status == receipt.status
+                    $0.executionId == receipt.executionId
+                        && $0.status == receipt.status
+                        && $0.verificationStatus == receipt.verificationStatus
                 }) else { return }
                 try await persistence.appendJSONLDurable(receipt.toJSON(), to: receiptPath)
             }
@@ -204,7 +242,7 @@ public enum WorkshopDeskReceiptBridge {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         guard let state = try? await store.liveState(),
               let item = state.items.first(where: { $0.handle == handle }) else { return }
-        let note = "[\(record.status)] \(summary)"
+        let note = "[\(deskNoteStatus(for: record))] \(summary)"
         if !item.notes.contains(where: { $0.text == note }) {
             do {
                 _ = try await store.appendNote(handle, text: note)
@@ -277,6 +315,23 @@ public enum WorkshopDeskReceiptBridge {
             return String(value.prefix(600))
         default:
             return "Workshop task \(record.status) after \(record.stepsCompleted.count)/\(record.plan.count) steps."
+        }
+    }
+
+    /// Execution completion and verified outcome completion are different
+    /// events. Keep the distinction visible in Desk history so Agent cannot
+    /// mistake a tool/model return for proof that the user's goal was met.
+    private static func deskNoteStatus(for record: WorkshopExecutionRecord) -> String {
+        guard ["completed", "done", "succeeded"].contains(record.status.lowercased()) else {
+            return record.status
+        }
+        switch record.verification?.status {
+        case .satisfied:
+            return "completed"
+        case .failed:
+            return "verification_failed"
+        case .unverified, .none:
+            return "execution_completed_unverified"
         }
     }
 }

@@ -91,9 +91,9 @@ public enum ContextBudgetPolicy {
     /// row from eating the block.
     static let maximumRowScale = 4.0
 
-    /// Recall breadth. Doubles once the window is genuinely large; a 200k model
-    /// keeps today's 5 (the extra rows are worth more on a 1M window where the
-    /// memory block cap can actually carry them).
+    /// Recall breadth. Widens once the window is genuinely large — 200k counts
+    /// (see `resolve`), so the models we actually route to get the wide limit
+    /// rather than only the 1M tier.
     /// Non-content characters a rendered memory row carries: the `- ` bullet,
     /// the newline, and the `[2026-07-14, preference]` provenance marker. The
     /// per-row content cap is sized net of this so `rowLimit` FULL rows
@@ -103,7 +103,7 @@ public enum ContextBudgetPolicy {
     static let memoryRowOverheadChars = 64
 
     static let baseRecallRowLimit = 5
-    static let wideRecallRowLimit = 10
+    static let wideRecallRowLimit = 12
     static let wideRecallWindowTokens = 200_000
 
     // MARK: - Floors (today's literals, verbatim)
@@ -271,7 +271,11 @@ public enum ContextBudgetPolicy {
         let scale = max(1.0, Double(allowance) / Double(referenceFloorTotalCharacters))
         let rowScale = min(scale, maximumRowScale)
 
-        let recallRowLimit = windowTokens > wideRecallWindowTokens
+        // At/above, not above: the live catalog's most-routed models sit EXACTLY
+        // at 200k (19 entries, the Claude models included), so a strict `>` left
+        // wide recall reachable only by the 1M tier — the band it was written
+        // for never qualified.
+        let recallRowLimit = windowTokens >= wideRecallWindowTokens
             ? wideRecallRowLimit
             : baseRecallRowLimit
         // Row size is bounded twice: by the gentle row scale, and by its share

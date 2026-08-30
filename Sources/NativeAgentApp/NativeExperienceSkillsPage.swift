@@ -84,6 +84,10 @@ struct NativeExperienceSkillsPage: View {
             _ = try await appModel.client.archiveSkill(id: skill.id)
             await appModel.refreshForSidebarItem(.capabilities)
             await loadVersions()
+        } catch let partial as SkillMutationRecallReconciliationError {
+            await appModel.refreshForSidebarItem(.capabilities)
+            await loadVersions()
+            self.error = partial.localizedDescription
         } catch { self.error = error.localizedDescription }
     }
 
@@ -93,6 +97,10 @@ struct NativeExperienceSkillsPage: View {
             _ = try await appModel.client.restoreSkill(id: skill.id, versionId: version.id)
             await appModel.refreshForSidebarItem(.capabilities)
             await loadVersions()
+        } catch let partial as SkillMutationRecallReconciliationError {
+            await appModel.refreshForSidebarItem(.capabilities)
+            await loadVersions()
+            self.error = partial.localizedDescription
         } catch { self.error = error.localizedDescription }
     }
 }

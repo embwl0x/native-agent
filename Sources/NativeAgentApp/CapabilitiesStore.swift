@@ -73,7 +73,24 @@ struct ToolChatConfig: Decodable, Hashable {
 @MainActor
 @Observable
 final class CapabilitiesStore {
-    var tools: [ToolCapability] = []
+    /// One TTL-governed capability projection serves every chat surface.
+    /// Detached panels used to allocate and fetch their own full manifest,
+    /// while the main ChatView replaced its first store on appearance. Sharing
+    /// the production owner keeps one decoded catalog resident and turns
+    /// simultaneous view appearances into one refresh boundary.
+    static let shared = CapabilitiesStore()
+
+    var tools: [ToolCapability] = [] {
+        didSet {
+            let eligible = tools.filter {
+                !$0.sideEffects && $0.effectiveAutonomy == "auto" && $0.availableNow
+            }
+            slashTools = eligible
+            slashCommandNames = Set(eligible.map(\.name))
+        }
+    }
+    private(set) var slashTools: [ToolCapability] = []
+    private(set) var slashCommandNames: Set<String> = []
     var persona: String = ""
     var activeProvider: String = ""
     var defaultIterationCap: Int = 12
@@ -149,7 +166,7 @@ final class CapabilitiesStore {
     // Returns tools suitable for dynamic slash-command exposure:
     // no side-effects, auto autonomy, available now.
     func slashCommandTools() -> [ToolCapability] {
-        tools.filter { $0.sideEffects == false && $0.effectiveAutonomy == "auto" && $0.availableNow }
+        slashTools
     }
 }
 

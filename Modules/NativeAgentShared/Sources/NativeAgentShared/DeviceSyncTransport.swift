@@ -217,7 +217,7 @@ public enum NAChatMessageCodec {
     }
 }
 
-// MARK: - Errors (mirror CloudKitSyncError from MemoryV2+CloudKit)
+// MARK: - Device transport errors
 
 public enum DeviceSyncError: Error, LocalizedError, Sendable {
     case notConfigured

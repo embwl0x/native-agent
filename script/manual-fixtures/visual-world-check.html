@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Visual World Check</title>
+  <style>
+    html, body, canvas { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #071018; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<canvas id="world"></canvas>
+<script>
+const canvas = document.querySelector('#world');
+const context = canvas.getContext('2d');
+const params = new URLSearchParams(location.search);
+const requestedSpeed = Number(params.get('speed') || 1);
+const speed = Number.isFinite(requestedSpeed) ? Math.min(50, Math.max(0.25, requestedSpeed)) : 1;
+const teleport = params.get('teleport') !== '0';
+let randomState = (Number(params.get('seed')) || 1) >>> 0;
+function random() {
+  randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0;
+  return randomState / 4294967296;
+}
+let lastFrameTime;
+let hits = 0;
+let misses = 0;
+let energy = 72;
+let lastAim = 'Aim offset: none';
+const objects = [
+  { id: 'yellow', color: '#ffde59', x: 0.22, y: 0.42, radius: 28, dx: 0.00009, dy: 0.00005 },
+  { id: 'blue', color: '#4aa8ff', x: 0.72, y: 0.30, radius: 26, dx: -0.00007, dy: 0.00006 },
+  { id: 'red', color: '#ff4f62', x: 0.58, y: 0.72, radius: 24, dx: 0.00004, dy: -0.00009 },
+];
+
+function resize() {
+  const scale = window.devicePixelRatio || 1;
+  canvas.width = Math.round(innerWidth * scale);
+  canvas.height = Math.round(innerHeight * scale);
+  context.setTransform(scale, 0, 0, scale, 0, 0);
+}
+
+function drawCircle(object) {
+  const x = object.x * innerWidth;
+  const y = object.y * innerHeight;
+  const glow = context.createRadialGradient(x, y, 4, x, y, object.radius * 1.45);
+  glow.addColorStop(0, object.color);
+  glow.addColorStop(0.55, object.color);
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  context.fillStyle = glow;
+  context.beginPath();
+  context.arc(x, y, object.radius * 1.45, 0, Math.PI * 2);
+  context.fill();
+  context.fillStyle = object.color;
+  context.beginPath();
+  context.arc(x, y, object.radius, 0, Math.PI * 2);
+  context.fill();
+}
+
+function draw(now) {
+  // Rates are the original 60Hz pace, independent of display refresh. Do not
+  // turn time spent in a background tab into one unobservable teleport.
+  const elapsed = lastFrameTime === undefined ? 0 : Math.min(0.05, (now - lastFrameTime) / 1000);
+  lastFrameTime = now;
+  const step = elapsed * 60 * speed;
+  context.fillStyle = '#071018';
+  context.fillRect(0, 0, innerWidth, innerHeight);
+
+  for (const object of objects) {
+    object.x += object.dx * step;
+    object.y += object.dy * step;
+    if (object.x < 0.08 || object.x > 0.92) {
+      object.x = object.x < 0.08 ? 0.16 - object.x : 1.84 - object.x;
+      object.dx *= -1;
+    }
+    if (object.y < 0.18 || object.y > 0.90) {
+      object.y = object.y < 0.18 ? 0.36 - object.y : 1.8 - object.y;
+      object.dy *= -1;
+    }
+    drawCircle(object);
+  }
+
+  const goalX = innerWidth * 0.84;
+  const goalY = innerHeight * 0.76;
+  context.fillStyle = '#42d982';
+  context.fillRect(goalX - 34, goalY - 34, 68, 68);
+
+  context.fillStyle = '#dfeaff';
+  context.font = '700 26px -apple-system, sans-serif';
+  context.fillText('Visual world check', 32, 44);
+  context.font = '600 20px -apple-system, sans-serif';
+  context.fillText(`Hits: ${hits}`, 32, 76);
+  context.fillText(`Misses: ${misses}`, 32, 104);
+  context.fillText(`Energy: ${energy}%`, 32, 132);
+  context.fillStyle = '#243646';
+  context.fillRect(32, 146, 240, 18);
+  context.fillStyle = '#42d982';
+  context.fillRect(32, 146, 240 * energy / 100, 18);
+  context.font = '600 20px -apple-system, sans-serif';
+  context.fillStyle = '#dfeaff';
+  context.fillText(`Speed: ${speed}x | ${teleport ? 'reposition on hit' : 'continuous motion'}`, 32, 198);
+  context.fillText(lastAim, 32, 226);
+
+  const occluderX = (0.5 + Math.sin(performance.now() / 1700) * 0.22) * innerWidth;
+  context.fillStyle = '#2a3642';
+  context.fillRect(occluderX - 42, innerHeight * 0.48, 84, 150);
+  requestAnimationFrame(draw);
+}
+
+canvas.addEventListener('click', event => {
+  const target = objects[0];
+  const dx = event.clientX - target.x * innerWidth;
+  const dy = event.clientY - target.y * innerHeight;
+  const distance = Math.hypot(dx, dy);
+  const signed = value => `${value >= 0 ? '+' : ''}${Math.round(value)}`;
+  lastAim = `Aim offset: X ${signed(dx)}, Y ${signed(dy)} px`;
+  if (distance <= target.radius * 1.35) {
+    hits += 1;
+    if (teleport) {
+      target.x = 0.12 + random() * 0.76;
+      target.y = 0.20 + random() * 0.64;
+    }
+    energy = Math.max(0, energy - 4);
+  } else {
+    misses += 1;
+  }
+});
+
+addEventListener('resize', resize);
+resize();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

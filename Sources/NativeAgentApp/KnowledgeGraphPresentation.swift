@@ -220,6 +220,19 @@ enum KnowledgeGraphPresentation {
         reconcileSelection(selectedID, visibleIDs: visibleIDs).selectedID
     }
 
+    /// Relationship navigation uses the same filtered selection boundary as
+    /// the list and canvas; it never silently clears filters to reveal a node.
+    static func relationshipNavigationDestination(
+        edge: KGEdge,
+        rootID: String,
+        visibleIDs: Set<String>
+    ) -> String? {
+        guard edge.from == rootID || edge.to == rootID else { return nil }
+        let destination = edge.from == rootID ? edge.to : edge.from
+        guard !destination.isEmpty, destination != rootID else { return nil }
+        return reconciledSelection(destination, visibleIDs: visibleIDs)
+    }
+
     static func relationships(isLoading: Bool, error: String?, edgeCount: Int?) -> Relationships {
         if isLoading { return .loading }
         if let error { return .failed(error) }

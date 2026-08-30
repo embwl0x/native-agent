@@ -34,26 +34,35 @@ private actor TelegramTurnControlsCapture {
         let markup: JSONValue?
     }
 
-    private(set) var handlerStarted = false
+    private(set) var handlerStarts: [String] = []
     private(set) var handlerCanceled = false
     private(set) var cardSends: [CardSend] = []
     private(set) var cardEdits: [CardEdit] = []
+    private(set) var cardEditMessageIds: [Int] = []
     private(set) var plainMessages: [String] = []
     private(set) var callbackAnswers: [(String, String)] = []
 
-    func startHandler() { handlerStarted = true }
+    func startHandler(_ text: String) { handlerStarts.append(text) }
     func cancelHandler() { handlerCanceled = true }
 
     func waitUntilHandlerStarts() async {
-        while !handlerStarted { await Task.yield() }
+        while handlerStarts.isEmpty { await Task.yield() }
+    }
+
+    func waitUntilHandlerStartCount(_ count: Int) async -> Bool {
+        for _ in 0..<2_000 where handlerStarts.count < count {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return handlerStarts.count >= count
     }
 
     func sendCard(text: String, markup: JSONValue) -> Int {
         cardSends.append(CardSend(text: text, markup: markup))
-        return 500
+        return 499 + cardSends.count
     }
 
-    func editCard(text: String, markup: JSONValue?) {
+    func editCard(messageId: Int, text: String, markup: JSONValue?) {
+        cardEditMessageIds.append(messageId)
         cardEdits.append(CardEdit(text: text, markup: markup))
     }
 
@@ -65,12 +74,13 @@ private actor TelegramTurnControlsCapture {
 
     func snapshot() -> (
         handlerCanceled: Bool,
+        handlerStarts: [String],
         cardSends: [CardSend],
         cardEdits: [CardEdit],
         plainMessages: [String],
         callbackAnswers: [(String, String)]
     ) {
-        (handlerCanceled, cardSends, cardEdits, plainMessages, callbackAnswers)
+        (handlerCanceled, handlerStarts, cardSends, cardEdits, plainMessages, callbackAnswers)
     }
 }
 
@@ -85,6 +95,58 @@ private actor TelegramExpiredApprovalHandler: TelegramApprovalHandling {
     ) async throws -> TelegramApprovalResolution {
         calls += 1
         throw TelegramBotError.underlying("approval expired")
+    }
+}
+
+private actor TelegramQueuedTurnOrderCapture {
+    private(set) var starts: [String] = []
+    private var firstRelease: CheckedContinuation<Void, Never>?
+
+    func run(_ label: String, waitsForRelease: Bool) async {
+        starts.append(label)
+        guard waitsForRelease else { return }
+        await withCheckedContinuation { continuation in
+            firstRelease = continuation
+        }
+    }
+
+    func waitForStarts(_ count: Int) async {
+        while starts.count < count { await Task.yield() }
+    }
+
+    func releaseFirst() {
+        firstRelease?.resume()
+        firstRelease = nil
+    }
+}
+
+private actor TelegramSteerGenerationCapture {
+    private var firstRelease: CheckedContinuation<Void, Never>?
+    private(set) var secondStarted = false
+    private(set) var secondCanceled = false
+
+    func runFirst() async {
+        await withCheckedContinuation { continuation in
+            firstRelease = continuation
+        }
+    }
+
+    func releaseFirst() {
+        firstRelease?.resume()
+        firstRelease = nil
+    }
+
+    func runSecond() async {
+        secondStarted = true
+        do {
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+        } catch is CancellationError {
+            secondCanceled = true
+        } catch {}
+    }
+
+    func waitForSecond() async {
+        while !secondStarted { await Task.yield() }
     }
 }
 
@@ -143,6 +205,21 @@ private func callbackData(
     return nil
 }
 
+private func queuedCallbackData(
+    action: TelegramQueuedTurnControlAction,
+    in markup: JSONValue
+) -> String? {
+    guard case .object(let root) = markup,
+          case .array(let rows)? = root["inline_keyboard"] else { return nil }
+    for case .array(let buttons) in rows {
+        for case .object(let button) in buttons {
+            guard case .string(let data)? = button["callback_data"] else { continue }
+            if data.contains("na_queue:\(action.rawValue):") { return data }
+        }
+    }
+    return nil
+}
+
 private func makeResponsiveTurnLoop(
     root: URL,
     responses: TelegramTurnControlsResponses,
@@ -179,16 +256,16 @@ private func makeResponsiveTurnLoop(
             await capture.sendCard(text: text, markup: markup)
         },
         editMessageText: { _, _, _, _ in },
-        editMessageTextWithReplyMarkup: { _, _, _, text, markup in
-            await capture.editCard(text: text, markup: markup)
+        editMessageTextWithReplyMarkup: { _, _, messageId, text, markup in
+            await capture.editCard(messageId: messageId, text: text, markup: markup)
         },
         draftEditIntervalSeconds: 0,
         turnCardMinimumEditIntervalSeconds: 0,
         turnCardHeartbeatNanoseconds: 0,
         turnCardSleeper: { try await Task.sleep(nanoseconds: $0) },
         turnStopConfirmationNanoseconds: 1_000_000_000,
-        progressChatHandler: { _, _, progress, _ in
-            await capture.startHandler()
+        progressChatHandler: { _, text, progress, _ in
+            await capture.startHandler(text)
             await progress(.toolUse(
                 name: "invoke_claude",
                 input: .object([
@@ -211,6 +288,118 @@ private func makeResponsiveTurnLoop(
 
 @Suite("Telegram responsive turn controls", .serialized)
 struct TelegramTurnControlsTests {
+    @Test func steerStopBoundToOldGenerationCannotCancelPromotedSuccessor() async throws {
+        let coordinator = TelegramTurnCoordinator()
+        let capture = TelegramSteerGenerationCapture()
+        let first = await coordinator.startTrackedTurn(chatId: 77, text: "first") { _ in
+            await capture.runFirst()
+        }
+        #expect(first != nil)
+        #expect(await coordinator.enqueueTrackedTurn(
+            updateId: 2,
+            chatId: 77,
+            text: "steer here",
+            acknowledgementMessageId: 501,
+            operation: { _ in await capture.runSecond() },
+            onStart: { _ in }
+        ) == 1)
+
+        let interrupted = try #require(await coordinator.activeTurnID(chatId: 77))
+        #expect(await coordinator.promoteQueuedTurn(chatId: 77, updateId: 2) != nil)
+        await capture.releaseFirst()
+        await capture.waitForSecond()
+
+        let outcome = await coordinator.requestStop(
+            chatId: 77,
+            turnId: interrupted,
+            confirmationTimeoutNanoseconds: 0,
+            sleeper: { _ in }
+        )
+        #expect(outcome == .notRunning)
+        #expect(await coordinator.snapshot(chatId: 77).promptPreview == "steer here")
+        #expect(await capture.secondCanceled == false)
+        await coordinator.shutdown()
+    }
+
+    @Test func queuedAcknowledgementCardSurvivesCoordinatorRestart() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_queue_card_restart_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let offsetURL = root
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        let update = TelegramUpdate(
+            updateId: 40,
+            message: TelegramMessage(
+                messageId: 40,
+                chatId: 77,
+                chatType: "private",
+                fromUserId: 11,
+                text: "resume after restart",
+                date: 1
+            )
+        )
+        let inbox = TelegramUpdateInbox(offsetURL: offsetURL)
+        _ = try await inbox.ensurePending(update)
+        _ = try await inbox.transition(updateId: 40, from: [.pending], to: .processing)
+        _ = try await inbox.transition(updateId: 40, from: [.processing], to: .queued)
+        _ = try await inbox.recordQueueAcknowledgement(updateId: 40, messageId: 777)
+
+        let responses = TelegramTurnControlsResponses()
+        let capture = TelegramTurnControlsCapture()
+        let coordinator = TelegramTurnCoordinator()
+        let loop = makeResponsiveTurnLoop(
+            root: root,
+            responses: responses,
+            capture: capture,
+            coordinator: coordinator,
+            token: "123456:RESTART_QUEUE_SECRET"
+        )
+
+        _ = await loop.tickOutcome()
+        await capture.waitUntilHandlerStarts()
+        let captured = await capture.snapshot()
+        #expect(captured.cardSends.count == 1,
+                "restart must reuse the durable queued card instead of sending a replacement")
+        #expect(await capture.cardEditMessageIds.contains(777))
+        #expect(captured.cardEdits.contains { $0.text.hasPrefix("Running now ·") })
+        #expect(try await inbox.snapshots().first?.phase == .completed)
+
+        await loop.shutdown()
+    }
+
+    @Test func queuedTurnsDrainInFIFOOrderAfterNaturalCompletion() async {
+        let coordinator = TelegramTurnCoordinator()
+        let capture = TelegramQueuedTurnOrderCapture()
+
+        _ = await coordinator.startTrackedTurn(chatId: 77, text: "first") { _ in
+            await capture.run("first", waitsForRelease: true)
+        }
+        await capture.waitForStarts(1)
+        #expect(await coordinator.enqueueTrackedTurn(
+            updateId: 2,
+            chatId: 77,
+            text: "second",
+            acknowledgementMessageId: 501,
+            operation: { _ in await capture.run("second", waitsForRelease: false) },
+            onStart: { _ in }
+        ) == 1)
+        #expect(await coordinator.enqueueTrackedTurn(
+            updateId: 3,
+            chatId: 77,
+            text: "third",
+            acknowledgementMessageId: 502,
+            operation: { _ in await capture.run("third", waitsForRelease: false) },
+            onStart: { _ in }
+        ) == 2)
+        #expect(await capture.starts == ["first"])
+
+        await capture.releaseFirst()
+        await capture.waitForStarts(3)
+        await coordinator.waitUntilAllIdle()
+        #expect(await capture.starts == ["first", "second", "third"])
+    }
+
     @Test func callbacksAndStatusStayResponsiveWhileOrdinaryTurnsRemainSerialized() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("telegram_turn_controls_\(UUID().uuidString)", isDirectory: true)
@@ -238,35 +427,33 @@ struct TelegramTurnControlsTests {
         let markup = try #require(initial.cardSends.first?.markup)
         let statusData = try #require(callbackData(action: .status, in: markup))
         let detailsData = try #require(callbackData(action: .details, in: markup))
-        let stopData = try #require(callbackData(action: .stop, in: markup))
 
         // Slash status is handled by the live card and produces no standalone
         // status message while the provider turn remains suspended.
         responses.setUpdate(telegramMessageUpdate(updateId: 2, messageId: 2, text: "/status"))
         _ = await loop.tickOutcome()
 
-        // A second ordinary turn cannot race the first one.
+        // A second ordinary turn queues by default and cannot race the first.
         responses.setUpdate(telegramMessageUpdate(updateId: 3, messageId: 3, text: "race this"))
         _ = await loop.tickOutcome()
 
-        // The refused ordinary message is deliberately not queued, but it must
-        // remain recoverable in the durable receipt trail.  This drives the
-        // actual polling transport while the first turn is still suspended;
-        // a direct coordinator call would miss both the send and receipt
-        // boundaries.
+        // The queue acknowledgement carries explicit steer/remove controls,
+        // while the durable inbox retains ownership until the queued turn runs.
         #expect(await coordinator.snapshot(chatId: 77).isRunning)
-        #expect(await coordinator.lastUserMessage(chatId: 77)?.text == "do long work",
-                "a refused busy message must not replace the retry source for the running turn")
-        let busyReceipts = await telegramFeedRows(root: root, "receipts").filter { row in
-            row["kind"] == .string("busy_notice")
+        #expect(await coordinator.lastUserMessage(chatId: 77)?.text == "race this")
+        let queuedSnapshot = try #require(await coordinator.queuedTurn(chatId: 77, updateId: 3))
+        #expect(queuedSnapshot.position == 1)
+        #expect(queuedSnapshot.acknowledgementMessageId == 501)
+        let afterQueue = await capture.snapshot()
+        #expect(afterQueue.cardSends.count == 2)
+        let queuedMarkup = afterQueue.cardSends[1].markup
+        let steerData = try #require(queuedCallbackData(action: .steer, in: queuedMarkup))
+        #expect(queuedCallbackData(action: .remove, in: queuedMarkup) != nil)
+        let queuedReceipts = await telegramFeedRows(root: root, "receipts").filter { row in
+            row["kind"] == .string("queued_notice")
         }
-        #expect(busyReceipts.count == 1)
-        #expect(busyReceipts.first?["textPreview"] == .string("race this"))
-        guard case .string(let busyReply)? = busyReceipts.first?["replyPreview"] else {
-            Issue.record("busy notice receipt must retain its reply preview")
-            return
-        }
-        #expect(busyReply.contains("already running"))
+        #expect(queuedReceipts.count == 1)
+        #expect(queuedReceipts.first?["textPreview"] == .string("race this"))
 
         responses.setUpdate(telegramCallbackUpdate(
             updateId: 4,
@@ -306,24 +493,26 @@ struct TelegramTurnControlsTests {
 
         responses.setUpdate(telegramCallbackUpdate(
             updateId: 8,
-            callbackId: "cb-stop",
-            data: stopData
+            callbackId: "cb-steer",
+            data: steerData,
+            messageId: 501
         ))
         _ = await loop.tickOutcome()
+        #expect(await capture.waitUntilHandlerStartCount(2))
 
         let captured = await capture.snapshot()
         #expect(captured.handlerCanceled)
-        let stoppedSnapshot = await coordinator.snapshot(chatId: 77)
-        #expect(!stoppedSnapshot.isRunning)
-        #expect(captured.cardSends.count == 1)
-        #expect(captured.plainMessages.count == 1)
-        #expect(captured.plainMessages.first?.contains("already running") == true)
+        #expect(captured.handlerStarts == ["do long work", "race this"])
+        let steeredSnapshot = await coordinator.snapshot(chatId: 77)
+        #expect(steeredSnapshot.isRunning)
+        #expect(steeredSnapshot.promptPreview == "race this")
+        #expect(captured.cardSends.count == 3)
+        #expect(captured.plainMessages.isEmpty)
         #expect(captured.cardEdits.contains { $0.text.hasPrefix("Work details") })
-        #expect(captured.cardEdits.last?.text.hasPrefix("Canceled ·") == true)
-        #expect(captured.cardEdits.last?.markup == TelegramTurnControlCallback.clearedReplyMarkup)
-        #expect(captured.callbackAnswers.contains { $0.0 == "cb-stop" })
+        #expect(captured.cardEdits.contains { $0.text.hasPrefix("Running now ·") })
+        #expect(captured.callbackAnswers.contains { $0.0 == "cb-steer" })
 
-        let renderedSurface = ([initial.cardSends[0].text]
+        let renderedSurface = (captured.cardSends.map(\.text)
             + captured.cardEdits.map(\.text)
             + captured.plainMessages
             + captured.callbackAnswers.map(\.1))
@@ -435,8 +624,8 @@ struct TelegramTurnControlsTests {
             answerCallbackQuery: { _, callbackId, text in
                 await capture.answer(callbackId, text: text)
             },
-            editMessageTextWithReplyMarkup: { _, _, _, text, markup in
-                await capture.editCard(text: text, markup: markup)
+            editMessageTextWithReplyMarkup: { _, _, messageId, text, markup in
+                await capture.editCard(messageId: messageId, text: text, markup: markup)
             },
             approvalHandler: handler
         )

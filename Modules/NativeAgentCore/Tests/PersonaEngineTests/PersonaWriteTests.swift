@@ -211,6 +211,40 @@ func savePersonality_mergesOverExisting() async throws {
     #expect(reloaded.essence == "Second essence.")
 }
 
+@Test("savePersonality refuses to overwrite a malformed canonical profile")
+func savePersonality_preservesMalformedProfile() async throws {
+    let root = try makeWriteTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let (engine, _, dataRoot) = makeEngine(root)
+    let memoryRoot = dataRoot.appendingPathComponent("memory", isDirectory: true)
+    try FileManager.default.createDirectory(at: memoryRoot, withIntermediateDirectories: true)
+    let profileURL = memoryRoot.appendingPathComponent("profile.json")
+    let corruptBytes = Data("{not-json".utf8)
+    try corruptBytes.write(to: profileURL)
+
+    await #expect(throws: PersonaWriteError.self) {
+        _ = try await engine.savePersonality(body: ["essence": .string("replacement")])
+    }
+    #expect(try Data(contentsOf: profileURL) == corruptBytes)
+}
+
+@Test("savePersonality refuses to replace a non-object canonical profile")
+func savePersonality_preservesNonObjectProfile() async throws {
+    let root = try makeWriteTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let (engine, _, dataRoot) = makeEngine(root)
+    let memoryRoot = dataRoot.appendingPathComponent("memory", isDirectory: true)
+    try FileManager.default.createDirectory(at: memoryRoot, withIntermediateDirectories: true)
+    let profileURL = memoryRoot.appendingPathComponent("profile.json")
+    let nonObjectBytes = Data("[]".utf8)
+    try nonObjectBytes.write(to: profileURL)
+
+    await #expect(throws: PersonaWriteError.self) {
+        _ = try await engine.savePersonality(body: ["essence": .string("replacement")])
+    }
+    #expect(try Data(contentsOf: profileURL) == nonObjectBytes)
+}
+
 @Test("savePersonality serializes canonical profile JSON bytes")
 func savePersonality_writesCanonicalProfileJSON() async throws {
     let root = try makeWriteTempRoot()

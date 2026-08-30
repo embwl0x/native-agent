@@ -384,6 +384,19 @@ private final class FailingSwarmLLM: LLMClient, @unchecked Sendable {
     }
 }
 
+private final class MixedSwarmLLM: LLMClient, @unchecked Sendable {
+    struct Down: Error {}
+
+    func complete(prompt: String, system: String?, model: String?) async throws -> String {
+        if model == "bad-model" { throw Down() }
+        return "completed by \(model ?? "default")"
+    }
+
+    func complete(prompt: String, system: String?, model: String?, surface: String) async throws -> String {
+        try await complete(prompt: prompt, system: system, model: model)
+    }
+}
+
 private actor RecordingSwarmWorkerRunner: AgentSwarmWorkerRunning {
     private(set) var calls: [(
         model: String,
@@ -420,6 +433,137 @@ private actor RecordingSwarmWorkerRunner: AgentSwarmWorkerRunning {
     )
     #expect(request.readOnly == false)
     #expect(request.workers.map(\.access) == ["read_only", "inherit"])
+}
+
+@Test func agentSwarmRequest_malformedExplicitWorkersNeverLaunchDefaultOrPartialSwarm() async throws {
+    let llm = RecordingSwarmLLM()
+    let runner = RecordingSwarmWorkerRunner()
+    let executor = SwiftNativeAgentSwarmExecutor(llm: llm, workerRunner: runner)
+    let malformed: [JSONValue] = [
+        .object(["role": .string("intended single worker")]), .string("not an array"),
+        .array([.bool(false)]), .array([.null]), .array([.string(" \n ")]),
+        .array([.object(["role": .string("first")]), .int(3), .object(["role": .string("third")])]),
+    ]
+    for workers in malformed {
+        do {
+            _ = try await executor.runTool(input: [
+                "objective": .string("Do only the specified worker jobs"),
+                "access": .string("inherit"), "agents": workers,
+            ], policy: AgentSwarmPolicy(storeReceipts: false))
+            Issue.record("malformed explicit workers must fail before any execution")
+        } catch AgentSwarmError.invalidRequest(let reason) {
+            #expect(reason.contains("worker"))
+        }
+    }
+    #expect(llm.prompts.isEmpty)
+    #expect(await runner.calls.isEmpty)
+}
+
+@Test func agentSwarmRequest_invalidExplicitAccessNeverSubstitutesDefaultMode() async throws {
+    let llm = RecordingSwarmLLM()
+    let runner = RecordingSwarmWorkerRunner()
+    let executor = SwiftNativeAgentSwarmExecutor(llm: llm, workerRunner: runner)
+    let malformed: [[String: JSONValue]] = [
+        ["access": .string("inherited")], ["access": .int(1)],
+        ["access": .null, "workerAccess": .bool(false)],
+        ["access": .string("inherit"), "agents": .array([.object(["access": .string("read_onyl")])])],
+        ["access": .string("inherit"), "agents": .array([.object(["access": .array([])])])],
+    ]
+    for fields in malformed {
+        do {
+            _ = try await executor.runTool(input: fields.merging(["objective": .string("Execute the exact requested capability mode")]) { first, _ in first },
+                                           policy: AgentSwarmPolicy(storeReceipts: false))
+            Issue.record("invalid explicit access must not silently select another capability mode")
+        } catch AgentSwarmError.invalidRequest(let reason) {
+            #expect(reason.contains("access"))
+        }
+    }
+    #expect(llm.prompts.isEmpty)
+    #expect(await runner.calls.isEmpty)
+}
+
+@Test func agentSwarmRequest_malformedMissionAndContextNeverStartAnyWorker() async throws {
+    let llm = RecordingSwarmLLM()
+    let runner = RecordingSwarmWorkerRunner()
+    let executor = SwiftNativeAgentSwarmExecutor(llm: llm, workerRunner: runner)
+    let fields = ["prompt", "lensBrief", "lens_brief", "instructions", "contextSlice", "context_slice", "context"]
+    for field in fields {
+        for malformed in [JSONValue.bool(false), .int(2), .array([.string("explicit constraint")]), .object(["constraint": .string("inspect only")])] {
+            // A valid higher-precedence alias cannot hide malformed supplied
+            // context/instructions, and a prior valid worker cannot run alone.
+            var worker: [String: JSONValue] = ["prompt": .string("valid brief"), "contextSlice": .string("valid context")]
+            worker[field] = malformed
+            do {
+                _ = try await executor.runTool(input: [
+                    "objective": .string("Honor every supplied worker constraint"), "access": .string("inherit"),
+                    "agents": .array([.object(["role": .string("valid first worker")]), .object(worker)]),
+                ], policy: AgentSwarmPolicy(storeReceipts: false))
+                Issue.record("malformed explicit mission/context must not execute")
+            } catch AgentSwarmError.invalidRequest(let reason) {
+                #expect(reason.contains("worker 2"))
+                #expect(reason.contains("field '\(field)'"))
+                #expect(reason.contains("No workers were started"))
+            }
+        }
+    }
+    #expect(llm.prompts.isEmpty)
+    #expect(await runner.calls.isEmpty)
+}
+
+@Test func agentSwarmRequest_workerTextPlaceholdersAndAliasPrecedenceStayIntact() throws {
+    let request = try AgentSwarmRunRequest.parse(input: [
+        "objective": .string("Retain explicit text references"),
+        "agents": .array([
+            .object(["prompt": .null, "lensBrief": .string(" \n"), "lens_brief": .string(" inspect exact file "),
+                     "instructions": .string("later alias remains lower precedence"),
+                     "contextSlice": .string(""), "context_slice": .null,
+                     "context": .string(" file: /fixture/report.txt\nconstraint: preserve bytes ")]),
+            .object(["prompt": .string("first brief"), "instructions": .null,
+                     "contextSlice": .string("first context"), "context": .string("later context")]),
+            .object(["prompt": .null, "context": .string(" \n ")]),
+            .object([:]),
+        ]),
+    ], policy: AgentSwarmPolicy(storeReceipts: false))
+    #expect(request.workers[0].prompt == "inspect exact file")
+    #expect(request.workers[0].contextSlice == "file: /fixture/report.txt\nconstraint: preserve bytes")
+    #expect(request.workers[1].prompt == "first brief")
+    #expect(request.workers[1].contextSlice == "first context")
+    #expect(request.workers[2].prompt.isEmpty && request.workers[2].contextSlice == nil)
+    #expect(request.workers[3].prompt.isEmpty && request.workers[3].contextSlice == nil)
+    #expect(request.workers.allSatisfy { $0.access == "read_only" })
+}
+
+@Test func agentSwarmRequest_optionalPlaceholdersDoNotHideLaterWorkerOrAccessAliases() throws {
+    let policy = AgentSwarmPolicy(storeReceipts: false)
+    let request = try AgentSwarmRunRequest.parse(input: [
+        "objective": .string("Respect the populated compatibility worker list"),
+        "agents": .null, "workers": .array([]),
+        "roles": .array([
+            .string("legacy role"), .object([:]),
+            .object(["access": .string(""), "workerAccess": .string("read-only")]),
+            .object(["access": .null, "readOnly": .null, "read_only": .bool(false)]),
+        ]),
+        "access": .null, "workerAccess": .string(" tools "), "agentCount": .int(9),
+    ], policy: policy)
+    #expect(request.workers.count == 4)
+    #expect(request.workers[0].role == "legacy role")
+    #expect(request.workers[1].role == "independent analyst 2")
+    #expect(request.workers.map(\.access) == ["inherit", "inherit", "read_only", "inherit"])
+    let defaults = try AgentSwarmRunRequest.parse(input: [
+        "objective": .string("Keep ordinary empty defaults"),
+        "agents": .array([]), "workers": .null, "roles": .array([]),
+        "access": .string(" "), "readOnly": .null, "agentCount": .int(2),
+    ], policy: policy)
+    #expect(defaults.workers.count == 2)
+    #expect(defaults.workers.allSatisfy { $0.access == "read_only" })
+    for access in ["inherit", "auto", "tools", "tool_capable", "tool-capable", "workspace", "full"] {
+        let inherited = try AgentSwarmRunRequest.parse(input: ["objective": .string("Keep existing admitted modes"), "access": .string(access)], policy: policy)
+        #expect(inherited.workers.allSatisfy { $0.access == "inherit" })
+    }
+    for access in ["read_only", "readonly", "read-only", "reasoning"] {
+        let readonly = try AgentSwarmRunRequest.parse(input: ["objective": .string("Keep existing prompt-only modes"), "access": .string(access)], policy: policy)
+        #expect(readonly.workers.allSatisfy { $0.access == "read_only" })
+    }
 }
 
 @Test func swiftAgentSwarmExecutor_usesEphemeralRunnerOnlyForInheritedWorkers() async throws {
@@ -508,6 +652,53 @@ private actor RecordingSwarmWorkerRunner: AgentSwarmWorkerRunning {
     #expect(summary["failed"] == .int(2))
 }
 
+@Test func swiftAgentSwarmExecutor_mixedWorkersReportPartialThroughRunLedger() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("swarm-partial-\(UUID().uuidString)", isDirectory: true)
+    let swarmDir = root.appendingPathComponent("swarms", isDirectory: true)
+    try FileManager.default.createDirectory(at: swarmDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let executor = SwiftNativeAgentSwarmExecutor(
+        llm: MixedSwarmLLM(),
+        runsPath: swarmDir.appendingPathComponent("runs.json"),
+        runLedgerDataRoot: root
+    )
+    let out = try await executor.runTool(
+        input: [
+            "objective": .string("mixed fan-out"),
+            "agents": .array([
+                .object(["role": .string("healthy"), "model": .string("good-model")]),
+                .object(["role": .string("broken"), "model": .string("bad-model")]),
+            ]),
+            "synthesize": .bool(false),
+        ],
+        policy: AgentSwarmPolicy(maxAgents: 20, storeReceipts: true)
+    )
+    guard case .object(let obj) = out,
+          case .object(let summary)? = obj["summary"] else {
+        Issue.record("expected partial swarm run object")
+        return
+    }
+    #expect(obj["status"] == .string("partial"))
+    #expect(summary["completed"] == .int(1))
+    #expect(summary["failed"] == .int(1))
+
+    let ledgerPath = root
+        .appendingPathComponent("runs", isDirectory: true)
+        .appendingPathComponent("runs.json")
+    let ledger = await SwiftNativePersistenceCore().readJSON(
+        ledgerPath, defaultValue: .array([])
+    )
+    guard case .array(let rows) = ledger,
+          case .object(let row)? = rows.first else {
+        Issue.record("expected partial cross-surface run ledger row")
+        return
+    }
+    #expect(row["status"] == .string("partial"))
+    #expect(row["error"] == .string("1 of 2 worker(s) failed"))
+}
+
 @Test func swiftAgentSwarmExecutor_persistsRunReceipt() async throws {
     let dir = FileManager.default.temporaryDirectory
         .appendingPathComponent("swarm-exec-\(UUID().uuidString)", isDirectory: true)
@@ -538,4 +729,55 @@ private actor RecordingSwarmWorkerRunner: AgentSwarmWorkerRunning {
     #expect(first["id"] == .string(runID))
     #expect(first["runtime"] == .string("swift-native"))
     #expect(first["surface"] == .string("swarms"))
+    let second = try await executor.runTool(
+        input: ["objective": .string("append next receipt"), "agentCount": .int(1), "synthesize": .bool(false)],
+        policy: AgentSwarmPolicy(storeReceipts: true)
+    )
+    #expect(SwarmRunsStore.load(path: runsPath).runs == [second, out])
+}
+
+@Test func swiftAgentSwarmExecutor_preservesUnavailableReceiptStoreAfterWorkersSettle() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("swarm-preserve-\(UUID().uuidString)")
+    let directory = root.appendingPathComponent("swarms")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let path = directory.appendingPathComponent("runs.json")
+    let llm = RecordingSwarmLLM()
+    let executor = SwiftNativeAgentSwarmExecutor(llm: llm, runsPath: path)
+    func runExpectingUnavailable(_ reason: String) async throws {
+        let before = llm.prompts.count
+        do {
+            _ = try await executor.runTool(
+                input: ["objective": .string("inert receipt preservation fixture"), "agentCount": .int(1), "synthesize": .bool(false)],
+                policy: AgentSwarmPolicy(storeReceipts: true)
+            )
+            Issue.record("unavailable existing receipt storage must not be reset")
+        } catch let failure as AgentSwarmReceiptPersistenceError {
+            guard case PersistenceCoreError.ioFailure(let message) = failure.underlyingError else {
+                Issue.record("original checked-read error must be retained"); return
+            }
+            #expect(message.contains("(\(reason))"))
+            #expect(message.contains("Workers have already settled"))
+        }
+        #expect(llm.prompts.count == before + 1)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("runs/runs.json").path))
+    }
+    for bytes in [Data(), Data("{invalid".utf8), Data("null".utf8), Data("{\"runs\":[]}".utf8)] {
+        try bytes.write(to: path)
+        try await runExpectingUnavailable("malformed")
+        #expect(try Data(contentsOf: path) == bytes)
+    }
+    try FileManager.default.removeItem(at: path)
+    try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+    let marker = path.appendingPathComponent("preserve-marker")
+    let markerBytes = Data("existing evidence".utf8)
+    try markerBytes.write(to: marker)
+    try await runExpectingUnavailable("not_a_file")
+    #expect(try Data(contentsOf: marker) == markerBytes)
+    try FileManager.default.removeItem(at: path)
+    let unavailableTarget = directory.appendingPathComponent("missing-target")
+    try FileManager.default.createSymbolicLink(at: path, withDestinationURL: unavailableTarget)
+    try await runExpectingUnavailable("unreadable")
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: path.path) == unavailableTarget.path)
+    #expect(!FileManager.default.fileExists(atPath: unavailableTarget.path))
 }

@@ -88,14 +88,14 @@ private func readRows(_ url: URL) -> [JSONValue] {
 
 // MARK: - TelegramExponentialBackoff unit tests (virtual time)
 
-@Test func backoff_curve_doubles_from_1s_to_60s_cap_with_unit_jitter() async {
+@Test func backoff_curve_doubles_from_1s_to_300s_cap_with_unit_jitter() async {
     let clock = VirtualClock()
     let backoff = TelegramExponentialBackoff(now: { clock.now }, random: { _ in 1.0 })
     var delays: [TimeInterval] = []
     for _ in 0..<8 {
         delays.append(await backoff.recordFailure())
     }
-    #expect(delays == [1, 2, 4, 8, 16, 32, 60, 60])
+    #expect(delays == [1, 2, 4, 8, 16, 32, 64, 128])
     #expect(await backoff.failureCount() == 8)
 }
 
@@ -139,19 +139,48 @@ private func readRows(_ url: URL) -> [JSONValue] {
     )
     // First failure: raw 1s × 1.2 jitter.
     #expect(await backoff.recordFailure() == 1.2)
-    // Drive to the cap: raw clamps to 60 BEFORE jitter, and the jittered
-    // value re-clamps to 60 — the documented cap is a hard ceiling.
+    // Drive to the cap: raw clamps to 300 BEFORE jitter, and the jittered
+    // value re-clamps to 300 — the documented cap is a hard ceiling.
     var last: TimeInterval = 0
     for _ in 0..<10 {
         last = await backoff.recordFailure()
     }
-    #expect(last == 60)
+    #expect(last == 300)
 }
 
 // MARK: - Poll-loop integration (failure gating + recovery, virtual time)
 
 @Suite(.serialized)
 struct TelegramBackoffPollLoopTests {
+
+    @Test func pollLoop_cancellation_is_shutdown_neutral() async throws {
+        let root = try mkRoot("cancel")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let offsetURL = root
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        let errorsURL = root
+            .appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("errors.jsonl")
+        let session = backoffMockSession { _ in
+            throw URLError(.cancelled)
+        }
+        let pollBackoff = TelegramExponentialBackoff()
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: "TKN123",
+            allowedChatIds: [5],
+            session: session,
+            dataRoot: root,
+            offsetURL: offsetURL,
+            sendMessage: { _, _, _ in },
+            pollBackoff: pollBackoff
+        )
+
+        #expect(await loop.tickOutcome() == .skipped(reason: "Telegram poll cancelled"))
+        #expect(readRows(errorsURL).isEmpty)
+        #expect(await pollBackoff.failureCount() == 0)
+    }
 
     @Test func pollLoop_transient_failures_back_off_and_reset_on_success() async throws {
         let root = try mkRoot("poll")

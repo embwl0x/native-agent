@@ -525,5 +525,268 @@ grep -q 'release_scan_files_for_regex "\$RELEASE_SECRET_VALUE_RE" cs "\$label" b
   "$ROOT/script/lib/release_bundle_gates.sh" \
   || fail "release_scan_dir_for_secret_values no longer requests the binary pass"
 
+# ---------------------------------------------------------------------------
+# ARTIFACT-VERIFIER REQUIRE-FLAG CONTRACT. Exercise the real verifier process
+# against one hermetic bundle while fake platform trust tools report controlled
+# evidence. The bundle contents still cross every ordinary verifier gate; only
+# codesign/notarization are substituted because these tests must not need Apple
+# credentials, a notarization ticket, or a mounted production DMG.
+# ---------------------------------------------------------------------------
+REQUIRE_ROOT="$TMP/require-flags"
+REQUIRE_BUNDLE="$REQUIRE_ROOT/NativeAgent.app"
+REQUIRE_RESOURCES="$REQUIRE_BUNDLE/Contents/Resources"
+REQUIRE_INFO="$REQUIRE_BUNDLE/Contents/Info.plist"
+REQUIRE_DMG="$REQUIRE_ROOT/NativeAgent-fixture.dmg"
+REQUIRE_FAKE_BIN="$REQUIRE_ROOT/fake-bin"
+REQUIRE_CALL_LOG="$REQUIRE_ROOT/platform-calls.log"
+REQUIRE_SOURCE_RESOURCES="$ROOT/Modules/NativeAgentCore/Sources/MemoryV2/Resources"
+REQUIRE_MODEL_BUNDLE="$REQUIRE_RESOURCES/NativeAgentCore_MemoryV2.bundle"
+REQUIRE_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+REQUIRE_REVISION="0123456789abcdef0123456789abcdef01234567"
+REQUIRE_VALID_SPARKLE_KEY="$(printf '0123456789abcdef0123456789abcdef' | base64)"
+
+mkdir -p \
+  "$REQUIRE_BUNDLE/Contents/MacOS" \
+  "$REQUIRE_MODEL_BUNDLE" \
+  "$REQUIRE_RESOURCES/docs" \
+  "$REQUIRE_FAKE_BIN"
+cp -R "$REQUIRE_SOURCE_RESOURCES/." "$REQUIRE_MODEL_BUNDLE/"
+cp \
+  "$ROOT/script/codex_thread_wakeup.js" \
+  "$ROOT/script/claude_thread_wakeup.js" \
+  "$ROOT/script/omp_thread_wakeup.js" \
+  "$REQUIRE_RESOURCES/"
+printf '%s\n' 'bounded release fixture data' > "$REQUIRE_RESOURCES/docs/data-bounds.md"
+printf '%s\n' "$REQUIRE_VERSION" > "$REQUIRE_RESOURCES/VERSION"
+printf '%s\n' "$REQUIRE_REVISION" > "$REQUIRE_RESOURCES/VERSION_SHA"
+cat > "$REQUIRE_ROOT/fixture-main.c" <<'C'
+#include <stdio.h>
+int main(void) {
+  puts("public_release_data_root.json");
+  puts("NativeAgent.pre-public-backup.");
+  return 0;
+}
+C
+xcrun clang -Os -Wl,-x \
+  "$REQUIRE_ROOT/fixture-main.c" \
+  -o "$REQUIRE_BUNDLE/Contents/MacOS/NativeAgentApp"
+chmod -R a+rX "$REQUIRE_BUNDLE"
+printf '%s\n' 'synthetic dmg payload' > "$REQUIRE_DMG"
+
+cat > "$REQUIRE_FAKE_BIN/codesign" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'codesign %s\n' "$*" >> "$FAKE_PLATFORM_CALL_LOG"
+if [[ "${1:-}" == "-dv" ]]; then
+  case "${FAKE_DMG_SIGNATURE:-absent}" in
+    absent) exit 1 ;;
+    invalid|valid) exit 0 ;;
+    *) echo "unexpected fake DMG signature state" >&2; exit 64 ;;
+  esac
+fi
+if [[ "${1:-}" == "--verify" ]]; then
+  target="${!#}"
+  if [[ "$target" == *.dmg ]]; then
+    case "${FAKE_DMG_SIGNATURE:-absent}" in
+      valid) exit 0 ;;
+      invalid) echo "fixture DMG signature is invalid" >&2; exit 1 ;;
+      absent) echo "fixture DMG signature is absent" >&2; exit 1 ;;
+    esac
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == "-d" && "${2:-}" == "--entitlements" ]]; then
+  cat <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.apple.security.personal-information.calendars</key><true/>
+</dict></plist>
+PLIST
+  exit 0
+fi
+echo "unexpected codesign invocation: $*" >&2
+exit 64
+SH
+
+cat > "$REQUIRE_FAKE_BIN/hdiutil" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'hdiutil %s\n' "$*" >> "$FAKE_PLATFORM_CALL_LOG"
+case "${1:-}" in
+  verify|detach) exit 0 ;;
+  attach)
+    mountpoint=""
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "-mountpoint" && $# -ge 2 ]]; then
+        mountpoint="$2"
+        break
+      fi
+      shift
+    done
+    [[ -n "$mountpoint" ]] || { echo "fixture attach has no mountpoint" >&2; exit 64; }
+    mkdir -p "$mountpoint"
+    ln -s "$FAKE_BUNDLE_SOURCE" "$mountpoint/NativeAgent.app"
+    ln -s /Applications "$mountpoint/Applications"
+    ;;
+  *) echo "unexpected hdiutil invocation" >&2; exit 64 ;;
+esac
+SH
+
+cat > "$REQUIRE_FAKE_BIN/xcrun" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'xcrun %s\n' "$*" >> "$FAKE_PLATFORM_CALL_LOG"
+case "${FAKE_NOTARIZATION:-absent}" in
+  valid) exit 0 ;;
+  absent) echo "fixture notarization ticket is absent" >&2; exit 1 ;;
+  invalid) echo "fixture notarization ticket is invalid" >&2; exit 1 ;;
+  *) echo "unexpected fake notarization state" >&2; exit 64 ;;
+esac
+SH
+
+cat > "$REQUIRE_FAKE_BIN/spctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'spctl %s\n' "$*" >> "$FAKE_PLATFORM_CALL_LOG"
+case "${FAKE_NOTARIZATION:-absent}" in
+  valid) exit 0 ;;
+  absent) echo "fixture notarization ticket is absent" >&2; exit 1 ;;
+  invalid) echo "fixture notarization ticket is invalid" >&2; exit 1 ;;
+  *) echo "unexpected fake notarization state" >&2; exit 64 ;;
+esac
+SH
+chmod +x "$REQUIRE_FAKE_BIN"/*
+
+write_require_flag_info() { # source-dirty Boolean, optional Sparkle public key
+  local source_dirty="$1" sparkle_key="$2" sparkle_xml=""
+  if [[ -n "$sparkle_key" ]]; then
+    sparkle_xml="<key>SUPublicEDKey</key><string>$sparkle_key</string>"
+  fi
+  cat > "$REQUIRE_INFO" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>io.github.embwl0x.nativeagent.mac</string>
+  <key>CFBundleExecutable</key><string>NativeAgentApp</string>
+  <key>CFBundleShortVersionString</key><string>$REQUIRE_VERSION</string>
+  <key>CFBundleVersion</key><string>$REQUIRE_VERSION</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
+  <key>UTExportedTypeDeclarations</key><array><dict>
+    <key>UTTypeIdentifier</key><string>com.nativeagent.chat-session</string>
+  </dict></array>
+  $sparkle_xml
+  <key>NativeAgentSourceRevision</key><string>$REQUIRE_REVISION</string>
+  <key>NativeAgentSourceDirty</key><$source_dirty/>
+</dict></plist>
+PLIST
+}
+
+run_require_flag_verifier() { # dmg-signature state, notarization state, args...
+  local dmg_signature="$1" notarization="$2"
+  shift 2
+  REQUIRE_RC=0
+  : > "$REQUIRE_CALL_LOG"
+  REQUIRE_OUTPUT="$(
+    PATH="$REQUIRE_FAKE_BIN:$PATH" \
+    FAKE_DMG_SIGNATURE="$dmg_signature" \
+    FAKE_NOTARIZATION="$notarization" \
+    FAKE_BUNDLE_SOURCE="$REQUIRE_BUNDLE" \
+    FAKE_PLATFORM_CALL_LOG="$REQUIRE_CALL_LOG" \
+    NATIVEAGENT_EXPECTED_MAC_BUNDLE_ID=io.github.embwl0x.nativeagent.mac \
+    NATIVEAGENT_PRIVACY_DENYLIST_FILE="$REQUIRE_ROOT/no-denylist" \
+    NATIVEAGENT_PRIVACY_RE='' \
+    NATIVEAGENT_LOCAL_IDENTITY_RE='' \
+    bash "$VERIFIER" "$@" 2>&1
+  )" || REQUIRE_RC=$?
+}
+
+require_flag_passes() {
+  local label="$1"
+  [[ "$REQUIRE_RC" -eq 0 ]] \
+    || fail "$label failed (rc $REQUIRE_RC):"$'\n'"$REQUIRE_OUTPUT"
+  [[ "$REQUIRE_OUTPUT" == *"verification passed"* ]] \
+    || fail "$label returned success without the verifier pass receipt:"$'\n'"$REQUIRE_OUTPUT"
+}
+
+require_flag_fails() {
+  local label="$1" expected="$2"
+  [[ "$REQUIRE_RC" -ne 0 ]] \
+    || fail "$label unexpectedly passed:"$'\n'"$REQUIRE_OUTPUT"
+  [[ "$REQUIRE_OUTPUT" == *"$expected"* ]] \
+    || fail "$label failed for the wrong reason; expected '$expected':"$'\n'"$REQUIRE_OUTPUT"
+  [[ "$REQUIRE_OUTPUT" != *"verification passed"* ]] \
+    || fail "$label printed a false pass receipt:"$'\n'"$REQUIRE_OUTPUT"
+}
+
+# Notarization is optional without the flag, but absent/invalid trust evidence
+# must fail once required. Valid stapler and Gatekeeper evidence passes.
+write_require_flag_info false ''
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE"
+require_flag_passes "bundle without --require-notarized"
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE" --require-notarized
+require_flag_fails "required absent notarization" "fixture notarization ticket is absent"
+run_require_flag_verifier absent invalid --bundle "$REQUIRE_BUNDLE" --require-notarized
+require_flag_fails "required invalid notarization" "fixture notarization ticket is invalid"
+run_require_flag_verifier absent valid --bundle "$REQUIRE_BUNDLE" --require-notarized
+require_flag_passes "required valid notarization"
+[[ "$(grep -c '^xcrun stapler validate ' "$REQUIRE_CALL_LOG")" -eq 1 \
+   && "$(grep -c '^spctl ' "$REQUIRE_CALL_LOG")" -eq 1 ]] \
+  || fail "valid bundle notarization did not execute exactly one stapler and one Gatekeeper check"
+
+# An unsigned DMG remains a development warning without the flag. Requiring the
+# signature distinguishes absent, structurally present-but-invalid, and valid.
+run_require_flag_verifier absent absent --dmg "$REQUIRE_DMG"
+require_flag_passes "unsigned development DMG"
+[[ "$REQUIRE_OUTPUT" == *"DMG is unsigned"* ]] \
+  || fail "unsigned development DMG did not emit its warning"
+run_require_flag_verifier absent absent --dmg "$REQUIRE_DMG" --require-dmg-signature
+require_flag_fails "required absent DMG signature" "DMG is not codesigned"
+run_require_flag_verifier invalid absent --dmg "$REQUIRE_DMG" --require-dmg-signature
+require_flag_fails "required invalid DMG signature" "fixture DMG signature is invalid"
+run_require_flag_verifier valid absent --dmg "$REQUIRE_DMG" --require-dmg-signature
+require_flag_passes "required valid DMG signature"
+
+# Sparkle's public key is optional for a feedless development artifact. Once
+# required it must exist, decode as base64, and contain exactly 32 bytes.
+write_require_flag_info false ''
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE" --require-sparkle-key
+require_flag_fails "required absent Sparkle key" "SUPublicEDKey is empty"
+write_require_flag_info false '!!!!'
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE" --require-sparkle-key
+require_flag_fails "required malformed Sparkle key" "SUPublicEDKey is not valid base64"
+write_require_flag_info false "$(printf 'short' | base64)"
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE" --require-sparkle-key
+require_flag_fails "required wrong-sized Sparkle key" "SUPublicEDKey must decode to 32 bytes"
+write_require_flag_info false "$REQUIRE_VALID_SPARKLE_KEY"
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE" --require-sparkle-key
+require_flag_passes "required valid Sparkle key"
+
+# Dirty provenance is allowed for development verification but is an explicit
+# release refusal when --require-clean-source is selected.
+write_require_flag_info true "$REQUIRE_VALID_SPARKLE_KEY"
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE"
+require_flag_passes "dirty development bundle"
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE" --require-clean-source
+require_flag_fails "required clean source with dirty provenance" \
+  "release artifact was built from a dirty or unknown source tree"
+write_require_flag_info false "$REQUIRE_VALID_SPARKLE_KEY"
+run_require_flag_verifier absent absent --bundle "$REQUIRE_BUNDLE" --require-clean-source
+require_flag_passes "required clean source with clean provenance"
+
+# The publication shape supplies all four flags together. This final run proves
+# the exact valid evidence set composes, including app + DMG notarization.
+run_require_flag_verifier valid valid \
+  --dmg "$REQUIRE_DMG" \
+  --require-notarized \
+  --require-dmg-signature \
+  --require-sparkle-key \
+  --require-clean-source
+require_flag_passes "combined production require flags"
+[[ "$(grep -c '^xcrun stapler validate ' "$REQUIRE_CALL_LOG")" -eq 2 \
+   && "$(grep -c '^spctl ' "$REQUIRE_CALL_LOG")" -eq 2 ]] \
+  || fail "combined production flags did not validate notarization for both app and DMG"
+
 printf '%s\n' 'release scanner integrity contract holds'
 printf '%s\n' 'release bundle identity gates passed'

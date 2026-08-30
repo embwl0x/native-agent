@@ -164,6 +164,15 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     /// projection without allowing their diagnostic traffic to become felt
     /// experience. Event turn-kind filtering remains independent.
     public var allowNonLiveProjection: Bool
+    /// Accepted chat provenance, when supplied by the shared turn owner.
+    /// Bare diagnostic callers retain legacy inference for compatibility.
+    public var turnKind: CognitiveTurnKind?
+
+    public var resolvedTurnKind: CognitiveTurnKind {
+        turnKind ?? CognitiveTurnKind.inferred(fromSignals: [
+            surface, sessionId ?? "", userMessage,
+        ])
+    }
 
     public init(
         surface: String,
@@ -172,7 +181,8 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         mode: CognitiveCapsuleMode = .inspectOnly,
         maximumCharacters: Int? = nil,
         organismProjection: OrganismProjection? = nil,
-        allowNonLiveProjection: Bool = false
+        allowNonLiveProjection: Bool = false,
+        turnKind: CognitiveTurnKind? = nil
     ) {
         self.surface = surface
         self.userMessage = userMessage
@@ -182,6 +192,7 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         self.maximumCharacters = maximumCharacters
         self.organismProjection = organismProjection
         self.allowNonLiveProjection = allowNonLiveProjection
+        self.turnKind = turnKind
     }
 }
 

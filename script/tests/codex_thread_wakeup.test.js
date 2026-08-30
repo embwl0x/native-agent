@@ -13,6 +13,44 @@ function entry(payload) {
   return { id: "entry-1", payload };
 }
 
+test("unicode preview clipping never persists half an emoji surrogate", () => {
+  const input = `${"x".repeat(999)}💜tail`;
+  const clipped = wakeup.unicodePrefix(input, 1000);
+  assert.equal(Array.from(clipped).length, 1000);
+  assert.equal(clipped.endsWith("💜"), true);
+  assert.equal(JSON.stringify({ preview: clipped }).includes("\\ud83d\""), false);
+});
+
+test("paired builder review reaches the prompt and stays absent from ordinary messages", () => {
+  const paired = wakeup.sanitizePayload({
+    messageId: "paired-review-1",
+    text: "build the change",
+    pairReviewer: true,
+    deskHandle: "desk_abc-123",
+  });
+  const pairedPrompt = wakeup.formatPrompt(paired);
+  assert.equal(paired.pairReviewer, true);
+  assert.equal(paired.deskHandle, "desk_abc-123");
+  assert.match(pairedPrompt, /pair exactly one reviewer/i);
+  assert.match(pairedPrompt, /exact committed SHA/i);
+  assert.match(pairedPrompt, /Findings return to you/i);
+  assert.match(pairedPrompt, /same reviewer inspect the resulting SHA/i);
+
+  const ordinary = wakeup.sanitizePayload({
+    messageId: "ordinary-1",
+    text: "answer a question",
+    pairReviewer: false,
+  });
+  assert.equal(ordinary.pairReviewer, undefined);
+  assert.doesNotMatch(wakeup.formatPrompt(ordinary), /PAIRED REVIEW/);
+
+  const batch = wakeup.formatBatchPrompt([
+    entry(ordinary),
+    { id: "entry-2", payload: paired },
+  ]);
+  assert.equal((batch.match(/PAIRED REVIEW/g) || []).length, 1);
+});
+
 test("per-message brain controls reach thread and turn start params", () => {
   const entries = [entry({
     messageId: "message-1",
@@ -207,6 +245,37 @@ test("completion prompt makes Agent assess the result and proactively tell User"
   assert.match(text, /Do not wait for him to ask/i);
 });
 
+test("receipt-only notes settle completed Codex turns without creating an Agent echo", () => {
+  const entries = [entry({
+    text: "Character art pass approved; no further changes requested.",
+    completionMode: "receipt_only",
+  })];
+  assert.equal(wakeup.sanitizePayload(entries[0].payload).completionMode, "receipt_only");
+  assert.equal(wakeup.shouldSuppressCompletionDelivery(entries, { status: "completed" }), true);
+  assert.equal(wakeup.shouldSuppressCompletionDelivery(entries, { status: "failed" }), false);
+  assert.equal(wakeup.shouldSuppressCompletionDelivery([
+    ...entries,
+    entry({ text: "Do the next implementation batch." }),
+  ], { status: "completed" }), false);
+});
+
+test("delegation producer identity survives Codex payload sanitization", () => {
+  const revision = "1234567890abcdef1234567890abcdef12345678";
+  const clean = wakeup.sanitizePayload(entry({
+    producerSchemaVersion: 1,
+    producerSourceRevision: revision.toUpperCase(),
+  }).payload);
+  assert.equal(clean.producerSchemaVersion, 1);
+  assert.equal(clean.producerSourceRevision, revision);
+
+  const invalid = wakeup.sanitizePayload(entry({
+    producerSchemaVersion: 0,
+    producerSourceRevision: "not-a-revision",
+  }).payload);
+  assert.equal(invalid.producerSchemaVersion, undefined);
+  assert.equal(invalid.producerSourceRevision, undefined);
+});
+
 test("empty completion tells Agent it was not automatically replayed", () => {
   const text = wakeup.formatCodexReplyForNativeAgent({
     turnId: "turn-empty",
@@ -372,12 +441,12 @@ test("hang watchdog does not trip when a long turn keeps advancing its rollout m
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("hung turn kills its exact app-server owner, clears a stale drain lock, and requeues once", async () => {
+test("hung turn kills its exact app-server owner, clears only its stale lane lock, and requeues once", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-hang-recovery-"));
   const receipts = path.join(dir, "hang-watchdog.jsonl");
-  const drainLock = path.join(dir, ".drain.lock");
-  fs.mkdirSync(drainLock);
-  fs.writeFileSync(path.join(drainLock, "pid"), "999999\n");
+  const laneLock = path.join(dir, ".lane.lock");
+  fs.mkdirSync(laneLock);
+  fs.writeFileSync(path.join(laneLock, "pid"), "999999\n");
   let ownerPID = 4242;
   let alive = true;
   const signals = [];
@@ -400,7 +469,7 @@ test("hung turn kills its exact app-server owner, clears a stale drain lock, and
     hangWatchdogReceiptsPath: receipts,
   }, {
     now: () => Date.parse("2026-08-18T21:00:00.000Z"),
-    drainLockDir: drainLock,
+    laneLockDir: laneLock,
     dirLockOwnerAlive: () => false,
     processOperations: {
       socketOwnerPid: () => ownerPID,
@@ -428,7 +497,7 @@ test("hung turn kills its exact app-server owner, clears a stale drain lock, and
   assert.equal(recovery.status, "requeued");
   assert.equal(recovery.retryCount, 1);
   assert.deepEqual(signals, [{ pid: 4242, signal: "SIGTERM" }]);
-  assert.equal(fs.existsSync(drainLock), false);
+  assert.equal(fs.existsSync(laneLock), false);
   assert.equal(queued.length, 1);
   assert.equal(queued[0].threadId, "thread-recover");
   assert.equal(queued[0].options.hangRetryCount, 1);
@@ -437,15 +506,19 @@ test("hung turn kills its exact app-server owner, clears a stale drain lock, and
   const actions = fs.readFileSync(receipts, "utf8").trim().split("\n").map(JSON.parse);
   assert.deepEqual(actions.map((row) => row.action), [
     "app_server_killed",
-    "stale_drain_lock_cleared",
+    "stale_wake_lane_lock_cleared",
     "app_server_respawned",
     "hung_wake_job_requeued",
   ]);
   assert.equal(actions[0].pidKilled, 4242);
   assert.equal(actions[3].retryCount, 1);
   for (const row of actions) {
-    assert.deepEqual(Object.keys(row).sort(), ["action", "pidKilled", "retryCount", "timestamp", "turnId"]);
+    for (const key of ["action", "pidKilled", "retryCount", "timestamp", "turnId"]) {
+      assert.ok(Object.hasOwn(row, key), `${row.action} missing ${key}`);
+    }
   }
+  assert.equal(actions[1].laneKey, "thread:thread-recover");
+  assert.equal(actions[1].lockDir, laneLock);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -468,7 +541,7 @@ test("a second hang on the same message reaches the cap and never requeues", asy
     hangMaxRetries: 1,
     hangWatchdogReceiptsPath: receipts,
   }, {
-    drainLockDir: path.join(dir, ".missing-drain.lock"),
+    laneLockDir: path.join(dir, ".missing-lane.lock"),
     processOperations: {
       socketOwnerPid: () => ownerPID,
       processStartIdentity: () => "daemon-generation-2",
@@ -1384,6 +1457,261 @@ test("pending drain uses a failure-specific deadline instead of a state poll", a
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("same-thread queue selection preserves FIFO order and normalizes conversation aliases", () => {
+  const queue = [
+    { id: "a-1", threadId: "thread-a", payload: { text: "first a" } },
+    { id: "b-1", threadId: "codex:thread-b", payload: { text: "first b" } },
+    { id: "a-2", threadId: "codex:thread-a", payload: { text: "second a" } },
+    { id: "b-2", threadId: "thread-b", payload: { text: "second b" } },
+  ];
+  assert.deepEqual(wakeup.firstPendingPerLane(queue).map((entry) => entry.id), ["a-1", "b-1"]);
+  assert.equal(
+    wakeup.firstPendingPerLane(queue.filter((entry) => entry.id !== "a-1"))
+      .find((entry) => wakeup.entryLaneKey(entry) === "thread:thread-a").id,
+    "a-2"
+  );
+  assert.equal(
+    wakeup.wakeLaneKey({}, "codex:thread-a", "pinned_thread"),
+    wakeup.wakeLaneKey({}, "thread-a", "pinned_thread")
+  );
+  const lockPath = wakeup.wakeLaneLockPath("thread:private/conversation-id", "/tmp/lane-locks");
+  assert.doesNotMatch(lockPath, /private|conversation/);
+});
+
+test("same-thread wakes NEVER overlap under real concurrent lane-lock attempts", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-same-lane-"));
+  const lanesRoot = path.join(dir, "lanes");
+  const capacityRoot = path.join(dir, "capacity");
+  const laneKey = wakeup.wakeLaneKey({}, "codex:thread-negative-control", "pinned_thread");
+  let active = 0;
+  let maximumActive = 0;
+  let entered;
+  let release;
+  const didEnter = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const operation = async () => {
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    entered();
+    await gate;
+    active -= 1;
+    return "completed";
+  };
+  try {
+    const first = wakeup.withWakeExecutionLane(laneKey, {}, operation, {
+      lanesRoot, capacityRoot,
+    });
+    await didEnter;
+    const duplicateOutcome = await Promise.race([
+      wakeup.withWakeExecutionLane(
+        wakeup.wakeLaneKey({}, "thread-negative-control", "pinned_thread"),
+        {},
+        operation,
+        { lanesRoot, capacityRoot }
+      ).then(
+        () => ({ status: "overlapped" }),
+        (error) => ({ status: "rejected", error })
+      ),
+      new Promise((resolve) => setTimeout(() => resolve({ status: "overlapped" }), 250)),
+    ]);
+    assert.equal(duplicateOutcome.status, "rejected");
+    assert.equal(duplicateOutcome.error.message, "lock_busy");
+    assert.equal(duplicateOutcome.error.reason, "wake_lane_lock_busy");
+    assert.equal(active, 1);
+    assert.equal(maximumActive, 1);
+    release();
+    assert.equal(await first, "completed");
+
+    assert.equal(await wakeup.withWakeExecutionLane(laneKey, {}, async () => "next", {
+      lanesRoot, capacityRoot,
+    }), "next");
+    assert.equal(maximumActive, 1);
+  } finally {
+    release();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("different wake lanes overlap while the filesystem admission pool caps them at four", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-cross-lane-"));
+  const lanesRoot = path.join(dir, "lanes");
+  const capacityRoot = path.join(dir, "capacity");
+  let active = 0;
+  let maximumActive = 0;
+  let admitted = 0;
+  let enteredFour;
+  let release;
+  const fourEntered = new Promise((resolve) => { enteredFour = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  try {
+    const attempts = Array.from({ length: 6 }, (_, index) => wakeup.withWakeExecutionLane(
+      `thread:cross-${index}`,
+      {},
+      async () => {
+        admitted += 1;
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        if (active === 4) enteredFour();
+        await gate;
+        active -= 1;
+        return { status: "sent", index };
+      },
+      { lanesRoot, capacityRoot, cap: 99 }
+    ).catch((error) => ({ status: "busy", reason: error.reason })));
+
+    await Promise.race([
+      fourEntered,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("four distinct lanes never overlapped")),
+        2000
+      )),
+    ]);
+    assert.equal(active, 4);
+    assert.equal(maximumActive, 4);
+    release();
+    const results = await Promise.all(attempts);
+    assert.equal(admitted, 4);
+    assert.equal(results.filter((result) => result.status === "sent").length, 4);
+    assert.equal(results.filter((result) => result.reason === "wake_capacity_busy").length, 2);
+    assert.equal(wakeup.wakeConcurrencyCap({}), 4);
+    assert.equal(wakeup.wakeConcurrencyCap({ wakeConcurrency: 99 }), 4);
+    assert.equal(wakeup.wakeConcurrencyCap({ wakeConcurrency: 2 }), 2);
+  } finally {
+    release();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("lock_busy healing is independent per wake lane", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-lane-heal-"));
+  const lanesRoot = path.join(dir, "lanes");
+  const capacityRoot = path.join(dir, "capacity");
+  const deadLane = "thread:dead-owner";
+  const liveLane = "thread:live-owner";
+  const freeLane = "thread:free";
+  const deadLock = wakeup.wakeLaneLockPath(deadLane, lanesRoot);
+  const liveLock = wakeup.wakeLaneLockPath(liveLane, lanesRoot);
+  fs.mkdirSync(deadLock, { recursive: true });
+  fs.writeFileSync(path.join(deadLock, "pid"), "999999\nnow\ndead-generation\n");
+  fs.mkdirSync(liveLock, { recursive: true });
+  fs.writeFileSync(path.join(liveLock, "pid"), `${process.pid}\nnow\n`);
+  try {
+    assert.equal(await wakeup.withWakeExecutionLane(deadLane, {}, async () => "healed", {
+      lanesRoot,
+      capacityRoot,
+      dirLockOwnerAlive: (lockDir) => lockDir === liveLock,
+    }), "healed");
+    await assert.rejects(
+      wakeup.withWakeExecutionLane(liveLane, {}, async () => "must-not-run", {
+        lanesRoot,
+        capacityRoot,
+        dirLockOwnerAlive: (lockDir) => lockDir === liveLock,
+      }),
+      (error) => error && error.reason === "wake_lane_lock_busy"
+    );
+    assert.equal(fs.existsSync(liveLock), true);
+    assert.equal(await wakeup.withWakeExecutionLane(freeLane, {}, async () => "independent", {
+      lanesRoot,
+      capacityRoot,
+      dirLockOwnerAlive: (lockDir) => lockDir === liveLock,
+    }), "independent");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stale queued wake requeues in place only after two dead-turn proofs", async () => {
+  const now = Date.parse("2026-08-27T18:00:00.000Z");
+  const entry = {
+    id: "queue-stale-1",
+    key: "thread-stale:message-stale-1",
+    laneKey: "thread:thread-stale",
+    threadId: "thread-stale",
+    addedAt: new Date(now - 16 * 60 * 1000).toISOString(),
+    payload: { messageId: "message-stale-1", text: "preserve this exact work" },
+  };
+  const probes = [];
+  let marked = null;
+  let receipt = null;
+  const result = await wakeup.recoverStaleQueuedWake(entry, {
+    active: true,
+    inProgressTurnIds: ["turn-dead"],
+  }, {}, {
+    now: () => now,
+    sleep: async (milliseconds) => { assert.equal(milliseconds, 5000); },
+    probeTurnLiveness: async (threadId, turnId) => {
+      probes.push({ threadId, turnId });
+      return { serverReachable: true, turnFound: false, turnClaimsInProgress: false };
+    },
+    markPendingStaleRecovery: async (candidate, recovery) => {
+      marked = { candidate, recovery };
+      return { status: "requeued", entry: { ...candidate, staleRecovery: recovery } };
+    },
+    appendReceipt: async (recovery) => {
+      receipt = recovery;
+      return "/tmp/stale-wake-receipt";
+    },
+  });
+
+  assert.equal(result.status, "requeued");
+  assert.deepEqual(probes, [
+    { threadId: "thread-stale", turnId: "turn-dead" },
+    { threadId: "thread-stale", turnId: "turn-dead" },
+  ]);
+  assert.equal(marked.candidate.id, entry.id);
+  assert.equal(marked.candidate.key, entry.key);
+  assert.equal(marked.candidate.addedAt, entry.addedAt);
+  assert.equal(result.entry.payload.messageId, "message-stale-1");
+  assert.deepEqual(result.ignoredTurnIds, ["turn-dead"]);
+  assert.equal(receipt.messageId, "message-stale-1");
+  assert.equal(receipt.originalAddedAt, entry.addedAt);
+  assert.equal(result.receiptPath, "/tmp/stale-wake-receipt");
+
+  let repeatedProofWork = 0;
+  const retried = await wakeup.recoverStaleQueuedWake(result.entry, {
+    active: true,
+    inProgressTurnIds: ["turn-dead"],
+  }, {}, {
+    now: () => now,
+    probeTurnLiveness: async () => { repeatedProofWork += 1; },
+    markPendingStaleRecovery: async () => { repeatedProofWork += 1; },
+    appendReceipt: async () => { repeatedProofWork += 1; },
+  });
+  assert.equal(retried.status, "requeued");
+  assert.equal(retried.reusedRecovery, true);
+  assert.deepEqual(retried.ignoredTurnIds, ["turn-dead"]);
+  assert.equal(repeatedProofWork, 0);
+});
+
+test("an old queued wake never evicts a turn that still proves live", async () => {
+  const now = Date.parse("2026-08-27T18:00:00.000Z");
+  let mutations = 0;
+  let receipts = 0;
+  const result = await wakeup.recoverStaleQueuedWake({
+    id: "queue-live-old",
+    key: "thread-live:message-live",
+    laneKey: "thread:thread-live",
+    threadId: "thread-live",
+    addedAt: new Date(now - 24 * 60 * 60 * 1000).toISOString(),
+    payload: { messageId: "message-live", text: "wait behind live work" },
+  }, {
+    active: true,
+    inProgressTurnIds: ["turn-live"],
+  }, {}, {
+    now: () => now,
+    probeTurnLiveness: async () => ({
+      serverReachable: true,
+      turnFound: true,
+      turnClaimsInProgress: true,
+    }),
+    markPendingStaleRecovery: async () => { mutations += 1; },
+    appendReceipt: async () => { receipts += 1; },
+  });
+  assert.equal(result.status, "preserved_live");
+  assert.equal(mutations, 0);
+  assert.equal(receipts, 0);
 });
 
 test("drainer heartbeat writes atomically on its configured interval", async () => {
@@ -2389,9 +2717,14 @@ test("an ambiguous 409 preserves the full reply instead of deleting it", async (
     const job = { id: "job-1", threadId: "t", turnId: "u", completedExecution: { turnResult: { message: "the full codex reply" } } };
     fs.writeFileSync(jobPath, JSON.stringify(job));
 
-    const result = wakeup.finalizeReplyJobFile(jobPath, {
+    const bridge = {
       status: "failed", httpStatus: 409, replyStatus: "outcome_unknown",
-    });
+    };
+    wakeup.persistReplyJobDeliveryState(jobPath, job, bridge);
+    assert.equal(job.phase, "delivery_unknown");
+    assert.equal(job.delivery.outcome, "unknown");
+    assert.equal(job.delivery.status, "failed");
+    const result = wakeup.finalizeReplyJobFile(jobPath, bridge);
     assert.equal(result.disposition, "preserve");
     assert.equal(result.preserved, true);
     assert.equal(fs.existsSync(jobPath), false);
@@ -2430,16 +2763,72 @@ test("preserved replies are 0600 and the undelivered store is capped", () => {
     // gpt-5.5 review MED: nothing else ever deletes preserved jobs, so the
     // store bounds itself — oldest evicted past the cap, newest kept.
     const undeliveredDir = path.join(jobsDir, "undelivered");
+    // Stamps must stay INSIDE the retention window: this test pins the count
+    // cap's eviction ORDER, and epoch-1970 stamps would be deleted by the
+    // age-out rule (C9-4) before the cap ever ran.
+    const base = Date.now() - 60 * 60 * 1000;
     for (let i = 0; i < 210; i += 1) {
       const p = path.join(undeliveredDir, `old-${String(i).padStart(3, "0")}.json`);
       fs.writeFileSync(p, "{}", { mode: 0o600 });
-      fs.utimesSync(p, new Date(1000000 + i), new Date(1000000 + i));
+      fs.utimesSync(p, new Date(base + i * 1000), new Date(base + i * 1000));
     }
     wakeup.pruneUndeliveredReplyJobs(undeliveredDir);
     const left = fs.readdirSync(undeliveredDir).filter((n) => n.endsWith(".json"));
     assert.equal(left.length, 200);
     assert.equal(left.includes("old-000.json"), false, "oldest evicted first");
     assert.equal(left.includes("old-209.json"), true, "newest kept");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// C9-4 (upgrade sweep 2026-08-28). The count cap never expired anything below
+// 200, so the live store held 16-day-old terminal replies with no path to zero
+// and DelegationOutcomeLoop kept carding the backlog. Age-out closes that.
+test("preserved replies age out past the retention window", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-job-age-out-"));
+  const undeliveredDir = path.join(dir, "undelivered");
+  fs.mkdirSync(undeliveredDir);
+  try {
+    const write = (name, ageMs) => {
+      const p = path.join(undeliveredDir, name);
+      fs.writeFileSync(p, "{}", { mode: 0o600 });
+      const when = new Date(Date.now() - ageMs);
+      fs.utimesSync(p, when, when);
+      return p;
+    };
+    const day = 24 * 60 * 60 * 1000;
+    write("ancient.json", 45 * day);
+    write("stale.json", 31 * day);
+    write("recent.json", 16 * day);
+    write("fresh.json", 60 * 1000);
+
+    // Well under the count cap: without the age rule NOTHING would be deleted.
+    wakeup.pruneUndeliveredReplyJobs(undeliveredDir);
+    const left = fs.readdirSync(undeliveredDir).filter((n) => n.endsWith(".json")).sort();
+    assert.deepEqual(left, ["fresh.json", "recent.json"]);
+
+    // Negative control: the age rule is opt-outable and is NOT what enforces
+    // the count cap — with age-out disabled every file survives.
+    write("ancient.json", 45 * day);
+    wakeup.pruneUndeliveredReplyJobs(undeliveredDir, 200, 0);
+    assert.equal(
+      fs.readdirSync(undeliveredDir).filter((n) => n.endsWith(".json")).length,
+      3,
+      "maxAgeMs=0 disables age-out"
+    );
+
+    // A file whose mtime could not be read (stamped 0) is left to the count
+    // cap, never deleted by the age rule alone.
+    const unstattable = path.join(undeliveredDir, "zero-mtime.json");
+    fs.writeFileSync(unstattable, "{}", { mode: 0o600 });
+    fs.utimesSync(unstattable, new Date(0), new Date(0));
+    wakeup.pruneUndeliveredReplyJobs(undeliveredDir);
+    assert.equal(
+      fs.existsSync(unstattable),
+      true,
+      "an unreadable (0) mtime must not be deleted on a failed stat"
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -2499,5 +2888,136 @@ test("all builder wake helpers use the shared event-driven process owner", () =>
     assert.ok(start > 0, `${name} not found`);
     const wrapper = source.slice(start, start + 2200);
     assert.ok(wrapper.includes("runBuilderWakeupHelper("), `${name} must delegate to the shared owner`);
+  }
+});
+
+// Wave 2, 2026-08-27. `codex:new` was stripped to the literal string "new" and
+// enqueued as a PINNED thread id; the app-server rejected it with an
+// unretryable parse error and the drain retried it 741 times in ~5 minutes,
+// starving the two rows queued behind it in the same `thread:new` lane.
+test("non-thread sentinels resolve to no-thread, real aliases survive", () => {
+  for (const sentinel of ["codex:new", "new", "NEW", "  ", "", "latest", "none",
+                          "00000000-0000-0000-0000-000000000000"]) {
+    assert.equal(wakeup.canonicalCodexThreadId(sentinel), null, `sentinel: ${sentinel}`);
+  }
+  // The alias-normalization contract above must survive: lane ids may be
+  // non-UUID, and `codex:` is only a handle prefix.
+  assert.equal(wakeup.canonicalCodexThreadId("thread-a"), "thread-a");
+  assert.equal(wakeup.canonicalCodexThreadId("codex:thread-a"), "thread-a");
+  const real = "01a043a9-2849-4d0e-9f2b-0000000000aa";
+  assert.equal(wakeup.canonicalCodexThreadId(`codex:${real}`), real);
+});
+
+test("a thread-less wake starts fresh instead of pinning to a name nothing resolves", () => {
+  assert.notEqual(wakeup.wakeupMode({}, { threadId: "codex:new" }), "pinned_thread");
+  assert.notEqual(wakeup.wakeupMode({}, { threadId: "" }), "pinned_thread");
+  assert.equal(wakeup.wakeupMode({}, { threadId: "01a043a9-2849-4d0e-9f2b-0000000000aa" }), "pinned_thread");
+  assert.equal(wakeup.wakeupMode({}, { threadId: "codex:thread-a" }), "pinned_thread");
+  // …and thread-less rows must not all collapse into ONE serialized lane, which
+  // is what starved lanes B and C behind lane A.
+  const a = wakeup.wakeLaneKey({ messageId: "A" }, wakeup.canonicalCodexThreadId("codex:new"), "fresh_thread");
+  const b = wakeup.wakeLaneKey({ messageId: "B" }, wakeup.canonicalCodexThreadId("codex:new"), "fresh_thread");
+  assert.notEqual(a, b);
+  assert.doesNotMatch(a, /thread:new/);
+});
+
+test("unretryable wakes are dead-lettered, retryable ones keep their attempts", () => {
+  // The app-server's own words are authoritative.
+  assert.equal(wakeup.isTerminalWakeFailure({ threadId: "new", attempts: 0 },
+    "invalid thread id: invalid character: ... found `n` at 1"), true);
+  assert.equal(wakeup.isTerminalWakeFailure({ threadId: "00000000-0000-0000-0000-000000000000", attempts: 0 },
+    "thread not loaded: 00000000-0000-0000-0000-000000000000"), true);
+  // A sentinel pinned id can never resolve, whatever the transport said.
+  assert.equal(wakeup.isTerminalWakeFailure({ threadId: "new", attempts: 0 }, "socket hang up"), true);
+  // A real alias/uuid with a transient failure must keep retrying…
+  assert.equal(wakeup.isTerminalWakeFailure({ threadId: "thread-a", attempts: 0 }, "socket hang up"), false);
+  // …and a FRESH row carries threadId null BY DESIGN — dead-lettering it on
+  // attempt 1 would turn this hot-loop fix into silent work loss.
+  assert.equal(wakeup.isTerminalWakeFailure({ threadId: null, attempts: 0 }, "socket hang up"), false);
+  // But nothing retries forever.
+  assert.equal(wakeup.isTerminalWakeFailure({ threadId: null, attempts: 999 }, "socket hang up"), true);
+});
+
+test("dead-lettering removes the row and preserves the caller's payload", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-deadletter-"));
+  const pending = path.join(dir, "pending-wakeups.json");
+  const deadLetter = path.join(dir, "dead-letter.jsonl");
+  const inbox = path.join(dir, "codex-inbox.jsonl");
+  const priorPending = process.env.NATIVE_AGENT_CODEX_PENDING_PATH;
+  const priorLock = process.env.NATIVE_AGENT_CODEX_PENDING_LOCK;
+  const priorDead = process.env.NATIVE_AGENT_CODEX_DEAD_LETTER_PATH;
+  const priorInboxLock = process.env.NATIVE_AGENT_CODEX_INBOX_LOCK;
+  process.env.NATIVE_AGENT_CODEX_PENDING_PATH = pending;
+  process.env.NATIVE_AGENT_CODEX_PENDING_LOCK = path.join(dir, ".pending.lock");
+  process.env.NATIVE_AGENT_CODEX_DEAD_LETTER_PATH = deadLetter;
+  process.env.NATIVE_AGENT_CODEX_INBOX_LOCK = path.join(dir, ".inbox.lock");
+  try {
+    const poison = { id: "poison-1", threadId: "new", attempts: 3,
+                     payload: { messageId: "M1", text: "the caller's brief", inboxPath: inbox } };
+    fs.writeFileSync(pending, JSON.stringify([poison], null, 2));
+    fs.writeFileSync(inbox, JSON.stringify({
+      id: "M1", messageId: "M1", read: false, text: "the caller's brief",
+    }) + "\n");
+    // Must not throw: this path referenced a helper that did not exist, so every
+    // terminal failure crashed the drain and left the row spinning.
+    await wakeup.deadLetterPendingEntry(poison, "invalid thread id", "terminal_rpc_failure");
+    assert.deepEqual(JSON.parse(fs.readFileSync(pending, "utf8")), []);
+    const rows = fs.readFileSync(deadLetter, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(rows[rows.length - 1].entry.payload.text, "the caller's brief");
+    const inboxRow = JSON.parse(fs.readFileSync(inbox, "utf8").trim());
+    assert.equal(inboxRow.read, false, "terminal failure is not successful consumption");
+    assert.equal(inboxRow.deliveryStatus, "dead_letter");
+    assert.equal(inboxRow.deliveryFailureReason, "terminal_rpc_failure");
+    assert.ok(inboxRow.deliveryTerminalAt);
+  } finally {
+    if (priorPending === undefined) delete process.env.NATIVE_AGENT_CODEX_PENDING_PATH;
+    else process.env.NATIVE_AGENT_CODEX_PENDING_PATH = priorPending;
+    if (priorLock === undefined) delete process.env.NATIVE_AGENT_CODEX_PENDING_LOCK;
+    else process.env.NATIVE_AGENT_CODEX_PENDING_LOCK = priorLock;
+    if (priorDead === undefined) delete process.env.NATIVE_AGENT_CODEX_DEAD_LETTER_PATH;
+    else process.env.NATIVE_AGENT_CODEX_DEAD_LETTER_PATH = priorDead;
+    if (priorInboxLock === undefined) delete process.env.NATIVE_AGENT_CODEX_INBOX_LOCK;
+    else process.env.NATIVE_AGENT_CODEX_INBOX_LOCK = priorInboxLock;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup repair projects historical dead letters without replaying or consuming", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-deadletter-repair-"));
+  const deadLetter = path.join(dir, "dead-letter.jsonl");
+  const inbox = path.join(dir, "codex-inbox.jsonl");
+  const priorInboxLock = process.env.NATIVE_AGENT_CODEX_INBOX_LOCK;
+  process.env.NATIVE_AGENT_CODEX_INBOX_LOCK = path.join(dir, ".inbox.lock");
+  try {
+    fs.writeFileSync(inbox, [
+      JSON.stringify({ id: "M1", read: false, text: "brief one" }),
+      JSON.stringify({ id: "M2", read: true, text: "brief two" }),
+    ].join("\n") + "\n");
+    fs.writeFileSync(deadLetter, [
+      JSON.stringify({
+        deadLetteredAt: "2026-08-27T01:00:00Z",
+        reason: "terminal_result",
+        entry: { id: "wake-1", payload: { messageId: "M1", inboxPath: inbox } },
+      }),
+      JSON.stringify({
+        deadLetteredAt: "2026-08-27T02:00:00Z",
+        reason: "terminal_rpc_failure",
+        entry: { id: "wake-2", payload: { messageId: "M2", inboxPath: inbox } },
+      }),
+    ].join("\n") + "\n");
+
+    const repaired = await wakeup.repairTerminalFromDeadLetters({ path: deadLetter });
+    assert.equal(repaired.status, "completed");
+    assert.equal(repaired.markedCount, 2);
+    const rows = fs.readFileSync(inbox, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(rows[0].read, false);
+    assert.equal(rows[0].deliveryStatus, "dead_letter");
+    assert.equal(rows[0].deliveryTerminalAt, "2026-08-27T01:00:00Z");
+    assert.equal(rows[1].read, true, "repair preserves the user's existing read state");
+    assert.equal(rows[1].deliveryFailureReason, "terminal_rpc_failure");
+  } finally {
+    if (priorInboxLock === undefined) delete process.env.NATIVE_AGENT_CODEX_INBOX_LOCK;
+    else process.env.NATIVE_AGENT_CODEX_INBOX_LOCK = priorInboxLock;
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

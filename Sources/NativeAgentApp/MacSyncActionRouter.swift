@@ -123,6 +123,58 @@ struct MacSyncActionRouter {
         )
     }
 
+    /// A phone delivery acknowledgement becomes organism evidence only after
+    /// its canonical receipt is durable. The injected seams keep the ordering
+    /// contract directly testable without touching the live data root.
+    static func notificationReceiptResponse(
+        payload: [String: String],
+        confirm: (String, String, String) async -> Bool,
+        receive: (String, String) async -> Void
+    ) async -> [String: String] {
+        let eventID = (payload["eventId"] ?? payload["event_id"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard NativeAgentDeviceEventIdentity.isCanonical(eventID) else {
+            return [
+                "status": "error",
+                "ok": "false",
+                "code": "invalid_event_id",
+                "message": "Notification receipt requires a canonical eventId.",
+            ]
+        }
+        let direction = (payload["direction"] ?? payload["receiptDirection"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard direction == "mac_to_ios" || direction == "ios_to_mac" else {
+            return [
+                "status": "error",
+                "ok": "false",
+                "code": "invalid_direction",
+                "message": "Notification receipt requires an explicit direction of mac_to_ios or ios_to_mac.",
+            ]
+        }
+        let channel = String((payload["channel"] ?? "ios").prefix(80))
+        guard await confirm(direction, eventID, channel) else {
+            return [
+                "status": "error",
+                "ok": "false",
+                "code": "receipt_persistence_failed",
+                "message": "Notification receipt could not be filed; delivery was not marked received.",
+                "eventId": eventID,
+                "direction": direction,
+                "channel": channel,
+            ]
+        }
+        if direction == "mac_to_ios" {
+            await receive(eventID, channel)
+        }
+        return [
+            "status": "ok",
+            "ok": "true",
+            "eventId": eventID,
+            "direction": direction,
+            "channel": channel,
+        ]
+    }
+
     var cancelChatTask: (String) -> Bool
 
     func dispatch(_ action: InboxAction) async -> [String: String] {
@@ -418,27 +470,23 @@ struct MacSyncActionRouter {
                 ]
 
             case "recordNotificationReceipt":
-                let eventID = (payload["eventId"] ?? payload["event_id"] ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard NativeAgentDeviceEventIdentity.isCanonical(eventID) else {
-                    return observed([
-                        "status": "error",
-                        "ok": "false",
-                        "code": "invalid_event_id",
-                        "message": "Notification receipt requires a canonical eventId.",
-                    ])
-                }
-                let channel = String((payload["channel"] ?? "ios").prefix(80))
-                await MacSyncMobileNotificationRelay.receiveDeliveryPrediction(
-                    eventID: eventID,
-                    channel: channel
-                )
-                return observed([
-                    "status": "ok",
-                    "ok": "true",
-                    "eventId": eventID,
-                    "channel": channel,
-                ])
+                return observed(await Self.notificationReceiptResponse(
+                    payload: payload,
+                    confirm: { direction, eventID, channel in
+                        await iCloudBridge.confirmChatDeliveryReceipt(
+                            direction: direction,
+                            eventID: eventID,
+                            channel: channel,
+                            dataRoot: NativeAgentPaths.dataRoot
+                        )
+                    },
+                    receive: { eventID, channel in
+                        await MacSyncMobileNotificationRelay.receiveDeliveryPrediction(
+                            eventID: eventID,
+                            channel: channel
+                        )
+                    }
+                ))
 
             case "cancelChat":
                 var sessionId = payload["sessionId"] ?? payload["session_id"] ?? ""

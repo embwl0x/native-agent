@@ -412,6 +412,7 @@ enum TurnInspectorGrouping {
 /// file is already bounded; the reader additionally guards against an
 /// unexpectedly huge file by reading the whole thing once (acceptable: capped).
 struct TurnTraceReplayReader {
+    static let replayCache = TurnTraceReplayCache()
 
     /// Resolve the per-day file path under the live (or overridden) trace root.
     /// Mirrors `TurnTracePersistLane.path(for:)` so live + replay read the same
@@ -426,11 +427,27 @@ struct TurnTraceReplayReader {
     /// array if the file is absent (no turns recorded that day) — not an error.
     /// Bad rows are counted in `skipped` for diagnostics.
     static func read(_ url: URL) -> (events: [TurnTraceEvent], skipped: Int) {
+        let key = url.resolvingSymlinksInPath().path
+        let before = TurnTraceReplayCache.fileStamp(url)
+        if let cached = replayCache.lookup(key: key, stamp: before) {
+            return cached
+        }
         guard let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else {
-            return ([], 0)
+            let empty: TurnTraceReplayCache.Result = ([], 0)
+            if let before,
+               before == TurnTraceReplayCache.fileStamp(url) {
+                replayCache.store(key: key, stamp: before, result: empty)
+            }
+            return empty
         }
-        return parse(text)
+        let result = parse(text)
+        if let before,
+           before.byteCount <= TurnTraceReplayCache.maximumCacheableBytes,
+           before == TurnTraceReplayCache.fileStamp(url) {
+            replayCache.store(key: key, stamp: before, result: result)
+        }
+        return result
     }
 
     /// Pure parse of newline-delimited JSON rows. Extracted so it is unit
@@ -441,8 +458,12 @@ struct TurnTraceReplayReader {
         for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty else { continue }
+            let physicalByteCount = line.utf8.count + 1
             guard let value = try? JSONValue.parse(Data(line.utf8)),
-                  let event = TurnTraceEvent(jsonRow: value) else {
+                  let event = TurnTraceEvent(
+                    persistedJSONRow: value,
+                    physicalByteCount: physicalByteCount
+                  ) else {
                 skipped += 1
                 continue
             }
@@ -457,5 +478,102 @@ struct TurnTraceReplayReader {
         f.timeZone = TimeZone.current
         f.dateFormat = "yyyy-MM-dd"
         return f.string(from: date)
+    }
+}
+
+/// Small process-wide cache for the two day files used by the recurring mobile
+/// summary pass. Yesterday is immutable and today's file changes only when a
+/// turn emits trace rows, so reparsing both every 30 seconds was pure idle CPU.
+/// Stat-strength identity keeps the append-only file authoritative; files over
+/// 2 MiB are deliberately not retained to bound decoded-event memory when the
+/// user browses an unusually large historical day.
+final class TurnTraceReplayCache: @unchecked Sendable {
+    typealias Result = (events: [TurnTraceEvent], skipped: Int)
+
+    enum FileStamp: Equatable {
+        case absent
+        case present(device: Int32, inode: UInt64, size: Int64, seconds: Int, nanoseconds: Int)
+
+        var byteCount: Int64 {
+            if case .present(_, _, let size, _, _) = self { return size }
+            return 0
+        }
+    }
+
+    static let maximumCacheableBytes: Int64 = 2 * 1_024 * 1_024
+    static let maximumEntries = 3
+
+    private struct Entry {
+        let stamp: FileStamp
+        let result: Result
+    }
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+    private var order: [String] = []
+    private var counters: [String: (hits: Int, misses: Int)] = [:]
+
+    static func fileStamp(_ url: URL) -> FileStamp? {
+        var info = stat()
+        if stat(url.path, &info) == 0 {
+            return .present(
+                device: info.st_dev,
+                inode: info.st_ino,
+                size: Int64(info.st_size),
+                seconds: info.st_mtimespec.tv_sec,
+                nanoseconds: info.st_mtimespec.tv_nsec
+            )
+        }
+        return errno == ENOENT ? .absent : nil
+    }
+
+    func lookup(key: String, stamp: FileStamp?) -> Result? {
+        lock.lock()
+        defer { lock.unlock() }
+        var tally = counters[key] ?? (0, 0)
+        guard let stamp, let entry = entries[key], entry.stamp == stamp else {
+            tally.misses += 1
+            note(key: key, tally: tally)
+            return nil
+        }
+        tally.hits += 1
+        note(key: key, tally: tally)
+        return entry.result
+    }
+
+    func store(key: String, stamp: FileStamp, result: Result) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard stamp.byteCount <= Self.maximumCacheableBytes else { return }
+        if entries[key] == nil {
+            order.append(key)
+            while order.count > Self.maximumEntries, let oldest = order.first {
+                order.removeFirst()
+                entries[oldest] = nil
+            }
+        }
+        entries[key] = Entry(stamp: stamp, result: result)
+    }
+
+    private func note(key: String, tally: (hits: Int, misses: Int)) {
+        if counters[key] == nil, counters.count >= Self.maximumEntries * 8 {
+            counters.removeAll()
+        }
+        counters[key] = tally
+    }
+
+    func forget(key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries[key] = nil
+        order.removeAll { $0 == key }
+        counters[key] = nil
+    }
+
+    func _testStats(key: String) -> (hits: Int, misses: Int, entries: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let tally = counters[key] ?? (0, 0)
+        return (tally.hits, tally.misses, entries.count)
     }
 }

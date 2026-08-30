@@ -270,6 +270,12 @@ public protocol KeywordRecallStorageProtocol: MemoryStorageProtocol {
     ) async throws -> [ScoredMemoryRecord]
 }
 
+/// Exact canonical lookup for supported stores only. No list-all fallback:
+/// disclosure/lifecycle/quality remain enforced by the MemoryV2 read boundary.
+protocol MemoryRecordLookupStorage: MemoryStorageProtocol {
+    func lookupMemoryRecord(id: String) async throws -> MemoryRecord?
+}
+
 public extension MemoryStorageProtocol {
     func insert(
         record: MemoryRecord,
@@ -387,6 +393,7 @@ extension SwiftNativeMemoryV2 {
     public func recall(_ query: MemoryV2RecallRequest) async throws -> MemoryV2RecallResponse {
         guard !query.text.isEmpty else { throw MemoryV2Error.invalidQuery }
         guard let storage else { throw MemoryV2Error.storageUnavailable }
+        try Task.checkCancellation()
         // Sweep R4 A5: a cold/failed embedder used to THROW out of here, so the
         // caller's whole recall lane collapsed to zero hits on the first message
         // after launch. Catch it and degrade to the lexical lane instead. A
@@ -408,6 +415,10 @@ extension SwiftNativeMemoryV2 {
         // a broken dense lane behind plausible keyword hits (gpt-5.5 review
         // 2026-08-06, blocking #2; fail-loud doctrine). Only the warm-up
         // race gets the graceful path.
+        // A provider can transiently throw CancellationError without this
+        // caller being canceled. Preserve that cold-model fallback, but never
+        // turn an actually canceled request into another retrieval attempt.
+        try Task.checkCancellation()
         let qvec = queryEmbedding?.vector ?? []
         let topK = max(1, query.topK)
         // Disclosure filtering happens before results leave MemoryV2. Fetch a
@@ -459,13 +470,24 @@ extension SwiftNativeMemoryV2 {
         } else {
             scored = []
         }
+        try Task.checkCancellation()
         let disclosed = scored.filter { scoredRecord in
             guard let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record) else {
                 return false
             }
             return classification.permits(surface: query.surface, personaID: query.persona)
         }
-        let sorted = Array(disclosed.sorted { $0.score > $1.score }.prefix(topK))
+        // storageTopK is a wider disclosure candidate window, not the result
+        // budget. Reapply the existing skill-hint share AFTER disclosure at
+        // the actual requested size so hints cannot consume the entire answer.
+        let sorted = MemoryRecallScoring.selectRecallResults(
+            from: disclosed.sorted { $0.score > $1.score }, limit: topK
+        ) {
+            MemoryRecallScoring.isSkillRecallHint(
+                id: $0.record.id,
+                kind: $0.record.memoryKind ?? MemoryRecallScoring.kind(of: $0.record.extras)
+            )
+        }.sorted { $0.score > $1.score }
         // Dead-lane alarm (2026-07-24): `persona` is an exact-equality filter
         // over RECORD persona ids (configured agent names). A
         // caller that hands it a persona SLOT id can never match a row, so the
@@ -490,6 +512,7 @@ extension SwiftNativeMemoryV2 {
         // latency is unchanged (Agent's zero-read-cost constraint). This is the
         // signal that stops archiveStale from evicting hot-but-never-merged
         // memories as "unused" (#0).
+        try Task.checkCancellation()
         let usedIds = sorted.map { $0.record.id }
         if !usedIds.isEmpty {
             let storageRef = storage
@@ -517,6 +540,7 @@ extension SwiftNativeMemoryV2 {
                 sr.record.text,
                 kind: sr.record.memoryKind
             )
+            let content = MemoryTextClip.sentenceClip(displayText, cap: memoryRecallContentCap)
             // Sweep R4 A4: the prompt renderer stamps a compact
             // `[YYYY-MM-DD, kind]` provenance marker on each recalled row so the
             // model can tell a stale fact from a fresh correction. `ts` was
@@ -524,18 +548,28 @@ extension SwiftNativeMemoryV2 {
             // (documented as the landing spot for extra keys) rather than a new
             // struct field, so the hit shape is unchanged.
             var extras: [String: JSONValue] = ["id": .string(sr.record.id)]
+            if content.count < displayText.count {
+                extras["content_truncated"] = .bool(true)
+                extras["full_content_chars"] = .int(Int64(displayText.count))
+            }
             if let kind = sr.record.memoryKind?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !kind.isEmpty {
                 extras["kind"] = .string(kind)
             }
+            // Descriptive canonical dates, not storage chronology or a
+            // validity-now decision. Explicit recall needs the same dated
+            // fact context that the automatic memory projection retains.
+            if let value = sr.record.validFrom { extras["valid_from"] = .string(value) }
+            if let value = sr.record.validTo { extras["valid_to"] = .string(value) }
+            if let value = sr.record.observedAt { extras["observed_at"] = .string(value) }
             return MemoryRecallHit(
                 score: sr.score,
                 sessionId: sr.record.sourceRunId,
                 role: nil,
                 ts: sr.record.createdAt,
                 preview: MemoryTextClip.sentenceClip(displayText, cap: memoryRecallPreviewCap),
-                content: MemoryTextClip.sentenceClip(displayText, cap: memoryRecallContentCap),
+                content: content,
                 source: usedKeywordFallback ? "swift-native-keyword-fallback" : "swift-native",
                 rankingSignals: nil,
                 extras: .object(extras)
@@ -547,6 +581,29 @@ extension SwiftNativeMemoryV2 {
             total: sorted.count,
             disclosureFilteredCount: scored.count - disclosed.count
         )
+    }
+
+    /// Exact-ID recovery for a previously recalled excerpt. Does not embed,
+    /// rank, enumerate records, or expose an admin/lineage bypass.
+    public func readMemoryRecord(id: String, persona: String? = nil, surface: String) async throws -> MemoryRecord? {
+        let id = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty, id.utf8.count <= 512 else { throw MemoryV2Error.invalidQuery }
+        guard let lookup = storage as? any MemoryRecordLookupStorage else {
+            throw MemoryV2Error.storageUnavailable
+        }
+        try Task.checkCancellation()
+        guard let record = try await lookup.lookupMemoryRecord(id: id),
+              record.id == id,
+              persona == nil || record.personaId == persona,
+              let disclosure = MemoryRecordDisclosurePolicy.classify(record),
+              disclosure.permits(surface: surface, personaID: persona),
+              MemoryCandidateQuality.isDurableCandidate(
+                text: record.text, source: record.sourceRunId, kind: record.memoryKind
+              ) else { return nil }
+        let tombstoned = try await lookup.isTombstoned(content: record.text)
+        guard !tombstoned else { return nil }
+        try Task.checkCancellation()
+        return record
     }
 
     /// Zero-hit path: decide whether the PERSONA FILTER specifically emptied
@@ -734,13 +791,22 @@ extension SwiftNativeMemoryV2 {
             }
         }
 
-        // 3. Observation time: the newest occurrence is when this was last true.
+        // 3. Observation time: when the newest evidence was observed, not a
+        //    new assertion of present validity.
         //    First-class column (the bridge maps `observed_at` → observedAt);
-        //    only ever moves FORWARD, and only for a parseable timestamp.
-        if case .string(let raw)? = newMeta["observed_at"],
-           MemoryRecallScoring.parseTimestamp(raw) != nil {
-            let current = existing.observedAt ?? ""
-            if raw > current { out["observed_at"] = .string(raw) }
+        //    only ever moves FORWARD by instant, never by ISO string order:
+        //    offsets and fractional seconds need not sort chronologically.
+        //    Match new-record alias precedence; an explicit malformed value
+        //    must not overwrite canonical observation time.
+        var observedAt: String?
+        if case .string(let value)? = newMeta["observed_at"] { observedAt = value }
+        if case .string(let value)? = newMeta["observedAt"] { observedAt = value }
+        if let raw = observedAt,
+           let observed = MemoryRecallScoring.parseTimestamp(raw) {
+            let current = existing.observedAt.flatMap(MemoryRecallScoring.parseTimestamp)
+            if current.map({ observed > $0 }) ?? true {
+                out["observed_at"] = .string(raw)
+            }
         }
         return out
     }
@@ -806,11 +872,16 @@ extension SwiftNativeMemoryV2 {
             ) {
                 patch[key] = value
             }
-            return try await storage.updateMemory(
+            let updated = try await storage.updateMemory(
                 id: existing.id,
                 patch: .object(patch),
                 newEmbedding: nil
             )
+            // Reassertions can advance observed dates and provenance even
+            // when prose/identity stay unchanged. Match new-record completion
+            // so the next prepared context sees the committed evidence.
+            await flushDerivedMemoryChanges()
+            return updated
         }
         // Embed ONCE; the same vector serves the semantic tombstone gate and
         // the insert. Wave1 T3: a paraphrase of a deleted claim blocks here at
@@ -1078,7 +1149,7 @@ extension SwiftNativeMemoryV2 {
 // A trivial in-memory `MemoryStorageProtocol` for tests and any callsite that
 // wants to exercise the actor before m1's SQLite-backed `MemoryStorage` lands.
 // NOT for production use.
-public actor InMemoryMemoryStorage: MemoryStorageProtocol {
+public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupStorage {
     private var records: [String: MemoryRecord] = [:]
     private var embeddings: [String: [Float]] = [:]
     private var personas: [String: String] = [:]
@@ -1087,6 +1158,8 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol {
     private var proposalEmbeddings: [String: [Float]] = [:]
 
     public init() {}
+
+    func lookupMemoryRecord(id: String) async throws -> MemoryRecord? { records[id] }
 
     public func listMemory(kind: String?) async throws -> [MemoryRecord] {
         let all = Array(records.values)

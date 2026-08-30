@@ -48,7 +48,14 @@ struct SlackSocketModeConfig: Sendable, Equatable {
 
     static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> SlackSocketModeConfig? {
         let objects = tokenObjects(dataRoot: dataRoot)
-        let botToken = firstString(keys: ["access_token", "bot_token"], in: objects)
+        // Match the connector readiness and outbound-delivery vocabulary.
+        // Imported/legacy Slack credentials may use `oauth_token` or `token`;
+        // rejecting those only here leaves an admitted connector unable to
+        // start its inbound transport.
+        let botToken = firstString(
+            keys: ["access_token", "oauth_token", "token", "bot_token"],
+            in: objects
+        )
         let appToken = firstString(keys: ["socket_mode_app_token", "app_token", "slack_app_token"], in: objects)
         guard let botToken, !botToken.isEmpty,
               let appToken, !appToken.isEmpty else {
@@ -261,6 +268,10 @@ private final class SlackPingContinuationGate: @unchecked Sendable {
         didResume = true
         return true
     }
+}
+
+enum SlackSocketSessionClosure: Error, Sendable, Equatable {
+    case disconnect(reason: String)
 }
 
 struct SlackInboundFile: Sendable, Equatable {
@@ -793,6 +804,7 @@ struct SlackSocketModeLoop: LoopRunner {
     private let chatHandler: SlackSocketModeChatHandler
     private let session: URLSession
     private let deduper = SlackEventDeduper()
+    private let deliveryJournal: SlackInboundDeliveryJournal
     private let historyPollState = SlackHistoryPollState()
     private let conversationCache = SlackConversationCache()
     // LOOPS-2: every spawned handling task is registered here so loop stop can
@@ -801,6 +813,7 @@ struct SlackSocketModeLoop: LoopRunner {
     // LOOPS-5: shared socket-liveness signal that gates history polling.
     private let socketHealth = SlackSocketHealth()
     private let outbound: SlackSocketModeOutbound
+    private let socketConnectionFactory: @Sendable (URL) -> SlackSocketConnection
     private let feedRetention: SlackReceiptErrorFeed.Retention
 
     /// A socket that has said `hello` and has produced a frame or a successful
@@ -815,14 +828,24 @@ struct SlackSocketModeLoop: LoopRunner {
     var historySafetyPollInterval: TimeInterval {
         max(config.historyPollInterval * 10, 900)
     }
+    static let shortLivedSessionFloor: TimeInterval = 30
+
+    /// Base reconnect spacing between socket sessions. A tick IS one session,
+    /// so `interval` is the reconnect delay after a session that ended without
+    /// tripping failure backoff. It used to be 2s, which meant a socket that
+    /// kept dying just above the failure floor reconnected 30x/minute (live
+    /// churn confirmed 2026-08). Slack's own guidance is one connection per
+    /// app; 15s is still far faster than any human notices a gap.
+    static let defaultReconnectInterval: TimeInterval = 15
 
     init(
         config: SlackSocketModeConfig,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        interval: TimeInterval = 2,
+        interval: TimeInterval = SlackSocketModeLoop.defaultReconnectInterval,
         sessionRecycleInterval: TimeInterval = 3_600,
         session: URLSession = .shared,
-        outbound: SlackSocketModeOutbound = .live,
+        outbound: SlackSocketModeOutbound? = nil,
+        socketConnectionFactory: (@Sendable (URL) -> SlackSocketConnection)? = nil,
         feedRetention: SlackReceiptErrorFeed.Retention = .production,
         chatHandler: @escaping SlackSocketModeChatHandler
     ) {
@@ -831,9 +854,11 @@ struct SlackSocketModeLoop: LoopRunner {
         self.interval = interval
         self.sessionRecycleInterval = sessionRecycleInterval
         self.session = session
-        self.outbound = outbound
+        self.outbound = outbound ?? .live(dataRoot: dataRoot, botToken: config.botToken)
+        self.socketConnectionFactory = socketConnectionFactory ?? { .live(session.webSocketTask(with: $0)) }
         self.feedRetention = feedRetention
         self.chatHandler = chatHandler
+        self.deliveryJournal = SlackInboundDeliveryJournal(dataRoot: dataRoot)
     }
 
     func tick() async {
@@ -842,6 +867,33 @@ struct SlackSocketModeLoop: LoopRunner {
 
     func tickOutcome() async -> LoopTickOutcome {
         guard config.enabled else { return .skipped(reason: "Slack socket mode disabled") }
+        // Recovery and socket admission share the canonical tick owner, but
+        // neither waits for the other's chat generation. Register recovery in
+        // the existing child set before opening the socket; every return path
+        // below drains that set, including failure before receiveLoop starts.
+        let recoveryId = UUID()
+        let recovery = Task(priority: .userInitiated) {
+            do {
+                try await recoverDurableInboundDeliveries()
+            } catch is CancellationError {
+                // The canonical tick is stopping.
+            } catch {
+                await recordError(context: "inbound_recovery", error: error)
+            }
+            await inFlight.finish(recoveryId)
+        }
+        await inFlight.register(recovery, id: recoveryId)
+        let outcome = await socketTickOutcome()
+        // Socket-open failure must still give bot-token/prepared recovery a
+        // bounded opportunity to finish. A held chat turn cannot postpone the
+        // next connection attempt forever, and cancellation skips this grace.
+        _ = await inFlight.waitForCompletion(timeout: 30)
+        await inFlight.cancelAndWaitAll()
+        return outcome
+    }
+
+    private func socketTickOutcome() async -> LoopTickOutcome {
+        let sessionStartedAt = Date()
         do {
             await writeState([
                 "connected": .bool(false),
@@ -852,7 +904,7 @@ struct SlackSocketModeLoop: LoopRunner {
             await writeState([
                 "socketUrlOpenedAt": .string(Self.nowString()),
             ])
-            let socket = session.webSocketTask(with: socketURL)
+            let socket = socketConnectionFactory(socketURL)
             socket.resume()
             // A4.8(a): planned session recycle. When the deadline fires it
             // closes the socket, which surfaces in receiveLoop as a receive
@@ -864,20 +916,64 @@ struct SlackSocketModeLoop: LoopRunner {
                 try? await Task.sleep(nanoseconds: UInt64(max(1, sessionRecycleInterval) * 1_000_000_000))
                 guard !Task.isCancelled else { return }
                 recycleFlag.fire()
-                socket.cancel(with: .goingAway, reason: nil)
+                socket.cancel()
             }
             defer { recycleTask.cancel() }
             do {
                 try await receiveLoop(socket: socket)
-                socket.cancel(with: .goingAway, reason: nil)
-                await writeState([
-                    "connected": .bool(false),
-                    "receiveLoopEndedAt": .string(Self.nowString()),
-                    "lastCloseReason": .string("receive_loop_returned"),
-                ])
-                return .completed(result: "Slack socket receive loop ended")
+                socket.cancel()
+                if Task.isCancelled {
+                    await writeState([
+                        "connected": .bool(false),
+                        "cancelledAt": .string(Self.nowString()),
+                    ])
+                    return .skipped(reason: "Slack socket mode canceled")
+                }
+                // A receive loop that returns without a `disconnect` frame is
+                // still a session that ended; if it ended fast it is churn, not
+                // success, and must reach failure backoff like every other
+                // short-lived session.
+                let outcome = Self.classifyReceiveLoopReturn(
+                    sessionDuration: max(0, Date().timeIntervalSince(sessionStartedAt)),
+                    recyclePlanned: recycleFlag.didFire,
+                    recycleInterval: sessionRecycleInterval
+                )
+                switch outcome {
+                case .completed(let result):
+                    await writeState([
+                        "connected": .bool(false),
+                        "receiveLoopEndedAt": .string(Self.nowString()),
+                        "lastCloseReason": .string("receive_loop_returned"),
+                    ])
+                    return .completed(result: result)
+                case .failed(let error):
+                    throw SlackSocketModeError.api(error)
+                case .skipped:
+                    return outcome
+                }
+            } catch let closure as SlackSocketSessionClosure {
+                socket.cancel()
+                let outcome = Self.classifySessionClosure(
+                    closure,
+                    sessionDuration: max(0, Date().timeIntervalSince(sessionStartedAt)),
+                    recyclePlanned: recycleFlag.didFire,
+                    recycleInterval: sessionRecycleInterval
+                )
+                switch outcome {
+                case .completed(let result):
+                    await writeState([
+                        "connected": .bool(false),
+                        "receiveLoopEndedAt": .string(Self.nowString()),
+                        "lastCloseReason": .string(Self.closeReason(for: closure)),
+                    ])
+                    return .completed(result: result)
+                case .failed(let error):
+                    throw SlackSocketModeError.api(error)
+                case .skipped:
+                    return outcome
+                }
             } catch {
-                socket.cancel(with: .goingAway, reason: nil)
+                socket.cancel()
                 if recycleFlag.didFire {
                     await writeState([
                         "connected": .bool(false),
@@ -956,7 +1052,7 @@ struct SlackSocketModeLoop: LoopRunner {
         return url
     }
 
-    private func receiveLoop(socket: URLSessionWebSocketTask) async throws {
+    private func receiveLoop(socket: SlackSocketConnection) async throws {
         let pingTask = Task {
             await pingUntilCancelled(socket: socket)
         }
@@ -989,7 +1085,7 @@ struct SlackSocketModeLoop: LoopRunner {
         await inFlight.cancelAndWaitAll()
     }
 
-    private func receiveLoopBody(socket: URLSessionWebSocketTask) async throws {
+    private func receiveLoopBody(socket: SlackSocketConnection) async throws {
         while !Task.isCancelled {
             let message = try await socket.receive()
             let json: JSONValue
@@ -1020,28 +1116,124 @@ struct SlackSocketModeLoop: LoopRunner {
                 ])
             case "disconnect":
                 await socketHealth.markDisconnected()
+                let reason = Self.string(obj["reason"]) ?? "disconnect"
                 await writeState([
                     "connected": .bool(false),
                     "disconnectedAt": .string(Self.nowString()),
-                    "disconnectReason": .string(Self.string(obj["reason"]) ?? "disconnect"),
+                    "disconnectReason": .string(reason),
                 ])
-                return
+                throw SlackSocketSessionClosure.disconnect(reason: reason)
             default:
                 let envelopeId = Self.string(obj["envelope_id"])
-                if let envelopeId {
-                    try await acknowledge(envelopeId: envelopeId, socket: socket)
-                }
                 await recordEnvelope(envelope: obj, envelopeId: envelopeId)
                 guard let inbound = inboundMessage(fromEnvelope: obj) else {
+                    if let envelopeId {
+                        try await acknowledge(envelopeId: envelopeId, socket: socket)
+                    }
                     await recordIgnoredEnvelope(obj)
                     continue
                 }
+                // Slack treats ACK as ownership transfer. Persist the complete
+                // admitted message first so a crash after ACK can recover it.
+                // If the journal is unavailable or saturated, leave the
+                // envelope unacknowledged and let Slack retain/redeliver it.
+                let claim = try await claimInboundBeforeAcknowledging(inbound) {
+                    if let envelopeId {
+                        try await acknowledge(envelopeId: envelopeId, socket: socket)
+                    }
+                }
+                if claim == .alreadyDelivered { continue }
                 let shouldProcess = await deduper.markIfNew(inbound.eventId)
                 guard shouldProcess else { continue }
                 // Socket handling stays concurrent (the receive loop must keep
                 // acking envelopes), but it is tracked — see spawnInboundHandling.
                 await spawnInboundHandling(inbound)
             }
+        }
+    }
+
+    static func classifySessionClosure(
+        _ closure: SlackSocketSessionClosure,
+        sessionDuration: TimeInterval,
+        recyclePlanned: Bool,
+        recycleInterval: TimeInterval
+    ) -> LoopTickOutcome {
+        // A planned recycle only claims the closure when the socket did not
+        // ALSO report a fatal condition. A `link_disabled`/`too_many_connections`
+        // disconnect racing the recycle timer must still fail the tick, or
+        // backoff is suppressed on a genuinely broken socket.
+        if recyclePlanned,
+           case .disconnect(let reason) = closure,
+           disconnectDisposition(forReason: reason) == .fatal {
+            return .failed(
+                error: "Slack socket reported \(reason) during a planned recycle"
+            )
+        }
+        if recyclePlanned {
+            return .completed(
+                result: "Slack socket session recycled after \(Int(recycleInterval))s"
+            )
+        }
+        switch closure {
+        case .disconnect(let reason):
+            let rounded = Int(sessionDuration.rounded())
+            let message = "Slack socket disconnected after \(rounded)s (\(reason))"
+            switch disconnectDisposition(forReason: reason) {
+            case .fatal:
+                return .failed(error: message)
+            case .routine:
+                guard sessionDuration < shortLivedSessionFloor else {
+                    return .completed(result: message)
+                }
+                return .failed(error: message)
+            }
+        }
+    }
+
+    /// Slack's `disconnect` reasons are not interchangeable. `link_disabled`
+    /// and `too_many_connections` describe a condition a fast reconnect makes
+    /// WORSE (a disabled app, or this loop already holding too many sockets),
+    /// so they are failures at any session length — the point is to get into
+    /// backoff. Every other reason (`refresh_requested`, `warning`, …) is
+    /// Slack's routine connection rotation and is only a failure when the
+    /// session was too short to have carried any traffic.
+    enum SlackDisconnectDisposition: Sendable, Equatable {
+        case routine
+        case fatal
+    }
+
+    static func disconnectDisposition(forReason reason: String) -> SlackDisconnectDisposition {
+        switch reason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "link_disabled", "too_many_connections":
+            return .fatal
+        default:
+            return .routine
+        }
+    }
+
+    /// A session whose receive loop returned with no `disconnect` frame. The
+    /// planned recycle stays success; anything shorter than the floor is churn.
+    static func classifyReceiveLoopReturn(
+        sessionDuration: TimeInterval,
+        recyclePlanned: Bool,
+        recycleInterval: TimeInterval
+    ) -> LoopTickOutcome {
+        if recyclePlanned {
+            return .completed(
+                result: "Slack socket session recycled after \(Int(recycleInterval))s"
+            )
+        }
+        let rounded = Int(sessionDuration.rounded())
+        guard sessionDuration >= shortLivedSessionFloor else {
+            return .failed(error: "Slack socket receive loop ended after \(rounded)s")
+        }
+        return .completed(result: "Slack socket receive loop ended after \(rounded)s")
+    }
+
+    private static func closeReason(for closure: SlackSocketSessionClosure) -> String {
+        switch closure {
+        case .disconnect(let reason):
+            return "disconnect:\(reason)"
         }
     }
 
@@ -1055,7 +1247,7 @@ struct SlackSocketModeLoop: LoopRunner {
         // but do not let the chat turn inherit the utility-priority socket
         // loop and starve behind unrelated local builds.
         let task = Task(priority: .userInitiated) {
-            let delivered = await handleInbound(inbound)
+            let delivered = await handleDurableInbound(inbound)
             if delivered {
                 await deduper.confirmDelivered(inbound.eventId)
             } else {
@@ -1064,6 +1256,15 @@ struct SlackSocketModeLoop: LoopRunner {
             await inFlight.finish(id)
         }
         await inFlight.register(task, id: id)
+    }
+
+    func claimInboundBeforeAcknowledging(
+        _ inbound: SlackInboundMessage,
+        acknowledge: @Sendable () async throws -> Void
+    ) async throws -> SlackInboundClaimOutcome {
+        let claim = try await deliveryJournal.claim(inbound)
+        try await acknowledge()
+        return claim
     }
 
     /// Test/lifecycle seam: cancel and await everything the loop spawned.
@@ -1199,86 +1400,200 @@ struct SlackSocketModeLoop: LoopRunner {
         }
     }
 
-    private func cachedPollableConversations() async throws -> [SlackConversationRef] {
-        if let cached = await conversationCache.value(maxAge: config.historyConversationRefreshInterval) {
+    func cachedPollableConversations(now: Date = Date()) async throws -> [SlackConversationRef] {
+        try Task.checkCancellation()
+        if let cached = await conversationCache.value(maxAge: config.historyConversationRefreshInterval, now: now) {
             return cached
         }
-        let conversations = try await pollableConversations()
-        await conversationCache.store(conversations)
-        return conversations
+        do {
+            let conversations = try await pollableConversations()
+            try Task.checkCancellation()
+            await conversationCache.store(conversations, now: now)
+            await writeState(["conversationDiscoveryUsingLastGood": .bool(false)])
+            return conversations
+        } catch {
+            if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
+                throw CancellationError()
+            }
+            let lastGood = await conversationCache.lastGoodValue()
+            await recordError(context: "conversation_discovery", error: error)
+            await writeState(["conversationDiscoveryUsingLastGood": .bool(lastGood != nil)])
+            try Task.checkCancellation()
+            guard let lastGood else { throw error }
+            return lastGood
+        }
     }
 
     private func pollableConversations() async throws -> [SlackConversationRef] {
-        let response = try await slackAPI(
-            method: "conversations.list",
-            httpMethod: "GET",
-            params: [
+        var conversations: [SlackConversationRef] = []
+        var seenIDs = Set<String>()
+        var seenCursors = Set<String>()
+        var cursor: String?
+        // Bound pathological/changing workspace pagination without publishing a
+        // partial list. This allows 20,000 virtual channel entries per refresh.
+        for _ in 0..<100 {
+            try Task.checkCancellation()
+            var params = [
                 "exclude_archived": "true",
                 "limit": "200",
                 "types": "public_channel,private_channel,mpim,im",
             ]
-        )
-        guard Self.bool(response["ok"]) == true else {
-            throw SlackSocketModeError.api(Self.string(response["error"]) ?? "conversations.list failed")
+            if let cursor { params["cursor"] = cursor }
+            let response = try await slackAPI(
+                method: "conversations.list",
+                httpMethod: "GET",
+                params: params
+            )
+            try Task.checkCancellation()
+            guard Self.bool(response["ok"]) == true else {
+                throw SlackSocketModeError.api(Self.string(response["error"]) ?? "conversations.list failed")
+            }
+            guard case .array(let channels)? = response["channels"] else {
+                throw SlackSocketModeError.api("conversations.list returned malformed channels; discovery incomplete")
+            }
+            let page: [SlackConversationRef] = try channels.compactMap { raw in
+                guard case .object(let obj) = raw,
+                      let id = Self.string(obj["id"]),
+                      !id.isEmpty else {
+                    throw SlackSocketModeError.api("conversations.list returned malformed channel entry; discovery incomplete")
+                }
+                let isIM = Self.bool(obj["is_im"]) == true
+                let isMPIM = Self.bool(obj["is_mpim"]) == true
+                let isMember = Self.bool(obj["is_member"]) == true
+                guard isIM || isMPIM || isMember else { return nil }
+                let channelType: String
+                if isIM {
+                    channelType = "im"
+                } else if isMPIM {
+                    channelType = "mpim"
+                } else if Self.bool(obj["is_private"]) == true {
+                    channelType = "group"
+                } else {
+                    channelType = "channel"
+                }
+                // When policy is channel-only, avoid fetching any conversation the
+                // transport could never admit. A user allowlist still needs all
+                // joined conversations so message authors can be evaluated.
+                if config.allowedUserIds.isEmpty,
+                   !config.allowedChannelIds.contains(id) {
+                    return nil
+                }
+                return SlackConversationRef(id: id, channelType: channelType)
+            }
+            for conversation in page where seenIDs.insert(conversation.id).inserted {
+                conversations.append(conversation)
+            }
+            guard let metadata = response["response_metadata"] else { return conversations }
+            guard case .object(let fields) = metadata else {
+                throw SlackSocketModeError.api("conversations.list returned malformed pagination metadata; discovery incomplete")
+            }
+            guard let nextValue = fields["next_cursor"] else { return conversations }
+            guard case .string(let nextCursor) = nextValue else {
+                throw SlackSocketModeError.api("conversations.list returned malformed pagination cursor; discovery incomplete")
+            }
+            guard !nextCursor.isEmpty else { return conversations }
+            guard seenCursors.insert(nextCursor).inserted else {
+                throw SlackSocketModeError.api("conversations.list repeated pagination cursor; discovery incomplete")
+            }
+            cursor = nextCursor
         }
-        guard case .array(let channels)? = response["channels"] else { return [] }
-        return channels.compactMap { raw in
-            guard case .object(let obj) = raw,
-                  let id = Self.string(obj["id"]),
-                  !id.isEmpty else {
-                return nil
-            }
-            let isIM = Self.bool(obj["is_im"]) == true
-            let isMPIM = Self.bool(obj["is_mpim"]) == true
-            let isMember = Self.bool(obj["is_member"]) == true
-            guard isIM || isMPIM || isMember else { return nil }
-            let channelType: String
-            if isIM {
-                channelType = "im"
-            } else if isMPIM {
-                channelType = "mpim"
-            } else if Self.bool(obj["is_private"]) == true {
-                channelType = "group"
-            } else {
-                channelType = "channel"
-            }
-            // When policy is channel-only, avoid fetching any conversation the
-            // transport could never admit. A user allowlist still needs all
-            // joined conversations so message authors can be evaluated.
-            if config.allowedUserIds.isEmpty,
-               !config.allowedChannelIds.contains(id) {
-                return nil
-            }
-            return SlackConversationRef(id: id, channelType: channelType)
-        }
+        throw SlackSocketModeError.api("conversations.list exceeded 100 pages; discovery incomplete")
     }
 
-    private func pollHistory(conversation: SlackConversationRef) async throws {
+    private func historyMessages(
+        conversation: SlackConversationRef,
+        oldest: String?,
+        latest: String
+    ) async throws -> [[String: JSONValue]] {
         var params: [String: String] = [
             "channel": conversation.id,
             "inclusive": "false",
             "limit": "8",
+            // Keep the collection's upper boundary fixed while cursor paging,
+            // so new arrivals belong to the next poll, not this traversal.
+            "latest": latest,
         ]
-        if let oldest = await historyPollState.lastSeen(channelId: conversation.id) {
-            params["oldest"] = oldest
+        if let oldest { params["oldest"] = oldest }
+        var collected: [[String: JSONValue]] = []
+        var seenTimestamps = Set<String>()
+        var seenCursors = Set<String>()
+        for _ in 0..<100 {
+            try Task.checkCancellation()
+            let response = try await slackAPI(method: "conversations.history", httpMethod: "GET", params: params)
+            try Task.checkCancellation()
+            guard Self.bool(response["ok"]) == true else {
+                throw SlackSocketModeError.api(Self.string(response["error"]) ?? "conversations.history failed")
+            }
+            guard case .array(let rawMessages)? = response["messages"] else {
+                throw SlackSocketModeError.api("conversations.history returned malformed messages; history incomplete")
+            }
+            let page: [[String: JSONValue]] = try rawMessages.map { raw in
+                guard case .object(let message) = raw,
+                      let ts = Self.string(message["ts"]),
+                      let value = Decimal(string: ts, locale: Locale(identifier: "en_US_POSIX")),
+                      !value.isNaN, value > 0,
+                      ts.split(separator: ".", omittingEmptySubsequences: false).count <= 2,
+                      ts.split(separator: ".", omittingEmptySubsequences: false).allSatisfy({
+                          !$0.isEmpty && $0.utf8.allSatisfy { (48...57).contains($0) }
+                      }) else {
+                    throw SlackSocketModeError.api("conversations.history returned malformed message timestamp; history incomplete")
+                }
+                return message
+            }
+            for message in page {
+                let ts = Self.string(message["ts"])!
+                if let oldest, !Self.slackTimestampLessThan(oldest, ts) { continue }
+                if seenTimestamps.insert(ts).inserted { collected.append(message) }
+            }
+            // First enable/restart only seeds the newest observed message.
+            // Do not traverse older history or turn bootstrap into replay.
+            guard oldest != nil else { return collected }
+
+            let hasMore: Bool
+            if let value = response["has_more"] {
+                guard case .bool(let flag) = value else {
+                    throw SlackSocketModeError.api("conversations.history returned malformed has_more; history incomplete")
+                }
+                hasMore = flag
+            } else { hasMore = false }
+            var nextCursor = ""
+            if let metadata = response["response_metadata"] {
+                guard case .object(let fields) = metadata else {
+                    throw SlackSocketModeError.api("conversations.history returned malformed pagination metadata; history incomplete")
+                }
+                if let value = fields["next_cursor"] {
+                    guard case .string(let cursor) = value else {
+                        throw SlackSocketModeError.api("conversations.history returned malformed pagination cursor; history incomplete")
+                    }
+                    nextCursor = cursor
+                }
+            }
+            if !nextCursor.isEmpty {
+                guard seenCursors.insert(nextCursor).inserted else {
+                    throw SlackSocketModeError.api("conversations.history repeated pagination cursor; history incomplete")
+                }
+                params["cursor"] = nextCursor
+            } else if hasMore {
+                // Slack also supports time pagination without a cursor. Keep
+                // oldest fixed and require strict movement toward that bound.
+                guard let boundary = page.compactMap({ Self.string($0["ts"]) })
+                    .min(by: Self.slackTimestampLessThan),
+                      Self.slackTimestampLessThan(boundary, params["latest"]!),
+                      Self.slackTimestampLessThan(oldest!, boundary) else {
+                    throw SlackSocketModeError.api("conversations.history pagination made no progress; history incomplete")
+                }
+                params["latest"] = boundary
+                params.removeValue(forKey: "cursor")
+            } else { return collected }
         }
-        let response = try await slackAPI(
-            method: "conversations.history",
-            httpMethod: "GET",
-            params: params
-        )
-        guard Self.bool(response["ok"]) == true else {
-            await writeState([
-                "lastHistoryPollChannelId": .string(conversation.id),
-                "lastHistoryPollError": .string(Self.string(response["error"]) ?? "conversations.history failed"),
-            ])
-            return
-        }
-        guard case .array(let rawMessages)? = response["messages"] else { return }
-        let messages: [[String: JSONValue]] = rawMessages.compactMap { raw in
-            guard case .object(let obj) = raw else { return nil }
-            return obj
-        }
+        throw SlackSocketModeError.api("conversations.history exceeded 100 pages; history incomplete")
+    }
+
+    func pollHistory(conversation: SlackConversationRef, now: Date = Date()) async throws {
+        let oldest = await historyPollState.lastSeen(channelId: conversation.id)
+        let latest = String(format: "%.6f", locale: Locale(identifier: "en_US_POSIX"), now.timeIntervalSince1970)
+        let messages = try await historyMessages(conversation: conversation, oldest: oldest, latest: latest)
+        try Task.checkCancellation()
         guard let newest = messages
             .compactMap({ Self.string($0["ts"]) })
             .max(by: { Self.slackTimestampLessThan($0, $1) }) else {
@@ -1328,7 +1643,7 @@ struct SlackSocketModeLoop: LoopRunner {
                 "lastHistoryPollChannelId": .string(conversation.id),
                 "lastHistoryPollMessageTs": .string(inbound.ts),
             ])
-            let delivered = await handleInbound(inbound)
+            let delivered = await handleDurableInbound(inbound)
             if delivered {
                 await deduper.confirmDelivered(inbound.eventId)
                 watermark = Self.laterTs(watermark, inbound.ts)
@@ -1393,7 +1708,7 @@ struct SlackSocketModeLoop: LoopRunner {
         )
     }
 
-    private func pingUntilCancelled(socket: URLSessionWebSocketTask) async {
+    private func pingUntilCancelled(socket: SlackSocketConnection) async {
         while !Task.isCancelled {
             do {
                 try await Task.sleep(nanoseconds: 25_000_000_000)
@@ -1412,13 +1727,13 @@ struct SlackSocketModeLoop: LoopRunner {
                     "lastPingErrorAt": .string(Self.nowString()),
                     "lastPingError": .string(Self.redact(String(describing: error))),
                 ])
-                socket.cancel(with: .goingAway, reason: nil)
+                socket.cancel()
                 return
             }
         }
     }
 
-    private func sendPing(socket: URLSessionWebSocketTask) async throws {
+    private func sendPing(socket: SlackSocketConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let gate = SlackPingContinuationGate(continuation)
             socket.sendPing { error in
@@ -1466,7 +1781,7 @@ struct SlackSocketModeLoop: LoopRunner {
         return obj
     }
 
-    private func acknowledge(envelopeId: String, socket: URLSessionWebSocketTask) async throws {
+    private func acknowledge(envelopeId: String, socket: SlackSocketConnection) async throws {
         let payload = try JSONValue.object([
             "envelope_id": .string(envelopeId),
         ]).serialize(pretty: false)
@@ -1542,6 +1857,274 @@ struct SlackSocketModeLoop: LoopRunner {
             }
         }
         return channelId.hasPrefix("D") || channelId.hasPrefix("C") || channelId.hasPrefix("G")
+    }
+
+    private func recoverDurableInboundDeliveries() async throws {
+        for record in try await deliveryJournal.unresolved() {
+            guard !Task.isCancelled else { throw CancellationError() }
+            let inbound = record.inbound.inbound
+            // A credential/workspace change must not replay old workspace
+            // work into the newly selected Slack installation.
+            guard config.teamId == nil || config.teamId == inbound.teamId,
+                  config.allowedChannelIds.contains(inbound.channelId)
+                    || config.allowedUserIds.contains(inbound.userId) else {
+                await recordError(
+                    context: "inbound_recovery_policy_mismatch",
+                    error: SlackSocketModeError.api("Recovery paused: current Slack workspace or admission policy no longer matches the accepted message"),
+                    inbound: inbound
+                )
+                continue
+            }
+            guard await deduper.markIfNew(inbound.eventId) else { continue }
+            let delivered = await handleDurableInbound(inbound)
+            if delivered {
+                await deduper.confirmDelivered(inbound.eventId)
+            } else {
+                await deduper.unmark(inbound.eventId)
+            }
+        }
+        if Task.isCancelled { throw CancellationError() }
+    }
+
+    /// The production receive/history paths use this durable lifecycle. A
+    /// prepared reply may be safely retried without invoking the model again.
+    /// A dispatch whose outcome is ambiguous is reconciled, never blindly
+    /// replayed. History absence is NOT proof of non-delivery (retention,
+    /// deletion, visibility, and eventual consistency can all hide a post).
+    @discardableResult
+    func handleDurableInbound(_ inbound: SlackInboundMessage) async -> Bool {
+        guard await deliveryJournal.acquireHandler(eventId: inbound.eventId) else { return false }
+        let delivered = await processDurableInbound(inbound)
+        await deliveryJournal.releaseHandler(eventId: inbound.eventId)
+        return delivered
+    }
+
+    private func processDurableInbound(_ received: SlackInboundMessage) async -> Bool {
+        do {
+            let claim = try await deliveryJournal.claim(received)
+            guard case .claimed(var record) = claim else { return true }
+            let inbound = record.inbound.inbound
+            if record.phase == .generating {
+                // Chat turns may themselves use tools. A restart cannot
+                // blindly regenerate a turn that began but did not durably
+                // publish its prepared reply, or those effects can duplicate.
+                return await recordUnknownDelivery(inbound, detail: "Reply generation was interrupted; prior chat/tool effects require recovery before rerunning the turn")
+            }
+            if record.phase == .dispatching || record.phase == .outcomeUnknown {
+                return await reconcileDurableReply(record)
+            }
+            if record.phase == .claimed {
+                let hydrated = await hydratingAttachments(inbound)
+                guard !hydrated.text.isEmpty || !hydrated.attachments.isEmpty else {
+                    await recordError(context: "download_inbound_file", error: SlackSocketModeError.api("no supported Slack attachment could be read"), inbound: inbound)
+                    return false
+                }
+                guard !Task.isCancelled else { return false }
+                _ = try await deliveryJournal.beginGeneration(eventId: inbound.eventId)
+                let reply: SlackSocketModeReply
+                do {
+                    reply = try await chatHandler(hydrated)
+                } catch {
+                    guard !Task.isCancelled else { return false }
+                    await recordError(context: "chat_handler", error: error, inbound: inbound)
+                    // Prepare the error notice too. Its delivery is a real
+                    // external effect and must not multiply on retry.
+                    reply = SlackSocketModeReply(text: "(internal error while drafting a Slack reply)")
+                }
+                let uploads = Self.uploadableImageAttachments(reply.attachments).map {
+                    SlackPreparedUpload(
+                        path: $0.path ?? "",
+                        name: $0.name ?? URL(fileURLWithPath: $0.path ?? "").lastPathComponent,
+                        mime: $0.mime
+                    )
+                }
+                let text = reply.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty || !uploads.isEmpty else {
+                    await recordError(context: "empty_reply", error: SlackSocketModeError.api("chat returned empty reply"), inbound: inbound)
+                    return false
+                }
+                record = try await deliveryJournal.prepare(
+                    eventId: inbound.eventId,
+                    reply: .make(text: text.isEmpty ? "Generated image" : text, uploads: uploads)
+                )
+            }
+            guard let prepared = record.prepared else { throw SlackInboundJournalError.malformed }
+            guard !Task.isCancelled else { return false }
+            // Missing local artifacts are a pre-dispatch failure. Preserve the
+            // prepared reply and do not rerun the chat/tool turn to recreate it.
+            guard prepared.uploads.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
+                await recordError(context: "prepared_reply_artifact_missing", error: SlackSocketModeError.api("prepared Slack image is no longer available"), inbound: inbound)
+                return false
+            }
+            _ = try await deliveryJournal.beginDispatch(eventId: inbound.eventId)
+            var input: [String: JSONValue] = [
+                "channel": .string(inbound.channelId),
+                "text": .string(prepared.text),
+                "metadata": Self.deliveryMetadata(eventId: inbound.eventId, fingerprint: prepared.fingerprint),
+            ]
+            if let threadTs = inbound.replyThreadTs { input["thread_ts"] = .string(threadTs) }
+            let posted: JSONValue
+            do {
+                posted = try await outbound.postMessage(input)
+            } catch {
+                return await recordUnknownDelivery(inbound, detail: "Reply dispatch outcome is unknown: \(Self.redact(String(describing: error)))")
+            }
+            guard Self.envelopeOK(posted) else {
+                if Self.isProvenSlackRejection(posted) {
+                    _ = try await deliveryJournal.retryPrepared(eventId: inbound.eventId, detail: "Slack rejected reply before acceptance")
+                    await recordError(context: "post_reply", error: SlackSocketModeError.api(String(describing: posted)), inbound: inbound)
+                    return false
+                }
+                return await recordUnknownDelivery(inbound, detail: "Slack returned an ambiguous reply failure")
+            }
+            // File completion has no message-metadata hook. Once any upload
+            // begins, a failed/crashed attempt is explicitly ambiguous; it is
+            // never replayed merely because the text marker is visible.
+            for upload in prepared.uploads {
+                var uploadInput: [String: JSONValue] = [
+                    "channel": .string(inbound.channelId),
+                    "file_path": .string(upload.path),
+                    "filename": .string(upload.name),
+                    "title": .string(upload.name),
+                ]
+                if let threadTs = inbound.replyThreadTs { uploadInput["thread_ts"] = .string(threadTs) }
+                do {
+                    guard Self.envelopeOK(try await outbound.uploadFile(uploadInput)) else {
+                        return await recordUnknownDelivery(inbound, detail: "Text reply accepted; image completion is unconfirmed")
+                    }
+                } catch {
+                    return await recordUnknownDelivery(inbound, detail: "Text reply accepted; image dispatch outcome is unknown")
+                }
+            }
+            _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
+            await recordReceipt(kind: "reply", inbound: inbound, reply: prepared.text)
+            await writeState([
+                "lastDeliveryOutcome": .string("delivered"),
+                "lastDeliveryOutcomeEventId": .string(inbound.eventId),
+                "lastDeliveryOutcomeDetail": .null,
+            ])
+            return true
+        } catch {
+            await recordError(context: "inbound_delivery_journal", error: error, inbound: received)
+            return false
+        }
+    }
+
+    private func recordUnknownDelivery(_ inbound: SlackInboundMessage, detail: String) async -> Bool {
+        do {
+            _ = try await deliveryJournal.markOutcomeUnknown(eventId: inbound.eventId, detail: detail)
+        } catch {
+            await recordError(context: "inbound_delivery_journal", error: error, inbound: inbound)
+        }
+        await writeState([
+            "lastDeliveryOutcome": .string("outcome_unknown"),
+            "lastDeliveryOutcomeEventId": .string(inbound.eventId),
+            "lastDeliveryOutcomeDetail": .string(detail),
+        ])
+        await recordError(context: "reply_outcome_unknown", error: SlackSocketModeError.api(detail), inbound: inbound)
+        return false
+    }
+
+    private func reconcileDurableReply(_ record: SlackInboundDeliveryRecord) async -> Bool {
+        let inbound = record.inbound.inbound
+        guard let prepared = record.prepared, let botUserId = config.botUserId, !botUserId.isEmpty else {
+            return await recordUnknownDelivery(inbound, detail: "Cannot reconcile reply without its prepared artifact and bot identity")
+        }
+        var params: [String: String] = [
+            "channel": inbound.channelId,
+            "oldest": inbound.ts,
+            "inclusive": "false",
+            "include_all_metadata": "true",
+            "limit": "100",
+        ]
+        let method: String
+        if let threadTs = inbound.replyThreadTs {
+            method = "conversations.replies"
+            params["ts"] = threadTs
+        } else {
+            method = "conversations.history"
+        }
+        do {
+            let response = try await slackAPI(method: method, httpMethod: "GET", params: params)
+            guard Self.hasUniqueAcceptedReply(
+                response: response,
+                inbound: inbound,
+                fingerprint: prepared.fingerprint,
+                botUserId: botUserId
+            ) else {
+                return await recordUnknownDelivery(inbound, detail: "Slack history does not prove one uniquely accepted reply; automatic resend suppressed")
+            }
+            guard prepared.uploads.isEmpty else {
+                return await recordUnknownDelivery(inbound, detail: "Text reply reconciled; image completion cannot be uniquely proven from Slack history")
+            }
+            _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
+            await recordReceipt(kind: "reply_reconciled", inbound: inbound, reply: prepared.text)
+            await writeState([
+                "lastDeliveryOutcome": .string("delivered"),
+                "lastDeliveryOutcomeEventId": .string(inbound.eventId),
+                "lastDeliveryOutcomeDetail": .string("Accepted reply reconciled from Slack history"),
+            ])
+            return true
+        } catch {
+            return await recordUnknownDelivery(inbound, detail: "Slack reply reconciliation unavailable: \(Self.redact(String(describing: error)))")
+        }
+    }
+
+    static func deliveryMetadata(eventId: String, fingerprint: String) -> JSONValue {
+        .object([
+            "event_type": .string("nativeagent_reply"),
+            "event_payload": .object([
+                "event_id": .string(eventId),
+                "fingerprint": .string(fingerprint),
+            ]),
+        ])
+    }
+
+    /// Positive proof only. Incomplete/filtered history cannot establish
+    /// uniqueness, and a missing message never establishes non-delivery.
+    static func hasUniqueAcceptedReply(
+        response: [String: JSONValue],
+        inbound: SlackInboundMessage,
+        fingerprint: String,
+        botUserId: String
+    ) -> Bool {
+        guard bool(response["ok"]) == true,
+              bool(response["has_more"]) == false,
+              bool(response["is_limited"]) != true,
+              string(object(response["response_metadata"])?["next_cursor"])?.isEmpty != false,
+              case .array(let messages)? = response["messages"] else { return false }
+        var matches = 0
+        for raw in messages {
+            guard let message = object(raw) else { return false }
+            guard let metadata = object(message["metadata"]),
+                  string(metadata["event_type"]) == "nativeagent_reply",
+                  let payload = object(metadata["event_payload"]),
+                  string(payload["event_id"]) == inbound.eventId else { continue }
+            guard string(payload["fingerprint"]) == fingerprint,
+                  string(message["user"]) == botUserId,
+                  let ts = string(message["ts"]), !ts.isEmpty else { return false }
+            let thread = string(message["thread_ts"])
+            if let expected = inbound.replyThreadTs {
+                guard thread == expected else { return false }
+            } else if let thread, thread != ts {
+                return false
+            }
+            matches += 1
+        }
+        return matches == 1
+    }
+
+    static func isProvenSlackRejection(_ envelope: JSONValue) -> Bool {
+        guard let value = object(envelope), bool(value["ok"]) == false,
+              let error = string(value["error"]) ?? string(object(value["response"])?["error"]) else { return false }
+        // Slack documents internal_error/fatal_error as potentially partially
+        // successful. Only explicit pre-acceptance rejection classes retry.
+        return Set([
+            "invalid_auth", "not_authed", "token_expired", "token_revoked",
+            "missing_scope", "no_permission", "not_in_channel", "channel_not_found",
+            "is_archived", "no_text", "msg_too_long", "invalid_arguments",
+            "invalid_metadata", "metadata_too_large", "ratelimited", "rate_limited",
+        ]).contains(error)
     }
 
     /// Returns `true` only when the reply actually reached Slack. Callers use
@@ -2013,7 +2596,8 @@ struct SlackSocketModeLoop: LoopRunner {
     }
 
     private static func slackTimestampLessThan(_ lhs: String, _ rhs: String) -> Bool {
-        (Double(lhs) ?? 0) < (Double(rhs) ?? 0)
+        (Decimal(string: lhs, locale: Locale(identifier: "en_US_POSIX")) ?? 0)
+            < (Decimal(string: rhs, locale: Locale(identifier: "en_US_POSIX")) ?? 0)
     }
 
     static func nowString(_ date: Date = Date()) -> String {
@@ -2170,7 +2754,11 @@ struct SlackSessionStore: Sendable {
             rows.insert(row, at: 0)
             let out = try ChatSessionIndexFile.serializedData(for: rows)
             try out.write(to: sessionsPath, options: .atomic)
-            _ = try? ChatSessionRetention.enforce(dataRoot: dataRoot, now: Date())
+            ChatSessionRetention.enforceBestEffort(
+                dataRoot: dataRoot,
+                now: Date(),
+                context: "SlackSocketModeLoop.ensureSessionRow"
+            )
         }
     }
 
@@ -2197,6 +2785,10 @@ struct SlackConversationRef: Sendable, Equatable {
 actor SlackConversationCache {
     private var conversations: [SlackConversationRef] = []
     private var loadedAt: Date?
+
+    func lastGoodValue() -> [SlackConversationRef]? {
+        loadedAt == nil ? nil : conversations
+    }
 
     func value(maxAge: TimeInterval, now: Date = Date()) -> [SlackConversationRef]? {
         guard let loadedAt,
@@ -2227,7 +2819,8 @@ actor SlackHistoryPollState {
 
     func markSeen(channelId: String, ts: String) {
         let current = lastSeenByChannel[channelId] ?? "0"
-        if (Double(ts) ?? 0) >= (Double(current) ?? 0) {
+        if (Decimal(string: ts, locale: Locale(identifier: "en_US_POSIX")) ?? 0)
+            >= (Decimal(string: current, locale: Locale(identifier: "en_US_POSIX")) ?? 0) {
             lastSeenByChannel[channelId] = ts
         }
     }
@@ -2332,8 +2925,10 @@ actor SlackSocketHealth {
 actor SlackInFlightHandlers {
     private var tasks: [UUID: Task<Void, Never>] = [:]
     private var finished: Set<UUID> = []
+    private var completionWaiters: [UUID: AsyncStream<Void>.Continuation] = [:]
 
     var count: Int { tasks.count }
+    var completionWaiterCount: Int { completionWaiters.count }
 
     func register(_ task: Task<Void, Never>, id: UUID) {
         // The task may already have completed before we got here; don't
@@ -2346,6 +2941,41 @@ actor SlackInFlightHandlers {
         if tasks.removeValue(forKey: id) == nil {
             finished.insert(id)
         }
+        notifyCompletionIfEmpty()
+    }
+
+    private func notifyCompletionIfEmpty() {
+        guard tasks.isEmpty else { return }
+        let waiters = completionWaiters.values
+        completionWaiters.removeAll()
+        for waiter in waiters { waiter.finish() }
+    }
+
+    /// A short grace for already-owned work after socket-open failure. This
+    /// does not create an owner or release any task; the caller must follow it
+    /// with cancelAndWaitAll. Canonical cancellation ends the grace promptly.
+    func waitForCompletion(timeout: TimeInterval) async -> Bool {
+        guard !tasks.isEmpty, !Task.isCancelled, timeout > 0 else { return tasks.isEmpty }
+        let id = UUID()
+        let (events, continuation) = AsyncStream<Void>.makeStream()
+        // Registration and the empty check are in one actor turn, so a
+        // concurrent finish cannot be lost between observing and subscribing.
+        completionWaiters[id] = continuation
+        let deadline = Task {
+            do {
+                try await Task.sleep(for: .seconds(timeout))
+                continuation.finish()
+            } catch {
+                // Completion or canonical cancellation retired this deadline.
+            }
+        }
+        // AsyncStream iteration terminates on task cancellation without an
+        // unowned cancellation-relay task. The sole deadline is always joined.
+        for await _ in events {}
+        deadline.cancel()
+        await deadline.value
+        completionWaiters.removeValue(forKey: id)?.finish()
+        return tasks.isEmpty
     }
 
     /// Bounded: a handler that ignores cooperative cancellation must not
@@ -2373,7 +3003,28 @@ actor SlackInFlightHandlers {
         let abandoned = tasks.count
         tasks.removeAll()
         finished.removeAll()
+        notifyCompletionIfEmpty()
         return abandoned
+    }
+}
+
+/// Thin transport seam: ownership, receive dispatch, ACKs, and cancellation
+/// remain in the loop. Tests can hold real receive-loop work without a socket.
+struct SlackSocketConnection: Sendable {
+    var resume: @Sendable () -> Void
+    var cancel: @Sendable () -> Void
+    var receive: @Sendable () async throws -> URLSessionWebSocketTask.Message
+    var send: @Sendable (URLSessionWebSocketTask.Message) async throws -> Void
+    var sendPing: @Sendable (@escaping @Sendable (Error?) -> Void) -> Void
+
+    static func live(_ socket: URLSessionWebSocketTask) -> Self {
+        Self(
+            resume: { socket.resume() },
+            cancel: { socket.cancel(with: .goingAway, reason: nil) },
+            receive: { try await socket.receive() },
+            send: { try await socket.send($0) },
+            sendPing: { socket.sendPing(pongReceiveHandler: $0) }
+        )
     }
 }
 
@@ -2383,10 +3034,14 @@ struct SlackSocketModeOutbound: Sendable {
     var postMessage: @Sendable (_ input: [String: JSONValue]) async throws -> JSONValue
     var uploadFile: @Sendable (_ input: [String: JSONValue]) async throws -> JSONValue
 
-    static let live = SlackSocketModeOutbound(
-        postMessage: { try await SlackConnectorActions.postMessage(input: $0) },
-        uploadFile: { try await SlackConnectorActions.uploadFile(input: $0) }
-    )
+    static func live(dataRoot: URL, botToken: String) -> SlackSocketModeOutbound {
+        // Inbound, reply, and reconciliation must use one credential snapshot;
+        // the two persisted token stores can legitimately differ during repair.
+        SlackSocketModeOutbound(
+            postMessage: { try await SlackConnectorActions.postMessage(input: $0, dataRoot: dataRoot, tokenOverride: botToken) },
+            uploadFile: { try await SlackConnectorActions.uploadFile(input: $0, dataRoot: dataRoot, tokenOverride: botToken) }
+        )
+    }
 }
 
 enum SlackSocketModeError: Error, CustomStringConvertible {

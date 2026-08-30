@@ -46,7 +46,68 @@ struct AttachmentChip: View {
 }
 
 enum ChatEmptyStatePresentation {
-    static let suggestions = ["Plan my morning", "What's stuck?", "Run the audit"]
+    /// A blank chat is where a first-timer decides what this app is for, so
+    /// each chip names something the agent can really do today. Every one is
+    /// grounded in a shipped tool: mac_calendar_list_upcoming, read_file /
+    /// file_excerpt, commit_memory / recall_memory, and desk_add_item.
+    static let suggestions = [
+        "What's on my calendar today?",
+        "Summarize a file on my Mac",
+        "Remember something about me",
+        "Add a task to my Desk",
+    ]
+}
+
+// D1 (2026-08-28): a blank chat on a machine with no connected provider used
+// to invite a first message ("Say something to …") that could only dead-end in
+// "No reply came back". The blank slate now branches: with a provider, the D6
+// capability chips; without one, the connect prompt — the same honest guidance
+// `missingProviderChatGuidance()` gives AFTER a failed send, moved to before it.
+enum ChatEmptyStateMode: Equatable, Sendable {
+    case connectProvider
+    case suggestions
+
+    static func mode(hasUsableProvider: Bool) -> Self {
+        hasUsableProvider ? .suggestions : .connectProvider
+    }
+}
+
+struct ChatProviderConnectEmptyState: View {
+    static let title = "Connect an AI provider to start chatting"
+    static let detail = """
+    Nothing is connected yet, so a message sent now would not get a reply. \
+    Open Providers and connect one — pasting an Anthropic setup token from \
+    console.anthropic.com is the quickest way, with no API key or command-line \
+    tools needed.
+    """
+    static let actionTitle = "Open Providers"
+
+    var onConnect: () -> Void
+
+    var body: some View {
+        VStack(spacing: NativeAgentSpacing.xl) {
+            NativeEmptyState(
+                title: Self.title,
+                detail: Self.detail,
+                systemImage: "server.rack"
+            )
+
+            Button(Self.actionTitle, action: onConnect)
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("chat.empty-state.connect-provider")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+enum ChatSessionListEmptyStatePresentation {
+    static func message(totalSessionCount: Int, searchQuery: String) -> String {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if totalSessionCount == 0 && query.isEmpty {
+            return "No conversations yet"
+        }
+        return "No matching sessions"
+    }
 }
 
 enum ChatEmptyStateSuggestionAction {
@@ -74,11 +135,16 @@ struct ChatEmptyState: View {
         VStack(spacing: NativeAgentSpacing.xl) {
             NativeEmptyState(
                 title: "Say something to \(personaName)",
-                detail: "Start with a goal, a question, or a task. Each session is kept separate and restored after restart.",
+                detail: "Start with a goal, a question, or a task. Each conversation is kept separate and comes back after you quit and reopen the app.",
                 systemImage: "bubble.left.and.bubble.right"
             )
 
-            HStack(spacing: NativeAgentSpacing.sm) {
+            // Four chips overflow a narrow chat pane in one fixed row, so they
+            // wrap instead of clipping the last capability off-screen.
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 170), spacing: NativeAgentSpacing.sm)],
+                spacing: NativeAgentSpacing.sm
+            ) {
                 ForEach(ChatEmptyStatePresentation.suggestions, id: \.self) { suggestion in
                     Button {
                         onSuggestion(suggestion)
@@ -91,11 +157,42 @@ struct ChatEmptyState: View {
                             .overlay(Capsule().strokeBorder(NativeAgentBrand.accent.opacity(0.25), lineWidth: 0.8))
                     }
                     .buttonStyle(.borderless)
-                    .help("Pre-fill: \(suggestion)")
+                    .help("Start with: \(suggestion)")
                 }
             }
+            .frame(maxWidth: 560)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+enum ChatComposerSendAction: Equatable {
+    case send
+    case queueNext
+    case appendToQueue
+    case appendToPausedQueue
+
+    static func resolve(isRunning: Bool, hasQueuedTurns: Bool, isQueuePaused: Bool) -> Self {
+        if hasQueuedTurns { return isQueuePaused ? .appendToPausedQueue : .appendToQueue }
+        return isRunning ? .queueNext : .send
+    }
+
+    var label: String {
+        switch self {
+        case .send: return "Send message"
+        case .queueNext: return "Queue message to send next"
+        case .appendToQueue: return "Add message to queue"
+        case .appendToPausedQueue: return "Add message to paused queue"
+        }
+    }
+
+    var hint: String {
+        switch self {
+        case .send: return "Start a response in this conversation"
+        case .queueNext: return "Wait for the current response to finish"
+        case .appendToQueue: return "Run after the messages already queued in this conversation"
+        case .appendToPausedQueue: return "The queue stays paused. Use Send next to resume it."
+        }
     }
 }
 
@@ -112,6 +209,8 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     let screenCaptureDisabled: Bool
     let pendingAttachmentCount: Int
     let isRunning: Bool
+    let hasQueuedTurns: Bool
+    let isQueuePaused: Bool
     let canSend: Bool
     let onToggleVoice: () -> Void
     let onCaptureScreen: () -> Void
@@ -131,6 +230,8 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         screenCaptureDisabled: Bool,
         pendingAttachmentCount: Int,
         isRunning: Bool,
+        hasQueuedTurns: Bool = false,
+        isQueuePaused: Bool = false,
         canSend: Bool,
         onToggleVoice: @escaping () -> Void,
         onCaptureScreen: @escaping () -> Void,
@@ -145,6 +246,8 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         self.screenCaptureDisabled = screenCaptureDisabled
         self.pendingAttachmentCount = pendingAttachmentCount
         self.isRunning = isRunning
+        self.hasQueuedTurns = hasQueuedTurns
+        self.isQueuePaused = isQueuePaused
         self.canSend = canSend
         self.onToggleVoice = onToggleVoice
         self.onCaptureScreen = onCaptureScreen
@@ -162,6 +265,10 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
             parts.append("\(pendingAttachmentCount) attachment\(pendingAttachmentCount == 1 ? "" : "s")")
         }
         return parts.joined(separator: ", ")
+    }
+
+    private var sendAction: ChatComposerSendAction {
+        .resolve(isRunning: isRunning, hasQueuedTurns: hasQueuedTurns, isQueuePaused: isQueuePaused)
     }
 
     var body: some View {
@@ -242,8 +349,9 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                     NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
                     value: canSend
                 )
-                .help(isRunning ? "Queue message to send next" : "Send message")
-                .accessibilityLabel(isRunning ? "Queue message to send next" : "Send message")
+                .help("\(sendAction.label). \(sendAction.hint)")
+                .accessibilityLabel(sendAction.label)
+                .accessibilityHint(sendAction.hint)
             }
         }
         // The whole visible box focuses the field. contentShape covers the

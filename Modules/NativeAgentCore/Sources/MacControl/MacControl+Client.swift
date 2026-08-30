@@ -142,6 +142,7 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// TCC permission; this seam only ever PREFLIGHTS it (never prompts, never
     /// toggles) and reports the answer honestly.
     private let screenCaptureSource: any MacScreenCaptureSource
+    private let pointerPositionSource: any MacPointerPositionSource
     /// W3.5 — set-of-marks renderer. Injectable so the placement math and the
     /// byte budget are pinned with no window server in the loop.
     private let screenImageRenderer: any MacScreenImageRenderer
@@ -194,6 +195,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         accessibilityActSource: any MacAXActSource = defaultMacAXActSource(),
         effectObserverSource: any MacAXEffectObserverSource = defaultMacAXEffectObserverSource(),
         screenCaptureSource: any MacScreenCaptureSource = defaultMacScreenCaptureSource(),
+        pointerPositionSource: any MacPointerPositionSource = defaultMacPointerPositionSource(),
         screenImageRenderer: any MacScreenImageRenderer = defaultMacScreenImageRenderer(),
         screenViewStore: MacScreenViewStore = .shared,
         lookFrameStore: MacLookFrameStore = .shared,
@@ -217,6 +219,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.accessibilityActSource = accessibilityActSource
         self.effectObserverSource = effectObserverSource
         self.screenCaptureSource = screenCaptureSource
+        self.pointerPositionSource = pointerPositionSource
         self.screenImageRenderer = screenImageRenderer
         self.screenViewStore = screenViewStore
         self.lookFrameStore = lookFrameStore
@@ -327,6 +330,16 @@ public actor SwiftNativeMacControl: MacControlClient {
             // error, not an escalation — but fail loudly rather than silently
             // widening what a capability means.
             throw MacControlError.unknownAction(normalized)
+        }
+
+        // Perception is deliberately live and effect-free. Sending these reads
+        // through the durable motor-operation lifecycle both adds filesystem
+        // latency to every frame and makes an operation-id replay capable of
+        // returning stale screen state. Keep the same policy preflight inside
+        // `executeAction`, but reserve durable begin/transition/replay records
+        // for actions that can change the world.
+        if macControlAccessibilityReadActions.contains(normalized) {
+            return try await executeAction(normalized, body: body)
         }
 
         guard let operationStore else {
@@ -1900,11 +1913,31 @@ public actor SwiftNativeMacControl: MacControlClient {
     private func axSnapshot(
         limits: MacAXLimits,
         pid: Int32? = nil
-    ) -> MacAXRead? {
-        guard case .read(let read) = anchoredSnapshot(limits: limits, pid: pid, window: nil) else {
-            return nil
-        }
-        return read
+    ) -> MacAnchoredRead {
+        anchoredSnapshot(limits: limits, pid: pid, window: nil)
+    }
+
+    /// One vocabulary for the self-refusal across every read tool.
+    static let selfInspectionError = "self_inspection_unsupported"
+    static let selfInspectionNote =
+        "the target is NativeAgent's own window, and reading our own UI over AX "
+        + "deadlocks the app (in-process AppKit re-entry) — self-inspection via AX "
+        + "is refused; look at another app's window instead"
+
+    private func selfInspectionResult(action: String, started: Date) -> MacControlResult {
+        MacControlResult(
+            ok: false,
+            action: action,
+            output: .object([
+                "trusted": .bool(true),
+                "status": .string(Self.selfInspectionError),
+                "error": .string(Self.selfInspectionError),
+                "message": .string(Self.selfInspectionNote),
+            ]),
+            error: Self.selfInspectionError,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
     }
 
     /// The outcome of a WINDOW-ANCHORED read (gpt-5.5 round-3 B1/B2).
@@ -1913,11 +1946,20 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// apart: the app is gone, the app is there but the window she looked at is
     /// not, or several windows are equally plausible and picking one would be a
     /// coin flip.
-    private enum MacAnchoredRead {
+    enum MacAnchoredRead {
         case read(MacAXRead)
         case appGone
         case windowGone
         case windowDrifted(String)
+        /// The target is NativeAgent's own process. An AX walk of our own tree
+        /// re-enters AppKit in-process (P1 deadlock, sample 2026-08-28:
+        /// `AXUIElementCopyActionNames` on our own toolbar ran
+        /// `+[NSToolbarView defaultMenu]` → `-[NSOperation waitUntilFinished]`
+        /// on a background cooperative thread while the main thread was parked
+        /// in SwiftUI's update lock — mutual wait, force-kill to recover).
+        /// AX perception is for OTHER processes; the walk is refused before a
+        /// single element is read.
+        case selfProcess
     }
 
     /// One read epoch, optionally anchored to a NAMED WINDOW of a named process.
@@ -1930,11 +1972,15 @@ public actor SwiftNativeMacControl: MacControlClient {
     ///   with two windows of one app, a focus change between the look and the
     ///   act silently re-points the read at the other one, and the pid claim
     ///   still passes (round-2 B2 was necessary, not sufficient).
-    private func anchoredSnapshot(
+    func anchoredSnapshot(
         limits: MacAXLimits,
         pid: Int32?,
         window: MacAXWindowIdentity?
     ) -> MacAnchoredRead {
+        // See `MacAnchoredRead.selfProcess` — refusing here, before any element
+        // is resolved, is what keeps the in-process AppKit re-entry deadlock
+        // structurally unreachable from every snapshot caller.
+        if pid == getpid() { return .selfProcess }
         let root: MacAXElementRef
         var identity: MacAXWindowIdentity?
         if let pid {
@@ -1958,6 +2004,10 @@ public actor SwiftNativeMacControl: MacControlClient {
                 identity = candidates[0].identity
             }
         } else {
+            if let front = accessibilitySource.frontmostApp(),
+               front.processIdentifier == getpid() {
+                return .selfProcess
+            }
             guard let frontmost = accessibilitySource.frontmostWindowRoot() else { return .appGone }
             root = frontmost
             // The frontmost read still names its window, so the FRAME it mints
@@ -2134,7 +2184,11 @@ public actor SwiftNativeMacControl: MacControlClient {
         let started = now()
         guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "ax_tree") }
         let limits = Self.axLimits(from: body)
-        guard let read = axSnapshot(limits: limits) else {
+        let anchored = axSnapshot(limits: limits)
+        if case .selfProcess = anchored {
+            return selfInspectionResult(action: "ax_tree", started: started)
+        }
+        guard case .read(let read) = anchored else {
             return MacControlResult(
                 ok: false,
                 action: "ax_tree",
@@ -2215,6 +2269,10 @@ public actor SwiftNativeMacControl: MacControlClient {
             anchoredSnapshot(limits: limits, pid: anchorPid, window: anchorWindow)
         }
         let firstAnchor = anchoredRead()
+        // A self-process target is a refusal on BOTH the anchored and the
+        // unanchored path — the caller needs the reason, not a generic
+        // "no window" (the walk was refused, not absent).
+        if case .selfProcess = firstAnchor { return (nil, seam, firstAnchor) }
         var read: MacAXRead? = {
             if case .read(let hit) = firstAnchor { return hit }
             return nil
@@ -2362,7 +2420,10 @@ public actor SwiftNativeMacControl: MacControlClient {
             )
         }
         let limits = Self.axLimits(from: body)
-        let (read, seam, _) = await lookSnapshot(limits: limits, scope: scope)
+        let (read, seam, anchor) = await lookSnapshot(limits: limits, scope: scope)
+        if case .selfProcess? = anchor {
+            return selfInspectionResult(action: "look", started: started)
+        }
         guard let read else {
             return MacControlResult(
                 ok: false,
@@ -2572,7 +2633,11 @@ public actor SwiftNativeMacControl: MacControlClient {
         // hard, and the truncation state rides along so a zero-match answer is
         // distinguishable from "the button was past the cap".
         let limits = Self.axLimits(from: body)
-        guard let read = axSnapshot(limits: limits) else {
+        let anchored = axSnapshot(limits: limits)
+        if case .selfProcess = anchored {
+            return selfInspectionResult(action: "ax_find", started: started)
+        }
+        guard case .read(let read) = anchored else {
             return MacControlResult(
                 ok: false,
                 action: "ax_find",
@@ -2648,6 +2713,28 @@ public actor SwiftNativeMacControl: MacControlClient {
     ///   • neither              → both flags false and how to grant them.
     private func handleView(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
+        let viewStartedNs = DispatchTime.now().uptimeNanoseconds
+        func cancelledResult() -> MacControlResult {
+            MacControlResult(
+                ok: false, action: "view",
+                output: .object([
+                    "view": .null, "view_current": .bool(false), "image": .null,
+                    "view_note": .string("This screen request was cancelled; no new view was published."),
+                ]),
+                error: "view_capture_cancelled",
+                durationMs: Int(now().timeIntervalSince(started) * 1000), viaSwift: true
+            )
+        }
+        guard !Task.isCancelled else { return cancelledResult() }
+        let captureTicket = await screenViewStore.beginCapture()
+        func cancelCapture() async -> MacControlResult {
+            await screenViewStore.cancelCapture(captureTicket)
+            return cancelledResult()
+        }
+        guard !Task.isCancelled else { return await cancelCapture() }
+        func elapsedMilliseconds(from start: UInt64, to end: UInt64) -> Int64 {
+            Int64((end &- start) / 1_000_000)
+        }
         // The four-verb semantic screen consumes the same frozen capture as
         // mac_view, but its visual compiler must see the world rather than the
         // human-facing numbered ink we draw on top of it. This is an internal
@@ -2672,19 +2759,40 @@ public actor SwiftNativeMacControl: MacControlClient {
 
         // 1. Where to look. The window rect comes from AX (the root node's own
         //    frame), so the capture is exactly the window — not a guessed crop.
+        let axSnapshotStartedNs = DispatchTime.now().uptimeNanoseconds
         var windowRect: MacAXFrame?
         var app: MacAXAppInfo?
         var windowTitle: String?
         var snapshot: MacAXTreeSnapshot?
-        if accessibilityTrusted, let read = axSnapshot(limits: limits) {
-            snapshot = read.snapshot
-            app = read.app
-            windowTitle = read.rootTitle
-            windowRect = read.snapshot.nodes.first?.attributes.frame
+        var axSelfRefused = false
+        if accessibilityTrusted {
+            switch axSnapshot(limits: limits) {
+            case .read(let read):
+                snapshot = read.snapshot
+                app = read.app
+                windowTitle = read.rootTitle
+                windowRect = read.snapshot.nodes.first?.attributes.frame
+            case .selfProcess:
+                // The view degrades to pixels-only, like an untrusted AX read:
+                // the capture is still honest, only the tree is refused.
+                axSelfRefused = true
+            case .appGone, .windowGone, .windowDrifted:
+                break
+            }
         }
-        let captureRect: MacAXFrame? = (scope == .fullScreen) ? nil : windowRect
+        let transientMenus = app.map {
+            MacTransientMenus.read(source: accessibilitySource, pid: $0.processIdentifier)
+        } ?? []
+        let axSnapshotFinishedNs = DispatchTime.now().uptimeNanoseconds
+        guard !Task.isCancelled else { return await cancelCapture() }
+        let captureRect: MacAXFrame? = (scope == .fullScreen) ? nil
+            : MacTransientMenus.captureFrame(window: windowRect, menus: transientMenus)
         let capturedAt = now()
+        let screenCaptureStartedNs = DispatchTime.now().uptimeNanoseconds
         let capture = await screenCaptureSource.capture(rect: captureRect)
+        guard !Task.isCancelled else { return await cancelCapture() }
+        let screenCaptureFinishedNs = DispatchTime.now().uptimeNanoseconds
+        let observedPointer = pointerPositionSource.currentPosition()
         let fusionGapMs = Int(abs(now().timeIntervalSince(capturedAt)) * 1000)
 
         var output: [String: JSONValue] = [
@@ -2692,6 +2800,8 @@ public actor SwiftNativeMacControl: MacControlClient {
             "screen_recording_trusted": .bool(screenTrusted),
             "scope": .string(scope.rawValue),
             "app": app?.toJSON() ?? .null,
+            "transient_menus": MacTransientMenus.json(transientMenus),
+            "pointer": observedPointer?.json ?? .null,
             // W3.5-FIX-R2 2 — the window title is visible screen text, but the
             // root AXWindow is not a TEXT role, so it never enters
             // `visibleText` and the source redaction never saw it. A title is
@@ -2706,9 +2816,18 @@ public actor SwiftNativeMacControl: MacControlClient {
                 )
             } ?? .null,
             "fusion_gap_ms": .int(Int64(fusionGapMs)),
+            "ax_snapshot_ms": .int(elapsedMilliseconds(
+                from: axSnapshotStartedNs, to: axSnapshotFinishedNs
+            )),
+            "screen_capture_ms": .int(elapsedMilliseconds(
+                from: screenCaptureStartedNs, to: screenCaptureFinishedNs
+            )),
         ]
         if !accessibilityTrusted {
             output["accessibility_note"] = .string(MacAccessibilityReader.notTrustedNote)
+        }
+        if axSelfRefused {
+            output["accessibility_note"] = .string(Self.selfInspectionNote)
         }
         if !screenTrusted {
             output["screen_recording_note"] = .string(Self.screenRecordingNote)
@@ -2727,7 +2846,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
         let geometry: MacScreenViewGeometry? = {
             if let shot { return MacScreenViewGeometry(shot: shot) }
-            guard let rect = windowRect ?? captureRect, rect.w > 0, rect.h > 0 else { return nil }
+            guard let rect = captureRect ?? windowRect, rect.w > 0, rect.h > 0 else { return nil }
             return MacScreenViewGeometry(
                 bounds: rect,
                 pixelWidth: Int(rect.w.rounded()),
@@ -2744,6 +2863,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         // controls AND the prose. The bar is "could she act correctly from the
         // legend alone", and a legend with no prose fails it — a set of
         // controls with no idea what the window says is not seeing the screen.
+        let sceneSelectionStartedNs = DispatchTime.now().uptimeNanoseconds
         var selection = MacScreenViewBuilder.Selection(marks: [], omitted: 0, offscreen: 0)
         var text = MacScreenViewBuilder.TextSelection(items: [], omitted: 0)
         if let snapshot, let geometry {
@@ -2758,6 +2878,8 @@ public actor SwiftNativeMacControl: MacControlClient {
                 limit: Self.intValue(body, "max_text_items") ?? MacScreenViewBuilder.hardMaxTextItems
             )
         }
+        let sceneSelectionFinishedNs = DispatchTime.now().uptimeNanoseconds
+        guard !Task.isCancelled else { return await cancelCapture() }
 
         // 4. Draw them, under the byte cap. Pixel-first semantic perception
         // gets the dominant canvas/image cropped from the native capture BEFORE
@@ -2765,6 +2887,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         // window's byte budget before OCR ever sees its small status text.
         var imageDownscale: Double?
         var imageBytes: Int?
+        let imageRenderStartedNs = DispatchTime.now().uptimeNanoseconds
         if let shot, let geometry {
             let semanticFocusFrame = semanticFocusVisualSurface
                 ? snapshot.flatMap {
@@ -2783,8 +2906,10 @@ public actor SwiftNativeMacControl: MacControlClient {
                     renderGeometry.placement(mark: $0.mark, frame: $0.frame)
                 }
             let fitted = MacScreenViewBuilder.fitImage(maxBytes: maxImageBytes) { rung in
-                screenImageRenderer.renderPNG(shot: renderShot, placements: placements, downscale: rung)
+                guard !Task.isCancelled else { return nil }
+                return screenImageRenderer.renderPNG(shot: renderShot, placements: placements, downscale: rung)
             }
+            guard !Task.isCancelled else { return await cancelCapture() }
             if let fitted {
                 output["image"] = .string(fitted.data.base64EncodedString())
                 output["image_format"] = .string("png")
@@ -2813,6 +2938,10 @@ public actor SwiftNativeMacControl: MacControlClient {
                 imageFailure = .exceedsByteCap
             }
         }
+        let imageRenderFinishedNs = DispatchTime.now().uptimeNanoseconds
+        output["image_render_ms"] = .int(elapsedMilliseconds(
+            from: imageRenderStartedNs, to: imageRenderFinishedNs
+        ))
         if output["image"] == nil {
             output["image"] = .null
             output["image_unavailable_reason"] = .string(
@@ -2844,8 +2973,9 @@ public actor SwiftNativeMacControl: MacControlClient {
         // 5. Remember it, so `mark` can be resolved — and hand back its id.
         //    The id is the ONLY way to address these numbers later; an older
         //    one is refused rather than silently re-interpreted.
+        guard !Task.isCancelled else { return await cancelCapture() }
         let viewId = UUID().uuidString
-        await screenViewStore.record(MacScreenViewSnapshot(
+        let viewCurrent = await screenViewStore.record(MacScreenViewSnapshot(
             viewId: viewId,
             capturedAt: capturedAt,
             scope: scope,
@@ -2853,9 +2983,17 @@ public actor SwiftNativeMacControl: MacControlClient {
             appName: app?.name,
             windowTitle: windowTitle,
             marks: selection.marks
-        ))
-        output["view"] = .string(viewId)
+        ), captureTicket: captureTicket)
+        if !viewCurrent && Task.isCancelled { return await cancelCapture() }
+        output["view"] = viewCurrent ? .string(viewId) : .null
+        output["view_current"] = .bool(viewCurrent)
+        if !viewCurrent {
+            output["view_note"] = .string("This capture was superseded or invalidated while in flight. Its image and legend are diagnostic only; take a fresh view before acting.")
+        }
         output["captured_at"] = .string(ISO8601DateFormatter().string(from: capturedAt))
+        // Motion perception needs subsecond frame spacing. Keep the legacy
+        // human timestamp, but never round the machine observation clock.
+        output["captured_at_epoch_seconds"] = .double(capturedAt.timeIntervalSince1970)
         output["view_ttl_seconds"] = .int(Int64(MacScreenViewStore.ttlSeconds))
         output["marks"] = .array(selection.marks.map { $0.toJSON(valueChars: limits.valueChars) })
         output["mark_count"] = .int(Int64(selection.marks.count))
@@ -2889,14 +3027,24 @@ public actor SwiftNativeMacControl: MacControlClient {
             + "centre. Coordinates are for the parts of the picture "
             + "with no marks (canvas, game, video). Marks are only valid for THIS view."
         )
+        let viewFinishedNs = DispatchTime.now().uptimeNanoseconds
+        output["scene_selection_ms"] = .int(elapsedMilliseconds(
+            from: sceneSelectionStartedNs, to: sceneSelectionFinishedNs
+        ))
+        output["post_render_ms"] = .int(elapsedMilliseconds(
+            from: imageRenderFinishedNs, to: viewFinishedNs
+        ))
+        output["view_total_ms"] = .int(elapsedMilliseconds(
+            from: viewStartedNs, to: viewFinishedNs
+        ))
         // ok reflects whether ANY perception came back. Both permissions off is
         // a real failure; either one on is a real answer.
-        let ok = accessibilityTrusted || output["image"] != .null
+        let ok = viewCurrent && (accessibilityTrusted || output["image"] != .null)
         return MacControlResult(
             ok: ok,
             action: "view",
             output: .object(output),
-            error: ok ? nil : "no_perception_available",
+            error: ok ? nil : (viewCurrent ? "no_perception_available" : "view_capture_superseded"),
             durationMs: Int(now().timeIntervalSince(started) * 1000),
             viaSwift: true
         )
@@ -3232,12 +3380,27 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
     }
 
-    private static func intValue(_ body: [String: JSONValue], _ key: String) -> Int? {
+    static func intValue(_ body: [String: JSONValue], _ key: String) -> Int? {
         switch body[key] ?? .null {
-        case .int(let n): return Int(n)
-        case .double(let d) where d.isFinite: return Int(d)
+        case .int(let n): return Int(exactly: n)
+        // Finiteness alone does not imply Int representability. Preserve the
+        // existing truncation, then reject values outside the integer range.
+        // Double(Int.max) itself rounds UP, so a <= bound check is unsafe.
+        case .double(let d) where d.isFinite: return Int(exactly: d.rounded(.towardZero))
         default: return nil
         }
+    }
+
+    static func handWaitMilliseconds(seconds: Double?) -> Int {
+        let finiteSeconds = seconds.flatMap { $0.isFinite ? $0 : nil } ?? 0.6
+        // Clamp while still floating point, before multiplication or Int
+        // conversion can overflow. The existing hand range stays 0...10s.
+        return Int(max(0, min(finiteSeconds, 10)) * 1000)
+    }
+
+    static func handDragMilliseconds(seconds: Double?) -> Int {
+        guard let seconds, seconds.isFinite, seconds > 0 else { return 240 }
+        return Int(max(0.08, min(seconds, 2)) * 1000)
     }
 
     /// Effect-time human-takeover check shared by every motor sibling.
@@ -3702,6 +3865,17 @@ public actor SwiftNativeMacControl: MacControlClient {
         if let refusal = await attentionActionRefusal(action: "ax_act", body: body) {
             return refusal
         }
+        // ax_act resolves against the FRONTMOST app; when that is ourselves
+        // the act source's own fence would refuse as path-not-found, but the
+        // reason belongs in the payload — same vocabulary as the read tools.
+        if accessibilitySource.frontmostApp()?.processIdentifier == getpid() {
+            return injectionRefusal(
+                action: "ax_act",
+                error: Self.selfInspectionError,
+                status: 409,
+                extra: ["guidance": .string(Self.selfInspectionNote)]
+            )
+        }
 
         let requestedAction = body.stringValue("action")
         let value = body.stringValue("value")
@@ -3788,13 +3962,25 @@ public actor SwiftNativeMacControl: MacControlClient {
         guard let gesture = body.stringValue("gesture")?.lowercased(), !gesture.isEmpty else {
             return injectionRefusal(action: "hand", error: "missing required field: gesture", status: 400)
         }
+        let button: MacHandButton
+        if body["button"] != nil {
+            guard let raw = body.stringValue("button")?.lowercased(),
+                  let parsed = MacHandButton(rawValue: raw), parsed != .middle,
+                  ["click", "double_click", "hold", "drag"].contains(gesture) else {
+                return injectionRefusal(action: "hand", error: "invalid mouse button for gesture", status: 400)
+            }
+            button = parsed
+        } else {
+            button = .left
+        }
 
         func point(_ xKey: String = "x", _ yKey: String = "y") -> CGPoint? {
             guard let x = Self.doubleValue(body, xKey), let y = Self.doubleValue(body, yKey),
                   x.isFinite, y.isFinite, abs(x) <= 100_000, abs(y) <= 100_000 else { return nil }
             return CGPoint(x: x, y: y)
         }
-        let waitMs = max(0, min(Int((Self.doubleValue(body, "seconds") ?? 0.6) * 1000), 10_000))
+        let waitMs = Self.handWaitMilliseconds(seconds: Self.doubleValue(body, "seconds"))
+        var dragTravelMs: Int?
         var plan: [MacHandStep]
         do {
             switch gesture {
@@ -3803,7 +3989,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                     return injectionRefusal(action: "hand", error: "gesture needs finite x/y", status: 400)
                 }
                 let count = gesture == "double_click" ? 2 : 1
-                var steps = try MacHandRepertoire.click(button: .left, at: at, count: count)
+                var steps = try MacHandRepertoire.click(button: button, at: at, count: count)
                 if gesture == "click_type" {
                     guard let text = body.stringValue("text"), !text.isEmpty else {
                         return injectionRefusal(action: "hand", error: "click_type needs text", status: 400)
@@ -3826,24 +4012,32 @@ public actor SwiftNativeMacControl: MacControlClient {
                 guard let at = point() else {
                     return injectionRefusal(action: "hand", error: "hold needs finite x/y", status: 400)
                 }
-                plan = try MacHandRepertoire.pressAndHold(button: .left, at: at, holdMs: waitMs)
+                plan = try MacHandRepertoire.pressAndHold(button: button, at: at, holdMs: waitMs)
             case "drag":
                 guard let start = point(), let end = point("to_x", "to_y") else {
                     return injectionRefusal(action: "hand", error: "drag needs finite x/y and to_x/to_y", status: 400)
                 }
+                // Named four-verb drags publish travel_seconds. Preserve the
+                // legacy low-level seconds-as-endpoint-dwell contract otherwise.
+                if body["travel_seconds"] != nil {
+                    dragTravelMs = Self.handDragMilliseconds(seconds: Self.doubleValue(body, "travel_seconds"))
+                }
                 plan = try MacHandRepertoire.drag(
+                    button: button,
                     from: start,
                     to: end,
-                    steps: 18,
-                    holdMs: min(waitMs, 1_500)
+                    steps: dragTravelMs.map { max(4, min(60, $0 / 16)) } ?? 18,
+                    holdMs: dragTravelMs == nil ? min(waitMs, 1_500) : 0,
+                    travelMs: dragTravelMs ?? 0
                 )
             case "scroll":
                 guard let at = point() else {
                     return injectionRefusal(action: "hand", error: "scroll needs finite x/y", status: 400)
                 }
                 let dy = max(-120, min(Self.intValue(body, "dy") ?? -6, 120))
+                let dx = max(-120, min(Self.intValue(body, "dx") ?? 0, 120))
                 plan = MacHandRepertoire.move(to: at)
-                    + MacHandRepertoire.scroll(dx: 0, dy: Int32(dy), unit: .line)
+                    + MacHandRepertoire.scroll(dx: Int32(dx), dy: Int32(dy), unit: .line)
             case "key":
                 guard let keys = body.stringValue("keys") else {
                     return injectionRefusal(action: "hand", error: "key needs keys", status: 400)
@@ -3851,15 +4045,12 @@ public actor SwiftNativeMacControl: MacControlClient {
                 plan = try MacKeySyntax.parseChords(keys).flatMap(MacHandRepertoire.chord)
             case "hold_key":
                 guard let keys = body.stringValue("keys") else {
-                    return injectionRefusal(action: "hand", error: "hold_key needs one key or chord", status: 400)
+                    return injectionRefusal(action: "hand", error: "hold_key needs a held key set", status: 400)
                 }
-                let chords = try MacKeySyntax.parseChords(keys)
-                guard chords.count == 1, let chord = chords.first else {
-                    return injectionRefusal(action: "hand", error: "hold_key accepts exactly one key or chord", status: 400)
-                }
+                let held = try MacKeySyntax.parseHeldKeys(keys)
                 plan = try MacHandRepertoire.hold(
-                    modifiers: chord.modifiers,
-                    keys: [chord.keyCode]
+                    modifiers: held.modifiers,
+                    keys: held.keys
                 ) { [.wait(milliseconds: waitMs)] }
             default:
                 return injectionRefusal(
@@ -3872,36 +4063,18 @@ public actor SwiftNativeMacControl: MacControlClient {
             if let rawHolding = body.stringValue("holding")?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !rawHolding.isEmpty {
-                guard gesture != "hold", gesture != "hold_key" else {
+                // Pointer hold + held keys is one balanced coordinated gesture.
+                // Only nesting a second KEY hold conflicts with the outer set.
+                guard gesture != "hold_key" else {
                     return injectionRefusal(
                         action: "hand",
-                        error: "holding cannot wrap another hold gesture",
+                        error: "holding cannot wrap another keyboard hold gesture",
                         status: 400
                     )
                 }
-                var modifiers: MacKeyModifiers = []
-                var keyCodes: [UInt16] = []
-                for token in rawHolding.split(whereSeparator: { $0.isWhitespace }).map(String.init) {
-                    if let modifier = MacKeySyntax.modifier(token.lowercased()) {
-                        modifiers.formUnion(modifier)
-                        continue
-                    }
-                    let chords = try MacKeySyntax.parseChords(token)
-                    guard chords.count == 1, let chord = chords.first else {
-                        return injectionRefusal(
-                            action: "hand",
-                            error: "each held key must be one key or chord",
-                            status: 400
-                        )
-                    }
-                    modifiers.formUnion(chord.modifiers)
-                    if !keyCodes.contains(chord.keyCode) { keyCodes.append(chord.keyCode) }
-                }
-                guard !modifiers.isEmpty || !keyCodes.isEmpty else {
-                    return injectionRefusal(action: "hand", error: "holding was empty", status: 400)
-                }
+                let held = try MacKeySyntax.parseHeldKeys(rawHolding)
                 let inner = plan
-                plan = try MacHandRepertoire.hold(modifiers: modifiers, keys: keyCodes) { inner }
+                plan = try MacHandRepertoire.hold(modifiers: held.modifiers, keys: held.keys) { inner }
             }
         } catch {
             return injectionRefusal(action: "hand", error: "invalid gesture: \(error)", status: 400)
@@ -3911,6 +4084,10 @@ public actor SwiftNativeMacControl: MacControlClient {
             return injectionRefusal(action: "hand", error: "gesture plan was empty or unbalanced", status: 400)
         }
 
+        // A composed four-verb physical act may own both fresh observations.
+        // In that lane this hand reports emission only, never verification;
+        // all injection/attention/cancellation gates below remain unchanged.
+        let defersVisualVerification = body["defer_visual_verification"] == .bool(true)
         // Capture evidence inside the same canonical operation. Browser scroll
         // and Page Down often change pixels while the accessibility document
         // remains structurally identical, so the fused image participates in
@@ -3928,7 +4105,9 @@ public actor SwiftNativeMacControl: MacControlClient {
         var heldKeys: [UInt16] = []
         var heldButtons: [MacMouseButton] = []
         var lastPoint = CGPoint.zero
-        func recoverNeutral() {
+        var emittedEvents = 0
+        @discardableResult func recoverNeutral() -> Int {
+            let released = heldKeys.count + heldButtons.count
             for key in heldKeys.reversed() {
                 eventSink.post(key: MacKeyEvent(keyCode: key, down: false))
             }
@@ -3937,7 +4116,33 @@ public actor SwiftNativeMacControl: MacControlClient {
                     phase: .up, button: button, x: lastPoint.x, y: lastPoint.y
                 ))
             }
+            heldKeys.removeAll()
+            heldButtons.removeAll()
+            return released
         }
+        func interruptedResult() -> MacControlResult {
+            let recoveryEvents = recoverNeutral()
+            return MacControlResult(
+                ok: false,
+                action: "hand",
+                output: .object([
+                    "status": .string("interrupted"),
+                    "gesture": .string(gesture),
+                    "steps": .int(Int64(plan.count)),
+                    "requested_events_emitted": .int(Int64(emittedEvents)),
+                    "recovery_events_emitted": .int(Int64(recoveryEvents)),
+                    "effects_may_have_occurred": .bool(emittedEvents > 0),
+                    "verified": .bool(false),
+                    "hand_neutral": .bool(heldKeys.isEmpty && heldButtons.isEmpty),
+                    "guidance": .string("Cancellation stopped further input. Already emitted input was not undone; observe the current screen before any further action."),
+                ]),
+                error: "gesture_cancelled",
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true,
+                verification: .unverified
+            )
+        }
+        if Task.isCancelled { return interruptedResult() }
 
         // A targeted wheel gesture first moves the pointer into the named
         // region. That hover can change pixels by itself; it is positioning,
@@ -3949,33 +4154,42 @@ public actor SwiftNativeMacControl: MacControlClient {
             if let refusal = await attentionActionRefusal(action: "hand", body: body) {
                 return refusal
             }
+            if Task.isCancelled { return interruptedResult() }
             lastPoint = CGPoint(x: event.x, y: event.y)
             eventSink.post(mouse: event)
+            emittedEvents += 1
             executionPlan.removeFirst()
         }
 
-        let beforeView = visibleEvidence(await handleView([
+        if Task.isCancelled { return interruptedResult() }
+
+        let beforeView = defersVisualVerification ? nil : visibleEvidence(await handleView([
             "max_marks": .int(60),
             "max_text_items": .int(80),
         ]))
 
         for step in executionPlan {
+            if Task.isCancelled { return interruptedResult() }
             if let refusal = await attentionActionRefusal(action: "hand", body: body) {
                 recoverNeutral()
                 return refusal
             }
+            if Task.isCancelled { return interruptedResult() }
             switch step {
             case .key(let event):
                 eventSink.post(key: event)
+                emittedEvents += 1
                 if event.down { heldKeys.append(event.keyCode) }
                 else { heldKeys.removeAll { $0 == event.keyCode } }
             case .mouse(let event):
                 lastPoint = CGPoint(x: event.x, y: event.y)
                 eventSink.post(mouse: event)
+                emittedEvents += 1
                 if event.phase == .down { heldButtons.append(event.button) }
                 else if event.phase == .up { heldButtons.removeAll { $0 == event.button } }
             case .scroll(let event):
                 eventSink.post(scroll: event)
+                emittedEvents += 1
             case .wait(let milliseconds):
                 if milliseconds > 0 {
                     try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
@@ -3983,10 +4197,13 @@ public actor SwiftNativeMacControl: MacControlClient {
             }
         }
 
-        let afterView = visibleEvidence(await handleView([
+        if Task.isCancelled { return interruptedResult() }
+
+        let afterView = defersVisualVerification ? nil : visibleEvidence(await handleView([
             "max_marks": .int(60),
             "max_text_items": .int(80),
         ]))
+        if Task.isCancelled { return interruptedResult() }
         let visibleChanged = beforeView != nil && afterView != nil && beforeView != afterView
 
         return MacControlResult(
@@ -3998,7 +4215,10 @@ public actor SwiftNativeMacControl: MacControlClient {
                 "steps": .int(Int64(plan.count)),
                 "visible_changed": .bool(visibleChanged),
                 "verified": .bool(visibleChanged),
+                "visual_verification_deferred": .bool(defersVisualVerification),
+                "drag_travel_ms": dragTravelMs.map { .int(Int64($0)) } ?? .null,
                 "holding": body["holding"] ?? .null,
+                "button": body["button"] ?? .null,
                 "hand_neutral": .bool(heldKeys.isEmpty && heldButtons.isEmpty),
                 "verification_evidence": visibleChanged
                     ? .string("fresh_fused_view_change")
@@ -4163,6 +4383,26 @@ public actor SwiftNativeMacControl: MacControlClient {
                     "guidance": .string(
                         "this frame recorded no process id, so the act cannot be anchored to the app "
                         + "you looked at — call mac_look again"
+                    ),
+                ]
+            )
+        }
+        // 4a½. A frame that names OUR OWN process (only possible from a store
+        //      populated before the self-inspection fence shipped) must refuse
+        //      BEFORE `windows(pid:)` or any other actuator call starts an AX
+        //      transaction against ourselves — see `MacAnchoredRead.selfProcess`.
+        if framePid == getpid() {
+            await lookFrameStore.invalidate()
+            return injectionRefusal(
+                action: "act",
+                error: Self.selfInspectionError,
+                status: 409,
+                extra: [
+                    "handle": .string(handle),
+                    "reason": .string("cannot_act_on_own_process"),
+                    "guidance": .string(
+                        "this frame points at NativeAgent's own window, which AX must never touch — "
+                        + "the frame is discarded; call mac_look at another app's window"
                     ),
                 ]
             )
@@ -4367,7 +4607,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         switch identityAnchor {
         case .read(let hit):
             identityRead = hit
-        case .appGone, .windowGone, .windowDrifted:
+        case .appGone, .windowGone, .windowDrifted, .selfProcess:
             // Nothing to verify against and nothing to act on: the frame is
             // dead, so it must stop resolving handles as well.
             await lookFrameStore.invalidate()
@@ -4375,6 +4615,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 switch identityAnchor {
                 case .windowGone: return ("frame_window_gone", "window_gone_before_verify")
                 case .windowDrifted(let why): return ("window_drifted", why)
+                case .selfProcess: return (Self.selfInspectionError, "cannot_act_on_own_process")
                 default: return ("frame_app_gone", "no_window_to_verify_against")
                 }
             }()
@@ -4723,6 +4964,13 @@ var effect: [String: JSONValue] = [
                         "the act ran, but that app now has more than one window that could be the one "
                         + "you looked at, so nothing was re-read — the old frame is discarded; call "
                         + "mac_look to re-anchor"
+                    )
+                case .selfProcess?:
+                    return (
+                        Self.selfInspectionError,
+                        "the act ran, but the target now resolves to NativeAgent's own process, which "
+                        + "AX must not re-read — the old frame is discarded; call mac_look at another "
+                        + "app's window"
                     )
                 case .read?, nil:
                     return (

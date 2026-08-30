@@ -103,7 +103,6 @@ final class NativeAgentAppCoordinator {
         var startPermissionSync: () -> Void
         var wireGlobalHotkey: () -> Void
         var warmEmbeddings: () -> Void
-        var runInitialDoctor: () -> Void
     }
 
     struct WindowActions {
@@ -231,7 +230,6 @@ final class NativeAgentAppCoordinator {
         processDependencies.startPermissionSync()
         processDependencies.wireGlobalHotkey()
         processDependencies.warmEmbeddings()
-        processDependencies.runInitialDoctor()
     }
 
     @discardableResult

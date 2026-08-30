@@ -59,8 +59,8 @@ struct MacChatAccessibilityAcceptanceTests {
                 "A user message must not expose an assistant-only action that does nothing.")
 
         let hoverCall = try #require(source.range(of: "BubbleHoverBar("))
-        let timestamp = try #require(source.range(of: "Text(displayTimestamp)", range: hoverCall.upperBound..<source.endIndex))
-        let hoverOverlay = source[hoverCall.lowerBound..<timestamp.lowerBound]
+        let overlayEnd = try #require(source.range(of: "if !isUser, isLastAssistant", range: hoverCall.upperBound..<source.endIndex))
+        let hoverOverlay = source[hoverCall.lowerBound..<overlayEnd.lowerBound]
         #expect(hoverOverlay.contains(".accessibilityHidden(true)"),
                 "Opacity-zero pointer controls must not remain phantom VoiceOver focus stops.")
     }

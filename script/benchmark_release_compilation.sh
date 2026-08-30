@@ -24,9 +24,15 @@ done
 
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-release-compile-benchmark.XXXXXX")"
 cleanup_benchmark() {
-  if ! $KEEP && [[ "$SCRATCH" == "${TMPDIR:-/tmp}/nativeagent-release-compile-benchmark."* ]]; then
+  local original_status=$?
+  if [[ "$original_status" != 0 ]]; then
+    echo "[compile-benchmark] failed (exit $original_status); retained evidence: $SCRATCH" >&2
+  elif $KEEP; then
+    echo "[compile-benchmark] retained evidence: $SCRATCH"
+  elif [[ "$SCRATCH" == "${TMPDIR:-/tmp}/nativeagent-release-compile-benchmark."* ]]; then
     find "$SCRATCH" -depth -delete 2>/dev/null || true
   fi
+  return "$original_status"
 }
 trap cleanup_benchmark EXIT
 
@@ -37,6 +43,7 @@ run_build() {
   mkdir -p "$scratch"
   echo "[compile-benchmark] $name"
   /usr/bin/time -l swift build \
+    --force-resolved-versions --skip-update \
     --package-path "$ROOT" \
     --scratch-path "$scratch" \
     -c release --jobs "$JOBS" "$@" \
@@ -75,4 +82,3 @@ if awk -v cw="$candidate_wall" -v dw="$default_wall" \
 else
   echo "[compile-benchmark] candidate rejected; canonical release compiler mode remains unchanged"
 fi
-$KEEP && echo "[compile-benchmark] retained evidence: $SCRATCH"

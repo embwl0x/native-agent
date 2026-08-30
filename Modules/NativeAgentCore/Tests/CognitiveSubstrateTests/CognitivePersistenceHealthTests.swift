@@ -66,6 +66,54 @@ struct CognitivePersistenceHealthTests {
         await #expect(throws: CognitiveSQLiteReadError.self) {
             try await store.loadArtifacts(kindPrefix: "affect", limit: 1)
         }
+
+        let receiptID = UUID()
+        try await store.appendReceipt(
+            kind: "health.probe",
+            payload: .object(["status": .string("healthy")]),
+            at: now,
+            id: receiptID
+        )
+        try await direct.write { db in
+            try db.execute(
+                sql: "UPDATE cognitive_receipts SET payload_json = ? WHERE id = ?",
+                arguments: ["{broken", receiptID.uuidString]
+            )
+        }
+        await #expect(throws: CognitiveSQLiteReadError.self) {
+            try await store.loadReceipts(kindPrefix: "health.probe", limit: 1)
+        }
+        await #expect(throws: CognitiveSQLiteReadError.self) {
+            try await store.loadReceiptRecords(kindPrefix: "health.probe", limit: 1)
+        }
+    }
+
+    @Test func honestReceiptReadReportsCorruptEvidenceAsUnavailable() async throws {
+        let root = try temporaryRoot()
+        let now = Date(timeIntervalSince1970: 40_500_000)
+        let store = try CognitiveSQLiteStore(dataRoot: root)
+        let receiptID = UUID()
+        try await store.appendReceipt(
+            kind: "microcycle",
+            payload: .object(["status": .string("settled")]),
+            at: now,
+            id: receiptID
+        )
+
+        let direct = try DatabaseQueue(path: await store.databaseURL.path)
+        try await direct.write { db in
+            try db.execute(
+                sql: "UPDATE cognitive_receipts SET payload_json = ? WHERE id = ?",
+                arguments: ["[not-json", receiptID.uuidString]
+            )
+        }
+
+        let substrate = CognitiveSubstrate(
+            configuration: .allPhasesEnabled,
+            dependencies: CognitiveSubstrateDependencies(now: { now }),
+            store: store
+        )
+        #expect(await substrate.receiptReadSnapshot(limit: 10) == .unavailable(.readFailed))
     }
 
     @Test func partialRestoreDegradesWithoutClobberAndCleanRetryRecovers() async throws {

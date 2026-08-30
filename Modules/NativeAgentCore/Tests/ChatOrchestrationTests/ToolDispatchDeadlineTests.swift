@@ -41,8 +41,16 @@ private func slotErrorString(_ value: JSONValue) -> String? {
     return s
 }
 
-// MARK: - Surface taxonomy (pure, no env)
+// MARK: - Surface taxonomy (pure, no env — but reads the env-sensitive
+// timeoutNanos, so it must not run concurrently with the race suite below:
+// the 0.5s setenv bled into interactiveSurfacesHaveGenerousFiniteBackstop
+// under broad --changed filters, 2026-08-27. One serialized umbrella pins
+// the ordering for both.)
 
+@Suite("ToolDispatchDeadline", .serialized)
+struct ToolDispatchDeadlineUmbrella {}
+
+extension ToolDispatchDeadlineUmbrella {
 @Suite("ToolDispatchDeadline: surface taxonomy")
 struct ToolDispatchDeadlineTaxonomySuite {
     @Test
@@ -74,8 +82,11 @@ struct ToolDispatchDeadlineTaxonomySuite {
     }
 }
 
+}
+
 // MARK: - Env-driven config + race behavior (serialized: mutates process env)
 
+extension ToolDispatchDeadlineUmbrella {
 @Suite("ToolDispatchDeadline: config + race", .serialized)
 struct ToolDispatchDeadlineRaceSuite {
     private let envVar = ToolDispatchDeadline.envVar
@@ -138,6 +149,9 @@ struct ToolDispatchDeadlineRaceSuite {
         let err = slotErrorString(result)
         #expect(err?.contains("dispatch deadline") == true, "got: \(err ?? "nil")")
         #expect(err?.contains("hang") == true)
+        #expect(err?.contains("effects may already have occurred") == true)
+        #expect(err?.contains("original receipt and current state before retrying") == true)
+        #expect(err?.contains("After reconciliation") == true)
         // Fired on the ~400ms deadline, NOT after the 30s hang. 10s keeps an
         // order of magnitude below the hang while riding out scheduler noise.
         #expect(elapsed < .seconds(10), "deadline should fire fast; took \(elapsed)")
@@ -201,4 +215,5 @@ struct ToolDispatchDeadlineRaceSuite {
         #expect(isError)
         #expect(slotErrorString(result)?.contains("dispatch deadline") == true)
     }
+}
 }

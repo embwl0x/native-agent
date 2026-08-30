@@ -172,9 +172,16 @@ public protocol MemoryPromoting: Sendable {
 /// candidate crossed the gate" from an unobservable promotion attempt.
 public struct MemoryPromotionTelemetry: Sendable, Equatable {
     public let stagedProposalCount: Int64
+    public let semanticStatus: MemorySemanticExtractionStatus
+    public let semanticCandidateCount: Int64
+    public let candidateCount: Int64
 
-    public init(stagedProposalCount: Int) {
+    public init(stagedProposalCount: Int, semanticStatus: MemorySemanticExtractionStatus = .unreported,
+                semanticCandidateCount: Int = 0, candidateCount: Int = 0) {
         self.stagedProposalCount = Int64(max(0, stagedProposalCount))
+        self.semanticStatus = semanticStatus
+        self.semanticCandidateCount = Int64(max(0, semanticCandidateCount))
+        self.candidateCount = Int64(max(0, candidateCount))
     }
 }
 
@@ -207,12 +214,17 @@ public struct SharedAdaptiveMemoryPromoter: MemoryPromotionTelemetryReporting {
         assistantMessage: String,
         sessionId: String
     ) async -> MemoryPromotionTelemetry {
-        let staged = await AdaptiveMemoryPromoter.shared.observeTurn(
+        let observation = await AdaptiveMemoryPromoter.shared.observeTurnWithReport(
             userMessage: userMessage,
             assistantMessage: assistantMessage,
             sessionId: sessionId
         )
-        return MemoryPromotionTelemetry(stagedProposalCount: staged.count)
+        return MemoryPromotionTelemetry(
+            stagedProposalCount: observation.proposals.count,
+            semanticStatus: observation.extraction.semanticStatus,
+            semanticCandidateCount: observation.extraction.semanticCandidateCount,
+            candidateCount: observation.extraction.candidates.count
+        )
     }
 }
 
@@ -240,6 +252,78 @@ struct TurnContextSnapshot: Sendable {
 
     var toolSchemaParameterBytes: Int {
         toolSchemas.reduce(0) { $0 + $1.parametersJSON.count }
+    }
+}
+
+/// A schema catalog already read for this turn before ContextFlow preparation.
+///
+/// `context_expand` is the sole packet-scoped schema. The eager preload runs
+/// before the packet exists, so it normally omits that one schema. Preserve the
+/// rest of the already-built catalog and add/remove the canonical schema after
+/// packet preparation instead of throwing the whole preload away and walking
+/// every registry/MCP schema a second time.
+public struct TurnToolSchemaCatalogSeed: Sendable {
+    public let schemas: [LLMToolSchema]
+    private let contextExpandSchema: LLMToolSchema
+    private let contextExpandInsertionIndex: Int
+
+    static let canonicalContextExpandSchema = LLMToolSchema(
+        name: "context_expand",
+        description: "Read one deeper context section offered for this turn. The atom id must come from the current context pointer list; expansion is read-only and pinned to this turn's immutable generation.",
+        parametersJSON: (try? JSONValue.object([
+            "type": .string("object"),
+            "properties": .object([
+                "atom_id": .object([
+                    "type": .string("string"),
+                    "description": .string("Atom id from the current turn's offered context pointers."),
+                ]),
+                "max_characters": .object([
+                    "type": .string("integer"),
+                    "description": .string("Optional bounded character limit."),
+                ]),
+            ]),
+            "required": .array([.string("atom_id")]),
+        ]).serializedData(pretty: false)) ?? Data("{}".utf8)
+    )
+
+    public init(schemas: [LLMToolSchema]) {
+        let suppliedIndex = schemas.firstIndex { $0.name == "context_expand" }
+        self.contextExpandSchema = suppliedIndex.map { schemas[$0] }
+            ?? Self.canonicalContextExpandSchema
+        self.schemas = schemas.filter { $0.name != "context_expand" }
+        if let suppliedIndex {
+            self.contextExpandInsertionIndex = suppliedIndex
+        } else if let readIndex = self.schemas.firstIndex(where: { $0.name == "read_file" }) {
+            // Canonical built-in order places context_expand directly after
+            // read_file. Retain that order so provider tool arrays and prompt
+            // cache prefixes do not change merely because this path reused a
+            // preload.
+            self.contextExpandInsertionIndex = readIndex + 1
+        } else {
+            self.contextExpandInsertionIndex = self.schemas.count
+        }
+    }
+
+    func schemas(contextExpandEligible: Bool) -> [LLMToolSchema] {
+        guard contextExpandEligible else { return schemas }
+        var scoped = schemas
+        scoped.insert(
+            contextExpandSchema,
+            at: min(contextExpandInsertionIndex, scoped.count)
+        )
+        return scoped
+    }
+}
+
+/// Turn-owned quiet-hours preference bytes. The wrapper is intentionally
+/// non-optional even when no window is configured, so a multi-iteration turn
+/// can distinguish "captured absence" from "not captured yet" and avoid a
+/// second preference-file read.
+public struct TurnQuietHoursSnapshot: Sendable, Equatable {
+    let window: TurnQuietHoursWindow?
+
+    public init(window: TurnQuietHoursWindow?) {
+        self.window = window
     }
 }
 
@@ -370,6 +454,10 @@ public struct TurnContext: Sendable {
 // MARK: - TurnEngineResult
 
 public struct TurnEngineResult: Sendable {
+    public enum CompletionState: Sendable, Equatable {
+        case completed
+        case incomplete
+    }
     public struct TerminalObservation: Sendable, Equatable {
         public let reasoningEffort: String
         public let toolSchemaCount: Int
@@ -442,6 +530,9 @@ public struct TurnEngineResult: Sendable {
     /// needed by paths (notably Anthropic text compatibility) whose caller does
     /// not own the final iteration's rebuilt TurnContext.
     public let terminalObservation: TerminalObservation?
+    /// Engine-owned terminal truth, independent of any nonempty fallback prose.
+    /// Legacy paths that do not report this evidence leave it unknown.
+    public let completionState: CompletionState?
 
     public init(
         reply: String,
@@ -451,7 +542,8 @@ public struct TurnEngineResult: Sendable {
         elapsedMs: Int,
         rawLLMResponse: String,
         providerCallCount: Int? = nil,
-        terminalObservation: TerminalObservation? = nil
+        terminalObservation: TerminalObservation? = nil,
+        completionState: CompletionState? = nil
     ) {
         self.reply = reply
         self.modelUsed = modelUsed
@@ -461,6 +553,7 @@ public struct TurnEngineResult: Sendable {
         self.rawLLMResponse = rawLLMResponse
         self.providerCallCount = providerCallCount
         self.terminalObservation = terminalObservation
+        self.completionState = completionState
     }
 }
 
@@ -496,6 +589,9 @@ public actor SwiftNativeTurnEngine {
     /// One constructor seam disables both additions for an immediate rollback
     /// without changing persona docs or any durable runtime state.
     let naturalExpressionGuidanceEnabled: Bool
+    /// Injected only for deterministic turn-boundary proof. Production reads
+    /// the canonical preference file through `TurnQuietHoursWindow.read`.
+    private let quietHoursReader: @Sendable (URL) -> TurnQuietHoursWindow?
 
     /// Upper bound on the attention-signal read. A slow substrate must never
     /// stall the turn: on expiry we proceed with no signals and flag the trace.
@@ -516,7 +612,10 @@ public actor SwiftNativeTurnEngine {
         contextFlow: (any ContextTurnPreparing)? = nil,
         cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
         memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)? = nil,
-        naturalExpressionGuidanceEnabled: Bool = true
+        naturalExpressionGuidanceEnabled: Bool = true,
+        quietHoursReader: @escaping @Sendable (URL) -> TurnQuietHoursWindow? = {
+            TurnQuietHoursWindow.read(dataRoot: $0)
+        }
     ) {
         self.persona = persona
         self.memory = memory
@@ -535,6 +634,15 @@ public actor SwiftNativeTurnEngine {
         self.cognitiveContextProvider = cognitiveContextProvider
         self.memoryAtomTranslator = memoryAtomTranslator
         self.naturalExpressionGuidanceEnabled = naturalExpressionGuidanceEnabled
+        self.quietHoursReader = quietHoursReader
+    }
+
+    func readTurnQuietHours() -> TurnQuietHoursWindow? {
+        remPinsDataRoot.flatMap(quietHoursReader)
+    }
+
+    public func captureTurnQuietHoursSnapshot() -> TurnQuietHoursSnapshot {
+        TurnQuietHoursSnapshot(window: readTurnQuietHours())
     }
 
     func checkedActiveProviderID(for surface: String) async throws -> String? {
@@ -639,7 +747,49 @@ public actor SwiftNativeTurnEngine {
         // Turn-start instant for the clock line; a multi-iteration tool loop
         // passes the same value every iteration so the dynamic segment's
         // time line can't churn the cache mid-turn. nil = clock() per build.
-        clockNowOverride: Date? = nil
+        clockNowOverride: Date? = nil,
+        // Optional successful schema walk already performed for this turn.
+        // Reuse remains conditional on exact ContextFlow expansion eligibility.
+        toolSchemaCatalogSeed: TurnToolSchemaCatalogSeed? = nil,
+        // Text-compatible multi-iteration turns capture this once outside the
+        // stream loop. nil means this call itself owns a fresh turn capture.
+        quietHoursSnapshot: TurnQuietHoursSnapshot? = nil
+    ) async throws -> TurnContext {
+        let quietHoursWindow: TurnQuietHoursWindow?
+        if let quietHoursSnapshot {
+            quietHoursWindow = quietHoursSnapshot.window
+        } else {
+            quietHoursWindow = readTurnQuietHours()
+        }
+        return try await buildTurnContext(
+            surface: surface,
+            userMessage: userMessage,
+            personaOverride: personaOverride,
+            imageBlocks: imageBlocks,
+            recallQueryOverride: recallQueryOverride,
+            includeClockContext: includeClockContext,
+            sessionID: sessionID,
+            recentTurns: recentTurns,
+            queryUserMessage: queryUserMessage,
+            clockNowOverride: clockNowOverride,
+            toolSchemaCatalogSeed: toolSchemaCatalogSeed,
+            quietHoursSnapshot: quietHoursWindow
+        )
+    }
+
+    func buildTurnContext(
+        surface: String,
+        userMessage: String,
+        personaOverride: String?,
+        imageBlocks: [LLMContentBlock],
+        recallQueryOverride: String?,
+        includeClockContext: Bool,
+        sessionID: String?,
+        recentTurns: [String],
+        queryUserMessage: String?,
+        clockNowOverride: Date?,
+        toolSchemaCatalogSeed: TurnToolSchemaCatalogSeed?,
+        quietHoursSnapshot: TurnQuietHoursWindow?
     ) async throws -> TurnContext {
         // P2-3, one bridge for the whole turn: fold the surface ONCE here, so
         // every downstream comparison (routing, ContextSurface, autonomy,
@@ -647,6 +797,7 @@ public actor SwiftNativeTurnEngine {
         // nothing has to know two spellings exist. Only the Workshop spelling
         // is rewritten; other surfaces pass through byte-identical.
         let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
+        try Task.checkCancellation()
         var trace = ContextStageTrace()
         if userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && imageBlocks.isEmpty
@@ -668,7 +819,11 @@ public actor SwiftNativeTurnEngine {
         // read is bounded by `queryEmbeddingWarmupWaitNanos` — so semantic
         // recall can add at most that much turn wait, and only when the
         // embedder is still cold.
-        let queryEmbeddingTicket = await contextFlow?.beginQueryEmbedding(queryMessage)
+        let semanticQuery = SessionHistoryPromptRenderer.semanticRecallQuery(
+            userMessage: queryMessage, recentTurns: recentTurns
+        )
+        trace.setCount("contextFlow.semanticQueryChars", semanticQuery.count)
+        let queryEmbeddingTicket = await contextFlow?.beginQueryEmbedding(semanticQuery)
 
         // Mind-into-circulation: feed Fluid Context's dormant NeedSignal inputs
         // from her current attention BEFORE the request is built. The read is
@@ -767,7 +922,7 @@ public actor SwiftNativeTurnEngine {
             let start = DispatchTime.now().uptimeNanoseconds
             do {
                 preparedContextTurn = try await contextFlow?.prepareContextTurn(contextFlowRequest)
-                trace.setFlag("contextFlow.active", preparedContextTurn != nil)
+                try Task.checkCancellation()
                 if let expansion = preparedContextTurn?.budgetExpansion {
                     trace.setFlag("contextFlow.budgetExpanded", true)
                     trace.setCount(
@@ -789,6 +944,7 @@ public actor SwiftNativeTurnEngine {
                 }
                 trace.record(.contextFlowPrepare, since: start)
             } catch {
+                try Task.checkCancellation()
                 trace.setFlag("contextFlow.fallback", true)
                 trace.setLabel(
                     "contextFlow.fallbackError",
@@ -889,9 +1045,14 @@ public actor SwiftNativeTurnEngine {
                 personaMap = Dictionary(uniqueKeysWithValues: docs.map { ($0.id, $0.content) })
                 compiledPersonaPrompt = nil
             }
-            trace.record(.personaCompile, since: personaStartNs)
+            // Microsecond clock (A7): on the ContextFlow-active path the kernel
+            // is already compiled in the arena, so this bracket's real work is
+            // the mirror→document map — tens of microseconds, which truncated
+            // to 0ms on every turn and read as a dark lane.
+            trace.recordMicroseconds(.personaCompile, since: personaStartNs)
         } catch {
-            trace.record(.personaCompile, since: personaStartNs)
+            trace.recordMicroseconds(.personaCompile, since: personaStartNs)
+            try Task.checkCancellation()
             throw TurnEngineError.personaLoadFailed(underlying: error)
         }
 
@@ -926,23 +1087,17 @@ public actor SwiftNativeTurnEngine {
         trace.setFlag("budget.derived", turnBudget.isDerived)
         trace.setCount("budget.recallRowLimit", turnBudget.recallRowLimit)
         trace.setCount("budget.memoryBlockChars", turnBudget.memoryBlockChars)
+        try Task.checkCancellation()
         var recalled: [MemoryRecallHit] = []
+        var servedContextMemoryIDs: [String] = []
+        var contextFlowMemoryAtomCount: Int?
         if let preparedContextTurn {
-            let memoryAtomCount = preparedContextTurn.packet.selectedItems.reduce(into: 0) {
+            contextFlowMemoryAtomCount = preparedContextTurn.packet.selectedItems.reduce(into: 0) {
                 if $1.pointer.kind == .memory || $1.pointer.kind == .correction { $0 += 1 }
             }
-            trace.setMemoryRecallOutcome(.contextFlow(hitCount: memoryAtomCount))
-            // Task #42: these records are being SERVED into the live turn, and
-            // the legacy recall lane (the only other use_count bump) is skipped
-            // on this branch. Fire-and-forget after the outcome is traced —
-            // zero read latency, mirroring the recall lane's own bump. Only
-            // reachable in .active mode inside a real turn: shadow prepares
-            // detached and discards, and the frozen/eval lane never runs this
-            // engine, so neither can pollute access signals.
-            let servedIds = preparedContextTurn.selectedMemoryRecordIDs
-            if !servedIds.isEmpty, let memory {
-                Task { await memory.recordServedContextHits(ids: servedIds) }
-            }
+            // Selection alone is not a completed serve. Catalog/runtime
+            // assembly below can still suspend and be cancelled.
+            servedContextMemoryIDs = preparedContextTurn.selectedMemoryRecordIDs
         } else if let memory {
             let recallQuery = recallQueryOverride?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -956,6 +1111,7 @@ public actor SwiftNativeTurnEngine {
                 )
                 trace.setMemoryRecallOutcome(.succeeded(hitCount: recalled.count))
             } catch {
+                try Task.checkCancellation()
                 // FC0 preserves the established empty-recall degradation but
                 // stops presenting an error as a healthy zero-hit result.
                 recalled = []
@@ -966,14 +1122,30 @@ public actor SwiftNativeTurnEngine {
         } else {
             trace.setMemoryRecallOutcome(.notConfigured)
         }
-        trace.record(.memoryRecall, since: memoryStartNs)
+        // A7 (2026-08-28): on a ContextFlow-active turn the memory retrieval
+        // does NOT happen in the bracket above — it happens inside the packet
+        // selector during `contextFlow.prepare`, and the bracket only counts
+        // already-selected atoms. Attribute the selector's own measured
+        // latency to this lane so `memory.recall` reports the turn's real
+        // retrieval cost instead of a structural zero. On a prepared turn the
+        // bracket number is NEVER recorded: with no selector sample the lane
+        // stays absent rather than laundering atom-serving time into a
+        // fast-recall reading.
+        if preparedContextTurn == nil {
+            trace.recordMicroseconds(.memoryRecall, since: memoryStartNs)
+        } else if let selectionMicros = preparedContextTurn?.packet.receipt
+            .measuredSelectionMicroseconds {
+            trace.setMicroseconds(.memoryRecall, microseconds: Int64(selectionMicros))
+        }
         // Dedup: drop recalls whose text is superseded by a REM pin sharing
         // the same key or whose preview contains the pin's text verbatim.
         // This keeps the context tight — the pin IS the authoritative fact.
         if !remPins.isEmpty {
             recalled = recalled.filter { hit in
                 !remPins.contains(where: { pin in
-                    hit.preview.contains(pin.text) || pin.text.contains(hit.preview)
+                    !hit.preview.isEmpty
+                        && !pin.text.isEmpty
+                        && (hit.preview.contains(pin.text) || pin.text.contains(hit.preview))
                 })
             }
         }
@@ -982,16 +1154,49 @@ public actor SwiftNativeTurnEngine {
         //    LLM can actually emit tool calls. Schema fetch is best-effort:
         //    a dispatcher that only knows names degrades to the pre-W1 wire
         //    path (no `tools` field in the request body).
-        let toolNamesStartNs = DispatchTime.now().uptimeNanoseconds
-        let toolNames = await FluidContextToolScope.$current.withValue(preparedContextTurn) {
-            (try? await tools.listAvailableTools()) ?? []
+        // Resolve the seed's packet-sensitive eligibility on the actor before
+        // either async child starts. The children then capture only Sendable
+        // value state; the prepared packet remains on the parent task for the
+        // later render path.
+        let contextExpandEligible = preparedContextTurn?.packet.expandablePointers.isEmpty == false
+        let catalog = await FluidContextToolScope.$current.withValue(preparedContextTurn) {
+            // These walks are independent but both inherit the exact prepared
+            // ContextFlow scope. Preserve each result's established ordering
+            // and best-effort empty fallback while overlapping their policy,
+            // registry, and MCP reads.
+            async let namesResult: (value: [String], elapsedMs: Int64) = {
+                let started = DispatchTime.now().uptimeNanoseconds
+                let value = (try? await tools.listAvailableTools()) ?? []
+                return (
+                    value,
+                    Int64((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
+                )
+            }()
+            async let schemasResult: (value: [LLMToolSchema], elapsedMs: Int64, reused: Bool) = {
+                let started = DispatchTime.now().uptimeNanoseconds
+                if let toolSchemaCatalogSeed {
+                    return (
+                        toolSchemaCatalogSeed.schemas(
+                            contextExpandEligible: contextExpandEligible
+                        ),
+                        0,
+                        true
+                    )
+                }
+                let value = (try? await tools.listAvailableToolSchemas()) ?? []
+                return (
+                    value,
+                    Int64((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000),
+                    false
+                )
+            }()
+            return await (namesResult, schemasResult)
         }
-        trace.record(.toolsNames, since: toolNamesStartNs)
-        let toolSchemasStartNs = DispatchTime.now().uptimeNanoseconds
-        let toolSchemas = await FluidContextToolScope.$current.withValue(preparedContextTurn) {
-            (try? await tools.listAvailableToolSchemas()) ?? []
-        }
-        trace.record(.toolsSchemas, since: toolSchemasStartNs)
+        let toolNames = catalog.0.value
+        let toolSchemas = catalog.1.value
+        trace.setTiming(.toolsNames, milliseconds: catalog.0.elapsedMs)
+        trace.setTiming(.toolsSchemas, milliseconds: catalog.1.elapsedMs)
+        trace.setFlag("tools.schemasSeedReused", catalog.1.reused)
         let snapshot = TurnContextSnapshot(
             providerPreferences: prefs,
             toolNames: toolNames,
@@ -1060,9 +1265,7 @@ public actor SwiftNativeTurnEngine {
         // because a window happens to be configured.
         let currentTurnClock = clockNowOverride ?? clock()
         let quietHoursActive: Bool = {
-            guard let quietHours = remPinsDataRoot.flatMap(TurnQuietHoursWindow.read(dataRoot:)) else {
-                return false
-            }
+            guard let quietHours = quietHoursSnapshot else { return false }
             var calendar = Calendar(identifier: .gregorian)
             calendar.timeZone = .current
             return quietHours.contains(hour: calendar.component(.hour, from: currentTurnClock))
@@ -1082,11 +1285,19 @@ public actor SwiftNativeTurnEngine {
             let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
             finalContext = await contextByAppendingCurrentTurnFacts(
                 baseContext,
-                clockNowOverride: currentTurnClock
+                clockNowOverride: currentTurnClock,
+                quietHours: quietHoursSnapshot
             )
             trace.record(ContextStageName.contextClockRuntime, since: runtimeStartNs)
         } else {
             finalContext = baseContext
+        }
+        try Task.checkCancellation()
+        if contextFlowMode == .active {
+            trace.setFlag("contextFlow.active", preparedContextTurn != nil)
+        }
+        if let contextFlowMemoryAtomCount {
+            trace.setMemoryRecallOutcome(.contextFlow(hitCount: contextFlowMemoryAtomCount))
         }
         trace.setCount("snapshot.providerPrefs", snapshot.providerPreferences.count)
         trace.setCount("snapshot.toolNames", snapshot.toolNames.count)
@@ -1113,6 +1324,12 @@ public actor SwiftNativeTurnEngine {
         trace.setCount("imageBlockCount", imageBlocks.count)
         trace.setFlag("snapshot.requestScoped", true)
         trace.emit(kind: "context.summary", surface: surface)
+        // Keep the existing asynchronous access writer, admitted only after
+        // this context has completed assembly and passed cancellation.
+        if !servedContextMemoryIDs.isEmpty, let memory {
+            let servedIDs = servedContextMemoryIDs
+            Task { await memory.recordServedContextHits(ids: servedIDs) }
+        }
         return finalContext
     }
 
@@ -1265,13 +1482,19 @@ public actor SwiftNativeTurnEngine {
         }
     }
 
-    nonisolated private static func renderContextPacket(_ prepared: ContextPreparedTurn) -> String {
+    nonisolated public static func renderContextPacket(_ prepared: ContextPreparedTurn) -> String {
         var sections: [String] = []
         if !prepared.packet.selectedItems.isEmpty {
             let items = prepared.packet.selectedItems.map { item in
                 "- [\(item.pointer.kind.rawValue)] \(item.text)"
             }.joined(separator: "\n")
-            sections.append("# Relevant context (derived from canonical local sources)\n\(items)")
+            sections.append(
+                """
+                # Relevant context (derived from canonical local sources)
+                These records preserve evidence from when they were written; they are not automatically live readings. Recheck changing status, counts, health, availability, and claims labeled current/latest/live/present with their canonical owner before repeating them as current.
+                \(items)
+                """
+            )
         }
         if !prepared.packet.expandablePointers.isEmpty {
             let pointerLines: String = prepared.packet.expandablePointers.map { pointer in
@@ -1392,21 +1615,22 @@ public actor SwiftNativeTurnEngine {
                 "userMessageChars": Int64(userMessage.count),
                 "assistantMessageChars": Int64(assistantMessage.count),
                 "stagedProposalCount": promotionTelemetry?.stagedProposalCount ?? 0,
+                "extractedCandidateCount": promotionTelemetry?.candidateCount ?? 0,
+                "semanticCandidateCount": promotionTelemetry?.semanticCandidateCount ?? 0,
             ],
             flags: [
                 "configured": true,
                 "outcomeReported": promotionTelemetry != nil,
-            ]
+            ],
+            labels: ["semanticExtraction": promotionTelemetry?.semanticStatus.rawValue ?? "unreported"]
         )
     }
 
     func contextByAppendingCurrentTurnFacts(
         _ context: TurnContext,
-        clockNowOverride: Date? = nil
+        clockNowOverride: Date? = nil,
+        quietHours: TurnQuietHoursWindow?
     ) async -> TurnContext {
-        // Quiet hours are read per turn from the SAME dataRoot the REM pins
-        // come from; nil root (legacy/test callers) → time-and-zone only.
-        let quietHours = remPinsDataRoot.flatMap(TurnQuietHoursWindow.read(dataRoot:))
         // clockNowOverride (turn-context-iteration-cache follow-up,
         // 2026-08-13): the clock line renders into the DYNAMIC system
         // segment, and a multi-iteration tool turn that crosses a minute
@@ -1511,10 +1735,17 @@ public actor SwiftNativeTurnEngine {
         )
         var used = 0
         var bullets: [String] = []
-        for hit in recalled.prefix(resolved.recallRowLimit) {
+        var relatedNames: [String] = []
+        // B11: filter empties BEFORE taking the row limit. A hit with no text
+        // used to occupy one of the (few) recall slots inside the prefix window
+        // and then render nothing, silently costing a real memory its place.
+        let renderable = recalled.lazy.filter {
+            !($0.content ?? $0.preview)
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        for hit in renderable.prefix(resolved.recallRowLimit) {
             let full = (hit.content ?? hit.preview)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !full.isEmpty else { continue }
             let bounded = full.count > resolved.memoryRowChars
                 ? String(full.prefix(resolved.memoryRowChars)) + "…"
                 : full
@@ -1531,9 +1762,50 @@ public actor SwiftNativeTurnEngine {
                used + line.count > resolved.memoryBlockChars { break }
             used += line.count
             bullets.append(line)
+            // B4: collect the graph neighbours of the rows we ACTUALLY render.
+            // Gathering them here rather than from `recalled` keeps the line
+            // honest — a memory dropped by the row limit or the block bound
+            // contributes no entities either.
+            if case .object(let extras)? = hit.extras,
+               case .array(let names)? = extras["kg_related"] {
+                for value in names {
+                    guard case .string(let name) = value else { continue }
+                    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty, !relatedNames.contains(trimmed) else { continue }
+                    relatedNames.append(trimmed)
+                }
+            }
         }
         guard !bullets.isEmpty else { return nil }
-        return "Relevant memory:\n" + bullets.joined(separator: "\n")
+        let block = "Relevant memory:\n" + bullets.joined(separator: "\n")
+        guard let related = renderRelatedEntitiesLine(relatedNames) else { return block }
+        return block + "\n" + related
+    }
+
+    /// Hard ceiling on the `related:` line. One line, one turn, 400 characters —
+    /// the whole point of the feature is a cheap hint about what the recalled
+    /// memories connect to, and a hint that can grow without bound is just an
+    /// unbudgeted second memory block.
+    nonisolated static let relatedEntitiesLineChars = 400
+
+    /// Render the single `related:` line, or nil when there is nothing to say.
+    ///
+    /// Names are appended whole: a truncated entity name is worse than a missing
+    /// one, because the model cannot tell "Agent" from "Agent's Telegram bridge"
+    /// cut at the apostrophe. The loop therefore stops at the last name that
+    /// fits rather than clipping mid-name. Inputs arrive recency-first, so what
+    /// survives the cap is the freshest end of the list.
+    nonisolated static func renderRelatedEntitiesLine(_ names: [String]) -> String? {
+        guard !names.isEmpty else { return nil }
+        let prefix = "related: "
+        var line = prefix
+        for name in names {
+            let separator = line == prefix ? "" : ", "
+            guard line.count + separator.count + name.count <= relatedEntitiesLineChars
+            else { break }
+            line += separator + name
+        }
+        return line == prefix ? nil : line
     }
 
     /// Compact `[2026-07-14, preference]` provenance marker. Either half may be

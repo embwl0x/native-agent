@@ -182,7 +182,7 @@ extension SwiftNativePersonaEngine {
         try await persistence.withFileLock(growthURL) {
             let existing: String
             if FileManager.default.fileExists(atPath: growthURL.path) {
-                existing = (try? String(contentsOf: growthURL, encoding: .utf8)) ?? ""
+                existing = try Self.readPersonaTextForAppend(at: growthURL)
             } else {
                 // daemon: existing = default_personality_doc_content("GROWTH", ...)
                 existing = scaffoldBody
@@ -294,7 +294,7 @@ extension SwiftNativePersonaEngine {
         let backupPath: String? = try await persistence.withFileLock(target) {
             let existing: String
             if FileManager.default.fileExists(atPath: target.path) {
-                existing = (try? String(contentsOf: target, encoding: .utf8)) ?? ""
+                existing = try Self.readPersonaTextForAppend(at: target)
             } else {
                 existing = ""
             }
@@ -317,6 +317,20 @@ extension SwiftNativePersonaEngine {
     }
 
     // MARK: - shared write helpers
+
+    /// Append operations are read-modify-write transitions over canonical
+    /// persona documents. An existing unreadable file is authority we cannot
+    /// safely merge, never an empty document; fail before backup/write so the
+    /// original bytes remain the only state until an explicit repair occurs.
+    private static func readPersonaTextForAppend(at url: URL) throws -> String {
+        do {
+            return try String(contentsOf: url, encoding: .utf8)
+        } catch {
+            throw PersonaWriteError.ioFailure(
+                "Cannot append to unreadable \(url.lastPathComponent): \(error.localizedDescription)"
+            )
+        }
+    }
 
     func flushDerivedPersonaChange(_ target: URL, reason: String) async {
         let namespace = target.path.contains("/skills/bodies/") ? "skill" : "persona"

@@ -177,6 +177,52 @@ struct LLMProviderStatusFeedEvalTests {
         }
     }
 
+    @Test("fresh organism provider health supersedes an old manual probe")
+    func runtimeHealthReadsCanonicalOrganismState() async throws {
+        let dataRoot = try root("runtime-health")
+        defer { try? FileManager.default.removeItem(at: dataRoot) }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let cognition = dataRoot.appendingPathComponent("cognition", isDirectory: true)
+        try FileManager.default.createDirectory(at: cognition, withIntermediateDirectories: true)
+        let iso = ISO8601DateFormatter()
+        let object: [String: Any] = [
+            "savedAt": iso.string(from: now),
+            "bodySchema": ["providersAvailable": true, "providersHealthy": true],
+        ]
+        try JSONSerialization.data(withJSONObject: object)
+            .write(to: cognition.appendingPathComponent("organism_state.json"))
+
+        guard case .healthy(let savedAt) = ProviderRuntimeHealthFeed.read(dataRoot: dataRoot, now: now) else {
+            Issue.record("fresh organism health must be usable as provider evidence")
+            return
+        }
+        #expect(savedAt == now)
+
+        let staleProbe = LLMProviderStatusFeed.Record(
+            status: .ok,
+            checkedAt: now.addingTimeInterval(-LLMProviderStatusFeed.staleAfter - 1),
+            detail: "old manual probe",
+            providerID: "anthropic",
+            model: "old-model",
+            tested: true
+        )
+        try await LLMProviderStatusFeed.write(staleProbe, to: LLMProviderStatusFeed.path(in: dataRoot))
+        guard case .stale = LLMProviderStatusFeed.read(dataRoot: dataRoot, now: now) else {
+            Issue.record("manual probe fixture must remain stale")
+            return
+        }
+
+        let staleRuntime = ProviderRuntimeHealthFeed.read(
+            dataRoot: dataRoot,
+            now: now.addingTimeInterval(ProviderRuntimeHealthFeed.staleAfter + 1)
+        )
+        guard case .unavailable(let detail) = staleRuntime else {
+            Issue.record("stale organism state must not masquerade as current provider health")
+            return
+        }
+        #expect(detail.contains("stale"))
+    }
+
     @Test("native provider probes own the production writer and the instrument names adverse states")
     func productionWiringAndReaderSemantics() throws {
         let doctorSource = try AppSourceScraping.appSource("NativeClient+SystemOpsActions.swift")

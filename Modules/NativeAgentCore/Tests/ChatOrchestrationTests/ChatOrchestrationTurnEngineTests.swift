@@ -142,6 +142,95 @@ private final class SnapshotToolClient: ToolDispatchClient, @unchecked Sendable 
     }
 }
 
+private actor CatalogWalkGate {
+    enum Walk: Hashable {
+        case names
+        case schemas
+    }
+
+    private var entered: Set<Walk> = []
+    private var bothWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enter(_ walk: Walk) async {
+        entered.insert(walk)
+        if entered.count == 2 {
+            let waiters = bothWaiters
+            bothWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilBothEntered() async {
+        guard entered.count < 2 else { return }
+        await withCheckedContinuation { continuation in
+            bothWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func entryCount() -> Int { entered.count }
+}
+
+private final class CoordinatedCatalogToolClient: ToolDispatchClient, @unchecked Sendable {
+    let gate: CatalogWalkGate
+    let names: [String]
+    let schemas: [LLMToolSchema]
+
+    init(gate: CatalogWalkGate, names: [String], schemas: [LLMToolSchema]) {
+        self.gate = gate
+        self.names = names
+        self.schemas = schemas
+    }
+
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        .null
+    }
+
+    func listAvailableTools() async throws -> [String] {
+        await gate.enter(.names)
+        return names
+    }
+
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
+        await gate.enter(.schemas)
+        return schemas
+    }
+}
+
+private final class QuietHoursReadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    let window: TurnQuietHoursWindow?
+
+    init(window: TurnQuietHoursWindow?) {
+        self.window = window
+    }
+
+    func read(dataRoot: URL) -> TurnQuietHoursWindow? {
+        _ = dataRoot
+        lock.lock()
+        reads += 1
+        lock.unlock()
+        return window
+    }
+
+    var count: Int {
+        lock.lock()
+        let value = reads
+        lock.unlock()
+        return value
+    }
+}
+
 private func collectTraceEvents(
     kind: String,
     turnId: String? = nil,
@@ -255,6 +344,27 @@ private final class SpyMemoryRecaller: MemoryRecalling, @unchecked Sendable {
         lastPersona = persona
         lastSurface = surface
         return []
+    }
+}
+
+private final class ScriptedMemoryRecaller: MemoryRecalling, @unchecked Sendable {
+    let hits: [MemoryRecallHit]
+
+    init(hits: [MemoryRecallHit]) {
+        self.hits = hits
+    }
+
+    func recall(_ query: String, k: Int) async throws -> [MemoryRecallHit] {
+        Array(hits.prefix(k))
+    }
+
+    func recall(
+        _ query: String,
+        k: Int,
+        persona: String?,
+        surface: String?
+    ) async throws -> [MemoryRecallHit] {
+        Array(hits.prefix(k))
     }
 }
 
@@ -631,6 +741,73 @@ func turnEngine_quietHoursPreferenceIsRenderedAndReceiptStampedWithoutStaleState
 }
 
 @Test
+func turnEngine_quietHoursPreference_isReadExactlyOncePerBareAndHistoryTurn() async throws {
+    let dataRoot = try makeTempDir("quiet-hours-single-read")
+    defer { try? FileManager.default.removeItem(at: dataRoot) }
+    let personaRoot = try makeTempDir("quiet-hours-single-read-persona")
+    defer { try? FileManager.default.removeItem(at: personaRoot) }
+    try writeFile(personaRoot.appendingPathComponent("SOUL.md"), "QUIET-SINGLE-READ")
+
+    var local = Calendar(identifier: .gregorian)
+    local.timeZone = .current
+    let now = try #require(local.date(from: DateComponents(
+        year: 2026, month: 8, day: 27, hour: 22, minute: 0
+    )))
+    let probe = QuietHoursReadProbe(
+        window: TurnQuietHoursWindow(startHour: 19, endHour: 3)
+    )
+    let engine = SwiftNativeTurnEngine(
+        persona: hermeticPersona(root: personaRoot),
+        memory: nil,
+        router: StubRouting(prefs: [
+            "chat": SurfacePreference(
+                surface: "chat", model: "gpt-5.5", reasoningEffort: "high"
+            ),
+        ]),
+        trust: hermeticTrust(),
+        llm: MockLLMClient(scriptedResponses: ["unused"]),
+        tools: MockToolDispatchClient(),
+        clock: { now },
+        remPinsDataRoot: dataRoot,
+        memoryPromoter: nil,
+        quietHoursReader: { probe.read(dataRoot: $0) }
+    )
+
+    let bare = try await engine.buildTurnContext(surface: "chat", userMessage: "bare")
+    #expect(bare.systemPrompt?.contains("Quiet hours: 7:00 PM–3:00 AM local") == true)
+    #expect(probe.count == 1)
+
+    let pinnedHistoryTurn = await engine.captureTurnQuietHoursSnapshot()
+    #expect(probe.count == 2)
+    let history = try await engine.buildTurnContextWithHistory(
+        surface: "chat",
+        userMessage: "history",
+        sessionId: "quiet-history",
+        historyLimit: 0,
+        historyReader: SessionHistoryReader(dataRoot: dataRoot),
+        personaOverride: nil,
+        clockNowOverride: now,
+        quietHoursSnapshot: pinnedHistoryTurn
+    )
+    #expect(history.systemPrompt?.contains("Quiet hours: 7:00 PM–3:00 AM local") == true)
+    #expect(probe.count == 2)
+
+    // A native-tools loop may rebuild context after a load. Reusing the same
+    // turn snapshot keeps the preference read count pinned across iterations.
+    _ = try await engine.buildTurnContextWithHistory(
+        surface: "chat",
+        userMessage: "history iteration 2",
+        sessionId: "quiet-history",
+        historyLimit: 0,
+        historyReader: SessionHistoryReader(dataRoot: dataRoot),
+        personaOverride: nil,
+        clockNowOverride: now,
+        quietHoursSnapshot: pinnedHistoryTurn
+    )
+    #expect(probe.count == 2)
+}
+
+@Test
 func turnEngine_buildTurnContext_appends_clock_context_to_dynamic_segment() async throws {
     var utc = Calendar(identifier: .gregorian)
     utc.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -841,6 +1018,89 @@ func turnEngine_remPinsReadStage_hasNoStaleCacheAfterDeleteOrMalformedIndex() as
 }
 
 @Test
+func turnEngine_remPinDedupeDoesNotDropEmptyPreviewRecallHits() async throws {
+    let dataRoot = try makeTempDir("rem-pin-empty-preview")
+    defer { try? FileManager.default.removeItem(at: dataRoot) }
+    let personaRoot = try makeTempDir("rem-pin-empty-preview-persona")
+    defer { try? FileManager.default.removeItem(at: personaRoot) }
+    try writeFile(personaRoot.appendingPathComponent("SOUL.md"), "REM-PIN-EMPTY-PREVIEW")
+    try """
+    {"GROWTH.md":[{"id":"pin-empty","text":"Pinned durable fact","createdAt":"2026-06-01T00:00:00Z"}]}
+    """.write(
+        to: dataRoot.appendingPathComponent("rem_pins.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let engine = SwiftNativeTurnEngine(
+        persona: hermeticPersona(root: personaRoot),
+        memory: ScriptedMemoryRecaller(hits: [
+            MemoryRecallHit(score: 0.9, preview: "", content: "full memory body")
+        ]),
+        router: StubRouting(prefs: [
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+        ]),
+        trust: hermeticTrust(),
+        llm: MockLLMClient(scriptedResponses: ["unused"]),
+        tools: MockToolDispatchClient(),
+        remPinsDataRoot: dataRoot,
+        memoryPromoter: nil
+    )
+
+    let context = try await engine.buildTurnContext(
+        surface: "chat",
+        userMessage: "recall the pinned fact",
+        personaOverride: nil,
+        imageBlocks: [],
+        includeClockContext: false
+    )
+    #expect(context.systemPrompt?.contains("Pinned durable fact") == true)
+    #expect(context.recalled.count == 1, "empty preview must not self-match every pin")
+    #expect(context.recalled.first?.preview == "")
+}
+
+@Test
+func turnEngine_remPinDedupeStillDropsNonEmptyPreviewDuplicates() async throws {
+    let dataRoot = try makeTempDir("rem-pin-nonempty-preview")
+    defer { try? FileManager.default.removeItem(at: dataRoot) }
+    let personaRoot = try makeTempDir("rem-pin-nonempty-preview-persona")
+    defer { try? FileManager.default.removeItem(at: personaRoot) }
+    try writeFile(personaRoot.appendingPathComponent("SOUL.md"), "REM-PIN-NONEMPTY-PREVIEW")
+    try """
+    {"GROWTH.md":[{"id":"pin-dup","text":"Pinned durable fact about User","createdAt":"2026-06-01T00:00:00Z"}]}
+    """.write(
+        to: dataRoot.appendingPathComponent("rem_pins.json"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let engine = SwiftNativeTurnEngine(
+        persona: hermeticPersona(root: personaRoot),
+        memory: ScriptedMemoryRecaller(hits: [
+            MemoryRecallHit(score: 0.9, preview: "Pinned durable fact", content: "full memory body")
+        ]),
+        router: StubRouting(prefs: [
+            "chat": SurfacePreference(surface: "chat", model: "gpt-5.5", reasoningEffort: "high"),
+        ]),
+        trust: hermeticTrust(),
+        llm: MockLLMClient(scriptedResponses: ["unused"]),
+        tools: MockToolDispatchClient(),
+        remPinsDataRoot: dataRoot,
+        memoryPromoter: nil
+    )
+
+    let context = try await engine.buildTurnContext(
+        surface: "chat",
+        userMessage: "recall the pinned fact",
+        personaOverride: nil,
+        imageBlocks: [],
+        includeClockContext: false
+    )
+    #expect(context.systemPrompt?.contains("Pinned durable fact about User") == true)
+    #expect(context.recalled.isEmpty, "non-empty overlapping previews should still dedupe")
+}
+
+@Test
 func turnEngine_buildTurnContext_uses_one_active_provider_snapshot_for_runtime() async throws {
     let dir = try makeTempDir("provider-snapshot")
     try writeFile(dir.appendingPathComponent("SOUL.md"), "PROVIDER-SNAPSHOT-PERSONA")
@@ -922,6 +1182,103 @@ func turnEngine_buildTurnContext_snapshots_tool_catalog_and_schemas_once() async
     #expect(ctx.toolSchemas == [schema])
     #expect(tools.namesCalls == 1)
     #expect(tools.schemasCalls == 1)
+}
+
+@Test(.timeLimit(.minutes(1)))
+func turnEngine_toolCatalogWalks_enterConcurrently_andPreserveResults() async throws {
+    let dir = try makeTempDir("tool-catalog-overlap")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let schema = LLMToolSchema(
+        name: "beta",
+        description: "Beta tool",
+        parametersJSON: Data(#"{"type":"object"}"#.utf8)
+    )
+    let gate = CatalogWalkGate()
+    let tools = CoordinatedCatalogToolClient(
+        gate: gate,
+        names: ["zeta", "beta"],
+        schemas: [schema]
+    )
+    let engine = makeEngine(
+        persona: hermeticPersona(root: dir),
+        llm: MockLLMClient(scriptedResponses: ["unused"]),
+        tools: tools
+    )
+
+    let build = Task {
+        try await engine.buildTurnContext(surface: "chat", userMessage: "hi")
+    }
+    await gate.waitUntilBothEntered()
+    #expect(await gate.entryCount() == 2)
+    await gate.release()
+    let context = try await build.value
+
+    // The overlap changes scheduling only. Dispatcher order remains canonical.
+    #expect(context.toolsAvailable == ["zeta", "beta"])
+    #expect(context.toolSchemas == [schema])
+}
+
+@Test
+func turnEngine_schemaSeed_scopesContextExpansionWithoutRepeatingCatalogWalk() async throws {
+    let dir = try makeTempDir("tool-schema-seed")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let seeded = LLMToolSchema(
+        name: "seeded",
+        description: "Preloaded schema",
+        parametersJSON: Data(#"{"type":"object"}"#.utf8)
+    )
+    let live = LLMToolSchema(
+        name: "live",
+        description: "Fresh schema",
+        parametersJSON: Data(#"{"type":"object"}"#.utf8)
+    )
+    let tools = SnapshotToolClient(names: ["live"], schemas: [live])
+    let engine = makeEngine(
+        persona: hermeticPersona(root: dir),
+        llm: MockLLMClient(scriptedResponses: ["unused", "unused"]),
+        tools: tools
+    )
+
+    let reused = try await engine.buildTurnContext(
+        surface: "chat",
+        userMessage: "reuse",
+        personaOverride: nil,
+        imageBlocks: [],
+        toolSchemaCatalogSeed: TurnToolSchemaCatalogSeed(schemas: [seeded])
+    )
+    #expect(reused.toolSchemas == [seeded])
+    #expect(tools.namesCalls == 1)
+    #expect(tools.schemasCalls == 0)
+
+    // No ContextFlow packet means context_expand is ineligible. Filtering that
+    // one packet-scoped schema must not throw away the rest of the eager
+    // catalog and repeat its registry/MCP walk.
+    let contextExpand = LLMToolSchema(
+        name: "context_expand",
+        description: "Scoped expansion",
+        parametersJSON: Data(#"{"type":"object"}"#.utf8)
+    )
+    let scoped = try await engine.buildTurnContext(
+        surface: "chat",
+        userMessage: "refresh",
+        personaOverride: nil,
+        imageBlocks: [],
+        toolSchemaCatalogSeed: TurnToolSchemaCatalogSeed(schemas: [contextExpand, seeded])
+    )
+    #expect(scoped.toolSchemas == [seeded])
+    #expect(tools.namesCalls == 2)
+    #expect(tools.schemasCalls == 0)
+
+    let readFile = LLMToolSchema(
+        name: "read_file",
+        description: "Read",
+        parametersJSON: Data(#"{"type":"object"}"#.utf8)
+    )
+    let preload = TurnToolSchemaCatalogSeed(schemas: [readFile, seeded])
+    #expect(preload.schemas(contextExpandEligible: false) == [readFile, seeded])
+    let expanded = preload.schemas(contextExpandEligible: true)
+    #expect(expanded.map(\.name) == ["read_file", "context_expand", "seeded"])
+    #expect(expanded[1] == TurnToolSchemaCatalogSeed.canonicalContextExpandSchema)
 }
 
 @Test

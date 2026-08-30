@@ -15,66 +15,28 @@ struct WorkshopView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if store.isLoading && store.tasks.isEmpty {
+                switch WorkshopContentPresentation.state(
+                    tasks: store.tasks,
+                    isLoading: store.isLoading,
+                    loadError: store.loadError
+                ) {
+                case .loading:
                     ProgressView("Loading tasks…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    List {
-                        // Pending approvals — shown first
-                        if !store.pendingApprovals.isEmpty {
-                            Section("Pending Approval") {
-                                ForEach(store.pendingApprovals) { task in
-                                    WorkshopTaskRow(task: task)
-                                        .swipeActions(edge: .trailing) {
-                                            Button(role: .destructive) {
-                                                Task { _ = await store.rejectWorkshopTask(task) }
-                                            } label: { Label("Reject", systemImage: "xmark") }
-                                        }
-                                        .swipeActions(edge: .leading) {
-                                            Button {
-                                                Task { _ = await store.approveWorkshopTask(task) }
-                                            } label: { Label("Approve", systemImage: "checkmark") }
-                                                .tint(.green)
-                                        }
-                                        .onTapGesture { selectedWorkshopTask = task }
-                                }
-                            }
-                        }
-
-                        // Active tasks
-                        let active = store.activeTasks
-                        if !active.isEmpty {
-                            Section("Active (\(active.count))") {
-                                ForEach(active) { task in
-                                    WorkshopTaskRow(task: task)
-                                        .onTapGesture { selectedWorkshopTask = task }
-                                }
-                            }
-                        }
-
-                        // History (done / blocked)
-                        let done = store.doneTasks
-                        if !done.isEmpty {
-                            Section("History") {
-                                ForEach(done.prefix(20)) { task in
-                                    WorkshopTaskRow(task: task)
-                                        .onTapGesture { selectedWorkshopTask = task }
-                                }
-                            }
-                        }
-
-                        if store.tasks.isEmpty {
-                            AppEmptyState(
-                                title: "No tasks yet",
-                                systemImage: "checklist",
-                                kind: .empty,
-                                description: "Your agent proposes tasks when high-value work is worth tracking."
-                            )
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                        }
-                    }
-                    .listStyle(.insetGrouped)
+                case .unavailable(let message):
+                    AppEmptyState(
+                        title: "Workshop unavailable",
+                        systemImage: "icloud.slash",
+                        kind: .unavailable,
+                        description: message,
+                        action: (
+                            title: "Try Again",
+                            systemImage: "arrow.clockwise",
+                            handler: { Task { await store.refresh() } }
+                        )
+                    )
+                case .empty, .content:
+                    workshopList
                 }
             }
             .navigationTitle("Workshop")
@@ -84,6 +46,7 @@ struct WorkshopView: View {
                     Button { showNewWorkshopTask = true } label: {
                         Image(systemName: "plus")
                     }
+                    .accessibilityLabel("Add Workshop task")
                 }
                 ToolbarItem(placement: .navigationBarLeading) {
                     if let syncAt = iCloudSyncEngine.shared.lastSyncAt {
@@ -109,15 +72,95 @@ struct WorkshopView: View {
             Text(store.error ?? "")
         })
     }
+
+    private var workshopList: some View {
+        List {
+            if !store.pendingApprovals.isEmpty {
+                Section("Pending Approval") {
+                    ForEach(store.pendingApprovals) { task in
+                        workshopTaskButton(task)
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    Task { _ = await store.rejectWorkshopTask(task) }
+                                } label: { Label("Reject", systemImage: "xmark") }
+                            }
+                            .swipeActions(edge: .leading) {
+                                Button {
+                                    Task { _ = await store.approveWorkshopTask(task) }
+                                } label: { Label("Approve", systemImage: "checkmark") }
+                                    .tint(.green)
+                            }
+                    }
+                }
+            }
+
+            let active = store.activeTasks
+            if !active.isEmpty {
+                Section("Active (\(active.count))") {
+                    ForEach(active) { task in workshopTaskButton(task) }
+                }
+            }
+
+            let done = store.doneTasks
+            if !done.isEmpty {
+                Section("History") {
+                    ForEach(done.prefix(20)) { task in workshopTaskButton(task) }
+                }
+            }
+
+            if store.tasks.isEmpty {
+                AppEmptyState(
+                    title: "No tasks yet",
+                    systemImage: "checklist",
+                    kind: .empty,
+                    description: "Your agent proposes tasks when high-value work is worth tracking."
+                )
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            }
+        }
+        .listStyle(.insetGrouped)
+    }
+
+    private func workshopTaskButton(_ task: WorkshopTaskRecord) -> some View {
+        Button {
+            selectedWorkshopTask = task
+        } label: {
+            WorkshopTaskRow(task: task)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens Workshop task details")
+    }
 }
 
 // MARK: - Store
+
+enum WorkshopContentPresentation: Equatable {
+    case loading
+    case unavailable(String)
+    case empty
+    case content
+
+    static func state(
+        tasks: [WorkshopTaskRecord],
+        isLoading: Bool,
+        loadError: String?
+    ) -> WorkshopContentPresentation {
+        guard tasks.isEmpty else { return .content }
+        if isLoading { return .loading }
+        if let loadError, !loadError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .unavailable(loadError)
+        }
+        return .empty
+    }
+}
 
 @MainActor
 final class WorkshopStore: ObservableObject {
     @Published var tasks: [WorkshopTaskRecord] = []
     @Published var isLoading = false
     @Published var error: String?
+    @Published private(set) var loadError: String?
 
     var activeTasks: [WorkshopTaskRecord] {
         tasks.filter { task in
@@ -140,15 +183,16 @@ final class WorkshopStore: ObservableObject {
 
     func refresh() async {
         isLoading = true
+        defer { isLoading = false }
         await iCloudSyncEngine.shared.refreshWorkshopTasksSnapshot()
         let next = iCloudSyncEngine.shared.workshopTasks
         applySyncedTasks(next)
-        isLoading = false
+        loadError = next.isEmpty ? iCloudSyncEngine.shared.syncError : nil
     }
 
     func applySyncedTasks(_ next: [WorkshopTaskRecord]) {
-        guard next != tasks else { return }
-        tasks = next
+        if next != tasks { tasks = next }
+        if !next.isEmpty { loadError = nil }
     }
 
     func submitWorkshopTask(title: String, objective: String) async -> Bool {
@@ -368,14 +412,25 @@ struct NewWorkshopTaskSheet: View {
                         .lineLimit(4...8)
                 }
                 Section {
-                    Button("Submit Workshop Task") {
+                    Button {
                         Task {
+                            guard !isSubmitting else { return }
                             isSubmitting = true
                             if await store.submitWorkshopTask(title: title, objective: objective) { dismiss() }
                             isSubmitting = false
                         }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if isSubmitting {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .accessibilityHidden(true)
+                            }
+                            Text(isSubmitting ? "Submitting Workshop Task…" : "Submit Workshop Task")
+                        }
                     }
                     .disabled(title.isEmpty || objective.isEmpty || isSubmitting)
+                    .accessibilityLabel(isSubmitting ? "Submitting Workshop task" : "Submit Workshop task")
                 }
             }
             .navigationTitle("New Workshop Task")

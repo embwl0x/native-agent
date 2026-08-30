@@ -102,6 +102,27 @@ extension NativeClient {
                 authEnvironment: ProcessInfo.processInfo.environment
             )
             let registryCheck = Self.providerDoctorCoverageCheck(providers)
+            switch ProviderRuntimeHealthFeed.read(dataRoot: dataRoot) {
+            case .healthy:
+                guard registryCheck.status == "ok" else { return registryCheck }
+                return DoctorCheck(
+                    id: registryCheck.id,
+                    title: registryCheck.title,
+                    status: "ok",
+                    detail: "\(registryCheck.detail) Recent provider calls are healthy.",
+                    repair: nil
+                )
+            case .unhealthy(_, let detail):
+                return DoctorCheck(
+                    id: "live.providers",
+                    title: "Providers and OAuth",
+                    status: "warn",
+                    detail: "\(registryCheck.detail) \(Self.safeDoctorDetail(detail))",
+                    repair: "Open Providers and inspect the active path before running another agent turn."
+                )
+            case .unavailable:
+                break
+            }
             switch LLMProviderStatusFeed.read(dataRoot: dataRoot) {
             case .current:
                 return registryCheck

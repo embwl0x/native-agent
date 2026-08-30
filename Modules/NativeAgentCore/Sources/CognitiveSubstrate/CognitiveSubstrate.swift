@@ -38,28 +38,6 @@ public struct CognitiveSubstrateDependencies: Sendable {
     public static let live = CognitiveSubstrateDependencies()
 }
 
-/// The honest result of asking the substrate to hand replay work to its
-/// canonical Dream/REM owner. This method never runs Dream/REM itself: a
-/// `delegatedToDreamREMOwner` result means its bounded evidence receipt was
-/// durably committed, not that Dream/REM execution has completed.
-public enum CognitiveReplayRunOutcome: Sendable, Equatable {
-    case disabled
-    case unavailable(CognitiveReplayRunUnavailability)
-    case adverse(CognitiveReplayRunAdverseState)
-    case delegatedToDreamREMOwner(evidenceNodeIDs: [UUID])
-}
-
-public enum CognitiveReplayRunUnavailability: String, Sendable, Equatable {
-    case noReplayEvidence = "no_replay_evidence"
-    case persistenceDisabled = "persistence_disabled"
-    case storeUnavailable = "store_unavailable"
-}
-
-public enum CognitiveReplayRunAdverseState: String, Sendable, Equatable {
-    case persistenceWritesBlocked = "persistence_writes_blocked"
-    case receiptWriteFailed = "receipt_write_failed"
-}
-
 /// Receipt history is observational evidence, not an empty-by-default metric.
 /// The Observatory must be able to distinguish a quiet loop from a disabled or
 /// unreadable receipt lane instead of turning every failed read into `[]`.
@@ -1023,46 +1001,6 @@ public actor CognitiveSubstrate {
             at: dependencies.now(),
             id: id ?? UUID()
         )
-    }
-
-    /// Records a bounded, durable handoff request for the canonical Dream/REM owner.
-    /// This compatibility surface must not run a shadow replay in substrate:
-    /// Dream/REM owns execution and `integrateReplayChecked` owns the later
-    /// result integration. A missing receipt is therefore an unavailable or
-    /// adverse outcome, never a success-shaped silent no-op.
-    public func runReplay(reason: String) async -> CognitiveReplayRunOutcome {
-        guard configuration.enabled, configuration.replayEnabled else { return .disabled }
-        let nodes = (await snapshot()).nodes.prefix(4)
-        guard !nodes.isEmpty else { return .unavailable(.noReplayEvidence) }
-        guard configuration.persistenceEnabled else { return .unavailable(.persistenceDisabled) }
-        guard store != nil else { return .unavailable(.storeUnavailable) }
-        guard !persistenceWritesBlocked else { return .adverse(.persistenceWritesBlocked) }
-
-        let evidenceNodeIDs = nodes.map(\.id)
-        do {
-            try await recordReceiptChecked(
-                kind: "replay",
-                payload: .object([
-                    "reason": .string(bounded(reason, maxCharacters: 120)),
-                    "evidenceNodeIds": .array(evidenceNodeIDs.map { .string($0.uuidString) }),
-                    "status": .string("delegated-to-dream-rem-owner"),
-                ])
-            )
-            return .delegatedToDreamREMOwner(
-                evidenceNodeIDs: evidenceNodeIDs
-            )
-        } catch let error as CognitivePersistenceError {
-            switch error {
-            case .storeUnavailable:
-                return .unavailable(.storeUnavailable)
-            case .writesBlocked:
-                return .adverse(.persistenceWritesBlocked)
-            case .invalidRestoreArtifact, .artifactWriteFailed:
-                return .adverse(.receiptWriteFailed)
-            }
-        } catch {
-            return .adverse(.receiptWriteFailed)
-        }
     }
 
     @discardableResult

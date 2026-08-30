@@ -580,9 +580,12 @@ enum TurnPlanTraceRecorder {
         await writer.enqueue {
             let persistence = SwiftNativePersistenceCore()
             do {
-                try await persistence.withFileLock(tracesPath) {
-                    try await persistence.appendJSONL(row, to: tracesPath)
-                }
+                try await appendPathOwnedJSONL(
+                    row,
+                    to: tracesPath,
+                    using: persistence,
+                    logLabel: "TurnPlanTraceRecorder.trace"
+                )
             } catch {
                 FileHandle.standardError.write(
                     Data("TurnPlanTraceRecorder: trace append failed: \(error)\n".utf8)

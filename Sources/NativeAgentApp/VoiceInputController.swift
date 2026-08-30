@@ -174,8 +174,24 @@ final class VoiceInputController {
         self.permissionRequest = permissionRequest
         self.recognitionDriver = recognitionDriver
         self.stopTimeoutNanoseconds = stopTimeoutNanoseconds
-        recognizer = SFSpeechRecognizer(locale: Locale.current)
-        audioEngine = AVAudioEngine()
+    }
+
+    /// Chat, detached chat, and the global voice shortcut each own a
+    /// controller. Keep Speech and AVFoundation cold until one of those
+    /// surfaces actually starts native voice input; constructing them during
+    /// ordinary app/view initialization needlessly loads service state and the
+    /// Speech framework retains per-recognizer internals on macOS.
+    private func prepareNativeResourcesIfNeeded() {
+        if recognizer == nil {
+            recognizer = SFSpeechRecognizer(locale: Locale.current)
+        }
+        if audioEngine == nil {
+            audioEngine = AVAudioEngine()
+        }
+    }
+
+    var _nativeResourcesPreparedForTesting: Bool {
+        recognizer != nil || audioEngine != nil
     }
 
     func requestPermission() async -> Bool {
@@ -251,6 +267,7 @@ final class VoiceInputController {
             startListening(using: recognitionDriver)
             return
         }
+        prepareNativeResourcesIfNeeded()
         guard let recognizer, recognizer.isAvailable else {
             errorMessage = "Speech recognizer not available on this device."
             return

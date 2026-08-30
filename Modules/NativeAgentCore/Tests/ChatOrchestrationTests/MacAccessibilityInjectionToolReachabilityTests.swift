@@ -237,6 +237,27 @@ func macInjectionTools_schemasSayPlainlyWhatTheyDo() async throws {
         return
     }
     #expect(required.isEmpty)
+
+    // The natural action schema carries the same limits the runtime enforces,
+    // so providers do not need a rejected or silently oversized first try.
+    let naturalAct = try properties("act")
+    func numericBound(_ property: String, _ bound: String) -> Double? {
+        guard case .object(let schema)? = naturalAct[property] else { return nil }
+        switch schema[bound] {
+        case .int(let value): return Double(value)
+        case .double(let value): return value
+        default: return nil
+        }
+    }
+    #expect(numericBound("repeat", "minimum") == 1)
+    #expect(numericBound("repeat", "maximum") == 12)
+    #expect(numericBound("seconds", "minimum") == 0)
+    #expect(numericBound("seconds", "maximum") == 10)
+    #expect(numericBound("interval", "minimum") == 0)
+    #expect(numericBound("interval", "maximum") == 2)
+    let naturalDescription = try schema("act").description.lowercased()
+    #expect(naturalDescription.contains("requested, accepted, planned, completed"))
+    #expect(naturalDescription.contains("elapsed boundary"))
 }
 
 // MARK: - Dispatch mapping + category gate

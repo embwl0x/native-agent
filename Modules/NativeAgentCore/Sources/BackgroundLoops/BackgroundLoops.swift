@@ -515,6 +515,79 @@ public struct LoopFailureBackoffPolicy: Sendable, Equatable {
     }
 }
 
+private struct FailureReceiptIncident: Sendable {
+    let loopId: String
+    let error: String
+    let firstAt: String
+    let lastAt: String
+    let occurrences: Int
+
+    init(loopId: String, error: String, firstAt: String, lastAt: String, occurrences: Int = 1) {
+        self.loopId = loopId
+        self.error = error
+        self.firstAt = firstAt
+        self.lastAt = lastAt
+        self.occurrences = max(1, occurrences)
+    }
+
+    init?(row: JSONValue) {
+        guard case .object(let object) = row,
+              case .string("background_loop.failure")? = object["kind"],
+              case .string(let loopId)? = object["loopId"],
+              case .string(let error)? = object["error"] else {
+            return nil
+        }
+        let createdAt = Self.timestamp(from: object["createdAt"])
+        let firstAt = Self.timestamp(from: object["firstAt"]) ?? createdAt
+        let lastAt = Self.timestamp(from: object["lastAt"]) ?? createdAt
+        guard let firstAt, let lastAt else { return nil }
+        self.init(
+            loopId: loopId,
+            error: error,
+            firstAt: firstAt,
+            lastAt: lastAt,
+            occurrences: Self.occurrences(from: object["occurrences"])
+        )
+    }
+
+    func toJSON(id: String) -> JSONValue {
+        .object([
+            "id": .string(id),
+            "kind": .string("background_loop.failure"),
+            "loopId": .string(loopId),
+            "status": .string("failed"),
+            "error": .string(error),
+            "createdAt": .string(firstAt),
+            "firstAt": .string(firstAt),
+            "lastAt": .string(lastAt),
+            "occurrences": .int(Int64(occurrences)),
+        ])
+    }
+
+    func coalescing(_ next: FailureReceiptIncident) -> FailureReceiptIncident {
+        FailureReceiptIncident(
+            loopId: loopId,
+            error: error,
+            firstAt: firstAt,
+            lastAt: next.lastAt,
+            occurrences: occurrences + next.occurrences
+        )
+    }
+
+    private static func timestamp(from value: JSONValue?) -> String? {
+        guard case .string(let raw)? = value else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func occurrences(from value: JSONValue?) -> Int {
+        guard case .int(let raw)? = value,
+              let exact = Int(exactly: raw),
+              exact > 0 else { return 1 }
+        return exact
+    }
+}
+
 /// A single periodic worker the scheduler drives. Neither entry point may
 /// throw. `tickOutcome()` is the PRIMARY method every loop implements: the
 /// scheduler records the returned `LoopTickOutcome` as the loop's durable state
@@ -693,6 +766,17 @@ public struct LoopState: Sendable, Equatable {
     public var lastResult: String?
     public var lastError: String?
     public var tickCount: Int
+    /// C8: when this loop last COMPLETED — did real work, as opposed to
+    /// ticking. `lastTickAt` advances on failures and on skips alike, so a lane
+    /// that is registered, scheduled and ticking perfectly while every tick
+    /// says "not configured" reads as healthy on every other field. This is the
+    /// one field that can tell dormancy from health, and it is DURABLE (see
+    /// the "completions" map in the loop-state file) so a relaunch does not
+    /// reset the dormancy clock.
+    public var lastCompletedAt: Date?
+    /// C8: when this loop was first registered on this machine (durable). The
+    /// floor dormancy is measured from when nothing has ever completed.
+    public var firstSeenAt: Date?
 
     public init(
         loopId: String,
@@ -700,7 +784,9 @@ public struct LoopState: Sendable, Equatable {
         nextTickAt: Date? = nil,
         lastResult: String? = nil,
         lastError: String? = nil,
-        tickCount: Int = 0
+        tickCount: Int = 0,
+        lastCompletedAt: Date? = nil,
+        firstSeenAt: Date? = nil
     ) {
         self.loopId = loopId
         self.lastTickAt = lastTickAt
@@ -708,6 +794,8 @@ public struct LoopState: Sendable, Equatable {
         self.lastResult = lastResult
         self.lastError = lastError
         self.tickCount = tickCount
+        self.lastCompletedAt = lastCompletedAt
+        self.firstSeenAt = firstSeenAt
     }
 }
 
@@ -757,8 +845,19 @@ public actor SwiftNativeLoopScheduler {
     private let loopStatePath: URL?
     private let startupStagger: TimeInterval
     private var persistedLastRun: [String: Date] = [:]
+    /// C8: durable last-COMPLETED stamp per loop, flushed alongside
+    /// `persistedLastRun` under the "completions" key. Separate map rather than
+    /// a field on the run stamp so the existing file shape stays readable by an
+    /// older build (it simply ignores the extra key).
+    private var persistedLastCompleted: [String: Date] = [:]
+    /// C8: when this loop was FIRST registered on this machine, written once
+    /// and never advanced. Dormancy is measured from max(firstSeen,
+    /// lastCompleted): `lastTickAt` is useless for it (a loop that ticks hourly
+    /// and completes nothing looks freshly-run forever), and without a durable
+    /// floor a relaunch would reset the clock every time.
+    private var persistedFirstSeen: [String: Date] = [:]
     private var persistedStateLoaded = false
-    private var persistedStateLoad: Task<[String: Date], Never>?
+    private var persistedStateLoad: Task<(runs: [String: Date], completions: [String: Date], firstSeen: [String: Date]), Never>?
     // A1/FIX-3 — durable-flush coalescing. See `recordDurableRun`.
     private let durableFlushWindow: TimeInterval
     private let durableFlushImmediateInterval: TimeInterval
@@ -779,6 +878,12 @@ public actor SwiftNativeLoopScheduler {
     // blip failed telegram_poll + github_tracking once each, two pushes).
     // Receipts still land on every failure regardless.
     private var failureTransitionPush: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
+    /// App-injected inverse of `failureTransitionPush`. The scheduler asks it
+    /// to resolve a matching durable card after the first proven-healthy tick
+    /// on launch and after every surfaced failure episode.
+    private var failureRecoveryPush:
+        (@Sendable (_ loopId: String, _ healthyAt: Date) async -> Bool)?
+    private var failureRecoveryProbePending: Set<String> = []
     private var lastFailurePushAt: [String: Date] = [:]
     private var consecutiveFailures: [String: Int] = [:]
     private var failureStreakStartedAt: [String: Date] = [:]
@@ -823,6 +928,68 @@ public actor SwiftNativeLoopScheduler {
         self.jitter = jitter
     }
 
+    // MARK: C5 — healthy-branch jitter and randomized startup stagger
+    //
+    // Both spread the herd: without them every loop of a given interval ticks
+    // in lockstep forever (they all seed from the same launch instant), and N
+    // starved loops all fire in the same instant on a cold start.
+    //
+    // THE BOUND both must respect: Doctor calls a loop overdue when it drifts
+    // past `nextRun` by more than `DoctorLoopHealth.overdueTolerance` =
+    // max(estimatedInterval / 2, 60s). The scheduler publishes `nextTickAt`
+    // AFTER applying jitter, so a jittered tick is never late against its own
+    // advertised time — but a consumer holding a pre-jitter `nextRun` (a status
+    // read racing the delay computation, or the spawn-time seed) would be. So
+    // the added delay is capped at BOTH a fraction of the interval and an
+    // absolute ceiling strictly below the 60s tolerance floor, which makes it
+    // unconditionally inside the tolerance for every interval.
+
+    /// Fraction of a loop's interval available as healthy-branch jitter.
+    public static let healthyJitterFraction = 0.1
+    /// Absolute ceiling on added jitter. Strictly below `overdueTolerance`'s
+    /// 60s floor, so `jitterCeiling(for:) < overdueTolerance(for:)` holds for
+    /// every interval — pinned by `LoopJitterBoundsTests`.
+    public static let maximumHealthyJitter: TimeInterval = 30
+
+    /// The largest delay jitter may ADD for `interval`. One-sided (never early)
+    /// so the spread costs latency, never extra ticks.
+    public static func jitterCeiling(for interval: TimeInterval) -> TimeInterval {
+        max(0, min(max(0, interval) * healthyJitterFraction, maximumHealthyJitter))
+    }
+
+    /// `base` plus a jittered fraction of `interval`, bounded by
+    /// `jitterCeiling(for:)`. `jitter` returns a value inside the range it is
+    /// handed (the injected `Double.random(in:)` in production).
+    public static func jitteredHealthyDelay(
+        base: TimeInterval,
+        interval: TimeInterval,
+        jitter: (ClosedRange<Double>) -> Double
+    ) -> TimeInterval {
+        let ceiling = jitterCeiling(for: interval)
+        guard ceiling > 0 else { return base }
+        let draw = min(max(jitter(0...ceiling), 0), ceiling)
+        return base + draw
+    }
+
+    /// Randomized startup stagger for the `slot`-th overdue loop. The
+    /// deterministic `stagger * slot` ladder still put every launch's loops in
+    /// the same order at the same offsets; the draw spreads them across the
+    /// slot's own window. Bounded by `maximumStartupStagger` so a data root
+    /// with dozens of starved loops cannot push the last one minutes out, and
+    /// `firstTickDelay` additionally clamps it to the loop's period.
+    public static let maximumStartupStagger: TimeInterval = 60
+
+    public static func randomizedStagger(
+        base: TimeInterval,
+        slot: Int,
+        jitter: (ClosedRange<Double>) -> Double
+    ) -> TimeInterval {
+        let ladder = max(0, base) * Double(max(1, slot))
+        guard ladder > 0 else { return 0 }
+        let capped = min(ladder, maximumStartupStagger)
+        return min(max(jitter(0...capped), 0), capped)
+    }
+
     /// First-sleep rule after (re)start. Pure so it can be pinned directly.
     ///
     /// - no persisted last-run → sleep the full period (the loop's clock
@@ -852,6 +1019,12 @@ public actor SwiftNativeLoopScheduler {
         self.failureTransitionPush = push
     }
 
+    public func setFailureRecoveryPush(
+        _ push: (@Sendable (_ loopId: String, _ healthyAt: Date) async -> Bool)?
+    ) {
+        self.failureRecoveryPush = push
+    }
+
     public func register(_ loop: any LoopRunner) async {
         let id = loop.loopId
         // Load durable last-run BEFORE any spawn so the first sleep can be the
@@ -862,8 +1035,23 @@ public actor SwiftNativeLoopScheduler {
         // shortly after launch still leaves the stamp behind — otherwise a
         // weekly loop's clock resets on every restart, which is the starvation
         // bug itself.
+        let stampedFirstSeen: Bool
+        if persistedFirstSeen[id] == nil {
+            persistedFirstSeen[id] = clock()
+            stampedFirstSeen = true
+        } else {
+            stampedFirstSeen = false
+        }
         if persistedLastRun[id] == nil {
             await recordDurableRun(loopId: id, at: clock())
+        } else if stampedFirstSeen {
+            // `recordDurableRun` above flushes; this is the OTHER case — a loop
+            // an older build already knew (it has a run stamp) but that has no
+            // first-seen stamp yet. Written synchronously for the same reason
+            // the run stamp is: a process that exits shortly after launch must
+            // not keep re-stamping "first seen" as now on every relaunch, which
+            // would hold the dormancy clock at zero forever.
+            await flushLoopState()
         }
         // If this loopId is already registered, cancel the old task before
         // installing the new registration. The old task's generation token
@@ -876,6 +1064,18 @@ public actor SwiftNativeLoopScheduler {
         }
         let reg = Registration(loop: loop, registrationId: UUID())
         loops[id] = reg
+        // One launch/replacement probe repairs a card left active by a prior
+        // process. It resolves only after this registration proves health.
+        failureRecoveryProbePending.insert(id)
+        // A long-lived loop (Slack socket mode) may not return from its first
+        // new session for an hour. A durable completion from a prior process is
+        // already health proof; the app resolver compares it with the card's
+        // creation time before retiring anything.
+        if let healthyAt = persistedLastCompleted[id],
+           let recovery = failureRecoveryPush,
+           await recovery(id, healthyAt) {
+            failureRecoveryProbePending.remove(id)
+        }
         if states[id] == nil {
             states[id] = LoopState(loopId: id)
         }
@@ -898,6 +1098,7 @@ public actor SwiftNativeLoopScheduler {
         // and a reload must not reset the knock clock.
         consecutiveFailures.removeValue(forKey: loopId)
         failureStreakStartedAt.removeValue(forKey: loopId)
+        failureRecoveryProbePending.remove(loopId)
     }
 
     public func start() async {
@@ -923,11 +1124,23 @@ public actor SwiftNativeLoopScheduler {
     }
 
     public func loopState(loopId: String) async -> LoopState? {
-        states[loopId]
+        states[loopId].map(withDurableCompletion)
     }
 
     public func allLoopStates() async -> [LoopState] {
-        Array(states.values).sorted { $0.loopId < $1.loopId }
+        states.values.map(withDurableCompletion).sorted { $0.loopId < $1.loopId }
+    }
+
+    /// The in-memory state only knows about completions THIS process saw. The
+    /// durable map carries the rest, and it is the newer of the two that tells
+    /// the truth about dormancy across a relaunch.
+    private func withDurableCompletion(_ state: LoopState) -> LoopState {
+        var copy = state
+        copy.lastCompletedAt = [state.lastCompletedAt, persistedLastCompleted[state.loopId]]
+            .compactMap { $0 }
+            .max()
+        copy.firstSeenAt = persistedFirstSeen[state.loopId]
+        return copy
     }
 
     /// Read-only eligibility projection for an opportunistic OS wake.
@@ -943,6 +1156,28 @@ public actor SwiftNativeLoopScheduler {
         guard let lastRun = persistedLastRun[loopId] else { return true }
         let now = requestedNow ?? clock()
         return now.timeIntervalSince(lastRun) >= max(0, registration.loop.interval)
+    }
+
+    public func nextPhysiologyEligibleAt(
+        loopId: String,
+        at requestedNow: Date? = nil
+    ) async -> Date? {
+        guard let registration = loops[loopId] else { return nil }
+        let now = requestedNow ?? clock()
+        guard let lastTickAt = states[loopId]?.lastTickAt else { return now }
+        let streak = consecutiveFailures[loopId] ?? 0
+        let spacing: TimeInterval
+        if streak > 0 {
+            let policy = registration.loop.failureBackoffPolicy ?? defaultFailureBackoff
+            spacing = max(
+                minimumTickSpacing,
+                policy.delay(forConsecutiveFailures: streak, jitter: jitter)
+            )
+        } else {
+            spacing = minimumTickSpacing
+        }
+        let eligible = lastTickAt.addingTimeInterval(spacing)
+        return eligible > now ? eligible : now
     }
 
     // MARK: internals
@@ -962,7 +1197,11 @@ public actor SwiftNativeLoopScheduler {
         let stagger: TimeInterval
         if elapsed {
             overdueStartupSlots += 1
-            stagger = startupStagger * Double(overdueStartupSlots)
+            stagger = Self.randomizedStagger(
+                base: startupStagger,
+                slot: overdueStartupSlots,
+                jitter: jitter
+            )
         } else {
             stagger = startupStagger
         }
@@ -1037,7 +1276,15 @@ public actor SwiftNativeLoopScheduler {
             delay = max(minimumTickSpacing, max(interval, backoff))
         } else {
             let elapsed = max(0, now.timeIntervalSince(tickStartedAt))
-            delay = max(minimumTickSpacing, interval - elapsed)
+            // C5: jitter the HEALTHY branch only. The failing branch already
+            // jitters through the backoff policy, and `nextTickAt` below is
+            // stamped from this jittered delay, so Doctor's overdue check reads
+            // the same time the task actually sleeps to.
+            delay = Self.jitteredHealthyDelay(
+                base: max(minimumTickSpacing, interval - elapsed),
+                interval: interval,
+                jitter: jitter
+            )
         }
         // Keep the advertised next-tick time honest: Doctor's overdue check
         // reads this, and after backoff/drift correction `now + interval` is
@@ -1063,7 +1310,7 @@ public actor SwiftNativeLoopScheduler {
     /// `register` spawn against a still-empty map and sleep a full interval.
     private func loadPersistedStateIfNeeded() async {
         if persistedStateLoaded { return }
-        let load: Task<[String: Date], Never>
+        let load: Task<(runs: [String: Date], completions: [String: Date], firstSeen: [String: Date]), Never>
         if let inFlight = persistedStateLoad {
             load = inFlight
         } else {
@@ -1077,8 +1324,16 @@ public actor SwiftNativeLoopScheduler {
         persistedStateLoad = nil
         // Never clobber a stamp recorded while the read was in flight — that
         // one is newer than anything on disk.
-        for (id, date) in loaded where persistedLastRun[id] == nil {
+        for (id, date) in loaded.runs where persistedLastRun[id] == nil {
             persistedLastRun[id] = date
+        }
+        for (id, date) in loaded.completions where persistedLastCompleted[id] == nil {
+            persistedLastCompleted[id] = date
+        }
+        // First-seen is the OLDEST stamp, not the newest: a register that ran
+        // while the read was in flight recorded "now", and disk holds the truth.
+        for (id, date) in loaded.firstSeen {
+            persistedFirstSeen[id] = [persistedFirstSeen[id], date].compactMap { $0 }.min()
         }
     }
 
@@ -1096,20 +1351,24 @@ public actor SwiftNativeLoopScheduler {
 
     /// A missing/corrupt file simply yields no persisted history, which
     /// degrades to the pre-LOOPS-4 behavior rather than blocking startup.
-    private static func readLoopState(_ path: URL?) async -> [String: Date] {
-        guard let path else { return [:] }
+    private static func readLoopState(
+        _ path: URL?
+    ) async -> (runs: [String: Date], completions: [String: Date], firstSeen: [String: Date]) {
+        guard let path else { return ([:], [:], [:]) }
         let value = await SwiftNativePersistenceCore().readJSON(path, defaultValue: .object([:]))
-        guard case .object(let root) = value,
-              case .object(let loops)? = root["loops"]
-        else { return [:] }
+        guard case .object(let root) = value else { return ([:], [:], [:]) }
         let iso = ISO8601DateFormatter()
-        var result: [String: Date] = [:]
-        for (id, raw) in loops {
-            guard !retiredLoopIds.contains(id) else { continue }
-            guard case .string(let stamp) = raw, let date = iso.date(from: stamp) else { continue }
-            result[id] = date
+        func stamps(_ key: String) -> [String: Date] {
+            guard case .object(let rows)? = root[key] else { return [:] }
+            var result: [String: Date] = [:]
+            for (id, raw) in rows {
+                guard !retiredLoopIds.contains(id) else { continue }
+                guard case .string(let stamp) = raw, let date = iso.date(from: stamp) else { continue }
+                result[id] = date
+            }
+            return result
         }
-        return result
+        return (stamps("loops"), stamps("completions"), stamps("firstSeen"))
     }
 
     /// Serializes the whole (small — one entry per loop id ever registered)
@@ -1123,9 +1382,22 @@ public actor SwiftNativeLoopScheduler {
         for (id, date) in persistedLastRun {
             loops[id] = .string(iso.string(from: date))
         }
+        var completions: [String: JSONValue] = [:]
+        for (id, date) in persistedLastCompleted {
+            completions[id] = .string(iso.string(from: date))
+        }
+        var firstSeen: [String: JSONValue] = [:]
+        for (id, date) in persistedFirstSeen {
+            firstSeen[id] = .string(iso.string(from: date))
+        }
         do {
             try await persistence.writeJSON(
-                .object(["version": .string("1"), "loops": .object(loops)]),
+                .object([
+                    "version": .string("1"),
+                    "loops": .object(loops),
+                    "completions": .object(completions),
+                    "firstSeen": .object(firstSeen),
+                ]),
                 to: loopStatePath
             )
         } catch {
@@ -1264,6 +1536,8 @@ public actor SwiftNativeLoopScheduler {
         case .completed(let result):
             st.lastResult = result ?? "completed"
             st.lastError = nil
+            st.lastCompletedAt = now
+            persistedLastCompleted[id] = now
         case .skipped(let reason, _):
             st.lastResult = "skipped: \(reason)"
             // A HEALTH-NEUTRAL skip proves nothing about the loop's health, so
@@ -1307,6 +1581,11 @@ public actor SwiftNativeLoopScheduler {
         case .completed, .skipped:
             consecutiveFailures[id] = 0
             failureStreakStartedAt[id] = nil
+            if failureRecoveryProbePending.contains(id),
+               let recovery = failureRecoveryPush,
+               await recovery(id, now) {
+                failureRecoveryProbePending.remove(id)
+            }
         }
     }
 
@@ -1359,22 +1638,39 @@ public actor SwiftNativeLoopScheduler {
         let boundedError = trimmed.isEmpty
             ? "unspecified failure (empty error description)"
             : String(trimmed.prefix(2_000))
-        let receipt: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("background_loop.failure"),
-            "loopId": .string(loopId),
-            "status": .string("failed"),
-            "error": .string(boundedError),
-            "createdAt": .string(ISO8601DateFormatter().string(from: clock())),
-        ])
+        let now = ISO8601DateFormatter().string(from: clock())
+        let mayCoalesce = (consecutiveFailures[loopId] ?? 0) > 0
+        let incident = FailureReceiptIncident(
+            loopId: loopId,
+            error: boundedError,
+            firstAt: now,
+            lastAt: now
+        )
         do {
-            try await appendJSONLCapped(
-                receipt,
-                to: failureReceiptsPath,
-                using: persistence,
-                maxLines: JSONLLineCaps.backgroundLoopFailures,
-                logLabel: "BackgroundLoops.failures"
-            )
+            try await persistence.withFileLock(failureReceiptsPath) {
+                let rows = (try? await persistence.readJSONL(failureReceiptsPath)) ?? []
+                let nextRows = coalescedFailureReceiptRows(
+                    rows,
+                    appending: incident,
+                    mayCoalesce: mayCoalesce
+                )
+                try await persistence.writeDataAtomicDurable(
+                    try renderJSONL(nextRows),
+                    to: failureReceiptsPath
+                )
+                let dropped = try enforceJSONLLineCap(
+                    at: failureReceiptsPath,
+                    maxLines: JSONLLineCaps.backgroundLoopFailures
+                )
+                if dropped > 0 {
+                    NSLog(
+                        "%@: %@ cap dropped %d oldest line(s)",
+                        "BackgroundLoops.failures",
+                        failureReceiptsPath.lastPathComponent,
+                        dropped
+                    )
+                }
+            }
         } catch {
             FileHandle.standardError.write(Data(
                 "BackgroundLoops: failed to persist \(loopId) failure receipt: \(error)\n".utf8
@@ -1424,6 +1720,7 @@ public actor SwiftNativeLoopScheduler {
         }
         lastFailurePushAt[loopId] = now
         await recordPushStamp(loopId: loopId, at: now)
+        failureRecoveryProbePending.insert(loopId)
         await push(loopId, error)
     }
 
@@ -1513,11 +1810,20 @@ public actor SwiftNativeLoopScheduler {
         await maybePushFailureStreak(loopId: loopId, error: error, now: now)
     }
 
-    public func recordResult(loopId: String, result: String) async {
+    /// `completedWork: false` records the tick without advancing the durable
+    /// last-COMPLETED stamp — the out-of-band `.skipped` path passes it so a
+    /// lane that only ever skips cannot masquerade as productive (C8).
+    public func recordResult(
+        loopId: String, result: String, completedWork: Bool = true
+    ) async {
         var st = states[loopId] ?? LoopState(loopId: loopId)
         let now = clock()
         st.lastResult = result
         st.lastError = nil
+        if completedWork {
+            st.lastCompletedAt = now
+            persistedLastCompleted[loopId] = now
+        }
         // A manual/event-driven run is a real tick for LIVE health too, not
         // just the durable clock: without these stamps Doctor keeps reading
         // the old overdue nextTickAt until the periodic task happens to fire
@@ -1535,6 +1841,11 @@ public actor SwiftNativeLoopScheduler {
         await recordDurableRun(loopId: loopId, at: now)
         consecutiveFailures[loopId] = 0
         failureStreakStartedAt[loopId] = nil
+        if failureRecoveryProbePending.contains(loopId),
+           let recovery = failureRecoveryPush,
+           await recovery(loopId, now) {
+            failureRecoveryProbePending.remove(loopId)
+        }
     }
 
     /// Test seam: the loop's live consecutive-failure streak.
@@ -1553,6 +1864,46 @@ public actor SwiftNativeLoopScheduler {
 
     /// Test seam: true while a coalesced durable write is still scheduled.
     internal func _testHasPendingDurableFlush() -> Bool { pendingDurableFlush != nil }
+
+    internal func _testFailureReceiptRows() async -> [JSONValue] {
+        guard let failureReceiptsPath else { return [] }
+        return (try? await persistence.readJSONL(failureReceiptsPath)) ?? []
+    }
+}
+
+private func coalescedFailureReceiptRows(
+    _ rows: [JSONValue],
+    appending incident: FailureReceiptIncident,
+    mayCoalesce: Bool
+) -> [JSONValue] {
+    guard mayCoalesce,
+          let last = rows.last,
+          let prior = FailureReceiptIncident(row: last),
+          prior.loopId == incident.loopId,
+          prior.error == incident.error else {
+        return rows + [incident.toJSON(id: UUID().uuidString.lowercased())]
+    }
+
+    var next = rows
+    next[next.count - 1] = prior.coalescing(incident).toJSON(
+        id: failureReceiptID(from: last) ?? UUID().uuidString.lowercased()
+    )
+    return next
+}
+
+private func failureReceiptID(from row: JSONValue) -> String? {
+    guard case .object(let object) = row,
+          case .string(let id)? = object["id"] else { return nil }
+    return id
+}
+
+private func renderJSONL(_ rows: [JSONValue]) throws -> Data {
+    var data = Data()
+    for row in rows {
+        data.append(try row.serializedData(pretty: false))
+        data.append(0x0A)
+    }
+    return data
 }
 
 // MARK: - DoctorAutoRunLoop

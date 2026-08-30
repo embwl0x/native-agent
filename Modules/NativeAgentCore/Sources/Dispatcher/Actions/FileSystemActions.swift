@@ -270,7 +270,9 @@ enum FileSystemActions {
         switch value ?? .null {
         case .null: return def
         case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
+        // Preserve truncation toward zero for ordinary numeric inputs, but
+        // reject unrepresentable values instead of trapping the app process.
+        case .double(let d): return Int(exactly: d.rounded(.towardZero))
         case .string(let s):
             if s.isEmpty { return def }
             if let i = Int(s) { return i }
@@ -293,6 +295,44 @@ enum FileSystemActions {
     }
 
     // MARK: - read_file
+
+    /// Observes the actual regular-file read request in focused tests, without
+    /// exposing file paths/content or adding process-wide instrumentation.
+    @TaskLocal static var regularFileReadObserver: (@Sendable (Int) -> Void)?
+
+    private static func readFileWindow(
+        path: URL,
+        maxBytes: Int,
+        useCompactDefault: Bool
+    ) throws -> (data: Data, totalBytes: Int) {
+        let handle = try FileHandle(forReadingFrom: path)
+        defer { try? handle.close() }
+        func limit(for totalBytes: Int) -> Int {
+            if useCompactDefault && shouldUseCompactReadDefault(path: path, actualBytes: totalBytes) {
+                return min(maxBytes, connectorReadFileHandoffDefaultMaxBytes)
+            }
+            return maxBytes
+        }
+        #if canImport(Darwin)
+        var metadata = stat()
+        if fstat(handle.fileDescriptor, &metadata) == 0,
+           metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+           let totalBytes = Int(exactly: metadata.st_size), totalBytes >= 0 {
+            // Size and bytes belong to the same opened file, not a second
+            // path lookup that could observe a replacement. Metadata is an
+            // observation, not a snapshot against concurrent in-place writes.
+            let byteLimit = limit(for: totalBytes)
+            regularFileReadObserver?(byteLimit)
+            let data = try handle.read(upToCount: byteLimit) ?? Data()
+            return (data, totalBytes)
+        }
+        #endif
+        // Preserve the existing EOF-based behavior of nonregular files; their
+        // st_size need not describe the data they produce. This optimization
+        // does not add a regular-file-only capability gate.
+        let data = try handle.readToEnd() ?? Data()
+        return (Data(data.prefix(limit(for: data.count))), data.count)
+    }
 
     static func readFile(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let rawPath = stringField(input, "path")
@@ -333,16 +373,15 @@ enum FileSystemActions {
         if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found") }
         if isDir.boolValue { return errResult("Not a file: \(resolved.path)", code: "file_not_found") }
 
-        guard let rawData = FileManager.default.contents(atPath: resolved.path) else {
+        guard let window = try? readFileWindow(
+            path: resolved, maxBytes: maxBytes, useCompactDefault: !hasExplicitMaxBytes
+        ) else {
             return errResult("could not read file")
         }
-        let actualBytes = rawData.count
-        if !hasExplicitMaxBytes && shouldUseCompactReadDefault(path: resolved, actualBytes: actualBytes) {
-            maxBytes = min(maxBytes, connectorReadFileHandoffDefaultMaxBytes)
-        }
-        let slice = actualBytes > maxBytes ? rawData.prefix(maxBytes) : rawData[...]
+        let actualBytes = window.totalBytes
+        let slice = window.data
         // Python: decode("utf-8", errors="replace")
-        let content = decodeUTF8Replacing(Data(slice))
+        let content = decodeUTF8Replacing(slice)
         return .object([
             "ok": .bool(true),
             "path": .string(resolved.path),
@@ -409,6 +448,9 @@ enum FileSystemActions {
 
     // MARK: - write_file
 
+    /// Task-scoped observation of the opened append handle for race fixtures.
+    @TaskLocal static var appendHandleOpened: (@Sendable () -> Void)?
+
     static func writeFile(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let rawPath = stringField(input, "path")
         if rawPath.isEmpty { return errResult("path is required", code: "bad_input") }
@@ -467,14 +509,19 @@ enum FileSystemActions {
             try fm.createDirectory(at: parent, withIntermediateDirectories: true)
             let data = Data(content.utf8)
             if append {
-                if fm.fileExists(atPath: resolved.path) {
-                    let handle = try FileHandle(forWritingTo: resolved)
-                    defer { try? handle.close() }
-                    try handle.seekToEnd()
-                    try handle.write(contentsOf: data)
-                } else {
-                    try data.write(to: resolved)
+                // Append at the kernel's current EOF for every write. Separate
+                // exists/seek/write calls can lose concurrent append payloads,
+                // including when both callers initially see a missing file.
+                let fd = open(resolved.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o666)
+                guard fd >= 0 else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
                 }
+                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                defer { try? handle.close() }
+                appendHandleOpened?()
+                // Retain Foundation's full-write and I/O-error handling; an
+                // append does not promise transactionality across callers.
+                try handle.write(contentsOf: data)
             } else {
                 // Atomic overwrite via tmp + POSIX rename(2) (matches retired
                 // os.replace: atomic, creates-or-replaces the destination).
@@ -743,6 +790,10 @@ enum FileSystemActions {
     // `max_results` output lines are returned (joined + truncated). Timeout 30s
     // → bash_timeout, any other launch failure → generic error (no error_code).
 
+    /// A task-scoped lookup seam lets dispatch fixtures exercise both installed
+    /// search engines without changing the process-wide PATH.
+    @TaskLocal static var grepExecutableResolver: (@Sendable (String) -> String?)?
+
     static func grep(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let pattern = stringField(input, "pattern").trimmingCharacters(in: .whitespacesAndNewlines)
         if pattern.isEmpty { return errResult("pattern is required", code: "bad_input") }
@@ -782,15 +833,18 @@ enum FileSystemActions {
             )
         }
 
-        let rgPath = which("rg")
+        let resolveExecutable: @Sendable (String) -> String? = grepExecutableResolver ?? { which($0) }
+        let rgPath = resolveExecutable("rg")
         let launch: String
         let args: [String]
+        // Patterns are regex data, never CLI options (e.g. searching --help
+        // must not execute the engine's help command and report it as matches).
         if let rg = rgPath {
             launch = rg
-            args = ["--no-heading", "--line-number", "-m", String(maxResults), pattern, searchPath.path]
-        } else if let grepBin = which("grep") {
+            args = ["--no-heading", "--line-number", "-m", String(maxResults), "-e", pattern, "--", searchPath.path]
+        } else if let grepBin = resolveExecutable("grep") {
             launch = grepBin
-            args = ["-rnE", "--include=*", "-m", String(maxResults), pattern, searchPath.path]
+            args = ["-rnE", "--include=*", "-m", String(maxResults), "-e", pattern, "--", searchPath.path]
         } else {
             // Python would raise FileNotFoundError from subprocess.run → caught by
             // the broad `except Exception` → generic error (no error_code).
@@ -1174,22 +1228,23 @@ private func splitLines(_ text: String) -> [String] {
     if text.isEmpty { return [] }
     var lines: [String] = []
     var current = ""
-    let chars = Array(text)
-    var i = 0
-    while i < chars.count {
-        let c = chars[i]
-        if c == "\r" {
-            lines.append(current)
-            current = ""
-            // CRLF collapses to one break.
-            if i + 1 < chars.count && chars[i + 1] == "\n" { i += 1 }
-        } else if c == "\n" {
-            lines.append(current)
-            current = ""
-        } else {
-            current.append(c)
+    var previousWasCR = false
+    // CRLF is ONE Swift Character, so Character comparisons against CR or LF
+    // never recognize it. Python str.splitlines uses scalar boundaries and
+    // also recognizes the remaining universal line separators below.
+    for scalar in text.unicodeScalars {
+        if previousWasCR && scalar.value == 0x0A {
+            previousWasCR = false
+            continue
         }
-        i += 1
+        previousWasCR = scalar.value == 0x0D
+        switch scalar.value {
+        case 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029:
+            lines.append(current)
+            current = ""
+        default:
+            current.unicodeScalars.append(scalar)
+        }
     }
     if !current.isEmpty { lines.append(current) }
     return lines

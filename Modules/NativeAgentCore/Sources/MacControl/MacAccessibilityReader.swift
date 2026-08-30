@@ -491,6 +491,10 @@ public protocol MacAXElementSource: Sendable {
     /// pid, and nil otherwise — absence over a wrong answer, like every other
     /// member here.
     func appInfo(pid: Int32) -> MacAXAppInfo?
+    /// Currently open native menus belonging to this frontmost app. They can
+    /// be application siblings, not descendants of its document window.
+    /// These roots are never window-relative action addresses.
+    func transientMenuRoots(pid: Int32) -> [MacAXElementRef]
     func attributes(of ref: MacAXElementRef) -> MacAXAttributes?
     func children(of ref: MacAXElementRef) -> [MacAXElementRef]
     /// Child count WITHOUT materializing the array. Default falls back to
@@ -519,6 +523,7 @@ public protocol MacAXElementSource: Sendable {
 }
 
 public extension MacAXElementSource {
+    func transientMenuRoots(pid: Int32) -> [MacAXElementRef] { [] }
     func childCount(of ref: MacAXElementRef) -> Int { children(of: ref).count }
     func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef] {
         limit <= 0 ? [] : Array(children(of: ref).prefix(limit))
@@ -877,8 +882,63 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         #endif
     }
 
+    public func transientMenuRoots(pid: Int32) -> [MacAXElementRef] {
+        guard pid != getpid(), isTrusted(), frontmostApp()?.processIdentifier == pid else { return [] }
+        let app = AXUIElementCreateApplication(pid)
+        var menus: [AXUIElement] = []
+        func appendMenu(_ element: AXUIElement) {
+            guard menus.count < MacTransientMenus.maxMenus,
+                  copyString(element, kAXRoleAttribute) == "AXMenu",
+                  copyBool(element, "AXHidden") != true,
+                  let frame = copyFrame(element), MacTransientMenus.validFrame(frame),
+                  !menus.contains(where: { CFEqual($0, element) }) else { return }
+            menus.append(element)
+        }
+        // Chrome keeps focus on AXWebArea while its context menu is a sibling
+        // of an ancestor group. The ordinary page-first walk excludes it.
+        let nearby = MacTransientMenus.nearFocus(
+            copyElement(app, kAXFocusedUIElementAttribute),
+            parent: { self.copyElement($0, kAXParentAttribute) },
+            children: { element, limit in
+                guard self.copyString(element, kAXRoleAttribute) != "AXMenuBar" else { return [] }
+                var values: CFArray?
+                guard AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0,
+                                                     CFIndex(limit), &values) == .success,
+                      let children = values as? [AnyObject] else { return [] }
+                return children.compactMap { child in
+                    CFGetTypeID(child) == AXUIElementGetTypeID() ? (child as! AXUIElement) : nil
+                }
+            },
+            isMenu: { self.copyString($0, kAXRoleAttribute) == "AXMenu" },
+            equal: { CFEqual($0, $1) }
+        )
+        for menu in nearby {
+            appendMenu(menu)
+        }
+        // Chromium context menus commonly live directly under the application.
+        // Use ranged reads so a large application tree is not materialized.
+        for attribute in [kAXChildrenAttribute, kAXWindowsAttribute] {
+            var values: CFArray?
+            guard AXUIElementCopyAttributeValues(app, attribute as CFString, 0, 64, &values) == .success,
+                  let children = values as? [AnyObject] else { continue }
+            for child in children where CFGetTypeID(child) == AXUIElementGetTypeID() {
+                appendMenu(child as! AXUIElement)
+            }
+        }
+        return menus.map { mint($0) }
+    }
+
     public func windowRoot(pid: Int32) -> MacAXElementRef? {
         #if canImport(AppKit)
+        // NEVER mint an element for our own process: an AX read of our own
+        // tree re-enters AppKit in-process and can deadlock against the main
+        // thread (P1, sample 2026-08-28 — AXUIElementCopyActionNames on our
+        // own toolbar parked a background thread in NSOperation
+        // waitUntilFinished while the main thread held SwiftUI's update lock).
+        // The tool layer refuses with a named reason (`selfProcess`); this
+        // guard is the safety net for any caller that reaches the source
+        // directly.
+        guard pid != getpid() else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
         if let focused = copyElement(appElement, kAXFocusedWindowAttribute) {
@@ -905,6 +965,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     /// ordinary focused/main window appear twice.
     public func windowRoots(pid: Int32) -> [MacAXWindowHandle] {
         #if canImport(AppKit)
+        // Same self-process fence as `windowRoot(pid:)` — see the deadlock
+        // note there.
+        guard pid != getpid() else { return [] }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
         let appElement = AXUIElementCreateApplication(pid)
         let windows = MacAXWindowInventory.union(
@@ -972,6 +1035,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     private func focusedElementPathOnExecutionLane(relativeTo rootRef: MacAXElementRef?) -> [Int]? {
         #if canImport(AppKit)
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        // Same self-process fence as `windowRoot(pid:)` — a focused element in
+        // our own window must never be walked over AX.
+        guard app.processIdentifier != getpid() else { return nil }
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
         guard let focused = copyElement(appElement, kAXFocusedUIElementAttribute) else { return nil }
         let root: AXUIElement

@@ -237,6 +237,10 @@ extension SwiftNativeMemoryV2 {
             removed += 1
         }
 
+        // A completed reconciliation also joins already-admitted projection
+        // delivery. Current turn leases remain immutable; the next read must
+        // not keep a retired pointer or a previous hook from the same save.
+        await flushDerivedMemoryChanges()
         return SkillIndexSyncResult(
             added: added, updated: updated, removed: removed, unchanged: unchanged
         )

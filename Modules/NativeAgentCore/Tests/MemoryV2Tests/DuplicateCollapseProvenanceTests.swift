@@ -25,6 +25,96 @@ import PersistenceCore
 @Suite("DuplicateCollapseProvenance")
 struct DuplicateCollapseProvenanceTests {
 
+    @Test func duplicateObservationCompletesProjectionWithoutReembeddingOrRecreating() async throws {
+        let root = try makeTempRoot("observation-completion")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(dataRoot: root)
+        let original = StoredMemory(
+            id: "orchard-observation", content: "The orchard gate opens at dusk.",
+            source: "fixture:first", createdAt: "2026-08-01T00:00:00Z",
+            observedAt: "2026-08-02T00:00:00Z"
+        )
+        _ = try await storage.insertMemory(original)
+        let recorder = DuplicateObservationProjectionRecorder()
+        await storage.attachKnowledgeGraphHook { row, deleted in
+            if !deleted { await recorder.record(row.observedAt) }
+        }
+        // Any accidental embedding call fails this save. The duplicate
+        // branch must remain independent of provider readiness.
+        let memory = SwiftNativeMemoryV2(
+            embedder: FailClosedEmbeddingProvider(), storage: MemoryStorageBridge(storage: storage)
+        )
+        let updated = try await memory.store(
+            content: original.content, source: "fixture:repeat",
+            metadata: .object(["observed_at": .string("2026-08-03T00:00:00Z")])
+        )
+        #expect(updated.id == original.id)
+        #expect(updated.createdAt == original.createdAt)
+        #expect(updated.observedAt == "2026-08-03T00:00:00Z")
+        #expect(await recorder.observations == ["2026-08-03T00:00:00Z"])
+        #expect(try await storage.listMemories().count == 1)
+        #expect(strings(extras(updated)["source_history"]) == ["fixture:first", "fixture:repeat"])
+    }
+
+    @Test(arguments: [
+        ("2026-08-09T09:00:00Z", "2026-08-09T10:00:00+02:00", false),
+        ("2026-08-09T10:00:00+02:00", "2026-08-09T09:30:00Z", true),
+        ("2026-08-09T09:00:00Z", "2026-08-09T09:00:00.500Z", true),
+        ("2026-08-09T09:00:00.500Z", "2026-08-09T09:00:00Z", false),
+        ("2026-08-09T09:00:00Z", "2026-08-09T11:00:00+02:00", false),
+        ("2026-08-09T09:00:00Z", "not-a-timestamp", false),
+    ])
+    func observationOrderingUsesInstants(scenario: (String, String, Bool)) {
+        let (existingDate, incomingDate, shouldAdvance) = scenario
+        let existing = MemoryRecord(
+            id: "observation", text: "The studio opens at nine.",
+            createdAt: "2026-08-01T00:00:00Z", observedAt: existingDate
+        )
+        let patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
+            existing: existing, newSource: "fixture:repeat",
+            newMetadata: .object(["observed_at": .string(incomingDate)])
+        )
+        #expect(patch["observed_at"] == (shouldAdvance ? .string(incomingDate) : nil))
+    }
+
+    @Test(arguments: ["observed_at", "observedAt"])
+    func bothObservationAliasesAdvanceCanonicalSQLiteTime(key: String) async throws {
+        let root = try makeTempRoot("observation-alias")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let memory = try sqliteMemory(root: root)
+        let text = "The studio opens at nine."
+        let first = try await memory.store(
+            content: text, source: "fixture:first",
+            metadata: .object([key: .string("2026-08-09T10:00:00+02:00")])
+        )
+        let second = try await memory.store(
+            content: text, source: "fixture:repeat",
+            metadata: .object([key: .string("2026-08-09T09:30:00Z")])
+        )
+        #expect(second.id == first.id)
+        #expect(second.observedAt == "2026-08-09T09:30:00Z")
+        #expect(second.validFrom == nil)
+        #expect(second.validTo == nil)
+        #expect(strings(extras(second)["source_history"]) == ["fixture:first", "fixture:repeat"])
+        let stored = try #require(try await memory.listMemory(kind: nil).first)
+        #expect(stored.observedAt == "2026-08-09T09:30:00Z")
+    }
+
+    @Test func malformedPreferredObservationAliasDoesNotOverwriteCanonicalTime() {
+        let existing = MemoryRecord(
+            id: "observation", text: "The studio opens at nine.",
+            createdAt: "2026-08-01T00:00:00Z", observedAt: "2026-08-09T09:00:00Z"
+        )
+        let patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
+            existing: existing, newSource: "fixture:repeat",
+            newMetadata: .object([
+                "observed_at": .string("2026-08-09T10:00:00Z"),
+                "observedAt": .string("not-a-timestamp"),
+            ])
+        )
+        #expect(patch["observed_at"] == nil)
+    }
+
     private func makeTempRoot(_ label: String) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("DuplicateCollapseProvenance-\(label)-\(UUID().uuidString)")
@@ -205,5 +295,12 @@ struct DuplicateCollapseProvenanceTests {
         #expect(older.observedAt == "2026-08-09T11:30:00Z")
         // …but the older run is still traceable.
         #expect(strings(extras(older)["source_history"]).contains("workshop:wsx-old"))
+    }
+}
+
+private actor DuplicateObservationProjectionRecorder {
+    private(set) var observations: [String] = []
+    func record(_ value: String?) {
+        if let value { observations.append(value) }
     }
 }

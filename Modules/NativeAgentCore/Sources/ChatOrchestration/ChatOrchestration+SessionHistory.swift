@@ -1,4 +1,5 @@
 import Foundation
+import Context
 import NativeAgentCore
 import PersistenceCore
 
@@ -15,6 +16,20 @@ public struct ChatMessage: Sendable, Codable {
         self.content = content
         self.timestamp = timestamp
         self.extras = extras
+    }
+}
+
+private extension ChatMessage {
+    /// Head/tail reads overlap, but separate messages can share timestamp,
+    /// role and text (especially attachment-only or rescued partial rows).
+    /// Prefer the transcript's existing identity; retain the old tuple only
+    /// for legacy rows that have no usable ID. This never changes stored IDs.
+    func historyIdentity(renderedRole: String? = nil, renderedContent: String? = nil) -> String {
+        if case .object(let record)? = extras,
+           case .string(let id)? = record["id"], !id.isEmpty {
+            return "id\u{1F}\(id)"
+        }
+        return "legacy\u{1F}\(timestamp)\u{1F}\(renderedRole ?? role)\u{1F}\(renderedContent ?? content)"
     }
 }
 
@@ -107,11 +122,8 @@ public actor SessionHistoryReader {
     private static let relevanceSampleMaximumBytes = 96 * 1024
     private static let relevanceSampleWindowCount = 8
 
-    /// Internal (not private) so buildTurnContextWithHistory can derive the
-    /// default SessionDigestProvider from the SAME data root the history
-    /// comes from (immutable Sendable `let` → legal synchronous cross-actor
-    /// access within the module). Fixture-rooted tests therefore never leak
-    /// digest reads onto the live data dir.
+    /// Internal so turn assembly resolves the model-window policy against
+    /// the same data root as the history reader.
     let dataRoot: URL
 
     public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
@@ -317,7 +329,7 @@ public actor SessionHistoryReader {
         var seen: Set<String> = []
         var out: [ChatMessage] = []
         for msg in decoded {
-            let key = "\(msg.timestamp)\u{1F}\(msg.role)\u{1F}\(msg.content)"
+            let key = msg.historyIdentity()
             guard !seen.contains(key) else { continue }
             seen.insert(key)
             out.append(msg)
@@ -391,7 +403,7 @@ public actor SessionHistoryReader {
         var out: [ChatMessage] = []
         out.reserveCapacity(decoded.count)
         for message in decoded {
-            let key = "\(message.timestamp)\u{1F}\(message.role)\u{1F}\(message.content)"
+            let key = message.historyIdentity()
             guard seen.insert(key).inserted else { continue }
             out.append(message)
         }
@@ -410,13 +422,6 @@ public actor SessionHistoryReader {
                 truncated: lineRead.truncated || decoded.count != out.count
             )
         )
-    }
-
-    private nonisolated static func tailLines(
-        from path: URL,
-        minimumLineCount: Int
-    ) -> [String] {
-        tailLinesResult(from: path, minimumLineCount: minimumLineCount).lines
     }
 
     private nonisolated static func tailLinesResult(
@@ -476,13 +481,6 @@ public actor SessionHistoryReader {
             bytesRead: Int64(data.count),
             truncated: offset > 0
         )
-    }
-
-    private nonisolated static func headLines(
-        from path: URL,
-        maximumLineCount: Int
-    ) -> [String] {
-        headLinesResult(from: path, maximumLineCount: maximumLineCount).lines
     }
 
     private nonisolated static func headLinesResult(
@@ -696,9 +694,9 @@ extension SwiftNativeTurnEngine {
     /// persona+pins+memory context (stable segments first, dynamic last —
     /// see the caching contract at the combine site below). If the session
     /// has no on-disk history (file missing) this degrades to the normal
-    /// `buildTurnContext` shape — no error is raised. Either way the
-    /// per-session "since last session" digest (U3 item 8) is injected at
-    /// the end of the STABLE segment when a prior session exists.
+    /// `buildTurnContext` shape — no error is raised. Broad cross-session
+    /// activity digests are opt-in through the explicit-provider overload;
+    /// ordinary turns retain same-session history without that injection.
     public func buildTurnContextWithHistory(
         surface: String,
         userMessage: String,
@@ -720,6 +718,8 @@ extension SwiftNativeTurnEngine {
     /// Same as `buildTurnContextWithHistory(...)` but with a Mac UI
     /// `UserDefaults["chatPersona"]` override forwarded into the compiled
     /// persona packet. nil → no override (legacy callers unaffected).
+    /// `sessionDigest` is an explicit opt-in: nil never builds or reads a
+    /// cached background-activity digest.
     public func buildTurnContextWithHistory(
         surface: String,
         userMessage: String,
@@ -737,7 +737,9 @@ extension SwiftNativeTurnEngine {
         queryUserMessage: String? = nil,
         // Turn-start instant for the clock line (see buildTurnContext) —
         // tool loops pass the same value every iteration.
-        clockNowOverride: Date? = nil
+        clockNowOverride: Date? = nil,
+        toolSchemaCatalogSeed: TurnToolSchemaCatalogSeed? = nil,
+        quietHoursSnapshot: TurnQuietHoursSnapshot? = nil
     ) async throws -> TurnContext {
         // Non-nil queryUserMessage is authoritative EVEN WHEN BLANK — an
         // attachment-only text-compat turn must not fall back to the hinted
@@ -791,6 +793,15 @@ extension SwiftNativeTurnEngine {
             )
         }
         let baseStartNs = DispatchTime.now().uptimeNanoseconds
+        // Capture once at the outer turn boundary. The base builder owns the
+        // receipt flag and this history wrapper owns final clock rendering;
+        // both must observe the same preference bytes without a second read.
+        let quietHoursWindow: TurnQuietHoursWindow?
+        if let quietHoursSnapshot {
+            quietHoursWindow = quietHoursSnapshot.window
+        } else {
+            quietHoursWindow = readTurnQuietHours()
+        }
         let rawBase: TurnContext
         do {
             rawBase = try await buildTurnContext(
@@ -801,8 +812,11 @@ extension SwiftNativeTurnEngine {
                 recallQueryOverride: expandedRecallQuery,
                 includeClockContext: false,
                 sessionID: sessionId,
-                recentTurns: prior.suffix(4).map(\.content),
-                queryUserMessage: queryMessage
+                recentTurns: prior.filter { $0.role == "user" || $0.role == "assistant" }.suffix(4).map(\.content),
+                queryUserMessage: queryMessage,
+                clockNowOverride: clockNowOverride,
+                toolSchemaCatalogSeed: toolSchemaCatalogSeed,
+                quietHoursSnapshot: quietHoursWindow
             )
             trace.record(.contextBase, since: baseStartNs)
         } catch {
@@ -813,7 +827,7 @@ extension SwiftNativeTurnEngine {
             await Self.injectingSessionDigest(
                 into: rawBase,
                 sessionId: sessionId,
-                provider: sessionDigest ?? SessionDigestProvider(dataRoot: historyReader.dataRoot)
+                provider: sessionDigest
             )
         }
         let naturalExpressionCue = naturalExpressionGuidanceEnabled
@@ -840,7 +854,7 @@ extension SwiftNativeTurnEngine {
             SessionHistoryPromptRenderer.renderDetailed(
                 messages: prior,
                 middleCandidates: middleCandidates,
-                userMessage: userMessage,
+                userMessage: queryMessage,
                 surface: surface,
                 historyLimit: historyLimit,
                 windowTokens: historyWindowTokens
@@ -887,12 +901,16 @@ extension SwiftNativeTurnEngine {
         // FIRST turn has no renderable history and used to early-return, and
         // the first turn is exactly where the digest must already be present
         // (turn 2+ would otherwise prepend new stable bytes → prefix churn).
-        // nil provider → derive from the history reader's data root, so the
-        // digest always reads the same store the history comes from.
+        // Activity digests are now explicit opt-in: nil provider leaves even
+        // cached digest bytes out of ordinary turns. An explicitly supplied
+        // provider owns its source roots; normal history remains unaffected.
         guard let historyBlock else {
             let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
             let clockedBase = await contextByAppendingCurrentTurnFacts(
-                base, clockNowOverride: clockNowOverride)
+                base,
+                clockNowOverride: clockNowOverride,
+                quietHours: quietHoursWindow
+            )
             let finalBase = Self.contextBySettingNaturalExpressionCue(
                 clockedBase,
                 cue: naturalExpressionCue
@@ -970,7 +988,10 @@ extension SwiftNativeTurnEngine {
         )
         let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
         let clocked = await contextByAppendingCurrentTurnFacts(
-            contextWithHistory, clockNowOverride: clockNowOverride)
+            contextWithHistory,
+            clockNowOverride: clockNowOverride,
+            quietHours: quietHoursWindow
+        )
         let finalContext = Self.contextBySettingNaturalExpressionCue(
             clocked,
             cue: naturalExpressionCue
@@ -1096,8 +1117,12 @@ extension SwiftNativeTurnEngine {
     nonisolated static func injectingSessionDigest(
         into base: TurnContext,
         sessionId: String,
-        provider: SessionDigestProvider
+        provider: SessionDigestProvider?
     ) async -> TurnContext {
+        // Guard before provider/cache access: ordinary turns must not pull
+        // unsolicited prior-session work or background activity into context,
+        // including bytes persisted by an earlier explicit digest request.
+        guard let provider else { return base }
         guard let seg = base.systemSegments else { return base }
         guard let digest = await provider.digest(forSessionId: sessionId),
               !digest.isEmpty else { return base }
@@ -1175,9 +1200,19 @@ enum SessionHistoryPromptRenderer {
     private struct Renderable {
         let role: String
         let content: String
+        let historyIdentity: String
+        let originLabel: String?
+        let incompleteReplyLabel: String?
         let timestamp: String
         let isTool: Bool
         let isCompactionSummary: Bool
+
+        /// Display provenance is not query text: origin labels must not affect
+        /// lexical relevance, correction detection, roles, or authority.
+        var displayContent: String {
+            ChatTranscriptEvidenceRendering.displayContent(
+                content, originLabel: originLabel, incompleteReplyLabel: incompleteReplyLabel)
+        }
     }
 
     struct RenderResult: Sendable {
@@ -1220,7 +1255,12 @@ enum SessionHistoryPromptRenderer {
         guard !renderables.isEmpty else { return RenderResult(historyBlock: nil) }
 
         let budget = budget(for: surface, windowTokens: windowTokens)
-        var sections: [String] = []
+        var sections: [String] = [
+            """
+            # Historical evidence boundary
+            Session continuity and conversation rows below preserve what was known when they were recorded; they are not live readings. Before stating that a status, count, health result, availability claim, or other changing fact is current/latest/live/present, refresh it from its canonical tool or store. If it is not refreshed, describe it as historical.
+            """
+        ]
         if cappedLimit >= 6,
            let continuity = continuityState(
             from: renderables,
@@ -1312,6 +1352,16 @@ enum SessionHistoryPromptRenderer {
         return hardCap(lines.joined(separator: "\n"), maxCount)
     }
 
+    /// Short references need their referent for semantic recall. Greetings,
+    /// standalone questions, and empty attachment text keep the raw query.
+    /// Only current-session history is consulted; no backlog is introduced.
+    static func semanticRecallQuery(userMessage: String, recentTurns: [String]) -> String {
+        guard ContextCorrectionScope.isReferentialFollowup(userMessage),
+              !recentTurns.isEmpty else { return userMessage }
+        let recent = recentTurns.suffix(2).map { String($0.prefix(600)) }.joined(separator: "\n")
+        return String(userMessage.prefix(400)) + "\nRecent conversation:\n" + recent
+    }
+
     static func middleSnippetText(
         userMessage: String,
         promptMessages: [ChatMessage],
@@ -1382,20 +1432,8 @@ enum SessionHistoryPromptRenderer {
         // vanished from rebuilt history entirely, a captioned one lost the
         // fact an image was attached. Render a compact reference instead —
         // never the base64 (history lives in the cacheable system prompt).
-        if let attachments = array(metadata?["attachments"]), !attachments.isEmpty {
-            let refs = attachments.compactMap { entry -> String? in
-                guard let obj = object(entry) else { return nil }
-                let name = string(obj["name"]) ?? string(obj["mime"]) ?? "attachment"
-                if let bytes = int(obj["byteSize"]), bytes > 0 {
-                    return "\(name), \(bytes / 1024)kB"
-                }
-                return name
-            }
-            if !refs.isEmpty {
-                let marker = "[sent image: \(refs.joined(separator: "; "))]"
-                content = content.isEmpty ? marker : "\(marker) \(content)"
-            }
-        }
+        content = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
+            content, attachments: metadata?["attachments"])
         guard !content.isEmpty else { return nil }
         if role == "assistant", isTransientAssistantFailure(content) {
             return nil
@@ -1403,6 +1441,12 @@ enum SessionHistoryPromptRenderer {
         return Renderable(
             role: isCompactionSummary ? "summary" : role,
             content: content,
+            historyIdentity: message.historyIdentity(
+                renderedRole: isCompactionSummary ? "summary" : role, renderedContent: content),
+            originLabel: role == "user" && !isCompactionSummary
+                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(metadata?["origin"]) : nil,
+            incompleteReplyLabel: role == "assistant" && !isCompactionSummary
+                ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: extrasObject, metadata: metadata) : nil,
             timestamp: message.timestamp,
             isTool: isTool,
             isCompactionSummary: isCompactionSummary
@@ -1434,21 +1478,21 @@ enum SessionHistoryPromptRenderer {
         var lines: [String] = ["SESSION_CONTINUITY_STATE:"]
         if !anchors.isEmpty {
             let rendered = anchors
-                .map { "[\($0.role)] \(cap($0.content, 220))" }
+                .map { "[\($0.role)] \(cap($0.displayContent, 220))" }
                 .joined(separator: " | ")
             lines.append("Initial anchors: \(rendered)")
         }
         if let latestUser {
-            lines.append("Latest user before this turn: \(cap(latestUser.content, 280))")
+            lines.append("Latest user before this turn: \(cap(latestUser.displayContent, 280))")
         }
         if let latestAssistant {
-            lines.append("Latest assistant tail: \(cap(latestAssistant.content, 320))")
+            lines.append("Latest assistant tail: \(cap(latestAssistant.displayContent, 320))")
         }
         if let latestCorrection {
-            lines.append("Recent correction/callout: \(cap(latestCorrection.content, 260))")
+            lines.append("Recent correction/callout: \(cap(latestCorrection.displayContent, 260))")
         }
         if let openLoop {
-            lines.append("Open loop: \(cap(openLoop.content, 280))")
+            lines.append("Open loop: \(cap(openLoop.displayContent, 280))")
         }
         lines.append("For older or elided wording, use search_chat_history/session_search scoped to the current session first, then broaden only if needed.")
 
@@ -1525,7 +1569,7 @@ enum SessionHistoryPromptRenderer {
         var added = 0
         for hit in ranked {
             let capValue = min(capForRole(hit.message, budget: budget), budget.relevantItemCap)
-            let line = "[\(hit.message.role)] \(cap(hit.message.content, capValue))"
+            let line = "[\(hit.message.role)] \(cap(hit.message.displayContent, capValue))"
             let projected = used + line.count + 1
             if added > 0 && projected > budget.relevantChars { break }
             lines.append(line)
@@ -1581,7 +1625,7 @@ enum SessionHistoryPromptRenderer {
     }
 
     private static func signature(_ message: Renderable) -> String {
-        "\(message.timestamp)\u{1F}\(message.role)\u{1F}\(message.content)"
+        message.historyIdentity
     }
 
     private static func conversationHistory(
@@ -1593,7 +1637,7 @@ enum SessionHistoryPromptRenderer {
         guard !tail.isEmpty else { return nil }
 
         func renderedLine(_ msg: Renderable) -> String {
-            "[\(msg.role)] \(cap(msg.content, capForRole(msg, budget: budget)))"
+            "[\(msg.role)] \(cap(msg.displayContent, capForRole(msg, budget: budget)))"
         }
 
         var admitted: [(index: Int, line: String)] = []
@@ -1653,7 +1697,7 @@ enum SessionHistoryPromptRenderer {
         return """
         Immediate reply reference:
         The current user message is a short approval or continuation. Unless contradicted, treat it as referring to the immediately previous assistant message:
-        [assistant] \(cap(latest.content, assistantCap))
+        [assistant] \(cap(latest.displayContent, assistantCap))
         """
     }
 
@@ -1681,15 +1725,17 @@ enum SessionHistoryPromptRenderer {
         content: String,
         metadata: [String: JSONValue]?
     ) -> String {
+        let recordedStatus = ChatTranscriptEvidenceRendering.recordedToolStatus(metadata)
         let normalizedContent = normalize(content)
         if !normalizedContent.isEmpty {
-            return normalizedContent
+            return recordedStatus.map { "\($0): \(normalizedContent)" } ?? normalizedContent
         }
         let name = string(metadata?["toolName"]) ?? string(metadata?["tool_name"]) ?? "tool"
         let ok: String = {
             if case .bool(let value)? = metadata?["ok"] { return value ? "ok" : "failed" }
             return "ran"
         }()
+        let toolStatus = recordedStatus.map { "\($0): \(name)" } ?? "\(name) \(ok)"
         // Skill reads: the 180-char preview would be the skill body's first
         // paragraph — redundant bytes in every subsequent prompt. The NAME is
         // the whole continuity signal ("I already read that skill"); she can
@@ -1698,15 +1744,15 @@ enum SessionHistoryPromptRenderer {
         if name == "read_skill" {
             let skillName = Self.readSkillName(fromInputJSON: string(metadata?["inputJSON"]))
             return skillName.isEmpty
-                ? "read_skill \(ok)"
-                : "read_skill \(ok): \(skillName) (body elided — re-read if needed)"
+                ? toolStatus
+                : "\(toolStatus): \(skillName) (body elided — re-read if needed)"
         }
         let rawResult = string(metadata?["resultSummary"]) ?? ""
         let result = toolResultProjection(rawResult)
         if result.isEmpty {
-            return "\(name) \(ok)"
+            return toolStatus
         }
-        return "\(name) \(ok): \(result)"
+        return "\(toolStatus): \(result)"
     }
 
     // MARK: - Cross-turn tool-result projection (sweep R4, finding #6)

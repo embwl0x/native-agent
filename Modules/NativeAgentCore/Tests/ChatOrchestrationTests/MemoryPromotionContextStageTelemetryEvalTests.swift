@@ -19,7 +19,8 @@ private struct MemoryPromotionTelemetryEvalPromoter: MemoryPromotionTelemetryRep
         assistantMessage: String,
         sessionId: String
     ) async -> MemoryPromotionTelemetry {
-        MemoryPromotionTelemetry(stagedProposalCount: 2)
+        MemoryPromotionTelemetry(stagedProposalCount: 2, semanticStatus: .timedOut,
+                                 semanticCandidateCount: 0, candidateCount: 3)
     }
 }
 
@@ -114,6 +115,9 @@ private struct MemoryPromotionTelemetryEvalLLM: LLMClient {
 
     let (reportingCounts, reportingFlags) = try state("telegram")
     #expect(reportingCounts["stagedProposalCount"] == .int(2))
+    #expect(reportingCounts["extractedCandidateCount"] == .int(3))
+    #expect(reportingCounts["semanticCandidateCount"] == .int(0))
+    #expect(payloadsBySurface["telegram"]?["labels"] == .object(["semanticExtraction": .string("timedOut")]))
     #expect(reportingFlags == ["configured": .bool(true), "outcomeReported": .bool(true)])
     let serialized = String(describing: payloadsBySurface)
     #expect(!serialized.contains("source content"))

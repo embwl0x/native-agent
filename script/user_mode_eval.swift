@@ -2,6 +2,7 @@
 
 import AppKit
 import ApplicationServices
+import Darwin
 import Foundation
 
 // User Mode Eval is intentionally black-box: it inspects the installed app,
@@ -17,6 +18,8 @@ struct Options {
     /// user-facing evaluator contract.
     var uiGateOnly = false
     var forceAXUntrustedForTesting = false
+    var visibilityContractOnly = false
+    var processContractOnly = false
 }
 
 struct Finding: Codable {
@@ -104,18 +107,18 @@ func userModeRoutes(includeNativeExperience: Bool) -> [UIRoute] {
         UIRoute(id: "workshop-schedule", steps: [commandStep("4", labels: ["Workshop"]), axStep(["Schedule", "Scheduler"])], displayName: "Workshop > Schedule", expectedDetailText: ["Add Nightly Reflection", "Scheduler"]),
         UIRoute(id: "workshop-research", steps: [commandStep("4", labels: ["Workshop"]), axStep(["Research"])], displayName: "Workshop > Research", expectedDetailText: ["Research"]),
         UIRoute(id: "skills", steps: [appRouteStep("s", labels: ["Skills"])], displayName: "Skills & Tools > Skills", expectedDetailText: ["Skills & Tools", "Skills"]),
-        UIRoute(id: "providers", steps: [commandStep("7", labels: ["Providers"])], displayName: "Providers", expectedDetailText: ["Providers", "Choose which LLM provider"]),
+        UIRoute(id: "providers", steps: [axStep(["Providers"], sidebarOnly: true)], displayName: "Providers", expectedDetailText: ["Providers", "Choose which LLM provider"]),
         UIRoute(id: "mac-integration", steps: [appRouteStep("m", labels: ["Mac Integration"])], displayName: "Mac Integration", expectedDetailText: ["Mac Integration", "System Permissions"]),
         UIRoute(id: "settings", steps: [commandStep("9", labels: ["Settings"])], displayName: "Settings", expectedDetailText: ["Settings"]),
-        UIRoute(id: "personality", steps: [commandStep("5", labels: ["Personality"])], displayName: "Personality", expectedDetailText: ["Personality", "Custom mode"]),
+        UIRoute(id: "personality", steps: [axStep(["Personality"], sidebarOnly: true)], displayName: "Personality", expectedDetailText: ["Personality", "Custom mode"]),
         UIRoute(id: "connectors", steps: [appRouteStep("c", labels: ["Connectors"])], displayName: "Connectors", expectedDetailText: ["Connectors"]),
-        UIRoute(id: "trust", steps: [commandStep("6", labels: ["Trust"])], displayName: "Trust", expectedDetailText: ["Trust", "Full Mac"]),
+        UIRoute(id: "trust", steps: [axStep(["Trust"], sidebarOnly: true)], displayName: "Trust", expectedDetailText: ["Trust", "Full Mac"]),
         // Mounted on Trust > Mac Control. This is intentionally read-only:
         // the walk proves the live inventory and must never apply a preset or
         // trigger macOS permission prompts on the user's installed app.
-        UIRoute(id: "mac-assistant-watch-setup", steps: [commandStep("6", labels: ["Trust"])], displayName: "Trust > Assistant Watch Setup", expectedDetailText: ["Assistant Watch Setup"], requiredDetailText: ["Mac Control Bridge", "Gmail unread digest"]),
+        UIRoute(id: "mac-assistant-watch-setup", steps: [axStep(["Trust"], sidebarOnly: true)], displayName: "Trust > Assistant Watch Setup", expectedDetailText: ["Assistant Watch Setup"], requiredDetailText: ["Mac Control Bridge", "Gmail unread digest"]),
         UIRoute(id: "capabilities", steps: [appRouteStep("p", labels: ["Capabilities"])], displayName: "Capabilities", expectedDetailText: ["Capabilities", "Next-gen"]),
-        UIRoute(id: "knowledge", steps: [commandStep("8", labels: ["Knowledge Graph"])], displayName: "Knowledge Graph", expectedDetailText: ["Knowledge Graph", "entities"]),
+        UIRoute(id: "knowledge", steps: [axStep(["Knowledge Graph"], sidebarOnly: true)], displayName: "Knowledge Graph", expectedDetailText: ["Knowledge Graph", "entities"]),
         UIRoute(id: "dreams", steps: [appRouteStep("d", labels: ["Dreams"])], displayName: "Dreams", expectedDetailText: ["Dreams", "Run Dream"]),
         UIRoute(id: "diagnostics", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"])], displayName: "Diagnostics", expectedDetailText: ["Doctor", "Run Doctor"]),
         UIRoute(id: "diagnostics-status", steps: [appRouteStep("x", labels: ["Doctor", "Diagnostics"]), axStep(["Status"])], displayName: "Diagnostics > Status", expectedDetailText: ["Runtime", "Watchdog"]),
@@ -171,12 +174,8 @@ func userModeExpectedAdditionalRouteIDs(includeNativeExperience: Bool) -> Set<St
     return routeIDs
 }
 
-func axStep(_ labels: [String]) -> UIRouteStep {
-    UIRouteStep(labels: labels, commandKey: nil, modifiersScript: nil, paletteQuery: nil, sidebarOnly: false)
-}
-
-func sidebarStep(_ labels: [String]) -> UIRouteStep {
-    UIRouteStep(labels: labels, commandKey: nil, modifiersScript: nil, paletteQuery: nil, sidebarOnly: true)
+func axStep(_ labels: [String], sidebarOnly: Bool = false) -> UIRouteStep {
+    UIRouteStep(labels: labels, commandKey: nil, modifiersScript: nil, paletteQuery: nil, sidebarOnly: sidebarOnly)
 }
 
 func commandStep(_ key: String, labels: [String]) -> UIRouteStep {
@@ -224,6 +223,8 @@ func parseOptions() -> Options {
     var strictUI = false
     var uiGateOnly = false
     var forceAXUntrustedForTesting = false
+    var visibilityContractOnly = false
+    var processContractOnly = false
     var args = Array(CommandLine.arguments.dropFirst())
     while !args.isEmpty {
         let arg = args.removeFirst()
@@ -242,6 +243,10 @@ func parseOptions() -> Options {
             uiGateOnly = true
         case "--test-force-ax-untrusted":
             forceAXUntrustedForTesting = true
+        case "--test-visibility-contract":
+            visibilityContractOnly = true
+        case "--test-process-contract":
+            processContractOnly = true
         case "--help", "-h":
             print("""
             User Mode Eval
@@ -259,7 +264,8 @@ func parseOptions() -> Options {
         }
     }
     return Options(repo: repo, artifacts: artifacts, skipUI: skipUI, strictUI: strictUI,
-                   uiGateOnly: uiGateOnly, forceAXUntrustedForTesting: forceAXUntrustedForTesting)
+                   uiGateOnly: uiGateOnly, forceAXUntrustedForTesting: forceAXUntrustedForTesting,
+                   visibilityContractOnly: visibilityContractOnly, processContractOnly: processContractOnly)
 }
 
 func isoNow() -> String {
@@ -308,12 +314,71 @@ func jsonLine(_ object: [String: Any]) throws -> String {
     return String(data: data, encoding: .utf8) ?? "{}"
 }
 
-func appendOpenApprovalsProbeCard(inboxURL: URL, id: String) throws -> Data? {
-    let original = try? Data(contentsOf: inboxURL)
-    var text = original.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-    if !text.isEmpty && !text.hasSuffix("\n") {
-        text += "\n"
+func withCanonicalFileLock<T>(_ targetURL: URL, body: () throws -> T) throws -> T {
+    let lockPath = targetURL.path + ".lock"
+    try fm.createDirectory(
+        at: URL(fileURLWithPath: lockPath).deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let deadline = Date().addingTimeInterval(5)
+    var inodeAttempts = 0
+    while true {
+        inodeAttempts += 1
+        let fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
+        guard fd >= 0 else {
+            throw NSError(
+                domain: "UserModeEvalFileLock",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"]
+            )
+        }
+        var acquired = false
+        defer {
+            if acquired { _ = flock(fd, LOCK_UN) }
+            Darwin.close(fd)
+        }
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let lockError = errno
+            guard lockError == EWOULDBLOCK || lockError == EINTR else {
+                throw NSError(
+                    domain: "UserModeEvalFileLock",
+                    code: Int(lockError),
+                    userInfo: [NSLocalizedDescriptionKey: "flock failed: \(String(cString: strerror(lockError)))"]
+                )
+            }
+            guard Date() < deadline else {
+                throw NSError(
+                    domain: "UserModeEvalFileLock",
+                    code: Int(ETIMEDOUT),
+                    userInfo: [NSLocalizedDescriptionKey: "timed out locking \(targetURL.path)"]
+                )
+            }
+            usleep(20_000)
+        }
+        acquired = true
+
+        // Match PersistenceCore's acquire-then-validate discipline: orphan
+        // cleanup may unlink a sidecar while this process is opening it.
+        var held = stat()
+        var atPath = stat()
+        let sameInode = fstat(fd, &held) == 0
+            && stat(lockPath, &atPath) == 0
+            && held.st_dev == atPath.st_dev
+            && held.st_ino == atPath.st_ino
+        if sameInode {
+            return try body()
+        }
+        guard inodeAttempts < 8, Date() < deadline else {
+            throw NSError(
+                domain: "UserModeEvalFileLock",
+                code: Int(EAGAIN),
+                userInfo: [NSLocalizedDescriptionKey: "lock file was replaced repeatedly: \(lockPath)"]
+            )
+        }
     }
+}
+
+func installOpenApprovalsProbeCard(inboxURL: URL, id: String) throws -> Bool {
     let row: [String: Any] = [
         "actions": [],
         "created_at": isoNow(),
@@ -330,18 +395,43 @@ func appendOpenApprovalsProbeCard(inboxURL: URL, id: String) throws -> Data? {
         "summary": "Temporary User Mode probe for the Inbox Open Approvals action.",
         "title": "User Mode Open Approvals Probe"
     ]
-    text += try jsonLine(row)
-    text += "\n"
-    try fm.createDirectory(at: inboxURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try text.write(to: inboxURL, atomically: true, encoding: .utf8)
-    return original
+    let probe = Data((try jsonLine(row) + "\n").utf8)
+    return try withCanonicalFileLock(inboxURL) {
+        let existed = fm.fileExists(atPath: inboxURL.path)
+        let original = existed ? try Data(contentsOf: inboxURL) : Data()
+        var updated = probe
+        updated.append(original)
+        try updated.write(to: inboxURL, options: .atomic)
+        return existed
+    }
 }
 
-func restoreFile(_ url: URL, original: Data?) {
-    if let original {
-        try? original.write(to: url, options: .atomic)
-    } else {
-        try? fm.removeItem(at: url)
+func removeJSONLRow(url: URL, id: String, fileExistedBeforeProbe: Bool) throws {
+    try withCanonicalFileLock(url) {
+        guard let current = try? Data(contentsOf: url) else { return }
+        var retained = Data()
+        var lineStart = current.startIndex
+        while lineStart < current.endIndex {
+            let newline = current[lineStart...].firstIndex(of: 0x0A)
+            let lineEnd = newline ?? current.endIndex
+            var payloadEnd = lineEnd
+            if payloadEnd > lineStart, current[current.index(before: payloadEnd)] == 0x0D {
+                payloadEnd = current.index(before: payloadEnd)
+            }
+            let payload = current[lineStart..<payloadEnd]
+            let object = (try? JSONSerialization.jsonObject(with: Data(payload))) as? [String: Any]
+            let matchesProbe = object?["id"] as? String == id
+            let segmentEnd = newline.map { current.index(after: $0) } ?? current.endIndex
+            if !matchesProbe {
+                retained.append(current[lineStart..<segmentEnd])
+            }
+            lineStart = segmentEnd
+        }
+        if retained.isEmpty, !fileExistedBeforeProbe {
+            try? fm.removeItem(at: url)
+        } else {
+            try retained.write(to: url, options: .atomic)
+        }
     }
 }
 
@@ -349,12 +439,6 @@ func string(_ value: Any?) -> String {
     if let s = value as? String { return s }
     if let n = value as? NSNumber { return n.stringValue }
     return ""
-}
-
-func int(_ value: Any?) -> Int? {
-    if let n = value as? NSNumber { return n.intValue }
-    if let s = value as? String { return Int(s) }
-    return nil
 }
 
 func bool(_ value: Any?) -> Bool? {
@@ -381,22 +465,108 @@ func runProcess(_ executable: String, _ args: [String], timeout: TimeInterval = 
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = pipe
+    defer { pipe.fileHandleForReading.closeFile() }
+    let fd = pipe.fileHandleForReading.fileDescriptor
+    let flags = fcntl(fd, F_GETFL)
+    guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+        return (-1, "Could not configure nonblocking process output")
+    }
     do {
         try proc.run()
     } catch {
         return (-1, error.localizedDescription)
     }
-    let deadline = Date().addingTimeInterval(timeout)
-    while proc.isRunning && Date() < deadline {
-        Thread.sleep(forTimeInterval: 0.05)
+    pipe.fileHandleForWriting.closeFile()
+    var data = Data()
+    var eof = false
+    var readFailed = false
+    var buffer = [UInt8](repeating: 0, count: 65_536)
+    func drainAvailable() {
+        // Bound each drain too: an always-writing child cannot starve the
+        // timeout check. Never block waiting for EOF held by a descendant.
+        for _ in 0..<64 {
+            let count = Darwin.read(fd, &buffer, buffer.count)
+            if count > 0 { data.append(contentsOf: buffer.prefix(count)) }
+            else if count == 0 { eof = true; return }
+            else if errno == EINTR { continue }
+            else {
+                if errno != EAGAIN && errno != EWOULDBLOCK { readFailed = true }
+                return
+            }
+        }
+    }
+    let deadline = ProcessInfo.processInfo.systemUptime + max(0, timeout)
+    var timedOut = false
+    while proc.isRunning {
+        drainAvailable()
+        if ProcessInfo.processInfo.systemUptime >= deadline { timedOut = true; break }
+        Thread.sleep(forTimeInterval: 0.01)
     }
     if proc.isRunning {
         proc.terminate()
-        Thread.sleep(forTimeInterval: 0.2)
-        if proc.isRunning { proc.interrupt() }
+        let grace = ProcessInfo.processInfo.systemUptime + 0.2
+        while proc.isRunning && ProcessInfo.processInfo.systemUptime < grace {
+            drainAvailable()
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
     }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    proc.waitUntilExit() // Reap this exact child before reading its status.
+    let drainDeadline = ProcessInfo.processInfo.systemUptime + 0.2
+    repeat {
+        drainAvailable()
+        if eof || readFailed { break }
+        Thread.sleep(forTimeInterval: 0.01)
+    } while ProcessInfo.processInfo.systemUptime < drainDeadline
+    var output = String(decoding: data, as: UTF8.self)
+    if readFailed && !timedOut { return (-1, output + "\n[evaluator] process output read failed\n") }
+    if timedOut || !eof {
+        output += timedOut ? "\n[evaluator] process timed out\n" : "\n[evaluator] output pipe remained open after child exit\n"
+        return (124, output)
+    }
+    return (proc.terminationStatus, output)
+}
+
+func runProcessContract(recorder: Recorder) {
+    func require(_ condition: Bool, _ id: String, _ detail: String) {
+        if condition { recorder.pass(id, detail) }
+        else { recorder.fail(id, "Process execution contract failed", detail) }
+    }
+    let large = runProcess("/usr/bin/printf", ["%200000s", "x"], timeout: 3)
+    require(large.status == 0 && large.output.utf8.count == 200_000 && large.output.hasSuffix("x"),
+            "process.output.large", "status=\(large.status), captured=\(large.output.utf8.count) of 200000 bytes")
+
+    let failure = runProcess("/bin/sh", ["-c", "printf 'before\\n'; printf 'failure\\n' >&2; exit 7"])
+    require(failure.status == 7 && failure.output.contains("before\n") && failure.output.contains("failure\n"),
+            "process.output.failure", "Nonzero exit retains both output streams and the child status")
+
+    let started = ProcessInfo.processInfo.systemUptime
+    let timeout = runProcess("/bin/sh", ["-c", "trap '' TERM; echo $$; exec /bin/sleep 30"], timeout: 0.1)
+    let childPID = timeout.output.split(separator: "\n").first.flatMap { Int32($0) }
+    let reaped = childPID.map { kill($0, 0) == -1 && errno == ESRCH } ?? false
+    require(timeout.status == 124 && reaped && ProcessInfo.processInfo.systemUptime - started < 2,
+            "process.timeout.reaped", "Timeout kills and reaps the exact TERM-resistant child; status=\(timeout.status), reaped=\(reaped)")
+
+    let inheritedStarted = ProcessInfo.processInfo.systemUptime
+    let inherited = runProcess("/bin/sh", ["-c", "/bin/sleep 5 & echo $!"], timeout: 1)
+    // This deliberately inherited descriptor belongs to our short-lived
+    // fixture descendant only; release it even if the assertion fails.
+    if let pid = inherited.output.split(separator: "\n").first.flatMap({ Int32($0) }) {
+        kill(pid, SIGTERM)
+    }
+    require(inherited.status == 124 && ProcessInfo.processInfo.systemUptime - inheritedStarted < 2
+                && inherited.output.contains("output pipe remained open"),
+            "process.output.inherited_pipe", "An inherited pipe cannot make post-exit draining unbounded")
+
+    let failedListing = Recorder()
+    checkRuntimeProcesses(recorder: failedListing, processResult: failure)
+    require(failedListing.findings.contains { $0.id == "runtime.process_list.readable" && $0.severity == "fail" }
+                && !failedListing.scenarios.contains { $0.status == "pass" },
+            "process.list.failure_truth", "A failed process listing cannot certify daemon absence")
+    let cleanListing = Recorder()
+    checkRuntimeProcesses(recorder: cleanListing, processResult: large)
+    require(cleanListing.scenarios.contains { $0.id == "runtime.no_retired_python_daemon" && $0.status == "pass" },
+            "process.list.success", "A successful complete process listing still certifies daemon absence")
 }
 
 func installedAppURL(repo: URL) -> URL {
@@ -502,7 +672,9 @@ func axChildren(_ element: AXUIElement) -> [AXUIElement] {
 
 func axWindows(_ element: AXUIElement) -> [AXUIElement] {
     guard let windows = copyAX(element, kAXWindowsAttribute) as? [AXUIElement] else { return [] }
-    return windows
+    // During launch AX can briefly return the application proxy itself here.
+    // Do not recurse through that proxy as though it were a mounted window.
+    return windows.filter { axString($0, kAXRoleAttribute) == kAXWindowRole }
 }
 
 func axActions(_ element: AXUIElement) -> [String] {
@@ -549,7 +721,9 @@ func collectAppSnapshot(appElement: AXUIElement) -> [UISnapshot] {
     var budget = 2_000
     let windows = axWindows(appElement)
     for (idx, window) in windows.enumerated() {
-        collectAX(window, path: "window\(idx)", depth: 0, maxDepth: 9, budget: &budget, out: &out)
+        // Nested SwiftUI Lists expose their row labels below depth nine.
+        // Keep the node budget bounded, but include those actual controls.
+        collectAX(window, path: "window\(idx)", depth: 0, maxDepth: 18, budget: &budget, out: &out)
     }
     return out
 }
@@ -580,7 +754,11 @@ func elementMatches(_ element: AXUIElement, labels: [String], depth: Int = 0, ma
     if !label.isEmpty {
         for candidate in labels {
             let needle = candidate.lowercased()
-            if label == needle || label.contains(needle) {
+            // AX combines a link title and its subtitle with a comma. Match
+            // that title, not an incidental word in another row's subtitle.
+            if label == needle || label.hasPrefix(needle + ",")
+                || label.hasPrefix(needle + " (")
+                || (needle.hasSuffix("(" ) && label.hasPrefix(needle)) {
                 return true
             }
         }
@@ -615,7 +793,7 @@ func findActionable(
     _ root: AXUIElement,
     labels: [String],
     depth: Int = 0,
-    maxDepth: Int = 10,
+    maxDepth: Int = 18,
     budget: inout Int,
     region: ((CGRect?) -> Bool)? = nil
 ) -> AXUIElement? {
@@ -624,16 +802,18 @@ func findActionable(
     let role = axString(root, kAXRoleAttribute)
     let actions = axActions(root)
     let canSelect = selectableActions.contains(where: { actions.contains($0) })
+    // Prefer the actual control over an enclosing AXRow/AXCell. SwiftUI can
+    // accept ShowDefaultUI on that wrapper without activating its link.
+    for child in axChildren(root) {
+        if let found = findActionable(child, labels: labels, depth: depth + 1, maxDepth: maxDepth, budget: &budget, region: region) {
+            return found
+        }
+    }
     var matchBudget = 80
     if (actionableRoles.contains(role) || canSelect)
         && (region?(axFrame(root)) ?? true)
         && elementMatches(root, labels: labels, budget: &matchBudget) {
         return root
-    }
-    for child in axChildren(root) {
-        if let found = findActionable(child, labels: labels, depth: depth + 1, maxDepth: maxDepth, budget: &budget, region: region) {
-            return found
-        }
     }
     return nil
 }
@@ -651,7 +831,7 @@ func findExactButton(
     _ root: AXUIElement,
     labels: [String],
     depth: Int = 0,
-    maxDepth: Int = 10,
+    maxDepth: Int = 18,
     budget: inout Int
 ) -> AXUIElement? {
     guard depth <= maxDepth, budget > 0 else { return nil }
@@ -678,20 +858,19 @@ func findFirstElement(
     maxDepth: Int = 12,
     budget: inout Int
 ) -> AXUIElement? {
-    guard depth <= maxDepth, budget > 0 else { return nil }
-    budget -= 1
-    if axString(root, kAXRoleAttribute) == expectedRole {
-        return root
-    }
-    for child in axChildren(root) {
-        if let found = findFirstElement(
-            child,
-            role: expectedRole,
-            depth: depth + 1,
-            maxDepth: maxDepth,
-            budget: &budget
-        ) {
-            return found
+    // Search shallow siblings first: a large list must not consume the budget
+    // before we inspect a sheet attached to the same window.
+    var queue: [(AXUIElement, Int)] = [(root, depth)]
+    var index = 0
+    while index < queue.count && budget > 0 {
+        let (element, currentDepth) = queue[index]
+        index += 1
+        guard currentDepth <= maxDepth else { continue }
+        budget -= 1
+        if axString(element, kAXRoleAttribute) == expectedRole { return element }
+        if currentDepth < maxDepth {
+            let available = max(0, budget - (queue.count - index))
+            queue.append(contentsOf: axChildren(element).prefix(available).map { ($0, currentDepth + 1) })
         }
     }
     return nil
@@ -699,7 +878,13 @@ func findFirstElement(
 
 func pressFirst(appElement: AXUIElement, labels: [String], sidebarOnly: Bool = false) -> Bool {
     var budget = 2_000
-    let region: ((CGRect?) -> Bool)? = sidebarOnly ? sidebarRegion(appElement: appElement) : nil
+    let window = firstWindowFrame(appElement: appElement)
+    let region: ((CGRect?) -> Bool)? = sidebarOnly ? sidebarRegion(appElement: appElement) : { frame in
+        guard let frame, let window else { return false }
+        // Child-page actions belong to the detail, never a same-named global
+        // sidebar item (for example Native Experience > Capabilities).
+        return frame.minX >= window.minX + 265 && frameIsFullyVisible(frame, within: window)
+    }
     guard let element = findActionable(appElement, labels: labels, budget: &budget, region: region) else { return false }
     let frame = axFrame(element)
     if sidebarOnly, let frame, isVisibleFrame(frame) {
@@ -728,9 +913,12 @@ func pressFirst(appElement: AXUIElement, labels: [String], sidebarOnly: Bool = f
 func pressExactButton(appElement: AXUIElement, labels: [String]) -> Bool {
     var budget = 2_000
     guard let element = findExactButton(appElement, labels: labels, budget: &budget) else { return false }
+    guard let frame = axFrame(element),
+          let window = firstWindowFrame(appElement: appElement),
+          frameIsFullyVisible(frame, within: window) else { return false }
     let err = AXUIElementPerformAction(element, kAXPressAction as CFString)
     if err == .success { return true }
-    if let frame = axFrame(element), isVisibleFrame(frame) {
+    if isVisibleFrame(frame) {
         return mouseClick(frame: frame)
     }
     return false
@@ -752,9 +940,32 @@ func trimmedText(_ text: String) -> String {
     text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-func isVisibleSnapshot(_ snapshot: UISnapshot) -> Bool {
-    guard let width = snapshot.width, let height = snapshot.height else { return false }
-    return width > 1 && height > 1
+func snapshotFrame(_ snapshot: UISnapshot) -> CGRect? {
+    guard let x = snapshot.x, let y = snapshot.y,
+          let width = snapshot.width, let height = snapshot.height,
+          x.isFinite, y.isFinite, width.isFinite, height.isFinite,
+          width > 1, height > 1 else { return nil }
+    return CGRect(x: x, y: y, width: width, height: height)
+}
+
+func containingWindowFrame(for snapshot: UISnapshot, in snapshots: [UISnapshot]) -> CGRect? {
+    let windowPath = snapshot.path.split(separator: ".", maxSplits: 1).first.map(String.init) ?? snapshot.path
+    return snapshots.first { $0.path == windowPath }.flatMap(snapshotFrame)
+}
+
+func frameIsFullyVisible(_ frame: CGRect, within window: CGRect) -> Bool {
+    let tolerance: CGFloat = 0.5
+    return frame.minX >= window.minX - tolerance
+        && frame.minY >= window.minY - tolerance
+        && frame.maxX <= window.maxX + tolerance
+        && frame.maxY <= window.maxY + tolerance
+}
+
+func isVisibleSnapshot(_ snapshot: UISnapshot, in snapshots: [UISnapshot]) -> Bool {
+    guard let frame = snapshotFrame(snapshot),
+          let window = containingWindowFrame(for: snapshot, in: snapshots) else { return false }
+    return snapshot.path == snapshot.path.split(separator: ".", maxSplits: 1).first.map(String.init)
+        || frameIsFullyVisible(frame, within: window)
 }
 
 func isHiddenHarnessText(_ text: String) -> Bool {
@@ -796,14 +1007,14 @@ func effectiveVisibleLabel(_ snapshot: UISnapshot, in snapshots: [UISnapshot]) -
     }
     let childPrefix = "\(snapshot.path)."
     return snapshots
-        .filter { $0.path.hasPrefix(childPrefix) && isVisibleSnapshot($0) }
+        .filter { $0.path.hasPrefix(childPrefix) && isVisibleSnapshot($0, in: snapshots) }
         .flatMap(visibleSnapshotTextParts)
         .first ?? ""
 }
 
 func allVisibleText(_ snapshots: [UISnapshot]) -> String {
     snapshots
-        .filter(isVisibleSnapshot)
+        .filter { isVisibleSnapshot($0, in: snapshots) }
         .flatMap(visibleSnapshotTextParts)
         .joined(separator: "\n")
 }
@@ -812,10 +1023,138 @@ func detailVisibleText(_ snapshots: [UISnapshot]) -> String {
     let windowMinX = snapshots.first(where: { $0.path.hasPrefix("window") && !$0.path.contains(".") })?.x ?? 0
     let detailMinX = windowMinX + 265
     return snapshots
-        .filter(isVisibleSnapshot)
+        .filter { isVisibleSnapshot($0, in: snapshots) }
         .filter { ($0.x ?? 0) >= detailMinX }
         .flatMap(visibleSnapshotTextParts)
         .joined(separator: "\n")
+}
+
+// Read-only navigation of long setup panels. Hidden AX text is never proof:
+// scroll its owning area until the actual label enters the window.
+func revealDetailText(_ label: String, appElement: AXUIElement) -> Bool {
+    for _ in 0..<12 {
+        let snapshots = collectAppSnapshot(appElement: appElement)
+        if detailVisibleText(snapshots).localizedCaseInsensitiveContains(label) { return true }
+        guard let target = snapshots.first(where: {
+            rawSnapshotTextParts($0).contains { $0.localizedCaseInsensitiveContains(label) }
+        }), let frame = snapshotFrame(target),
+        let window = containingWindowFrame(for: target, in: snapshots),
+        let ancestor = snapshots.last(where: {
+            $0.role == kAXScrollAreaRole && target.path.hasPrefix($0.path + ".")
+        }) else { return false }
+        let components = ancestor.path.split(separator: ".")
+        guard let first = components.first,
+              let index = Int(first.dropFirst("window".count)) else { return false }
+        let windows = axWindows(appElement)
+        guard windows.indices.contains(index) else { return false }
+        var element = windows[index]
+        for component in components.dropFirst() {
+            let children = axChildren(element)
+            guard let childIndex = Int(component), children.indices.contains(childIndex) else { return false }
+            element = children[childIndex]
+        }
+        // AppKit reports successful page actions on this SwiftUI ScrollView
+        // without moving it. Use the same bounded wheel gesture as a person.
+        guard let area = axFrame(element) else { return false }
+        let visibleArea = area.intersection(window)
+        guard !visibleArea.isNull, visibleArea.width > 20, visibleArea.height > 20 else { return false }
+        let point = CGPoint(x: visibleArea.maxX - 20, y: visibleArea.midY)
+        guard let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                 mouseCursorPosition: point, mouseButton: .left),
+              let scroll = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                                   wheelCount: 1, wheel1: frame.minY < window.minY ? 500 : -500,
+                                   wheel2: 0, wheel3: 0) else { return false }
+        move.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.05)
+        scroll.location = point
+        scroll.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+    return detailVisibleText(collectAppSnapshot(appElement: appElement)).localizedCaseInsensitiveContains(label)
+}
+
+func visibilityFixtureSnapshot(
+    path: String,
+    role: String = kAXButtonRole,
+    x: Double,
+    y: Double,
+    width: Double,
+    height: Double
+) -> UISnapshot {
+    UISnapshot(
+        path: path,
+        role: role,
+        title: path,
+        value: "",
+        description: "",
+        enabled: true,
+        actions: [kAXPressAction],
+        childCount: 0,
+        x: x,
+        y: y,
+        width: width,
+        height: height
+    )
+}
+
+func runVisibilityContract(artifactDir: URL, recorder: Recorder) {
+    let snapshots = [
+        visibilityFixtureSnapshot(path: "window0", role: kAXWindowRole, x: 100, y: 100, width: 900, height: 700),
+        visibilityFixtureSnapshot(path: "window0.0", x: 150, y: 180, width: 120, height: 30),
+        visibilityFixtureSnapshot(path: "window0.1", x: 150, y: 1_600, width: 120, height: 30),
+        visibilityFixtureSnapshot(path: "window0.2", x: 150, y: 790, width: 120, height: 30),
+        visibilityFixtureSnapshot(path: "window0.3", x: 150, y: 220, width: 0, height: 30),
+    ]
+    let observed = snapshots.map { isVisibleSnapshot($0, in: snapshots) }
+    if observed == [true, true, false, false, false] {
+        recorder.pass("ui.visibility.geometry", "Only positive-size controls fully contained by their app window count as visible.")
+    } else {
+        recorder.fail(
+            "ui.visibility.geometry",
+            "Window-clipped controls passed the visibility contract",
+            "Expected [true, true, false, false, false], observed \(observed)."
+        )
+    }
+
+    let semanticRoutes = userModeRoutes(includeNativeExperience: false).filter {
+        ["providers", "trust", "personality", "knowledge", "mac-assistant-watch-setup"].contains($0.id)
+    }
+    if semanticRoutes.count == 5 && semanticRoutes.allSatisfy({
+        $0.steps.count == 1 && $0.steps[0].sidebarOnly && $0.steps[0].commandKey == nil
+    }) {
+        recorder.pass("ui.routes.semantic_sidebar", "Reordered and Advanced pages use their visible sidebar labels, not stale numbered shortcuts.")
+    } else {
+        recorder.fail("ui.routes.semantic_sidebar", "Sidebar routes regressed to positional shortcuts", "Expected five named sidebar routes.")
+    }
+
+    let inboxURL = artifactDir.appendingPathComponent("visibility-contract-inbox.jsonl")
+    let historical = Data("{\"id\":\"older-a\"}\n{\"id\":\"older-b\"}\n".utf8)
+    do {
+        try historical.write(to: inboxURL, options: .atomic)
+        let existed = try installOpenApprovalsProbeCard(inboxURL: inboxURL, id: "front-probe")
+        let installed = try Data(contentsOf: inboxURL)
+        let firstID = jsonlRows(at: inboxURL).first?["id"] as? String
+        let retainedHistory = installed.suffix(historical.count).elementsEqual(historical)
+        let concurrent = Data("{\"id\":\"arrived-during-eval\"}\n".utf8)
+        var withConcurrentArrival = installed
+        withConcurrentArrival.append(concurrent)
+        try withConcurrentArrival.write(to: inboxURL, options: .atomic)
+        try removeJSONLRow(url: inboxURL, id: "front-probe", fileExistedBeforeProbe: existed)
+        let cleaned = try Data(contentsOf: inboxURL)
+        var expected = historical
+        expected.append(concurrent)
+        if firstID == "front-probe", retainedHistory, cleaned == expected {
+            recorder.pass("ui.flow.inbox_open_approvals.fixture_order", "The locked Open Approvals probe is mounted first and cleanup preserves concurrent arrivals.")
+        } else {
+            recorder.fail(
+                "ui.flow.inbox_open_approvals.fixture_order",
+                "The Open Approvals probe did not own the first visible row",
+                "firstID=\(firstID ?? "nil"), retainedHistory=\(retainedHistory), preservedConcurrentArrival=\(cleaned == expected)"
+            )
+        }
+    } catch {
+        recorder.fail("ui.flow.inbox_open_approvals.fixture_order", "Could not exercise the probe fixture contract", error.localizedDescription)
+    }
 }
 
 func screenshot(to url: URL) {
@@ -852,9 +1191,7 @@ func sendShortcut(_ key: String, modifiersScript: String) -> Bool {
 
 func commandPaletteField(appElement: AXUIElement) -> AXUIElement? {
     var sheetBudget = 2_000
-    guard let sheet = findFirstElement(appElement, role: kAXSheetRole, budget: &sheetBudget) else {
-        return nil
-    }
+    guard let sheet = findFirstElement(appElement, role: kAXSheetRole, budget: &sheetBudget) else { return nil }
     var fieldBudget = 500
     return findFirstElement(sheet, role: kAXTextFieldRole, maxDepth: 6, budget: &fieldBudget)
 }
@@ -1025,8 +1362,12 @@ func checkScheduler(repo: URL, recorder: Recorder) {
     }
 }
 
-func checkRuntimeProcesses(recorder: Recorder) {
-    let result = runProcess("/bin/ps", ["-axo", "pid,command"], timeout: 5)
+func checkRuntimeProcesses(recorder: Recorder, processResult: (status: Int32, output: String)? = nil) {
+    let result = processResult ?? runProcess("/bin/ps", ["-axo", "pid,command"], timeout: 5)
+    guard result.status == 0 else {
+        recorder.fail("runtime.process_list.readable", "Could not inspect running processes", result.output)
+        return
+    }
     if result.output.contains("native_agentd.py") {
         recorder.fail("runtime.no_retired_python_daemon", "Retired external runtime is running", "ps output still includes native_agentd.py.")
     } else {
@@ -1372,7 +1713,12 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
     let appElement = AXUIElementCreateApplication(app.processIdentifier)
     let initialScreenshot = artifactDir.appendingPathComponent("initial.png")
     screenshot(to: initialScreenshot)
-    let initial = collectAppSnapshot(appElement: appElement)
+    var initial = collectAppSnapshot(appElement: appElement)
+    let accessibilityDeadline = Date().addingTimeInterval(5)
+    while initial.isEmpty && Date() < accessibilityDeadline {
+        Thread.sleep(forTimeInterval: 0.25)
+        initial = collectAppSnapshot(appElement: appElement)
+    }
     do {
         try writeJSON(initial, to: artifactDir.appendingPathComponent("ui-inventory-initial.json"))
     } catch {
@@ -1380,7 +1726,7 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
     }
     let windowCount = initial.filter { $0.path.hasPrefix("window") && $0.path.split(separator: ".").count == 1 }.count
     let actionable = initial.filter {
-        isVisibleSnapshot($0)
+        isVisibleSnapshot($0, in: initial)
             && !isHiddenHarnessSnapshot($0)
             && !isDescendantOfRole($0, role: "AXScrollBar", in: initial)
             && !isStandardWindowChrome($0)
@@ -1442,11 +1788,14 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
         }
         guard reachable else { continue }
         Thread.sleep(forTimeInterval: 0.9)
+        if route.id == "mac-assistant-watch-setup" {
+            _ = revealDetailText("Assistant Watch Setup", appElement: appElement)
+        }
         let snap = collectAppSnapshot(appElement: appElement)
         let path = artifactDir.appendingPathComponent("ui-inventory-\(route.id).json")
         try? writeJSON(snap, to: path)
         let routeActionable = snap.filter {
-            isVisibleSnapshot($0)
+            isVisibleSnapshot($0, in: snap)
                 && !isHiddenHarnessSnapshot($0)
                 && !isDescendantOfRole($0, role: "AXScrollBar", in: snap)
                 && !isStandardWindowChrome($0)
@@ -1490,9 +1839,15 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
             }
         }
         if !route.requiredDetailText.isEmpty {
-            let lowerDetail = detailText.lowercased()
-            let missing = route.requiredDetailText.filter {
-                !lowerDetail.contains($0.lowercased())
+            var missing: [String] = []
+            for (index, required) in route.requiredDetailText.enumerated() {
+                if revealDetailText(required, appElement: appElement) {
+                    let evidence = collectAppSnapshot(appElement: appElement)
+                    try? writeJSON(evidence, to: artifactDir.appendingPathComponent("ui-inventory-\(route.id)-required-\(index).json"))
+                    screenshot(to: artifactDir.appendingPathComponent("route-\(route.id)-required-\(index).png"))
+                } else {
+                    missing.append(required)
+                }
             }
             if missing.isEmpty {
                 recorder.pass(
@@ -1514,10 +1869,10 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
         .appendingPathComponent("notifications", isDirectory: true)
         .appendingPathComponent("inbox.jsonl")
     let probeID = "user-mode-open-approvals-\(UUID().uuidString)"
-    var originalInboxData: Data?
     var didInstallProbe = false
+    var inboxExistedBeforeProbe = false
     do {
-        originalInboxData = try appendOpenApprovalsProbeCard(inboxURL: inboxURL, id: probeID)
+        inboxExistedBeforeProbe = try installOpenApprovalsProbeCard(inboxURL: inboxURL, id: probeID)
         didInstallProbe = true
     } catch {
         recorder.fail(
@@ -1531,6 +1886,12 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
         && sendShortcut("i", modifiersScript: "{command down, shift down}")
     if openedInboxForApprovalAction {
         Thread.sleep(forTimeInterval: 1.0)
+        // Approval-backlog notices live in the System lane, not the default
+        // For you lane. Refresh through the real UI after adding our fixture.
+        _ = pressExactButton(appElement: appElement, labels: ["Refresh inbox"])
+        Thread.sleep(forTimeInterval: 0.4)
+        _ = pressFirst(appElement: appElement, labels: ["System ("])
+        Thread.sleep(forTimeInterval: 0.4)
         let inboxSnapshot = collectAppSnapshot(appElement: appElement)
         try? writeJSON(inboxSnapshot, to: artifactDir.appendingPathComponent("ui-inventory-flow-inbox-open-approvals-before.json"))
         if pressExactButton(appElement: appElement, labels: ["Open Approvals"]) {
@@ -1563,7 +1924,19 @@ func runUIEval(app: NSRunningApplication, dataRoot: URL, artifactDir: URL, optio
         )
     }
     if didInstallProbe {
-        restoreFile(inboxURL, original: originalInboxData)
+        do {
+            try removeJSONLRow(
+                url: inboxURL,
+                id: probeID,
+                fileExistedBeforeProbe: inboxExistedBeforeProbe
+            )
+        } catch {
+            recorder.fail(
+                "ui.flow.inbox_open_approvals.fixture_cleanup",
+                "Could not remove temporary Open Approvals probe",
+                error.localizedDescription
+            )
+        }
     }
     checkUIRuntimeIssues(
         since: uiEvalStartedAt,
@@ -1590,7 +1963,11 @@ let includeNativeExperience = UserDefaults(suiteName: bundleID)?
     .bool(forKey: "nativeagent.experience.enabled") == true
 let routes = userModeRoutes(includeNativeExperience: includeNativeExperience)
 
-if options.uiGateOnly {
+if options.processContractOnly {
+    runProcessContract(recorder: recorder)
+} else if options.visibilityContractOnly {
+    runVisibilityContract(artifactDir: artifactDir, recorder: recorder)
+} else if options.uiGateOnly {
     // Test this exact policy in a subprocess without launching an app or
     // touching its state. The normal path below still samples AX directly.
     let accessibilityTrusted = options.forceAXUntrustedForTesting ? false : AXIsProcessTrusted()

@@ -258,4 +258,43 @@ struct MacSyncCompletionDurabilityTests {
             atPath: ICloudSyncStatePaths.snapshotSkips(dataRoot: root).path
         ))
     }
+
+    @Test("a lightweight pass retains unattempted heavyweight snapshot failures")
+    func unattemptedSnapshotFailuresRemainDurable() throws {
+        let root = syncStateRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        MacSyncEngine.persistSnapshotSkipState(
+            ["providers": "provider catalog unavailable", "health": "health unavailable"],
+            dataRoot: root
+        )
+
+        let unresolved = MacSyncEngine.updateSnapshotSkipState(
+            currentSkips: [:],
+            attemptedGroups: ["health"],
+            dataRoot: root
+        )
+
+        #expect(unresolved == ["providers": "provider catalog unavailable"])
+        let recorded = try JSONDecoder().decode(
+            [String: String].self,
+            from: try Data(contentsOf: ICloudSyncStatePaths.snapshotSkips(dataRoot: root))
+        )
+        #expect(recorded["providers"] == "provider catalog unavailable")
+        #expect(recorded["health"] == nil)
+    }
+
+    @Test("a retried snapshot failure replaces its durable reason")
+    func attemptedSnapshotFailureRefreshesReason() {
+        let root = syncStateRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        MacSyncEngine.persistSnapshotSkipState(["providers": "old failure"], dataRoot: root)
+
+        let unresolved = MacSyncEngine.updateSnapshotSkipState(
+            currentSkips: ["providers": "new failure"],
+            attemptedGroups: ["providers"],
+            dataRoot: root
+        )
+
+        #expect(unresolved == ["providers": "new failure"])
+    }
 }

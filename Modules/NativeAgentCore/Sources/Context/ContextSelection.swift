@@ -265,6 +265,7 @@ public enum ContextEligibilityReason: String, Codable, Sendable {
     case surfaceDenied = "surface_denied"
     case privacyDenied = "privacy_denied"
     case neverInject = "never_inject"
+    case outsideContextScope = "outside_context_scope"
     case expired
     case staleRuntime = "stale_runtime"
     case secretBearing = "secret_bearing"
@@ -814,6 +815,10 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     public let maximumPointers: Int
     public let maximumAtomsPerSource: Int
     public let maximumAtomsPerKind: Int
+    /// Kind-specific overrides of `maximumAtomsPerKind`. Memory atoms get a
+    /// larger quota by default so high-scoring memories are not crowded out
+    /// of the 12-atom dynamic budget by the uniform per-kind cap.
+    public let maximumAtomsPerKindOverrides: [ContextAtomKind: Int]
     public let minimumRelevance: Double
     public let weights: ContextScoreWeights
 
@@ -823,6 +828,7 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         maximumPointers: Int = 8,
         maximumAtomsPerSource: Int = 2,
         maximumAtomsPerKind: Int = 4,
+        maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8],
         minimumRelevance: Double = 0.05,
         weights: ContextScoreWeights = ContextScoreWeights()
     ) {
@@ -831,8 +837,15 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         self.maximumPointers = max(0, maximumPointers)
         self.maximumAtomsPerSource = max(1, maximumAtomsPerSource)
         self.maximumAtomsPerKind = max(1, maximumAtomsPerKind)
+        self.maximumAtomsPerKindOverrides = maximumAtomsPerKindOverrides.mapValues { max(1, $0) }
         self.minimumRelevance = max(0, minimumRelevance)
         self.weights = weights
+    }
+
+    /// Effective per-kind cap: the override for `kind` when present, else the
+    /// uniform `maximumAtomsPerKind`.
+    public func maximumAtoms(forKind kind: ContextAtomKind) -> Int {
+        maximumAtomsPerKindOverrides[kind] ?? maximumAtomsPerKind
     }
 }
 
@@ -930,7 +943,6 @@ public struct ContextSelector: Sendable {
         let groupByAtom = Dictionary(uniqueKeysWithValues: groups.flatMap { group in
             group.memberAtomIDs.map { ($0, group.id) }
         })
-        let scoreContext = makeScoreContext(need)
         // Precovered sources are already present in the stable prompt. Keep
         // their eligibility receipts, but do not spend per-turn ranking work
         // on atoms that cannot become dynamic candidates. Explicit mandatory
@@ -946,6 +958,7 @@ public struct ContextSelector: Sendable {
                     ?? ContextSelectionIndexEntry(atom: atom.draft)
             )
         })
+        let scoreContext = makeScoreContext(need, lexicalIndex: lexicalIndex)
         var scores: [ContextAtomID: ContextCandidateScoreFeatures] = [:]
         for atom in scorable {
             scores[atom.draft.id] = score(
@@ -1041,20 +1054,32 @@ public struct ContextSelector: Sendable {
                 if $0.value != $1.value { return $0.value > $1.value }
                 return $0.unit.stableKey < $1.unit.stableKey
             }
-            let unit = reranked[0].unit
-            units.removeAll { $0.stableKey == unit.stableKey }
-
             let remainingAtomSlots = configuration.maximumDynamicAtoms - selectedDynamicCount
-            guard unit.atoms.count <= remainingAtomSlots,
-                  quotaAllows(unit, sourceCounts: sourceCounts, kindCounts: kindCounts),
-                  let planned = plannedItems(
+            var examinedKeys = Set<String>()
+            var selectedPlan: [ContextPacketItem]?
+            // Rejecting a unit changes no diversity, redundancy, quota, or
+            // budget input. Its successors therefore keep this exact scored
+            // order until an actual selection lands. Re-sorting after each
+            // full-quota/oversized candidate made a saturated memory lane
+            // quadratic while producing the same scores and receipts.
+            for candidate in reranked {
+                let unit = candidate.unit
+                examinedKeys.insert(unit.stableKey)
+                guard unit.atoms.count <= remainingAtomSlots,
+                      quotaAllows(unit, sourceCounts: sourceCounts, kindCounts: kindCounts),
+                      let planned = plannedItems(
                     for: unit,
                     generationID: generation.generation.id,
                     remainingCharacters: need.characterBudget - usedCharacters
-                  ) else {
-                if let conflictID = unit.conflictID { omittedConflictIDs.insert(conflictID) }
-                continue
+                      ) else {
+                    if let conflictID = unit.conflictID { omittedConflictIDs.insert(conflictID) }
+                    continue
+                }
+                selectedPlan = planned
+                break
             }
+            units.removeAll { examinedKeys.contains($0.stableKey) }
+            guard let planned = selectedPlan else { break }
 
             for item in planned {
                 selectedItems.append(item)
@@ -1191,6 +1216,13 @@ private extension ContextSelector {
         /// context (recent turns, attention terms, tool groups) and therefore
         /// dilutes any single source.
         let messageTokens: Set<String>
+        let tokenSpecificity: [String: Double]
+
+        func matchedWeight(_ tokens: Set<String>, in document: Set<String>) -> Double {
+            tokens.intersection(document).sorted().reduce(0) {
+                $0 + (tokenSpecificity[$1] ?? 1)
+            }
+        }
     }
 
     struct ConflictGroup {
@@ -1221,6 +1253,9 @@ private extension ContextSelector {
             return .generationMismatch
         }
         if need.deletedAtomIDs.contains(atom.draft.id) { return .deleted }
+        if !ContextCorrectionScope.applies(atom.draft, message: need.message, recentTurns: need.recentTurns) {
+            return .outsideContextScope
+        }
         if need.tombstonedAtomIDs.contains(atom.draft.id) { return .tombstoned }
         if source.health == .removed { return .sourceRemoved }
         if !need.authorization.allowedOrigins.contains(need.origin) { return .originDenied }
@@ -1260,7 +1295,11 @@ private extension ContextSelector {
         let exact = context.normalizedMessage.map {
             lexicalEntry.normalizedSearchableText.contains($0) ? 1.0 : 0.0
         } ?? 0
-        let overlap = Self.tokenOverlap(context.queryTokens, lexicalEntry.searchableTokens)
+        let matchedWeight = context.matchedWeight(context.queryTokens, in: lexicalEntry.searchableTokens)
+        let overlap = context.queryTokens.isEmpty ? 0 : (
+            matchedWeight / Double(context.queryTokens.count)
+                + matchedWeight / Double(max(1, context.queryTokens.union(lexicalEntry.searchableTokens).count))
+        ) / 2
         let semantic: Double = {
             guard let queryFingerprint = need.queryEmbeddingModelFingerprint,
                   let atomEmbedding = atom.draft.embedding,
@@ -1301,8 +1340,8 @@ private extension ContextSelector {
         // 4+-token messages get the full evidenced weight.
         let messageCoverage: Double = {
             guard !context.messageTokens.isEmpty else { return 0 }
-            let hit = context.messageTokens.intersection(lexicalEntry.searchableTokens)
-            let raw = Double(hit.count) / Double(context.messageTokens.count)
+            let hit = context.matchedWeight(context.messageTokens, in: lexicalEntry.searchableTokens)
+            let raw = hit / Double(context.messageTokens.count)
             let lengthDamp = min(1.0, Double(context.messageTokens.count) / 4.0)
             return raw * lengthDamp
         }()
@@ -1340,7 +1379,15 @@ private extension ContextSelector {
     }
 
     func queryText(_ need: NeedSignal) -> String {
-        ([
+        // Match the existing semantic-recall and correction-scope contract:
+        // prior conversation helps resolve a referential follow-up, but is
+        // not fresh topic evidence after a self-contained user request.
+        // Otherwise old work can clear minimumRelevance on lexical overlap
+        // alone even when the current message has changed subjects.
+        let recentTurns = ContextCorrectionScope.isReferentialFollowup(need.message)
+            ? need.recentTurns.suffix(2).map { String($0.prefix(600)) }
+            : []
+        return ([
             need.message,
             need.activeTask,
             need.unresolvedQuestion,
@@ -1349,14 +1396,17 @@ private extension ContextSelector {
             need.sessionID,
             need.executionID,
         ].compactMap { $0 }
-            + need.recentTurns.suffix(4)
+            + recentTurns
             + need.contextualTerms.sorted()
             + need.predictedToolGroups.sorted()
             + need.extractedEntities.flatMap { [$0.id, $0.label] })
             .joined(separator: " ")
     }
 
-    func makeScoreContext(_ need: NeedSignal) -> ScoreContext {
+    func makeScoreContext(
+        _ need: NeedSignal,
+        lexicalIndex: [ContextAtomID: ContextSelectionIndexEntry]
+    ) -> ScoreContext {
         let contextualIDs = [need.currentProjectID, need.sessionID, need.executionID]
             .compactMap { $0 }
         var identifiers = Set(need.extractedEntities.map {
@@ -1364,12 +1414,27 @@ private extension ContextSelector {
         })
         identifiers.formUnion(contextualIDs.map { "id:\($0.lowercased())" })
         let trimmedMessage = need.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let queryTokens = Self.tokens(queryText(need))
+        // Smoothed, normalized inverse document frequency: ubiquitous names
+        // and boilerplate are weak relevance evidence, not multiple strong
+        // votes against a semantic paraphrase. Only eligible/scorable atoms
+        // participate, so inaccessible sources cannot influence ranking.
+        // Uses the resident lexical index; no tokenization, I/O or model call.
+        let documentCount = Double(lexicalIndex.count)
+        let normalization = 1 + log(documentCount + 1)
+        let specificity = Dictionary(uniqueKeysWithValues: queryTokens.map { token in
+            let frequency = lexicalIndex.values.reduce(0) {
+                $0 + ($1.searchableTokens.contains(token) ? 1 : 0)
+            }
+            return (token, (1 + log((documentCount + 1) / Double(frequency + 1))) / normalization)
+        })
         return ScoreContext(
-            queryTokens: Self.tokens(queryText(need)),
+            queryTokens: queryTokens,
             normalizedMessage: trimmedMessage.isEmpty ? nil : need.message.lowercased(),
             identifiers: identifiers,
             contextualTokens: Set(contextualIDs.flatMap { Self.tokens($0) }),
-            messageTokens: Self.tokens(need.message)
+            messageTokens: Self.tokens(need.message),
+            tokenSpecificity: specificity
         )
     }
 
@@ -1466,7 +1531,7 @@ private extension ContextSelector {
             if sourceCounts[atom.draft.sourceID, default: 0] + 1
                 > configuration.maximumAtomsPerSource { return false }
             if kindCounts[atom.draft.kind, default: 0] + 1
-                > configuration.maximumAtomsPerKind { return false }
+                > configuration.maximumAtoms(forKind: atom.draft.kind) { return false }
         }
         return true
     }
@@ -1647,13 +1712,6 @@ private extension ContextSelector {
         ContextLexicalTokenizer.tokens(text)
     }
 
-    static func tokenOverlap(_ lhs: Set<String>, _ rhs: Set<String>) -> Double {
-        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
-        let intersection = lhs.intersection(rhs)
-        let queryCoverage = Double(intersection.count) / Double(lhs.count)
-        return (queryCoverage + jaccard(lhs, rhs)) / 2
-    }
-
     static func jaccard(_ lhs: Set<String>, _ rhs: Set<String>) -> Double {
         guard !lhs.isEmpty || !rhs.isEmpty else { return 0 }
         return Double(lhs.intersection(rhs).count) / Double(lhs.union(rhs).count)
@@ -1681,12 +1739,17 @@ private enum ContextLexicalTokenizer {
         "that", "the", "their", "theirs", "them", "they", "this", "to", "was",
         "we", "were", "what", "when", "where", "which", "who", "why", "will",
         "with", "you", "your", "yours",
+        // Auxiliary/modal verbs express the question, not its subject. A
+        // question starting "should the agent ..." must not rank every
+        // unrelated instruction containing "agent should" above the answer.
+        "am", "being", "can", "could", "did", "do", "does", "had",
+        "may", "might", "must", "shall", "should", "would",
     ]
 
     static func tokens(_ text: String) -> Set<String> {
         Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }.compactMap {
             let token = String($0)
-            return routingStopWords.contains(token) ? nil : token
+            return routingStopWords.contains(token) ? nil : RecallLexicalNormalization.term(token)
         })
     }
 }

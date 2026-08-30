@@ -396,30 +396,38 @@ extension ChatStore {
         pendingTimeouts[pendingId] = task
     }
 
+    /// E1 (upgrade-sweep 2026-08): the reply nudge floor while a reply is
+    /// outstanding. Was 500ms for the first 20 attempts, then 1.2s.
+    static let iCloudReplyNudgeFloorSeconds: TimeInterval = 8
+    /// The transcript snapshot re-read is the slow safety net, not the
+    /// transport. Was every 5s for the first 60s.
+    static let iCloudReplySnapshotBackstopSeconds: TimeInterval = 30
+    /// How long the snapshot backstop keeps running before the reply timeout
+    /// owns the outcome.
+    static let iCloudReplySnapshotBackstopWindowSeconds: TimeInterval = 120
+    static let iCloudReplyPollingHintAfterSeconds: TimeInterval = 10
+
     func armReplyPoll(for pendingId: String, client: MacBridgeClient) {
         pendingPolls.removeValue(forKey: pendingId)?.cancel()
-        // Runs two iCloud-only wait paths in parallel:
-        //   1. Fast iCloud nudge loop: 500ms early, then 1.2s — prods NSMetadataQuery.
-        //   2. Snapshot refresh every 5s, cap 60s (12 polls max):
-        //      calls forceRefresh(using:) which bypasses the 2s throttle and
-        //      reads the iCloud-backed transcript snapshot. If a reply landed
-        //      there first, the placeholder updates and isLoading clears.
-        //      Also sets isPollingFallback=true after 10s so the UI can show a hint.
+        // E1: push-first. CloudKit delivers the reply on a silent push that
+        // drains the transport and resolves the placeholder, so this loop is a
+        // backstop rather than the transport. The hot path drains incoming only
+        // at the 8s floor; the heavier transcript-snapshot re-read moves to a
+        // 30s cadence over a 120s window.
         let task = Task { [weak self, weak client] in
-            var iCloudAttempt = 0
-            var snapshotAttempt = 0
-            var nextSnapshotPollAt = Date().addingTimeInterval(5)
-            let maxSnapshotPolls = 12            // 12 x 5s = 60s cap
-            let snapshotHintAfter: TimeInterval = 10  // show hint after 10s
+            let startedAt = Date()
+            var nextSnapshotPollAt = startedAt.addingTimeInterval(Self.iCloudReplySnapshotBackstopSeconds)
+            let snapshotDeadline = startedAt.addingTimeInterval(Self.iCloudReplySnapshotBackstopWindowSeconds)
+            var hintShown = false
 
             while !Task.isCancelled {
-                // --- iCloud Drive nudge ---
-                // Keep the pending-reply watchdog moving even if one iCloud
-                // Drive scan stalls while downloading or coordinating files.
+                // --- incoming drain (hot path) ---
+                // Detached so one stalled iCloud scan cannot wedge the
+                // pending-reply watchdog behind it.
                 Task { await client?.pollICloudRepliesNow() }
-                iCloudAttempt += 1
-                let nudgeIntervalNs: UInt64 = iCloudAttempt < 20 ? 500_000_000 : 1_200_000_000
-                try? await Task.sleep(nanoseconds: nudgeIntervalNs)
+                try? await Task.sleep(
+                    nanoseconds: UInt64(Self.iCloudReplyNudgeFloorSeconds * 1_000_000_000)
+                )
 
                 guard let self else { return }
 
@@ -432,21 +440,23 @@ extension ChatStore {
                     return
                 }
 
-                // --- iCloud snapshot refresh leg ---
                 let now = Date()
-                if now >= nextSnapshotPollAt, snapshotAttempt < maxSnapshotPolls, let client {
-                    snapshotAttempt += 1
-                    nextSnapshotPollAt = now.addingTimeInterval(5)
-
-                    // Enable "still waiting…" hint after 10s (2nd snapshot poll = attempt 2).
-                    if Double(snapshotAttempt) * 5 >= snapshotHintAfter {
-                        await MainActor.run {
-                            self.isPollingFallback = true
-                            if let placeholderId = self.pendingICloudPlaceholders[pendingId] {
-                                self.streamingHintsByMessageId[placeholderId] = "Still working on the Mac"
-                            }
+                // The hint is time-based now that the snapshot leg no longer
+                // ticks every 5s; it must still appear at 10s.
+                if !hintShown,
+                   now.timeIntervalSince(startedAt) >= Self.iCloudReplyPollingHintAfterSeconds {
+                    hintShown = true
+                    await MainActor.run {
+                        self.isPollingFallback = true
+                        if let placeholderId = self.pendingICloudPlaceholders[pendingId] {
+                            self.streamingHintsByMessageId[placeholderId] = "Still working on the Mac"
                         }
                     }
+                }
+
+                // --- iCloud snapshot refresh leg (slow backstop) ---
+                if now >= nextSnapshotPollAt, now < snapshotDeadline, let client {
+                    nextSnapshotPollAt = now.addingTimeInterval(Self.iCloudReplySnapshotBackstopSeconds)
 
                     // Force-refresh bypasses the 2s throttle.
                     await self.forceRefresh(using: client, fallbackMessages: nil)

@@ -512,6 +512,69 @@ enum ChatToolCatalogPresentation {
 
 }
 
+/// Local presentation only: search never reclassifies or grants a tool. Keep
+/// normal disclosure choices separate so clearing a search restores the page.
+struct ChatToolCatalogSearchState {
+    private(set) var query = ""
+    private var expandedBuckets: Set<String> = []
+    private var collapsedSearchBuckets: Set<String> = []
+
+    var isSearching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    mutating func setQuery(_ value: String) {
+        guard query != value else { return }
+        query = value
+        collapsedSearchBuckets.removeAll()
+    }
+
+    func isExpanded(_ bucketID: String) -> Bool {
+        isSearching ? !collapsedSearchBuckets.contains(bucketID) : expandedBuckets.contains(bucketID)
+    }
+
+    mutating func setExpanded(_ expanded: Bool, bucketID: String) {
+        if isSearching {
+            if expanded { collapsedSearchBuckets.remove(bucketID) }
+            else { collapsedSearchBuckets.insert(bucketID) }
+        } else {
+            if expanded { expandedBuckets.insert(bucketID) }
+            else { expandedBuckets.remove(bucketID) }
+        }
+    }
+
+    func filteredBuckets(_ buckets: [ChatToolCatalogPresentation.Bucket]) -> [ChatToolCatalogPresentation.Bucket] {
+        let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !terms.isEmpty else { return buckets }
+        return buckets.compactMap { bucket in
+            let tools = bucket.tools.filter { tool in
+                terms.allSatisfy { term in
+                    tool.name.localizedStandardContains(term) || tool.description.localizedStandardContains(term)
+                }
+            }
+            guard !tools.isEmpty else { return nil }
+            return .init(id: bucket.id, title: bucket.title, icon: bucket.icon, tools: tools)
+        }
+    }
+}
+
+struct ChatToolDetailsButton: View {
+    let toolName: String
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        Button {
+            isExpanded.toggle()
+        } label: {
+            Label(isExpanded ? "Hide details" : "Show details",
+                  systemImage: isExpanded ? "chevron.up" : "chevron.down")
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
+        .accessibilityLabel("\(isExpanded ? "Hide" : "Show") details for \(toolName)")
+        .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+        .help("Show or hide the full tool description and catalog metadata. This does not run the tool.")
+    }
+}
+
 private struct ChatToolCatalogSection: View {
     let catalog: ChatToolCatalogSnapshot
     let bucketResult: ChatToolCatalogPresentation.BucketResult
@@ -521,9 +584,10 @@ private struct ChatToolCatalogSection: View {
     let jumpToTrust: () -> Void
 
     @State private var expanded: Set<String> = []
-    @State private var expandedBuckets: Set<String> = []
+    @State private var searchState = ChatToolCatalogSearchState()
 
     var body: some View {
+        let filteredBuckets = searchState.filteredBuckets(bucketResult.buckets)
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Chat Tool Catalog")
@@ -532,6 +596,32 @@ private struct ChatToolCatalogSection: View {
                 Text("\(bucketResult.visibleToolCount) usable of \(catalog.tools.count) tools • permission: \(catalog.permissionLevel.isEmpty ? "—" : catalog.permissionLevel)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if !bucketResult.buckets.isEmpty {
+                HStack(spacing: 8) {
+                    TextField("Search tool names or descriptions", text: Binding(
+                        get: { searchState.query },
+                        set: { searchState.setQuery($0) }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 420)
+                    .accessibilityLabel("Search chat tool catalog")
+                    if searchState.isSearching {
+                        Button {
+                            searchState.setQuery("")
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Clear tool search")
+                        .accessibilityLabel("Clear tool search")
+                        Text("\(filteredBuckets.reduce(0) { $0 + $1.tools.count }) matching tools")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
             }
 
             if let staleDetail {
@@ -571,8 +661,18 @@ private struct ChatToolCatalogSection: View {
                         : "The live catalog returned \(catalog.tools.count) row\(catalog.tools.count == 1 ? "" : "s"), but none had a unique non-empty tool identity.",
                     systemImage: "exclamationmark.triangle"
                 )
+            } else if filteredBuckets.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("No tools match this search", systemImage: "magnifyingglass")
+                    Text("Try another name or description, or clear the search to browse the loaded catalog.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Clear search") { searchState.setQuery("") }
+                        .buttonStyle(.borderless)
+                }
+                .padding(.vertical, 12)
             } else {
-                ForEach(bucketResult.buckets) { bucket in
+                ForEach(filteredBuckets) { bucket in
                     bucketView(bucket)
                 }
             }
@@ -638,13 +738,9 @@ private struct ChatToolCatalogSection: View {
 
     private func bucketExpandedBinding(_ id: String) -> Binding<Bool> {
         Binding(
-            get: { expandedBuckets.contains(id) },
+            get: { searchState.isExpanded(id) },
             set: { isExpanded in
-                if isExpanded {
-                    expandedBuckets.insert(id)
-                } else {
-                    expandedBuckets.remove(id)
-                }
+                searchState.setExpanded(isExpanded, bucketID: id)
             }
         )
     }
@@ -659,6 +755,12 @@ private struct ChatToolCatalogSection: View {
                     .textSelection(.enabled)
                 Spacer()
                 statusBadge(for: tool)
+                ChatToolDetailsButton(toolName: tool.name, isExpanded: Binding(
+                    get: { expanded.contains(tool.id) },
+                    set: { value in
+                        if value { expanded.insert(tool.id) } else { expanded.remove(tool.id) }
+                    }
+                ))
             }
             Text(tool.description)
                 .font(.caption)
@@ -681,10 +783,6 @@ private struct ChatToolCatalogSection: View {
             }
         }
         .padding(.vertical, 6)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if isExpanded { expanded.remove(tool.id) } else { expanded.insert(tool.id) }
-        }
     }
 
     @ViewBuilder

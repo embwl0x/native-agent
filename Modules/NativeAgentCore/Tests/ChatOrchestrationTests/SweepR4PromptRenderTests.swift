@@ -107,6 +107,8 @@ struct CompactionRecollectionRenderCapTests {
         // newest-first filling would otherwise have spent the whole budget
         // before reaching the oldest row.
         #expect(rendered.contains(String(repeating: "c", count: 1_000)))
+        #expect(rendered.contains("# Historical evidence boundary"))
+        #expect(rendered.contains("refresh it from its canonical tool or store"))
     }
 }
 
@@ -274,5 +276,62 @@ struct CrossTurnToolResultProjectionTests {
             #expect(rendered.contains("TAILMARK"), "tail lost on \(surface)")
             #expect(rendered.contains("chars elided"), "marker lost on \(surface)")
         }
+    }
+}
+
+// MARK: - B4: the one-hop "related:" line
+
+@Suite("B4 — KG related line")
+struct KnowledgeGraphRelatedLineTests {
+
+    private func hit(_ text: String, id: String, related: [String]) -> MemoryRecallHit {
+        var extras: [String: JSONValue] = ["id": .string(id)]
+        if !related.isEmpty {
+            extras["kg_related"] = .array(related.map { .string($0) })
+        }
+        return MemoryRecallHit(
+            score: 1, preview: text, content: text, extras: .object(extras)
+        )
+    }
+
+    /// ONE line per turn, not one per memory — the entities of every rendered
+    /// row are merged, de-duplicated, and emitted once.
+    @Test func multipleMemoriesProduceASingleMergedRelatedLine() throws {
+        let block = try #require(SwiftNativeTurnEngine.renderRecalledMemoryBlock([
+            hit("Ships tonight.", id: "a", related: ["NativeAgent", "TradingView"]),
+            hit("Bridge is healthy.", id: "b", related: ["NativeAgent", "Telegram"]),
+        ]))
+        let relatedLines = block.split(separator: "\n").filter {
+            $0.hasPrefix("related: ")
+        }
+        #expect(relatedLines.count == 1)
+        #expect(relatedLines.first == "related: NativeAgent, TradingView, Telegram")
+    }
+
+    /// No graph data means no line at all — the block is byte-identical to what
+    /// it rendered before B4.
+    @Test func noRelatedEntitiesLeavesTheBlockUnchanged() throws {
+        let block = try #require(SwiftNativeTurnEngine.renderRecalledMemoryBlock([
+            hit("Ships tonight.", id: "a", related: [])
+        ]))
+        #expect(!block.contains("related:"))
+        #expect(block == "Relevant memory:\n- Ships tonight.")
+    }
+
+    /// Capped at 400 characters, and capped by DROPPING whole names: a clipped
+    /// entity name is worse than an absent one.
+    @Test func relatedLineIsCappedAndNeverTruncatesANameMidway() throws {
+        let names = (0..<60).map { "Entity-\($0)-" + String(repeating: "x", count: 20) }
+        let line = try #require(SwiftNativeTurnEngine.renderRelatedEntitiesLine(names))
+        #expect(line.count <= SwiftNativeTurnEngine.relatedEntitiesLineChars)
+        #expect(line.hasPrefix("related: "))
+        let rendered = line.dropFirst("related: ".count).components(separatedBy: ", ")
+        // Every name that made it in is present in full.
+        for name in rendered { #expect(names.contains(name)) }
+        #expect(rendered.count < names.count)  // the cap actually bit
+    }
+
+    @Test func emptyNameListRendersNoLine() {
+        #expect(SwiftNativeTurnEngine.renderRelatedEntitiesLine([]) == nil)
     }
 }

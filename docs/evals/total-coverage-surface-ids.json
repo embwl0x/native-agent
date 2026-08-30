@@ -1,7 +1,7 @@
 {
   "baselineInputs": {
-    "coverage-overrides.json": "5d82eaee16d0725a913f1763e27ea47a3ab52ff736bec0ab34f3934c9edcfa16",
-    "phase1-fragments.json": "e0620c6c76d7a1632f4675af70ded2b1c349425f6ed9962de1dc186b7a43fb00"
+    "coverage-overrides.json": "0d60b2a25851bc79d024236d7ce02a20f882710cdd3e8f19979b29c271f951f9",
+    "phase1-fragments.json": "dfa9232bb418ba73d981ff4e96cb68cbde58cb41a4816687809d1af69cc67c52"
   },
   "surfaces": [
     {
@@ -51,10 +51,6 @@
     {
       "fence": "core.substrate.affect",
       "id": "ui.control.capsuleInjectionEnabled"
-    },
-    {
-      "fence": "core.substrate.field",
-      "id": "substrate.runReplay"
     },
     {
       "fence": "core.substrate.organism",

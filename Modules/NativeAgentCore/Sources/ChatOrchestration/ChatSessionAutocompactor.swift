@@ -132,6 +132,7 @@ public struct ChatSessionCompactionOutcome: Sendable, Equatable {
 }
 
 struct ChatSessionAutocompactor: Sendable {
+    static let maximumCompactBackups = 5
     typealias BackupFileCopy = @Sendable (_ source: URL, _ destination: URL) throws -> Void
 
     let dataRoot: URL
@@ -406,6 +407,11 @@ struct ChatSessionAutocompactor: Sendable {
                     NSLocalizedDescriptionKey: "pre-compaction backup verification failed"
                 ])
             }
+            Self.pruneCompactBackups(
+                in: dir,
+                keeping: Self.maximumCompactBackups,
+                preserving: backup
+            )
         } catch {
             try? FileManager.default.removeItem(at: backup)
             throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -5, userInfo: [
@@ -414,6 +420,44 @@ struct ChatSessionAutocompactor: Sendable {
             ])
         }
         return backup
+    }
+
+    /// Keep a bounded recovery window without letting every compaction leave a
+    /// permanent full-transcript copy. Cleanup is best-effort: preserving an
+    /// extra old backup is safer than invalidating the verified fresh one.
+    @discardableResult
+    static func pruneCompactBackups(
+        in directory: URL,
+        keeping: Int,
+        preserving protected: URL? = nil
+    ) -> [URL] {
+        guard keeping >= 0,
+              let entries = try? FileManager.default.contentsOfDirectory(
+                  at: directory,
+                  includingPropertiesForKeys: nil
+              )
+        else { return [] }
+        let backups = entries
+            .filter {
+                $0.lastPathComponent.hasPrefix("messages.compact.")
+                    && $0.pathExtension == "jsonl"
+            }
+            .sorted { lhs, rhs in
+                if lhs == protected { return true }
+                if rhs == protected { return false }
+                return lhs.lastPathComponent > rhs.lastPathComponent
+            }
+        var removed: [URL] = []
+        for stale in backups.dropFirst(keeping) {
+            do {
+                try FileManager.default.removeItem(at: stale)
+                removed.append(stale)
+            } catch {
+                // Best effort: a retained recovery copy is safer than making
+                // transcript compaction fail after its fresh backup verified.
+            }
+        }
+        return removed
     }
 
     private func writeRows(_ rows: [JSONValue], to path: URL) throws {
@@ -468,7 +512,7 @@ struct ChatSessionAutocompactor: Sendable {
             "createdAt": .string(ISO8601DateFormatter().string(from: now())),
         ])
         do {
-            try await appendJSONLCapped(
+            try await appendPathOwnedJSONL(
                 row,
                 to: tracesPath,
                 using: persistence,
@@ -635,8 +679,25 @@ enum ChatCompactionRowRendering {
             return ""
         }()
         let normalized = normalize(content, collapseNewlines: collapseNewlines)
-        if !normalized.isEmpty { return normalized }
-        return toolFallbackLine(obj)
+        let metadata: [String: JSONValue]?
+        if case .object(let value)? = obj["metadata"] { metadata = value } else { metadata = nil }
+        let body = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
+            normalized.isEmpty ? toolFallbackLine(obj) ?? "" : normalized,
+            attachments: metadata?["attachments"])
+        guard !body.isEmpty else { return nil }
+        let role: String
+        if case .string(let value)? = obj["role"] {
+            role = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        } else { role = "" }
+        let isCompactionSummary: Bool
+        if case .string("compaction_summary")? = metadata?["kind"] { isCompactionSummary = true }
+        else { isCompactionSummary = false }
+        return ChatTranscriptEvidenceRendering.displayContent(
+            body,
+            originLabel: role == "user" && !isCompactionSummary
+                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(metadata?["origin"]) : nil,
+            incompleteReplyLabel: role == "assistant" && !isCompactionSummary
+                ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: obj, metadata: metadata) : nil)
     }
 
     /// `toolName (ok): result summary` — nil when the row has no tool metadata.
@@ -644,8 +705,9 @@ enum ChatCompactionRowRendering {
         guard case .object(let metadata)? = obj["metadata"] else { return nil }
         guard case .string(let toolName)? = metadata["toolName"],
               !toolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        var line = toolName
-        if case .bool(let ok)? = metadata["ok"] {
+        let recordedStatus = ChatTranscriptEvidenceRendering.recordedToolStatus(metadata)
+        var line = recordedStatus.map { "\($0): \(toolName)" } ?? toolName
+        if recordedStatus == nil, case .bool(let ok)? = metadata["ok"] {
             line += ok ? " (ok)" : " (failed)"
         }
         if case .string(let summary)? = metadata["resultSummary"] {

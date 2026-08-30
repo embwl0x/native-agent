@@ -37,6 +37,7 @@ extension SwiftToolDispatcher {
             ? []
             : await activeToolsStore.load(sessionId: sessionId).activeTools
         let turnScoped = LLMCallContext.turnActiveTools ?? []
+        let modelVisibleTurnScoped = Self.modelVisibleCatalogToolNames(turnScoped)
         let activeForTurn = sessionActive.union(turnScoped)
         let nameSet = Set(names)
         let mcpNameSet = Set(modelVisibleMCPToolNames())
@@ -45,7 +46,7 @@ extension SwiftToolDispatcher {
         // belong in currentlyLoaded too — otherwise the description's
         // "tools not in currentlyLoaded are not in your current tools[]
         // array" claim is false for MCP tools and misleads the LLM.
-        let modelNameSet = nameSet.subtracting(Self.legacyMacModelToolNames)
+        let modelNameSet = Self.modelVisibleCatalogToolNames(nameSet)
         let currentlyLoaded = Self.normalModelToolNames(activeTools: activeForTurn)
             .union(mcpNameSet)
             .intersection(modelNameSet)
@@ -82,8 +83,13 @@ extension SwiftToolDispatcher {
         let swiftBuilderTools = (Self.fullMacFileToolNames + Self.fullMacSystemToolNames + Self.fullMacBuilderToolNames + Self.fullMacRestartToolNames).sorted()
         let availableBuilderTools = swiftBuilderTools.filter { names.contains($0) }
         let lockedBuilderTools = swiftBuilderTools.filter { !names.contains($0) }
-        let availableAppTools = Self.fullMacAppToolNames.sorted().filter { names.contains($0) }
-        let lockedAppTools = Self.fullMacAppToolNames.sorted().filter { !names.contains($0) }
+        // mac_focus_app/mac_quit_app remain internal compatibility routes, not
+        // conversational model tools. These legacy fields must obey the same
+        // model-visible set as available_tools or they contradict the schemas.
+        let availableAppTools = Self.fullMacAppToolNames.sorted().filter { modelNameSet.contains($0) }
+        let lockedAppTools = Self.fullMacAppToolNames.sorted().filter {
+            modelNameSet.contains($0) && !names.contains($0)
+        }
         let axReadTools = Self.fullMacAccessibilityReadToolNames.sorted()
         let availableAXReadTools = axReadTools.filter { names.contains($0) }
         let lockedAXReadTools = axReadTools.filter { !names.contains($0) }
@@ -170,7 +176,7 @@ extension SwiftToolDispatcher {
             "mac_accessibility_act_available_tools": .array(availableAXActTools.map { .string($0) }),
             "mac_accessibility_act_policy_locked_tools": .array(lockedAXActTools.map { .string($0) }),
             "currently_loaded": .array(currentlyLoaded.map { .string($0) }),
-            "turn_active_tools": .array(turnScoped.sorted().map { .string($0) }),
+            "turn_active_tools": .array(modelVisibleTurnScoped.sorted().map { .string($0) }),
             "discovery_only_tools": .array(discoveryOnly.map { .string($0) }),
             "available_tools": .array(modelNameSet.sorted().map { .string($0) }),
             "builder_available_tools": .array(availableBuilderTools.map { .string($0) }),
@@ -288,7 +294,16 @@ extension SwiftToolDispatcher {
         })
         requested = canonicalRequested
 
-        let validNames = requested.intersection(allTools)
+        let allSchemas = (try? await listAvailableToolSchemas()) ?? builtInToolSchemas()
+        // Registry discovery deliberately includes inactive names. Loading is
+        // narrower: without a current active schema there is nothing to offer
+        // the model. Keep built-in and MCP readiness/authority unchanged.
+        let customRegistryNames = Set(readRegistryNames().filter {
+            !Self.reservedBuiltInNames.contains($0) && !$0.hasPrefix("mcp__")
+        })
+        let schemaNames = Set(allSchemas.map(\.name))
+        let registryUnavailable = requested.intersection(customRegistryNames).subtracting(schemaNames)
+        let validNames = requested.intersection(allTools).subtracting(registryUnavailable)
         let notInCatalog = requested.subtracting(allTools).sorted()
         let alreadyActive = validNames.intersection(effectiveExisting).sorted()
         let turnActive = validNames.intersection(turnScoped).sorted()
@@ -296,14 +311,19 @@ extension SwiftToolDispatcher {
         let toAddSorted = toAdd.sorted()
 
         var newActive = existing
-        if !toAdd.isEmpty {
+        // The store protects its input set from cap eviction and refreshes
+        // its load timestamps. Pass the whole explicit persistent request,
+        // not only the delta: otherwise an already-active requested tool can
+        // be evicted by the new names while the receipt claims it is loaded.
+        // Mechanical turn-only readiness must still never become persistent.
+        let toPersist = validNames.subtracting(turnScoped)
+        if !toPersist.isEmpty {
             newActive = (try await activeToolsStore.addLoaded(
-                sessionId: sessionId, names: toAdd
+                sessionId: sessionId, names: toPersist
             )).activeTools
         }
 
         var addedSchemas: [JSONValue] = []
-        let allSchemas = (try? await listAvailableToolSchemas()) ?? builtInToolSchemas()
         for schema in allSchemas where toAdd.contains(schema.name) {
             var row: [String: JSONValue] = [
                 "name": .string(schema.name),
@@ -315,22 +335,27 @@ extension SwiftToolDispatcher {
             addedSchemas.append(.object(row))
         }
 
+        let readinessNote = registryUnavailable.isEmpty ? "" :
+            "Some known registry tools have no active callable schema. Enable or repair them through tool management, then retry tool_load. "
+        let loadNote = toAdd.isEmpty
+            ? (!turnActive.isEmpty
+                ? "Requested schemas are already available for this turn; no session loadout changed."
+                : "No new schemas were loaded.")
+            : "Newly loaded schemas will be available in your next response's tool list."
         return .object([
-            "status": .string("loaded"),
+            "status": .string(registryUnavailable.isEmpty ? "loaded" : (validNames.isEmpty ? "unavailable" : "partial")),
             "session_id": .string(sessionId),
             "category": requestedCategory.map { .string($0) } ?? .null,
             "loaded_now": .array(toAddSorted.map { .string($0) }),
             "loaded": .array(validNames.sorted().map { .string($0) }),
             "not_in_catalog": .array(notInCatalog.map { .string($0) }),
-            "unavailable": .array(notInCatalog.map { .string($0) }),
+            "unavailable": .array(Set(notInCatalog).union(registryUnavailable).sorted().map { .string($0) }),
             "aliased": .object(aliased),
             "already_active": .array(alreadyActive.map { .string($0) }),
             "turn_active": .array(turnActive.map { .string($0) }),
             "session_active_count": .int(Int64(newActive.count)),
             "schemas_added": .array(addedSchemas),
-            "next_turn_note": .string(toAdd.isEmpty && !turnActive.isEmpty
-                ? "Requested schemas are already available for this turn; no session loadout changed."
-                : "Newly loaded schemas will be available in your next response's tool list."),
+            "next_turn_note": .string(readinessNote + loadNote),
         ])
     }
 

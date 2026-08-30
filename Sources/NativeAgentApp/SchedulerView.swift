@@ -33,12 +33,47 @@ enum SchedulerJobsLiveRefresh {
     }
 }
 
+/// Scheduler has two legitimate refresh sources while mounted: the canonical
+/// jobs-file watcher and an explicit Retry. Keep those reads single-flight,
+/// while preserving one edge that arrives during the active read so a mutation
+/// is not lost merely because the first snapshot was still being decoded.
+struct SchedulerJobsRefreshCoalescer: Equatable {
+    private(set) var isRefreshing = false
+    private(set) var trailingRefreshQueued = false
+
+    mutating func requestRefresh() -> Bool {
+        guard !isRefreshing else {
+            trailingRefreshQueued = true
+            return false
+        }
+        isRefreshing = true
+        trailingRefreshQueued = false
+        return true
+    }
+
+    mutating func completeRefresh() -> Bool {
+        guard isRefreshing else { return false }
+        if trailingRefreshQueued {
+            trailingRefreshQueued = false
+            return true
+        }
+        cancel()
+        return false
+    }
+
+    mutating func cancel() {
+        isRefreshing = false
+        trailingRefreshQueued = false
+    }
+}
+
 struct SchedulerView: View {
     @Environment(AppModel.self) private var appModel
     @State private var isLoadingJobs = true
     @State private var isAddingReflection = false
     @State private var reflectionOutcome: NightlyReflectionJobOutcome?
     @State private var jobsLoadResult: SchedulerJobsRefreshResult?
+    @State private var refreshCoalescer = SchedulerJobsRefreshCoalescer()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -62,7 +97,7 @@ struct SchedulerView: View {
                 .foregroundStyle(reflectionOutcome.succeeded ? Color.secondary : Color.red)
             }
 
-            if isLoadingJobs {
+            if isLoadingJobs, appModel.jobs.isEmpty {
                 ProgressView("Loading schedule")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let detail = jobsLoadResult?.failureDetail, appModel.jobs.isEmpty {
@@ -76,6 +111,15 @@ struct SchedulerView: View {
                 )
             } else {
                 VStack(alignment: .leading, spacing: 8) {
+                    if isLoadingJobs {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Refreshing schedule…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                     if let detail = jobsLoadResult?.failureDetail {
                         StalePanelNotice(text: detail)
                     }
@@ -112,9 +156,16 @@ struct SchedulerView: View {
 
     @MainActor
     private func loadJobs() async {
+        guard refreshCoalescer.requestRefresh() else { return }
         isLoadingJobs = true
-        jobsLoadResult = nil
-        jobsLoadResult = await appModel.refreshSchedulerJobs()
+        repeat {
+            jobsLoadResult = await appModel.refreshSchedulerJobs()
+            guard !Task.isCancelled else {
+                refreshCoalescer.cancel()
+                isLoadingJobs = false
+                return
+            }
+        } while refreshCoalescer.completeRefresh()
         isLoadingJobs = false
     }
 }

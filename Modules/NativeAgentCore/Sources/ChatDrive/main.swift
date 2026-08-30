@@ -1444,10 +1444,12 @@ struct ChatDriveMain {
             )
             let packet = try selector.select(need, from: generation)
             let selected = packet.selectedItems.compactMap { recordByAtom[$0.pointer.atomID] }
-            let matched = selected.contains { memory in
-                if let expectedID = probe.expectMemoryId, memory.id == expectedID { return true }
+            let matched = packet.selectedItems.contains { item in
+                guard let memory = recordByAtom[item.pointer.atomID] else { return false }
+                if let expectedID = probe.expectMemoryId, memory.id == expectedID,
+                   item.representation == .body, !item.text.isEmpty { return true }
                 return probe.expectAnySubstring.contains { expected in
-                    !expected.isEmpty && memory.content.range(
+                    !expected.isEmpty && item.text.range(
                         of: expected,
                         options: [.caseInsensitive]
                     ) != nil
@@ -1460,11 +1462,27 @@ struct ChatDriveMain {
                 misses.append(.object([
                     "probeId": .string(probe.id),
                     "selected": .array(selected.prefix(5).map { .string($0.id) }),
+                    "rankingEvidence": .array(packet.receipt.candidateScores
+                        .sorted { $0.features.total > $1.features.total }
+                        .compactMap { candidate -> JSONValue? in
+                            guard let memory = recordByAtom[candidate.atomID] else { return nil }
+                            return .object([
+                                "recordID": .string(memory.id),
+                                "expected": .bool(memory.id == probe.expectMemoryId),
+                                "semantic": .double(candidate.features.semanticCosine),
+                                "overlap": .double(candidate.features.tokenOverlap),
+                                "coverage": .double(candidate.features.messageCoverage),
+                                "total": .double(candidate.features.total),
+                            ])
+                        }),
                 ]))
             }
         }
         return .object([
             "productionSelector": .bool(true),
+            "productionAssembly": .bool(false),
+            "scope": .string("memory-only component; full app assembly is covered by the app context integration eval"),
+            "renderedEvidence": .bool(true),
             "total": .int(Int64(probeSet.probes.count)),
             "hits": .int(Int64(hits)),
             "summary": .string("\(hits)/\(probeSet.probes.count)"),

@@ -44,6 +44,10 @@ struct ChatSessionIndexReconcilerTests {
 
         let second = try await reconciler.reconcile()
         #expect(second.sessionsRecovered == 0)
+        #expect(
+            second.transcriptsExamined == 0,
+            "a transcript with a canonical index row must not be parsed again at launch"
+        )
         #expect(try ChatSessionIndexFile.loadObjectRowsForMutation(
             at: dataRoot.appendingPathComponent("chat/sessions.json")
         ).count == 1)
@@ -75,7 +79,7 @@ struct ChatSessionIndexReconcilerTests {
         ).isEmpty)
     }
 
-    @Test func boundedScanPrioritizesOrphansOverKnownHistoricalTranscripts() async throws {
+    @Test func boundedScanExcludesKnownHistoricalTranscripts() async throws {
         let dataRoot = try root()
         defer { try? FileManager.default.removeItem(at: dataRoot) }
         let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
@@ -96,8 +100,8 @@ struct ChatSessionIndexReconcilerTests {
 
         let report = try await ChatSessionIndexReconciler(dataRoot: dataRoot)
             .reconcile(maximumFiles: 2)
-        #expect(report.transcriptsExamined == 2)
-        #expect(report.skippedForBounds == 2)
+        #expect(report.transcriptsExamined == 1)
+        #expect(report.skippedForBounds == 0)
         #expect(report.sessionsRecovered == 1)
         let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
         #expect(rows.contains { $0["id"] == .string("zz-orphan") })

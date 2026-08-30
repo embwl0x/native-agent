@@ -234,11 +234,18 @@ struct TurnTraceTests {
         #expect(lastObj["turnId"] as? String == "newest-turn")
         #expect(lastObj["kind"] as? String == "llm.call")
 
-        // Force the trigger: exceed the byte threshold and the EXACT cap applies.
+        // F8 (2026-08-28) TIGHTENED this contract. The byte trigger alone let a
+        // feed whose rows are small relative to `trigger / maxLines` run well
+        // past its LINE budget — for activity/events.jsonl, to ~134% of it. The
+        // capped append now forces a full line-cap evaluation every
+        // `JSONLLineCaps.capCheckStride` appends, so the line budget is the
+        // binding constraint and the overshoot is bounded by the stride rather
+        // than by row size. An explicit trim is therefore a NO-OP here (there is
+        // no overshoot left to drop) — the stronger claim, not a weaker one.
         let dropped = try enforceJSONLLineCap(at: path, maxLines: TurnTracePersistLane.maxLines)
         let after = try String(contentsOf: path, encoding: .utf8).split(separator: "\n")
-        #expect(dropped >= 1, "the deferred trim drops the overshoot: \(dropped)")
-        #expect(after.count == TurnTracePersistLane.maxLines, "exact cap on explicit trim")
+        #expect(dropped == 0, "the amortized cap already held the line budget: \(dropped)")
+        #expect(after.count <= TurnTracePersistLane.maxLines, "never above the cap")
         #expect(!after.first!.contains(#""i":0"#), "oldest seed line trimmed once the cap runs")
     }
 
@@ -430,8 +437,13 @@ struct TurnTraceTests {
                 on: bus
             )
         }
-        // 10s, not 2s — same non-blocking claim as above, noise-proofed.
-        #expect(ContinuousClock.now - started < .seconds(10))
+        // Hang-vs-slow discriminator ONLY, never a perf assertion: a blocking
+        // fire() makes this loop effectively infinite, while any live machine
+        // finishes 50k enqueue-or-drop calls in seconds. 60s cannot flake
+        // under parallel-suite load (observed 12.6s under a full --changed
+        // gate, 4.0s isolated, 2026-08-27); the structural teeth are the two
+        // expectations below (inFlight cap held, drops occurred).
+        #expect(ContinuousClock.now - started < .seconds(60))
         #expect(TurnTraceBus.emissionBacklog.inFlight <= 4096)
         #expect(TurnTraceBus.emissionBacklog.dropped > baselineDrops)
 

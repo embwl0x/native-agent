@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Visual Navigation Check</title>
+  <style>
+    html, body, canvas { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #071018; }
+    canvas { display: block; touch-action: none; }
+  </style>
+</head>
+<body>
+<canvas id="world"></canvas>
+<script>
+// Deliberately local and pixel-only. Native input drives every visible result;
+// no automation API, network, persistence, or hidden solution coordinates.
+const canvas = document.querySelector('#world');
+const ctx = canvas.getContext('2d');
+let cameraX = 0, cameraY = 0, zoom = 1;
+let rightDrags = 0, leftDrags = 0, wheels = 0, horizontalWheels = 0;
+let token = {x: 0.34, y: 0.57};
+let drag = null, previousTime;
+let dragTiming = 'none';
+const keys = new Set();
+const supportedKeys = new Set(['w', 'a', 's', 'd']);
+function resize() {
+  const scale = devicePixelRatio || 1;
+  canvas.width = Math.round(innerWidth * scale);
+  canvas.height = Math.round(innerHeight * scale);
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+}
+function tokenPoint() { return {x: token.x * innerWidth, y: token.y * innerHeight}; }
+canvas.addEventListener('pointerdown', event => {
+  const point = tokenPoint();
+  const onToken = Math.hypot(event.clientX - point.x, event.clientY - point.y) < 42;
+  if (event.button !== 2 && !(event.button === 0 && onToken)) return;
+  drag = {button: event.button, x: event.clientX, y: event.clientY, distance: 0,
+    started: performance.now(), firstMove: null, lastMove: null, updates: 0};
+  canvas.setPointerCapture(event.pointerId);
+  event.preventDefault();
+});
+canvas.addEventListener('pointermove', event => {
+  if (!drag) return;
+  const now = performance.now();
+  if (drag.firstMove === null) drag.firstMove = now;
+  drag.lastMove = now; drag.updates++;
+  const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+  drag.distance += Math.hypot(dx, dy);
+  drag.x = event.clientX; drag.y = event.clientY;
+  if (drag.button === 2) { cameraX += dx; cameraY += dy; }
+  else {
+    token.x = Math.min(0.94, Math.max(0.06, event.clientX / innerWidth));
+    token.y = Math.min(0.94, Math.max(0.35, event.clientY / innerHeight));
+  }
+});
+canvas.addEventListener('pointerup', event => {
+  if (!drag) return;
+  if (drag.distance > 4) {
+    if (drag.button === 2) rightDrags++; else leftDrags++;
+  }
+  dragTiming = `${Math.round(performance.now() - drag.started)}ms held | ${Math.round((drag.lastMove ?? drag.started) - (drag.firstMove ?? drag.started))}ms moving | ${drag.updates} updates`;
+  drag = null;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+});
+canvas.addEventListener('pointercancel', () => { drag = null; });
+canvas.addEventListener('contextmenu', event => event.preventDefault());
+canvas.addEventListener('wheel', event => {
+  event.preventDefault(); wheels++;
+  if (event.deltaX !== 0) { cameraX -= event.deltaX; horizontalWheels++; }
+  zoom = Math.min(3, Math.max(0.3, zoom * Math.exp(-event.deltaY * 0.002)));
+}, {passive: false});
+addEventListener('keydown', event => {
+  const key = event.key.toLowerCase();
+  if (!supportedKeys.has(key) || event.metaKey || event.ctrlKey || event.altKey) return;
+  keys.add(key); event.preventDefault();
+});
+addEventListener('keyup', event => keys.delete(event.key.toLowerCase()));
+addEventListener('blur', () => { keys.clear(); drag = null; });
+function draw(time) {
+  const dt = previousTime === undefined ? 0 : Math.min(0.05, (time - previousTime) / 1000);
+  previousTime = time;
+  cameraX += ((keys.has('d') ? 1 : 0) - (keys.has('a') ? 1 : 0)) * dt * 120;
+  cameraY += ((keys.has('s') ? 1 : 0) - (keys.has('w') ? 1 : 0)) * dt * 120;
+  ctx.fillStyle = '#071018'; ctx.fillRect(0, 0, innerWidth, innerHeight);
+  const spacing = 80 * zoom;
+  ctx.strokeStyle = '#182733'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = ((cameraX % spacing) + spacing) % spacing; x < innerWidth; x += spacing) {
+    ctx.moveTo(x, 320); ctx.lineTo(x, innerHeight);
+  }
+  for (let y = 320 + ((cameraY % spacing) + spacing) % spacing; y < innerHeight; y += spacing) {
+    ctx.moveTo(0, y); ctx.lineTo(innerWidth, y);
+  }
+  ctx.stroke();
+  ctx.fillStyle = '#dfeaff'; ctx.font = '700 26px -apple-system, sans-serif';
+  ctx.fillText('Visual navigation check', 32, 44);
+  ctx.font = '600 20px -apple-system, sans-serif';
+  const lines = [
+    `Camera: ${Math.round(cameraX)}, ${Math.round(cameraY)}`,
+    `Right drags: ${rightDrags} | Left drags: ${leftDrags}`,
+    `Zoom: ${Math.round(zoom * 100)}% | Wheel events: ${wheels} | Horizontal: ${horizontalWheels}`,
+    `Keys: ${[...keys].sort().join(' + ') || 'none'} | Pointer: ${drag ? (drag.button === 2 ? 'right held' : 'left held') : 'released'}`,
+    'Right-drag pans the grid. Left-drag moves the orange circle.',
+    'Hold W A S D to pan. Vertical wheel zooms; horizontal wheel pans.',
+    `Last drag: ${dragTiming}`,
+  ];
+  lines.forEach((line, index) => ctx.fillText(line, 32, 80 + index * 32));
+  const point = tokenPoint();
+  ctx.fillStyle = '#ff9d38'; ctx.beginPath(); ctx.arc(point.x, point.y, 36, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#42d982'; ctx.fillRect(innerWidth * 0.76 - 36, innerHeight * 0.57 - 36, 72, 72);
+  requestAnimationFrame(draw);
+}
+addEventListener('resize', resize);
+resize(); requestAnimationFrame(draw);
+</script>
+</body>
+</html>

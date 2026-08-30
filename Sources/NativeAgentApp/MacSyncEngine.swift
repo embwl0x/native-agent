@@ -5,6 +5,7 @@
 //   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
 
 import CommonCrypto
+import CognitiveSubstrate
 import CryptoKit
 import AppKit
 import Foundation
@@ -129,9 +130,17 @@ final class MacSyncEngine: ObservableObject {
     /// Production always takes the real snapshot writer. The injected path is
     /// deliberately limited to the final coalesced chat projection boundary.
     let chatTranscriptSnapshotWriter: (@MainActor @Sendable (Bool) async -> Void)?
+    /// Production sleeps for the requested coalescing duration. An injected
+    /// delay lets lifecycle evaluations hold the real debounce task at that
+    /// boundary without depending on wall-clock scheduler timing.
+    let chatSnapshotCoalescingDelay: @MainActor @Sendable (Duration) async throws -> Void
     /// Isolated lifecycle evaluations persist only their digest state beneath
     /// this injected root. Production always uses the canonical data root.
     let stateDataRootOverride: URL?
+    /// The production closure reads the app-owned cognition actor. Snapshot
+    /// projection evals inject an immutable organism read so they can execute
+    /// the real Mac writer without touching the resident agent's body state.
+    let organismSnapshotProvider: @Sendable () async -> OrganismSnapshot
 
     enum KVSKey {
         static let snapshotUpdated = "snapshot_updated"
@@ -141,11 +150,19 @@ final class MacSyncEngine: ObservableObject {
     init(
         stateDataRootOverride: URL?,
         chatTurnCompletedNotificationCenter: NotificationCenter = .default,
-        chatTranscriptSnapshotWriter: (@MainActor @Sendable (Bool) async -> Void)? = nil
+        chatTranscriptSnapshotWriter: (@MainActor @Sendable (Bool) async -> Void)? = nil,
+        chatSnapshotCoalescingDelay: @escaping @MainActor @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        },
+        organismSnapshotProvider: @escaping @Sendable () async -> OrganismSnapshot = {
+            await NativeCognitionRuntime.shared.organismSnapshot()
+        }
     ) {
         self.stateDataRootOverride = stateDataRootOverride
         self.chatTurnCompletedNotificationCenter = chatTurnCompletedNotificationCenter
         self.chatTranscriptSnapshotWriter = chatTranscriptSnapshotWriter
+        self.chatSnapshotCoalescingDelay = chatSnapshotCoalescingDelay
+        self.organismSnapshotProvider = organismSnapshotProvider
     }
 
     enum Folder {
@@ -161,9 +178,7 @@ final class MacSyncEngine: ObservableObject {
     /// Backstop ceiling kept well below the hard 1024-key KVS quota.
     let inboxResponseKeyMaxCount = ICloudKVSProgressWriteAdmission.inboxResponseKeyCeiling
 
-    private init() {
-        stateDataRootOverride = nil
-        chatTurnCompletedNotificationCenter = .default
-        chatTranscriptSnapshotWriter = nil
+    private convenience init() {
+        self.init(stateDataRootOverride: nil)
     }
 }

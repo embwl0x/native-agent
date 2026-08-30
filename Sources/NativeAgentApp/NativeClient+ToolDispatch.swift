@@ -38,6 +38,17 @@ import Skills
 import Connectors
 import Browser
 
+enum ChatMessageClearError: Error, LocalizedError {
+    case transcriptClearedMetadataNotSaved(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .transcriptClearedMetadataNotSaved(let reason):
+            return "Messages were cleared, but conversation metadata could not be saved: \(reason)"
+        }
+    }
+}
+
 // W-H Band (U5 decomposition, move-only): tool-dispatch + chat-message ops
 // (dispatchTool/dispatchToolData, clearChatMessages, deleteChatMessage,
 // cancelChatSession + their helpers). Relocated verbatim. Documented lifts:
@@ -110,7 +121,11 @@ extension NativeClient {
     /// The app-side half of clearing a chat transcript.  Keep the root explicit
     /// so this durable boundary can be exercised without the resident data
     /// root; production always passes the canonical resolver above.
-    static func clearChatMessages(sessionId: String, dataRoot root: URL) async throws -> EmptyResponse {
+    static func clearChatMessages(
+        sessionId: String,
+        dataRoot root: URL,
+        afterTranscriptClear: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> EmptyResponse {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw invalidChatSessionIDError(operation: "clear chat messages")
         }
@@ -124,6 +139,13 @@ extension NativeClient {
             .appendingPathComponent(safeSessionId, isDirectory: true)
             .appendingPathComponent("messages.jsonl")
         let persistence = SwiftNativePersistenceCore()
+        let sessionsPath = root.appendingPathComponent("chat/sessions.json")
+        // Refuse known index corruption before deleting any transcript bytes.
+        // Keep locks separate: other writers have their own transcript/index
+        // ordering, so clear must not add a nested cross-file lock dependency.
+        _ = try await persistence.withFileLock(sessionsPath) {
+            try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+        }
         try await persistence.withFileLock(messagesPath) {
             let parent = messagesPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -131,6 +153,23 @@ extension NativeClient {
             if FileManager.default.fileExists(atPath: staleNestedPath.path) {
                 try? FileManager.default.removeItem(at: staleNestedPath)
             }
+        }
+        do {
+            try await afterTranscriptClear?()
+            try await persistence.withFileLock(sessionsPath) {
+                var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+                // A real append after clear owns the new index projection. Its
+                // normal writer will synchronize it; never zero its preview.
+                guard try messagesPath.resourceValues(forKeys: [.fileSizeKey]).fileSize == 0,
+                      let index = rows.firstIndex(where: { $0["id"] == .string(safeSessionId) })
+                else { return }
+                rows[index]["messageCount"] = .int(0)
+                rows[index]["lastMessagePreview"] = .null
+                rows[index]["updatedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
+                try await persistence.writeJSON(.array(rows.map(JSONValue.object)), to: sessionsPath)
+            }
+        } catch {
+            throw ChatMessageClearError.transcriptClearedMetadataNotSaved(error.localizedDescription)
         }
         return EmptyResponse()
     }

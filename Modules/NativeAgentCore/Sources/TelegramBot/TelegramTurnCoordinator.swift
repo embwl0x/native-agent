@@ -37,8 +37,17 @@ public struct TelegramTurnSnapshot: Sendable, Equatable {
     }
 }
 
+struct TelegramQueuedTurnSnapshot: Sendable, Equatable {
+    let updateId: Int
+    let chatId: Int
+    let position: Int
+    let promptPreview: String
+    let acknowledgementMessageId: Int?
+}
+
 public actor TelegramTurnCoordinator {
     public static let shared = TelegramTurnCoordinator()
+    static let maximumQueuedTurnsPerChat = 20
 
     private struct ActiveTurn: Sendable {
         let id: UUID
@@ -48,7 +57,16 @@ public actor TelegramTurnCoordinator {
         var card: TelegramTurnProgressCardDriver?
     }
 
+    private struct QueuedTurn: Sendable {
+        let updateId: Int
+        let text: String
+        let acknowledgementMessageId: Int?
+        let operation: @Sendable (_ turnId: UUID) async -> Void
+        let onStart: @Sendable (_ acknowledgementMessageId: Int?) async -> Void
+    }
+
     private var activeTurns: [Int: ActiveTurn] = [:]
+    private var queuedTurns: [Int: [QueuedTurn]] = [:]
     private var lastMessages: [Int: TelegramLastUserMessage] = [:]
     private var claimedCallbackIds: Set<String> = []
     private var callbackClaimOrder: [String] = []
@@ -107,8 +125,24 @@ public actor TelegramTurnCoordinator {
         operation: @escaping @Sendable (_ turnId: UUID) async -> Void
     ) -> (id: UUID, task: Task<Void, Never>)? {
         guard activeTurns[chatId] == nil else { return nil }
+        return launchTurn(
+            chatId: chatId,
+            text: text,
+            priority: priority,
+            operation: operation
+        )
+    }
+
+    private func launchTurn(
+        chatId: Int,
+        text: String,
+        priority: TaskPriority? = nil,
+        operation: @escaping @Sendable (_ turnId: UUID) async -> Void,
+        onStart: (@Sendable () async -> Void)? = nil
+    ) -> (id: UUID, task: Task<Void, Never>) {
         let id = UUID()
         let task = Task(priority: priority) { [weak self] in
+            await onStart?()
             await operation(id)
             await self?.finishTurn(chatId: chatId, turnId: id)
         }
@@ -120,6 +154,92 @@ public actor TelegramTurnCoordinator {
             card: nil
         )
         return (id, task)
+    }
+
+    func canEnqueue(chatId: Int) -> Bool {
+        (queuedTurns[chatId]?.count ?? 0) < Self.maximumQueuedTurnsPerChat
+    }
+
+    @discardableResult
+    func enqueueTrackedTurn(
+        updateId: Int,
+        chatId: Int,
+        text: String,
+        acknowledgementMessageId: Int?,
+        operation: @escaping @Sendable (_ turnId: UUID) async -> Void,
+        onStart: @escaping @Sendable (_ acknowledgementMessageId: Int?) async -> Void
+    ) -> Int? {
+        guard (queuedTurns[chatId]?.count ?? 0) < Self.maximumQueuedTurnsPerChat else {
+            return nil
+        }
+        let queued = QueuedTurn(
+            updateId: updateId,
+            text: text,
+            acknowledgementMessageId: acknowledgementMessageId,
+            operation: operation,
+            onStart: onStart
+        )
+        queuedTurns[chatId, default: []].append(queued)
+        if activeTurns[chatId] == nil {
+            startNextQueuedTurn(chatId: chatId)
+            return 0
+        }
+        return queuedTurns[chatId]?.firstIndex(where: { $0.updateId == updateId }).map { $0 + 1 }
+    }
+
+    func queuedTurn(
+        chatId: Int,
+        updateId: Int
+    ) -> TelegramQueuedTurnSnapshot? {
+        guard let queue = queuedTurns[chatId],
+              let index = queue.firstIndex(where: { $0.updateId == updateId }) else {
+            return nil
+        }
+        let item = queue[index]
+        return TelegramQueuedTurnSnapshot(
+            updateId: item.updateId,
+            chatId: chatId,
+            position: index + 1,
+            promptPreview: Self.preview(item.text),
+            acknowledgementMessageId: item.acknowledgementMessageId
+        )
+    }
+
+    func removeQueuedTurn(chatId: Int, updateId: Int) -> TelegramQueuedTurnSnapshot? {
+        guard var queue = queuedTurns[chatId],
+              let index = queue.firstIndex(where: { $0.updateId == updateId }) else {
+            return nil
+        }
+        let item = queue.remove(at: index)
+        queuedTurns[chatId] = queue.isEmpty ? nil : queue
+        return TelegramQueuedTurnSnapshot(
+            updateId: item.updateId,
+            chatId: chatId,
+            position: index + 1,
+            promptPreview: Self.preview(item.text),
+            acknowledgementMessageId: item.acknowledgementMessageId
+        )
+    }
+
+    @discardableResult
+    func promoteQueuedTurn(chatId: Int, updateId: Int) -> TelegramQueuedTurnSnapshot? {
+        guard var queue = queuedTurns[chatId],
+              let index = queue.firstIndex(where: { $0.updateId == updateId }) else {
+            return nil
+        }
+        let item = queue.remove(at: index)
+        queue.insert(item, at: 0)
+        queuedTurns[chatId] = queue
+        if activeTurns[chatId] == nil {
+            startNextQueuedTurn(chatId: chatId)
+        }
+        return TelegramQueuedTurnSnapshot(
+            updateId: item.updateId,
+            chatId: chatId,
+            position: 1,
+            promptPreview: Self.preview(item.text),
+            acknowledgementMessageId: item.acknowledgementMessageId
+        )
     }
 
     @discardableResult
@@ -167,6 +287,22 @@ public actor TelegramTurnCoordinator {
     public func finishTurn(chatId: Int, turnId: UUID) {
         guard activeTurns[chatId]?.id == turnId else { return }
         activeTurns[chatId] = nil
+        startNextQueuedTurn(chatId: chatId)
+    }
+
+    private func startNextQueuedTurn(chatId: Int) {
+        guard activeTurns[chatId] == nil,
+              var queue = queuedTurns[chatId],
+              !queue.isEmpty else { return }
+        let next = queue.removeFirst()
+        queuedTurns[chatId] = queue.isEmpty ? nil : queue
+        _ = launchTurn(
+            chatId: chatId,
+            text: next.text,
+            priority: .userInitiated,
+            operation: next.operation,
+            onStart: { await next.onStart(next.acknowledgementMessageId) }
+        )
     }
 
     @discardableResult
@@ -247,6 +383,10 @@ public actor TelegramTurnCoordinator {
         Set(activeTurns.values.map(\.id))
     }
 
+    func activeTurnID(chatId: Int) -> UUID? {
+        activeTurns[chatId]?.id
+    }
+
     func waitUntilIdle(excluding turnIds: Set<UUID>) async {
         while let task = activeTurns.values.first(where: {
             !turnIds.contains($0.id)
@@ -260,6 +400,7 @@ public actor TelegramTurnCoordinator {
         for task in tasks { task.cancel() }
         for task in tasks { await task.value }
         activeTurns.removeAll()
+        queuedTurns.removeAll()
     }
 
     public func snapshot(chatId: Int) -> TelegramTurnSnapshot {

@@ -3,6 +3,50 @@ import Testing
 @testable import MacControl
 import NativeAgentCore
 import PersistenceCore
+#if canImport(CoreGraphics)
+import CoreGraphics
+
+@Test func captureDisplaySelectionKeepsVisibleWindowInDesktopGap() {
+    // A 2x main screen and 1x external screen still share global POINTS.
+    // The external window centre (1900, 100) is in a gap; only its top strip
+    // is visible, on the external display. Primary fallback loses that strip.
+    let displays: [(id: UInt32, bounds: CGRect)] = [
+        (1, CGRect(x: 0, y: 0, width: 1440, height: 900)),
+        (2, CGRect(x: 1440, y: -900, width: 1440, height: 900)),
+    ]
+    func select(_ rect: MacAXFrame?, _ main: UInt32 = 1) -> UInt32? {
+        MacScreenCaptureDisplaySelection.selectedID(displays: displays, requested: rect, mainDisplayID: main)
+    }
+    #expect(select(MacAXFrame(x: 1600, y: -100, w: 600, h: 400)) == 2)
+    #expect(select(MacAXFrame(x: 1600, y: -500, w: 600, h: 400)) == 2)
+    #expect(select(MacAXFrame(x: 50, y: 50, w: 600, h: 400)) == 1)
+    #expect(select(nil) == 1)
+    #expect(select(MacAXFrame(x: 5000, y: 5000, w: 100, h: 100)) == 1)
+    #expect(MacScreenCaptureDisplaySelection.selectedID(
+        displays: [displays[0]], requested: MacAXFrame(x: 50, y: 50, w: 600, h: 400), mainDisplayID: 1
+    ) == 1)
+
+    let separated: [(id: UInt32, bounds: CGRect)] = [
+        (9, CGRect(x: 0, y: 0, width: 100, height: 100)),
+        (3, CGRect(x: 200, y: 0, width: 100, height: 100)),
+    ]
+    let equalOverlap = MacAXFrame(x: 50, y: 0, w: 200, h: 100)
+    #expect(MacScreenCaptureDisplaySelection.selectedID(
+        displays: separated, requested: equalOverlap, mainDisplayID: 9
+    ) == 9)
+    for ordered in [separated, separated.reversed().map { $0 }] {
+        #expect(MacScreenCaptureDisplaySelection.selectedID(
+            displays: ordered, requested: equalOverlap, mainDisplayID: 99
+        ) == 3)
+        #expect(MacScreenCaptureDisplaySelection.selectedID(
+            displays: ordered, requested: MacAXFrame(x: 25, y: 0, w: 240, h: 100), mainDisplayID: 3
+        ) == 9)
+    }
+    #expect(MacScreenCaptureDisplaySelection.selectedID(
+        displays: [], requested: nil, mainDisplayID: 1
+    ) == nil)
+}
+#endif
 
 /// W3.5 — THE FUSED VIEW.
 ///
@@ -100,6 +144,7 @@ private final class _ViewAXSource: MacAXElementSource, @unchecked Sendable {
     private let rootID: Int?
     private let trusted: Bool
     private let app: MacAXAppInfo?
+    var menuRoots: [Int] = []
 
     init(
         elements: [Int: _ViewElement],
@@ -120,10 +165,100 @@ private final class _ViewAXSource: MacAXElementSource, @unchecked Sendable {
     func isTrusted() -> Bool { trusted }
     func frontmostApp() -> MacAXAppInfo? { app }
     func frontmostWindowRoot() -> MacAXElementRef? { rootID.map { MacAXElementRef(id: $0) } }
+    func transientMenuRoots(pid: Int32) -> [MacAXElementRef] { menuRoots.map { MacAXElementRef(id: $0) } }
     func attributes(of ref: MacAXElementRef) -> MacAXAttributes? { elements[ref.id]?.attributes }
     func children(of ref: MacAXElementRef) -> [MacAXElementRef] {
         (elements[ref.id]?.children ?? []).map { MacAXElementRef(id: $0) }
     }
+}
+
+@Test func viewIncludesCurrentNativeMenuWithoutInventingWindowPaths() async throws {
+    let source = _ViewAXSource(elements: [
+        0: _ViewElement(attributes: MacAXAttributes(role: "AXWindow", title: "Document",
+            frame: MacAXFrame(x: 100, y: 100, w: 400, h: 300)), children: []),
+        10: _ViewElement(attributes: MacAXAttributes(role: "AXMenu",
+            frame: MacAXFrame(x: 450, y: 150, w: 200, h: 100)), children: [11, 12, 13]),
+        11: _ViewElement(attributes: MacAXAttributes(role: "AXMenuItem", title: "Inspect",
+            frame: MacAXFrame(x: 450, y: 150, w: 200, h: 25), actions: ["AXPress"]), children: []),
+        12: _ViewElement(attributes: MacAXAttributes(role: "AXMenuItem", title: "Unavailable",
+            enabled: false, frame: MacAXFrame(x: 450, y: 175, w: 200, h: 25)), children: []),
+        13: _ViewElement(attributes: MacAXAttributes(role: "AXMenuItem", title: "Hidden submenu item",
+            frame: MacAXFrame(x: 700, y: 175, w: 200, h: 25)), children: []),
+    ])
+    source.menuRoots = [10]
+    let capture = _StubCaptureSource(shot: nil)
+    let client = _client(ax: source, capture: capture, renderer: _StubRenderer(), store: MacScreenViewStore())
+    let result = try await client.dispatch(action: "view", body: [:])
+    let output = _object(result.output)
+    guard case .array(let menus)? = output["transient_menus"], let menu = menus.first,
+          case .array(let items)? = _object(menu)["items"] else { Issue.record("missing menu"); return }
+    #expect(menus.count == 1 && items.count == 2)
+    #expect(_object(items[0])["label"] == .string("Inspect"))
+    #expect(_object(items[1])["enabled"] == .bool(false))
+    #expect(items.allSatisfy { _object($0)["path"] == nil && _object($0)["mark"] == nil })
+    #expect(capture.box.requested! == MacAXFrame(x: 100, y: 100, w: 550, h: 300))
+    #expect(output["window_title"] == .string("Document"))
+    #expect(MacTransientMenus.read(source: source, pid: 999).isEmpty)
+    #expect(MacTransientMenus.read(source: source, pid: getpid()).isEmpty)
+    source.menuRoots = []
+    let closed = try await client.dispatch(action: "view", body: [:])
+    #expect(_object(closed.output)["transient_menus"] == .array([]))
+}
+
+@Test func transientMenusBoundAndRedactCurrentItems() {
+    let menuFrame = MacAXFrame(x: 10, y: 10, w: 300, h: 2500)
+    var elements = [0: _ViewElement(attributes: MacAXAttributes(role: "AXMenu", frame: menuFrame),
+                                   children: Array(1...100))]
+    for index in 1...100 {
+        elements[index] = _ViewElement(attributes: MacAXAttributes(
+            role: "AXMenuItem", title: index == 1 ? "sk-proj-abcdefghijklmnopqrstuv1234567890" : "Item \(index)",
+            frame: MacAXFrame(x: 10, y: 10 + Double(index - 1) * 20, w: 300, h: 20)), children: [])
+    }
+    let source = _ViewAXSource(elements: elements)
+    source.menuRoots = [0]
+    let menus = MacTransientMenus.read(source: source, pid: 4242)
+    #expect(menus.count == 1 && menus[0].items.count == MacTransientMenus.maxItems)
+    #expect(menus[0].truncated)
+    guard case .array(let json) = MacTransientMenus.json(menus),
+          case .array(let items)? = _object(json[0])["items"] else { Issue.record("missing items"); return }
+    #expect(_object(items[0])["label"] != .string("sk-proj-abcdefghijklmnopqrstuv1234567890"))
+}
+
+@Test func transientMenuDiscoveryFindsAncestorSiblingWhileFocusStaysOnPage() {
+    let parents = [1: 2, 2: 3, 3: 4]
+    let childMap = [1: [8], 2: [1], 3: [2, 5], 4: [3, 6]]
+    var requested = 0
+    let menus = MacTransientMenus.nearFocus(1, parent: { parents[$0] }, children: { node, limit in
+        requested += min(limit, childMap[node]?.count ?? 0)
+        return Array((childMap[node] ?? []).prefix(limit))
+    }, isMenu: { $0 == 5 }, equal: ==)
+    #expect(menus == [5])
+    #expect(requested <= 96)
+    let menuItself: [Int] = MacTransientMenus.nearFocus(5,
+        parent: { (_: Int) -> Int? in nil }, children: { (_: Int, _: Int) -> [Int] in [] },
+        isMenu: { $0 == 5 }, equal: { $0 == $1 })
+    #expect(menuItself == [5])
+}
+
+@Test func transientMenuDiscoveryBoundsWideTreesAndCycles() {
+    var childReads = 0, parentReads = 0
+    let empty: [Int] = MacTransientMenus.nearFocus(0, parent: { node in
+        parentReads += 1
+        return node + 1
+    }, children: { _, limit in
+        childReads += limit
+        return Array(100..<(100 + limit))
+    }, isMenu: { _ in false }, equal: ==)
+    #expect(empty.isEmpty && childReads == 96 && parentReads == 16)
+    var cyclicReads = 0
+    let cycleParent: (Int) -> Int? = { node in
+        cyclicReads += 1
+        return node
+    }
+    let cyclic: [Int] = MacTransientMenus.nearFocus(0, parent: cycleParent,
+        children: { (_: Int, _: Int) -> [Int] in [1, 1] },
+        isMenu: { $0 == 1 }, equal: { $0 == $1 })
+    #expect(cyclic == [1] && cyclicReads == 1)
 }
 
 /// A window at (100,200) 800x600 points containing, in this DOCUMENT order:
@@ -756,22 +891,515 @@ private extension Result where Success == MacScreenViewMark, Failure == MacScree
 
 // MARK: - The tool end to end (through the real dispatch)
 
+private actor _DeferredViewCapture: MacScreenCaptureSource {
+    private var requests = 0
+    private var pending: [Int: CheckedContinuation<Result<MacScreenShot, MacScreenCaptureFailure>, Never>] = [:]
+    nonisolated func isScreenRecordingTrusted() -> Bool { true }
+    func capture(rect: MacAXFrame?) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+        requests += 1
+        let request = requests
+        return await withCheckedContinuation { pending[request] = $0 }
+    }
+    func waitForRequest(_ request: Int) async {
+        while pending[request] == nil { await Task.yield() }
+    }
+    func finish(_ request: Int) { pending.removeValue(forKey: request)?.resume(returning: .success(_shot())) }
+}
+
+private struct _CancellingViewRenderer: MacScreenImageRenderer {
+    final class Box: @unchecked Sendable { var calls = 0 }
+    let box: Box
+    let bytes: Int?
+    func renderPNG(shot: MacScreenShot, placements: [MacScreenMarkerPlacement], downscale: Double) -> Data? {
+        box.calls += 1
+        withUnsafeCurrentTask { $0?.cancel() }
+        return bytes.map { Data(repeating: 0, count: $0) }
+    }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func viewCancellationDuringCaptureSkipsEncodingAndAttentionPublication() async throws {
+    for action in ["view", "attention"] {
+        let capture = _DeferredViewCapture()
+        let renderer = _StubRenderer(baseBytes: 100)
+        let store = MacScreenViewStore()
+        let attention = MacAttentionSessionStore(screenViewStore: store)
+        let client = SwiftNativeMacControl(
+            accessibilitySource: _composeWindowSource(), eventSink: _RecordingEventSink(),
+            screenCaptureSource: capture, screenImageRenderer: renderer, screenViewStore: store,
+            attentionEventSource: AttentionManualSource(), attentionStore: attention
+        )
+        let prior = MacScreenViewSnapshot(
+            viewId: "previous", capturedAt: Date(), scope: .focusedWindow,
+            bounds: _shot().bounds, appName: "TextEdit", windowTitle: "Compose", marks: []
+        )
+        await store.record(prior)
+        let pending = Task { try await client.dispatch(action: action, body: ["mode": .string("start")]) }
+        await capture.waitForRequest(1)
+        pending.cancel()
+        await capture.finish(1)
+        let result = try await pending.value
+        #expect(!result.ok)
+        #expect(result.error == "view_capture_cancelled")
+        let output = _object(result.output)
+        #expect(output["view"] == .null)
+        #expect(output["view_current"] == .bool(false))
+        #expect(output["image"] == .null)
+        #expect(renderer.box.calls.isEmpty)
+        if action == "view" {
+            #expect(await store.latestViewId() == "previous")
+        } else {
+            #expect(await attention.status(now: Date())?.latestViewId == nil)
+        }
+        _ = await attention.stop()
+    }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func viewCancellationOfOlderCaptureDoesNotRetireNewerTicket() async throws {
+    let capture = _DeferredViewCapture()
+    let store = MacScreenViewStore()
+    let client = SwiftNativeMacControl(
+        accessibilitySource: _composeWindowSource(), eventSink: _RecordingEventSink(),
+        screenCaptureSource: capture, screenImageRenderer: _StubRenderer(baseBytes: 100), screenViewStore: store
+    )
+    let older = Task { try await client.dispatch(action: "view", body: [:]) }
+    await capture.waitForRequest(1)
+    let newer = Task { try await client.dispatch(action: "view", body: [:]) }
+    await capture.waitForRequest(2)
+    older.cancel()
+    await capture.finish(1)
+    #expect(try await older.value.error == "view_capture_cancelled")
+    await capture.finish(2)
+    let current = try await newer.value
+    #expect(current.ok)
+    #expect(_object(current.output)["view_current"] == .bool(true))
+    #expect(await store.latestViewId() != nil)
+}
+
+@Test
+func viewCancellationStopsImageLadderEvenWhenCurrentEncodingFits() async throws {
+    for bytes in [nil, 100, 1000] as [Int?] {
+        let box = _CancellingViewRenderer.Box()
+        let store = MacScreenViewStore()
+        let client = SwiftNativeMacControl(
+            accessibilitySource: _composeWindowSource(), eventSink: _RecordingEventSink(),
+            screenCaptureSource: _StubCaptureSource(shot: _shot()),
+            screenImageRenderer: _CancellingViewRenderer(box: box, bytes: bytes), screenViewStore: store
+        )
+        let pending = Task { try await client.dispatch(action: "view", body: ["max_image_bytes": .int(200)]) }
+        let result = try await pending.value
+        #expect(result.error == "view_capture_cancelled")
+        #expect(_object(result.output)["view"] == .null)
+        #expect(_object(result.output)["image"] == .null)
+        #expect(box.calls == 1)
+        #expect(await store.latestViewId() == nil)
+    }
+}
+
+@Test
+func viewCancellationBeforeStartAndAtStorePublicationPreservesValidView() async throws {
+    let store = MacScreenViewStore()
+    let prior = MacScreenViewSnapshot(
+        viewId: "previous", capturedAt: Date(), scope: .focusedWindow,
+        bounds: _shot().bounds, appName: "TextEdit", windowTitle: "Compose", marks: []
+    )
+    await store.record(prior)
+    let ticket = await store.beginCapture()
+    let capture = _StubCaptureSource(shot: _shot())
+    let renderer = _StubRenderer(baseBytes: 100)
+    let client = SwiftNativeMacControl(
+        accessibilitySource: _composeWindowSource(), eventSink: _RecordingEventSink(),
+        screenCaptureSource: capture, screenImageRenderer: renderer, screenViewStore: store
+    )
+    let cancelled = Task {
+        withUnsafeCurrentTask { $0?.cancel() }
+        return try await client.dispatch(action: "view", body: [:])
+    }
+    #expect(try await cancelled.value.error == "view_capture_cancelled")
+    #expect(capture.box.requested == nil)
+    #expect(renderer.box.calls.isEmpty)
+    #expect(await store.latestViewId() == "previous")
+    let abandoned = MacScreenViewSnapshot(
+        viewId: "cancelled", capturedAt: Date(), scope: .focusedWindow,
+        bounds: _shot().bounds, appName: "TextEdit", windowTitle: "Compose", marks: []
+    )
+    let rejected = Task {
+        withUnsafeCurrentTask { $0?.cancel() }
+        _ = await store.beginCapture() // A cancelled caller must not replace the real ticket.
+        return await store.record(abandoned, captureTicket: ticket)
+    }
+    #expect(await rejected.value == false)
+    #expect(await store.latestViewId() == "previous")
+    #expect(await store.record(prior, captureTicket: ticket) == false, "Cancelled publication consumes only its own ticket")
+}
+
+@Test(.timeLimit(.minutes(1)))
+func viewCaptureOlderCompletionCannotReplaceNewerPublishedView() async throws {
+    let capture = _DeferredViewCapture()
+    let store = MacScreenViewStore()
+    let client = SwiftNativeMacControl(
+        accessibilitySource: _composeWindowSource(), eventSink: _RecordingEventSink(),
+        screenCaptureSource: capture, screenImageRenderer: _StubRenderer(baseBytes: 100), screenViewStore: store
+    )
+    let older = Task { try await client.dispatch(action: "view", body: [:]) }
+    await capture.waitForRequest(1)
+    let newer = Task { try await client.dispatch(action: "view", body: [:]) }
+    await capture.waitForRequest(2)
+    await capture.finish(2)
+    let newest = try await newer.value
+    #expect(newest.ok)
+    let newestOutput = _object(newest.output)
+    #expect(newestOutput["view_current"] == .bool(true))
+    let latestID = await store.latestViewId()
+    #expect(latestID != nil)
+
+    await capture.finish(1)
+    let stale = try await older.value
+    #expect(!stale.ok)
+    #expect(stale.error == "view_capture_superseded")
+    let staleOutput = _object(stale.output)
+    #expect(staleOutput["view_current"] == .bool(false))
+    #expect(staleOutput["view"] == .null)
+    let serialized = try JSONSerialization.jsonObject(with: stale.output.serializedData(pretty: false)) as? [String: Any]
+    #expect(serialized?["view"] is NSNull)
+    #expect(staleOutput["image"] != .null, "Diagnostic content can remain without a usable mark token")
+    #expect(await store.latestViewId() == latestID)
+}
+
+@Test(.timeLimit(.minutes(1)))
+func viewCaptureInvalidationCannotBeUndoneByLateCompletion() async throws {
+    for action in ["view", "attention"] {
+        let capture = _DeferredViewCapture()
+        let store = MacScreenViewStore()
+        let attention = MacAttentionSessionStore(screenViewStore: store)
+        let client = SwiftNativeMacControl(
+            accessibilitySource: _composeWindowSource(), eventSink: _RecordingEventSink(),
+            screenCaptureSource: capture, screenImageRenderer: _StubRenderer(baseBytes: 100), screenViewStore: store,
+            attentionEventSource: AttentionManualSource(), attentionStore: attention
+        )
+        let pending = Task { try await client.dispatch(action: action, body: ["mode": .string("start")]) }
+        await capture.waitForRequest(1)
+        await store.invalidate()
+        await capture.finish(1)
+        let stale = try await pending.value
+        #expect(!stale.ok)
+        #expect(_object(stale.output)["view"] == .null)
+        #expect(await store.latestViewId() == nil)
+        if action == "attention" {
+            let status = await attention.status(now: Date())
+            #expect(status != nil)
+            #expect(status?.latestViewId == nil, "The actual consumer must not mark rejected capture observed")
+        }
+        _ = await attention.stop()
+    }
+}
+
+private final class _CancellingHandSink: MacEventSink, @unchecked Sendable {
+    enum Point: Sendable { case keyDown, mouseDown, never }
+    let point: Point
+    let recorded = _RecordingEventSink()
+    var isAvailable: Bool { true }
+    init(_ point: Point) { self.point = point }
+    func post(key event: MacKeyEvent) {
+        recorded.post(key: event)
+        if point == .keyDown, event.down { withUnsafeCurrentTask { $0?.cancel() } }
+    }
+    func post(mouse event: MacMouseEvent) {
+        recorded.post(mouse: event)
+        if point == .mouseDown, event.phase == .down { withUnsafeCurrentTask { $0?.cancel() } }
+    }
+    func post(scroll event: MacScrollEvent) { recorded.post(scroll: event) }
+}
+
+private struct _CancellingHandCapture: MacScreenCaptureSource {
+    func isScreenRecordingTrusted() -> Bool { true }
+    func capture(rect: MacAXFrame?) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
+        withUnsafeCurrentTask { $0?.cancel() }
+        return .success(_shot())
+    }
+}
+
+@Test func handControlAliasesCarryIdenticalMouseFlagsAndRelease() async throws {
+    var recordings: [[MacMouseEvent]] = []
+    for holding in ["ctrl", "control", "CTRL"] {
+        let sink = _RecordingEventSink()
+        let client = SwiftNativeMacControl(
+            accessibilitySource: _composeWindowSource(), eventSink: sink,
+            screenCaptureSource: _StubCaptureSource(shot: _shot()),
+            screenImageRenderer: _StubRenderer(baseBytes: 100)
+        )
+        let result = try await client.dispatch(action: "hand", body: [
+            "gesture": .string("click"), "x": .int(150), "y": .int(250),
+            "holding": .string(holding), "defer_visual_verification": .bool(true),
+        ])
+        #expect(result.ok)
+        #expect(sink.mouse.count == 3)
+        #expect(sink.mouse.allSatisfy { $0.modifiers == .control })
+        #expect(sink.keys.last?.down == false && sink.keys.last?.modifiers.isEmpty == true)
+        #expect(_object(result.output)["hand_neutral"] == .bool(true))
+        recordings.append(sink.mouse)
+    }
+    #expect(recordings.dropFirst().allSatisfy { $0 == recordings.first })
+}
+
+@Test func timedMultiKeyHoldReleasesTheWholeSetAndCancelsWithoutPressingRemainingKeys() async throws {
+    for cancel in [false, true] {
+        let sink = _CancellingHandSink(cancel ? .keyDown : .never)
+        let task = Task {
+            let client = SwiftNativeMacControl(accessibilitySource: _composeWindowSource(), eventSink: sink,
+                screenCaptureSource: _StubCaptureSource(shot: _shot()),
+                screenImageRenderer: _StubRenderer(baseBytes: 100))
+            return try await client.dispatch(action: "hand", body: [
+                "gesture": .string("hold_key"), "keys": .string("w d"), "seconds": .double(0),
+                "defer_visual_verification": .bool(true),
+            ])
+        }
+        let result = try await task.value
+        #expect(result.ok == !cancel)
+        #expect(_object(result.output)["hand_neutral"] == .bool(true))
+        #expect(sink.recorded.keys.map(\.keyCode) == (cancel ? [13, 13] : [13, 2, 2, 13]))
+        #expect(sink.recorded.keys.map(\.down) == (cancel ? [true, false] : [true, true, false, false]))
+        #expect(sink.recorded.mouse.isEmpty && sink.recorded.scrolls.isEmpty)
+    }
+}
+
+@Test func handRightDragCarriesModifiersAndCancellationReleasesRightButton() async throws {
+    for interrupted in [false, true] {
+        let sink = _CancellingHandSink(interrupted ? .mouseDown : .never)
+        let task = Task {
+            let client = SwiftNativeMacControl(accessibilitySource: _composeWindowSource(), eventSink: sink,
+                screenCaptureSource: _StubCaptureSource(shot: _shot()), screenImageRenderer: _StubRenderer(baseBytes: 100))
+            return try await client.dispatch(action: "hand", body: [
+                "gesture": .string("drag"), "button": .string("right"), "holding": .string("shift"),
+                "x": .int(150), "y": .int(250), "to_x": .int(300), "to_y": .int(250),
+                "travel_seconds": .double(0.08), "defer_visual_verification": .bool(true),
+            ])
+        }
+        let result = try await task.value
+        #expect(result.ok != interrupted)
+        #expect(_object(result.output)["hand_neutral"] == .bool(true))
+        #expect(sink.recorded.mouse.allSatisfy { $0.button == .right })
+        #expect(sink.recorded.mouse.last?.phase == .up)
+        #expect(sink.recorded.keys.last?.down == false)
+        if interrupted {
+            #expect(!sink.recorded.mouse.contains { $0.phase == .drag })
+        } else {
+            #expect(sink.recorded.mouse.allSatisfy { $0.modifiers == .shift })
+            #expect(_object(result.output)["drag_travel_ms"] == .int(80))
+        }
+    }
+}
+
+@Test func namedDragDurationUsesBoundedTravelAndZeroDefault() {
+    #expect(SwiftNativeMacControl.handDragMilliseconds(seconds: nil) == 240)
+    #expect(SwiftNativeMacControl.handDragMilliseconds(seconds: 0) == 240)
+    #expect(SwiftNativeMacControl.handDragMilliseconds(seconds: .nan) == 240)
+    #expect(SwiftNativeMacControl.handDragMilliseconds(seconds: 0.001) == 80)
+    #expect(SwiftNativeMacControl.handDragMilliseconds(seconds: 0.3) == 300)
+    #expect(SwiftNativeMacControl.handDragMilliseconds(seconds: Double.greatestFiniteMagnitude) == 2000)
+}
+
+@Test func coordinatedPointerHoldReleasesMouseAndKeysOnCompletionOrCancellation() async throws {
+    for point in [_CancellingHandSink.Point.keyDown, .mouseDown, .never] {
+        let sink = _CancellingHandSink(point)
+        let task = Task {
+            let client = SwiftNativeMacControl(accessibilitySource: _composeWindowSource(), eventSink: sink,
+                screenCaptureSource: _StubCaptureSource(shot: _shot()), screenImageRenderer: _StubRenderer(baseBytes: 100))
+            return try await client.dispatch(action: "hand", body: [
+                "gesture": .string("hold"), "button": .string("right"), "holding": .string("w d"),
+                "x": .int(150), "y": .int(250), "seconds": .int(0),
+                "defer_visual_verification": .bool(true),
+            ])
+        }
+        let result = try await task.value
+        #expect(result.ok == (point == .never))
+        #expect(_object(result.output)["hand_neutral"] == .bool(true))
+        #expect(sink.recorded.keys.last?.down == false)
+        if point != .keyDown {
+            #expect(sink.recorded.mouse.last?.phase == .up)
+            #expect(sink.recorded.mouse.allSatisfy { $0.button == .right })
+        } else { #expect(sink.recorded.mouse.isEmpty) }
+        if point == .never {
+            #expect(sink.recorded.keys.map(\.keyCode) == [13, 2, 2, 13])
+        }
+    }
+}
+
+@Test func handCancellationEmitsOnlyHeldReleasesAfterInterruption() async throws {
+    for point in [_CancellingHandSink.Point.keyDown, .mouseDown, .never] {
+        let sink = _CancellingHandSink(point)
+        let task = Task {
+            let client = SwiftNativeMacControl(
+                accessibilitySource: _composeWindowSource(), eventSink: sink,
+                screenCaptureSource: _StubCaptureSource(shot: _shot()),
+                screenImageRenderer: _StubRenderer(baseBytes: 100)
+            )
+            let body: [String: JSONValue] = point == .keyDown ? [
+                "gesture": .string("key"), "keys": .string("a b"),
+            ] : [
+                "gesture": .string("drag"), "x": .int(150), "y": .int(250),
+                "to_x": .int(200), "to_y": .int(300), "seconds": .int(0),
+                "holding": .string("shift"),
+            ]
+            return try await client.dispatch(action: "hand", body: body)
+        }
+        let result = try await task.value
+        let output = _object(result.output)
+        #expect(output["hand_neutral"] == .bool(true))
+        if point == .never {
+            #expect(result.ok)
+            #expect(sink.recorded.mouse.contains { $0.phase == .drag })
+        } else {
+            #expect(!result.ok)
+            #expect(result.verification == .unverified)
+            #expect(output["status"] == .string("interrupted"))
+            #expect(output["verified"] == .bool(false))
+            #expect(output["effects_may_have_occurred"] == .bool(true))
+            #expect(sink.recorded.keys.map(\.down) == [true, false])
+            #expect(sink.recorded.keys.first?.keyCode == sink.recorded.keys.last?.keyCode)
+            if point == .keyDown {
+                #expect(sink.recorded.mouse.isEmpty)
+                #expect(output["requested_events_emitted"] == .int(1))
+                #expect(output["recovery_events_emitted"] == .int(1))
+            } else {
+                #expect(sink.recorded.mouse.map(\.phase) == [.down, .up])
+                #expect(sink.recorded.mouse.last?.x == 150)
+                #expect(sink.recorded.mouse.last?.y == 250)
+                #expect(output["requested_events_emitted"] == .int(2))
+                #expect(output["recovery_events_emitted"] == .int(2))
+            }
+        }
+    }
+}
+
+@Test func handCancellationAfterCaptureEmitsNoInput() async throws {
+    let sink = _RecordingEventSink()
+    let task = Task {
+        let client = SwiftNativeMacControl(
+            accessibilitySource: _composeWindowSource(), eventSink: sink,
+            screenCaptureSource: _CancellingHandCapture(),
+            screenImageRenderer: _StubRenderer(baseBytes: 100)
+        )
+        return try await client.dispatch(action: "hand", body: [
+            "gesture": .string("key"), "keys": .string("a"),
+        ])
+    }
+    let result = try await task.value
+    #expect(!result.ok)
+    #expect(sink.keys.isEmpty && sink.mouse.isEmpty && sink.scrolls.isEmpty)
+    let output = _object(result.output)
+    #expect(output["requested_events_emitted"] == .int(0))
+    #expect(output["recovery_events_emitted"] == .int(0))
+    #expect(output["effects_may_have_occurred"] == .bool(false))
+}
+
+@Test func handCanDeferVisualProofWithoutClaimingVerificationOrTakingDuplicateCaptures() async throws {
+    for deferred in [false, true] {
+        let sink = _RecordingEventSink()
+        let renderer = _StubRenderer(baseBytes: 100)
+        let client = _client(
+            ax: _composeWindowSource(), capture: _StubCaptureSource(shot: _shot()),
+            renderer: renderer, store: MacScreenViewStore(), sink: sink
+        )
+        let result = try await client.dispatch(action: "hand", body: [
+            "gesture": .string("click"), "x": .int(150), "y": .int(250),
+            "defer_visual_verification": .bool(deferred),
+        ])
+        #expect(result.ok)
+        #expect(sink.mouse.map(\.phase) == [.move, .down, .up])
+        #expect(renderer.box.calls.count == (deferred ? 0 : 2))
+        let output = _object(result.output)
+        #expect(output["visual_verification_deferred"] == .bool(deferred))
+        #expect(output["verified"] == .bool(false), "emission or identical fake views are not proof")
+        #expect(output["verification_evidence"] == .null)
+        #expect(output["hand_neutral"] == .bool(true))
+    }
+}
+
+@Test func macNumericBoundaryNormalizationPreservesValidValuesAndRejectsOverflow() {
+    for value in [1e300, -1e300, Double(Int.max), Double(Int.min).nextDown, .infinity, -.infinity, .nan] {
+        #expect(SwiftNativeMacControl.intValue(["n": .double(value)], "n") == nil)
+    }
+    #expect(SwiftNativeMacControl.intValue(["n": .double(Double(Int.max).nextDown)], "n")
+        == Int(exactly: Double(Int.max).nextDown))
+    #expect(SwiftNativeMacControl.intValue(["n": .double(Double(Int.min))], "n") == Int.min)
+    #expect(SwiftNativeMacControl.intValue(["n": .int(Int64.max)], "n") == Int.max)
+    #expect(SwiftNativeMacControl.intValue(["n": .double(4.9)], "n") == 4)
+    #expect(SwiftNativeMacControl.intValue(["n": .double(-4.9)], "n") == -4)
+    for value: JSONValue in [.null, .bool(true), .string("10"), .array([])] {
+        #expect(SwiftNativeMacControl.intValue(["n": value], "n") == nil)
+    }
+    #expect(SwiftNativeMacControl.intValue([:], "n") == nil)
+    for seconds in [1e300, Double.greatestFiniteMagnitude, 11] {
+        #expect(SwiftNativeMacControl.handWaitMilliseconds(seconds: seconds) == 10_000)
+    }
+    for seconds in [-1e300, -1, 0] {
+        #expect(SwiftNativeMacControl.handWaitMilliseconds(seconds: seconds) == 0)
+    }
+    #expect(SwiftNativeMacControl.handWaitMilliseconds(seconds: 0.1239) == 123)
+    #expect(SwiftNativeMacControl.handWaitMilliseconds(seconds: nil) == 600)
+    #expect(SwiftNativeMacControl.handWaitMilliseconds(seconds: .nan) == 600)
+}
+
+@Test func macNumericBoundaryHugeDurationDoesNotCrashCanonicalHand() async throws {
+    let sink = _RecordingEventSink()
+    let client = _client(
+        ax: _composeWindowSource(), capture: _StubCaptureSource(shot: _shot()),
+        renderer: _StubRenderer(baseBytes: 100), store: MacScreenViewStore(), sink: sink
+    )
+    // move does not wait, but used to trap while normalizing seconds before
+    // dispatching the gesture. The only event destination is a recording sink.
+    for seconds in [1e300, -1e300] {
+        let result = try await client.dispatch(action: "hand", body: [
+            "gesture": .string("move"), "x": .int(150), "y": .int(150),
+            "seconds": .double(seconds),
+        ])
+        #expect(result.ok)
+        #expect(_object(result.output)["hand_neutral"] == .bool(true))
+    }
+    #expect(sink.mouse.count == 2)
+    #expect(sink.mouse.allSatisfy { $0.phase == .move })
+    #expect(sink.keys.isEmpty && sink.scrolls.isEmpty)
+}
+
 private func _client(
     ax: _ViewAXSource,
     capture: _StubCaptureSource,
     renderer: any MacScreenImageRenderer,
     store: MacScreenViewStore,
     sink: _RecordingEventSink = _RecordingEventSink(),
-    act: _FakeAXActSource = _FakeAXActSource(root: nil)
+    act: _FakeAXActSource = _FakeAXActSource(root: nil),
+    pointer: any MacPointerPositionSource = UnavailableMacPointerPositionSource()
 ) -> SwiftNativeMacControl {
     SwiftNativeMacControl(
         accessibilitySource: ax,
         eventSink: sink,
         accessibilityActSource: act,
         screenCaptureSource: capture,
+        pointerPositionSource: pointer,
         screenImageRenderer: renderer,
         screenViewStore: store
     )
+}
+
+private struct _ViewPointerSource: MacPointerPositionSource {
+    let point: MacPointerPosition?
+    func currentPosition() -> MacPointerPosition? { point }
+}
+
+@Test func viewReadsSystemPointerWithoutPostingInputOrInventingUnavailablePosition() async throws {
+    for point in [MacPointerPosition(x: -123, y: 456), nil] {
+        let sink = _RecordingEventSink()
+        let client = _client(ax: _composeWindowSource(), capture: _StubCaptureSource(shot: _shot()),
+            renderer: _StubRenderer(), store: MacScreenViewStore(), sink: sink,
+            pointer: _ViewPointerSource(point: point))
+        let reply = try await client.dispatch(action: "view", body: [:])
+        #expect(reply.ok)
+        #expect(_object(reply.output)["pointer"] == (point?.json ?? .null))
+        #expect(sink.mouse.isEmpty && sink.keys.isEmpty && sink.scrolls.isEmpty)
+    }
+    #expect(defaultMacPointerPositionSource().currentPosition() == nil)
 }
 
 @Test func viewFusesThePictureAndTheStructureIntoOneObject() async throws {
@@ -796,6 +1424,12 @@ private func _client(
     #expect(_int(result.output, "mark_count") == 3)
     #expect(_string(result.output, "image") != nil)
     #expect(_int(result.output, "image_bytes") == 100_000)
+    #expect((_int(result.output, "ax_snapshot_ms") ?? -1) >= 0)
+    #expect((_int(result.output, "screen_capture_ms") ?? -1) >= 0)
+    #expect((_int(result.output, "image_render_ms") ?? -1) >= 0)
+    #expect((_int(result.output, "scene_selection_ms") ?? -1) >= 0)
+    #expect((_int(result.output, "post_render_ms") ?? -1) >= 0)
+    #expect((_int(result.output, "view_total_ms") ?? -1) >= 0)
     #expect(_string(result.output, "view")?.isEmpty == false)
     #expect(_bool(result.output, "truncated") == false)
     guard case .double(let scale)? = _object(result.output)["scale"] else {
@@ -829,6 +1463,23 @@ private func _client(
     #expect(_marks(result.output).count == 3, "raw pixels must not discard the AX half of fusion")
     #expect(_bool(result.output, "image_annotations") == false)
     #expect(renderer.box.calls.first?.placements.isEmpty == true)
+}
+
+@Test func fusedViewPreservesSubsecondCaptureTimeForMovingTargets() async throws {
+    let instant = Date(timeIntervalSince1970: 1_000.375)
+    let client = SwiftNativeMacControl(
+        now: { instant },
+        accessibilitySource: _composeWindowSource(),
+        eventSink: _RecordingEventSink(),
+        screenCaptureSource: _StubCaptureSource(shot: _shot()),
+        screenImageRenderer: _StubRenderer(baseBytes: 100_000),
+        screenViewStore: MacScreenViewStore()
+    )
+    let result = try await client.dispatch(action: "view", body: ["semantic_raw_frame": .bool(true)])
+    #expect(result.ok)
+    #expect(_object(result.output)["captured_at_epoch_seconds"] == .double(1_000.375))
+    #expect(_string(result.output, "captured_at") == "1970-01-01T00:16:40Z",
+        "retain the old human-readable field while adding precise machine timing")
 }
 
 @Test func semanticScreenFocusesAVisualSurfaceBeforeEncodingWithoutChangingWindowGeometry() async throws {

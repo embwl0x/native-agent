@@ -30,35 +30,121 @@ private struct ProbeResult {
     let stderr: String
 }
 
-private func runProbe(_ arguments: [String], outputRoot: URL) throws -> ProbeResult {
+private struct ProbeHarnessError: Error, CustomStringConvertible {
+    let description: String
+}
+
+/// Locate the probe product built by the outer test gate. Building it from this
+/// process would ask SwiftPM to acquire the package lock already held by the
+/// parent `swift test`, deadlocking until a timeout. The cached sibling product
+/// makes each test exercise one real executable without nested SwiftPM work.
+private enum ActivityProbeExecutable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cached: Result<URL, Error>?
+
+    static func resolve() throws -> URL {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached { return try cached.get() }
+
+        do {
+            let packageProduct = try activityRepositoryRoot()
+                .appendingPathComponent("Modules/NativeAgentCore/.build/debug/activity-probe")
+            if FileManager.default.isExecutableFile(atPath: packageProduct.path) {
+                cached = .success(packageProduct)
+                return packageProduct
+            }
+            let roots = [Bundle.main.bundleURL, URL(fileURLWithPath: CommandLine.arguments[0])]
+            for root in roots {
+                var directory = root
+                for _ in 0..<12 {
+                    let candidate = directory.appendingPathComponent("activity-probe")
+                    if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                        cached = .success(candidate)
+                        return candidate
+                    }
+                    let parent = directory.deletingLastPathComponent()
+                    if parent.path == directory.path { break }
+                    directory = parent
+                }
+            }
+            throw ProbeHarnessError(
+                description: "activity-probe is not built beside the test bundle; "
+                    + "run `swift build --package-path Modules/NativeAgentCore "
+                    + "--product activity-probe` before this suite"
+            )
+        } catch {
+            cached = .failure(error)
+            throw error
+        }
+    }
+}
+
+private func runProbeProcess(
+    executable: URL,
+    arguments: [String],
+    outputRoot: URL,
+    timeout: TimeInterval
+) throws -> ProbeResult {
     let resultID = UUID().uuidString
     let stdoutURL = outputRoot.appendingPathComponent("probe-\(resultID).out")
     let stderrURL = outputRoot.appendingPathComponent("probe-\(resultID).err")
     FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
     FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    // Each process test gets a separate SwiftPM scratch directory. This avoids
-    // test-parallel races while still executing the shipped executable.
-    let scratch = outputRoot.appendingPathComponent("probe-build", isDirectory: true)
-    process.arguments = [
-        "swift", "run", "--package-path",
-        try activityRepositoryRoot().appendingPathComponent("Modules/NativeAgentCore").path,
-        "--scratch-path", scratch.path,
-        "activity-probe",
-    ] + arguments
+    process.executableURL = executable
+    process.arguments = arguments
     let out = try FileHandle(forWritingTo: stdoutURL)
     let err = try FileHandle(forWritingTo: stderrURL)
     process.standardOutput = out
     process.standardError = err
-    try process.run()
-    process.waitUntilExit()
+    do {
+        try process.run()
+    } catch {
+        try? out.close()
+        try? err.close()
+        throw error
+    }
+
+    let deadline = Date().addingTimeInterval(timeout)
+    while process.isRunning && Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    if process.isRunning {
+        process.terminate()
+        let grace = Date().addingTimeInterval(2)
+        while process.isRunning && Date() < grace {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+            let killDeadline = Date().addingTimeInterval(2)
+            while process.isRunning && Date() < killDeadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+        try? out.close()
+        try? err.close()
+        throw ProbeHarnessError(
+            description: "probe process timed out after \(Int(timeout)) seconds: "
+                + ([executable.path] + arguments).joined(separator: " ")
+        )
+    }
     try out.close()
     try err.close()
     return ProbeResult(
         status: process.terminationStatus,
         stdout: try String(contentsOf: stdoutURL, encoding: .utf8),
         stderr: try String(contentsOf: stderrURL, encoding: .utf8)
+    )
+}
+
+private func runProbe(_ arguments: [String], outputRoot: URL) throws -> ProbeResult {
+    try runProbeProcess(
+        executable: ActivityProbeExecutable.resolve(),
+        arguments: arguments,
+        outputRoot: outputRoot,
+        timeout: 120
     )
 }
 

@@ -55,6 +55,14 @@ private final class BrowserHTTPWave2Fixture: @unchecked Sendable {
             // clears BrowserWindowController's real single-flight latch.
             guard path != "/slow" else { return }
 
+            if path == "/redirect-data" {
+                let response = "HTTP/1.1 302 Found\r\nLocation: data:text/html,blocked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
+                    connection.cancel()
+                })
+                return
+            }
+
             let status = path == "/missing" ? 404 : 200
             let reason = status == 404 ? "Not Found" : "OK"
             let body: String
@@ -214,6 +222,34 @@ struct MacBrowserBehaviorWave2EvalTests {
         }
 
         let retry = try await controller.navigate(try await fixture.url(path: "/ok"), runID: "retry")
+        #expect(retry.httpStatus == 200)
+        #expect(retry.url.contains("/ok"))
+    }
+
+    @Test("main-frame redirects cannot escape HTTP(S) capture authority")
+    @MainActor
+    func browserNavigationRejectsUnsafeRedirectAndRecoversItsLatch() async throws {
+        let root = try browserIPCWave2Root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try BrowserHTTPWave2Fixture()
+        let controller = BrowserWindowController(dataRoot: root)
+
+        do {
+            _ = try await controller.navigate(
+                try await fixture.url(path: "/redirect-data"),
+                runID: "unsafe-redirect"
+            )
+            Issue.record("a data: redirect unexpectedly became browser capture authority")
+        } catch BrowserError.unsafeScheme(let scheme) {
+            #expect(scheme == "data")
+        } catch {
+            Issue.record("unsafe redirect returned the wrong failure: \(error)")
+        }
+
+        let retry = try await controller.navigate(
+            try await fixture.url(path: "/ok"),
+            runID: "safe-retry"
+        )
         #expect(retry.httpStatus == 200)
         #expect(retry.url.contains("/ok"))
     }

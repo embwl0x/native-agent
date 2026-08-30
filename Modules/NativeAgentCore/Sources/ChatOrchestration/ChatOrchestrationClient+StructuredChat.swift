@@ -128,13 +128,6 @@ extension SwiftNativeChatOrchestrationClient {
         let runId = (suppressUserAppend ? ChatPersistenceContext.pinnedTurnRunID : nil)
             ?? UUID().uuidString
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
-        TurnLifecycleTelemetry.emit(
-            .turnAccepted,
-            surface: surface,
-            sessionId: resolvedSession,
-            observedBy: "structured_chat.entry"
-        )
-
         // B7 (review round 2, MED): derive + clear the per-session cancel flag
         // AT TURN ACCEPT — before the user append and autocompact awaits — so
         // the window where a cross-process Stop meant for THIS turn could be
@@ -193,6 +186,14 @@ extension SwiftNativeChatOrchestrationClient {
             fileAccess: fileAccess, verifiedSessionId: resolvedSession
         )
         let boundTurnId = StructuredTurnTraceIdentity.currentOrMint()
+        TurnLifecycleTelemetry.emit(
+            .turnAccepted,
+            surface: surface,
+            sessionId: resolvedSession,
+            observedBy: "structured_chat.entry",
+            turnId: boundTurnId,
+            on: turnTraceBus
+        )
         async let residentPreparationTask = prepareResidentTurnInputs(
             message: message,
             surface: surface,
@@ -374,6 +375,7 @@ extension SwiftNativeChatOrchestrationClient {
                         sessionId: resolvedSession,
                         runId: runId,
                         maxIterations: toolLoopMaxIterations(for: surface),
+                        turnWallClockSecondsOverride: turnWallClockSecondsOverride,
                         llm: llm,
                         tools: gated,
                         preBuiltContext: providerCtx,
@@ -459,6 +461,16 @@ extension SwiftNativeChatOrchestrationClient {
             outcomeContext: providerCtx,
             outcomeTurnID: boundTurnId
         )
+        if !result.reply.isEmpty, await outputMilestoneGate.claim() {
+            TurnLifecycleTelemetry.emit(
+                .surfaceOutputEnqueued,
+                surface: surface,
+                sessionId: resolvedSession,
+                observedBy: "structured_chat.return",
+                turnId: boundTurnId,
+                on: turnTraceBus
+            )
+        }
         emitMetacognitiveTerminalTrace(
             turnId: boundTurnId,
             sessionId: resolvedSession,
@@ -515,13 +527,6 @@ extension SwiftNativeChatOrchestrationClient {
         let runId = (suppressUserAppend ? ChatPersistenceContext.pinnedTurnRunID : nil)
             ?? UUID().uuidString
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
-        TurnLifecycleTelemetry.emit(
-            .turnAccepted,
-            surface: surface,
-            sessionId: resolvedSession,
-            observedBy: "structured_stream.entry"
-        )
-
         // #19 + B7 review round 2 (MED): derive + clear the per-session cancel
         // flag AT TURN ACCEPT — before the user append / autocompact awaits —
         // so the window where a Stop meant for THIS turn could be wiped is
@@ -574,6 +579,14 @@ extension SwiftNativeChatOrchestrationClient {
             fileAccess: fileAccess, verifiedSessionId: resolvedSession
         )
         let boundTurnId = StructuredTurnTraceIdentity.currentOrMint()
+        TurnLifecycleTelemetry.emit(
+            .turnAccepted,
+            surface: surface,
+            sessionId: resolvedSession,
+            observedBy: "structured_stream.entry",
+            turnId: boundTurnId,
+            on: turnTraceBus
+        )
         async let residentPreparationTask = prepareResidentTurnInputs(
             message: message,
             surface: surface,
@@ -741,6 +754,7 @@ extension SwiftNativeChatOrchestrationClient {
                     sessionId: resolvedSession,
                     runId: runId,
                     maxIterations: toolLoopMaxIterations(for: surface),
+                        turnWallClockSecondsOverride: turnWallClockSecondsOverride,
                     llm: llm,
                     tools: gated,
                     preBuiltContext: providerCtx,
@@ -852,6 +866,16 @@ extension SwiftNativeChatOrchestrationClient {
             outcomeContext: providerCtx,
             outcomeTurnID: boundTurnId
         )
+        if !result.reply.isEmpty, await outputMilestoneGate.claim() {
+            TurnLifecycleTelemetry.emit(
+                .surfaceOutputEnqueued,
+                surface: surface,
+                sessionId: resolvedSession,
+                observedBy: "structured_stream.return",
+                turnId: boundTurnId,
+                on: turnTraceBus
+            )
+        }
         emitMetacognitiveTerminalTrace(
             turnId: boundTurnId,
             sessionId: resolvedSession,
@@ -967,6 +991,12 @@ extension SwiftNativeChatOrchestrationClient {
             ).capsuleChars,
             allowNonLiveProjection: Self.shouldProjectCognitiveStateForTrustedBridgeEnvelope(
                 userMessage
+            ),
+            turnKind: Self.cognitiveMessageTurnKind(
+                role: "user",
+                source: surface,
+                redactedContent: ChatSecretRedactor.redactText(userMessage),
+                origin: ChatPersistenceContext.originProvenance
             )
         )
     }

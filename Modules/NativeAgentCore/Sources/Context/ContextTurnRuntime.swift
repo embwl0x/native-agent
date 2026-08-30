@@ -17,6 +17,9 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
 
     public var valueIfReady: ContextQueryEmbeddingValue? { lock.withLock { value } }
 
+    /// Payload-free registration count for deterministic waiter-lifecycle tests.
+    var pendingWaiterCount: Int { lock.withLock { waiters.count } }
+
     /// Sweep R4 A5: the vector, waiting up to `timeoutNanoseconds` for a cold
     /// embedder to warm. Returns nil on timeout — the caller then proceeds
     /// exactly as the old never-wait behavior did, so a permanently cold or
@@ -26,6 +29,7 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     public func value(
         waitingUpTo timeoutNanoseconds: UInt64
     ) async -> ContextQueryEmbeddingValue? {
+        guard !Task.isCancelled else { return nil }
         if let ready = valueIfReady { return ready }
         guard timeoutNanoseconds > 0 else { return nil }
         let id = UUID()
@@ -38,29 +42,36 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
         // the lock — closes the window.
         let timeoutHolder = TaskHolder()
         defer { timeoutHolder.cancel() }
-        return await withCheckedContinuation {
-            (continuation: CheckedContinuation<ContextQueryEmbeddingValue?, Never>) in
-            // Re-check UNDER the lock: `publish` may have landed between the
-            // fast path above and here, and a continuation parked after the
-            // one-shot publish would only ever be resumed by the timeout.
-            var immediate: ContextQueryEmbeddingValue?
-            var alreadyResolved = false
-            lock.withLock {
-                if let ready = value {
-                    immediate = ready
-                    alreadyResolved = true
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation {
+                (continuation: CheckedContinuation<ContextQueryEmbeddingValue?, Never>) in
+                // Re-check UNDER the lock: cancellation may precede waiter
+                // registration, just as publication may precede it. Checking
+                // here closes the cancel-before-register lost-wakeup race.
+                var immediate: ContextQueryEmbeddingValue?
+                var alreadyResolved = false
+                lock.withLock {
+                    if Task.isCancelled {
+                        alreadyResolved = true
+                    } else if let ready = value {
+                        immediate = ready
+                        alreadyResolved = true
+                    } else {
+                        waiters[id] = continuation
+                    }
+                }
+                if alreadyResolved {
+                    continuation.resume(returning: immediate)
                 } else {
-                    waiters[id] = continuation
+                    timeoutHolder.store(Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                        self?.resumeWaiter(id)
+                    })
                 }
             }
-            if alreadyResolved {
-                continuation.resume(returning: immediate)
-            } else {
-                timeoutHolder.store(Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    self?.resumeWaiter(id)
-                })
-            }
+        } onCancel: {
+            self.resumeWaiter(id, cancelled: true)
+            timeoutHolder.cancel()
         }
     }
 
@@ -69,25 +80,29 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     private final class TaskHolder: @unchecked Sendable {
         private let holderLock = NSLock()
         private var task: Task<Void, Never>?
+        private var cancelled = false
         func store(_ t: Task<Void, Never>) {
             holderLock.lock(); defer { holderLock.unlock() }
-            task = t
+            if cancelled { t.cancel() }
+            else { task = t }
         }
         func cancel() {
             holderLock.lock(); defer { holderLock.unlock() }
+            cancelled = true
             task?.cancel()
+            task = nil
         }
     }
 
     /// Resume ONE waiter with whatever the ticket holds now (nil on timeout).
     /// Removing from the dictionary under the lock is what makes resume
     /// exactly-once across the publish/timeout race.
-    private func resumeWaiter(_ id: UUID) {
+    private func resumeWaiter(_ id: UUID, cancelled: Bool = false) {
         var continuation: CheckedContinuation<ContextQueryEmbeddingValue?, Never>?
         var current: ContextQueryEmbeddingValue?
         lock.withLock {
             continuation = waiters.removeValue(forKey: id)
-            current = value
+            current = cancelled ? nil : value
         }
         continuation?.resume(returning: current)
     }
@@ -256,6 +271,8 @@ public final class ContextPreparedTurn: @unchecked Sendable {
     private let feedbackLock = NSLock()
     private var outcomeRecorded = false
     private var memoryRecordProvenance: [String]?
+    private var atomMemoryRecords: [ContextAtomID: String] = [:]
+    private var correctedRecordIDs: Set<String> = []
 
     public init(
         mode: ContextFlowMode,
@@ -296,12 +313,33 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         feedbackLock.withLock { memoryRecordProvenance ?? [] }
     }
 
-    public func attachMemoryRecordProvenance(_ recordIDs: [String]) {
+    public func attachMemoryRecordProvenance(
+        _ recordIDs: [String], atomRecords: [ContextAtomID: String] = [:]
+    ) {
         let bounded = Array(Set(recordIDs.filter { !$0.isEmpty })).sorted().prefix(32)
         feedbackLock.withLock {
             guard memoryRecordProvenance == nil else { return }
             memoryRecordProvenance = Array(bounded)
+            let selected = Set(packet.receipt.selectedAtomIDs)
+            let acceptedRecords = Set(bounded)
+            atomMemoryRecords = atomRecords.filter {
+                selected.contains($0.key) && acceptedRecords.contains($0.value)
+            }
         }
+    }
+
+    /// Called only AFTER the canonical memory owner confirms a correction.
+    /// Exact selected-record attribution, independent of turn completion;
+    /// unrelated memories and duplicate tool retries receive no signal.
+    public func recordAppliedMemoryCorrection(recordID: String, replacementID: String) async {
+        guard !replacementID.isEmpty, replacementID != recordID else { return }
+        let atoms: [ContextAtomID] = feedbackLock.withLock {
+            let matched = atomMemoryRecords.filter { $0.value == recordID }.map(\.key).sorted()
+            guard !matched.isEmpty, correctedRecordIDs.insert(recordID).inserted else { return [] }
+            return matched
+        }
+        guard !atoms.isEmpty else { return }
+        await feedbackHandler?(.correction(.contradicts), atoms, ["memory-correction:\(replacementID)"])
     }
 
     public func recordExpansion(atomID: ContextAtomID, receiptID: String) async {

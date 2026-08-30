@@ -47,6 +47,7 @@ struct ActivityView: View {
     @Environment(AppModel.self) private var appModel
     @AppStorage(NativeExperiencePreferences.masterKey) private var experienceEnabled = false
     @State private var path = NavigationPath()
+    @State private var rootListIdentity = UUID()
     // B2.4: cognition proposals aren't mirrored into AppModel's badge counts;
     // this mounted owner reads the real runtime and consumes its change stream.
     @State private var cognitionSubscription = ActivityCognitionSubscription()
@@ -325,6 +326,10 @@ struct ActivityView: View {
                 }
             }
             .listStyle(.inset)
+            // Clearing NavigationPath alone leaves AppKit's selected link row
+            // behind. A requested return to root must also reset that selection
+            // so the same destination can be opened again.
+            .id(rootListIdentity)
             .navigationTitle("Activity")
             .navigationDestination(for: ActivitySection.self) { section in
                 switch section {
@@ -369,6 +374,7 @@ struct ActivityView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openActivityRootRequest)) { _ in
             appModel.pendingActivitySectionRaw = nil
             path = NavigationPath()
+            rootListIdentity = UUID()
         }
     }
 

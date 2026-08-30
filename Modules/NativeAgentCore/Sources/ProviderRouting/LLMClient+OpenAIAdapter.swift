@@ -304,6 +304,7 @@ public final class OpenAIAdapter: LLMAdapter {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")")))
                     return
                 }
+                defer { bytes.task.cancel() }
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if !(200..<300).contains(status) {
                     // 2026-07-21 audit: drain + preserve the provider error body
@@ -454,6 +455,7 @@ public final class OpenAIAdapter: LLMAdapter {
                     } catch {
                         throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
                     }
+                    defer { bytes.task.cancel() }
                     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                     if !(200..<300).contains(status) {
                         var errData = Data()

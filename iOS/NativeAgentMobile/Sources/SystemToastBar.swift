@@ -311,9 +311,29 @@ enum MacStatusChipPresentation {
         case .online: return "Live"
         case .awaitingMacActivity: return "Waiting for Mac"
         case .offline: return "No iCloud"
-        case .macUnreachable: return "Mac asleep"
+        case .macUnreachable: return "Mac unavailable"
+        case .deviceOffline: return "iPhone offline"
         case .stale(let minutesAgo): return "\(minutesAgo)m ago"
         case .connecting: return "Connecting"
+        }
+    }
+
+    static func explanation(for status: BridgeStatus) -> String {
+        switch status {
+        case .online:
+            return "The Mac checked in recently through iCloud. If it goes offline, new messages may wait until it returns."
+        case .awaitingMacActivity:
+            return "iCloud is available, but this phone has not received any activity from the Mac yet. Messages may wait until the Mac checks in."
+        case .offline:
+            return "This iPhone cannot reach iCloud right now, so nothing can be sent or received."
+        case .macUnreachable:
+            return "The paired Mac connection has not recovered. The Mac may be asleep or offline, or iCloud may be unavailable. Messages may wait until the connection returns."
+        case .deviceOffline:
+            return "This iPhone has no network connection. That is a local outage, not a Mac problem — messages are queued and send themselves when it returns."
+        case .stale:
+            return "The Mac has gone quiet. What you see may be out of date, and a new message may sit waiting."
+        case .connecting:
+            return "Still establishing the iCloud link. Give it a moment."
         }
     }
 }
@@ -331,7 +351,7 @@ private struct MacStatusDetail: View {
                     .font(AppFont.label)
                     .foregroundStyle(status.color)
             }
-            Text(explanation)
+            Text(MacStatusChipPresentation.explanation(for: status))
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -352,22 +372,6 @@ private struct MacStatusDetail: View {
         .frame(minWidth: 240, maxWidth: 300, alignment: .leading)
     }
 
-    private var explanation: String {
-        switch status {
-        case .online:
-            return "The Mac is awake and picking up what you send."
-        case .awaitingMacActivity:
-            return "iCloud is available, but this phone has not received any activity from the Mac yet. Messages may wait until the Mac checks in."
-        case .offline:
-            return "This iPhone cannot reach iCloud right now, so nothing can be sent or received."
-        case .macUnreachable:
-            return "iCloud is fine, but the Mac has not checked in. It is probably asleep or closed — anything you send waits until it wakes up."
-        case .stale:
-            return "The Mac has gone quiet. What you see may be out of date, and a new message may sit waiting."
-        case .connecting:
-            return "Still establishing the iCloud link. Give it a moment."
-        }
-    }
 }
 
 // MARK: - Sync error banner (Sweep R4 C11.3)
@@ -399,15 +403,26 @@ struct MacSyncErrorBanner: View {
         Group {
             if let message {
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "exclamationmark.icloud")
-                        .foregroundStyle(.orange)
-                        .accessibilityHidden(true)
-                    Text(message)
-                        .font(.footnote)
-                        .foregroundStyle(.primary)
-                        .lineLimit(isExpanded ? nil : 1)
-                        .fixedSize(horizontal: false, vertical: isExpanded)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button {
+                        isExpanded.toggle()
+                    } label: {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.icloud")
+                                .foregroundStyle(.orange)
+                                .accessibilityHidden(true)
+                            Text(message)
+                                .font(.footnote)
+                                .foregroundStyle(.primary)
+                                .lineLimit(isExpanded ? nil : 1)
+                                .fixedSize(horizontal: false, vertical: isExpanded)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Sync warning: \(message)")
+                    .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+                    .accessibilityHint(isExpanded ? "Collapses the warning" : "Reads the full warning")
                     Button {
                         dismissedMessage = message
                         isExpanded = false
@@ -428,9 +443,7 @@ struct MacSyncErrorBanner: View {
                     Rectangle().fill(Color.orange.opacity(0.35)).frame(height: 0.5)
                 }
                 .contentShape(Rectangle())
-                .onTapGesture { isExpanded.toggle() }
                 .accessibilityElement(children: .contain)
-                .accessibilityHint(isExpanded ? "Tap to collapse" : "Tap to read the full message")
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }

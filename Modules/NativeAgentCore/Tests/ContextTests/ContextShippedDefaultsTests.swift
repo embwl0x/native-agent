@@ -31,6 +31,9 @@ struct ContextShippedDefaultsTests {
         #expect(configuration.maximumPointers == 8)
         #expect(configuration.maximumAtomsPerSource == 2)
         #expect(configuration.maximumAtomsPerKind == 4)
+        #expect(configuration.maximumAtomsPerKindOverrides == [.memory: 8])
+        #expect(configuration.maximumAtoms(forKind: .memory) == 8)
+        #expect(configuration.maximumAtoms(forKind: .fact) == 4)
         #expect(configuration.minimumRelevance == 0.05)
         // The nested weights carry their own pin in ContextSelectionTests; what
         // matters here is that a bare configuration still routes to it rather

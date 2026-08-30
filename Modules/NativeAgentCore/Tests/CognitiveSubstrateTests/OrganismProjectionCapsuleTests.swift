@@ -166,7 +166,7 @@ private func capsuleLines(_ capsule: CognitiveCapsule) -> [String] {
         kind: "fact"
     ))
     #expect(!MemoryCandidateQuality.isDurableCandidate(
-        text: "- Body: resources feel tight; keep the next move lightweight.",
+        text: "- Body: internal workload fatigue is high; keep the next move lightweight.",
         source: "unit-test",
         kind: "fact"
     ))

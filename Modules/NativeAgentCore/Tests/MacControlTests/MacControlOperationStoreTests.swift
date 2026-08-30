@@ -406,6 +406,21 @@ private actor _UncancellableNotificationAdapter: NotificationCenterAdapter {
     #expect(result.verification == .satisfied)
 }
 
+@Test func perceptionReadsDoNotCreateOrReplayDurableMotorOperations() async throws {
+    let root = try operationTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = MacControlOperationStore(dataRoot: root)
+    let client = SwiftNativeMacControl(operationStore: store)
+
+    let result = try await client.dispatch(action: "ax_status", body: [
+        "operationId": .string("live-perception-must-not-replay"),
+    ])
+
+    #expect(result.action == "ax_status")
+    #expect(result.operationId == nil)
+    #expect(try await store.record(operationId: "live-perception-must-not-replay") == nil)
+}
+
 @Test func appFocusVerificationRequiresSeparateFrontmostObservation() async throws {
     let root = try operationTestRoot()
     defer { try? FileManager.default.removeItem(at: root) }

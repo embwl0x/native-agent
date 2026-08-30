@@ -30,10 +30,11 @@ private final class PartialCarryStreamingLLM: LLMClient, @unchecked Sendable {
     struct Boom: Error, LocalizedError {
         var errorDescription: String? { "scripted provider failure" }
     }
-    enum Ending: Sendable { case fail, cancel }
+    enum Ending: Sendable { case fail, cancel, waitForExternalFinish }
 
     private let deltas: [String]
     private let ending: Ending
+    private let heldContinuation = LockedBox<AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation?>(nil)
     nonisolated(unsafe) private(set) var callCount = 0
 
     init(deltas: [String], ending: Ending) {
@@ -57,13 +58,21 @@ private final class PartialCarryStreamingLLM: LLMClient, @unchecked Sendable {
         callCount += 1
         let deltas = self.deltas
         let ending = self.ending
+        let heldContinuation = self.heldContinuation
         return AsyncThrowingStream { continuation in
+            if case .waitForExternalFinish = ending { heldContinuation.set(continuation) }
             for delta in deltas { continuation.yield(.textDelta(delta)) }
             switch ending {
             case .fail: continuation.finish(throwing: Boom())
             case .cancel: continuation.finish(throwing: CancellationError())
+            case .waitForExternalFinish: break
             }
         }
+    }
+
+    func finishNormally() {
+        heldContinuation.get()?.finish()
+        heldContinuation.set(nil)
     }
 }
 
@@ -254,6 +263,52 @@ func streamCancelled_carriesThePartialAndIsDistinctFromInterrupted() async throw
     if case .streamInterrupted = error {
         Issue.record("a user Stop was misclassified as a provider interruption")
     }
+}
+
+@Test(arguments: [false, true])
+func streamCancelled_atSilentEOFCarriesPartial(usingCancelFlag: Bool) async throws {
+    let root = try partialNoticeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let flag = root.appendingPathComponent("cancelled.flag")
+    let partial = "This visible answer has not completed yet."
+    let llm = PartialCarryStreamingLLM(deltas: [partial], ending: .waitForExternalFinish)
+    let engine = makePartialCarryEngine(llm: llm)
+    let tools = MockToolDispatchClient()
+    let (visible, signalVisible) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    let task = Task {
+        try await engine.executeTurnWithStreamingToolLoop(
+            userMessage: "explain the build", llm: llm, tools: tools,
+            progress: { event in
+                if case .delta = event { signalVisible.yield(()) }
+            },
+            cancelFlagPath: usingCancelFlag ? flag : nil
+        )
+    }
+    defer {
+        task.cancel()
+        llm.finishNormally()
+        signalVisible.finish()
+    }
+    // The barrier proves the sole text event was consumed before cancellation;
+    // no later event or thrown provider error can activate the old event check.
+    for await _ in visible { break }
+    if usingCancelFlag {
+        try Data().write(to: flag)
+    } else {
+        task.cancel()
+    }
+    llm.finishNormally()
+    let result = await task.result
+    guard case .failure(let thrown) = result,
+          let error = thrown as? TurnEngineError,
+          case .streamCancelled(let carried, let underlying) = error else {
+        Issue.record("silent EOF after cancellation must not return a completed reply")
+        return
+    }
+    #expect(carried == partial)
+    #expect(underlying is CancellationError)
+    #expect(llm.callCount == 1)
+    #expect(tools.dispatches.isEmpty)
 }
 
 @Test

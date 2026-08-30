@@ -25,6 +25,38 @@ struct NativeAgentLaunchPreflightTests {
         #expect(!launchBody.contains("preparePublicReleaseDataRootIfNeeded"))
     }
 
+    @Test("healthy launch does not rebuild the complete memory graph")
+    func healthyLaunchUsesAdditiveKnowledgeGraphRepair() throws {
+        let launch = try AppSourceScraping.appSource("AppDelegate+Launch.swift")
+        let launchBody = try AppSourceScraping.functionBody(
+            named: "applicationDidFinishLaunching",
+            in: launch
+        )
+        let migrationGate = try #require(
+            launchBody.range(of: "if !report.skippedAlreadyMigrated")
+        )
+        let fullRebuild = try #require(
+            launchBody.range(of: "reconcileKnowledgeGraphProjection()")
+        )
+        #expect(migrationGate.lowerBound < fullRebuild.lowerBound)
+        #expect(AppSourceScraping.occurrences(
+            of: "reconcileKnowledgeGraphProjection()",
+            in: launchBody
+        ) == 1)
+
+        let sharedURL = try AppSourceScraping.repositoryRoot()
+            .appendingPathComponent(
+                "Modules/NativeAgentCore/Sources/MemoryV2/MemoryV2+SharedInstance.swift"
+            )
+        let shared = try String(contentsOf: sharedURL, encoding: .utf8)
+        let startup = try #require(shared.range(of: "Healthy launches only repair rows"))
+        let additive = try #require(shared.range(
+            of: "kgIndexer.backfillMissingMemoryIndexRows()",
+            range: startup.lowerBound..<shared.endIndex
+        ))
+        #expect(startup.lowerBound < additive.lowerBound)
+    }
+
     @Test("Codex cannot launch the dist GUI executable")
     func suppressesCodexDistLaunch() {
         #expect(NativeAgentLaunchPreflight.shouldSuppressGUIStart(

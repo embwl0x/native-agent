@@ -58,6 +58,60 @@ struct GitHubCommandStoreTests {
         return receipt
     }
 
+    @Test("unchanged live state reuses one replay and an append invalidates it")
+    func liveStateReplayMemo() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = GitHubCommandStore(dataRoot: root)
+        let key = GitHubCommandStore.memoKey(store.opsPath)
+        await GitHubCommandStore.sharedLiveStateMemo.forget(key: key)
+
+        _ = try await store.detect(
+            repository: "example/widgets",
+            number: 42,
+            kind: .pullRequest,
+            title: "Repair the widget"
+        )
+        let before = await GitHubCommandStore.sharedLiveStateMemo._testStats(key: key)
+        let cold = try await store.liveState()
+        let warm = try await store.liveState()
+        let cached = await GitHubCommandStore.sharedLiveStateMemo._testStats(key: key)
+
+        #expect(cold == warm)
+        #expect(cached.misses - before.misses == 1)
+        #expect(cached.hits - before.hits == 1)
+
+        _ = try await store.observe(observation(version: "quiet", waiting: .review))
+        let changed = try await store.liveState()
+        let invalidated = await GitHubCommandStore.sharedLiveStateMemo._testStats(key: key)
+        #expect(changed.item("example/widgets#42")?.state == .waitingUpstream(.review))
+        #expect(invalidated.misses - cached.misses == 1)
+        await GitHubCommandStore.sharedLiveStateMemo.forget(key: key)
+    }
+
+    @Test("batch observation primes its committed live state")
+    func batchObservationPrimesLiveState() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = GitHubCommandStore(dataRoot: root)
+        let key = GitHubCommandStore.memoKey(store.opsPath)
+        await GitHubCommandStore.sharedLiveStateMemo.forget(key: key)
+
+        _ = try await store.detect(
+            repository: "example/widgets", number: 42,
+            kind: .pullRequest, title: "Repair the widget"
+        )
+        _ = try await store.observe([
+            observation(version: "quiet", waiting: .review),
+        ])
+        let before = await GitHubCommandStore.sharedLiveStateMemo._testStats(key: key)
+        let state = try await store.liveState()
+        let after = await GitHubCommandStore.sharedLiveStateMemo._testStats(key: key)
+
+        #expect(state.item("example/widgets#42")?.state == .waitingUpstream(.review))
+        #expect(after.hits - before.hits == 1)
+        #expect(after.misses == before.misses)
+        await GitHubCommandStore.sharedLiveStateMemo.forget(key: key)
+    }
+
     @Test("store owns the complete transition path")
     func transitionPath() async throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }

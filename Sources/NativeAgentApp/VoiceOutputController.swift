@@ -74,14 +74,23 @@ enum OpenAIVoiceFailureDisposition: Equatable {
 final class VoiceOutputController: NSObject {
     typealias OpenAISynthesis = @Sendable (_ text: String) async throws -> Data
 
+    /// Manual message playback is globally singular: starting one bubble must
+    /// stop the previous bubble instead of allowing several speech engines to
+    /// talk over one another. Auto-read keeps its separate ChatView owner.
+    static let sharedMessagePlayback = VoiceOutputController()
+
     var isSpeaking: Bool = false
     var errorMessage: String? = nil
+    private(set) var speechOwnerID: String? = nil
+    private(set) var errorOwnerID: String? = nil
 
-    private let synthesizer = AVSpeechSynthesizer()
+    private var synthesizer: AVSpeechSynthesizer?
     private var audioPlayer: AVAudioPlayer?
+    private var pendingSynthesis: Task<Data, Error>?
     // Bumped on every speak()/stop() so an in-flight speakOpenAI can detect it was superseded across its network await.
     private(set) var speechGeneration: Int = 0
     private let openAISynthesis: OpenAISynthesis
+    private let audioPlayerFactory: (Data) throws -> AVAudioPlayer
     // Weak back-reference for app runtime settings, set by ChatView on init.
     var nativeBaseURL: String = ""
 
@@ -89,16 +98,40 @@ final class VoiceOutputController: NSObject {
         self.init(openAISynthesis: Self.liveOpenAISynthesis)
     }
 
-    init(openAISynthesis: @escaping OpenAISynthesis) {
+    init(
+        audioPlayerFactory: @escaping (Data) throws -> AVAudioPlayer = { try AVAudioPlayer(data: $0) },
+        openAISynthesis: @escaping OpenAISynthesis
+    ) {
+        self.audioPlayerFactory = audioPlayerFactory
         self.openAISynthesis = openAISynthesis
         super.init()
-        synthesizer.delegate = self
     }
 
-    func speak(text: String, mode: VoiceOutputMode = .local) async {
+    /// SwiftUI may retain several controller state locations while chat
+    /// surfaces are rebuilt. A synthesizer carries system speech-service state,
+    /// so create it only for an actual local utterance instead of once per
+    /// mounted controller.
+    private func localSynthesizer() -> AVSpeechSynthesizer {
+        if let synthesizer { return synthesizer }
+        let created = AVSpeechSynthesizer()
+        created.delegate = self
+        synthesizer = created
+        return created
+    }
+
+    var _localSynthesizerPreparedForTesting: Bool { synthesizer != nil }
+
+    func speak(
+        text: String,
+        mode: VoiceOutputMode = .local,
+        ownerID: String? = nil
+    ) async {
         guard !text.isEmpty else { return }
         stop()
         speechGeneration &+= 1
+        speechOwnerID = ownerID
+        errorMessage = nil
+        errorOwnerID = nil
         isSpeaking = true
         switch mode {
         case .local:
@@ -111,16 +144,34 @@ final class VoiceOutputController: NSObject {
     /// Preserve the policy-read result through the playback boundary. The
     /// actual fallback is still local AVSpeechSynthesizer, while the mounted
     /// chat surface receives a truthful notice when policy evidence was absent.
-    func speak(text: String, resolution: VoiceOutputModeResolution) async {
-        await speak(text: text, mode: resolution.mode)
+    func speak(
+        text: String,
+        resolution: VoiceOutputModeResolution,
+        ownerID: String? = nil
+    ) async {
+        await speak(text: text, mode: resolution.mode, ownerID: ownerID)
         if let notice = resolution.notice, isSpeaking {
             errorMessage = notice
+            errorOwnerID = ownerID
         }
+    }
+
+    func isSpeaking(ownerID: String) -> Bool {
+        isSpeaking && speechOwnerID == ownerID
+    }
+
+    func consumeError(ownerID: String) -> String? {
+        guard errorOwnerID == ownerID, let errorMessage else { return nil }
+        self.errorMessage = nil
+        errorOwnerID = nil
+        return errorMessage
     }
 
     func stop() {
         speechGeneration &+= 1
-        synthesizer.stopSpeaking(at: .immediate)
+        pendingSynthesis?.cancel()
+        pendingSynthesis = nil
+        synthesizer?.stopSpeaking(at: .immediate)
         // Wave 35 W18: detach the delegate BEFORE dropping the reference so a
         // superseded player can never deliver a stale didFinish/decodeError that
         // would stomp a newer playback's state. This is the sound supersession
@@ -131,15 +182,16 @@ final class VoiceOutputController: NSObject {
         audioPlayer?.stop()
         audioPlayer = nil
         isSpeaking = false
+        speechOwnerID = nil
     }
 
     func pause() {
-        synthesizer.pauseSpeaking(at: .word)
+        synthesizer?.pauseSpeaking(at: .word)
         audioPlayer?.pause()
     }
 
     func resume() {
-        synthesizer.continueSpeaking()
+        synthesizer?.continueSpeaking()
         audioPlayer?.play()
     }
 
@@ -149,7 +201,7 @@ final class VoiceOutputController: NSObject {
         let utterance = GenerationTaggedUtterance(string: text, generation: speechGeneration)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
-        synthesizer.speak(utterance)
+        localSynthesizer().speak(utterance)
         // isSpeaking set to false by delegate when done
     }
 
@@ -157,6 +209,14 @@ final class VoiceOutputController: NSObject {
         // Snapshot the current generation; if stop()/speak() runs during the network await,
         // it bumps speechGeneration and we must not clobber the new state when we resume.
         let generation = speechGeneration
+        let synthesis = Task { [openAISynthesis] in
+            try Task.checkCancellation()
+            return try await openAISynthesis(text)
+        }
+        pendingSynthesis = synthesis
+        defer {
+            if generation == speechGeneration { pendingSynthesis = nil }
+        }
         do {
             // Swift-native TTS: direct URLSession POST to OpenAI's
             // /v1/audio/speech through SwiftOpenAITTSClient. The key is
@@ -164,27 +224,45 @@ final class VoiceOutputController: NSObject {
             // installed .app bundle reads the app-owned provider config instead
             // of a CWD-relative path.
             let audioData: Data
-            audioData = try await openAISynthesis(text)
+            audioData = try await withTaskCancellationHandler {
+                try await synthesis.value
+            } onCancel: {
+                synthesis.cancel()
+            }
             // Superseded by a concurrent stop()/speak() while awaiting — bail without touching shared state.
             guard generation == speechGeneration else { return }
+            // Injected or underlying synthesis may ignore cancellation and still return bytes.
+            try Task.checkCancellation()
             // Detach any prior player's delegate before replacing it, so a
             // superseded player can't fire a stale callback (Wave 35 W18).
             audioPlayer?.delegate = nil
-            let player = try AVAudioPlayer(data: audioData)
+            let player = try audioPlayerFactory(audioData)
             player.delegate = self
             audioPlayer = player
-            player.play()
+            guard player.play() else {
+                errorMessage = "Audio playback could not start. Try reading aloud again."
+                errorOwnerID = speechOwnerID
+                stop()
+                return
+            }
             isSpeaking = true
         } catch {
             // Don't report/clear state if a concurrent stop()/speak() already superseded this call.
             guard generation == speechGeneration else { return }
+            if Task.isCancelled || error is CancellationError {
+                stop()
+                return
+            }
             switch OpenAIVoiceFailureDisposition.resolve(error) {
             case .fallbackToLocal(let message):
                 errorMessage = message
+                errorOwnerID = speechOwnerID
                 speakLocal(text: text)
             case .surfaceFailure(let message):
                 errorMessage = message
+                errorOwnerID = speechOwnerID
                 isSpeaking = false
+                speechOwnerID = nil
             }
         }
     }
@@ -232,6 +310,7 @@ extension VoiceOutputController: AVSpeechSynthesizerDelegate {
         Task { @MainActor in
             if let generation, generation != self.speechGeneration { return }
             self.isSpeaking = false
+            self.speechOwnerID = nil
         }
     }
 
@@ -240,6 +319,7 @@ extension VoiceOutputController: AVSpeechSynthesizerDelegate {
         Task { @MainActor in
             if let generation, generation != self.speechGeneration { return }
             self.isSpeaking = false
+            self.speechOwnerID = nil
         }
     }
 }

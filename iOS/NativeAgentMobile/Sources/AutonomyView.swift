@@ -141,6 +141,8 @@ struct AutonomyView: View {
         .listStyle(.insetGrouped)
         .navigationTitle("Self-Improvement")
         .macSyncErrorBanner()
+        // E6: freshness of the Mac snapshot behind this list.
+        .macSnapshotFreshnessBadge()
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await sync.refreshActivitySnapshot() }
         .task { await sync.refreshActivitySnapshot() }

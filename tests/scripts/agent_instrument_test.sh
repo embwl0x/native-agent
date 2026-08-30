@@ -44,10 +44,27 @@
 #
 set -uo pipefail
 
+TIMING_ONLY=0
+if [[ "${1:-}" == --turn-timing-only && $# == 1 ]]; then
+  TIMING_ONLY=1
+elif [[ $# != 0 ]]; then
+  echo "usage: $0 [--turn-timing-only]" >&2
+  exit 2
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TOOL="$REPO_ROOT/script/agent_instrument.swift"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/agent_instrument_test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
+# Compile ONCE and execute the binary everywhere below. Running the .swift
+# file through the interpreter re-type-checked and re-compiled the whole
+# instrument on each of the 53 invocations, which under concurrent build
+# load turned this smoke into a 90-minute silent "hang" (2026-08-27, the
+# B04 gate). One compile, then fast native runs.
+TOOL_BIN="$TMP/agent_instrument.bin"
+# These are tiny correctness fixtures. Optimizing this large source costs far
+# more than it saves across the native runs; keep compilation unoptimized.
+swiftc "$TOOL" -o "$TOOL_BIN" || exit 1
 
 FAILURES=0
 pass() { printf '  ok   %s\n' "$1"; }
@@ -57,6 +74,55 @@ check() { # check <name> <condition-exit-code>
 }
 
 [ -f "$TOOL" ] || { echo "missing $TOOL"; exit 2; }
+
+# Reproduce the canonical structured-tool-loop clock boundaries: context was
+# built before the engine timer began, while all work ended before terminal.
+TIMING_ROOT="$TMP/turn-timing"
+mkdir -p "$TIMING_ROOT/turn_traces"
+TIMING_DAY="$(date -u +%Y-%m-%d)"
+cat > "$TIMING_ROOT/turn_traces/$TIMING_DAY.jsonl" <<JSON
+{"kind":"turn.accepted","ts":"${TIMING_DAY}T00:00:00.000Z","turnId":"timing-probe","surface":"chat","payload":{}}
+{"kind":"context.summary","ts":"${TIMING_DAY}T00:00:00.435Z","turnId":"timing-probe","surface":"chat","payload":{"totalMs":434}}
+{"kind":"llm.call","ts":"${TIMING_DAY}T00:00:26.230Z","turnId":"timing-probe","surface":"chat","payload":{"durationMs":25632}}
+{"kind":"tool.dispatch","ts":"${TIMING_DAY}T00:00:17.888Z","turnId":"timing-probe","surface":"chat","payload":{"phase":"end","durationMs":27,"status":"ok"}}
+{"kind":"turn.terminal","ts":"${TIMING_DAY}T00:00:26.290Z","turnId":"timing-probe","surface":"chat","payload":{"schema":"metacognition.observed.v1","status":"completed","turnElapsedMs":25701}}
+JSON
+"$TOOL_BIN" --data-root "$TIMING_ROOT" --days 7 --out "$TMP/timing.md" > "$TMP/timing.log" 2>&1 || exit 1
+grep -qF '26290 ms total' "$TMP/timing.md"
+check "turn clock uses paired 26290ms lifecycle rather than 25701ms engine payload" $?
+grep -qF '| terminal payload clock (not additive) | 25.701 |' "$TMP/timing.md"
+check "engine payload remains separately observable" $?
+! grep -qE 'stamp more work|need timing-scope attribution|terminal row closes while|split is meaningful' "$TMP/timing.md"
+check "prebuilt assembly does not create a false timing inconsistency or partition" $?
+
+for variant in fallback excess absent; do
+  variant_root="$TMP/timing-$variant"
+  mkdir -p "$variant_root/turn_traces"
+  case "$variant" in
+    fallback) expression='select(.kind != "turn.accepted")';;
+    excess) expression='if .kind == "llm.call" then .payload.durationMs = 30000 else . end';;
+    absent) expression='select(.kind != "turn.accepted" and .kind != "turn.terminal")';;
+  esac
+  jq -c "$expression" "$TIMING_ROOT/turn_traces/$TIMING_DAY.jsonl" > "$variant_root/turn_traces/$TIMING_DAY.jsonl"
+  "$TOOL_BIN" --data-root "$variant_root" --days 7 --out "$TMP/timing-$variant.md" > "$TMP/timing-$variant.log" 2>&1 || exit 1
+done
+grep -qF '| paired accepted→terminal | source absent | source absent |' "$TMP/timing-fallback.md"
+check "missing lifecycle pairing stays absent, not a zero or payload-derived wall clock" $?
+grep -qF 'scope unknown fallback' "$TMP/timing-fallback.md"
+check "payload-only latency explicitly declares its unknown scope" $?
+! grep -q 'need timing-scope attribution' "$TMP/timing-fallback.md"
+check "unknown-scope payload is not used to accuse overlapping work" $?
+grep -qF 'paired lifecycle 26290 ms; model+tool+assembly sum 30461 ms; excess 4171 ms.' "$TMP/timing-excess.md"
+check "real sum excess retains exact millisecond evidence without inventing its cause" $?
+grep -qF 'A duration sum alone cannot prove post-terminal work' "$TMP/timing-excess.md"
+check "sum excess reports an attribution question, not an unsupported runtime diagnosis" $?
+grep -qF 'current end-to-end turn latency is unmeasured' "$TMP/timing-absent.md"
+check "absent terminal and paired clocks remain unmeasured" $?
+if [[ "$TIMING_ONLY" == 1 ]]; then
+  [[ "$FAILURES" == 0 ]] || exit 1
+  echo 'agent_instrument_test.sh: turn timing assertions passed'
+  exit 0
+fi
 
 # ── Build the synthetic data root ────────────────────────────────────────────
 ROOT="$TMP/data"
@@ -140,9 +206,8 @@ INSERT INTO cognitive_artifacts VALUES
  ('a3','standing_view','proposed',0,'{}',1000,1000);
 SQL
 
-# Passive organism sampler: an old but well-formed row must read DORMANT, not
-# as zero organism activity. This is intentionally just outside the 7-day
-# window; the writer's JSON shape is the real `organism_watch.sh` shape.
+# Passive organism sampler: an old but well-formed row without the writer's
+# lock marker is historical/inactive, not a failed resident lane.
 printf '{"at":"%s","ok":true,"enabled":true,"signalCount":1,"posture":"baseline"}\n' \
   "$(inst 8)" > "$ROOT/cognition/organism_watch.jsonl"
 
@@ -169,9 +234,8 @@ printf '{"planted": true, "n": 99}\n' > "$ROOT/plantedsubsystem/2026-08-19.jsonl
 #                      notifications/inbox.jsonl, memory.sqlite) deliberately
 #                      still missing, because other assertions above pin those
 #                      as absent.
-#   SYS-02/06/07/08  MEASURED, each carrying a planted fault the leads must
-#                      name: a loop failure streak, a stale Workshop lease and
-#                      an unstamped GitHub watcher snapshot.
+#   SYS-02/06/07/08  MEASURED: loop failures and an unstamped GitHub watcher
+#                      are faults; an old Workshop lease is only history.
 mkdir -p "$ROOT/logs" "$ROOT/desk" "$ROOT/orchestration" "$ROOT/mobile_push" \
          "$ROOT/notifications" "$ROOT/icloud" "$ROOT/memory" "$ROOT/heartbeat" \
          "$ROOT/notify" "$ROOT/connectors/github" \
@@ -179,8 +243,8 @@ mkdir -p "$ROOT/logs" "$ROOT/desk" "$ROOT/orchestration" "$ROOT/mobile_push" \
          "$ROOT/workshop/executions/8f14e45f-ceea-467a-9575-0e5e4ec1cbb1"
 
 # SYS-02: one healthy loop, one 5-day-stale loop, one loop failing repeatedly.
-printf '{"version": "1", "loops": {"healthyLoop": "%s", "staleLoop": "%s"}}\n' \
-  "$(inst 0)" "$(inst 5)" > "$ROOT/logs/background_loop_state.json"
+printf '{"version": "1", "loops": {"healthyLoop": "%s", "staleLoop": "%s", "workshop_pump": "%s"}}\n' \
+  "$(inst 0)" "$(inst 5)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/logs/background_loop_state.json"
 : > "$ROOT/logs/background_loop_failures.jsonl"
 for i in 1 2 3 4; do
   printf '{"kind": "failure", "loopId": "failingLoop", "createdAt": "%s", "error": "planted failure %d. detail"}\n' \
@@ -229,8 +293,8 @@ printf '[{"id": "focused-reply", "name": "Focused reply", "status": "active", "u
 printf '{"active_epoch": "planted-epoch-v1:abcdef", "at": "%s", "protected": true, "status": "current"}\n' \
   "$(inst 1)" > "$ROOT/memory/embedding_epoch_receipt.json"
 
-# SYS-06: a lease acquired 30h ago — past the 12h staleness bound, so the
-# stale-lease lead must fire.
+# SYS-06: old consumed-window history with a recent canonical pump tick must
+# retain the lease evidence without inventing a stopped-pump diagnosis.
 LEASE_STALE="$(date -u -v-30H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '30 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
 printf '{"acquiredAt": "%s", "holder": "workshop", "window": "planted-b0", "claims": [{"acquiredAt": "%s", "holder": "workshop", "window": "planted-b0"}]}\n' \
   "$LEASE_STALE" "$LEASE_STALE" > "$ROOT/workshop/background_lease.json"
@@ -291,7 +355,7 @@ mkdir -p "$ROOT/providers" "$ROOT/llm" "$ROOT/tools" "$ROOT/chat/archive" "$ROOT
 PLANTED_SECRET='sk-planted-DO-NOT-PRINT-3f9a'
 printf '{"chat": {"model": "claude-opus-5", "reasoningEffort": "high", "serviceTier": "default"}, "dream": {"model": "claude-x", "reasoningEffort": "medium", "serviceTier": "default"}}\n' \
   > "$ROOT/providers/surfaces.json"
-printf '{"chat": "anthropic", "dream": "ghostprovider", "cognition_cue": "anthropic"}\n' > "$ROOT/providers/active.json"
+printf '{"chat": "anthropic", "dream": "ghostprovider", "desk": "anthropic", "cognition_cue": "anthropic", "old_surface": "anthropic"}\n' > "$ROOT/providers/active.json"
 printf '{"auth_mode": "api_key", "default_model": "claude-opus-5", "api_key": "%s"}\n' "$PLANTED_SECRET" \
   > "$ROOT/providers/anthropic.json"
 printf '{"auth_mode": "oauth", "default_model": "gpt-5.5", "access_token": "%s"}\n' "$PLANTED_SECRET" \
@@ -348,11 +412,20 @@ printf '[{"id": "sess-live", "source": "app", "createdAt": "%s", "updatedAt": "%
   printf '{"id": "m2", "role": "assistant", "source": "app", "createdAt": "%s"}\n' "$(inst 1)"
   printf '{"id": "m3", "role": "user", "source": "telegram", "createdAt": "%s"}\n' "$(inst 40)"
 } > "$ROOT/chat/messages/sess-live.jsonl"
-# Canonical transcript deliberately absent from sessions.json: SYS-12 must
-# discover the directory population directly, count it, and flag its six
-# permanently-dark dimensions.
-printf '{"id":"m-dark","role":"assistant","content":"dark","createdAt":"%s","metadata":{"outcomeObservation":{"dimensionStates":{"responsePersistence":"unknown","context":"unknown","provider":"unknown","tools":"unknown","motor":"unknown","reaction":"unknown"}}}}\n' \
-  "$(inst 1)" > "$ROOT/chat/messages/unindexed-dark.jsonl"
+# Canonical transcripts deliberately absent from sessions.json: SYS-12 must
+# discover the directory population directly. The first proves strict durable
+# transcript adjacency promotes reaction only; the second proves a structured
+# feedback receipt does the same. The other five dimensions remain dark.
+{
+  printf '{"id":"request-dark","role":"user","sessionId":"unindexed-dark","runId":"run-dark","createdAt":"%s"}\n' "$(inst 1)"
+  printf '{"id":"m-dark","role":"assistant","sessionId":"unindexed-dark","runId":"run-dark","content":"dark","createdAt":"%s","metadata":{"outcomeObservation":{"schema":"response.outcome-observation.v2","messageID":"m-dark","sessionID":"unindexed-dark","turnID":"turn-dark","dimensionStates":{"responsePersistence":"unknown","context":"unknown","provider":"unknown","tools":"unknown","motor":"unknown","reaction":"unknown"}}}}\n' "$(inst 1)"
+  printf '{"id":"next-dark","role":"user","sessionId":"unindexed-dark","runId":"run-next","createdAt":"%s"}\n' "$(inst 1)"
+} > "$ROOT/chat/messages/unindexed-dark.jsonl"
+printf '{"id":"m-feedback","role":"assistant","sessionId":"unindexed-feedback","runId":"run-feedback","content":"feedback","createdAt":"%s","metadata":{"outcomeObservation":{"schema":"response.outcome-observation.v2","messageID":"m-feedback","sessionID":"unindexed-feedback","turnID":"turn-feedback","dimensionStates":{"responsePersistence":"unknown","context":"unknown","provider":"unknown","tools":"unknown","motor":"unknown","reaction":"unknown"}}}}\n' \
+  "$(inst 1)" > "$ROOT/chat/messages/unindexed-feedback.jsonl"
+mkdir -p "$ROOT/context"
+printf '{"schema":"response.feedback.v2","sessionId":"unindexed-feedback","messageId":"m-feedback","turnId":"turn-feedback","reaction":"thumbs_up"}\n' \
+  > "$ROOT/context/feedback.jsonl"
 printf '{"id": "sess-old", "archivedAt": "%s"}\n' "$(inst 40)" > "$ROOT/chat/archive/sessions.jsonl"
 printf '{"lastTurnAt": "%s", "state": "idle"}\n' "$(inst 1)" > "$ROOT/chat/mac_turn_lifecycle.json"
 
@@ -421,11 +494,14 @@ printf '[{"id":"flow-ok","status":"active","steps":[{"kind":"trace"}]},{"id":"fl
 } > "$ROOT/workflows/runs.jsonl"
 printf '{"id":"wf-stranded","status":"running"}\n' > "$ROOT/workflows/run_state/wf-stranded.json"
 touch -t 202001010000 "$ROOT/workflows/run_state/wf-stranded.json"
+printf '{"id":"wf-approval-history","status":"waiting_approval","activeStepAttempt":null}\n' > "$ROOT/workflows/run_state/wf-approval-history.json"
+printf '{"id":"wf-dispatch-intent","status":"running","activeStepAttempt":{"id":"attempt-1","phase":"dispatch_intent_persisted"}}\n' > "$ROOT/workflows/run_state/wf-dispatch-intent.json"
+touch -t 202001010000 "$ROOT/workflows/run_state/wf-approval-history.json" "$ROOT/workflows/run_state/wf-dispatch-intent.json"
 
 # ── 1. Happy path: run and capture ───────────────────────────────────────────
 echo "==> running instrument against the synthetic root"
 REPORT="$TMP/report.md"
-swift "$TOOL" --data-root "$ROOT" --days 7 --out "$REPORT" > "$TMP/stdout.md" 2> "$TMP/stderr.txt"
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --out "$REPORT" > "$TMP/stdout.md" 2> "$TMP/stderr.txt"
 RC=$?
 check "exits 0 on a valid synthetic root (rc=$RC)" "$([ $RC -eq 0 ] && echo 0 || echo 1)"
 [ $RC -eq 0 ] || { sed -n '1,40p' "$TMP/stderr.txt"; }
@@ -435,11 +511,17 @@ check "workflow run ledger renders a real three-source section" $?
 grep -qF 'retired\_kind=1' "$REPORT"
 check "workflow registry reports a kind the real executor cannot run" $?
 grep -qF 'waiting\_approval=1' "$REPORT"
-check "workflow run ledger retains an in-progress approval state" $?
+check "workflow run ledger retains an approval-waiting state" $?
 grep -qF 'failed=1' "$REPORT"
 check "workflow run ledger retains a refused terminal outcome" $?
-grep -qF 'stale non-terminal ids: `wf-stranded`' "$REPORT"
-check "workflow run-state reader flags an overdue in-progress run" $?
+grep -qF 'other non-terminal state ids unchanged >1h: `wf-stranded`' "$REPORT"
+check "workflow file age with no attempt remains unknown, not proven in flight" $?
+grep -qF 'approval wait ids unchanged >1h, no persisted active attempt: `wf-approval-history`' "$REPORT"
+check "old approval-only workflow stays distinct from dispatch evidence" $?
+grep -qF 'persisted attempt ids unchanged >1h: `wf-dispatch-intent`' "$REPORT"
+check "old dispatch intent still requires canonical outcome reconciliation" $?
+grep -qF 'exceeded the 1h drain window' "$REPORT"
+check "NEGATIVE CONTROL: file age does not invent a workflow drain deadline" "$([ $? -ne 0 ] && echo 0 || echo 1)"
 
 # ── 2. Dormant lane is flagged ───────────────────────────────────────────────
 echo "==> (a) dormant-lane detection"
@@ -475,24 +557,25 @@ check "leads carry an evidence citation" $?
 # ── 2b. Organism watch is a dated sampler, never a zero activity counter ───
 echo "==> (a.1) organism-watch sampler freshness"
 awk '/^### Organism watch sampler/{f=1} /^### Somatic signals/{f=0} f' "$REPORT" > "$TMP/organism-watch.md"
-grep -q 'DORMANT sampler' "$TMP/organism-watch.md"
-check "old organism-watch rows are labelled DORMANT sampler" $?
-grep -q '0 rows inside the 7d window' "$TMP/organism-watch.md"
-check "dormant organism watch reports no rows in-window, not zero activity" $?
+grep -q 'HISTORICAL / INACTIVE sampler' "$TMP/organism-watch.md"
+check "old organism-watch rows without a run marker are labelled historical/inactive" $?
+grep -q 'run marker: \*\*absent' "$TMP/organism-watch.md"
+check "inactive organism watch names the missing explicit run marker" $?
 grep -q '1 / 10000' "$TMP/organism-watch.md"
 check "organism watch reports its retained-row bound" $?
-awk '/^## \(j\) LEADS/{f=1} f' "$REPORT" | grep -q 'organism_watch.jsonl` is DORMANT'
-check "dormant organism watch produces a dated ranked lead" $?
+! awk '/^## \(j\) LEADS/{f=1} f' "$REPORT" | grep -q 'organism_watch.jsonl` is DORMANT'
+check "historical organism watch does not produce a current-failure lead" $?
 
-# Negative control: a current sample must be LIVE, not merely a present file
-# that this reader always calls dormant.
+# Negative control: a current sample with the writer's explicit marker must be
+# ACTIVE, not merely a present historical file.
 printf '{"at":"%s","ok":true,"enabled":true,"signalCount":1,"posture":"baseline"}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/cognition/organism_watch.jsonl"
+mkdir "$ROOT/cognition/organism_watch.jsonl.lock"
 WATCH_FRESH_REPORT="$TMP/organism-watch-fresh.md"
-swift "$TOOL" --data-root "$ROOT" --days 7 --out "$WATCH_FRESH_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --out "$WATCH_FRESH_REPORT" > /dev/null 2>&1
 awk '/^### Organism watch sampler/{f=1} /^### Somatic signals/{f=0} f' "$WATCH_FRESH_REPORT" > "$TMP/organism-watch-fresh-section.md"
-grep -q 'LIVE sampler' "$TMP/organism-watch-fresh-section.md"
-check "NEGATIVE CONTROL: current organism-watch sample is LIVE" $?
+grep -q 'ACTIVE sampler' "$TMP/organism-watch-fresh-section.md"
+check "NEGATIVE CONTROL: a current sample with the explicit marker is ACTIVE" $?
 grep -q 'DORMANT sampler' "$TMP/organism-watch-fresh-section.md"
 check "NEGATIVE CONTROL: current organism-watch sample is not DORMANT" \
   "$([ $? -ne 0 ] && echo 0 || echo 1)"
@@ -536,7 +619,7 @@ printf '{"version":1,"refs":{"floor":{"refKey":"floor","firstObservedAt":"%s","l
   "$(inst 0)" "$(inst 0)" "$(inst 0)" \
   "$(inst 0)" "$(inst 0)" "$(inst 0)" > "$CADENCE_ROOT/desk/cadence_stats.json"
 CADENCE_REPORT="$TMP/cadence.md"
-swift "$TOOL" --data-root "$CADENCE_ROOT" --days 7 --out "$CADENCE_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$CADENCE_ROOT" --days 7 --out "$CADENCE_REPORT" > /dev/null 2>&1
 CRC=$?
 [ "$CRC" -eq 0 ]
 check "cadence fixture runs (rc=$CRC)" $?
@@ -560,7 +643,7 @@ printf '{"ts":"%s","op":"create_item"}\n' "$(inst 0)" > "$STALE_CADENCE_ROOT/des
 printf '{"version":1,"refs":{"stale":{"refKey":"stale","firstObservedAt":"%s","lastObservedAt":"%s","lastChangeAt":"%s","observations":2,"changes":0}}}\n' \
   "$(inst 6)" "$(inst 6)" "$(inst 6)" > "$STALE_CADENCE_ROOT/desk/cadence_stats.json"
 STALE_CADENCE_REPORT="$TMP/cadence_stale.md"
-swift "$TOOL" --data-root "$STALE_CADENCE_ROOT" --days 1 --out "$STALE_CADENCE_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$STALE_CADENCE_ROOT" --days 1 --out "$STALE_CADENCE_REPORT" > /dev/null 2>&1
 awk '/^## \(j\) LEADS/{f=1} f' "$STALE_CADENCE_REPORT" | grep -q 'Desk cadence stats stopped updating while desk work continued'
 check "in-window Desk work plus stale cadence stats raises the freshness lead" $?
 
@@ -578,7 +661,7 @@ printf '{"canonical-now":{"last_fired_at":"%s"},"canonical-unstamped":{}}\n' "$(
 printf '{"legacy-only":{"last_fired_at":"2099-01-01T00:00:00Z"}}\n' \
   > "$TRIGGER_ROOT/inbox/trigger_state.json"
 TRIGGER_REPORT="$TMP/trigger_state.md"
-swift "$TOOL" --data-root "$TRIGGER_ROOT" --days 7 --out "$TRIGGER_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$TRIGGER_ROOT" --days 7 --out "$TRIGGER_REPORT" > /dev/null 2>&1
 TRC=$?
 [ "$TRC" -eq 0 ]
 check "canonical trigger-state fixture runs (rc=$TRC)" $?
@@ -604,7 +687,7 @@ printf '[{"name":"daily","kind":"time","enabled":true,"config":{"hour":8,"minute
 printf '{"daily":{"last_fired_at":"%s"}}\n' "$(inst 3)" \
   > "$STALE_TRIGGER_ROOT/triggers/trigger_state.json"
 STALE_TRIGGER_REPORT="$TMP/trigger_state_stale.md"
-swift "$TOOL" --data-root "$STALE_TRIGGER_ROOT" --days 7 --out "$STALE_TRIGGER_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$STALE_TRIGGER_ROOT" --days 7 --out "$STALE_TRIGGER_REPORT" > /dev/null 2>&1
 awk '/^## \(j\) LEADS/{f=1} f' "$STALE_TRIGGER_REPORT" | grep -q 'Canonical trigger claims have not advanced for enabled time triggers'
 check "stale canonical claim for an enabled time trigger raises the scheduler lead" $?
 
@@ -624,7 +707,7 @@ for component in $BACKUP_COMPONENTS; do
   printf '{}\n' > "$BACKUP_ROOT/backups/$BACKUP_ID/$component.json"
 done
 BACKUP_REPORT="$TMP/backups.md"
-swift "$TOOL" --data-root "$BACKUP_ROOT" --days 7 --out "$BACKUP_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$BACKUP_ROOT" --days 7 --out "$BACKUP_REPORT" > /dev/null 2>&1
 BRC=$?
 [ "$BRC" -eq 0 ]
 check "complete backup fixture runs (rc=$BRC)" $?
@@ -646,7 +729,7 @@ printf '[{"id":"%s","createdAt":"%s","path":"/untrusted/legacy/path","reason":"f
 printf '{}\n' > "$BROKEN_BACKUP_ROOT/backups/$BROKEN_BACKUP_ID/config.json"
 : > "$BROKEN_BACKUP_ROOT/backups/$BROKEN_BACKUP_ID/trust.json"
 BROKEN_BACKUP_REPORT="$TMP/backups_broken.md"
-swift "$TOOL" --data-root "$BROKEN_BACKUP_ROOT" --days 7 --out "$BROKEN_BACKUP_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$BROKEN_BACKUP_ROOT" --days 7 --out "$BROKEN_BACKUP_REPORT" > /dev/null 2>&1
 awk '/^### Backup generations/{f=1} /^### Desk backlog/{f=0} f' "$BROKEN_BACKUP_REPORT" > "$TMP/backups_broken_section.md"
 grep -qF 'claimed components: **3** · present: **2** · missing: **1**' "$TMP/backups_broken_section.md"
 check "newest incomplete backup reports its missing claimed component" $?
@@ -668,7 +751,7 @@ printf '{"sections":[]}\n' > "$LEGACY_CONTEXT_ROOT/context/cache/sections.json"
 sleep 1
 : > "$LEGACY_CONTEXT_ROOT/context/context.sqlite"
 LEGACY_CONTEXT_REPORT="$TMP/legacy_context.md"
-swift "$TOOL" --data-root "$LEGACY_CONTEXT_ROOT" --days 7 --out "$LEGACY_CONTEXT_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$LEGACY_CONTEXT_ROOT" --days 7 --out "$LEGACY_CONTEXT_REPORT" > /dev/null 2>&1
 LCRC=$?
 [ "$LCRC" -eq 0 ]
 check "legacy context fossil fixture runs (rc=$LCRC)" $?
@@ -690,7 +773,7 @@ sleep 1
 printf '{"generation":"revived"}\n' > "$REVIVED_CONTEXT_ROOT/context/22222222-2222-4222-8222-222222222222.json"
 printf '{"sections":["revived"]}\n' > "$REVIVED_CONTEXT_ROOT/context/cache/sections.json"
 REVIVED_CONTEXT_REPORT="$TMP/legacy_context_revived.md"
-swift "$TOOL" --data-root "$REVIVED_CONTEXT_ROOT" --days 7 --out "$REVIVED_CONTEXT_REPORT" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$REVIVED_CONTEXT_ROOT" --days 7 --out "$REVIVED_CONTEXT_REPORT" > /dev/null 2>&1
 awk '/^### Legacy context-generation cutover/{f=1} /^## \(b\)/{f=0} f' "$REVIVED_CONTEXT_REPORT" > "$TMP/legacy_context_revived_section.md"
 grep -cF '**ACTIVE AFTER CUTOVER**' "$TMP/legacy_context_revived_section.md" | grep -q '^2$'
 check "post-cutover legacy writes are named for both JSON and cache feeds" $?
@@ -701,7 +784,7 @@ check "post-cutover legacy writes raise the resolver-fallback lead" $?
 echo "==> (c) read-only discipline"
 # 4a. Refuses --out inside the data root.
 OUT_INSIDE="$ROOT/report.md"
-swift "$TOOL" --data-root "$ROOT" --days 7 --out "$OUT_INSIDE" > "$TMP/refuse.out" 2> "$TMP/refuse.err"
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --out "$OUT_INSIDE" > "$TMP/refuse.out" 2> "$TMP/refuse.err"
 RC=$?
 [ $RC -ne 0 ]
 check "refuses --out inside the data root (rc=$RC)" $?
@@ -710,18 +793,18 @@ check "refusal names itself in stderr" $?
 [ ! -e "$OUT_INSIDE" ]
 check "refused run created no file inside the data root" $?
 # 4b. Refuses a nested path inside the data root too.
-swift "$TOOL" --data-root "$ROOT" --out "$ROOT/traces/report.md" > /dev/null 2> "$TMP/refuse2.err"
+"$TOOL_BIN" --data-root "$ROOT" --out "$ROOT/traces/report.md" > /dev/null 2> "$TMP/refuse2.err"
 [ $? -ne 0 ] && grep -qi 'REFUSED' "$TMP/refuse2.err"
 check "refuses a NESTED --out inside the data root" $?
 # 4c. Negative control: an --out OUTSIDE the data root is accepted.
-swift "$TOOL" --data-root "$ROOT" --out "$TMP/outside.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$ROOT" --out "$TMP/outside.md" > /dev/null 2>&1
 [ $? -eq 0 ] && [ -s "$TMP/outside.md" ]
 check "NEGATIVE CONTROL: --out outside the data root is accepted" $?
 # 4d. A successful run mutates nothing in the data root.
 snap() { find "$ROOT" -print0 | xargs -0 stat -f '%N|%m|%z|%i' 2>/dev/null \
          || find "$ROOT" -printf '%p|%T@|%s|%i\n'; }
 snap | sort > "$TMP/before.txt"
-swift "$TOOL" --data-root "$ROOT" --days 7 > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$ROOT" --days 7 > /dev/null 2>&1
 snap | sort > "$TMP/after.txt"
 diff -q "$TMP/before.txt" "$TMP/after.txt" > /dev/null
 check "successful run leaves the data root byte-identical (mtime+size+inode)" $?
@@ -866,7 +949,7 @@ check "dark stage produces its own ranked LEAD" $?
 # Turn speed must have measured the fixture's lifecycle rows.
 grep -q '^## (f) Turn speed' "$REPORT"
 check "report has a turn-speed section" $?
-grep -q 'turns with a terminal row in window' "$REPORT"
+grep -q 'turns in diagnostic cohort' "$REPORT"
 check "turn speed reports end-to-end turn counts" $?
 awk '/^### Where the time goes/{f=1} /^### Assembly stages/{f=0} f' "$REPORT" | grep -q 'tool.dispatch'
 check "tool time is attributed (the \`\"phase\": \"end\"\` spacing trap)" $?
@@ -904,7 +987,7 @@ for i in $(seq 1 400); do
 done | sqlite3 "$CROOT/cognition/cognition.sqlite"
 
 # CONTROL: intact store reads clean, with real counts.
-swift "$TOOL" --data-root "$CROOT" --days 7 --out "$TMP/corrupt_control.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$CROOT" --days 7 --out "$TMP/corrupt_control.md" > /dev/null 2>&1
 CRC=$?
 [ $CRC -eq 0 ] && grep -q 'nodes: \*\*400\*\*' "$TMP/corrupt_control.md"
 check "CONTROL: intact fixture store reports its real 400 nodes (rc=$CRC)" $?
@@ -918,7 +1001,7 @@ check "CONTROL: the copy is integrity-gated with PRAGMA quick_check" $?
 DBF="$CROOT/cognition/cognition.sqlite"
 DBSIZE=$(wc -c < "$DBF" | tr -d ' ')
 head -c $((DBSIZE / 2)) "$DBF" > "$TMP/trunc.sqlite" && mv "$TMP/trunc.sqlite" "$DBF"
-swift "$TOOL" --data-root "$CROOT" --days 7 --out "$TMP/corrupt.md" > /dev/null 2>"$TMP/corrupt.err"
+"$TOOL_BIN" --data-root "$CROOT" --days 7 --out "$TMP/corrupt.md" > /dev/null 2>"$TMP/corrupt.err"
 RC=$?
 [ $RC -eq 0 ]
 check "corrupt store: run still exits 0 — a bad source is a finding, not a crash (rc=$RC)" $?
@@ -953,7 +1036,7 @@ else
        INSERT INTO cognitive_nodes VALUES ('n1','conversationFocus','{}',0,0,0,1000);"
   printf 'not-a-real-wal-but-it-exists-and-cannot-be-read' > "$WROOT/cognition/cognition.sqlite-wal"
   chmod 000 "$WROOT/cognition/cognition.sqlite-wal"
-  swift "$TOOL" --data-root "$WROOT" --days 7 --out "$TMP/wal.md" > /dev/null 2>&1
+  "$TOOL_BIN" --data-root "$WROOT" --days 7 --out "$TMP/wal.md" > /dev/null 2>&1
   WRC=$?
   chmod 644 "$WROOT/cognition/cognition.sqlite-wal"
   [ $WRC -eq 0 ]
@@ -965,7 +1048,7 @@ else
   awk '/^## \(j\) LEADS/{f=1} f' "$TMP/wal.md" | grep -q 'is UNREADABLE'
   check "sidecar failure raises a ranked LEAD" $?
   # NEGATIVE CONTROL: with the sidecar readable, the same store reads clean.
-  swift "$TOOL" --data-root "$WROOT" --days 7 --out "$TMP/wal_ok.md" > /dev/null 2>&1
+  "$TOOL_BIN" --data-root "$WROOT" --days 7 --out "$TMP/wal_ok.md" > /dev/null 2>&1
   grep -q 'sidecar -wal copy failed' "$TMP/wal_ok.md"
   check "NEGATIVE CONTROL: a readable sidecar produces no sidecar failure" \
     "$([ $? -ne 0 ] && echo 0 || echo 1)"
@@ -986,7 +1069,7 @@ printf '{"kind": "llm.call", "createdAt": "2026-08-20T12:00:00Z", "payload": {"s
 # A feed where EVERY line is garbage: unreadable, no matter the ratio rule.
 printf 'garbage one\ngarbage two\ngarbage three\ngarbage four\n' > "$MROOT/desk/desk_ops.jsonl"
 
-swift "$TOOL" --data-root "$MROOT" --days 7 --out "$TMP/malformed.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$MROOT" --days 7 --out "$TMP/malformed.md" > /dev/null 2>&1
 MRC=$?
 [ $MRC -eq 0 ]
 check "malformed JSONL: run exits 0 (rc=$MRC)" $?
@@ -1017,7 +1100,7 @@ check "NEGATIVE CONTROL: the clean synthetic root reports zero malformed lines" 
 # ── 13. --out through a symlink into the data root is refused ────────────────
 echo "==> (l) symlinked --out"
 ln -s "$ROOT/traces" "$TMP/sneak_dir"
-swift "$TOOL" --data-root "$ROOT" --out "$TMP/sneak_dir/report.md" > /dev/null 2>"$TMP/sneak.err"
+"$TOOL_BIN" --data-root "$ROOT" --out "$TMP/sneak_dir/report.md" > /dev/null 2>"$TMP/sneak.err"
 SRC=$?
 [ $SRC -ne 0 ] && grep -qi 'REFUSED' "$TMP/sneak.err"
 check "refuses --out through a symlinked DIR resolving into the data root (rc=$SRC)" $?
@@ -1025,7 +1108,7 @@ check "refuses --out through a symlinked DIR resolving into the data root (rc=$S
 check "no file was created inside the data root through the symlink" $?
 # A symlinked FILE whose target is inside the data root is refused too.
 ln -s "$ROOT/planted_out.md" "$TMP/sneak_file.md"
-swift "$TOOL" --data-root "$ROOT" --out "$TMP/sneak_file.md" > /dev/null 2>"$TMP/sneak2.err"
+"$TOOL_BIN" --data-root "$ROOT" --out "$TMP/sneak_file.md" > /dev/null 2>"$TMP/sneak2.err"
 SRC2=$?
 [ $SRC2 -ne 0 ] && grep -qi 'REFUSED' "$TMP/sneak2.err"
 check "refuses an --out that is a SYMLINK pointing into the data root (rc=$SRC2)" $?
@@ -1036,14 +1119,14 @@ check "the symlink target inside the data root was never created" $?
 # directories keep working.
 mkdir -p "$TMP/realout"
 ln -s "$TMP/realout" "$TMP/link_outside"
-swift "$TOOL" --data-root "$ROOT" --out "$TMP/link_outside/ok.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$ROOT" --out "$TMP/link_outside/ok.md" > /dev/null 2>&1
 [ $? -eq 0 ] && [ -s "$TMP/realout/ok.md" ]
 check "NEGATIVE CONTROL: a symlinked dir outside the data root is accepted" $?
 # O_NOFOLLOW itself: an --out that IS a symlink, even to a harmless target
 # outside the data root, is refused — the target cannot be re-verified after
 # the open, so the instrument never writes through one.
 ln -s "$TMP/realout/harmless.md" "$TMP/outside_link.md"
-swift "$TOOL" --data-root "$ROOT" --out "$TMP/outside_link.md" > /dev/null 2>"$TMP/nofollow.err"
+"$TOOL_BIN" --data-root "$ROOT" --out "$TMP/outside_link.md" > /dev/null 2>"$TMP/nofollow.err"
 NRC=$?
 [ $NRC -ne 0 ] && grep -qi 'REFUSED' "$TMP/nofollow.err" && grep -qi 'symlink' "$TMP/nofollow.err"
 check "O_NOFOLLOW: an --out that is itself a symlink is refused (rc=$NRC)" $?
@@ -1071,9 +1154,9 @@ build_injection_root() { # build_injection_root <dir> <extra-json-pair-or-empty>
 INJ='## fake ](x) `code` <b>&</b> |cell| \nsecond ### heading'
 build_injection_root "$TMP/data_inject" "\"$INJ\": 7, "
 build_injection_root "$TMP/data_inject_ctrl" ""
-swift "$TOOL" --data-root "$TMP/data_inject" --days 7 --out "$TMP/inject.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$TMP/data_inject" --days 7 --out "$TMP/inject.md" > /dev/null 2>&1
 IRC=$?
-swift "$TOOL" --data-root "$TMP/data_inject_ctrl" --days 7 --out "$TMP/inject_ctrl.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$TMP/data_inject_ctrl" --days 7 --out "$TMP/inject_ctrl.md" > /dev/null 2>&1
 [ $IRC -eq 0 ]
 check "injection fixture runs (rc=$IRC)" $?
 # Structure must be byte-identical in COUNT to the clean control.
@@ -1111,7 +1194,7 @@ check "NEGATIVE CONTROL: the injected row DOES carry escaped pipes (raw count di
 echo "==> (n) reach-walk failure is fatal"
 EROOT="$TMP/data_empty"
 mkdir -p "$EROOT"
-swift "$TOOL" --data-root "$EROOT" --days 7 --out "$TMP/empty.md" > /dev/null 2>"$TMP/empty.err"
+"$TOOL_BIN" --data-root "$EROOT" --days 7 --out "$TMP/empty.md" > /dev/null 2>"$TMP/empty.err"
 ERC=$?
 [ $ERC -ne 0 ]
 check "a walk that enumerates 0 files exits NONZERO (rc=$ERC)" $?
@@ -1154,7 +1237,7 @@ grep -E '^\| SYS-01 \|' "$TMP/sys.md" | grep -q '\*\*absent\*\*'
 check "SYS-01 (bridge lanes, hermetic on a synthetic root) is status **absent**" $?
 grep -E '^\| SYS-01 \|' "$TMP/sys.md" | grep -q 'source absent'
 check "SYS-01 renders the 'source absent' label" $?
-grep -E '^\| SYS-01 \|' "$TMP/sys.md" | grep -qE 'undelivered >24h|held-unreleased|stale-heartbeat|jobs 7d'
+grep -E '^\| SYS-01 \|' "$TMP/sys.md" | grep -qE 'terminal failed|unconsumed >24h|held-unreleased|stale-heartbeat|jobs 7d'
 check "NEGATIVE CONTROL: the absent organ prints NO bridge counts (not even 0)" \
   "$([ $? -ne 0 ] && echo 0 || echo 1)"
 grep -q '^### SYS-01 detail' "$TMP/sys.md"
@@ -1175,7 +1258,7 @@ check "skill registry reports lifecycle statuses without reading bodies" $?
 SKILL_REGISTRY_DAMAGE_ROOT="$TMP/data_skill_registry_damage"
 cp -R "$ROOT" "$SKILL_REGISTRY_DAMAGE_ROOT"
 printf '{"skills": {}}\n' > "$SKILL_REGISTRY_DAMAGE_ROOT/skills/registry.json"
-swift "$TOOL" --data-root "$SKILL_REGISTRY_DAMAGE_ROOT" --days 7 --out "$TMP/skill_registry_damage.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$SKILL_REGISTRY_DAMAGE_ROOT" --days 7 --out "$TMP/skill_registry_damage.md" > /dev/null 2>&1
 awk '/^### Skill registry inventory/{f=1} /^### SYS-11 detail/{f=0} f' "$TMP/skill_registry_damage.md" > "$TMP/skill_registry_damage_section.md"
 grep -q '\*\*source unreadable\*\*' "$TMP/skill_registry_damage_section.md"
 check "malformed skill registry is unreadable, never an empty registry" $?
@@ -1224,8 +1307,41 @@ check "SYS-05 still reports the planted tombstone file row" $?
 awk '/^## \(j\) LEADS/{f=1} f' "$REPORT" > "$TMP/leads.md"
 grep -q 'failingLoop` failed 4× in the 7-day window' "$TMP/leads.md"
 check "a loop failure streak produces a ranked LEAD" $?
-grep -q 'Workshop background lease last acquired' "$TMP/leads.md"
-check "a stale Workshop lease produces a ranked LEAD" $?
+grep -q 'Workshop background lease last acquired\|pump is not cycling' "$TMP/leads.md"
+check "NEGATIVE CONTROL: old lease history does not imply a stopped pump" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+grep -E '^\| SYS-06 \|' "$TMP/sys.md" | grep -q 'consumed-window history; not a heartbeat'
+check "Workshop row retains the lease history with its correct meaning" $?
+grep -E '^\| SYS-06 \|' "$TMP/sys.md" | grep -q 'pump: last recorded tick'
+check "Workshop activity uses the canonical pump tick" $?
+
+# Independent pump evidence cases: stale tick, absent/malformed tick source,
+# and a legitimate empty lease after releaseUnused. No real data is touched.
+PUMP_ROOT="$TMP/pump-evidence"
+mkdir -p "$PUMP_ROOT/logs"
+cp -R "$ROOT/workshop" "$PUMP_ROOT/workshop"
+printf '{"loops":{"workshop_pump":"%s"}}\n' "$(inst 5)" > "$PUMP_ROOT/logs/background_loop_state.json"
+"$TOOL_BIN" --data-root "$PUMP_ROOT" --days 7 --out "$TMP/pump-stale.md" >/dev/null 2>"$TMP/pump-stale.err"
+check "stale pump evidence fixture runs" $?
+grep -qE 'Workshop pump last recorded tick .*current activity unknown' "$TMP/pump-stale.md"
+check "old canonical pump tick remains an actionable evidence gap" $?
+rm "$PUMP_ROOT/logs/background_loop_state.json"
+"$TOOL_BIN" --data-root "$PUMP_ROOT" --days 7 --out "$TMP/pump-absent.md" >/dev/null 2>"$TMP/pump-absent.err"
+check "absent pump evidence fixture runs" $?
+grep -qF 'pump: tick unavailable (source absent); activity unknown' "$TMP/pump-absent.md"
+check "missing canonical tick is unknown despite old lease history" $?
+printf '{broken\n' > "$PUMP_ROOT/logs/background_loop_state.json"
+"$TOOL_BIN" --data-root "$PUMP_ROOT" --days 7 --out "$TMP/pump-corrupt.md" >/dev/null 2>"$TMP/pump-corrupt.err"
+check "corrupt pump evidence fixture runs" $?
+grep -E '^\| SYS-06 \|' "$TMP/pump-corrupt.md" | grep -q 'tick unavailable.*source unreadable.*activity unknown'
+check "corrupt canonical tick cannot borrow lease history as activity" $?
+printf '{"loops":{"workshop_pump":"%s"}}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$PUMP_ROOT/logs/background_loop_state.json"
+printf '{"claims":[]}\n' > "$PUMP_ROOT/workshop/background_lease.json"
+"$TOOL_BIN" --data-root "$PUMP_ROOT" --days 7 --out "$TMP/pump-empty.md" >/dev/null 2>"$TMP/pump-empty.err"
+check "empty returned lease fixture runs" $?
+grep -qF 'no consumed windows retained (empty claim history; not a heartbeat)' "$TMP/pump-empty.md"
+check "valid returned lease needs no acquiredAt stamp" $?
+grep -q 'Workshop background lease has no\|Workshop pump last recorded tick' "$TMP/pump-empty.md"
+check "NEGATIVE CONTROL: empty returned lease with current tick raises no pump lead" "$([ $? -ne 0 ] && echo 0 || echo 1)"
 grep -q 'GitHub watcher snapshot carries no timestamp' "$TMP/leads.md"
 check "an unstamped GitHub watcher snapshot produces a ranked LEAD" $?
 # NEGATIVE CONTROL: no bridge lead can be raised from the ABSENT bridge organ.
@@ -1308,7 +1424,7 @@ printf '{"createdAt": "%s", "state": "settled"}\n' "$(inst 1)" \
   > "$BCFG/claude-bridge/wake-jobs/job-a.json"
 printf '{"createdAt": "%s", "state": "settled"}\n' "$(inst 1)" \
   > "$BCFG/claude-bridge/wake-jobs/job-b.json"
-swift "$TOOL" --data-root "$ROOT" --days 7 --bridge-config-root "$BCFG" \
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --bridge-config-root "$BCFG" \
   --out "$TMP/bcfg.md" > /dev/null 2>&1
 BRC=$?
 sysrow() { awk '/^## \(h\) System matrix/{f=1} /^<a id="sec-i"/{f=0} f' "$2" | grep -E "^\| $1 \|"; }
@@ -1332,7 +1448,7 @@ perl -e 'utime time - 8 * 86400, time - 8 * 86400, $ARGV[0]' \
   "$MEMORY_RESIDUE_ROOT/memory/repairs/old.staged.json"
 printf '{"createdAt": "%s", "status": "ok"}\n' "$(inst 0)" \
   >> "$MEMORY_RESIDUE_ROOT/memory/hygiene.jsonl"
-swift "$TOOL" --data-root "$MEMORY_RESIDUE_ROOT" --days 7 --out "$TMP/memory_residue.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$MEMORY_RESIDUE_ROOT" --days 7 --out "$TMP/memory_residue.md" > /dev/null 2>&1
 sysrow SYS-05 "$TMP/memory_residue.md" | grep -q '\*\*9\*\*/8 generation(s)'
 check "memory feed flags backup generations beyond the named ceiling" $?
 sysrow SYS-05 "$TMP/memory_residue.md" | grep -q 'staged repairs: \*\*1\*\* staged, oldest'
@@ -1354,12 +1470,31 @@ check "NEGATIVE CONTROL: without --bridge-config-root SYS-01 measures nothing" \
 sysrow SYS-01 "$TMP/bcfg.md" | grep -q '\*\*partial\*\*'
 check "--bridge-config-root: a one-lane fixture reads **partial**, not measured" $?
 
+# 18a′. A dead-lettered brief is terminally failed, not still queued and not
+# successfully consumed. The sender-facing inbox retains the unread brief but
+# the two failure classes must stay separate in the diagnosis.
+BTERM="$TMP/bridge_terminal"
+mkdir -p "$BTERM/codex-nativeagent-bridge/reply-jobs"
+: > "$BTERM/codex-nativeagent-bridge/reply-deliveries.jsonl"
+{
+  printf '{"messageId":"dead-1","createdAt":"%s","read":false,"deliveryStatus":"dead_letter","deliveryTerminalAt":"%s","deliveryFailureReason":"terminal_result"}\n' "$(inst 2)" "$(inst 2)"
+  printf '{"messageId":"waiting-1","createdAt":"%s","read":false}\n' "$(inst 2)"
+} > "$BTERM/codex-nativeagent-bridge/codex-inbox.jsonl"
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --bridge-config-root "$BTERM" \
+  --out "$TMP/bterm.md" > /dev/null 2>&1
+sysrow SYS-01 "$TMP/bterm.md" | grep -q 'terminal failed: \*\*1\*\* · unconsumed >24h: \*\*1\*\*'
+check "dead-lettered and merely unconsumed bridge messages are counted separately" $?
+awk '/^## \(j\) LEADS/{f=1} f' "$TMP/bterm.md" | grep -q '1 bridge message(s) terminally failed delivery'
+check "an unread dead-lettered brief raises its own terminal-delivery lead" $?
+awk '/^## \(j\) LEADS/{f=1} f' "$TMP/bterm.md" | grep -q '1 bridge message(s) have sat unconsumed for over 24h'
+check "a separate genuinely unconsumed brief retains the consumer-backlog lead" $?
+
 # 18b. An ALL-UNPARSEABLE jobs directory is UNREADABLE, not "3 jobs in state
 # (unparseable)". Runs everywhere — no permission bit involved.
 BGAR="$TMP/bridge_garbage"
 mkdir -p "$BGAR/claude-bridge/wake-jobs"
 for n in 1 2 3; do printf 'this is not json at all\n' > "$BGAR/claude-bridge/wake-jobs/job-$n.json"; done
-swift "$TOOL" --data-root "$ROOT" --days 7 --bridge-config-root "$BGAR" \
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --bridge-config-root "$BGAR" \
   --out "$TMP/bgar.md" > /dev/null 2>&1
 GRC=$?
 [ $GRC -eq 0 ]
@@ -1387,7 +1522,7 @@ else
   printf '{"createdAt": "%s", "state": "settled"}\n' "$(inst 1)" \
     > "$BCHM/claude-bridge/wake-jobs/job-a.json"
   chmod 000 "$BCHM/claude-bridge/wake-jobs"
-  swift "$TOOL" --data-root "$ROOT" --days 7 --bridge-config-root "$BCHM" \
+  "$TOOL_BIN" --data-root "$ROOT" --days 7 --bridge-config-root "$BCHM" \
     --out "$TMP/bchm.md" > /dev/null 2>&1
   CRC2=$?
   chmod 755 "$BCHM/claude-bridge/wake-jobs"
@@ -1427,7 +1562,7 @@ printf '{"id": "cx-old", "createdAt": "%s", "phase": "watching_turn", "completed
   "$(inst 9)" "$(inst 9)" > "$BPRES/codex-nativeagent-bridge/reply-jobs/undelivered/nativeagent-codex-OLD.1786000000000.outcome_unknown.json"
 printf '{"id": "cx-new", "createdAt": "%s", "phase": "watching_turn", "completedExecution": {"turnResult": {"status": "completed", "completedAt": "%s", "message": "newer reply text"}}}\n' \
   "$(inst 2)" "$(inst 2)" > "$BPRES/codex-nativeagent-bridge/reply-jobs/undelivered/nativeagent-codex-NEW.1786600000000.outcome_unknown.json"
-swift "$TOOL" --data-root "$ROOT" --days 7 --bridge-config-root "$BPRES" \
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --bridge-config-root "$BPRES" \
   --out "$TMP/bpres.md" > /dev/null 2>&1
 PRC=$?
 [ $PRC -eq 0 ]
@@ -1457,7 +1592,7 @@ check "NEGATIVE CONTROL: no undelivered/ dir → no preserved LEAD" \
 BPGAR="$TMP/bridge_preserved_garbage"
 mkdir -p "$BPGAR/codex-nativeagent-bridge/reply-jobs/undelivered"
 for n in 1 2; do printf 'not json\n' > "$BPGAR/codex-nativeagent-bridge/reply-jobs/undelivered/bad-$n.json"; done
-swift "$TOOL" --data-root "$ROOT" --days 7 --bridge-config-root "$BPGAR" \
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --bridge-config-root "$BPGAR" \
   --out "$TMP/bpgar.md" > /dev/null 2>&1
 sysrow SYS-01 "$TMP/bpgar.md" | grep -q '\*\*UNREADABLE\*\*'
 check "an all-garbage undelivered/ dir marks SYS-01 **UNREADABLE**" $?
@@ -1474,7 +1609,7 @@ printf '{"kind": "llm.call", "createdAt": "%s", "payload": {"surface": "chat", "
   "$(inst 1)" > "$XROOT/traces/events.jsonl"
 printf 'not json\n' > "$XROOT/workshop/executions/e1/execution.json"
 printf 'not json\n' > "$XROOT/workshop/executions/e2/execution.json"
-swift "$TOOL" --data-root "$XROOT" --days 7 --no-bridge-config --out "$TMP/xgar.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$XROOT" --days 7 --no-bridge-config --out "$TMP/xgar.md" > /dev/null 2>&1
 XRC=$?
 [ $XRC -eq 0 ]
 check "all-unparseable executions dir: run still exits 0 (rc=$XRC)" $?
@@ -1504,7 +1639,7 @@ printf '{"version": "1", "loops": {"loopF": "%s", "loopC": "%s", "loopA": "%s", 
 : > "$LROOT/logs/background_loop_failures.jsonl"
 DRIFT=0
 for r in 1 2 3 4; do
-  swift "$TOOL" --data-root "$LROOT" --days 7 --no-bridge-config \
+  "$TOOL_BIN" --data-root "$LROOT" --days 7 --no-bridge-config \
     --out "$TMP/eq_$r.md" > /dev/null 2>&1
   awk '/^## \(h\) System matrix/{f=1} /^<a id="sec-i"/{f=0} f' "$TMP/eq_$r.md" > "$TMP/eq_sys_$r.md"
   [ "$r" -eq 1 ] || cmp -s "$TMP/eq_sys_1.md" "$TMP/eq_sys_$r.md" || DRIFT=$((DRIFT + 1))
@@ -1531,12 +1666,16 @@ echo "==> (s) wave-2 organs (SYS-09..15)"
 # ── SYS-09 providers/routing ──
 sysrow SYS-09 "$REPORT" | grep -q 'measured'
 check "SYS-09 (providers) is MEASURED on a root with pin + registry + trace" $?
-sysrow SYS-09 "$REPORT" | grep -q 'surface pins: \*\*2\*\* model-pinned / 3 surface(s)'
-check "SYS-09 counts model pins and the orphan routing key" $?
+sysrow SYS-09 "$REPORT" | grep -q 'surface pins: \*\*2\*\* model-pinned / 5 surface(s)'
+check "SYS-09 includes canonical desk plus compatibility and orphan routing keys" $?
 sysrow SYS-09 "$REPORT" | grep -q 'pins unresolvable: \*\*1\*\*'
 check "SYS-09 names the pin whose provider has no config file" $?
 sysrow SYS-09 "$REPORT" | grep -q 'pins on unknown surfaces: \*\*1\*\*'
 check "SYS-09 names a persisted provider pin that no canonical routing surface can consume" $?
+sysrow SYS-09 "$REPORT" | grep -q 'retired compatibility pins: \*\*1\*\* (`cognition_cue`)'
+check "SYS-09 recognizes cognition_cue as retired compatibility state, not an unknown surface" $?
+grep -q 'Retired compatibility pins (not failures).*`cognition_cue`' "$REPORT"
+check "SYS-09 detail labels cognition_cue as historical residue" $?
 sysrow SYS-09 "$REPORT" | grep -q 'ghostprovider'
 check "SYS-09 names the missing provider by id" $?
 sysrow SYS-09 "$REPORT" | grep -q 'substitutions in window: \*\*1\*\*'
@@ -1568,7 +1707,7 @@ CAPSULE_ABSENT_ROOT="$TMP/data_capsule_absent"
 mkdir -p "$CAPSULE_ABSENT_ROOT/turn_traces"
 printf '{"kind":"context.snapshot","ts":"%s","surface":"chat","payload":{"_preview":"{\\"dynamicBytes\\":1}"}}\n' "$(inst 1)" \
   > "$CAPSULE_ABSENT_ROOT/turn_traces/$(day 1).jsonl"
-swift "$TOOL" --data-root "$CAPSULE_ABSENT_ROOT" --days 7 --out "$TMP/capsule_absent.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$CAPSULE_ABSENT_ROOT" --days 7 --out "$TMP/capsule_absent.md" > /dev/null 2>&1
 awk '/^### Capsule anatomy/{f=1} /^### REM pins/{f=0} f' "$TMP/capsule_absent.md" | grep -q 'source absent'
 check "capsule anatomy labels an absent cognitivePreview source instead of rendering zero-rate rows" $?
 awk '/^### Capsule anatomy/{f=1} /^### REM pins/{f=0} f' "$TMP/capsule_absent.md" | grep -q '^| `fingerprint`'
@@ -1591,7 +1730,7 @@ check "SYS-10 fails the envelope for an eleven-call tool and a >25% overall fail
 TOOL_PASS_ROOT="$TMP/data_tool_envelope_pass"
 cp -R "$ROOT" "$TOOL_PASS_ROOT"
 perl -pi -e 's/"status": "failed"/"status": "ok"/g; s/"outcome": "failed"/"outcome": "completed"/g' "$TOOL_PASS_ROOT/traces/events.jsonl"
-swift "$TOOL" --data-root "$TOOL_PASS_ROOT" --days 7 --out "$TMP/tool_envelope_pass.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$TOOL_PASS_ROOT" --days 7 --out "$TMP/tool_envelope_pass.md" > /dev/null 2>&1
 sysrow SYS-10 "$TMP/tool_envelope_pass.md" | grep -q 'envelope \*\*PASS\*\* (≤25% overall; ≤25% per tool with ≥10 calls)'
 check "SYS-10 passes the same >=10-call envelope when the real event rows recover" $?
 sysrow SYS-10 "$REPORT" | grep -q 'gate refusals in window: \*\*1\*\*'
@@ -1628,22 +1767,27 @@ sysrow SYS-12 "$REPORT" | grep -q 'pinned: source absent'
 check "SYS-12's pinned cell says 'source absent', not 0 (per-feed guard)" $?
 sysrow SYS-12 "$REPORT" | grep -q 'sessions: \*\*2\*\* (app=1, telegram=1)'
 check "SYS-12 counts sessions per source" $?
-sysrow SYS-12 "$REPORT" | grep -q 'user \*\*1\*\* / assistant \*\*2\*\*'
+sysrow SYS-12 "$REPORT" | grep -q 'user \*\*3\*\* / assistant \*\*3\*\*'
 check "SYS-12 counts in-window turns from every canonical transcript file" $?
 sysrow SYS-12 "$REPORT" | grep -q 'archived: \*\*1\*\*'
 check "SYS-12 counts the archive tail" $?
 grep -q 'chat session(s) have an index row but no message file' "$TMP/leads.md"
 check "an index row with no transcript produces a ranked LEAD" $?
-# NEGATIVE CONTROL: the out-of-window message row is NOT counted as a turn.
-sysrow SYS-12 "$REPORT" | grep -q 'turns in window: \*\*4\*\*'
-check "NEGATIVE CONTROL: the 40-day-old message row is excluded from the window" \
-  "$([ $? -ne 0 ] && echo 0 || echo 1)"
+# NEGATIVE CONTROL: the 40-day-old message row is NOT counted as a turn; the
+# six current rows are exact.
+sysrow SYS-12 "$REPORT" | grep -q 'turns in window: \*\*6\*\*'
+check "NEGATIVE CONTROL: the 40-day-old message row is excluded from the window" $?
 sysrow SYS-12 "$REPORT" | grep -q 'absent \*\*1\*\* (reported separately, not zero)'
 check "SYS-12 reports absent outcome observations separately from zero" $?
 sysrow SYS-12 "$REPORT" | grep -q 'dark >95%'
 check "SYS-12 renders >95% non-terminal outcome lanes" $?
+sysrow SYS-12 "$REPORT" | grep -q '`reaction` \[observed=2\]'
+check "SYS-12 joins structured and adjacency reaction evidence into outcome health" $?
 grep -q 'Outcome dimension .* has no promoter wired' "$TMP/leads.md"
 check "SYS-12 ranks permanently-dark outcome lanes as promoter leads" $?
+grep -q 'Outcome dimension `reaction` has no promoter wired' "$TMP/leads.md"
+check "NEGATIVE CONTROL: reaction evidence prevents a false missing-promoter lead" \
+  "$([ $? -ne 0 ] && echo 0 || echo 1)"
 
 # Missing canonical population is an unavailable source, never six measured
 # zeroes. Keep this as a separate root so the branch cannot pass because the
@@ -1654,7 +1798,7 @@ printf '[]\n' > "$CHAT_ABSENT_ROOT/chat/sessions.json"
 : > "$CHAT_ABSENT_ROOT/chat/archive/sessions.jsonl"
 printf '[]\n' > "$CHAT_ABSENT_ROOT/chat/pinned_session_ids.json"
 printf '{}\n' > "$CHAT_ABSENT_ROOT/chat/mac_turn_lifecycle.json"
-swift "$TOOL" --data-root "$CHAT_ABSENT_ROOT" --days 7 \
+"$TOOL_BIN" --data-root "$CHAT_ABSENT_ROOT" --days 7 \
   --out "$TMP/chat_population_absent.md" > /dev/null 2>&1
 sysrow SYS-12 "$TMP/chat_population_absent.md" | grep -q 'canonical `chat/messages/` population is unavailable. This is not a zero.'
 check "SYS-12 labels a missing canonical population absent rather than zero" $?
@@ -1674,7 +1818,7 @@ else
   printf '{}\n' > "$CHAT_UNREADABLE_ROOT/chat/mac_turn_lifecycle.json"
   printf '{}\n' > "$CHAT_UNREADABLE_ROOT/chat/messages/hidden.jsonl"
   chmod 000 "$CHAT_UNREADABLE_ROOT/chat/messages"
-  swift "$TOOL" --data-root "$CHAT_UNREADABLE_ROOT" --days 7 \
+  "$TOOL_BIN" --data-root "$CHAT_UNREADABLE_ROOT" --days 7 \
     --out "$TMP/chat_population_unreadable.md" > /dev/null 2>&1
   CHAT_UNREADABLE_RC=$?
   chmod 755 "$CHAT_UNREADABLE_ROOT/chat/messages"
@@ -1739,7 +1883,7 @@ seed_sys13_complete_root() {
 
 SHROOT="$TMP/data_security_matrix_healthy"
 seed_sys13_complete_root "$SHROOT" '{"securityPolicy":{"originTrustEnabled":true,"signedRemoteCommandsRequired":true,"promptInjectionShieldEnabled":true,"secretFirewallEnabled":true,"rollbackByDefault":true,"auditReceiptsEnabled":true}}'
-swift "$TOOL" --data-root "$SHROOT" --days 7 --out "$TMP/security_matrix_healthy.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$SHROOT" --days 7 --out "$TMP/security_matrix_healthy.md" > /dev/null 2>&1
 sysrow SYS-13 "$TMP/security_matrix_healthy.md" | grep -q 'measured · healthy'
 check "complete SYS-13 fixture with all live protections enabled is measured healthy" $?
 sysrow SYS-13 "$TMP/security_matrix_healthy.md" | grep -q 'effective protective controls: \*\*6/6 enabled\*\*'
@@ -1750,7 +1894,7 @@ check "NEGATIVE CONTROL: healthy policy is not labelled weakened" \
 
 SAROOT="$TMP/data_security_matrix_adverse"
 seed_sys13_complete_root "$SAROOT" '{"securityPolicy":{"originTrustEnabled":false,"signedRemoteCommandsRequired":false,"promptInjectionShieldEnabled":false,"secretFirewallEnabled":false,"rollbackByDefault":false,"auditReceiptsEnabled":false}}'
-swift "$TOOL" --data-root "$SAROOT" --days 7 --out "$TMP/security_matrix_adverse.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$SAROOT" --days 7 --out "$TMP/security_matrix_adverse.md" > /dev/null 2>&1
 sysrow SYS-13 "$TMP/security_matrix_adverse.md" | grep -q 'measured · \*\*FAILING\*\*'
 check "complete SYS-13 fixture with disabled protections is measured failure" $?
 sysrow SYS-13 "$TMP/security_matrix_adverse.md" | grep -q 'effective protective controls: \*\*0/6 enabled\*\*; \*\*weakened:\*\* origin trust, remote command signing, prompt-injection shield, secret firewall, rollback receipts, audit receipts'
@@ -1769,7 +1913,7 @@ check "disabled live protections produce a ranked SYS-13 lead" $?
 SPROOT="$TMP/data_security_posture_partial"
 mkdir -p "$SPROOT/trust"
 printf '{"securityPolicy":{"killSwitchEnabled":true,"toolSigningRequired":true}}\n' > "$SPROOT/trust/policy.json"
-swift "$TOOL" --data-root "$SPROOT" --days 7 --out "$TMP/security_posture_partial.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$SPROOT" --days 7 --out "$TMP/security_posture_partial.md" > /dev/null 2>&1
 awk '/^### SYS-13 detail/{f=1} /^## \(i\)/{f=0} f' "$TMP/security_posture_partial.md" > "$TMP/security_posture_partial_section.md"
 grep -qF '| `killSwitchEnabled` | true | explicit |' "$TMP/security_posture_partial_section.md"
 check "partial trust policy keeps saved kill-switch intent explicit" $?
@@ -1793,7 +1937,7 @@ check "NEGATIVE CONTROL: a backfilled sibling is never relabeled as explicit" \
 # the reader must mark its source unreadable and refuse to infer per-key state.
 SUROOT="$TMP/data_security_posture_unreadable"
 seed_sys13_complete_root "$SUROOT" '{"securityPolicy":{"originTrustEnabled":"false"}}'
-swift "$TOOL" --data-root "$SUROOT" --days 7 --out "$TMP/security_posture_unreadable.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$SUROOT" --days 7 --out "$TMP/security_posture_unreadable.md" > /dev/null 2>&1
 sysrow SYS-13 "$TMP/security_posture_unreadable.md" | grep -q '\*\*UNREADABLE\*\*'
 check "malformed canonical security policy marks complete-source SYS-13 unreadable" $?
 awk '/^### SYS-13 detail/{f=1} /^## \(i\)/{f=0} f' "$TMP/security_posture_unreadable.md" > "$TMP/security_posture_unreadable_section.md"
@@ -1820,7 +1964,7 @@ sysrow SYS-14 "$REPORT" | grep -qE 'SUFeedURL|installed bundle:|Sparkle state:|C
 check "NEGATIVE CONTROL: the absent update organ prints NO bundle/feed reading" \
   "$([ $? -ne 0 ] && echo 0 || echo 1)"
 # And --no-machine-state names the FLAG as the reason, not a missing bundle.
-swift "$TOOL" --data-root "$ROOT" --days 7 --no-machine-state --out "$TMP/nomach.md" > /dev/null 2>&1
+"$TOOL_BIN" --data-root "$ROOT" --days 7 --no-machine-state --out "$TMP/nomach.md" > /dev/null 2>&1
 sysrow SYS-14 "$TMP/nomach.md" | grep -q '\*\*absent\*\*'
 check "--no-machine-state keeps SYS-14 absent" $?
 awk '/^## BOOM/{f=1} /^<a id="sec-sources"/{f=0} f' "$TMP/nomach.md" | grep -q 'organs measured'
@@ -1852,7 +1996,7 @@ RABSENT="$TMP/data_research_absent"
 mkdir -p "$RABSENT/turn_traces"
 printf '{"kind":"context.summary","ts":"%s","payload":{"counts":{},"flags":{},"stageMs":{}}}\n' "$(inst 1)" \
   > "$RABSENT/turn_traces/$(day 1).jsonl"
-swift "$TOOL" --data-root "$RABSENT" --days 7 --no-bridge-config --no-machine-state \
+"$TOOL_BIN" --data-root "$RABSENT" --days 7 --no-bridge-config --no-machine-state \
   --out "$TMP/research_absent.md" > /dev/null 2>&1
 sysrow SYS-15 "$TMP/research_absent.md" | grep -q 'source absent'
 check "SYS-15 labels a wholly absent research boundary source absent" $?
@@ -1869,7 +2013,7 @@ RUNREAD="$TMP/data_research_unreadable"
 mkdir -p "$RUNREAD/research/lab"
 printf '{"searxng_base_url": 9}\n' > "$RUNREAD/research/config.json"
 printf '[]\n' > "$RUNREAD/research/lab/runs.json"
-swift "$TOOL" --data-root "$RUNREAD" --days 7 --no-bridge-config --no-machine-state \
+"$TOOL_BIN" --data-root "$RUNREAD" --days 7 --no-bridge-config --no-machine-state \
   --out "$TMP/research_unreadable.md" > /dev/null 2>&1
 sysrow SYS-15 "$TMP/research_unreadable.md" | grep -q '\*\*UNREADABLE\*\*'
 check "SYS-15 marks malformed persisted connector configuration UNREADABLE" $?
@@ -1887,7 +2031,7 @@ mkdir -p "$RADVERSE/research/lab"
 printf '{"searxng_base_url": "http://research-fixture.invalid"}\n' > "$RADVERSE/research/config.json"
 printf '[{"id":"lab-failed","objective":"fixture","status":"needs_connector","createdAt":"%s","connector":"none"}]\n' "$(inst 1)" \
   > "$RADVERSE/research/lab/runs.json"
-swift "$TOOL" --data-root "$RADVERSE" --days 7 --no-bridge-config --no-machine-state \
+"$TOOL_BIN" --data-root "$RADVERSE" --days 7 --no-bridge-config --no-machine-state \
   --out "$TMP/research_adverse.md" > /dev/null 2>&1
 sysrow SYS-15 "$TMP/research_adverse.md" | grep -q 'measured · \*\*FAILING\*\*'
 check "SYS-15 ranks a persisted needs_connector run as an adverse outcome" $?
@@ -1922,7 +2066,7 @@ BABSENT="$TMP/data_browser_absent"
 mkdir -p "$BABSENT/turn_traces"
 printf '{"kind":"context.summary","ts":"%s","payload":{"counts":{},"flags":{},"stageMs":{}}}\n' "$(inst 1)" \
   > "$BABSENT/turn_traces/$(day 1).jsonl"
-swift "$TOOL" --data-root "$BABSENT" --days 7 --no-bridge-config --no-machine-state \
+"$TOOL_BIN" --data-root "$BABSENT" --days 7 --no-bridge-config --no-machine-state \
   --out "$TMP/browser_absent.md" > /dev/null 2>&1
 sysrow SYS-16 "$TMP/browser_absent.md" | grep -q 'source absent'
 check "SYS-16 labels missing Browser stores source absent" $?
@@ -1940,7 +2084,7 @@ printf '{"not":"a run array"}\n' > "$BUNREAD/native_power/browser/runs.json"
 printf '{"id":"receipt-ok","createdAt":"%s"}\n' "$(inst 1)" > "$BUNREAD/native_power/browser/receipts.jsonl"
 printf '{"kind":"context.summary","ts":"%s","payload":{"counts":{},"flags":{},"stageMs":{}}}\n' "$(inst 1)" \
   > "$BUNREAD/turn_traces/$(day 1).jsonl"
-swift "$TOOL" --data-root "$BUNREAD" --days 7 --no-bridge-config --no-machine-state \
+"$TOOL_BIN" --data-root "$BUNREAD" --days 7 --no-bridge-config --no-machine-state \
   --out "$TMP/browser_unreadable.md" > /dev/null 2>&1
 sysrow SYS-16 "$TMP/browser_unreadable.md" | grep -q '\*\*UNREADABLE\*\*'
 check "SYS-16 marks a malformed canonical Browser run store unreadable" $?
@@ -1977,7 +2121,7 @@ check "BOOM's uncovered count equals section (i)'s (${BOOM_UNCOV:-?} vs ${SEC_UN
 echo "==> (u) whole-report determinism over a frozen root"
 DET_DRIFT=0
 for r in 1 2 3; do
-  swift "$TOOL" --data-root "$ROOT" --days 7 --no-bridge-config --no-machine-state \
+  "$TOOL_BIN" --data-root "$ROOT" --days 7 --no-bridge-config --no-machine-state \
     --now 2026-08-21T12:00:00Z --out "$TMP/whole_$r.md" > /dev/null 2>&1
   [ "$r" -eq 1 ] || cmp -s "$TMP/whole_1.md" "$TMP/whole_$r.md" || DET_DRIFT=$((DET_DRIFT + 1))
 done
@@ -2032,6 +2176,9 @@ for i in 1 2 3; do
   printf '{"kind": "surface.outputEnqueued", "ts": "%sT10:00:05Z", "turnId": "w3-ok-%d", "surface": "chat", "payload": {"milestone": "surface.outputEnqueued", "observedBy": "surface"}}\n' "$W3D" "$i" >> "$W3DAY"
   printf '{"kind": "turn.terminal", "ts": "%sT10:00:05Z", "turnId": "w3-ok-%d", "surface": "chat", "payload": {"status": "completed", "turnElapsedMs": 5000}}\n' "$W3D" "$i" >> "$W3DAY"
 done
+# A later provider/tool round rebuilds context for the same turn. Multiplicity
+# is valid; the earliest context.ready still owns initial ordering.
+printf '{"kind": "context.ready", "ts": "%sT10:00:02.500Z", "turnId": "w3-ok-1", "surface": "chat", "payload": {"schema": "turn.lifecycle.v1", "milestone": "context.ready", "observedBy": "tool-loop-rebuild"}}\n' "$W3D" >> "$W3DAY"
 # ── VIOLATION 1: a terminal turn with NO `context.ready` ────────────────────
 printf '{"kind": "turn.accepted", "ts": "%sT11:00:00Z", "turnId": "w3-noready", "surface": "chat", "payload": {"milestone": "turn.accepted"}}\n' "$W3D" >> "$W3DAY"
 printf '{"kind": "surface.outputEnqueued", "ts": "%sT11:00:01Z", "turnId": "w3-noready", "surface": "chat", "payload": {"milestone": "surface.outputEnqueued"}}\n' "$W3D" >> "$W3DAY"
@@ -2052,6 +2199,8 @@ printf '{"kind": "experimental.newlane", "ts": "%sT11:30:00Z", "turnId": "w3-ok-
 printf '{"kind": "motor.state", "ts": "%sT11:40:00Z", "turnId": "motor-closed", "payload": {"schema": "motor.action.read-model.v1", "actionIdentity": "closedaction", "phase": "running", "domain": "mac", "domainState": "x", "verification": "pending", "payloadFree": true, "controlAuthority": false}}\n' "$W3D" >> "$W3DAY"
 printf '{"kind": "motor.state", "ts": "%sT11:41:00Z", "turnId": "motor-closed", "payload": {"schema": "motor.action.read-model.v1", "actionIdentity": "closedaction", "phase": "succeeded", "domain": "mac", "domainState": "x", "verification": "satisfied", "payloadFree": true, "controlAuthority": false}}\n' "$W3D" >> "$W3DAY"
 printf '{"kind": "motor.state", "ts": "%sT11:42:00Z", "turnId": "motor-open", "payload": {"schema": "motor.action.read-model.v1", "actionIdentity": "halfopenaction", "phase": "waiting_external", "domain": "mac", "domainState": "y", "verification": "pending", "payloadFree": true, "controlAuthority": false}}\n' "$W3D" >> "$W3DAY"
+printf '{"kind": "motor.state", "ts": "%sT11:43:00Z", "turnId": "github-ready", "payload": {"schema": "motor.action.read-model.v1", "actionIdentity": "githubready", "phase": "ready", "domain": "github_command", "domainState": "found", "verification": "not_started", "payloadFree": true, "controlAuthority": false}}\n' "$W3D" >> "$W3DAY"
+printf '{"kind": "motor.state", "ts": "%sT11:44:00Z", "turnId": "github-wait", "payload": {"schema": "motor.action.read-model.v1", "actionIdentity": "githubwait", "phase": "waiting_external", "domain": "github_command", "domainState": "waiting_upstream", "verification": "satisfied", "payloadFree": true, "controlAuthority": false}}\n' "$W3D" >> "$W3DAY"
 # ── The remaining dark lanes, one row each ──────────────────────────────────
 printf '{"kind": "context.stage", "ts": "%sT11:50:00Z", "turnId": "w3-ok-1", "surface": "chat", "payload": {"stage": "contextFlow.attention", "elapsedMs": 12}}\n' "$W3D" >> "$W3DAY"
 printf '{"kind": "turn.failed", "ts": "%sT11:51:00Z", "turnId": "w3-failed", "surface": "chat", "payload": {"reason": "toolLoopExhausted", "iteration": 3, "dispatchCount": 9}}\n' "$W3D" >> "$W3DAY"
@@ -2135,6 +2284,7 @@ printf '{"ts": "%s", "ok": true}\n' "$(inst 1)" > "$W3/telegram/receipts.jsonl"
 # …and an impossible offset plus an inbox that is not draining.
 printf '{"offset": -7}\n' > "$W3/telegram/last_offset.json"
 printf '{"update_id": 1}\n' > "$W3/telegram/update_inbox/1.json"
+printf '{"schemaVersion":1,"entries":{"1":{"updateId":1,"phase":"pending"}}}\n' > "$W3/telegram/update_inbox/claims_index.json"
 touch -t 202601010101 "$W3/telegram/update_inbox/1.json"
 
 # doctor — a STALE verdict that still names a failing check. Self-healing reads
@@ -2150,7 +2300,9 @@ printf '{"access_token": "%s", "refresh_token": "%s-refresh", "expires_at": "202
 
 # mac_control — 5 operations against 1 `mac.*` dispatch row: a 5x divergence
 # between two records of the same action.
-printf '{"operations": [{"id": "o1", "status": "failed"}, {"id": "o2", "status": "failed"}, {"id": "o3", "status": "failed"}, {"id": "o4", "status": "failed"}, {"id": "o5", "status": "ok"}], "schema": "v1"}\n' \
+W3_MAC_OPERATION_AT="$(inst 1)"
+printf '{"operations": [{"id": "o1", "state": "failed", "terminalAt": "%s"}, {"id": "o2", "state": "failed", "terminalAt": "%s"}, {"id": "o3", "state": "failed", "terminalAt": "%s"}, {"id": "o4", "state": "failed", "terminalAt": "%s"}, {"id": "o5", "state": "completed", "terminalAt": "%s"}], "schema": "v1"}\n' \
+  "$W3_MAC_OPERATION_AT" "$W3_MAC_OPERATION_AT" "$W3_MAC_OPERATION_AT" "$W3_MAC_OPERATION_AT" "$W3_MAC_OPERATION_AT" \
   > "$W3/mac_control/operations.json"
 
 # feeds.macctl_bridge_and_browser_ipc — local discovery is shape-only. These
@@ -2183,7 +2335,7 @@ printf '1\n' > "$W3/chat/sessions/s-live/cancelled.flag"
 touch -t 202601010101 "$W3/chat/sessions/s-live/cancelled.flag"
 
 W3REPORT="$TMP/w3report.md"
-swift "$TOOL" --data-root "$W3" --days 7 --no-bridge-config --no-machine-state \
+"$TOOL_BIN" --data-root "$W3" --days 7 --no-bridge-config --no-machine-state \
   --out "$W3REPORT" > /dev/null 2>"$TMP/w3.err"
 W3RC=$?
 check "wave-3 fixture root: run exits 0 (rc=$W3RC)" "$([ $W3RC -eq 0 ] && echo 0 || echo 1)"
@@ -2214,8 +2366,8 @@ check "a kind with no declaration appears in the table with its real count" $?
 W3_ROW="$(grep -F '| `experimental.newlane` |' "$TMP/w3_i1.md")"
 grep -qF 'UNDECLARED — vocabulary drift' <<< "$W3_ROW"
 check "…and is labelled UNDECLARED (vocabulary drift)" $?
-grep -qF '| `context.ready` | 5 | 5 |' "$TMP/w3_i1.md"
-check "NEGATIVE CONTROL: a live milestone reports its real 5 rows, not a state label" $?
+grep -qF '| `context.ready` | 6 | 6 |' "$TMP/w3_i1.md"
+check "NEGATIVE CONTROL: context.ready reports all initial and rebuild rows without calling multiplicity a violation" $?
 grep -qF 'cheap-scan cross-check: **0 disagreement(s)**' "$TMP/w3_i1.md"
 check "the byte scanner is cross-checked against the JSON parser (0 disagreements)" $?
 grep -qF 'declared turn-trace kind(s) are INERT' "$TMP/w3_leads.md"
@@ -2233,21 +2385,21 @@ else
   grep -qF 'day file(s) are present and could not be opened' "$TMP/w3_leads.md"
   check "an unreadable day file raises a ranked LEAD" $?
 fi
-grep -qF "| \`$W3D.jsonl\` | yes | 47 | 0 |" "$TMP/w3_i1.md"
-check "NEGATIVE CONTROL: the readable day file reports opened=yes and its 47 rows" $?
+grep -qF "| \`$W3D.jsonl\` | yes | 50 | 0 |" "$TMP/w3_i1.md"
+check "NEGATIVE CONTROL: the readable day file reports opened=yes and its 50 rows" $?
 
 # ── (i.1) LIFECYCLE PAIRING ────────────────────────────────────────────────
-grep -qF '| every terminal turn carries exactly one `context.ready` | 6 | 1 | **1 violation(s)** |' "$TMP/w3_i1.md"
-check "the terminal turn with no context.ready is 1 violation out of 6 checked" $?
+grep -qF '| every terminal turn carries ≥1 `context.ready` | 6 | 1 | **1 violation(s)** |' "$TMP/w3_i1.md"
+check "the terminal turn with no context.ready is 1 violation out of 6 while a valid rebuild is accepted" $?
 grep -qF '| `context.ready` precedes `provider.requestStarted` | 4 | 1 | **1 violation(s)** |' "$TMP/w3_i1.md"
 check "the inverted ready/requestStarted pair is 1 violation out of 4 checked" $?
-grep -qF '| every ok-terminal turn carries ≥1 `surface.outputEnqueued` | 6 | 1 | **1 violation(s)** |' "$TMP/w3_i1.md"
-check "the ok-terminal turn with no enqueue milestone is 1 violation out of 6" $?
+grep -qF '| every accepted ok-terminal turn carries ≥1 `surface.outputEnqueued` | 6 | 1 | **1 violation(s)** |' "$TMP/w3_i1.md"
+check "the accepted ok-terminal turn with no enqueue milestone is 1 violation out of 6" $?
 # NEGATIVE CONTROL: the healthy turns are NOT counted as violations. A checker
 # that flagged every turn would satisfy all three assertions above.
 grep -qF '| `turn.accepted` → `context.ready` elapsed is non-negative | 5 | 0 | ok |' "$TMP/w3_i1.md"
 check "NEGATIVE CONTROL: the ordering check with no violation reads 'ok', 0 of 5" $?
-grep -qF 'do not carry exactly one `context.ready`' "$TMP/w3_leads.md"
+grep -qF 'terminal turn(s) carry no `context.ready`' "$TMP/w3_leads.md"
 check "the missing-context.ready violation raises a ranked LEAD" $?
 grep -qF 'precedes `context.ready` on 1 turn(s)' "$TMP/w3_leads.md"
 check "the inverted assembly/provider boundary raises its own ranked LEAD" $?
@@ -2261,8 +2413,10 @@ grep -qF 'rows in window: **6** = ' "$TMP/w3_i1.md"
 check "stream.tick reports its share of the whole feed (its retention-budget cost)" $?
 grep -qF 'ticks per turn: p50 2 · p95 2 · max 2 over 3 turn(s)' "$TMP/w3_i1.md"
 check "per-turn tick counts are measured against that ceiling" $?
-grep -qF '| `motor.state` half-open actions | 1 of 2 never reached a terminal phase |' "$TMP/w3_i1.md"
-check "the half-open motor action is named 1 of 2 — the succeeded one is not" $?
+grep -qF '| `motor.state` half-open actions | 1 of 4 never reached a terminal phase |' "$TMP/w3_i1.md"
+check "the half-open Mac motor action is named while intentional GitHub waits are excluded" $?
+grep -qF '| `motor.state` intentional GitHub waits | **2** `github_command` action(s)' "$TMP/w3_i1.md"
+check "ready and waiting_external GitHub watcher states are reported as intentional, not abandoned" $?
 grep -qF 'motor action(s) never reached a terminal phase' "$TMP/w3_leads.md"
 check "the half-open motor action raises a ranked LEAD" $?
 grep -qF '| `memory.commit` two feeds | turn_traces **1** vs traces/events.jsonl **0** row(s) in window |' "$TMP/w3_i1.md"
@@ -2291,10 +2445,10 @@ grep -qF 'sessions whose compact artifacts are NOT smaller than the live transcr
 check "a compaction artifact bigger than its source is named" $?
 grep -qF 'compaction artifacts no smaller than the live transcript' "$TMP/w3_leads.md"
 check "the non-shrinking compaction raises a ranked LEAD" $?
-grep -qF '**1** older than 1d' "$TMP/w3_i2.md"
-check "a cancelled.flag that outlived its turn is named against a stated age bound" $?
+grep -qF '**1** cleanup residue older than 1d; turn acceptance clears the session flag before execution' "$TMP/w3_i2.md"
+check "an old cancelled.flag is reported as cleanup residue, not a live cancellation hazard" $?
 grep -qF 'have outlived their turn' "$TMP/w3_leads.md"
-check "the stale cancellation flag raises a ranked LEAD" $?
+check "old cancellation residue does not raise a false live-turn LEAD" "$([ $? -ne 0 ] && echo 0 || echo 1)"
 grep -qF 'rows: **43 / 5000** line cap' "$TMP/w3_i2.md"
 check "activity/events.jsonl is measured against its line cap" $?
 grep -qF 'trim trigger' "$TMP/w3_i2.md"
@@ -2303,8 +2457,10 @@ grep -qF 'kinds that the FIRST eviction would remove entirely (≤2 rows): **3**
 check "the rare kinds an eviction would erase are named BEFORE the trim" $?
 grep -qF '`approvals`' "$TMP/w3_i2.md"
 check "…by name, not as a count" $?
-grep -qF 'has no retention' "$TMP/w3_leads.md"
-check "builder_audit crossing its stated age bound raises a ranked LEAD" $?
+grep -qF 'receipts: **2 / 500** writer-retention bound' "$TMP/w3_i2.md"
+check "builder_audit reports its real 500-receipt writer bound" $?
+grep -qF '`builder_audit/` has no retention' "$TMP/w3_leads.md"
+check "old retained builder receipts do not raise a false no-retention LEAD" "$([ $? -ne 0 ] && echo 0 || echo 1)"
 # feeds.logs.uncovered — the general error feed must be counted beside the
 # scheduler's failure feed, while opaque .txt logs are bounded by metadata only.
 grep -qF 'text files: **2**' "$TMP/w3_i2.md"
@@ -2335,8 +2491,8 @@ grep -qF 'live-path shadows: **1**' "$TMP/w3_i2.md" && grep -qF 'shadows LIVE' "
 check "the disabled github-command snapshot is matched to its live counterpart" $?
 grep -qF 'live-reader guard: **0** non-shadow readers resolve under `disabled/`' "$TMP/w3_i2.md"
 check "no live instrument reader resolves a disabled path" $?
-grep -qF '`disabled/` contains 1 file(s) that shadow a live operational path' "$TMP/w3_leads.md"
-check "a disabled tree with a live-path twin raises a subject-pinning LEAD" $?
+! grep -qF '`disabled/` contains 1 file(s) that shadow a live operational path' "$TMP/w3_leads.md"
+check "an inert disabled tree does not raise a lead while its reader guard is clean" $?
 grep -qF '| slack | 5 | 5 | ' "$TMP/w3_i2.md"
 check "the slack error feed reports its total rows and its in-window rows" $?
 W3_ROW="$(grep -F '| slack |' "$TMP/w3_i2.md")"
@@ -2344,11 +2500,26 @@ grep -qF '**FAILING, NOT IDLE**' <<< "$W3_ROW"
 check "errors live + receipts stale reads FAILING, NOT IDLE" $?
 grep -qF 'is FAILING, not idle' "$TMP/w3_leads.md"
 check "the failing-not-idle surface raises a ranked LEAD" $?
+# A fresh connected canonical Slack heartbeat outranks historical errors and a
+# stale receipt. Re-run the same frozen fixture with only current state added.
+printf '{"connected":true,"updatedAt":"%s","lastError":null}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$W3/slack/state.json"
+W3_SLACK_CURRENT="$TMP/w3-slack-current.md"
+"$TOOL_BIN" --data-root "$W3" --days 7 --out "$W3_SLACK_CURRENT" > /dev/null 2>&1
+W3_ROW="$(grep -F '| slack |' "$W3_SLACK_CURRENT")"
+grep -qF '**CURRENTLY CONNECTED** (historical errors retained)' <<< "$W3_ROW"
+check "fresh connected Slack state prevents historical errors from being called a current failure" $?
+! grep -qF '`slack` is FAILING, not idle' "$W3_SLACK_CURRENT"
+check "fresh Slack heartbeat suppresses the stale-receipt failure lead" $?
 # NEGATIVE CONTROL: telegram has live errors AND live receipts. A rule that
 # fired on any error at all would light this row up too.
 W3_ROW="$(grep -F '| telegram |' "$TMP/w3_i2.md")"
 grep -q 'FAILING' <<< "$W3_ROW"
 check "NEGATIVE CONTROL: a surface with LIVE receipts is not called failing" \
+  "$([ $? -ne 0 ] && echo 0 || echo 1)"
+grep -qF '/ 5.0 MB byte cap' <<< "$W3_ROW"
+check "Telegram errors report the writer's real 5 MiB byte-rotation policy" $?
+grep -qF 'line cap' <<< "$W3_ROW"
+check "Telegram errors are not assigned a fictitious line cap" \
   "$([ $? -ne 0 ] && echo 0 || echo 1)"
 grep -qF 'offset: **-7** — **NEGATIVE, which the API cannot produce**' "$TMP/w3_i2.md"
 check "a negative telegram offset is named impossible, not printed as a number" $?
@@ -2356,6 +2527,15 @@ grep -qF 'holds a negative offset' "$TMP/w3_leads.md"
 check "the impossible offset raises a ranked LEAD" $?
 grep -qF 'is not draining' "$TMP/w3_leads.md"
 check "an update_inbox that is not draining raises a ranked LEAD" $?
+# The writer intentionally keeps up to 256 terminal claims and their lock
+# sidecars. They are history, not pending work.
+printf '{"schemaVersion":1,"entries":{"1":{"updateId":1,"phase":"completed"}}}\n' > "$W3/telegram/update_inbox/claims_index.json"
+W3_TELEGRAM_RETAINED="$TMP/w3-telegram-retained.md"
+"$TOOL_BIN" --data-root "$W3" --days 7 --out "$W3_TELEGRAM_RETAINED" > /dev/null 2>&1
+grep -qF 'completed retained **1 / 256**' "$W3_TELEGRAM_RETAINED" && grep -qF '**idle** — terminal claim retention is intentional' "$W3_TELEGRAM_RETAINED"
+check "retained completed Telegram claims are distinguished from pending/processing work" $?
+! grep -qF '`telegram/update_inbox/` is not draining' "$W3_TELEGRAM_RETAINED"
+check "terminal Telegram retention does not raise a false drain failure" $?
 grep -qF 'checks: **2** · failing: **1**' "$TMP/w3_i2.md"
 check "doctor/latest.json reports its check count and its failing checks" $?
 grep -qF 'self-healing is acting on a frozen verdict' "$TMP/w3_leads.md"
@@ -2377,10 +2557,18 @@ check "browser IPC discovery requires and reports its loopback endpoint" $?
 grep -qF 'Browser IPC bearer file:' "$TMP/w3_i2.md" && grep -qF 'private mode **yes**' "$TMP/w3_i2.md" && grep -qF 'contents **not read**' "$TMP/w3_i2.md"
 check "browser IPC token is metadata-only and private" $?
 W3_IPC_DAMAGE="$TMP/w3_ipc_damage"
+chmod u+r "$W3UNREADABLE" || exit 1
 cp -R "$W3" "$W3_IPC_DAMAGE"
+W3_COPY_RC=$?
+chmod 000 "$W3UNREADABLE" || exit 1
+if [ "$W3_COPY_RC" -ne 0 ]; then
+  fail "wave-3 IPC fixture copy failed (rc=$W3_COPY_RC)"
+  exit 1
+fi
+chmod 000 "$W3_IPC_DAMAGE/turn_traces/$(basename "$W3UNREADABLE")" || exit 1
 printf '{"host": "0.0.0.0", "port": 8766, "token": "still-not-rendered", "writtenAt": "%s"}\n' "$(inst 1)" \
   > "$W3_IPC_DAMAGE/browser_ipc.json"
-swift "$TOOL" --data-root "$W3_IPC_DAMAGE" --days 7 --no-bridge-config --no-machine-state \
+"$TOOL_BIN" --data-root "$W3_IPC_DAMAGE" --days 7 --no-bridge-config --no-machine-state \
   --out "$TMP/w3_ipc_damage.md" > /dev/null 2>&1
 awk '/^### Local Mac-control and browser IPC discovery/{f=1} /^## \(j\) LEADS/{f=0} f' "$TMP/w3_ipc_damage.md" > "$TMP/w3_ipc_damage_section.md"
 grep -qF 'Browser IPC descriptor: **source unreadable**' "$TMP/w3_ipc_damage_section.md"
@@ -2415,15 +2603,19 @@ mutate() { # mutate <name> <root> <sed-expr> <grep-check-cmd...>
   local name="$1"; shift
   local mroot="$1"; shift
   local expr="$1"; shift
-  local mtool="$TMP/mutant.swift" mreport="$TMP/mutant.md"
+  local mtool="$TMP/mutant.swift" mreport="$TMP/mutant.md" mbin="$TMP/mutant.bin"
   sed "$expr" "$TOOL" > "$mtool"
   if cmp -s "$mtool" "$TOOL"; then
     fail "MUTATION '$name': sed changed nothing — the mutation itself is stale"
     return
   fi
   rm -f "$mreport"
+  if ! swiftc "$mtool" -o "$mbin" > /dev/null 2>"$TMP/mut.err"; then
+    fail "MUTATION '$name': mutant failed to compile ($(head -1 "$TMP/mut.err"))"
+    return
+  fi
   # shellcheck disable=SC2086 — MUT_EXTRA is deliberately word-split argv.
-  if ! swift "$mtool" --data-root "$mroot" --days 7 $MUT_EXTRA --out "$mreport" > /dev/null 2>"$TMP/mut.err"; then
+  if ! "$mbin" --data-root "$mroot" --days 7 $MUT_EXTRA --out "$mreport" > /dev/null 2>"$TMP/mut.err"; then
     fail "MUTATION '$name': mutant failed to run ($(head -1 "$TMP/mut.err"))"
     return
   fi
@@ -2560,7 +2752,7 @@ check_whole_report_stable() {
   # $1 is the mutant's report; re-run the mutant a second time and compare.
   local second="$TMP/mut_whole_2.md"
   rm -f "$second"
-  swift "$TMP/mutant.swift" --data-root "$ROOT" --days 7 --no-bridge-config \
+  "$TMP/mutant.bin" --data-root "$ROOT" --days 7 --no-bridge-config \
     --no-machine-state --now 2026-08-21T12:00:00Z --out "$second" > /dev/null 2>&1 || return 1
   cmp -s "$1" "$second"
 }
@@ -2595,7 +2787,7 @@ check_lane_table_sorted() { # $1 = report: section-(a) lane names must be sorted
 # the rendered PROPERTY itself: >=8 lane names, in sorted order, on a root
 # big enough that hash order could not pass by luck.
 rm -f "$TMP/lane_order_healthy.md"
-swift "$TOOL" --data-root "$LANE_ORDER_ROOT" --days 7 --no-bridge-config \
+"$TOOL_BIN" --data-root "$LANE_ORDER_ROOT" --days 7 --no-bridge-config \
   --no-machine-state --now 2026-08-21T12:00:00Z --out "$TMP/lane_order_healthy.md" > /dev/null 2>&1
 check_lane_table_sorted "$TMP/lane_order_healthy.md"
 check "lane table renders >=8 names in deterministic sorted order" $?
@@ -2627,7 +2819,7 @@ fi
 # M16 — the missing-`context.ready` detector stops detecting. The pairing table
 # still renders, with a confident "ok" on a turn that has no boundary stamp.
 check_ready_violation() {
-  grep -qF '| every terminal turn carries exactly one `context.ready` | 6 | 1 | **1 violation(s)** |' "$1"
+  grep -qF '| every terminal turn carries ≥1 `context.ready` | 6 | 1 | **1 violation(s)** |' "$1"
 }
 mutate "missing-context.ready detector disabled" "$W3" \
   's@    let missingReady = terminalTurns.filter { $0.value.readyRows == 0 }@    let missingReady = terminalTurns.filter { _ in false } // MUTATED@' \
@@ -2645,7 +2837,7 @@ mutate "oauth allowlist widened to token material" "$W3" \
 # live) must then go red — which is what proves that control is not decorative.
 check_telegram_not_failing() { ! grep -q 'FAILING' <<< "$(grep -F '| telegram |' "$1")"; }
 mutate "failing-not-idle rule ignores the receipt feed" "$W3" \
-  's@    let reading = f.errorRowsInWindow > 0 && receiptsStale == "receipts stale"@    let reading = f.errorRows > 0@' \
+  's@f.errorRowsInWindow > 0 && receiptsStale == "receipts stale"@f.errorRows > 0@' \
   check_telegram_not_failing
 
 MUT_EXTRA=""

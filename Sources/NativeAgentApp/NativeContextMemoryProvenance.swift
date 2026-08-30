@@ -32,9 +32,10 @@ enum NativeContextMemoryProvenance {
                 return nil
             }
         }
-        let recordIDs = index.recordIDs(for: memoryAtomIDs)
+        let mapping = index.recordMap(for: memoryAtomIDs)
+        let recordIDs = Array(mapping.values)
         if !recordIDs.isEmpty {
-            prepared.attachMemoryRecordProvenance(recordIDs)
+            prepared.attachMemoryRecordProvenance(recordIDs, atomRecords: mapping)
         }
         return NativeContextMemoryProvenanceResolution(
             requestedMemoryAtomCount: memoryAtomIDs.count,

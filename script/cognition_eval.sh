@@ -75,7 +75,7 @@ state_json() {
         (.contextFlow | type == "object"),
         (.contextFlow.mode | type == "string")
       ] | all
-    ' <<<"$response"; then
+    ' <<<"$response" >/dev/null; then
     echo "bridge state is incomplete or malformed" >&2
     return 1
   fi
@@ -90,8 +90,9 @@ run_organism() {
   debug_json() {
     local body="$1"
     local expected_status="$2"
+    local timeout_seconds="${3:-30}"
     local response
-    response="$(curl -fsS --max-time 30 \
+    response="$(curl -fsS --max-time "$timeout_seconds" \
       -H "Authorization: Bearer $TOKEN" \
       -H "Content-Type: application/json" \
       -H "Accept: application/json" \
@@ -109,6 +110,24 @@ run_organism() {
       return 1
     fi
   }
+
+  # These mode-local traps are installed only by the organism entrypoint;
+  # cognition's separate lock/temp cleanup below remains untouched.
+  ORGANISM_OVERRIDE_ATTEMPTED=0
+  cleanup_organism_override() {
+    local original_status=$?
+    trap - EXIT INT TERM
+    if [[ "$ORGANISM_OVERRIDE_ATTEMPTED" == 1 ]]; then
+      if ! debug_json '{"action":"clear"}' "cleared" 5; then
+        echo "organism eval cleanup was not confirmed; temporary override may remain until its TTL expires" >&2
+        [[ "$original_status" != 0 ]] || original_status=1
+      fi
+    fi
+    exit "$original_status"
+  }
+  trap cleanup_organism_override EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   record() {
     local label="$1"
@@ -145,11 +164,15 @@ run_organism() {
 
   for scenario in provider_brittle stale_phone resource_tight approval_closed; do
     body="$(jq -n --arg scenario "$scenario" '{scenario:$scenario, ttlSeconds:45}')"
+    # Arm before transport: the server can apply the override and then lose
+    # its response. Even that uncertain outcome needs a best-effort clear.
+    ORGANISM_OVERRIDE_ATTEMPTED=1
     debug_json "$body" "active"
     state_json | record "scenario:$scenario"
   done
 
   debug_json '{"action":"clear"}' "cleared"
+  ORGANISM_OVERRIDE_ATTEMPTED=0
   state_json | record "cleared"
 
   echo "wrote $OUT"
@@ -166,7 +189,9 @@ run_cognition() {
   PID_VALUE="$(jq -r '.cognition.microcycle.processIdentifier // empty' <<<"$STATE")"
   CPU=""
   if [[ "$PID_VALUE" =~ ^[0-9]+$ ]]; then
-    CPU="$(ps -p "$PID_VALUE" -o %cpu= 2>/dev/null | tr -d ' ' || true)"
+    if ! CPU="$(ps -p "$PID_VALUE" -o %cpu= 2>/dev/null | tr -d ' ')"; then
+      CPU=""
+    fi
   fi
 
   mkdir -p "$(dirname "$OUT")"
@@ -191,7 +216,7 @@ run_cognition() {
       runId: $runId,
       dayIndex: ($dayIndex | tonumber),
       note: (if $note == "" then null else $note end),
-      processCpuPercent: ($cpu | tonumber?),
+      processCpuPercent: ($cpu | tonumber? // null),
       appUptimeSeconds: $state.uptimeSeconds,
       microcycle: $state.cognition.microcycle,
       organismSignalCount: $state.organism.signalCount,
@@ -203,6 +228,12 @@ run_cognition() {
         pressure: $state.contextFlow.pressure
       }
     }')"
+  # Optional telemetry must never erase the complete evidence row. Validate
+  # before trimming/replacing retained history or claiming a sample was written.
+  if ! jq -se 'length == 1 and (.[0] | type == "object")' <<<"$ROW" >/dev/null; then
+    echo "cognition sample did not produce exactly one valid object" >&2
+    return 1
+  fi
 
   # Manual evidence only: bounded to 256 rows and serialized by the lock above.
   # This is an eval artifact, never canonical cognition tissue.

@@ -141,51 +141,54 @@ struct ChatView: View {
     private var chatBody: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                if let error = store.errorBanner {
-                    HStack {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                        Text(error).font(.callout)
-                        Spacer()
-                        Button { store.dismissErrorBanner() } label: {
-                            Image(systemName: "xmark")
-                        }
-                        .accessibilityLabel("Dismiss chat error")
-                    }
-                    .padding(10)
-                    .background(.red.opacity(0.12))
-                }
-
-                // Voice input error banner
-                if let voiceErr = voiceInput.error {
-                    HStack {
-                        Image(systemName: "mic.slash.fill")
-                        Text(voiceErr).font(.callout)
-                        Spacer()
-                        if voiceErr.localizedCaseInsensitiveContains("permission")
-                            || voiceErr.localizedCaseInsensitiveContains("settings") {
-                            Button("Settings") { voiceInput.openSettings() }
-                                .font(.callout.weight(.semibold))
-                        }
-                        Button { voiceInput.error = nil } label: {
-                            Image(systemName: "xmark")
-                        }
+                // E8: an outage on THIS phone gets named as such. Without it
+                // every local failure funnelled into a Mac-blaming message.
+                if let offline = bridgeClient.offlineBannerMessage {
+                    HStack(spacing: 8) {
+                        Image(systemName: "wifi.slash")
+                        Text(offline).font(.callout)
+                        Spacer(minLength: 0)
                     }
                     .padding(10)
                     .background(.orange.opacity(0.14))
                     .transition(.move(edge: .top).combined(with: .opacity))
+                    .accessibilityElement(children: .combine)
+                }
+
+                if let error = store.errorBanner {
+                    MobileChatIssueBanner(
+                        message: error,
+                        systemImage: "exclamationmark.triangle.fill",
+                        tint: .red,
+                        dismissLabel: "Dismiss chat error",
+                        onDismiss: { store.dismissErrorBanner() }
+                    )
+                }
+
+                // Voice input error banner
+                if let voiceErr = voiceInput.error {
+                    MobileChatIssueBanner(
+                        message: voiceErr,
+                        systemImage: "mic.slash.fill",
+                        tint: .orange,
+                        dismissLabel: "Dismiss voice input error",
+                        action: voiceErr.localizedCaseInsensitiveContains("permission")
+                            || voiceErr.localizedCaseInsensitiveContains("settings")
+                            ? ("Open Settings", { voiceInput.openSettings() })
+                            : nil,
+                        onDismiss: { voiceInput.error = nil }
+                    )
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
                 if let speechErr = voiceOutput.error {
-                    HStack {
-                        Image(systemName: "speaker.slash.fill")
-                        Text(speechErr).font(.callout)
-                        Spacer()
-                        Button { voiceOutput.error = nil } label: {
-                            Image(systemName: "xmark")
-                        }
-                    }
-                    .padding(10)
-                    .background(.orange.opacity(0.14))
+                    MobileChatIssueBanner(
+                        message: speechErr,
+                        systemImage: "speaker.slash.fill",
+                        tint: .orange,
+                        dismissLabel: "Dismiss spoken reply error",
+                        onDismiss: { voiceOutput.error = nil }
+                    )
                 }
 
                 runtimeControlsBar
@@ -345,6 +348,8 @@ struct ChatView: View {
                         Image(systemName: "arrow.clockwise")
                     }
                     .disabled(store.isLoading || store.isSwitchingSession || !store.messages.contains(where: { $0.role == .assistant }))
+                    .accessibilityLabel("Regenerate last response")
+                    .accessibilityHint("Asks the agent to answer the latest message again")
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
@@ -658,6 +663,7 @@ struct ChatView: View {
                                 RoundedRectangle(cornerRadius: 10)
                                     .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
                             }
+                            .accessibilityLabel("Attached photo")
                         Button {
                             let removal = PendingPhotoPresentation.removing(photo.id, from: pendingPhotos)
                             pendingPhotos = removal.photos
@@ -670,10 +676,13 @@ struct ChatView: View {
                                 .font(.system(size: 18, weight: .semibold))
                                 .symbolRenderingMode(.palette)
                                 .foregroundStyle(.white, .black.opacity(0.58))
+                                .frame(width: 44, height: 44, alignment: .topTrailing)
+                                .contentShape(Rectangle())
                         }
                         .offset(x: 6, y: -6)
+                        .accessibilityLabel("Remove attached photo")
                     }
-                    .accessibilityLabel("Attached photo")
+                    .accessibilityElement(children: .contain)
                 }
             }
             .padding(.horizontal, 2)
@@ -835,13 +844,14 @@ struct ChatView: View {
                                     requested: .init(providerID: requestedProvider, model: model, reasoningEffort: requestedEffort, fastMode: selectedFastMode),
                                     requestGeneration: myGeneration
                                 ) { requested in
-                                    _ = try await sync.configureSurfaceSelection(
+                                    let receipt = try await sync.configureSurfaceSelection(
                                         surface: "ios",
                                         providerId: requested.providerID,
                                         model: requested.model,
                                         reasoningEffort: requested.reasoningEffort,
                                         serviceTier: requested.fastMode ? "priority" : "default"
                                     )
+                                    adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
                                 }
                                 if let restored = result.restored {
                                     // Only undo if no NEWER pick happened while this
@@ -892,13 +902,14 @@ struct ChatView: View {
                             let myGeneration = beginSurfaceSelectionUpdate()
                             Task {
                                 do {
-                                    _ = try await sync.configureSurfaceSelection(
+                                    let receipt = try await sync.configureSurfaceSelection(
                                         surface: "ios",
                                         providerId: requestedProvider,
                                         model: requestedModel,
                                         reasoningEffort: option.id,
                                         serviceTier: requestedServiceTier
                                     )
+                                    adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
                                 } catch {
                                     finishSurfaceSelectionFailure(requestGeneration: myGeneration)
                                     // Generation, not value (ABA) — see model menu above.
@@ -940,13 +951,14 @@ struct ChatView: View {
                             let myGeneration = beginSurfaceSelectionUpdate()
                             Task {
                                 do {
-                                    _ = try await sync.configureSurfaceSelection(
+                                    let receipt = try await sync.configureSurfaceSelection(
                                         surface: "ios",
                                         providerId: requestedProvider,
                                         model: requestedModel,
                                         reasoningEffort: requestedEffort,
                                         serviceTier: enabled ? "priority" : "default"
                                     )
+                                    adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
                                 } catch {
                                     finishSurfaceSelectionFailure(requestGeneration: myGeneration)
                                     if let restored = ChatRuntimeControlPresentation.rollback(
@@ -1078,13 +1090,14 @@ struct ChatView: View {
                 requested: .init(providerID: id, model: requestedModel, reasoningEffort: requestedEffort, fastMode: requestedFastMode),
                 requestGeneration: myGeneration
             ) { requested in
-                _ = try await sync.configureSurfaceSelection(
+                let receipt = try await sync.configureSurfaceSelection(
                     surface: "ios",
                     providerId: requested.providerID,
                     model: requested.model,
                     reasoningEffort: requested.reasoningEffort,
                     serviceTier: requested.fastMode ? "priority" : "default"
                 )
+                adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
             }
             if let restored = result.restored {
                     selectedProviderId = restored.providerID
@@ -1195,6 +1208,20 @@ struct ChatView: View {
         surfaceSelectionGeneration += 1
         surfaceSelectionAwaitingSync = true
         return surfaceSelectionGeneration
+    }
+
+    private func adoptCanonicalSurfaceSelection(_ receipt: MobileSurfaceSelectionReceipt, requestGeneration: Int) {
+        guard let selection = ChatRuntimeControlPresentation.acceptReceipt(
+            receipt, defaults: .standard, requestGeneration: requestGeneration
+        ) else { return }
+        selectedProviderId = selection.providerID
+        selectedModel = selection.model
+        selectedReasoningEffort = selection.reasoningEffort
+        selectedFastMode = selection.fastMode
+        // Keep stale projections fenced until this exact canonical tuple is
+        // observed. The matching snapshot may already have arrived mid-await.
+        surfaceSelectionAwaitingSync = true
+        adoptSurfaceModelPreferenceFromSync()
     }
 
     private func finishSurfaceSelectionFailure(requestGeneration: Int) {
@@ -1595,6 +1622,55 @@ struct ChatView: View {
     }
 }
 
+/// One readable, reachable presentation for transient chat failures. Error
+/// copy can be much longer than the happy-path composer controls (especially
+/// permission guidance), so actions sit on their own row instead of competing
+/// with the message for horizontal space on compact iPhones or at large text
+/// sizes. The close control keeps the platform's minimum touch target and an
+/// outcome-specific VoiceOver label.
+private struct MobileChatIssueBanner: View {
+    let message: String
+    let systemImage: String
+    let tint: Color
+    let dismissLabel: String
+    var action: (title: String, handler: () -> Void)? = nil
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(tint)
+                    .padding(.top, 3)
+                    .accessibilityHidden(true)
+                Text(message)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(dismissLabel)
+            }
+
+            if let action {
+                Button(action.title, action: action.handler)
+                    .font(.callout.weight(.semibold))
+                    .padding(.leading, 28)
+            }
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, 4)
+        .padding(.vertical, 4)
+        .background(tint.opacity(0.14))
+        .accessibilityElement(children: .contain)
+    }
+}
+
 /// Pure decisions shared by ChatView's controls. Keeping these outside the
 /// view makes an iPhone selection an explicit, testable value before it is
 /// sent to the signed Mac route.
@@ -1734,6 +1810,21 @@ enum ChatRuntimeControlPresentation {
         defaults.set(selection.reasoningEffort, forKey: effortDefaultsKey)
         defaults.set(selection.fastMode, forKey: fastDefaultsKey)
         defaults.set(selection.providerID, forKey: providerDefaultsKey)
+    }
+
+    static func acceptReceipt(
+        _ receipt: MobileSurfaceSelectionReceipt,
+        defaults: UserDefaults,
+        requestGeneration: Int
+    ) -> Selection? {
+        guard receipt.surface == "ios",
+              defaults.integer(forKey: generationDefaultsKey) == requestGeneration else { return nil }
+        let selection = Selection(
+            providerID: receipt.providerID, model: receipt.model,
+            reasoningEffort: receipt.reasoningEffort, fastMode: receipt.serviceTier == "priority"
+        )
+        persist(selection, in: defaults)
+        return selection
     }
 
     /// The shared action seam behind every optimistic runtime-control menu.

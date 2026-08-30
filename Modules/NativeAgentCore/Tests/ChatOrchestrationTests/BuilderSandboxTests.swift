@@ -535,6 +535,92 @@ func BuilderTools_bash_timeout_kills_process_group() async throws {
     #expect(try String(contentsOf: fileURL, encoding: .utf8) == "alpha\ndelta\ngamma\n")
 }
 
+@Test(arguments: ["sample.txt", "./sample.txt", "alias.txt"], [false, true])
+func BuilderTools_context_patch_accumulates_repeated_file_sections(secondPath: String, dependent: Bool) async throws {
+    let root = try sbTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let workspace = try NativeAgentWorkspaceRoot.prepare(dataRoot: root, environment: [:])
+    let file = workspace.appendingPathComponent("sample.txt")
+    try "alpha\nbeta\ngamma\n".write(to: file, atomically: true, encoding: .utf8)
+    try FileManager.default.createSymbolicLink(
+        at: workspace.appendingPathComponent("alias.txt"), withDestinationURL: file
+    )
+    let patch = """
+    --- a/sample.txt
+    +++ b/sample.txt
+    @@
+    -alpha
+    +first
+    --- a/\(secondPath)
+    +++ b/\(secondPath)
+    @@
+    -\(dependent ? "first" : "beta")
+    +second
+    --- a/sample.txt
+    +++ b/sample.txt
+    @@
+    -gamma
+    +last
+    """
+    let result = await SwiftToolDispatcher.impl_apply_patch(
+        input: ["patch": .string(patch), "cwd": .string(workspace.path)], dataRoot: root
+    )
+    guard case .object(let envelope) = result else {
+        Issue.record("Expected patch result")
+        return
+    }
+    #expect(envelope["status"] == .string("completed"))
+    #expect(envelope["changed_files"] == .array([.string("sample.txt")]))
+    #expect(try String(contentsOf: file, encoding: .utf8) == (dependent ? "second\nbeta\nlast\n" : "first\nsecond\nlast\n"))
+    guard case .string(let auditPath)? = envelope["audit_path"] else {
+        Issue.record("Expected durable patch audit path")
+        return
+    }
+    let audit = try JSONValue.parse(Data(contentsOf: URL(fileURLWithPath: auditPath)))
+    guard case .object(let auditFields) = audit else {
+        Issue.record("Expected durable patch audit")
+        return
+    }
+    #expect(auditFields["changed_files"] == .array([.string("sample.txt")]))
+}
+
+@Test(arguments: [false, true])
+func BuilderTools_context_patch_validates_all_sections_and_reports_net_changes(revert: Bool) async throws {
+    let root = try sbTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let workspace = try NativeAgentWorkspaceRoot.prepare(dataRoot: root, environment: [:])
+    let file = workspace.appendingPathComponent("sample.txt")
+    let original = "alpha\nbeta\n"
+    try original.write(to: file, atomically: true, encoding: .utf8)
+    let patch = """
+    --- a/sample.txt
+    +++ b/sample.txt
+    @@
+    -alpha
+    +changed
+    --- a/./sample.txt
+    +++ b/./sample.txt
+    @@
+    -\(revert ? "changed" : "missing")
+    +alpha
+    """
+    let result = await SwiftToolDispatcher.impl_apply_patch(
+        input: ["patch": .string(patch), "cwd": .string(workspace.path)], dataRoot: root
+    )
+    guard case .object(let envelope) = result else {
+        Issue.record("Expected patch result")
+        return
+    }
+    #expect(try String(contentsOf: file, encoding: .utf8) == original)
+    if revert {
+        #expect(envelope["status"] == .string("completed"))
+        #expect(envelope["changed_files"] == .array([]))
+    } else {
+        #expect(envelope["status"] == .string("failed"))
+        #expect(envelope["reason"] == .string("context_patch_old_block_not_found"))
+    }
+}
+
 @Test func BuilderTools_apply_patch_rejects_codex_patch_format_with_fix_hint() async throws {
     let root = try sbTempRoot()
     let result = await SwiftToolDispatcher.impl_apply_patch(

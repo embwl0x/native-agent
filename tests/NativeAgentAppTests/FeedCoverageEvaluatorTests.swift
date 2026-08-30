@@ -254,10 +254,36 @@ struct FeedCoverageEvaluatorTests {
     @Test func refusesAnOutputPathInsideTheObservedRoot() throws {
         let data = try root("refusal")
         defer { try? FileManager.default.removeItem(at: data.deletingLastPathComponent()) }
+        let fm = FileManager.default
+        try fm.createDirectory(at: data, withIntermediateDirectories: true)
         let bad = data.appendingPathComponent("must-not-write.md")
-        let run = try report(data, output: bad)
-        #expect(run.status != 0)
-        #expect(run.combined.contains("REFUSED"))
-        #expect(!FileManager.default.fileExists(atPath: bad.path))
+        let alias = data.deletingLastPathComponent().appendingPathComponent("data-alias")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: data)
+        let existing = data.appendingPathComponent("existing.md")
+        try "preserve observed bytes".write(to: existing, atomically: true, encoding: .utf8)
+        let fileAlias = data.deletingLastPathComponent().appendingPathComponent("file-alias.md")
+        try fm.createSymbolicLink(at: fileAlias, withDestinationURL: existing)
+        for (observed, output) in [
+            (data, bad),
+            (data, alias.appendingPathComponent("must-not-write.md")),
+            (alias, bad),
+            (data, alias.appendingPathComponent("missing-parent/report.md")),
+            (data, fileAlias),
+        ] {
+            let run = try report(observed, output: output)
+            #expect(run.status != 0, Comment(rawValue: run.combined))
+            #expect(run.combined.contains("REFUSED"))
+        }
+        #expect(!fm.fileExists(atPath: bad.path))
+        #expect(!fm.fileExists(atPath: data.appendingPathComponent("missing-parent").path))
+        #expect(try String(contentsOf: existing, encoding: .utf8) == "preserve observed bytes")
+
+        let outside = data.deletingLastPathComponent().appendingPathComponent("outside", isDirectory: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        let outsideAlias = data.deletingLastPathComponent().appendingPathComponent("outside-alias")
+        try fm.createSymbolicLink(at: outsideAlias, withDestinationURL: outside)
+        let allowed = try report(alias, output: outsideAlias.appendingPathComponent("report.md"))
+        #expect(allowed.status == 0, Comment(rawValue: allowed.combined))
+        #expect(fm.fileExists(atPath: outside.appendingPathComponent("report.md").path))
     }
 }

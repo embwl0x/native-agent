@@ -9,16 +9,11 @@ import Testing
     #expect(parameters.includePeerToPeer == false)
 }
 
-@Test func nativeBridgePortPlanAdvancesThenUsesSystemAssignedFallback() {
-    let plan = NativeLoopbackPortPlan(preferredPort: 8771, consecutiveFallbacks: 2)
-
-    #expect(plan.candidates == [
-        .fixed(8771),
-        .fixed(8772),
-        .fixed(8773),
-        .automatic,
-    ])
-    #expect(plan[4] == nil)
+@Test func claudeBridgeProductionPortContractAdvancesThenUsesSystemAssignedFallback() {
+    #expect(ClaudeBridge.port == 8771)
+    #expect(ClaudeBridge.listenerPortPlan.candidates ==
+        (8771...8786).map { .fixed(UInt16($0)) } + [.automatic])
+    #expect(ClaudeBridge.listenerPortPlan[17] == nil)
 }
 
 @Test func nativeBridgePortPlanCannotOverflowTheTCPPortRange() {

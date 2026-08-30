@@ -122,14 +122,17 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
     /// before it waited out the remainder of a 1s tick.
     ///
     /// No missed-event window at the seam: the watcher is armed BEFORE the
-    /// first read, and the stream's buffer is unbounded, so an edge that lands
-    /// while a read is in flight is delivered to the very next `next()` rather
-    /// than being dropped.
+    /// first read. The buffer retains the newest pending edge because every
+    /// edge has the same meaning — re-read the canonical approval record. A
+    /// burst while that read is in flight therefore costs one follow-up read,
+    /// not an unbounded queue of redundant reads.
     func awaitResolution(id: String) async throws -> ApprovalDecision {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let approvalsPath = await inbox.approvalsPath
 
-        let (wakes, wake) = AsyncStream<Void>.makeStream()
+        let (wakes, wake) = AsyncStream<Void>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
         let watcher = FileChangeWatcher(paths: [approvalsPath]) { _ in
             wake.yield(())
         }

@@ -133,7 +133,13 @@ final class NativeLoopbackPortFallbackListener: @unchecked Sendable {
     private var generation: UInt64 = 0
 
     init(preferredPort: UInt16, label: String) {
-        plan = NativeLoopbackPortPlan(preferredPort: preferredPort)
+        self.plan = NativeLoopbackPortPlan(preferredPort: preferredPort)
+        self.label = label
+        queue = DispatchQueue(label: "nativeagent.loopback.\(label)", qos: .userInitiated)
+    }
+
+    init(plan: NativeLoopbackPortPlan, label: String) {
+        self.plan = plan
         self.label = label
         queue = DispatchQueue(label: "nativeagent.loopback.\(label)", qos: .userInitiated)
     }

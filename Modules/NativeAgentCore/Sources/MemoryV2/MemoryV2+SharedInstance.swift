@@ -24,7 +24,7 @@ import PersistenceCore
 
 // MARK: - MemoryStorageBridge — MemoryStorage actor → MemoryStorageProtocol
 
-public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol {
+public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol, MemoryRecordLookupStorage {
     private let storage: MemoryStorage
 
     public init(storage: MemoryStorage) {
@@ -32,6 +32,11 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
     }
 
     public func underlyingStorage() -> MemoryStorage { storage }
+
+    func lookupMemoryRecord(id: String) async throws -> MemoryRecord? {
+        guard let stored = try await storage.memory(id: id) else { return nil }
+        return Self.toMemoryRecord(stored)
+    }
 
     public func listMemory(kind: String?) async throws -> [MemoryRecord] {
         // R13 (review HIGH): status:nil deliberately includes archived rows,
@@ -131,13 +136,10 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
             // Keys with no typed MemoryPatch slot (the Mac UI pin path sends
             // "pinned") round-trip through metadata_json. This bridge used to
             // DROP them and still return ok — pin was a silent no-op (audit
-            // 2026-06-09). patch.metadata replaces wholesale in storage, so
-            // merge over the existing record's metadata. "kind" is
+            // 2026-06-09). Storage merges these keys inside the same SQLite
+            // transaction as the row update. "kind" is
             // deliberately NOT passthrough — it's semantics-owned (kind-scoped
-            // decay) and no UI path patches it (gpt-5.5 review). KNOWN narrow
-            // race: a consolidator metadata write between this read and the
-            // storage write loses that write — flagged NEEDS-USER for a
-            // storage-transaction merge; pin was 100% broken before this.
+            // decay) and no UI path patches it (gpt-5.5 review).
             // recall_count added 2026-07-24 (gpt-5.5 BLOCKING): store()'s
             // write-time duplicate guard bumps it as merge-corroboration
             // evidence; without passthrough the bump silently no-oped on
@@ -155,13 +157,7 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
                 MemoryPatchContract.untypedPassthroughKeys.contains($0.key)
             }
             if !passthrough.isEmpty {
-                guard let existing = try await storage.memory(id: id) else {
-                    throw MemoryV2Error.recordNotFound
-                }
-                var meta: [String: JSONValue]
-                if case .object(let m)? = existing.metadata { meta = m } else { meta = [:] }
-                for (k, v) in passthrough { meta[k] = v }
-                p.metadata = .object(meta)
+                p.metadataMerge = passthrough
             }
         }
         if let newEmbedding {
@@ -577,48 +573,48 @@ extension SwiftNativeMemoryV2 {
         let kgIndexer = try? SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: storage.path)
         Task {
             await storage.attachSpotlightHook { stored, deleted in
-                Task {
-                    // Skill pointers are recall-only rows (skills-recall
-                    // rework 2026-07-03): keep them out of Spotlight.
-                    if stored.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { return }
-                    if deleted {
-                        try? await indexer.remove(id: stored.id)
-                    } else {
-                        try? await indexer.indexRecord(id: stored.id, text: stored.content, kind: stored.status)
-                    }
+                // Skill pointers are recall-only rows (skills-recall
+                // rework 2026-07-03): keep them out of Spotlight.
+                if stored.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { return }
+                if deleted {
+                    try? await indexer.remove(id: stored.id)
+                } else {
+                    try? await indexer.indexRecord(id: stored.id, text: stored.content, kind: stored.status)
                 }
             }
             if let kgIndexer {
                 await storage.attachKnowledgeGraphHook { stored, deleted in
-                    Task {
-                        // Recall-only skill pointers never enter the KG —
-                        // entity extraction over "Skill available: ..." rows
-                        // mints junk entities (gpt-5.5 review HIGH,
-                        // 2026-07-03).
-                        if stored.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { return }
-                        try? await kgIndexer.indexMemory(
-                            KnowledgeGraphMemoryFact(
-                                id: stored.id,
-                                content: stored.content,
-                                source: stored.source,
-                                status: stored.status,
-                                createdAt: stored.createdAt,
-                                updatedAt: stored.updatedAt,
-                                metadata: stored.projectionMetadata
-                            ),
-                            deleted: deleted
-                        )
-                    }
+                    // Recall-only skill pointers never enter the KG —
+                    // entity extraction over "Skill available: ..." rows
+                    // mints junk entities (gpt-5.5 review HIGH,
+                    // 2026-07-03).
+                    if stored.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { return }
+                    try? await kgIndexer.indexMemory(
+                        KnowledgeGraphMemoryFact(
+                            id: stored.id,
+                            content: stored.content,
+                            source: stored.source,
+                            status: stored.status,
+                            createdAt: stored.createdAt,
+                            updatedAt: stored.updatedAt,
+                            metadata: stored.projectionMetadata
+                        ),
+                        deleted: deleted
+                    )
                 }
-                // Reconcile the rebuildable projection once from canonical
-                // MemoryV2 instead of replaying N independent index calls.
-                // This also retracts proven indexer-owned rows whose source
-                // memory disappeared before a delete hook completed. Manual
-                // and legacy graph content lacks the indexer stamp and is preserved.
-                do {
-                    _ = try await kgIndexer.rebuildMemoryDerivedGraphFromCanonicalStore()
-                } catch {
-                    NSLog("[MemoryV2] Knowledge Graph startup rebuild failed: %@", String(describing: error))
+                // Healthy launches only repair rows missed by a fire-and-forget
+                // mutation hook. The migration task owns the one full rebuild
+                // when the canonical migration actually runs; starting this
+                // additive pass before that boundary would race the importer.
+                let migrationMarker = dataRoot
+                    .appendingPathComponent("memory", isDirectory: true)
+                    .appendingPathComponent(".migrated_to_sqlite_v2_approved_only")
+                if FileManager.default.fileExists(atPath: migrationMarker.path) {
+                    do {
+                        _ = try await kgIndexer.backfillMissingMemoryIndexRows()
+                    } catch {
+                        NSLog("[MemoryV2] Knowledge Graph startup backfill failed: %@", String(describing: error))
+                    }
                 }
             }
         }
@@ -648,8 +644,9 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
         self.memory = memory
     }
     public func recall(_ query: String, k: Int) async throws -> [MemoryRecallHit] {
-        let response = try await memory.recall(MemoryV2RecallRequest(text: query, topK: k, persona: nil))
-        return response.hits
+        let request = MemoryV2RecallRequest(text: query, topK: k, persona: nil)
+        let response = try await memory.recall(request)
+        return await annotatedWithRelatedEntities(response, query: request)
     }
 
     public func recall(
@@ -658,12 +655,80 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
         persona: String?,
         surface: String?
     ) async throws -> [MemoryRecallHit] {
-        let response = try await memory.recall(MemoryV2RecallRequest(
+        let request = MemoryV2RecallRequest(
             text: query,
             topK: k,
             persona: persona,
             surface: surface
-        ))
-        return response.hits
+        )
+        let response = try await memory.recall(request)
+        return await annotatedWithRelatedEntities(response, query: request)
+    }
+
+    /// B4 (2026-08-28): attach each hit's one-hop Knowledge Graph entities under
+    /// `extras["kg_related"]`, for the prompt renderer to fold into a single
+    /// `related:` line.
+    ///
+    /// ── WHY HERE ─────────────────────────────────────────────────────────────
+    /// This adapter is the narrowest place that has both halves: recall has
+    /// already applied `MemoryRecordDisclosurePolicy`, and the shared instance
+    /// can still reach the SQLite file the graph lives in. The renderer
+    /// downstream is a pure `nonisolated static` function with no handles, and
+    /// giving it a database would be a far larger change than the feature is
+    /// worth.
+    ///
+    /// ── DISCLOSURE ───────────────────────────────────────────────────────────
+    /// The classification is re-asserted here rather than inherited. `hits` is
+    /// already disclosure-filtered upstream, so this is belt-and-braces — but it
+    /// is the check that makes the privacy argument local and readable: only
+    /// memories that classify AND permit this exact surface/persona are used to
+    /// seed the graph hop, and each memory's entities were extracted from that
+    /// memory's own text. A memory that fails the check contributes no seed and
+    /// therefore no entity names.
+    ///
+    /// ── FAIL-OPEN ────────────────────────────────────────────────────────────
+    /// Any failure — no bridge, missing database, unreadable graph — returns the
+    /// hits exactly as recall produced them. The `related:` line is an
+    /// enrichment; it must never be able to cost a turn its memories.
+    private func annotatedWithRelatedEntities(
+        _ response: MemoryV2RecallResponse,
+        query: MemoryV2RecallRequest
+    ) async -> [MemoryRecallHit] {
+        guard !response.hits.isEmpty else { return response.hits }
+        let disclosedIDs: Set<String> = Set(
+            response.scored.compactMap { scoredRecord in
+                guard let classification =
+                        MemoryRecordDisclosurePolicy.classify(scoredRecord.record),
+                      classification.permits(
+                        surface: query.surface, personaID: query.persona
+                      ) else { return nil }
+                return scoredRecord.record.id
+            }
+        )
+        guard !disclosedIDs.isEmpty else { return response.hits }
+        guard let bridge = await memory.underlyingBridge() else { return response.hits }
+        let related: [String: [String]]
+        do {
+            let sqlitePath = await bridge.underlyingStorage().path
+            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+            related = try await indexer.relatedEntityNames(
+                forMemoryIDs: Array(disclosedIDs)
+            )
+        } catch {
+            return response.hits
+        }
+        guard !related.isEmpty else { return response.hits }
+        return response.hits.map { hit in
+            // Recall stamps the record id into `extras["id"]`; that is the only
+            // link back from a hit to the memory it came from.
+            guard case .object(var extras)? = hit.extras,
+                  case .string(let id)? = extras["id"],
+                  disclosedIDs.contains(id),
+                  let names = related[id], !names.isEmpty else { return hit }
+            var annotated = hit
+            extras["kg_related"] = .array(names.map { .string($0) })
+            annotated.extras = .object(extras)
+            return annotated
+        }
     }
 }

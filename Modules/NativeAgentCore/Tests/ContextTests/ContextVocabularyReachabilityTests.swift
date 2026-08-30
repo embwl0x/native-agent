@@ -229,18 +229,12 @@ struct ContextVocabularyReachabilityTests {
 
     @Test
     func everyContextFeedbackSignalLeafHasAProducerOrADatedDormancyReason() throws {
-        /// 2026-08-23 (coverage ledger, fence core.context). `recordFeedback` is
-        /// private and there is no API of any kind — public, internal or
-        /// tool-facing — that can emit these four. The live store agrees: 584
-        /// feedback receipts over ~5 days are selection 404 / outcome.completed
-        /// 179 / expansion 1, and nothing else. This matters more than a normal
-        /// dead case: the reducer gives `correction.contradicts` outcomeUtility
-        /// -0.45 and activation -0.75, the biggest magnitudes in the table, so
-        /// the feedback loop's only NEGATIVE pole is unreachable and selection
-        /// learning is positive-only and self-reinforcing.
+        /// 2026-08-30: applied canonical memory corrections now produce an
+        /// atom-exact contradiction through the prepared-turn provenance map.
+        /// Affirmation and whole-turn confirmation remain deliberately dormant:
+        /// completion/praise must not certify all selected context as useful.
         let dormant: [String: String] = [
-            "correction.confirms": "no producer; recordFeedback is private and no correction API exists",
-            "correction.contradicts": "no producer; the loop's negative pole is unreachable",
+            "correction.confirms": "no authoritative per-memory confirmation producer",
             "outcome.confirmed": "no producer; only .completed/.abandoned are emitted by the tool loop",
             "outcome.contradicted": "no producer; only .completed/.abandoned are emitted by the tool loop",
         ]

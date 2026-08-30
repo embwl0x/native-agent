@@ -38,8 +38,26 @@ final class PollScheduler: ObservableObject {
     private let pausedRecheckInterval: TimeInterval = 5
     private let maxSleepInterval: TimeInterval = 120
     private let minSleepInterval: TimeInterval = 0.5
+    private let now: @MainActor () -> Date
+    private let sleep: @Sendable (TimeInterval) async throws -> Void
+    private let isStreaming: @MainActor (AppModel?) -> Bool
+    private let isAppActive: @MainActor () -> Bool
 
-    init() {}
+    init(
+        now: @escaping @MainActor () -> Date = { Date() },
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { delay in
+            try await Task.sleep(for: .seconds(delay))
+        },
+        isStreaming: @escaping @MainActor (AppModel?) -> Bool = { model in
+            model?.anySessionStreaming == true
+        },
+        isAppActive: @escaping @MainActor () -> Bool = { NSApp.isActive }
+    ) {
+        self.now = now
+        self.sleep = sleep
+        self.isStreaming = isStreaming
+        self.isAppActive = isAppActive
+    }
 
     func bind(to model: AppModel) {
         self.appModel = model
@@ -53,7 +71,7 @@ final class PollScheduler: ObservableObject {
         // `interval` after registration — callers that want an immediate fire
         // do it inline BEFORE register(), and we don't want to double-fire on
         // the next 1s scheduler tick. (Review finding #6.)
-        lastTick[job.id] = Date()
+        lastTick[job.id] = now()
         restart()
     }
 
@@ -67,15 +85,15 @@ final class PollScheduler: ObservableObject {
     private func shouldFire(_ job: PollJob, now: Date) -> Bool {
         if let last = lastTick[job.id], now.timeIntervalSince(last) < job.interval { return false }
         // `anySessionStreaming` already subsumes `isChatStreaming`. (Review #10.)
-        if job.pauseWhenStreaming, appModel?.anySessionStreaming == true { return false }
-        if job.pauseWhenUnfocused, !NSApp.isActive { return false }
+        if job.pauseWhenStreaming, isStreaming(appModel) { return false }
+        if job.pauseWhenUnfocused, !isAppActive() { return false }
         return true
     }
 
     private func isPaused(_ job: PollJob) -> Bool {
         // `anySessionStreaming` already subsumes `isChatStreaming`. (Review #10.)
-        if job.pauseWhenStreaming, appModel?.anySessionStreaming == true { return true }
-        if job.pauseWhenUnfocused, !NSApp.isActive { return true }
+        if job.pauseWhenStreaming, isStreaming(appModel) { return true }
+        if job.pauseWhenUnfocused, !isAppActive() { return true }
         return false
     }
 
@@ -111,15 +129,15 @@ final class PollScheduler: ObservableObject {
         }
         task = Task { [weak self] in
             while !Task.isCancelled {
-                let now = Date()
                 guard let me = self else { return }
+                let now = me.now()
                 let snapshot = Array(me.jobs.values)
                 for job in snapshot where me.shouldFire(job, now: now) {
                     me.lastTick[job.id] = now
                     if let h = me.handlers[job.id] { await h() }
                 }
-                let delay = me.nextSleepInterval(now: Date())
-                try? await Task.sleep(for: .seconds(delay))
+                let delay = me.nextSleepInterval(now: me.now())
+                try? await me.sleep(delay)
             }
         }
     }

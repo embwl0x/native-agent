@@ -44,26 +44,40 @@ public actor ChatSessionIndexReconciler {
                 return raw
             })
 
-            let candidates = try FileManager.default.contentsOfDirectory(
+            let directoryEntries = try FileManager.default.contentsOfDirectory(
                 at: messagesDirectory,
                 includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
                 options: [.skipsHiddenFiles]
             ).filter { $0.pathExtension == "jsonl" }
-                .sorted { lhs, rhs in
-                    // Missing index rows are the repair target, so examine
-                    // them before already-indexed transcripts. Otherwise the
-                    // first 256 healthy historical files can permanently
-                    // starve a newer orphan whose filename sorts later.
-                    func priority(_ url: URL) -> Int {
-                        let raw = url.deletingPathExtension().lastPathComponent
-                        guard NativeAgentChatSessionID.normalizedPathComponent(raw) == raw else { return 1 }
-                        return knownIDs.contains(raw) ? 2 : 0
-                    }
-                    let lhsPriority = priority(lhs)
-                    let rhsPriority = priority(rhs)
-                    if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
-                    return lhs.lastPathComponent < rhs.lastPathComponent
+
+            // This is a missing-index-row repair, not a transcript health
+            // audit. A transcript whose normalized filename already has a
+            // canonical index row cannot change the result below: the old
+            // implementation still locked, read, JSON-parsed, and validated
+            // every such file on every launch before reaching the final
+            // `knownIDs` guard. On a healthy long-lived root that meant all
+            // historical active transcripts and no repair. Keep invalid names
+            // visible as corruption candidates, but remove known transcripts
+            // before applying the bounded recovery budget.
+            let candidates = directoryEntries.filter { transcript in
+                let raw = transcript.deletingPathExtension().lastPathComponent
+                guard NativeAgentChatSessionID.normalizedPathComponent(raw) == raw else {
+                    return true
                 }
+                return !knownIDs.contains(raw)
+            }.sorted { lhs, rhs in
+                // Valid orphan IDs are the repair target. Examine them before
+                // invalid filenames so a pile of damaged names cannot starve a
+                // recoverable session under the file bound.
+                func priority(_ url: URL) -> Int {
+                    let raw = url.deletingPathExtension().lastPathComponent
+                    return NativeAgentChatSessionID.normalizedPathComponent(raw) == raw ? 0 : 1
+                }
+                let lhsPriority = priority(lhs)
+                let rhsPriority = priority(rhs)
+                if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+                return lhs.lastPathComponent < rhs.lastPathComponent
+            }
 
             let fileLimit = max(0, maximumFiles)
             let boundedCandidates = candidates.prefix(fileLimit)

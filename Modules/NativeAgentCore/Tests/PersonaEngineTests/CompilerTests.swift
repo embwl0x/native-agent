@@ -91,6 +91,20 @@ func compile_with_default_persona_only() async throws {
     #expect(packet.compiledSystemPrompt.contains("voice body"))
 }
 
+@Test("compile fails closed when a canonical persona document is unreadable")
+func compile_rejectsUnreadableCanonicalDocument() async throws {
+    let root = try makeTempPersonaRoot()
+    try writeCanonical(root)
+    let voiceURL = root.appendingPathComponent("VOICE.md")
+    let invalidUTF8 = Data([0xFF, 0xFE, 0xFD])
+    try invalidUTF8.write(to: voiceURL)
+
+    await #expect(throws: PersonaEngineError.self) {
+        _ = try await makeCompiler(root: root).compile(surface: "chat")
+    }
+    #expect(try Data(contentsOf: voiceURL) == invalidUTF8)
+}
+
 @Test
 func compile_uses_persona_user_doc_and_ignores_split_generated_user_doc() async throws {
     let root = try makeTempPersonaRoot()
@@ -128,6 +142,22 @@ func compile_with_custom_persona_overrides_SOUL() async throws {
     #expect(packet.activeDocs["VOICE"] == "voice body\n")
 }
 
+@Test("compile does not fall back from an unreadable selected persona override")
+func compile_rejectsUnreadableCustomOverride() async throws {
+    let root = try makeTempPersonaRoot()
+    try writeCanonical(root)
+    let customRoot = root.appendingPathComponent("Agent", isDirectory: true)
+    try FileManager.default.createDirectory(at: customRoot, withIntermediateDirectories: true)
+    let soulURL = customRoot.appendingPathComponent("SOUL.md")
+    let invalidUTF8 = Data([0xF5, 0x80, 0x80, 0x80])
+    try invalidUTF8.write(to: soulURL)
+
+    await #expect(throws: PersonaEngineError.self) {
+        _ = try await makeCompiler(root: root).compile(surface: "chat")
+    }
+    #expect(try Data(contentsOf: soulURL) == invalidUTF8)
+}
+
 @Test
 func compile_with_partial_custom_persona() async throws {
     let root = try makeTempPersonaRoot()
@@ -155,6 +185,22 @@ func compile_with_surface_override_appended_to_system_prompt() async throws {
     #expect(packet.activeDocs["surface:dream"] == "DREAMS ARE WEIRD\n")
 }
 
+@Test("compile fails closed when a surface persona override is unreadable")
+func compile_rejectsUnreadableSurfaceOverride() async throws {
+    let root = try makeTempPersonaRoot()
+    try writeCanonical(root)
+    let surfaces = root.appendingPathComponent("surfaces", isDirectory: true)
+    try FileManager.default.createDirectory(at: surfaces, withIntermediateDirectories: true)
+    let chatURL = surfaces.appendingPathComponent("chat.md")
+    let invalidUTF8 = Data([0xC0, 0xAF])
+    try invalidUTF8.write(to: chatURL)
+
+    await #expect(throws: PersonaEngineError.self) {
+        _ = try await makeCompiler(root: root).compile(surface: "chat")
+    }
+    #expect(try Data(contentsOf: chatURL) == invalidUTF8)
+}
+
 @Test
 func compile_active_persona_selected_via_active_json() async throws {
     let root = try makeTempPersonaRoot()
@@ -167,6 +213,34 @@ func compile_active_persona_selected_via_active_json() async throws {
     let packet = try await makeCompiler(root: root).compile(surface: "chat")
     #expect(packet.personaId == "Zeta")
     #expect(packet.activeDocs["SOUL"] == "Z\n")
+}
+
+@Test("compile fails closed when active.json is malformed")
+func compile_rejectsMalformedActivePersonaSelector() async throws {
+    let root = try makeTempPersonaRoot()
+    try writeCanonical(root)
+    try write("A\n", to: root.appendingPathComponent("Alpha").appendingPathComponent("SOUL.md"))
+    let activeURL = root.appendingPathComponent("active.json")
+    let malformed = Data("{not-json".utf8)
+    try malformed.write(to: activeURL)
+
+    await #expect(throws: PersonaEngineError.self) {
+        _ = try await makeCompiler(root: root).compile(surface: "chat")
+    }
+    #expect(try Data(contentsOf: activeURL) == malformed)
+}
+
+@Test("compile fails closed when active.json has no usable persona")
+func compile_rejectsIncompleteActivePersonaSelector() async throws {
+    let root = try makeTempPersonaRoot()
+    try writeCanonical(root)
+    try write("A\n", to: root.appendingPathComponent("Alpha").appendingPathComponent("SOUL.md"))
+    let activeURL = root.appendingPathComponent("active.json")
+    try write(#"{"persona":"   "}"#, to: activeURL)
+
+    await #expect(throws: PersonaEngineError.self) {
+        _ = try await makeCompiler(root: root).compile(surface: "chat")
+    }
 }
 
 @Test

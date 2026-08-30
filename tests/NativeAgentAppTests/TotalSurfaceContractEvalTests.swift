@@ -94,12 +94,15 @@ struct TotalSurfaceContractEvalTests {
         let ledger = try Self.decode(Ledger.self, "docs/evals/ledger.json")
         let byKey = Dictionary(uniqueKeysWithValues: ledger.surfaces.map { (Campaign.Key(fence: $0.fence, id: $0.id), $0) })
 
-        #expect(campaign.surfaces.count == 641, "The authorized burn-down must stay frozen at its audited 641-row boundary.")
+        // 2026-08-30: User authorized retiring the unused substrate.runReplay
+        // compatibility API and its dedicated test. The other 640 IDs remain
+        // frozen; the real app-level replay/integration surfaces remain live.
+        #expect(campaign.surfaces.count == 640, "The authorized burn-down must retain its reviewed 640-row boundary after the one explicit retirement.")
         #expect(Set(campaign.surfaces).count == campaign.surfaces.count, "Campaign fence/ID keys must be unique.")
         #expect(Set(campaign.baselineInputs.keys) == Set(["phase1-fragments.json", "coverage-overrides.json"]))
         for (name, expectedHash) in campaign.baselineInputs {
             let data = try Data(contentsOf: Self.repo.appendingPathComponent("docs/evals/\(name)"))
-            #expect(Self.sha256(data) == expectedHash, "\(name) changed after the 641-row campaign was captured; deliberately regenerate/review its frozen membership")
+            #expect(Self.sha256(data) == expectedHash, "\(name) changed after the 640-row campaign was reviewed; deliberately regenerate/review its frozen membership")
         }
 
         var failures: [String] = []

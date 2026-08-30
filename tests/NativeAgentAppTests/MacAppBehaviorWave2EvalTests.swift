@@ -6,6 +6,31 @@ import Testing
 
 @Suite("Mac app behavior evaluations — wave 2")
 struct MacAppBehaviorWave2EvalTests {
+    private final class WakeResetRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var dispatches = 0
+        private var completions = 0
+
+        func reset(_ completion: @escaping @Sendable () -> Void) {
+            lock.lock()
+            dispatches += 1
+            lock.unlock()
+            completion()
+        }
+
+        func complete() {
+            lock.lock()
+            completions += 1
+            lock.unlock()
+        }
+
+        var counts: (dispatches: Int, completions: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (dispatches, completions)
+        }
+    }
+
     @Test("recent Spotlight prompts are deduplicated, newest-first, and bounded")
     func spotlightRecentPromptsAreBounded() throws {
         let suite = "NativeAgentSpotlightEval-\(UUID().uuidString)"
@@ -103,6 +128,26 @@ struct MacAppBehaviorWave2EvalTests {
         #expect(throttle.shouldFire(now: t0.addingTimeInterval(-120)))
         #expect(!throttle.shouldFire(now: t0.addingTimeInterval(-110)))
         #expect(throttle.shouldFire(now: t0.addingTimeInterval(-80)))
+    }
+
+    @Test("an accepted wake dispatches one reset effect and completes while an immediate repeat is suppressed")
+    func wakeResetRouteDispatchesAndCompletesExactlyOnce() {
+        let throttle = WakeResetThrottle()
+        let recorder = WakeResetRecorder()
+
+        let accepted = throttle.handleWake(
+            resetEffect: recorder.reset,
+            resetCompleted: recorder.complete
+        )
+        let suppressed = throttle.handleWake(
+            resetEffect: recorder.reset,
+            resetCompleted: recorder.complete
+        )
+
+        #expect(accepted)
+        #expect(!suppressed)
+        #expect(recorder.counts.dispatches == 1)
+        #expect(recorder.counts.completions == 1)
     }
 
     @Test("Grant All stays visible until every real system permission is granted")

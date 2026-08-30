@@ -4,6 +4,19 @@ import NativeAgentCore
 import PersistenceCore
 @testable import MacControl
 
+@Test func unknownSemanticOmissionsDoNotInventActionableControls() {
+    let percept = MacLookPercept(app: nil, windowTitle: "Partial capture", focus: nil,
+        modal: nil, landmarks: [], affordances: [], unlabeledByRole: [:], affordancesOmitted: 14,
+        interactiveCount: 14, labeledCount: 14, truncated: false, truncationReasons: [], skippedAtLeast: 0)
+    let screen = MacScreenRender.screen(from: percept)
+    let rendering = MacScreenRender.rendering(screen)
+    #expect(screen.totalControls == 0)
+    #expect(screen.contents.isEmpty)
+    #expect(rendering.controlsDropped == 0 && rendering.rowsDropped == 0)
+    #expect(rendering.text.contains("Semantic read omitted 14 AX targets"))
+    #expect(!rendering.text.contains("14 actionable"))
+}
+
 // MARK: - MacScreenRender — ONE STRUCTURE, EVERY SCREEN
 //
 // docs/build_plans/native-screen.md. These tests exist to prove ONE claim: the
@@ -458,7 +471,7 @@ struct MacScreenRenderTests {
         // The two unlabeled toolbar buttons are retained as `button 1` and
         // `button 2`, so they count toward the action surface and its cap.
         #expect(controlCapped.text.contains("DO      7 actionable, showing 2"))
-        #expect(controlCapped.text.contains("… 5 more not shown (raise maxControls)"))
+        #expect(controlCapped.text.contains("… 5 observed controls not shown (screen part: controls, or name a control)"))
         #expect(controlCapped.controlsDropped == 5)
 
         // A non-scrollable content section says the honest recourse instead of
@@ -497,6 +510,31 @@ struct MacScreenRenderTests {
     }
 
     // MARK: Abstains are visible
+
+    @Test("physical-only evidence is distinct from a refused target or an unparsed canvas")
+    func physicalOnlyEvidenceIsNotARefusal() {
+        let screen = MacScreenRender.Screen(
+            appName: "Visual Fixture",
+            contents: [
+                MacScreenRender.Content(kind: .grid, rows: [
+                    MacScreenRender.Row(label: visionText("yellow object"), provenance: .vision(0.8), physicalOnly: true),
+                    MacScreenRender.Row(label: visionText("covered object"), provenance: .vision(0.8),
+                        abstain: "covered by foreground window", physicalOnly: true),
+                ]),
+                MacScreenRender.Content(kind: .canvas, canvas: MacScreenRender.Canvas(
+                    description: "visual surface", width: 900, height: 600,
+                    provenance: .vision(1), hasPerceptualEvidence: true
+                )),
+            ]
+        )
+        let rendering = MacScreenRender.rendering(screen)
+        #expect(rendering.text.contains("PHYSICAL ONLY: role uncertain"))
+        #expect(rendering.text.contains("ABSTAINED: covered by foreground window"))
+        #expect(rendering.abstained == 1)
+        #expect(rendering.text.contains("900x600 — partial vision; use listed targets, roles may be uncertain"))
+        #expect(!rendering.text.contains("not interpreted"))
+        #expect(MacScreenRender.render(canvasAppScreen()).contains("not interpreted, act physically"))
+    }
 
     @Test("an abstaining row is reported with its reason, never dropped or guessed")
     func abstainsAreVisible() {

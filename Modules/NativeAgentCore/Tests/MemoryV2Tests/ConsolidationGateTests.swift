@@ -8,6 +8,7 @@ import GRDB
 import KnowledgeGraph
 @testable import MemoryV2
 import NativeAgentCore
+import PersistenceCore
 
 private actor ConsolidationInvalidationRecorder {
     private(set) var changes: [DerivedSourceChange] = []
@@ -278,8 +279,22 @@ struct MemoryConsolidationGateTests {
 
         _ = try await approvals(root: fx.root).resolve(
             approvalId, decision: .approved, decidedBy: "gate-test")
+        let stagedRecord = try await approvals(root: fx.root).get(approvalId)
+        let stagedRunId = try #require(MemoryConsolidationGate.runId(of: stagedRecord.payload))
+        let hygienePath = fx.root
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("hygiene_last_run.json")
+        try Data("""
+        {"id":"hygiene-fixture","status":"staged","createdAt":"2026-08-24T12:00:00Z","consolidationRunId":"\(stagedRunId)"}
+        """.utf8).write(to: hygienePath, options: .atomic)
         let outcomes = await MemoryConsolidationGate.reconcile(dataRoot: fx.root)
         #expect(outcomes.contains { if case .applied = $0 { return true }; return false })
+
+        let appliedHealth = try #require(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: hygienePath)) as? [String: Any]
+        )
+        #expect(appliedHealth["status"] as? String == "completed")
+        #expect(appliedHealth["consolidationRunId"] as? String == stagedRunId)
 
         // The accepted proposal is now an active live memory.
         let actives = try await fx.storage.listMemories()
@@ -309,6 +324,19 @@ struct MemoryConsolidationGateTests {
             .appendingPathComponent("backups", isDirectory: true)
         let backups = (try? FileManager.default.contentsOfDirectory(atPath: backupsDir.path)) ?? []
         #expect(backups.contains { $0.hasPrefix("pre-consolidation-") })
+
+        // Upgrade/crash compatibility: an older app may have left the shared
+        // health projection staged after the exact receipt became terminal.
+        // Receipt reconciliation must heal that projection without reapplying.
+        try Data("""
+        {"id":"hygiene-fixture","status":"staged","createdAt":"2026-08-24T12:00:00Z","consolidationRunId":"\(stagedRunId)"}
+        """.utf8).write(to: hygienePath, options: .atomic)
+        _ = await MemoryConsolidationGate.reconcile(dataRoot: fx.root)
+        let reconciledHealth = try #require(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: hygienePath)) as? [String: Any]
+        )
+        #expect(reconciledHealth["status"] as? String == "completed")
+        #expect(reconciledHealth["consolidationRunId"] as? String == stagedRunId)
     }
 
     /// Lifecycle regression (blueprint R1): the swap's INSERT INTO memories must
@@ -436,6 +464,7 @@ struct MemoryConsolidationGateTests {
         let changes = await invalidations.changes
         #expect(changes.count == 1)
         #expect(changes.first?.namespace == "memory-v2")
+        #expect(changes.first?.canonicalLocator == livePath.standardizedFileURL.path)
         #expect(changes.first?.operation == .reconcile)
         #expect(changes.first?.reason == "memory_consolidation_projection_rebuild")
 
@@ -486,6 +515,70 @@ struct MemoryConsolidationGateTests {
         #expect(candidateRunIds(root: fx.root).isEmpty)
     }
 
+    @Test func proposalEvidenceAfterStagingRefusesBothSwapBoundaries() async throws {
+        let fx = try await makeFixture()
+        let outcome = try await fx.consolidator.consolidateGated()
+        let approvalId = try #require(stagedApprovalId(outcome))
+        let staged = try await approvals(root: fx.root).get(approvalId)
+        let runId = try #require(MemoryConsolidationGate.runId(of: staged.payload))
+        let livePath = await fx.storage.path
+        let stagedFingerprint = try await liveFingerprint(fx)
+        let candidatePath = MemoryConsolidationGate.candidateDBPath(
+            dataRoot: fx.root, runId: runId
+        )
+
+        // Exercise the real repeated-observation path. It retains the same
+        // proposal identity/content/status and changes only its evidence.
+        let memory = SwiftNativeMemoryV2(
+            embedder: fx.embedder, storage: MemoryStorageBridge(storage: fx.storage)
+        )
+        let repeated = try await memory.propose(
+            content: fx.proposal.content,
+            source: "gate-test-later-session",
+            confidence: 0.97,
+            kind: "user_fact",
+            supportingSessionIDs: ["later-session"],
+            recurrenceCount: 2
+        )
+        #expect(repeated.id == fx.proposal.id)
+        #expect(repeated.status == "pending")
+        let expectedMetadata: JSONValue = .object([
+            "durability_score": .double(0.91),
+            "kind": .string("user_fact"),
+            "confidence": .double(0.97),
+            "supporting_session_ids": .array([.string("later-session")]),
+            "recurrence_count": .int(3),
+        ])
+        #expect(repeated.metadata == expectedMetadata)
+        let newerFingerprint = try await liveFingerprint(fx)
+        #expect(newerFingerprint != stagedFingerprint)
+
+        // A metadata-only mutation arriving after the outer check must also
+        // be rejected by the authoritative immediate-transaction recheck.
+        #expect(throws: MemoryConsolidationGate.SwapStaleError.self) {
+            try MemoryConsolidationGate.transactionalTableSwap(
+                livePath: livePath,
+                candidatePath: candidatePath,
+                expectedLiveFingerprint: stagedFingerprint
+            )
+        }
+        #expect(try await fx.storage.getProposal(id: fx.proposal.id)?.metadata == expectedMetadata)
+
+        _ = try await approvals(root: fx.root).resolve(
+            approvalId, decision: .approved, decidedBy: "gate-test"
+        )
+        let outcomes = await MemoryConsolidationGate.reconcile(dataRoot: fx.root)
+        #expect(outcomes.contains { if case .staleRefused = $0 { return true }; return false })
+        #expect(try await liveFingerprint(fx) == newerFingerprint)
+        let surviving = try #require(try await fx.storage.getProposal(id: fx.proposal.id))
+        #expect(surviving.status == "pending")
+        #expect(surviving.metadata == expectedMetadata)
+        #expect(try await fx.storage.listMemories().count == 2)
+        #expect(candidateRunIds(root: fx.root).isEmpty)
+        let receipt = try await approvals(root: fx.root).get(approvalId)
+        #expect(receipt.detail?.contains("STALE") == true)
+    }
+
     @Test func deniedDecisionCleansUpCandidate() async throws {
         let fx = try await makeFixture()
         let outcome = try await fx.consolidator.consolidateGated()
@@ -504,6 +597,33 @@ struct MemoryConsolidationGateTests {
         let deniedRecord = try await approvals(root: fx.root).get(approvalId)
         #expect(deniedRecord.executedAction != nil)
         #expect(deniedRecord.detail?.contains("denied") == true)
+    }
+
+    @Test func unreadableTerminalReceiptFailsClosedAndPreservesCandidate() async throws {
+        let fx = try await makeFixture()
+        let outcome = try await fx.consolidator.consolidateGated()
+        let approvalId = try #require(stagedApprovalId(outcome))
+        let record = try await approvals(root: fx.root).get(approvalId)
+        let runId = try #require(MemoryConsolidationGate.runId(of: record.payload))
+        let before = try await liveFingerprint(fx)
+        try FileManager.default.createDirectory(
+            at: MemoryConsolidationGate.receiptsDir(dataRoot: fx.root),
+            withIntermediateDirectories: true
+        )
+        try Data("not-json".utf8).write(
+            to: MemoryConsolidationGate.receiptPath(dataRoot: fx.root, runId: runId)
+        )
+        _ = try await approvals(root: fx.root).resolve(
+            approvalId, decision: .approved, decidedBy: "gate-test")
+
+        let outcomes = await MemoryConsolidationGate.reconcile(dataRoot: fx.root)
+
+        #expect(outcomes.contains {
+            if case .failed(let failedRunId, _) = $0 { return failedRunId == runId }
+            return false
+        })
+        #expect(candidateRunIds(root: fx.root) == [runId])
+        #expect(try await liveFingerprint(fx) == before)
     }
 
     @Test func crashAfterCommitReconcilesAsAlreadyApplied() async throws {
@@ -849,5 +969,124 @@ struct MemoryConsolidationGateTests {
         // Second legacy run surfaces the already-staged state in errors.
         let second = try await fx.consolidator.consolidate()
         #expect(second.errors.contains { $0.contains("already staged") })
+    }
+
+    // MARK: - Backup retention (B9)
+
+    private func backupsDir(root: URL) -> URL {
+        root.appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("backups", isDirectory: true)
+    }
+
+    /// Materialize a backup directory dated `age` before `now`, named exactly
+    /// as `backupLiveStore` names them.
+    @discardableResult
+    private func seedBackup(root: URL, now: Date, age: TimeInterval, suffix: String) throws -> String {
+        let name = "pre-consolidation-"
+            + MemoryConsolidationGate.timestamp(now.addingTimeInterval(-age))
+            + "-\(suffix)"
+        let dir = backupsDir(root: root).appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: dir.appendingPathComponent("memory.sqlite"))
+        return name
+    }
+
+    private func backupNames(root: URL) -> Set<String> {
+        Set((try? FileManager.default.contentsOfDirectory(atPath: backupsDir(root: root).path)) ?? [])
+    }
+
+    /// Retention is a UNION: newest-5 OR younger-than-30d survives. Proves
+    /// each clause independently, and the boundary in both directions.
+    @Test func backupSweepKeepsNewestFiveUnionThirtyDays() async throws {
+        let fx = try await makeFixture()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let day: TimeInterval = 24 * 60 * 60
+
+        // Six ancient backups: only the newest 5 may survive the age rule.
+        var ancient: [String] = []
+        for index in 0..<6 {
+            ancient.append(try seedBackup(
+                root: fx.root, now: now, age: 100 * day + Double(index) * day, suffix: "anc\(index)"))
+        }
+        // Recent ones are kept by AGE even though they are past rank 5.
+        let recent = try seedBackup(root: fx.root, now: now, age: 1 * day, suffix: "recent")
+        // Boundary: EXACTLY 30 days is inside the window; a second past it is not.
+        let onBoundary = try seedBackup(root: fx.root, now: now, age: 30 * day, suffix: "edge")
+        let pastBoundary = try seedBackup(root: fx.root, now: now, age: 30 * day + 1, suffix: "over")
+        // Undated residue is never counted and never deleted.
+        let foreign = "not-a-backup-dir"
+        try FileManager.default.createDirectory(
+            at: backupsDir(root: fx.root).appendingPathComponent(foreign, isDirectory: true),
+            withIntermediateDirectories: true)
+
+        let removed = MemoryConsolidationGate.sweepBackups(dataRoot: fx.root, now: now)
+        let survivors = backupNames(root: fx.root)
+
+        // Newest five by date: recent, edge, over, anc0, anc1.
+        #expect(survivors.contains(recent))
+        #expect(survivors.contains(onBoundary), "exactly maxAge old is still within the window")
+        #expect(survivors.contains(pastBoundary), "one second past maxAge survives on the newest-5 clause")
+        #expect(survivors.contains(ancient[0]))
+        #expect(survivors.contains(ancient[1]))
+        #expect(survivors.contains(foreign), "an undated directory has an unknown age, not an old age")
+        // Ranks 6+ AND older than 30d.
+        for stale in ancient[2...] {
+            #expect(!survivors.contains(stale), "\(stale) is past rank 5 and older than 30d")
+        }
+        #expect(Set(removed) == Set(ancient[2...]))
+
+        // Idempotent: a second sweep has nothing left to take.
+        #expect(MemoryConsolidationGate.sweepBackups(dataRoot: fx.root, now: now).isEmpty)
+    }
+
+    /// The age clause alone must never empty the directory, and the newest-5
+    /// clause alone must never delete something recent.
+    @Test func backupSweepKeepsEverythingRecentAndNeverDropsBelowFive() async throws {
+        let fx = try await makeFixture()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let day: TimeInterval = 24 * 60 * 60
+
+        // Twelve backups all inside the age window: nothing is swept.
+        for index in 0..<12 {
+            try seedBackup(root: fx.root, now: now, age: Double(index) * day, suffix: "fresh\(index)")
+        }
+        #expect(MemoryConsolidationGate.sweepBackups(dataRoot: fx.root, now: now).isEmpty)
+        #expect(backupNames(root: fx.root).count == 12)
+
+        // Now age every one of them far past the window: exactly 5 survive.
+        let aged = try await makeFixture()
+        for index in 0..<12 {
+            try seedBackup(root: aged.root, now: now, age: 400 * day + Double(index) * day, suffix: "old\(index)")
+        }
+        let removed = MemoryConsolidationGate.sweepBackups(dataRoot: aged.root, now: now)
+        #expect(removed.count == 7)
+        #expect(backupNames(root: aged.root).count == 5)
+    }
+
+    /// The sweep is wired into the applied path, not merely callable.
+    @Test func appliedSwapSweepsExpiredBackups() async throws {
+        let fx = try await makeFixture()
+        let outcome = try await fx.consolidator.consolidateGated()
+        let approvalId = try #require(stagedApprovalId(outcome))
+        _ = try await approvals(root: fx.root).resolve(
+            approvalId, decision: .approved, decidedBy: "gate-test")
+
+        // One ancient backup already on disk, plus five newer ancient ones so
+        // the swap's own fresh backup cannot be what evicts it.
+        let now = Date()
+        let day: TimeInterval = 24 * 60 * 60
+        let doomed = try seedBackup(root: fx.root, now: now, age: 400 * day, suffix: "doomed")
+        for index in 0..<5 {
+            try seedBackup(root: fx.root, now: now, age: 100 * day + Double(index) * day, suffix: "keep\(index)")
+        }
+
+        let outcomes = await MemoryConsolidationGate.reconcile(dataRoot: fx.root)
+        guard case .applied = outcomes.first else {
+            Issue.record("expected .applied, got \(String(describing: outcomes.first))")
+            return
+        }
+        let survivors = backupNames(root: fx.root)
+        #expect(!survivors.contains(doomed), "the applied path must sweep expired backups")
+        #expect(survivors.count == 5, "newest five (the fresh pre-swap backup + four) survive")
     }
 }

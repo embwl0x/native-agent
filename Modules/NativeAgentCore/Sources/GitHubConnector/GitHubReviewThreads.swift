@@ -504,7 +504,7 @@ private extension GitHubConnectorActions {
                 rateLimitReset: nil
             )
         }
-        let token = try await loadToken(dataRoot: dataRoot)
+        let token = try await requestToken(explicitToken: nil, dataRoot: dataRoot)
         var request = URLRequest(url: URL(string: "https://api.github.com/graphql")!)
         request.httpMethod = "POST"
         request.timeoutInterval = 30

@@ -73,6 +73,8 @@ struct KGEntityRow: View {
 struct KGEntityDetailView: View {
     let entity: KGEntity
     let api: NativeClient
+    let selectableEntityIDs: Set<String>
+    let onSelectEntity: (String) -> Void
 
     @State private var neighbors: KGNeighborsResponse? = nil
     @State private var loading = false
@@ -157,7 +159,11 @@ struct KGEntityDetailView: View {
                         NativePanel(title: "Relationships (\(count))", systemImage: "arrow.triangle.branch") {
                             VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
                                 ForEach(visibleEdges) { edge in
-                                    KGEdgeRow(edge: edge, entities: nbr.neighbors, rootId: entity.id)
+                                    KGEdgeRow(
+                                        edge: edge, entities: nbr.neighbors, rootId: entity.id,
+                                        selectableEntityIDs: selectableEntityIDs,
+                                        onSelectEntity: onSelectEntity
+                                    )
                                 }
                             }
                         }
@@ -178,7 +184,11 @@ struct KGEntityDetailView: View {
                                         .foregroundStyle(.secondary)
                                 } else {
                                     ForEach(visibleEdges) { edge in
-                                        KGEdgeRow(edge: edge, entities: nbr.neighbors, rootId: entity.id)
+                                        KGEdgeRow(
+                                            edge: edge, entities: nbr.neighbors, rootId: entity.id,
+                                            selectableEntityIDs: selectableEntityIDs,
+                                            onSelectEntity: onSelectEntity
+                                        )
                                     }
                                 }
                             }
@@ -226,21 +236,44 @@ private struct KGEdgeRow: View {
     let edge: KGEdge
     let entities: [String: KGEntity]
     let rootId: String
+    let selectableEntityIDs: Set<String>
+    let onSelectEntity: (String) -> Void
+
+    private var otherName: String {
+        let otherID = edge.from == rootId ? edge.to : edge.from
+        return entities[otherID]?.name ?? otherID
+    }
 
     var body: some View {
+        if let destination = KnowledgeGraphPresentation.relationshipNavigationDestination(
+            edge: edge, rootID: rootId, visibleIDs: selectableEntityIDs
+        ) {
+            Button { onSelectEntity(destination) } label: {
+                relationshipContent(isLink: true)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Show \(otherName) in Knowledge Graph")
+            .accessibilityLabel("Show entity \(otherName)")
+            .accessibilityHint("Selects this related entity without changing your filters.")
+        } else {
+            relationshipContent(isLink: false)
+        }
+        Divider()
+    }
+
+    private func relationshipContent(isLink: Bool) -> some View {
         HStack(spacing: NativeAgentSpacing.xs) {
             Image(systemName: "arrow.right").foregroundStyle(.secondary).font(.caption)
-            let otherId = edge.from == rootId ? edge.to : edge.from
-            let otherName = entities[otherId]?.name ?? otherId
             let direction = edge.from == rootId ? "→" : "←"
             Text("\(direction) [\(edge.kind)] \(otherName)")
                 .font(NativeAgentFont.body)
+                .foregroundStyle(isLink ? Color.accentColor : Color.primary)
             Spacer()
             if let w = edge.weight {
                 Text(String(format: "%.2f", w)).font(NativeAgentFont.label).foregroundStyle(.tertiary)
             }
         }
         .padding(.vertical, 2)
-        Divider()
     }
 }

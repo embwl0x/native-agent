@@ -1207,13 +1207,20 @@ func swiftToolDispatcher_reports_swift_runtime_introspection_aliases() async thr
     defer { try? FileManager.default.removeItem(at: root) }
     let tools = SwiftToolDispatcher(dataRoot: root)
 
-    let agent = try await tools.dispatch(tool: "agent_introspect", input: [:], surface: "chat")
+    let agent = try await tools.dispatch(
+        tool: "agent_introspect", input: ["detail": .string("full")], surface: "chat")
     guard case .object(let agentObj) = agent else {
         Issue.record("expected agent_introspect object")
         return
     }
     #expect(agentObj["runtime"] == .string("swift-native"))
+    #expect(agentObj["detail"] == .string("full"))
     #expect(agentObj["python_daemon"] == .string("retired"))
+    let expectedRuntimeID = "swift-native-\(ProcessInfo.processInfo.processIdentifier)"
+    #expect(agentObj["runtime_instance_id"] == .string(expectedRuntimeID))
+    #expect(agentObj["process_id"] == .int(Int64(ProcessInfo.processInfo.processIdentifier)))
+    #expect(agentObj["conversation_session_id"] == nil)
+    #expect(agentObj["session_id"] == nil)
     guard case .array(let activeTools)? = agentObj["active_tools"] else {
         Issue.record("expected active tool list")
         return
@@ -1241,7 +1248,32 @@ func swiftToolDispatcher_reports_swift_runtime_introspection_aliases() async thr
         return
     }
     #expect(compatObj["runtime"] == .string("swift-native"))
+    #expect(compatObj["detail"] == .string("compact"))
     #expect(compatObj["invoked_as"] == .string("daemon_introspect"))
+    #expect(compatObj["active_tools"] == nil)
+}
+
+@Test
+func swiftToolDispatcher_introspectionSeparatesConversationFromRuntimeIdentity() async throws {
+    let root = try makeTempRoot("introspect-session-identity")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tools = SwiftToolDispatcher(dataRoot: root)
+
+    let value = try await tools.dispatch(
+        tool: "agent_introspect",
+        input: ["__session_id": .string("conversation-exact-123")],
+        surface: "chat"
+    )
+    guard case .object(let object) = value else {
+        Issue.record("expected agent_introspect object")
+        return
+    }
+    #expect(object["runtime_instance_id"]
+        == .string("swift-native-\(ProcessInfo.processInfo.processIdentifier)"))
+    #expect(object["conversation_session_id"] == .string("conversation-exact-123"))
+    #expect(object["session_id"] == .string("conversation-exact-123"))
+    #expect(object["detail"] == .string("compact"))
+    #expect(object["outcome_dimension_health"] == nil)
 }
 
 @Test
@@ -1257,7 +1289,8 @@ func swiftToolDispatcher_introspection_marksUnreadableOutcomePopulationUnavailab
     )
 
     let tools = SwiftToolDispatcher(dataRoot: root)
-    let value = try await tools.dispatch(tool: "agent_introspect", input: [:], surface: "chat")
+    let value = try await tools.dispatch(
+        tool: "agent_introspect", input: ["detail": .string("full")], surface: "chat")
     guard case .object(let object) = value,
           case .object(let health)? = object["outcome_dimension_health"] else {
         Issue.record("expected outcome health in production introspection")
@@ -1299,6 +1332,9 @@ func swiftToolDispatcher_tool_catalog_includes_swift_aliases() async throws {
     #expect(obj["lazy_load"] == .bool(true))
     #expect(obj["builder_mode"] == .string("policy_locked"))
     #expect(obj["full_mac_active"] == .bool(false))
+    #expect(SwiftToolDispatcher.modelVisibleCatalogToolNames([
+        "mac_focus_app", "mac_quit_app", "act", "go", "market_status",
+    ]) == ["act", "go", "market_status"])
     guard case .array(let names)? = obj["available_tools"] else {
         Issue.record("expected available_tools")
         return
@@ -1373,6 +1409,9 @@ func swiftToolDispatcher_alwaysOnCoreNames_staysWithinLazyLoadBudget() async thr
 @Test
 func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async throws {
     let root = try makeTempRoot("codex-message")
+    let deskItem = try await SwiftNativeDeskStore(dataRoot: root).createItem(
+        kind: .project, project: "NativeAgent", title: "Bound delegation"
+    )
     let configRoot = root.appendingPathComponent("config", isDirectory: true)
     let bridge = FakeMacIntegrationBridgeForCodexMessage()
     let wakeup = CodexWakeupInputRecorder()
@@ -1403,6 +1442,8 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
                 "text": JSONValue.string("hello Codex from Agent"),
                 "priority": JSONValue.string("important"),
                 "topic": JSONValue.string("nativeagent-test"),
+                "completion_mode": JSONValue.string("receipt_only"),
+                "desk_item": JSONValue.string(deskItem.alias),
                 "model": JSONValue.string("gpt-5.6-terra"),
                 "reasoning_effort": JSONValue.string("ultra"),
                 "fast": JSONValue.bool(true),
@@ -1420,6 +1461,7 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
     #expect(obj["priority"] == JSONValue.string("important"))
     #expect(obj["conversationId"] == JSONValue.string("codex:thread-test"))
     #expect(obj["replyWith"] == JSONValue.string("codex_message"))
+    #expect(obj["deskHandle"] == JSONValue.string(deskItem.handle))
 
     guard let filePathValue = obj["filePath"],
           case .string(let filePath) = filePathValue else {
@@ -1448,6 +1490,8 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
     #expect(rowMessageId == rowId)
     #expect(row["priority"] == JSONValue.string("important"))
     #expect(row["topic"] == JSONValue.string("nativeagent-test"))
+    #expect(row["deskHandle"] == JSONValue.string(deskItem.handle))
+    #expect(row["completionMode"] == JSONValue.string("receipt_only"))
     #expect(row["text"] == JSONValue.string("hello Codex from Agent"))
     #expect(row["sessionId"] == JSONValue.string("session-test"))
     #expect(row["model"] == JSONValue.string("gpt-5.6-terra"))
@@ -1492,6 +1536,8 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
     #expect(wakeupInputs.first?["text"] == JSONValue.string("hello Codex from Agent"))
     #expect(wakeupInputs.first?["priority"] == JSONValue.string("important"))
     #expect(wakeupInputs.first?["topic"] == JSONValue.string("nativeagent-test"))
+    #expect(wakeupInputs.first?["deskHandle"] == JSONValue.string(deskItem.handle))
+    #expect(wakeupInputs.first?["completionMode"] == JSONValue.string("receipt_only"))
     #expect(wakeupInputs.first?["source"] == JSONValue.string("codex_message"))
     #expect(wakeupInputs.first?["sessionId"] == JSONValue.string("session-test"))
     #expect(wakeupInputs.first?["model"] == JSONValue.string("gpt-5.6-terra"))
@@ -1582,6 +1628,239 @@ func swiftToolDispatcher_codexConversationReferenceResumesExactThread() async th
     #expect(await wakeup.all().count == 1)
 }
 
+/// C9-1 (upgrade sweep 2026-08-28). 75 of the 101 live `claude_message`
+/// failures in the trace feed were `"conversation_id": ""` rejected as
+/// `invalid_conversation_id`. An empty reference is the same statement as an
+/// omitted one — "this is new work" — and the tool description literally tells
+/// the model to omit the key for that. Models that cannot emit an absent
+/// optional send "". Pin BOTH halves: empty starts a fresh conversation, and a
+/// genuinely malformed reference still fails (negative control, so a future
+/// "be lenient" edit cannot quietly turn this into a fuzzy match).
+@Test
+func swiftToolDispatcher_emptyConversationReferenceStartsFreshInsteadOfFailing() async throws {
+    let root = try makeTempRoot("builder-empty-conversation")
+    let claudeWakeup = CodexWakeupInputRecorder()
+    let codexWakeup = CodexWakeupInputRecorder()
+    let tools = SwiftToolDispatcher(
+        dataRoot: root,
+        agentBridgeConfigRoot: root.appendingPathComponent("config", isDirectory: true),
+        codexMessageNotificationPermissionOverride: false,
+        codexMessageWakeupOverride: { input in
+            await codexWakeup.append(input)
+            return .object(["status": .string("sent"), "threadId": .string("thread-fresh")])
+        },
+        claudeMessageWakeupOverride: { input in
+            await claudeWakeup.append(input)
+            return .object(["status": .string("sent")])
+        }
+    )
+
+    for empty in ["", "   "] {
+        let result = try await tools.dispatch(
+            tool: "claude_message",
+            input: [
+                "text": .string("New work, no prior conversation."),
+                "conversation_id": .string(empty),
+                "topic": .string("Upgrade Sweep C9"),
+                "message_id": .string("claude-empty-\(empty.count)"),
+            ],
+            surface: "chat"
+        )
+        guard case .object(let object) = result else {
+            Issue.record("claude_message should return an object")
+            return
+        }
+        #expect(object["status"] == .string("queued"))
+        #expect(object["reason"] == nil)
+        // Empty means absent, so the requested topic still mints the handle.
+        #expect(object["conversationId"] == .string("claude:upgrade-sweep-c9"))
+    }
+    #expect(await claudeWakeup.all().count == 2)
+
+    // Same rule on the codex twin, whose branch mints no id without a topic.
+    let codexResult = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("New codex work."),
+            "conversation_id": .string(""),
+            "working_directory": .string(""),
+            "message_id": .string("codex-empty-1"),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let codexObject) = codexResult else {
+        Issue.record("codex_message should return an object")
+        return
+    }
+    #expect(codexObject["reason"] == nil)
+    #expect(await codexWakeup.all().count == 1)
+
+    // Negative control: a non-empty but unparseable reference STILL fails.
+    let malformed = try await tools.dispatch(
+        tool: "claude_message",
+        input: [
+            "text": .string("Garbage reference must not start fresh."),
+            "conversation_id": .string("not-a-reference"),
+            "message_id": .string("claude-malformed-1"),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let malformedObject) = malformed else {
+        Issue.record("malformed reference should return an object")
+        return
+    }
+    #expect(malformedObject["status"] == .string("failed"))
+    #expect(malformedObject["reason"] == .string("invalid_conversation_id"))
+    #expect(await claudeWakeup.all().count == 2)
+}
+
+/// The worktree allocator's `isFollowUp` has to answer "was a conversation
+/// referenced?" the SAME way `builderConversationSelection` does, or empty is
+/// only half-absent: the allocator would take the follow-up branch and reject
+/// a caller-supplied `working_directory` as a follow-up directory conflict on
+/// work the selector just called brand new. One rule, all three call sites.
+@Test
+func swiftToolDispatcher_conversationReferencePresenceUsesOneRule() {
+    #expect(SwiftToolDispatcher.builderConversationReferenceSupplied(in: [:]) == false)
+    #expect(SwiftToolDispatcher.builderConversationReferenceSupplied(
+        in: ["conversation_id": .string("")]) == false)
+    #expect(SwiftToolDispatcher.builderConversationReferenceSupplied(
+        in: ["conversation_id": .string("   ")]) == false)
+    #expect(SwiftToolDispatcher.builderConversationReferenceSupplied(
+        in: ["conversation_id": .string("claude:topic")]) == true)
+    // A wrong-typed value is malformed, not absent: the selector must get the
+    // chance to reject it rather than have this quietly restart the thread.
+    #expect(SwiftToolDispatcher.builderConversationReferenceSupplied(
+        in: ["conversation_id": .int(42)]) == true)
+}
+
+@Test
+func swiftToolDispatcher_builderReviewPairPropagatesWithoutChangingOrdinaryMessages() async throws {
+    let root = try makeTempRoot("builder-review-pair")
+    let codexWakeup = CodexWakeupInputRecorder()
+    let claudeWakeup = CodexWakeupInputRecorder()
+    let tools = SwiftToolDispatcher(
+        dataRoot: root,
+        agentBridgeConfigRoot: root.appendingPathComponent("config", isDirectory: true),
+        codexMessageNotificationPermissionOverride: false,
+        codexMessageWakeupOverride: { input in
+            await codexWakeup.append(input)
+            return .object(["status": .string("sent"), "threadId": .string("paired-codex")])
+        },
+        claudeMessageWakeupOverride: { input in
+            await claudeWakeup.append(input)
+            return .object(["status": .string("sent")])
+        }
+    )
+
+    let codex = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("Build the focused change."),
+            "message_id": .string("paired-codex-message"),
+            "pair_reviewer": .bool(true),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let codexObject) = codex else {
+        Issue.record("paired codex_message should return an object")
+        return
+    }
+    #expect(codexObject["reviewerPairRequested"] == .bool(true))
+    #expect(codexObject["reviewerPaired"] == nil)
+    #expect((await codexWakeup.all()).first?["pairReviewer"] == .bool(true))
+
+    let claude = try await tools.dispatch(
+        tool: "claude_message",
+        input: [
+            "text": .string("Build another focused change."),
+            "topic": .string("paired-claude"),
+            "message_id": .string("paired-claude-message"),
+            "pair_reviewer": .bool(true),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let claudeObject) = claude else {
+        Issue.record("paired claude_message should return an object")
+        return
+    }
+    #expect(claudeObject["reviewerPairRequested"] == .bool(true))
+    #expect(claudeObject["reviewerPaired"] == nil)
+    #expect((await claudeWakeup.all()).first?["pairReviewer"] == .bool(true))
+
+    _ = try await tools.dispatch(
+        tool: "codex_message",
+        input: [
+            "text": .string("This ordinary note needs no reviewer."),
+            "message_id": .string("ordinary-codex-message"),
+        ],
+        surface: "chat"
+    )
+    let codexPayloads = await codexWakeup.all()
+    #expect(codexPayloads.count == 2)
+    #expect(codexPayloads[1]["pairReviewer"] == nil)
+
+    let invalid = try await tools.dispatch(
+        tool: "claude_message",
+        input: [
+            "text": .string("Invalid pairing must not queue."),
+            "pair_reviewer": .string("yes"),
+        ],
+        surface: "chat"
+    )
+    guard case .object(let invalidObject) = invalid else {
+        Issue.record("invalid pairing should return an object")
+        return
+    }
+    #expect(invalidObject["status"] == .string("failed"))
+    #expect(invalidObject["reason"] == .string("invalid_pair_reviewer"))
+    #expect(await claudeWakeup.all().count == 1)
+}
+
+@Test
+func swiftToolDispatcher_builderReviewRequestNeverClaimsPairingWhenWakeSkipsOrFails() async throws {
+    let root = try makeTempRoot("builder-review-request-honesty")
+    let tools = SwiftToolDispatcher(
+        dataRoot: root,
+        agentBridgeConfigRoot: root.appendingPathComponent("config", isDirectory: true),
+        codexMessageNotificationPermissionOverride: false,
+        codexMessageWakeupOverride: { input in
+            let status = input["messageId"] == .string("codex-skipped") ? "skipped" : "failed"
+            return .object(["status": .string(status)])
+        },
+        claudeMessageWakeupOverride: { input in
+            let status = input["messageId"] == .string("claude-skipped") ? "skipped" : "failed"
+            return .object(["status": .string(status)])
+        }
+    )
+
+    for (tool, messageID, expectedWakeStatus) in [
+        ("codex_message", "codex-skipped", "skipped"),
+        ("codex_message", "codex-failed", "failed"),
+        ("claude_message", "claude-skipped", "skipped"),
+        ("claude_message", "claude-failed", "failed"),
+    ] {
+        let result = try await tools.dispatch(
+            tool: tool,
+            input: [
+                "text": .string("Build with one paired reviewer."),
+                "message_id": .string(messageID),
+                "pair_reviewer": .bool(true),
+            ],
+            surface: "chat"
+        )
+        guard case .object(let object) = result,
+              case .object(let wakeup)? = object["wakeup"] else {
+            Issue.record("\(tool) \(expectedWakeStatus) wake should return a nested receipt")
+            continue
+        }
+        #expect(object["status"] == .string("queued"))
+        #expect(object["reviewerPairRequested"] == .bool(true))
+        #expect(object["reviewerPaired"] == nil)
+        #expect(wakeup["status"] == .string(expectedWakeStatus))
+    }
+}
+
 @Test
 func swiftToolDispatcher_claudeMessageQueuesInboxAndWakesClaudeSession() async throws {
     let root = try makeTempRoot("claude-message-wakeup")
@@ -1642,7 +1921,18 @@ func swiftToolDispatcher_claudeMessageQueuesInboxAndWakesClaudeSession() async t
         return path
     })
 
-    // Replaying the same message_id must NOT double-wake her.
+    // Model the helper's durable consumption, which the recording override
+    // deliberately does not perform. An unread inbox row alone is not proof
+    // of admission; explicit retries of that case belong to BuilderInboxRecoveryTests.
+    let inboxURL = URL(fileURLWithPath: inboxPath)
+    var consumedRow = try JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: inboxURL))
+    consumedRow["read"] = .bool(true)
+    consumedRow["consumedAt"] = .string("2026-08-30T20:00:00Z")
+    var consumedData = try JSONValue.object(consumedRow).serializedData(pretty: false)
+    consumedData.append(0x0a)
+    try consumedData.write(to: inboxURL, options: .atomic)
+
+    // Replaying an already-consumed message must not start another wake.
     let replay = try await tools.dispatch(tool: "claude_message", input: input, surface: "chat")
     guard case .object(let replayObj) = replay,
           case .object(let replayReceipt)? = replayObj["wakeup"] else {
@@ -1843,6 +2133,7 @@ func claudeMessageRunsTheRealHelperEndToEnd() async throws {
             "text": .string("prove the wake path"),
             "topic": .string("Wake Parity"),
             "message_id": .string("e2e-wake-1"),
+            "__session_id": .string("e2e-origin-session"),
         ],
         surface: "chat"
     )
@@ -1857,6 +2148,11 @@ func claudeMessageRunsTheRealHelperEndToEnd() async throws {
     #expect(receipt["topicSlug"] == JSONValue.string("wake-parity"))
     #expect(receipt["messageId"] == JSONValue.string("e2e-wake-1"))
     #expect(receipt["helper"] == JSONValue.string(helper.path))
+    guard case .object(let bridge)? = receipt["bridge"] else {
+        Issue.record("the real helper should return its delivery receipt")
+        return
+    }
+    #expect(bridge["status"] == .string("dry_run"))
 
     // The would-be bridge text carries the reply and the loop guard.
     guard case .string(let wouldSend)? = receipt["wouldSendText"] else {
@@ -2044,6 +2340,17 @@ private func runRepositoryTestGit(_ arguments: [String], at directory: URL) thro
     return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 }
 
+/// The absolute shared object store behind a checkout or one of its worktrees.
+/// Two paths reporting the same value are provably the same repository.
+private func repositoryTestCommonGitDirectory(_ directory: URL) throws -> String {
+    let raw = try runRepositoryTestGit(
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        at: directory
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !raw.isEmpty else { return "" }
+    return URL(fileURLWithPath: raw).standardizedFileURL.resolvingSymlinksInPath().path
+}
+
 /// The `repository` opt-in is the whole point of the change: chat may name a
 /// repo (never a path) and get a verified checkout + network profile, while a
 /// same-named directory pointing at a DIFFERENT remote must never resolve.
@@ -2105,15 +2412,20 @@ func swiftToolDispatcher_codexMessageRepositoryResolvesOnlyVerifiedRemote() asyn
 
     let inputs = await wakeup.all()
     #expect(inputs.count == 1)
+    // A count mismatch must fail this test, not force-index a crash that takes
+    // the whole test process (and every test after it) down with it.
+    let sent = try #require(inputs.first)
     // Unresolvable repository degrades to today's behavior: message still
     // sends, but with no directory and no elevated profile.
-    #expect(inputs[0]["workingDirectory"] == nil)
-    #expect(inputs[0]["executionProfile"] == nil)
+    #expect(sent["workingDirectory"] == nil)
+    #expect(sent["executionProfile"] == nil)
 }
 
 /// The positive half of the wiring: a repository that DOES resolve must reach
-/// the wakeup with both the verified directory and the elevated execution
-/// profile, from an ordinary chat surface. This drives the resolver's real
+/// the wakeup with both a working directory derived from the verified checkout
+/// and the elevated execution profile, from an ordinary chat surface. Since
+/// `bac13d70` that directory is the builder's isolated worktree of the resolved
+/// repository rather than the checkout itself. This drives the resolver's real
 /// defaultSearchRoots (dataRoot is <base>/NativeAgent/data, so <base> is a
 /// search root) rather than injecting searchRoots the tool path cannot pass.
 ///
@@ -2136,6 +2448,15 @@ func swiftToolDispatcher_codexMessageRepositoryGrantsProfileFromChat() async thr
         ["remote", "add", "origin", "https://github.com/nativeagent-tests/nativeagent-repo-optin-fixture.git"],
         at: checkout
     )
+    // A real checkout always has a commit. Without one, HEAD is unborn and the
+    // builder worktree allocator cannot branch from it -- an artifact of the
+    // fixture, not of the repository opt-in this test covers.
+    try runRepositoryTestGit(["config", "user.name", "NativeAgent Test"], at: checkout)
+    try runRepositoryTestGit(["config", "user.email", "nativeagent-test@example.invalid"], at: checkout)
+    try runRepositoryTestGit(["config", "commit.gpgsign", "false"], at: checkout)
+    try Data("fixture\n".utf8).write(to: checkout.appendingPathComponent("README.md"))
+    try runRepositoryTestGit(["add", "."], at: checkout)
+    try runRepositoryTestGit(["commit", "-q", "-m", "fixture"], at: checkout)
 
     let wakeup = CodexWakeupInputRecorder()
     let tools = SwiftToolDispatcher(
@@ -2160,8 +2481,27 @@ func swiftToolDispatcher_codexMessageRepositoryGrantsProfileFromChat() async thr
 
     let inputs = await wakeup.all()
     #expect(inputs.count == 1)
-    #expect(inputs[0]["workingDirectory"] == .string(checkout.standardizedFileURL.path))
-    #expect(inputs[0]["executionProfile"] == .string("github-command-repository-network-v1"))
+    // Guarded, not force-indexed: a count mismatch fails this test instead of
+    // trapping and killing every remaining test in the process.
+    let sent = try #require(inputs.first)
+    #expect(sent["executionProfile"] == .string("github-command-repository-network-v1"))
+
+    // Since the builder worktree allocator landed, a resolved Git checkout is
+    // handed to the builder as its own isolated worktree rather than the
+    // checkout itself. Pin that the directory really is derived from the
+    // repository this test resolved -- same Git object store, distinct
+    // working tree -- so the assertion cannot be satisfied by an unrelated path.
+    guard case .string(let workingDirectory)? = sent["workingDirectory"] else {
+        Issue.record("codex_message sent no workingDirectory for a resolved repository")
+        return
+    }
+    let worktree = URL(fileURLWithPath: workingDirectory)
+        .standardizedFileURL.resolvingSymlinksInPath()
+    #expect(worktree.path != checkout.standardizedFileURL.resolvingSymlinksInPath().path)
+    let worktreeStore = try repositoryTestCommonGitDirectory(worktree)
+    let checkoutStore = try repositoryTestCommonGitDirectory(checkout)
+    #expect(!worktreeStore.isEmpty)
+    #expect(worktreeStore == checkoutStore)
 }
 
 /// Slug extraction from request prose. Pure string work -- the resolver still
@@ -2226,6 +2566,15 @@ func swiftToolDispatcher_codexMessageInfersRepositoryFromRequestText() async thr
         ["remote", "add", "origin", "https://github.com/nativeagent-tests/nativeagent-inferred-fixture.git"],
         at: checkout
     )
+    // A real checkout always has a commit. Without one, HEAD is unborn and the
+    // builder worktree allocator cannot branch from it -- an artifact of the
+    // fixture, not of the inference this test covers.
+    try runRepositoryTestGit(["config", "user.name", "NativeAgent Test"], at: checkout)
+    try runRepositoryTestGit(["config", "user.email", "nativeagent-test@example.invalid"], at: checkout)
+    try runRepositoryTestGit(["config", "commit.gpgsign", "false"], at: checkout)
+    try Data("fixture\n".utf8).write(to: checkout.appendingPathComponent("README.md"))
+    try runRepositoryTestGit(["add", "."], at: checkout)
+    try runRepositoryTestGit(["commit", "-q", "-m", "fixture"], at: checkout)
 
     let wakeup = CodexWakeupInputRecorder()
     let tools = SwiftToolDispatcher(
@@ -2250,8 +2599,23 @@ func swiftToolDispatcher_codexMessageInfersRepositoryFromRequestText() async thr
 
     let inputs = await wakeup.all()
     #expect(inputs.count == 1)
-    #expect(inputs[0]["workingDirectory"] == .string(checkout.standardizedFileURL.path))
-    #expect(inputs[0]["executionProfile"] == .string("github-command-repository-network-v1"))
+    // Guarded, not force-indexed: a count mismatch fails this test instead of
+    // trapping and killing every remaining test in the process.
+    let sent = try #require(inputs.first)
+    #expect(sent["executionProfile"] == .string("github-command-repository-network-v1"))
+    // The builder worktree allocator hands the builder an isolated worktree of
+    // the inferred checkout, not the checkout itself. Pin that it really is
+    // derived from this repository: same Git object store, distinct work tree.
+    let workingDirectory = try #require(
+        sent["workingDirectory"].flatMap { if case .string(let s) = $0 { s } else { nil } },
+        "codex_message sent no workingDirectory for an inferred repository"
+    )
+    let worktree = URL(fileURLWithPath: workingDirectory)
+        .standardizedFileURL.resolvingSymlinksInPath()
+    #expect(worktree.path != checkout.standardizedFileURL.resolvingSymlinksInPath().path)
+    let worktreeStore = try repositoryTestCommonGitDirectory(worktree)
+    #expect(!worktreeStore.isEmpty)
+    #expect(worktreeStore == (try repositoryTestCommonGitDirectory(checkout)))
     // The auto-attach is observable at the call site, not silent.
     if case .object(let object) = response {
         #expect(object["executionProfile"] == .string("github-command-repository-network-v1"))
@@ -3424,11 +3788,21 @@ func swiftToolDispatcher_fullMacTrust_exposes_builder_and_mac_app_tools() async 
         Issue.record("expected builder_available_tools array")
     }
     if case .array(let appTools)? = catalogObj["mac_app_available_tools"] {
-        #expect(appTools.contains(.string("mac_focus_app")))
-        #expect(appTools.contains(.string("mac_quit_app")))
+        // Legacy app routes remain dispatchable above, but conversational
+        // discovery exposes the native four verbs, not schema-less aliases.
+        #expect(appTools.isEmpty)
     } else {
         Issue.record("expected mac_app_available_tools array")
     }
+    guard case .array(let modelTools)? = catalogObj["available_tools"] else {
+        Issue.record("expected available_tools array")
+        return
+    }
+    for name in ["screen", "act", "go", "wait"] {
+        #expect(modelTools.contains(.string(name)))
+    }
+    #expect(!modelTools.contains(.string("mac_focus_app")))
+    #expect(!modelTools.contains(.string("mac_quit_app")))
 
     let target = repo
         .appendingPathComponent("outside-workspace", isDirectory: true)
@@ -3763,6 +4137,23 @@ func chatClient_non_streaming_no_tools_returns_response_and_persists() async thr
         "reaction": .unknown,
     ])
 
+    // A durable next user row immediately following the exact assistant anchor
+    // promotes reaction PRESENCE only. Its prose is not classified as praise,
+    // criticism, or quality evidence.
+    _ = try await client.enqueueUserMessage(
+        message: "continue from that answer",
+        sessionId: "s-plain",
+        persona: nil,
+        surface: "chat"
+    )
+
+    // Simulate history written before continuation receipts shipped. Exact
+    // transcript adjacency remains enough to observe reaction PRESENCE on the
+    // read side; no sentiment or quality is inferred from the user's prose.
+    try FileManager.default.removeItem(
+        at: root.appendingPathComponent("context/feedback.jsonl")
+    )
+
     // Population health keeps absent observations separate from state counts,
     // and names a permanently-dark nonterminal lane instead of presenting it
     // as measured zero evidence.
@@ -3782,11 +4173,12 @@ func chatClient_non_streaming_no_tools_returns_response_and_persists() async thr
     #expect(audit.absentObservations == 1)
     #expect(audit.distributions["provider"]?[.observed] == 1)
     #expect(audit.distributions["provider"]?[.unknown] == 1)
-    #expect(audit.distributions["reaction"]?[.unknown] == 2)
-    #expect(audit.permanentlyNonterminalDimensions.contains("reaction"))
+    #expect(audit.distributions["reaction"]?[.observed] == 1)
+    #expect(audit.distributions["reaction"]?[.unknown] == 1)
+    #expect(!audit.permanentlyNonterminalDimensions.contains("reaction"))
     #expect(audit.permanentlyNonterminalDimensions.contains("context"))
     #expect(!audit.permanentlyNonterminalDimensions.contains("provider"))
-    #expect(audit.rankedLeads.contains("reaction: this dimension has no promoter wired"))
+    #expect(!audit.rankedLeads.contains(where: { $0.hasPrefix("reaction:") }))
     #expect(audit.rankedLeads.first?.contains("outcome observation absent") == true)
 
     // A row derived from the real persisted assistant bytes but missing one of
@@ -4164,6 +4556,171 @@ func canonicalAssistantRegenerationFailsBeforeAppendWhenTargetIsMissing() async 
     #expect(rows.count == 1)
     #expect(rows.first?["content"] as? String == "keep me")
     #expect(rows.first?["runId"] as? String == "run-old")
+}
+
+@Test(arguments: ["valid", "missing", "stale"])
+func textCompatibilityRegenerationRequiresSuccessfulFinalPersistence(target: String) async throws {
+    let root = try makeTempRoot("compat-regenerate-\(target)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let sessionID = "compat-regenerate"
+    let llm = ToolSchemaCapturingLLM(scriptedResponses: ["structured lane must not run"])
+    let tools = MockToolDispatchClient()
+    let streamer = MockStreamingLLMClient(chunks: ["Replacement answer."])
+    let client = SwiftNativeChatOrchestrationClient(
+        engine: makeEngine(root: root, llm: llm, tools: tools),
+        tools: tools, llm: llm, streamingLLM: streamer,
+        history: SessionHistoryReader(dataRoot: root), dataRoot: root,
+        trust: SwiftNativeTrustCenter(dataRoot: root)
+    )
+    try await client.appendMessage(
+        sessionId: sessionID, role: "user", content: "Question", runId: "old-user", attachments: []
+    )
+    try await client.appendMessage(
+        sessionId: sessionID, role: "assistant", content: "Original answer", runId: "old-answer",
+        attachments: [], canonicalAssistantCompletion: true
+    )
+    let oldID = try #require(readJSONL(root, sessionId: sessionID).last?["id"] as? String)
+    if target == "stale" {
+        try await client.appendMessage(
+            sessionId: sessionID, role: "user", content: "Newer question", runId: "newer-user", attachments: []
+        )
+    }
+    let path = root.appendingPathComponent("chat/messages/\(sessionID).jsonl")
+    let originalBytes = try Data(contentsOf: path)
+    let replacementID = target == "missing" ? "missing-assistant" : oldID
+    var response: ChatResponse?
+    var failure: Error?
+    do {
+        response = try await TurnTraceContext.$turnId.withValue("compat-retry-turn") {
+            try await ChatPersistenceContext.$replacementAssistantMessageID.withValue(replacementID) {
+                try await client.chat(
+                    message: "Question", sessionId: sessionID, model: "claude-opus-4-8",
+                    reasoningEffort: "high", fileAccess: "workspace", attachments: [],
+                    persona: nil, surface: "telegram", suppressUserAppend: true, progress: nil
+                )
+            }
+        }
+    } catch { failure = error }
+    #expect(streamer.callCount == 1)
+    #expect(llm.callCount == 0)
+    if target == "valid" {
+        #expect(failure == nil)
+        let savedResponse = try #require(response)
+        #expect(savedResponse.output == "Replacement answer.")
+        let rows = readJSONL(root, sessionId: sessionID)
+        #expect(rows.count == 2)
+        #expect(rows.filter { $0["role"] as? String == "assistant" }.count == 1)
+        #expect(rows.last?["content"] as? String == savedResponse.output)
+        #expect(rows.last?["runId"] as? String == savedResponse.runId)
+        let metadata = try #require(rows.last?["metadata"] as? [String: Any])
+        #expect(metadata["turnTraceId"] as? String == "compat-retry-turn")
+        let outcome = try #require(metadata["outcomeObservation"] as? [String: Any])
+        #expect(outcome["messageID"] as? String == rows.last?["id"] as? String)
+    } else {
+        #expect(response == nil)
+        #expect(failure is ChatOrchestrationError)
+        #expect(String(describing: failure).contains("persist assistant turn failed"))
+        #expect(try Data(contentsOf: path) == originalBytes)
+    }
+}
+
+@Test
+func canonicalAssistantRegenerationKeepsItsOwnToolReceiptsBeforeTheReplacement() async throws {
+    let root = try makeTempRoot("regenerate-with-tools")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let schema = LLMToolSchema(
+        name: "tool_catalog", description: "Inert fixture tool",
+        parametersJSON: Data(#"{"type":"object","properties":{},"additionalProperties":false}"#.utf8))
+    let toolCall = #"{"tool_calls":[{"id":"retry-tool","type":"function","function":{"name":"tool_catalog","arguments":"{}"}}]}"#
+    let llm = ToolSchemaCapturingLLM(scriptedResponses: ["old answer", toolCall, "new answer after tool"])
+    let tools = SchemaBackedToolDispatch(schemas: [schema], scripted: [
+        "tool_catalog": .object(["status": .string("queued"), "messageId": .string("fixture-message")]),
+    ])
+    let engine = makeEngine(root: root, llm: llm, tools: tools)
+    let client = SwiftNativeChatOrchestrationClient(
+        engine: engine, tools: tools, llm: llm,
+        history: SessionHistoryReader(dataRoot: root), dataRoot: root,
+        trust: SwiftNativeTrustCenter(dataRoot: root), toolLoopMaxIterations: 4)
+    let session = "s-regenerate-with-tools"
+    _ = try await client.chat(
+        message: "question", sessionId: session, model: "client-model", reasoningEffort: "high",
+        fileAccess: "workspace", attachments: [], suppressUserAppend: false)
+    let oldID = try #require(readJSONL(root, sessionId: session).last?["id"] as? String)
+    let response = try await ChatPersistenceContext.$replacementAssistantMessageID.withValue(oldID) {
+        try await client.chat(
+            message: "question", sessionId: session, model: "client-model", reasoningEffort: "high",
+            fileAccess: "workspace", attachments: [], suppressUserAppend: true)
+    }
+    #expect(response.output == "new answer after tool")
+    let rows = readJSONL(root, sessionId: session)
+    #expect(rows.compactMap { $0["role"] as? String } == ["user", "tool", "assistant"])
+    #expect(rows.contains { $0["id"] as? String == oldID } == false)
+    let receipt = try #require(rows.first { $0["role"] as? String == "tool" })
+    #expect(receipt["runId"] as? String == response.runId)
+    #expect(rows.last?["runId"] as? String == response.runId)
+    let metadata = try #require(receipt["metadata"] as? [String: Any])
+    #expect(metadata["resultClass"] as? String == "unknown")
+    #expect(tools.dispatches.count == 1)
+}
+
+@Test
+func canonicalAssistantRegenerationPreservesItsPendingApprovalReceipt() async throws {
+    let root = try makeTempRoot("regenerate-pending-receipt")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = makeClientForNoticeTests(root: root)
+    let session = "s-regenerate-pending"
+    try await client.appendMessage(
+        sessionId: session, role: "assistant", content: "old answer", runId: "old-run",
+        attachments: [], canonicalAssistantCompletion: true)
+    let oldID = try #require(readJSONL(root, sessionId: session).last?["id"] as? String)
+    try await client.appendToolMessage(
+        sessionId: session, runId: "retry-run", toolName: "write_file", inputJSON: "{}",
+        resultSummary: #"{"status":"waiting_approval","approvalId":"pending-fixture"}"#, ok: true)
+    let receiptBefore = try #require(readJSONL(root, sessionId: session).last)
+    try await ChatPersistenceContext.$replacementAssistantMessageID.withValue(oldID) {
+        try await client.appendMessage(
+            sessionId: session, role: "assistant", content: "Waiting for approval.", runId: "retry-run",
+            attachments: [], canonicalAssistantCompletion: true)
+    }
+    let rows = readJSONL(root, sessionId: session)
+    #expect(rows.compactMap { $0["role"] as? String } == ["tool", "assistant"])
+    #expect(rows.first?["id"] as? String == receiptBefore["id"] as? String)
+    let metadata = try #require(rows.first?["metadata"] as? [String: Any])
+    #expect(metadata["kind"] as? String == ChatTranscriptToolMessageKind.approvalPending)
+    #expect(metadata["approvalId"] as? String == "pending-fixture")
+}
+
+@Test(arguments: ["foreign-run", "foreign-session", "untyped", "user", "assistant"])
+func canonicalAssistantRegenerationRejectsUnrelatedTrailingRows(shape: String) async throws {
+    let root = try makeTempRoot("regenerate-foreign-tail")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let client = makeClientForNoticeTests(root: root)
+    let session = "s-regenerate-foreign"
+    try await client.appendMessage(
+        sessionId: session, role: "assistant", content: "old answer", runId: "old-run",
+        attachments: [], canonicalAssistantCompletion: true)
+    let oldID = try #require(readJSONL(root, sessionId: session).last?["id"] as? String)
+    let trailer: JSONValue = .object([
+        "id": .string("later-row"), "role": .string(["user", "assistant"].contains(shape) ? shape : "tool"),
+        "content": .string("preserve this row"),
+        "sessionId": .string(shape == "foreign-session" ? "other-session" : session),
+        "runId": .string(shape == "foreign-run" ? "other-run" : "retry-run"),
+        "metadata": .object([
+            "kind": .string(shape == "untyped" ? "legacy" : ChatTranscriptToolMessageKind.toolUse),
+            "toolName": .string("tool_catalog"),
+        ]),
+    ])
+    let path = root.appendingPathComponent("chat/messages/\(session).jsonl")
+    try await SwiftNativePersistenceCore().appendJSONL(trailer, to: path)
+    let before = try Data(contentsOf: path)
+    await #expect(throws: ChatOrchestrationError.self) {
+        try await ChatPersistenceContext.$replacementAssistantMessageID.withValue(oldID) {
+            try await client.appendMessage(
+                sessionId: session, role: "assistant", content: "must not replace", runId: "retry-run",
+                attachments: [], canonicalAssistantCompletion: true)
+        }
+    }
+    #expect(try Data(contentsOf: path) == before)
 }
 
 @Test
@@ -4714,8 +5271,17 @@ func chatClient_freezesOneCheckedRouteAcrossContextAndMultipleProviderCalls() as
     #expect(adapter.calls.allSatisfy { $0.system?.contains("provider=xai_oauth_direct") == false })
 }
 
+// EVAL FENCE: core.chat.engine / chat.admission.llmCallContextBinding
+// Drive the public streaming admission facade and observe its checked route at
+// the real provider boundary. The caller must remain unbound before and after
+// the child stream task so one turn cannot leak admission into another.
 @Test
-func chatClient_streamingFreezesOneCheckedRouteAcrossIOSProviderCalls() async throws {
+func chatAdmissionBinding_streamFacadeBindsCheckedRouteAndRestoresCaller() async throws {
+    #expect(LLMCallContext.admittedModel == nil)
+    #expect(LLMCallContext.providerId == nil)
+    #expect(LLMCallContext.reasoningEffort == nil)
+    #expect(LLMCallContext.serviceTier == nil)
+
     let root = try makeTempRoot("frozen-stream-route-generation")
     defer { try? FileManager.default.removeItem(at: root) }
     let router = RotatingCheckedRoutingForClient(surface: "ios")
@@ -4762,6 +5328,62 @@ func chatClient_streamingFreezesOneCheckedRouteAcrossIOSProviderCalls() async th
     #expect(adapter.calls.allSatisfy { $0.effort == "medium" })
     #expect(adapter.calls.allSatisfy { $0.tier == "priority" })
     #expect(router.checkedCallCount >= 1)
+
+    #expect(LLMCallContext.admittedModel == nil)
+    #expect(LLMCallContext.providerId == nil)
+    #expect(LLMCallContext.reasoningEffort == nil)
+    #expect(LLMCallContext.serviceTier == nil)
+}
+
+// Regression tripwire only (not ledger evidence): detached work is an explicit
+// isolation boundary and must not inherit an admitted provider route.
+@Test
+func llmCallContext_detachedTaskDoesNotInheritAdmittedTuple() async {
+    struct Route: Sendable, Equatable {
+        let model: String?
+        let provider: String?
+        let effort: String?
+        let tier: String?
+    }
+
+    func currentRoute() -> Route {
+        Route(
+            model: LLMCallContext.admittedModel,
+            provider: LLMCallContext.providerId,
+            effort: LLMCallContext.reasoningEffort,
+            tier: LLMCallContext.serviceTier
+        )
+    }
+
+    let empty = Route(model: nil, provider: nil, effort: nil, tier: nil)
+    let expected = Route(
+        model: "gpt-admitted",
+        provider: "openai_oauth_direct",
+        effort: "xhigh",
+        tier: "priority"
+    )
+    #expect(currentRoute() == empty)
+
+    let observations = await LLMCallContext.$admittedModel.withValue(expected.model) {
+        await LLMCallContext.$providerId.withValue(expected.provider) {
+            await LLMCallContext.$reasoningEffort.withValue(expected.effort) {
+                await LLMCallContext.$serviceTier.withValue(expected.tier) {
+                    let before = currentRoute()
+                    let detached = await Task.detached { currentRoute() }.value
+                    let after = currentRoute()
+                    return (before: before, detached: detached, after: after)
+                }
+            }
+        }
+    }
+
+    #expect(observations.before == expected)
+    #expect(observations.detached.model == nil)
+    #expect(observations.detached.provider == nil)
+    #expect(observations.detached.effort == nil)
+    #expect(observations.detached.tier == nil)
+    #expect(observations.after == expected)
+    #expect(currentRoute() == empty)
 }
 
 @Test
@@ -4817,50 +5439,6 @@ func chatClient_anthropicTextCompatibilityFreezesTelegramRouteAcrossToolRounds()
     #expect(textStream.routeCalls.allSatisfy { $0.tier == "priority" })
     #expect(textStream.routeCalls.allSatisfy { $0.surface == "telegram" })
     #expect(router.checkedCallCount >= 1)
-}
-
-// EVAL FENCE: core.chat.engine / chat.admission.llmCallContextBinding
-// A provider invocation must receive the complete admitted tuple through its
-// structured task chain. `Task.detached` deliberately does not inherit it;
-// this negative control catches any future attempt to move an admitted read
-// across that isolation boundary and silently fall back to current routing.
-@Test
-func chatAdmissionBinding_isPresentInStructuredTasks_andAbsentInDetachedTasks() async throws {
-    struct Route: Sendable, Equatable {
-        let model: String?
-        let provider: String?
-        let effort: String?
-        let tier: String?
-    }
-    func currentRoute() -> Route {
-        Route(
-            model: LLMCallContext.admittedModel,
-            provider: LLMCallContext.providerId,
-            effort: LLMCallContext.reasoningEffort,
-            tier: LLMCallContext.serviceTier
-        )
-    }
-
-    let expected = Route(
-        model: "gpt-admitted",
-        provider: "openai_oauth_direct",
-        effort: "xhigh",
-        tier: "priority"
-    )
-    let observations = try await LLMCallContext.$admittedModel.withValue(expected.model) {
-        try await LLMCallContext.$providerId.withValue(expected.provider) {
-            try await LLMCallContext.$reasoningEffort.withValue(expected.effort) {
-                try await LLMCallContext.$serviceTier.withValue(expected.tier) {
-                    let structured = await Task { currentRoute() }.value
-                    let detached = await Task.detached { currentRoute() }.value
-                    return (structured, detached)
-                }
-            }
-        }
-    }
-
-    #expect(observations.0 == expected)
-    #expect(observations.1 == Route(model: nil, provider: nil, effort: nil, tier: nil))
 }
 
 @Test
@@ -5518,6 +6096,60 @@ func chatClient_ios_claude_streaming_uses_text_streaming_compatibility_path() as
     #expect(lines[1]["role"] as? String == "assistant")
     #expect(lines[1]["source"] as? String == "ios")
     #expect(lines[1]["content"] as? String == "ios reply")
+}
+
+@Test(arguments: [false, true])
+func chatClient_nonStreamingPersistsToolReceiptsWithOrWithoutProgress(progressEnabled: Bool) async throws {
+    let root = try makeTempRoot("nonstream-tool-receipts")
+    defer { try? FileManager.default.removeItem(at: root) }
+    // These are the real public-caller shapes: bridge chat without a callback,
+    // and Telegram chat with one. Both use the same structured execution path.
+    let surface = progressEnabled ? "telegram" : "chat"
+    let session = "s-nonstream-tool-receipts"
+    let schema = LLMToolSchema(
+        name: "tool_catalog", description: "Inert fixture tool",
+        parametersJSON: Data(#"{"type":"object","properties":{},"additionalProperties":false}"#.utf8))
+    let toolCall = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"tool_catalog","arguments":"{}"}}]}"#
+    let llm = ToolSchemaCapturingLLM(scriptedResponses: [toolCall, "The fixture is queued, not completed."])
+    // Use an always-available inert tool to isolate receipt plumbing from lazy
+    // activation and real bridge dispatch. Its scripted output models queued work.
+    let tools = SchemaBackedToolDispatch(schemas: [schema], scripted: [
+        "tool_catalog": .object(["status": .string("queued"), "messageId": .string("fixture-message")]),
+    ])
+    let router = StubRoutingForClient(prefs: [
+        surface: SurfacePreference(surface: surface, model: "client-model", reasoningEffort: "high"),
+    ])
+    let engine = makeEngine(root: root, llm: llm, tools: tools, router: router)
+    let client = SwiftNativeChatOrchestrationClient(
+        engine: engine, tools: tools, llm: llm,
+        history: SessionHistoryReader(dataRoot: root), dataRoot: root,
+        trust: SwiftNativeTrustCenter(dataRoot: root), toolLoopMaxIterations: 4)
+    let captured = ToolProgressCapture()
+    let captureProgress: ChatOrchestrationProgressHandler = { event in await captured.record(event) }
+    let progress: ChatOrchestrationProgressHandler? = progressEnabled ? captureProgress : nil
+
+    let response = try await client.chat(
+        message: "Use the fixture tool.", sessionId: session, model: "client-model",
+        reasoningEffort: "high", fileAccess: "workspace", attachments: [], persona: nil,
+        surface: surface, suppressUserAppend: false, progress: progress)
+
+    #expect(response.output == "The fixture is queued, not completed.")
+    #expect(tools.dispatches.count == 1)
+    let rows = readJSONL(root, sessionId: session)
+    #expect(rows.compactMap { $0["role"] as? String } == ["user", "tool", "assistant"])
+    let receipt = try #require(rows.first { $0["role"] as? String == "tool" })
+    let final = try #require(rows.last)
+    let runID = try #require(receipt["runId"] as? String)
+    #expect(!runID.isEmpty)
+    #expect(final["runId"] as? String == runID)
+    #expect(receipt["source"] as? String == (progressEnabled ? "telegram" : "app"))
+    let metadata = try #require(receipt["metadata"] as? [String: Any])
+    #expect(metadata["kind"] as? String == ChatTranscriptToolMessageKind.toolUse)
+    #expect(metadata["ok"] as? Bool == true)
+    #expect(metadata["resultClass"] as? String == ChatToolOutcome.ExactResultClass.unknown.rawValue)
+    #expect((metadata["resultSummary"] as? String)?.contains("queued") == true)
+    #expect(await captured.uses() == (progressEnabled ? ["tool_catalog"] : []))
+    #expect(await captured.results() == (progressEnabled ? ["tool_catalog"] : []))
 }
 
 @Test
@@ -7617,8 +8249,7 @@ private actor NoticeCapture {
 
 private func makeClientForNoticeTests(
     root: URL,
-    turnTraceBus: TurnTraceBus = .shared,
-    publicSafeMode: Bool = false
+    turnTraceBus: TurnTraceBus = .shared
 ) -> SwiftNativeChatOrchestrationClient {
     let llm = ModelCapturingLLM()
     let tools = MockToolDispatchClient()
@@ -7630,8 +8261,7 @@ private func makeClientForNoticeTests(
         dataRoot: root,
         turnTraceBus: turnTraceBus,
         trust: hermeticTrust(),
-        clock: { Date(timeIntervalSince1970: 1_234) },
-        publicSafeMode: publicSafeMode
+        clock: { Date(timeIntervalSince1970: 1_234) }
     )
 }
 

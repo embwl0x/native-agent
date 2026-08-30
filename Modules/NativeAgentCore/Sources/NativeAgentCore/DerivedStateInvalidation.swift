@@ -72,6 +72,7 @@ public actor DerivedStateInvalidationCenter {
     private struct ChangeKey: Hashable {
         let namespace: String
         let stableID: String
+        let canonicalLocator: String?
     }
 
     private let coalescingNanoseconds: UInt64
@@ -79,12 +80,20 @@ public actor DerivedStateInvalidationCenter {
     private var pending: [ChangeKey: DerivedSourceChange] = [:]
     private var deliveryTask: Task<Void, Never>?
     private var deliveryGeneration: UInt64 = 0
+    private var sinkEpoch: UInt64 = 0
+    private var nextDeliveryID: UInt64 = 0
+    private struct Delivery {
+        let sinkEpoch: UInt64
+        let task: Task<Void, Never>
+    }
+    private var inFlightDeliveries: [UInt64: Delivery] = [:]
 
     public init(coalescingNanoseconds: UInt64 = 150_000_000) {
         self.coalescingNanoseconds = coalescingNanoseconds
     }
 
     public func install(_ sink: (any DerivedStateInvalidationSink)?) {
+        sinkEpoch &+= 1
         self.sink = sink
         guard sink == nil else { return }
         deliveryGeneration &+= 1
@@ -100,7 +109,13 @@ public actor DerivedStateInvalidationCenter {
     public func publish(_ changes: [DerivedSourceChange]) async {
         guard sink != nil, !changes.isEmpty else { return }
         for change in changes {
-            pending[ChangeKey(namespace: change.namespace, stableID: change.stableID)] = change
+            // Candidate databases retain the live row IDs. Their changes must
+            // not replace a live-root change while this batch is coalescing.
+            pending[ChangeKey(
+                namespace: change.namespace,
+                stableID: change.stableID,
+                canonicalLocator: change.canonicalLocator
+            )] = change
         }
         guard deliveryTask == nil else { return }
         deliveryGeneration &+= 1
@@ -120,11 +135,24 @@ public actor DerivedStateInvalidationCenter {
     }
 
     public func flush() async {
+        await flush(onAdmission: nil)
+    }
+
+    /// Internal admission receipt keeps concurrency fixtures deterministic
+    /// without exposing payloads or adding a production observer API.
+    func flush(onAdmission: (@Sendable (Int) -> Void)?) async {
         deliveryGeneration &+= 1
         let scheduledDelivery = deliveryTask
         deliveryTask = nil
         scheduledDelivery?.cancel()
-        await deliverPending()
+        startPendingDelivery()
+        // Snapshot one boundary before suspending. New publishes belong to a
+        // later flush; detached deliveries for an old installation cannot
+        // hold a new owner hostage. Earlier flushes retain their own tasks.
+        let admitted = inFlightDeliveries.sorted { $0.key < $1.key }
+            .map(\.value).filter { $0.sinkEpoch == sinkEpoch }.map(\.task)
+        onAdmission?(admitted.count)
+        for delivery in admitted { await delivery.value }
     }
 
     /// The coalescing task must not route through `flush()`: doing so cancels
@@ -133,17 +161,32 @@ public actor DerivedStateInvalidationCenter {
     private func scheduledDeliveryFired(_ expectedGeneration: UInt64) async {
         guard expectedGeneration == deliveryGeneration else { return }
         deliveryTask = nil
-        await deliverPending()
+        startPendingDelivery()
     }
 
-    private func deliverPending() async {
+    private func startPendingDelivery() {
         guard let sink, !pending.isEmpty else { return }
         let changes = pending.values.sorted {
             if $0.namespace != $1.namespace { return $0.namespace < $1.namespace }
             if $0.stableID != $1.stableID { return $0.stableID < $1.stableID }
+            if $0.canonicalLocator != $1.canonicalLocator {
+                return ($0.canonicalLocator ?? "") < ($1.canonicalLocator ?? "")
+            }
             return $0.occurredAt < $1.occurredAt
         }
         pending.removeAll(keepingCapacity: true)
-        await sink.sourceDidChange(changes)
+        nextDeliveryID &+= 1
+        let id = nextDeliveryID
+        // This center owns delivery, not the flushing caller or delay timer.
+        // Canceling either must not cancel the canonical refresh in the sink.
+        let task = Task<Void, Never> { [weak self] in
+            await sink.sourceDidChange(changes)
+            await self?.deliveryFinished(id)
+        }
+        inFlightDeliveries[id] = Delivery(sinkEpoch: sinkEpoch, task: task)
+    }
+
+    private func deliveryFinished(_ id: UInt64) {
+        inFlightDeliveries[id] = nil
     }
 }

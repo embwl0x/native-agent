@@ -250,19 +250,10 @@ public struct WorkshopSession: WorkshopSessionRunning {
     static func productionTurnExecutor(
         dataRoot: URL
     ) -> @Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String) {
-        let usesLiveAppBody = dataRoot == PersistenceCore.defaultDataRoot()
         return { request, tools in
-            let cognition = usesLiveAppBody ? NativeCognitionRuntime.shared : nil
-            let client = makeChatOrchestrationClient(
+            let client = makeNativeAgentAppChatOrchestrationClient(
                 tools: tools,
-                dataRoot: dataRoot,
-                cognitiveObserver: cognition,
-                cognitiveContextProvider: cognition,
-                providerLifecycleObserver: cognition,
-                contextFlow: usesLiveAppBody ? NativeContextFlowRuntime.shared : nil,
-                memoryAtomTranslator: usesLiveAppBody
-                    ? NativeContextFlowRuntime.memoryRecordAtomID(forRecordID:)
-                    : nil
+                dataRoot: dataRoot
             )
             let response = try await client.runEphemeralToolTurn(
                 message: request.promptSeed,

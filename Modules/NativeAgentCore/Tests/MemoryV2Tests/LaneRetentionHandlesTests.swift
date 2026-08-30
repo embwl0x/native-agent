@@ -69,6 +69,26 @@ struct LaneRetentionHandlesTests {
         #expect(bounded.map(\.id) == Array(all.map(\.id).prefix(2)))
     }
 
+    @Test(arguments: ["workshop:", "lane[?*]:", "lane%_\\:"])
+    func handlesTreatLaneCaseAndPatternCharactersLiterally(prefix: String) async throws {
+        let root = try makeTempRoot("literal-prefix")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let memory = try sqliteMemory(root: root)
+        let sources = [prefix + "one", prefix.uppercased() + "other", "laneXABC:other"]
+        var ids: [String] = []
+        for (index, source) in sources.enumerated() {
+            let record = try await memory.store(
+                content: "Distinct lane retention fixture number \(index) for \(source).",
+                source: source,
+                metadata: .object(["kind": .string("operational")])
+            )
+            ids.append(record.id)
+        }
+        let handles = try await memory.memoryHandles(sourcePrefix: prefix, limit: nil)
+        #expect(handles.map(\.id) == [ids[0]])
+        #expect(handles.first?.source == sources[0])
+    }
+
     /// The property retention leans on: an archived row leaves the lane's
     /// ACTIVE set, so the sweep converges instead of re-archiving forever.
     @Test func archivedRowsLeaveTheLaneWithoutLeavingTheStore() async throws {

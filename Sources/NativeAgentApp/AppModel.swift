@@ -707,6 +707,8 @@ final class AppModel {
     // PATCH-2026-05-08: wave3 Feature A/B state
     var healthCard: HealthCard?
     var whatsRunning: WhatsRunning?
+    @ObservationIgnored var healthCardRefreshGate = LatestSnapshotRefreshGate()
+    @ObservationIgnored var whatsRunningRefreshGate = LatestSnapshotRefreshGate()
 
     @MainActor
     var chatDrafts: [String: String] = [:]

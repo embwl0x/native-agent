@@ -3,6 +3,14 @@ import Foundation
 import Testing
 @testable import NativeAgentApp
 
+private struct CatalogEmbeddingProvider: ContextMarkdownEmbeddingProvider {
+    let modelFingerprint = "catalog-reconciliation-test"
+
+    func embed(_ texts: [String]) async throws -> [[Float]] {
+        texts.map { _ in [1, 0] }
+    }
+}
+
 private struct MarkdownCatalogFixture {
     let root: URL
     let bodiesRoot: URL
@@ -31,6 +39,71 @@ private struct MarkdownCatalogFixture {
 
 @Suite("Native Markdown Context source catalog")
 struct NativeMarkdownContextSourceCatalogTests {
+    @Test("failed discovery retains the last generation; valid empty discovery retires skills")
+    func failedDiscoveryPreservesGenerationUntilValidEmptyInventory() async throws {
+        let fixture = try MarkdownCatalogFixture()
+        defer { fixture.cleanUp() }
+        let dataRoot = fixture.root.appendingPathComponent("data", isDirectory: true)
+        let personaRoot = dataRoot.appendingPathComponent("persona/canonical", isDirectory: true)
+        let bodiesRoot = personaRoot.appendingPathComponent("skills/bodies", isDirectory: true)
+        try FileManager.default.createDirectory(at: bodiesRoot, withIntermediateDirectories: true)
+        let soul = personaRoot.appendingPathComponent("SOUL.md")
+        try Data("# SOUL\nLast good identity.".utf8).write(to: soul)
+        try Data("# Build\nInspect the build receipt.".utf8)
+            .write(to: bodiesRoot.appendingPathComponent("build.md"))
+
+        let provider = PersonaContextFlowProvider(
+            dataRoot: dataRoot, mode: .active, personaOverride: { nil }
+        )
+        let registry = try ContextSourceRegistry()
+        let store = try ContextSQLiteStore(dataRoot: dataRoot)
+        let coordinator = ContextFlowCoordinator(
+            mode: .active,
+            store: store,
+            arena: try ContextArena(),
+            registry: registry,
+            compiler: ContextMarkdownCompiler(embeddingProvider: CatalogEmbeddingProvider()),
+            mirrorProvider: provider
+        )
+        // Exercise the complete production reconciliation without installing
+        // filesystem watchers that could race the fixture's replacement edges.
+        await coordinator.reconcileAfterWake()
+        let initial = try #require(try await store.loadActiveGeneration())
+        let initialMirrors = try await provider.requiredDocumentMirrors()
+        let initialRegistrations = await registry.allRegistrations()
+        let skillID = try #require(initial.sources.first {
+            $0.descriptor.kind == .skill
+        }?.descriptor.id)
+        #expect(initial.atoms.contains { $0.draft.sourceID == skillID })
+
+        // Existing invalid storage is an error, not a successfully read empty
+        // directory. Neither that error nor an unrelated persona edit may
+        // partially replace the last good owner inventory or mirror snapshot.
+        let savedBodies = personaRoot.appendingPathComponent("saved-bodies", isDirectory: true)
+        try FileManager.default.moveItem(at: bodiesRoot, to: savedBodies)
+        try Data("not a directory".utf8).write(to: bodiesRoot)
+        try Data("# SOUL\nNew identity waits for complete discovery.".utf8).write(to: soul)
+        await coordinator.reconcileAfterWake()
+        let failed = try #require(try await store.loadActiveGeneration())
+        #expect(failed.generation.id == initial.generation.id)
+        #expect(failed.sources.contains { $0.descriptor.id == skillID })
+        #expect(await registry.allRegistrations() == initialRegistrations)
+        #expect(try await provider.requiredDocumentMirrors() == initialMirrors)
+        #expect(await coordinator.health().activeArenaGenerationID == initial.generation.id)
+        #expect(await coordinator.health().lastError != nil)
+
+        try FileManager.default.removeItem(at: bodiesRoot)
+        try FileManager.default.createDirectory(at: bodiesRoot, withIntermediateDirectories: false)
+        await coordinator.reconcileAfterWake()
+        let recovered = try #require(try await store.loadActiveGeneration())
+        #expect(recovered.generation.id > initial.generation.id)
+        #expect(!recovered.sources.contains { $0.descriptor.id == skillID })
+        #expect(!recovered.atoms.contains { $0.draft.sourceID == skillID })
+        #expect(recovered.sources.contains { $0.descriptor.kind == .persona })
+        #expect(try await provider.requiredDocumentMirrors() != initialMirrors)
+        #expect(await coordinator.health().lastError == nil)
+    }
+
     @Test("registers direct skill Markdown with stable lazy policy")
     func registersDirectSkillMarkdown() throws {
         let fixture = try MarkdownCatalogFixture()

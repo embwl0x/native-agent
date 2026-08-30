@@ -355,6 +355,33 @@ func turnAccepted_structuredLaneEmitsExactlyOneCarryingItsOwnObservedByLabel() a
 }
 
 @Test
+func structuredLaneEmitsReturnHandoffForNonStreamingSurface() async throws {
+    let root = try chokePointRoot("output-handoff-structured")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let tools = ChokePointTools()
+    let llm = ChokePointLLM(scripted: ["plain answer"])
+    let events = try await withHermeticTraceBus(
+        kinds: ["turn.accepted", "surface.outputEnqueued", "turn.terminal"],
+        expecting: 3
+    ) { bus in
+        let client = makeChokePointClient(
+            root: root, llm: llm, tools: tools, turnTraceBus: bus
+        )
+        _ = try await client.chat(
+            message: "hi", sessionId: "s-output-structured",
+            model: "choke-model", reasoningEffort: "high",
+            fileAccess: "workspace", attachments: [], suppressUserAppend: false
+        )
+    }
+
+    #expect(events.filter { $0.kind == "turn.accepted" }.count == 1)
+    let handoff = try #require(events.first { $0.kind == "surface.outputEnqueued" })
+    #expect(observedBy(handoff) == "structured_chat.return")
+    #expect(handoff.sessionId == "s-output-structured")
+    #expect(events.filter { $0.kind == "turn.terminal" }.count == 1)
+}
+
+@Test
 func turnAccepted_streamingLaneEmitsExactlyOneCarryingItsOwnObservedByLabel() async throws {
     let root = try chokePointRoot("accepted-stream")
     defer { try? FileManager.default.removeItem(at: root) }

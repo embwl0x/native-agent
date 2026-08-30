@@ -550,13 +550,16 @@ private func seedReceipt(root: URL, runId: String, json: String) {
         )
     }
 
-    // Exercise retention through the actual compatibility reader: the session
-    // reference protects its old receipt while the reader removes fossils.
+    // Mounted maintenance calls the compatibility client's explicit retention
+    // entry point; ordinary context reads remain side-effect free.
     let client = SwiftNativeContextClient(now: { now }, dataRoot: root)
+    let report = await client.pruneLegacyReceipts(at: now)
     guard case .object(let current)? = await client.latestContextReceipt(sessionId: "sess_retention") else {
         Issue.record("expected protected receipt from the real legacy reader")
         return
     }
+    #expect(report.removed > 0)
+    #expect(report.removedArtifactPaths.contains("context/expired.json"))
     #expect(str(current["runId"]) == "protected_old")
     #expect(FileManager.default.fileExists(atPath: contextDirectory.appendingPathComponent("protected_old.json").path))
     #expect(!FileManager.default.fileExists(atPath: contextDirectory.appendingPathComponent("expired.json").path))

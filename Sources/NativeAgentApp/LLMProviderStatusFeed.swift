@@ -149,3 +149,52 @@ enum LLMProviderStatusFeed {
         return String(trimmed.prefix(max(0, maximum)))
     }
 }
+
+/// Fresh provider-path evidence already owned by the resident organism. This
+/// is stronger for runtime health than the user-initiated probe above, while
+/// the probe remains useful when the organism has no recent observation.
+enum ProviderRuntimeHealthFeed {
+    static let staleAfter: TimeInterval = 10 * 60
+    static let allowedClockSkew: TimeInterval = 5 * 60
+
+    enum Reading: Sendable, Equatable {
+        case healthy(savedAt: Date)
+        case unhealthy(savedAt: Date, detail: String)
+        case unavailable(String)
+    }
+
+    static func read(dataRoot: URL, now: Date = Date()) -> Reading {
+        let path = dataRoot
+            .appendingPathComponent("cognition", isDirectory: true)
+            .appendingPathComponent("organism_state.json")
+        guard let data = try? Data(contentsOf: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawSavedAt = object["savedAt"] as? String,
+              let savedAt = parseTimestamp(rawSavedAt),
+              let body = object["bodySchema"] as? [String: Any],
+              let available = body["providersAvailable"] as? Bool,
+              let healthy = body["providersHealthy"] as? Bool
+        else {
+            return .unavailable("Recent organism provider health is unavailable.")
+        }
+        if savedAt.timeIntervalSince(now) > allowedClockSkew {
+            return .unavailable("Organism provider health is dated in the future.")
+        }
+        if now.timeIntervalSince(savedAt) > staleAfter {
+            return .unavailable("Organism provider health is stale.")
+        }
+        guard available else {
+            return .unhealthy(savedAt: savedAt, detail: "The organism reports no provider path available.")
+        }
+        guard healthy else {
+            return .unhealthy(savedAt: savedAt, detail: "The organism reports the live provider path needs attention.")
+        }
+        return .healthy(savedAt: savedAt)
+    }
+
+    private static func parseTimestamp(_ raw: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    }
+}

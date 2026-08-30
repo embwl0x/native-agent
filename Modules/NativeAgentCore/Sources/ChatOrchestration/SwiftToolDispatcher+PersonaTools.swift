@@ -135,22 +135,53 @@ extension SwiftToolDispatcher {
     }
 
     func impl_agent_introspect(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
+        let sessionId = Self.extractSessionId(from: input)
+        let fullDetail = (jsonString(input["detail"]) ?? "compact")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "full"
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let provider = await Self.providerStamp(dataRoot: dataRoot)
+        let runtimeInstanceID = "swift-native-\(pid)"
+        var response: [String: JSONValue] = [
+            "status": .string("ok"),
+            "detail": .string(fullDetail ? "full" : "compact"),
+            "invoked_as": .string(invokedAs),
+            "runtime": .string("swift-native"),
+            "python_daemon": .string("retired"),
+            "provider": provider,
+            "dispatch": .object([
+                "provider_tools_field": .bool(true),
+                "tool_loop": .string("SwiftNativeTurnEngine.executeTurnWithToolLoop"),
+                "dispatcher": .string("SwiftToolDispatcher"),
+            ]),
+            "runtime_instance_id": .string(runtimeInstanceID),
+            "process_id": .int(Int64(pid)),
+            "tool_state": .string("use tool_catalog for active/loadable names; request detail=full for diagnostic roots, MCP names, and outcome population health"),
+        ]
+        if !sessionId.isEmpty {
+            // session_id stays as a compatibility alias, but now names the
+            // same authoritative conversation scope used by traces,
+            // scratchpads, and lazy tool activation. The process-scoped
+            // identity is separate above and must never masquerade as chat.
+            response["conversation_session_id"] = .string(sessionId)
+            response["session_id"] = .string(sessionId)
+        }
+        guard fullDetail else { return .object(response) }
+
         let availableTools = Set(await modelVisibleToolNames())
         let mcpTools = modelVisibleMCPToolNames().sorted()
-        let sessionId = Self.extractSessionId(from: input)
         let sessionTools: Set<String> = sessionId.isEmpty
             ? []
             : await activeToolsStore.load(sessionId: sessionId).activeTools
+        let modelVisibleAvailableTools = Self.modelVisibleCatalogToolNames(availableTools)
         let activeTools = Self.alwaysOnCoreNames
             .union(sessionTools)
             .union(LLMCallContext.turnActiveTools ?? [])
             .union(mcpTools)
-            .intersection(availableTools)
+            .intersection(modelVisibleAvailableTools)
             .sorted()
         let personaRoot = personaRootForTools()
         let trustedRoots = await trustedWorkspaceRoots()
-        let pid = ProcessInfo.processInfo.processIdentifier
-        let provider = await Self.providerStamp(dataRoot: dataRoot)
         let outcomeDimensionHealth: JSONValue
         do {
             let audit = try await OutcomeDimensionStatePopulationReader(
@@ -165,35 +196,22 @@ extension SwiftToolDispatcher {
                 "error_class": .string(String(describing: type(of: error))),
             ])
         }
-        return .object([
-            "status": .string("ok"),
-            "invoked_as": .string(invokedAs),
-            "runtime": .string("swift-native"),
-            "python_daemon": .string("retired"),
-            "provider": provider,
-            "outcome_dimension_health": outcomeDimensionHealth,
-            "dispatch": .object([
-                "provider_tools_field": .bool(true),
-                "tool_loop": .string("SwiftNativeTurnEngine.executeTurnWithToolLoop"),
-                "dispatcher": .string("SwiftToolDispatcher"),
-            ]),
-            "session_id": .string("swift-native-\(pid)"),
-            "process_id": .int(Int64(pid)),
-            "data_root": .string(dataRoot.path),
-            "persona_root": .string(personaRoot.path),
-            "read_root": .string(rootForRead.path),
-            "trusted_workspace_roots": .array(trustedRoots.map { .string($0.path) }),
-            "active_tools": .array(activeTools.map { .string($0) }),
-            "active_tool_count": .int(Int64(activeTools.count)),
-            "available_tool_count": .int(Int64(availableTools.count)),
-            "lazy_loading": .string("available tools omitted; use tool_catalog to discover and tool_load to activate"),
-            "mcp_tool_count": .int(Int64(mcpTools.count)),
-            "mcp_tools": .array(mcpTools.map { .string($0) }),
-            "compatibility": .object([
-                "daemon_introspect": .string("alias_for_agent_introspect"),
-                "recall_search": .string("alias_for_recall_memory"),
-            ]),
+        response["outcome_dimension_health"] = outcomeDimensionHealth
+        response["data_root"] = .string(dataRoot.path)
+        response["persona_root"] = .string(personaRoot.path)
+        response["read_root"] = .string(rootForRead.path)
+        response["trusted_workspace_roots"] = .array(trustedRoots.map { .string($0.path) })
+        response["active_tools"] = .array(activeTools.map { .string($0) })
+        response["active_tool_count"] = .int(Int64(activeTools.count))
+        response["available_tool_count"] = .int(Int64(modelVisibleAvailableTools.count))
+        response["lazy_loading"] = .string("available tools omitted; use tool_catalog to discover and tool_load to activate")
+        response["mcp_tool_count"] = .int(Int64(mcpTools.count))
+        response["mcp_tools"] = .array(mcpTools.map { .string($0) })
+        response["compatibility"] = .object([
+            "daemon_introspect": .string("alias_for_agent_introspect"),
+            "recall_search": .string("alias_for_recall_memory"),
         ])
+        return .object(response)
     }
 
     /// The provider+model actually generating the current turn (live), or the

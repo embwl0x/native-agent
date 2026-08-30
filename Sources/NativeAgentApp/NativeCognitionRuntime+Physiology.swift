@@ -10,6 +10,13 @@ import PersistenceCore
 import ProviderRouting
 
 extension NativeCognitionRuntime {
+    typealias PhysiologySubmission = @Sendable (InstalledPhysiologySoakRecorder) async -> Void
+
+    private enum PhysiologySubmissionWork: Sendable {
+        case operation(PhysiologySubmission)
+        case loss(UInt64)
+    }
+
     /// The recorder's real enablement provenance. Consumers must not infer
     /// that a nil report represents a healthy zero-observation installed run.
     func installedPhysiologySoakCollectionStatus() -> InstalledPhysiologySoakEnablement {
@@ -17,8 +24,11 @@ extension NativeCognitionRuntime {
     }
 
     func installedPhysiologySoakReport() async -> InstalledPhysiologySoakReport? {
-        await drainPhysiologySubmissions()
-        return await physiologySoakRecorder?.report()
+        let drained = await drainPhysiologySubmissions()
+        let report = await physiologySoakRecorder?.report()
+        return drained ? report : report?.addingClaimBlocker(
+            "physiology submission barrier did not complete"
+        )
     }
 
     /// Keeps observational evidence entirely off the synchronous chat/tool
@@ -27,27 +37,53 @@ extension NativeCognitionRuntime {
     func submitPhysiology(  // internal for actor extensions (move-only Wave C)
         _ operation: @escaping @Sendable (InstalledPhysiologySoakRecorder) async -> Void
     ) {
-        guard let physiologySoakRecorder else { return }
-        let predecessor = physiologySubmissionTail
-        let generation = physiologySubmissionGeneration
-        pendingPhysiologySubmissions += 1
-        physiologySubmissionTail = Task { [weak self] in
-            await predecessor?.value
-            guard !Task.isCancelled else {
-                await self?.completePhysiologySubmission(generation: generation)
-                return
-            }
-            await operation(physiologySoakRecorder)
-            await self?.completePhysiologySubmission(generation: generation)
+        guard physiologySoakRecorder != nil else { return }
+        guard pendingPhysiologySubmissions < Self.maximumPendingPhysiologySubmissions else {
+            pendingPhysiologySubmissionLoss &+= 1
+            return
         }
+        pendingPhysiologySubmissions += 1
+        physiologySubmissionQueue.append(operation)
+        startPhysiologySubmissionWorkerIfNeeded()
+    }
+
+    private func startPhysiologySubmissionWorkerIfNeeded() {
+        guard physiologySubmissionTail == nil, let physiologySoakRecorder else { return }
+        let generation = physiologySubmissionGeneration
+        physiologySubmissionTail = Task { [weak self] in
+            while let work = await self?.nextPhysiologySubmission(generation: generation) {
+                guard !Task.isCancelled else { return }
+                switch work {
+                case .operation(let operation):
+                    await operation(physiologySoakRecorder)
+                    await self?.completePhysiologySubmission(generation: generation)
+                case .loss(let count):
+                    await physiologySoakRecorder.recordSubmissionLoss(count)
+                }
+            }
+        }
+    }
+
+    private func nextPhysiologySubmission(generation: UInt64) -> PhysiologySubmissionWork? {
+        // Cancellation alone cannot stop a non-cooperative operation already
+        // in flight. The generation fence prevents every later queued closure
+        // from executing after that abandoned operation eventually returns.
+        guard generation == physiologySubmissionGeneration, !Task.isCancelled else { return nil }
+        if !physiologySubmissionQueue.isEmpty {
+            return .operation(physiologySubmissionQueue.removeFirst())
+        }
+        if pendingPhysiologySubmissionLoss > 0 {
+            let count = pendingPhysiologySubmissionLoss
+            pendingPhysiologySubmissionLoss = 0
+            return .loss(count)
+        }
+        physiologySubmissionTail = nil
+        return nil
     }
 
     private func completePhysiologySubmission(generation: UInt64) {
         guard generation == physiologySubmissionGeneration else { return }
         pendingPhysiologySubmissions = max(0, pendingPhysiologySubmissions - 1)
-        if pendingPhysiologySubmissions == 0 {
-            physiologySubmissionTail = nil
-        }
     }
 
     /// Deterministic fault-injection seam for the ordered submission barrier.
@@ -61,52 +97,55 @@ extension NativeCognitionRuntime {
     }
 
     /// Waits until every recorder emission accepted before this barrier has
-    /// traversed the single ordered tail. Re-checking the count after each
+    /// traversed the single ordered worker. Re-checking the worker after each
     /// suspension also catches work appended while the actor was re-entrant.
-    func drainPhysiologySubmissions() async {  // internal for actor extensions (move-only Wave C)
+    @discardableResult
+    func drainPhysiologySubmissions() async -> Bool {  // internal for actor extensions (move-only Wave C)
         let deadline = ProcessInfo.processInfo.systemUptime
             + physiologySubmissionDrainDeadlineSeconds
-        while pendingPhysiologySubmissions > 0 {
-            guard let tail = physiologySubmissionTail else {
-                // Defensive recovery: the count and tail are maintained
-                // together, so this branch should be unreachable.
-                assertionFailure("physiology submission count lost its ordered tail")
-                abandonPhysiologySubmissions(
-                    reason: "submission count lost its ordered tail"
-                )
-                return
-            }
+        while let tail = physiologySubmissionTail {
+            let generation = physiologySubmissionGeneration
             let remaining = max(0, deadline - ProcessInfo.processInfo.systemUptime)
             let outcome = await raceAgainstTimeout(seconds: remaining) {
                 await tail.value
             }
+            // Another concurrent barrier may already have abandoned this
+            // generation. Its timeout cannot cancel a newly admitted worker.
+            guard generation == physiologySubmissionGeneration else { return false }
             switch outcome {
             case .value:
                 continue
             case .timedOut:
                 physiologySubmissionDrainTimeoutCount &+= 1
-                abandonPhysiologySubmissions(
+                await abandonPhysiologySubmissions(
                     reason: "drain exceeded \(physiologySubmissionDrainDeadlineSeconds)s deadline"
                 )
-                return
+                return false
             case .cancelled:
-                abandonPhysiologySubmissions(reason: "drain caller was cancelled")
-                return
+                await abandonPhysiologySubmissions(reason: "drain caller was cancelled")
+                return false
             case .failure(let detail):
-                abandonPhysiologySubmissions(reason: "drain race failed: \(detail)")
-                return
+                await abandonPhysiologySubmissions(reason: "drain race failed: \(detail)")
+                return false
             }
         }
+        return true
     }
 
-    private func abandonPhysiologySubmissions(reason: String) {
+    private func abandonPhysiologySubmissions(reason: String) async {
         let abandonedCount = pendingPhysiologySubmissions
+        let loss = pendingPhysiologySubmissionLoss &+ UInt64(abandonedCount)
         physiologySubmissionTail?.cancel()
         physiologySubmissionGeneration &+= 1
         pendingPhysiologySubmissions = 0
+        physiologySubmissionQueue.removeAll(keepingCapacity: true)
+        pendingPhysiologySubmissionLoss = 0
         physiologySubmissionTail = nil
         deadlineLogger(
             "PHYSIOLOGY BAIL-OUT: \(reason); abandoned \(abandonedCount) pending submission(s)"
         )
+        // The in-flight operation is conservatively unknown, not silently
+        // successful. Persist the gap through the recorder's existing owner.
+        await physiologySoakRecorder?.recordSubmissionLoss(loss)
     }
 }

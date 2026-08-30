@@ -131,7 +131,7 @@ let extraDeps: [String: [String]] = [
     // surface the policy already carried but nothing ever filled. No cycle —
     // MemoryV2 depends on PersistenceCore/KnowledgeGraph/ApprovalInbox and
     // never imports WorkshopExecution. See WorkshopExecution+ExecutionMemory.swift.
-    "WorkshopExecution": ["PersistenceCore", "ProviderRouting", "ApprovalInbox", "MemoryV2"],
+    "WorkshopExecution": ["PersistenceCore", "ProviderRouting", "ApprovalInbox", "MemoryV2", "TrustCenter"],
     "WorkflowOrchestration": [
         "PersistenceCore",
         "ApprovalInbox",
@@ -209,6 +209,15 @@ let subsystemTargets: [Target] = subsystems.flatMap { name -> [Target] in
         (externalDeps[name] ?? []) +
         (["ChatOrchestration", "PersistenceCore"].contains(name)
             ? [.target(name: "NativeAgentEvaluation")]
+            : []) +
+        // Test-only: SchemaOwnershipEvalTests replays the storage-owned
+        // migration against the graph store (cba7fbea). MemoryV2 must NOT
+        // join the production KnowledgeGraph deps — MemoryV2 imports
+        // KnowledgeGraph, so that direction would be a cycle. Incremental
+        // build caches masked this missing edge until the first fresh
+        // worktree resolve (2026-08-27; codex reported it first).
+        ((name == "KnowledgeGraph")
+            ? [.target(name: "MemoryV2")]
             : [])
     // Per-subsystem resources (e.g. MemoryV2 ships the WordPiece vocab).
     let targetResources: [Resource]? = (name == "MemoryV2") ? [

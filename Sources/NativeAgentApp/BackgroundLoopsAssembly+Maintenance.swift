@@ -3,6 +3,7 @@ import Darwin
 import NativeAgentCore
 import BackgroundLoops
 import ChatOrchestration
+import Context
 import DoctorChecks
 import MemoryV2
 import PersistenceCore
@@ -48,8 +49,8 @@ extension BackgroundLoopsAssembly {
         )
     }
 
-    /// The mounted six-hour retention wake handles both date-named trace
-    /// expiry and old orphan lock sidecars left by any `withFileLock` caller.
+    /// The mounted six-hour retention wake handles date-named trace expiry,
+    /// old orphan lock sidecars, and excess pre-compaction transcript backups.
     /// The generic sweep is bounded, so it drains large historical residue
     /// across wakes instead of turning a maintenance tick into a disk walk.
     static func makeTurnTraceRetentionLoop(
@@ -217,14 +218,22 @@ extension BackgroundLoopsAssembly {
             totalBytes: report.totalBytes,
             totalOverBudget: report.totalOverBudget,
             truncated: report.truncated,
-            depthTruncated: report.depthTruncated
+            depthTruncated: report.depthTruncated,
+            // F1: directory offenders survive the existence filter as-is — a
+            // branch is not a Clean Up target (nothing here ever trashes a
+            // directory), it is the "where did the growth go" line.
+            largeDirectories: report.largeDirectories
         )
         guard report.tripped else { return true }
         let now = ISO8601DateFormatter().string(from: Date())
         var lines: [String] = []
         if report.totalOverBudget {
             lines.append("data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes)) "
-                + "(over the 2GB budget).")
+                + "(over the \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget).")
+        }
+        for offender in report.largeDirectories.prefix(10) {
+            lines.append("▸ \(offender.relativePath)/ — "
+                + "\(DataRootDiskHygiene.humanSize(offender.sizeBytes)) across the whole branch")
         }
         for offender in report.largeFiles.prefix(20) {
             lines.append("• \(offender.relativePath) — \(DataRootDiskHygiene.humanSize(offender.sizeBytes))")
@@ -232,13 +241,16 @@ extension BackgroundLoopsAssembly {
         if report.truncated {
             lines.append("(scan hit its file budget — totals may undercount; largest offenders shown)")
         }
-        let detail = ("Large files under the app data directory (nothing was deleted):\n"
+        let detail = ("Large files and directories under the app data directory "
+            + "(nothing was deleted):\n"
             + lines.joined(separator: "\n")
             + "\n\nClean Up moves these files to the Trash (recoverable).")
         let summary = report.totalOverBudget
             ? "data/ is \(DataRootDiskHygiene.humanSize(report.totalBytes)); "
-                + "\(report.largeFiles.count) large file(s)"
-            : "\(report.largeFiles.count) large file(s) in data/"
+                + "\(report.largeFiles.count) large file(s), "
+                + "\(report.largeDirectories.count) large director(ies)"
+            : "\(report.largeFiles.count) large file(s), "
+                + "\(report.largeDirectories.count) large director(ies) in data/"
         let card: JSONValue = .object([
             "id": .string(diskHygieneCardId),
             "created_at": .string(now),
@@ -503,9 +515,29 @@ private struct TurnTraceRetentionRunner: LoopRunner {
                 dataRoot: dataRoot,
                 now: now
             )
+            let backupReport = await ChatCompactionBackupRetention.enforce(dataRoot: dataRoot)
+            let legacyContextReport = await SwiftNativeContextClient(dataRoot: dataRoot)
+                .pruneLegacyReceipts(at: now)
             try await MaintenanceSweepFeed.append(
                 traceReport: traceReport,
                 lockReport: lockReport,
+                dataRoot: dataRoot,
+                completedAt: now
+            )
+            try await MaintenanceSweepFeed.appendCompactionBackupRetention(
+                removedArtifactPaths: backupReport.removedArtifactPaths,
+                sessionsScanned: backupReport.sessionsScanned,
+                failures: backupReport.failures,
+                truncated: backupReport.truncated,
+                dataRoot: dataRoot,
+                completedAt: now
+            )
+            try await MaintenanceSweepFeed.appendLegacyContextReceiptRetention(
+                removedArtifactPaths: legacyContextReport.removedArtifactPaths,
+                discovered: legacyContextReport.discovered,
+                protected: legacyContextReport.protected,
+                failedRemovals: legacyContextReport.failedRemovals,
+                unavailable: legacyContextReport.unavailable,
                 dataRoot: dataRoot,
                 completedAt: now
             )
@@ -520,10 +552,27 @@ private struct TurnTraceRetentionRunner: LoopRunner {
             if lockReport.failures > 0 {
                 return .failed(error: "lock-sidecar sweep had \(lockReport.failures) failed candidate(s)")
             }
+            if backupReport.removed > 0 || backupReport.failures > 0 || backupReport.truncated {
+                NSLog("chat_compaction_backup_retention: removed %d backup(s), scanned %d session(s), failures %d, truncated %@",
+                      backupReport.removed, backupReport.sessionsScanned, backupReport.failures,
+                      backupReport.truncated.description)
+            }
+            if backupReport.failures > 0 {
+                return .failed(error: "compaction-backup sweep had \(backupReport.failures) failed session(s)")
+            }
+            if legacyContextReport.unavailable || legacyContextReport.failedRemovals > 0 {
+                return .failed(error: "legacy-context sweep unavailable=\(legacyContextReport.unavailable) failures=\(legacyContextReport.failedRemovals)")
+            }
             let bounded = lockReport.deferred > 0
                 ? "; \(lockReport.deferred) orphan lock(s) deferred"
                 : ""
-            return .completed(result: "turn-trace retention and lock-sidecar sweep completed\(bounded)")
+            let backupBounded = backupReport.truncated
+                ? "; compaction-backup scan bounded at \(backupReport.sessionsScanned) sessions"
+                : ""
+            let legacyContext = legacyContextReport.removed > 0
+                ? "; removed \(legacyContextReport.removed) legacy context receipt(s)"
+                : ""
+            return .completed(result: "maintenance retention completed\(bounded)\(backupBounded)\(legacyContext)")
         } catch {
             NSLog("turn_trace_retention: sweep failed: %@", String(describing: error))
             return .failed(error: String(describing: error))

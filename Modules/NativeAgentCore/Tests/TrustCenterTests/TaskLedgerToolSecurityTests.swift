@@ -26,6 +26,7 @@ private func hermeticCenter() throws -> SwiftNativeSecurityCenter {
     )
     #expect(envelope.risk == "medium")
     #expect(envelope.capabilities.contains("ledger_write"))
+    #expect(envelope.hasSideEffects)
     #expect(envelope.signedToolKnown)
     #expect(!envelope.capabilities.contains("shell"))
     #expect(!envelope.capabilities.contains("process_spawn"))
@@ -44,5 +45,24 @@ private func hermeticCenter() throws -> SwiftNativeSecurityCenter {
     #expect(envelope.capabilities.contains("safe_read"))
     #expect(envelope.signedToolKnown)
     #expect(!envelope.capabilities.contains("ledger_write"))
+    #expect(!envelope.hasSideEffects)
     #expect(envelope.rollbackRequired == false)
+}
+
+@Test func SecurityCapabilityClassifier_coversEveryEffectVocabulary() {
+    let effects = [
+        "agent_delegate", "approval_stage", "app_data_write", "browser_interaction",
+        "destructive", "evolution_apply_trigger", "evolution_write", "external_send",
+        "file_write", "filesystem_delete", "filesystem_write", "image_generation",
+        "ledger_write", "mac_control", "memory_write", "money", "network_write",
+        "notification", "organism_state_write", "outside_app_data_write",
+        "process_spawn", "remote_effect", "shell", "skill_write", "system_control",
+        "system_permission_reset", "workshop_write",
+    ]
+    for effect in effects {
+        #expect(SecurityCapabilityClassifier.hasSideEffects([effect]), "missing effect capability: \(effect)")
+    }
+    for readOrSensitivity in ["tool_call", "safe_read", "catalog_read", "network_read", "secrets", "secret_input"] {
+        #expect(!SecurityCapabilityClassifier.hasSideEffects([readOrSensitivity]), "non-effect capability marked mutating: \(readOrSensitivity)")
+    }
 }

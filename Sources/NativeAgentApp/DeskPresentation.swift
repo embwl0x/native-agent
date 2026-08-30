@@ -17,6 +17,53 @@ enum DeskPresentationTone: Sendable, Equatable {
     case danger
 }
 
+/// One semantic color vocabulary for every status-bearing Desk row. The view
+/// translates these tones to SwiftUI colors once; board items, delegation
+/// lanes, directed executions, and GitHub watcher rows never keep independent
+/// color switches that can drift apart.
+enum DeskStatusTonePresentation {
+    static func tone(for status: DeskStatus) -> DeskPresentationTone {
+        switch status {
+        case .now, .next: .info
+        case .blocked: .danger
+        case .flag: .warning
+        case .done: .success
+        case .todo, .watch, .canceled: .neutral
+        }
+    }
+}
+
+/// Shared relative-time vocabulary for every timestamp rendered on Desk rows.
+/// Callers provide the frozen presentation clock, which keeps tests and exact
+/// freshness boundaries deterministic without introducing a timer.
+enum DeskRelativeTimePresentation {
+    static func text(forISO raw: String, now: Date) -> String {
+        guard let date = UserDisplayFormatters.parseISOTimestamp(raw) else {
+            return "unknown"
+        }
+        return text(for: date, now: now)
+    }
+
+    static func text(for date: Date, now: Date) -> String {
+        let seconds = max(0, now.timeIntervalSince(date))
+        switch seconds {
+        case ..<90: return "just now"
+        case ..<3_600: return "\(Int(seconds / 60))m ago"
+        case ..<86_400: return "\(Int(seconds / 3_600))h ago"
+        default: return "\(Int(seconds / 86_400))d ago"
+        }
+    }
+}
+
+/// Counts are glance aids, not zero-state metrics. A quiet section keeps its
+/// plain title; a populated section uses the same compact label everywhere.
+enum DeskSectionHeaderPresentation {
+    static func label(_ title: String, count: Int?) -> String {
+        guard let count, count > 0 else { return title }
+        return "\(title) · \(count)"
+    }
+}
+
 /// The Desk's reader-facing truth state.  This is deliberately separate from
 /// row layout: a successful empty read is quiet, while an unavailable read is
 /// a visible uncertainty and prevents the whole board from claiming it is
@@ -65,6 +112,28 @@ enum DeskHonestyPresentation {
         return hasRenderedBenchRows ? .rows : .quiet(executionQuietCopy)
     }
 
+    /// "In progress" is fed by both Workshop executions and Desk program
+    /// families. A failed read from either owner makes the combined section
+    /// unknown; rendering the other owner's empty result as "Quiet" would be
+    /// the same silent-zero failure `DeskLaneState` exists to prevent.
+    static func inProgressLane(
+        executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>,
+        deskItems: DeskLaneState<DeskItem>,
+        hasRenderedRows: Bool
+    ) -> LaneBody {
+        if let reason = executions.unavailableReason {
+            return .unavailable(UnavailableNotice(
+                title: "Execution lane unavailable",
+                detail: reason))
+        }
+        if let reason = deskItems.unavailableReason {
+            return .unavailable(UnavailableNotice(
+                title: "Desk program state unavailable",
+                detail: reason))
+        }
+        return hasRenderedRows ? .rows : .quiet(executionQuietCopy)
+    }
+
     static func boardBody(
         itemCount: Int,
         executionCount: Int,
@@ -82,6 +151,242 @@ enum DeskHonestyPresentation {
             return .populated
         }
         return hasLoadedOnce ? .clear : .loading
+    }
+}
+
+// MARK: - Live Activity
+
+/// The pure, value-only model behind Desk's glancing Live Activity header.
+/// Canonical Desk rows remain the sole truth; this projection neither writes
+/// status nor promotes `laneOf` into the real `parent` hierarchy.
+enum DeskLiveActivityPresentation {
+    static let defaultActiveWindow: TimeInterval = 30 * 60
+    static let staleAfter: TimeInterval = 5 * 60
+    static let visibleRowCap = 4
+    private static let boundaryEpsilon: TimeInterval = 0.001
+
+    struct Progress: Sendable, Equatable {
+        let done: Int
+        let total: Int
+        let note: String?
+
+        var fraction: Double { Double(done) / Double(total) }
+    }
+
+    struct Row: Identifiable, Sendable, Equatable {
+        let id: String
+        let summary: String
+        let assignee: String
+        let assigneeSymbol: String
+        let lastUpdateText: String
+        let progress: Progress?
+    }
+
+    struct Content: Sendable, Equatable {
+        let rows: [Row]
+        let overflowCount: Int
+        let asOfText: String
+        let isStale: Bool
+        /// The next semantic boundary only: snapshot becomes stale or one
+        /// active row ages out. DeskLiveReloader sleeps to this exact instant;
+        /// there is no periodic freshness timer.
+        let nextRefreshAt: Date?
+
+        /// Every row eligible for this section, including the deterministic
+        /// overflow disclosed by "+N more". This is never a hidden store total.
+        var eligibleRowCount: Int { rows.count + overflowCount }
+    }
+
+    enum State: Sendable, Equatable {
+        case unavailable(DeskHonestyPresentation.UnavailableNotice)
+        case quiet
+        case rows(Content)
+
+        var nextRefreshAt: Date? {
+            guard case .rows(let content) = self else { return nil }
+            return content.nextRefreshAt
+        }
+    }
+
+    static func make(
+        deskItems: DeskLaneState<DeskItem>,
+        generatedTs: String?,
+        now: Date,
+        activeWindow: TimeInterval = defaultActiveWindow,
+        rowCap: Int = visibleRowCap,
+        staleLimit: TimeInterval = staleAfter
+    ) -> State {
+        if let reason = deskItems.unavailableReason {
+            return .unavailable(.init(title: "Live Activity unavailable", detail: reason))
+        }
+
+        let window = max(0, activeWindow)
+        let candidates = deskItems.items.compactMap { item -> (DeskItem, Date)? in
+            guard item.status == .now,
+                  let updated = UserDisplayFormatters.parseISOTimestamp(item.updatedAt)
+            else { return nil }
+            // Future stamps are treated as zero-age rather than being allowed
+            // to manufacture a negative relative time.
+            guard max(0, now.timeIntervalSince(updated)) <= window else { return nil }
+            return (item, updated)
+        }.sorted { left, right in
+            if left.1 != right.1 { return left.1 > right.1 }
+            if left.0.updatedAt != right.0.updatedAt {
+                return left.0.updatedAt > right.0.updatedAt
+            }
+            return left.0.handle < right.0.handle
+        }
+
+        // Blank slate and ordinary quiet state collapse completely, including
+        // a blank generatedTs from an empty canonical feed.
+        guard !candidates.isEmpty else { return .quiet }
+
+        guard let generatedTs,
+              let generatedAt = UserDisplayFormatters.parseISOTimestamp(generatedTs)
+        else {
+            return .unavailable(.init(
+                title: "Live Activity unavailable",
+                detail: "The Desk snapshot has no readable generated timestamp."))
+        }
+
+        let limit = max(0, staleLimit)
+        let snapshotAge = max(0, now.timeIntervalSince(generatedAt))
+        let stale = snapshotAge > limit
+        let cap = max(0, rowCap)
+        let visible = candidates.prefix(cap).map { item, updated in
+            Row(
+                id: item.handle,
+                summary: humanSummary(item),
+                assignee: assigneeLabel(item.assignee),
+                assigneeSymbol: assigneeSymbol(item.assignee),
+                lastUpdateText: "last update \(DeskRelativeTimePresentation.text(for: updated, now: now))",
+                progress: item.progress.map {
+                    Progress(done: $0.done, total: $0.total, note: $0.note)
+                }
+            )
+        }
+
+        var boundaries = candidates.compactMap { _, updated -> Date? in
+            let expiry = updated.addingTimeInterval(window + boundaryEpsilon)
+            return expiry > now ? expiry : nil
+        }
+        if !stale {
+            let staleBoundary = generatedAt.addingTimeInterval(limit + boundaryEpsilon)
+            if staleBoundary > now { boundaries.append(staleBoundary) }
+        }
+
+        return .rows(Content(
+            rows: visible,
+            overflowCount: max(0, candidates.count - visible.count),
+            asOfText: "as of \(DeskRelativeTimePresentation.text(for: generatedAt, now: now))",
+            isStale: stale,
+            nextRefreshAt: boundaries.min()
+        ))
+    }
+
+    static func relativeAge(_ date: Date, now: Date) -> String {
+        DeskRelativeTimePresentation.text(for: date, now: now)
+    }
+
+    static func humanSummary(_ item: DeskItem) -> String {
+        let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let summary, !summary.isEmpty { return summary }
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? "Untitled desk item" : title
+    }
+
+    static func assigneeLabel(_ value: String?) -> String {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmed, !trimmed.isEmpty else { return "Unassigned" }
+        return trimmed
+    }
+
+    static func assigneeSymbol(_ value: String?) -> String {
+        switch value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "codex": return "chevron.left.forwardslash.chevron.right"
+        case "claude": return "sparkles"
+        case "agent": return "brain.head.profile"
+        default: return "person.crop.circle"
+        }
+    }
+}
+
+// MARK: - Delegation program families
+
+/// `laneOf` is intentionally consumed only here, as a read model. Canonical
+/// `DeskItem.parent`, sequencing, archive guards, and board grouping remain
+/// untouched; a delegation family is visual context, not a second hierarchy.
+enum DeskProgramFamilyPresentation {
+    struct Lane: Identifiable, Sendable, Equatable {
+        let id: String
+        let title: String
+        let assignee: String
+        let assigneeSymbol: String
+        let status: DeskStatus
+        let progress: DeskLiveActivityPresentation.Progress?
+    }
+
+    struct Family: Identifiable, Sendable, Equatable {
+        let id: String
+        let parentTitle: String
+        let parentSummary: String
+        let lanes: [Lane]
+        fileprivate let newestUpdate: Date?
+    }
+
+    static func families(from deskItems: DeskLaneState<DeskItem>) -> [Family] {
+        guard deskItems.unavailableReason == nil else { return [] }
+        return families(from: deskItems.items)
+    }
+
+    static func families(from items: [DeskItem]) -> [Family] {
+        // A canonical store cannot produce duplicate handles, but this is a UI
+        // projection over durable bytes: retaining the first row is safer than
+        // trapping if a damaged/manual fixture reaches the presentation seam.
+        let byHandle = items.reduce(into: [String: DeskItem]()) { result, item in
+            if result[item.handle] == nil { result[item.handle] = item }
+        }
+        var lanesByParent: [String: [DeskItem]] = [:]
+        for item in items {
+            guard let raw = item.laneOf?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty,
+                  raw != item.handle,
+                  byHandle[raw] != nil
+            else { continue }
+            lanesByParent[raw, default: []].append(item)
+        }
+
+        return items.compactMap { parent -> Family? in
+            guard let lanes = lanesByParent[parent.handle], !lanes.isEmpty,
+                  parent.status == .now || lanes.contains(where: { $0.status == .now })
+            else { return nil }
+            let newest = ([parent] + lanes)
+                .compactMap { UserDisplayFormatters.parseISOTimestamp($0.updatedAt) }
+                .max()
+            return Family(
+                id: parent.handle,
+                parentTitle: parent.title,
+                parentSummary: DeskLiveActivityPresentation.humanSummary(parent),
+                lanes: lanes.map { lane in
+                    Lane(
+                        id: lane.handle,
+                        title: DeskLiveActivityPresentation.humanSummary(lane),
+                        assignee: DeskLiveActivityPresentation.assigneeLabel(lane.assignee),
+                        assigneeSymbol: DeskLiveActivityPresentation.assigneeSymbol(lane.assignee),
+                        status: lane.status,
+                        progress: lane.progress.map {
+                            .init(done: $0.done, total: $0.total, note: $0.note)
+                        }
+                    )
+                },
+                newestUpdate: newest
+            )
+        }.sorted { left, right in
+            if left.newestUpdate != right.newestUpdate {
+                return (left.newestUpdate ?? .distantPast) > (right.newestUpdate ?? .distantPast)
+            }
+            return left.id < right.id
+        }
     }
 }
 
@@ -240,13 +545,7 @@ enum DeskItemPresentation {
         }
         let seconds = max(0, now.timeIntervalSince(date))
         let days = Int(seconds / 86_400)
-        let plain: String
-        switch seconds {
-        case ..<90: plain = "just now"
-        case ..<3600: plain = "\(Int(seconds / 60))m ago"
-        case ..<86_400: plain = "\(Int(seconds / 3600))h ago"
-        default: plain = "\(days)d ago"
-        }
+        let plain = DeskRelativeTimePresentation.text(for: date, now: now)
         let stale = days >= staleThresholdDays
             && item.status != .blocked && item.status != .flag && !item.status.isTerminal
         return Freshness(text: stale ? "\(days)d stale" : plain, isStale: stale, isKnown: true)
@@ -322,18 +621,9 @@ enum DeskPursuitSectionPresentation {
 /// Human vocabulary for the GitHub Watcher state pill. Persisted enum names
 /// are machine identifiers and must never become a visible fallback label.
 enum DeskGitHubStatePillPresentation {
-    enum Tone: Equatable {
-        case warning
-        case working
-        case checking
-        case neutral
-        case failure
-        case success
-    }
-
     struct Pill: Equatable {
         let label: String
-        let tone: Tone
+        let tone: DeskPresentationTone
     }
 
     static let stalledCallbackStatus = "stalled"
@@ -343,9 +633,9 @@ enum DeskGitHubStatePillPresentation {
         case .detected, .needsCodex:
             return Pill(label: "Action needed", tone: .warning)
         case .codexWorking:
-            return Pill(label: "Codex working", tone: .working)
+            return Pill(label: "Codex working", tone: .info)
         case .verifying:
-            return Pill(label: "Verifying", tone: .checking)
+            return Pill(label: "Verifying", tone: .info)
         case .needsUser:
             return Pill(label: "Needs you", tone: .warning)
         case let .waitingUpstream(kind):
@@ -384,7 +674,7 @@ enum DeskGitHubStatePillPresentation {
         case .stale: label = "Stale observation"
         case .contradictoryState: label = "State needs review"
         }
-        return Pill(label: label, tone: .failure)
+        return Pill(label: label, tone: .danger)
     }
 
     private static func normalizedCallbackStatus(_ status: String?) -> String {

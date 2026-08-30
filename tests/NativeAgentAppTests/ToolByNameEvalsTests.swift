@@ -539,7 +539,7 @@ struct ToolByNameHermeticReadEvals {
 
         let delegation = try await dispatcher.dispatch(tool: "delegation_status", input: [:], surface: "chat")
         guard let delegationObject = asObject(delegation, tool: "delegation_status") else { return }
-        #expect(delegationObject["status"] == .string("ok"))
+        #expect(delegationObject["status"] == .string("no_evidence"))
         #expect(delegationObject["count"] == .int(0))
         #expect(delegationObject["open_count"] == .int(0))
 

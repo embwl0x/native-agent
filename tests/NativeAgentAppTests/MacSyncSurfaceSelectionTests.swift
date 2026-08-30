@@ -5,6 +5,38 @@ import ProviderRouting
 
 @Suite("MacSync surface selection")
 struct MacSyncSurfaceSelectionTests {
+    @Test("notification receipt is felt only after durable confirmation")
+    @MainActor
+    func notificationReceiptOrdersDurabilityBeforeOrganismEvidence() async {
+        let eventID = String(repeating: "a", count: 64)
+        var events: [String] = []
+        let success = await MacSyncActionRouter.notificationReceiptResponse(
+            payload: [
+                "eventId": eventID,
+                "direction": "mac_to_ios",
+                "channel": "ios",
+            ],
+            confirm: { _, _, _ in events.append("confirmed"); return true },
+            receive: { _, _ in events.append("felt") }
+        )
+        #expect(success["ok"] == "true")
+        #expect(events == ["confirmed", "felt"])
+
+        events = []
+        let failed = await MacSyncActionRouter.notificationReceiptResponse(
+            payload: [
+                "eventId": eventID,
+                "direction": "mac_to_ios",
+                "channel": "ios",
+            ],
+            confirm: { _, _, _ in events.append("confirm_failed"); return false },
+            receive: { _, _ in events.append("felt") }
+        )
+        #expect(failed["ok"] == "false")
+        #expect(failed["code"] == "receipt_persistence_failed")
+        #expect(events == ["confirm_failed"])
+    }
+
     @Test
     func unpinChatSessionAcceptsOnlySafeExactSessionIdentity() {
         #expect(MacSyncActionRouter.unpinChatSessionID(from: ["sessionId": " chat-123 "]) == "chat-123")

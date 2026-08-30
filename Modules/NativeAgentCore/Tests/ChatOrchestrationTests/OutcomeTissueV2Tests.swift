@@ -319,6 +319,34 @@ struct OutcomeTissueV2Tests {
         }
     }
 
+    @Test("read-only tools do not manufacture an unknown motor effect")
+    func readOnlyToolsAreMotorNotApplicable() throws {
+        let result = TurnEngineResult(
+            reply: "inspected",
+            modelUsed: "gpt-5.6",
+            recalledIds: [],
+            toolDispatches: [
+                .init(name: "read_file", input: [:], result: .string("contents")),
+                .init(name: "list_dir", input: [:], result: .array([.string("one")])),
+            ],
+            elapsedMs: 1,
+            rawLLMResponse: "inspected"
+        )
+        let observation = try #require(ResponseOutcomeObservationV2.make(
+            turnID: "turn-read-only",
+            messageID: "message-read-only",
+            sessionID: "session-read-only",
+            surface: "chat",
+            observedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            responsePersistence: "persisted",
+            result: result
+        ))
+
+        #expect(observation.dimensionStates["tools"] == .observed)
+        #expect(observation.dimensionStates["motor"] == .notApplicable)
+        #expect(observation.motorActions.isEmpty)
+    }
+
     @Test("duplicate actions and dry runs do not manufacture motor evidence")
     func duplicateAndDryRunMotorReferences() throws {
         let approvalID = "55555555-5555-4555-8555-555555555555"

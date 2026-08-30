@@ -23,7 +23,6 @@ enum CognitionObservatoryPanelID: String, CaseIterable, Sendable {
 /// by accidentally passing an ad-hoc disclosure identifier.
 enum CognitionSurfaceDispositionPresentation {
     enum Destination: Equatable, Sendable {
-        case observatory
         case activityCognitionProposals
         case diagnosticsCognition
     }
@@ -42,10 +41,6 @@ enum CognitionSurfaceDispositionPresentation {
         var approved: Bool { self == .approve }
     }
 
-    static func destination(for panel: CognitionObservatoryPanelID) -> Destination {
-        .observatory
-    }
-
     static let approvalsDestination: Destination = .activityCognitionProposals
     static let activityApprovalSection: ActivitySection = .cognitionProposals
     static let deskDebugDestination: Destination = .diagnosticsCognition
@@ -53,8 +48,6 @@ enum CognitionSurfaceDispositionPresentation {
     static func standingViewActions(isPending: Bool) -> [StandingViewAction] {
         isPending ? StandingViewAction.allCases : []
     }
-
-    static let schemaReplayActions: [StandingViewAction] = []
 }
 import Observation
 import CognitiveSubstrate

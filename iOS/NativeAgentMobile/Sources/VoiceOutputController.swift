@@ -34,8 +34,15 @@ final class VoiceOutputController: NSObject, ObservableObject {
     // to first speak() call shaves seconds off cold launch.
     private var _synthesizer: AVSpeechSynthesizer?
     private var audioSessionConfigured = false
+    /// True between a successful `setActive(true)` and the deactivation that
+    /// follows the last utterance.
+    private(set) var audioSessionActive = false
     private let configureAudioSession: () throws -> Void
     private let activateAudioSession: () throws -> Void
+    /// E5: leaving the session active after the last utterance keeps the audio
+    /// route held and suppresses other apps' audio indefinitely. Deactivating
+    /// with `.notifyOthersOnDeactivation` hands the route back.
+    private let deactivateAudioSession: () throws -> Void
     private var playbackState: VoiceOutputPlaybackState = .idle
     private var interruptionObserver: NSObjectProtocol?
 
@@ -49,10 +56,17 @@ final class VoiceOutputController: NSObject, ObservableObject {
         },
         activateAudioSession: @escaping () throws -> Void = {
             try AVAudioSession.sharedInstance().setActive(true)
+        },
+        deactivateAudioSession: @escaping () throws -> Void = {
+            try AVAudioSession.sharedInstance().setActive(
+                false,
+                options: [.notifyOthersOnDeactivation]
+            )
         }
     ) {
         self.configureAudioSession = configureAudioSession
         self.activateAudioSession = activateAudioSession
+        self.deactivateAudioSession = deactivateAudioSession
         super.init()
         interruptionObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
@@ -91,6 +105,7 @@ final class VoiceOutputController: NSObject, ObservableObject {
 
         do {
             try activateAudioSession()
+            audioSessionActive = true
         } catch {
             self.error = "Spoken reply could not start: \(error.localizedDescription)"
             finishPlayback()
@@ -140,6 +155,21 @@ final class VoiceOutputController: NSObject, ObservableObject {
     private func finishPlayback() {
         playbackState.finish()
         isSpeaking = playbackState.isSpeaking
+        releaseAudioSessionIfIdle()
+    }
+
+    /// E5: hand the audio route back once nothing is speaking. Only meaningful
+    /// if we actually activated the session; a failure leaves the flag set so
+    /// the next idle transition retries rather than silently keeping the route.
+    private func releaseAudioSessionIfIdle() {
+        guard audioSessionActive, playbackState == .idle else { return }
+        do {
+            try deactivateAudioSession()
+            audioSessionActive = false
+        } catch {
+            NSLog("[VoiceOutputController] audio session deactivate failed: %@",
+                  error.localizedDescription)
+        }
     }
 }
 

@@ -57,9 +57,10 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "inbox.json",
             ]
         case .advanced:
+            // command_palette.json retired 2026-08-28 (E8): the Mac stopped
+            // writing it, so the group must stop declaring it.
             [
                 "turn_summaries.json",
-                "command_palette.json",
                 "knowledge_graph.json",
                 "runs.json",
             ]

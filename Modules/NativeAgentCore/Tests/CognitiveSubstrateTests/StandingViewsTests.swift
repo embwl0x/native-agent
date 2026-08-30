@@ -604,4 +604,126 @@ struct StandingViewsTests {
         #expect(after.worldviewConflict > 0)
         #expect(afterTerm < beforeTerm, "conflict must leave a mark in the valence term: \(beforeTerm) → \(afterTerm)")
     }
+
+    // MARK: - Surfacing relevance (B7 — normalized BM25 + floor + fallback)
+
+    private func candidate(_ keywords: [String], line: String, ageRank: Int) -> CognitiveStandingViewCapsuleCandidate {
+        CognitiveStandingViewCapsuleCandidate(
+            id: UUID(),
+            line: "- Inner: \(line)",
+            concernKeywords: keywords.sorted(),
+            updatedAt: Date(timeIntervalSince1970: 1_000_000 - Double(ageRank))
+        )
+    }
+
+    /// THE DEFECT the floor exists for: substring containment surfaced a view
+    /// on a single incidental word. Same candidate, same message — the scored
+    /// path refuses it, and still takes a message actually about the view.
+    @Test func incidentalWordDoesNotClearTheMatchQualityFloor() {
+        let view = candidate(
+            ["interface", "legible", "simple", "verified", "choices"],
+            line: "Verified interface choices should stay simple and legible",
+            ageRank: 0
+        )
+        let incidental = "Can you schedule the grocery delivery tomorrow morning — keep it simple?"
+        // Negative control: the retired matcher WOULD have surfaced this.
+        #expect(view.concernKeywords.contains { incidental.lowercased().contains($0) },
+                "the message must still contain a keyword, or the floor is untested")
+        #expect(CognitiveSubstrate.bestRelevantCandidate(in: [view], for: incidental) == nil,
+                "one incidental word out of six is not what the message is about")
+
+        let onTopic = "keep the interface legible and simple"
+        #expect(CognitiveSubstrate.bestRelevantCandidate(in: [view], for: onTopic)?.id == view.id)
+    }
+
+    /// Scoring ranks; it does not just take the newest one that matches.
+    @Test func scoringPrefersTheViewTheMessageIsActuallyAbout() {
+        let newest = candidate(
+            ["interface", "legible", "simple"], line: "Interfaces should stay legible", ageRank: 0)
+        let older = candidate(
+            ["consolidation", "retention", "backups"], line: "Backups need a retention bound", ageRank: 5)
+
+        let picked = CognitiveSubstrate.bestRelevantCandidate(
+            in: [newest, older], for: "how does backups retention work for consolidation?")
+        #expect(picked?.id == older.id, "the older view is the one the message is about")
+
+        // No candidate is about this at all — nothing surfaces.
+        #expect(CognitiveSubstrate.bestRelevantCandidate(
+            in: [newest, older], for: "what should we cook tonight, something warm") == nil)
+        // A message with no distinctive terms cannot establish relevance.
+        #expect(CognitiveSubstrate.bestRelevantCandidate(in: [newest, older], for: "ok sure") == nil)
+        #expect(CognitiveSubstrate.bestRelevantCandidate(in: [newest, older], for: "   ") == nil)
+    }
+
+    /// FALLBACK: a view too short to yield distinctive terms of its own is
+    /// still recognisable — through the shipped concern lexicon it matched.
+    @Test func shortViewFallsBackToItsMatchedConcernLexicon() async throws {
+        let now = Date(timeIntervalSince1970: 23_500_000)
+        let clock = Clock(now)
+        let (store, root) = try makeStore("fallback"); defer { try? FileManager.default.removeItem(at: root) }
+        let s = substrate(store: store, clock: clock)
+        try await s.restorePersistentState()
+
+        // Every word is short or a stop word → zero distinctive terms.
+        let body = "I fix it, I own it, I say so"
+        let receipt = try #require(await formView(
+            s, prose: "A takeaway about the day.", viewBody: body, at: now))
+        let id = try #require(receipt.proposalIds.first)
+        _ = try #require(await s.resolveStandingView(id: id, approved: true))
+        #expect(CognitiveSubstrate.appraisalConcernTerms(in: body).isEmpty,
+                "premise: this view must have no distinctive terms, or the fallback is untested")
+
+        let candidates = await s.standingViewCapsuleCandidates()
+        let frozen = try #require(candidates.first { $0.line.contains("I fix it") })
+        #expect(!frozen.concernKeywords.isEmpty,
+                "the fallback must leave the view matchable, not frozen with an empty key set")
+        #expect(frozen.concernKeywords.contains("repair"))
+
+        let hit = await s.compileCapsule(request("can you repair the flow before we ship"))
+        #expect(hit.dynamicContext.contains("I fix it"))
+    }
+
+    /// The repeat canary is untouched: rollback still surfaces the newest
+    /// active view on any message, and an empty message still surfaces none.
+    @Test func relevanceCanaryStillRollsBackToNewestActive() async throws {
+        let now = Date(timeIntervalSince1970: 24_000_000)
+        let clock = Clock(now)
+        let (store, root) = try makeStore("canary-rollback"); defer { try? FileManager.default.removeItem(at: root) }
+        let s = substrate(store: store, clock: clock)
+        try await s.restorePersistentState()
+        let receipt = try #require(await formView(
+            s,
+            prose: "A takeaway about the day.",
+            viewBody: "Consolidation backups deserve a retention bound",
+            at: now
+        ))
+        let id = try #require(receipt.proposalIds.first)
+        _ = try #require(await s.resolveStandingView(id: id, approved: true))
+
+        let unrelated = await s.compileCapsule(request("what should we cook tonight"))
+        #expect(!unrelated.dynamicContext.contains("Consolidation backups"))
+
+        var rollback = config()
+        rollback.standingViewCapsuleRelevanceEnabled = false
+        await s.configure(rollback)
+        let legacy = await s.compileCapsule(request("what should we cook tonight"))
+        #expect(legacy.dynamicContext.contains("Consolidation backups"),
+                "canary off must restore the historical newest-active line")
+        let empty = await s.compileCapsule(request(""))
+        #expect(empty.dynamicContext.contains("Consolidation backups"),
+                "canary off is unconditional — relevance is never consulted")
+    }
+}
+
+// Review fix (2026-08-28): a bare 5-char shared prefix over-matched —
+// "inter" reached "internal"/"interesting". Matching is morphology, not
+// stem wildcarding: the longer term must be the shorter plus a common
+// inflection suffix.
+@Test func prefixMatchingIsInflectionNotStemWildcard() {
+    #expect(CognitiveSubstrate.standingViewTermsMatch("carry", "carrying"))
+    #expect(CognitiveSubstrate.standingViewTermsMatch("repair", "repairs"))
+    #expect(CognitiveSubstrate.standingViewTermsMatch("carrying", "carry"))
+    #expect(!CognitiveSubstrate.standingViewTermsMatch("inter", "internal"))
+    #expect(!CognitiveSubstrate.standingViewTermsMatch("inter", "interesting"))
+    #expect(!CognitiveSubstrate.standingViewTermsMatch("simple", "simplex"))
 }

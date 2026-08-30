@@ -47,13 +47,26 @@ private enum RunKindStyle {
 struct RunsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var selectedRun: RunRecord?
+    private let isRefreshing: Bool
+    private let refreshAction: (@MainActor () async -> Void)?
+
+    init(
+        isRefreshing: Bool = false,
+        refreshAction: (@MainActor () async -> Void)? = nil
+    ) {
+        self.isRefreshing = isRefreshing
+        self.refreshAction = refreshAction
+    }
 
     var body: some View {
         Group {
             switch RunsPresentation.state(
                 runs: appModel.runs,
-                staleNotice: appModel.panelStaleNotice(for: .diagnostics)
+                refresh: appModel.panelRefreshStatus[.diagnostics]
             ) {
+            case .loading:
+                ProgressView("Loading runs…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .unavailable(let unavailable):
                 NativeEmptyState(
                     title: "Runs unavailable",
@@ -75,29 +88,64 @@ struct RunsView: View {
                     }
                     .buttonStyle(.plain)
                 }
+            case .stale(let runs, let notice):
+                VStack(alignment: .leading, spacing: 8) {
+                    StalePanelNotice(text: notice)
+                    List(runs) { run in
+                        Button {
+                            selectedRun = run
+                        } label: {
+                            RunRow(run: run)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
             }
         }
         .navigationTitle("Runs")
         .toolbar {
             Button("Refresh", systemImage: "arrow.clockwise") {
-                Task { await appModel.refreshForSidebarItem(.diagnostics) }
+                Task { await refresh() }
             }
+            .disabled(isRefreshing)
         }
         .sheet(item: $selectedRun) { run in
             RunDetailSheet(run: run)
+        }
+    }
+
+    @MainActor
+    private func refresh() async {
+        if let refreshAction {
+            await refreshAction()
+        } else {
+            _ = await appModel.refreshForSidebarItem(.diagnostics)
         }
     }
 }
 
 enum RunsPresentation {
     enum State {
+        case loading
         case unavailable(String)
         case empty
         case rows([RunRecord])
+        case stale([RunRecord], String)
     }
 
-    static func state(runs: [RunRecord], staleNotice: String?) -> State {
-        if let staleNotice, !staleNotice.isEmpty { return .unavailable(staleNotice) }
+    static func state(
+        runs: [RunRecord],
+        refresh: AppModel.PanelRefreshStatus?
+    ) -> State {
+        guard let refresh else { return .loading }
+        let runsReadFailed = refresh.failedEndpoints.contains {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "runs"
+        }
+        if runsReadFailed {
+            return runs.isEmpty
+                ? .unavailable("The runs ledger is unavailable. Refresh to retry.")
+                : .stale(runs, "Showing previously loaded runs; the runs ledger could not be refreshed.")
+        }
         return runs.isEmpty ? .empty : .rows(runs)
     }
 }
@@ -122,7 +170,7 @@ enum RunStatusBadgePresentation {
     static let knownRawStatuses: Set<String> = [
         "active", "blocked", "canceled", "cancelled", "completed", "done",
         "disabled", "failed", "failed_pre_dispatch", "interrupted", "pending",
-        "queued", "rolled_back", "running", "skipped", "succeeded", "timeout",
+        "partial", "queued", "rolled_back", "running", "skipped", "succeeded", "timeout",
         "timed_out", "unknown", "waiting_approval"
     ]
 
@@ -138,6 +186,8 @@ enum RunStatusBadgePresentation {
             return Badge(label: "Running", themeStatus: "running", sourceStatus: sourceStatus)
         case "failed", "failed_pre_dispatch":
             return Badge(label: "Failed", themeStatus: "failed", sourceStatus: sourceStatus)
+        case "partial":
+            return Badge(label: "Partially completed", themeStatus: "warn", sourceStatus: sourceStatus)
         case "timeout", "timed_out":
             return Badge(label: "Timed out", themeStatus: "timeout", sourceStatus: sourceStatus)
         case "canceled", "cancelled":

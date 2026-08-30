@@ -3,6 +3,19 @@ import XCTest
 
 final class FoundationModelsTests: XCTestCase {
 
+    func testSemanticExtractionReportsFallbackWithoutClaimingNoFacts() async {
+        let extractor = SemanticAdaptiveFactExtractor(foundationTimeoutMilliseconds: 0)
+        let report = await extractor.extractWithReport(
+            userMessage: "I prefer quiet evenings at home.", assistantMessage: "unverified assistant text"
+        )
+        XCTAssertEqual(report.semanticStatus, .disabled)
+        XCTAssertEqual(report.semanticCandidateCount, 0)
+        XCTAssertFalse(report.candidates.isEmpty)
+        let blank = await extractor.extractWithReport(userMessage: " ", assistantMessage: "My name is Fake")
+        XCTAssertEqual(blank.semanticStatus, .emptyInput)
+        XCTAssertTrue(blank.candidates.isEmpty)
+    }
+
     func testIsAvailableIsBoolean() {
         _ = AppleFoundationModelsAdapter.isAvailable
     }

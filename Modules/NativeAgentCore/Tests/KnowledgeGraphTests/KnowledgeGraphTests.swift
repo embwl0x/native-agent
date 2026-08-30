@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 import NativeAgentCore
 import PersistenceCore
 import Testing
@@ -586,6 +587,7 @@ private let fixtureRaw: [String: JSONValue] = [
     let dir = try tempMemoryDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
 
     try await indexer.indexMemory(KnowledgeGraphMemoryFact(
@@ -627,6 +629,7 @@ private let fixtureRaw: [String: JSONValue] = [
     let dir = try tempMemoryDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     let fact = KnowledgeGraphMemoryFact(
         id: "mem-kg-repeat",
@@ -651,6 +654,7 @@ private let fixtureRaw: [String: JSONValue] = [
     let dir = try tempMemoryDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
 
     try await indexer.indexMemory(KnowledgeGraphMemoryFact(
@@ -710,6 +714,7 @@ private let fixtureRaw: [String: JSONValue] = [
     let dir = try tempMemoryDir()
     defer { try? FileManager.default.removeItem(at: dir) }
     let sqlitePath = dir.appendingPathComponent("memory.sqlite")
+    _ = try DatabasePool(path: sqlitePath.path) // fixture file (the indexer no longer creates the store — stable-failure #4)
     let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
     let fact = KnowledgeGraphMemoryFact(
         id: "mem-kg-delete-fact",
@@ -998,4 +1003,70 @@ private func writeKGFixture(_ doc: JSONValue) throws -> URL {
         graphPath: URL(fileURLWithPath: "/tmp/never.json")
     )
     #expect(client is SwiftNativeKnowledgeGraphForgetClient)
+}
+
+// MARK: - B5: recency as a tiebreak, never a dominance flip
+
+@Test func recencyBreaksTiesBetweenEquallyGoodMatches() {
+    let now = ISO8601DateFormatter().date(from: "2026-08-28T00:00:00Z")!
+    // Identical name/summary shape, so every other scoring term is equal and
+    // only last_seen can separate them. "stale" is FIRST in insertion order, so
+    // without the recency term the stable index tiebreak would keep it first.
+    let s = store([
+        "entities": obj([
+            "stale": obj([
+                "id": .string("stale"), "name": .string("Widget"),
+                "type": .string("concept"),
+                "last_seen": .string("2024-01-01T00:00:00Z"),
+            ]),
+            "fresh": obj([
+                "id": .string("fresh"), "name": .string("Widget"),
+                "type": .string("concept"),
+                "last_seen": .string("2026-08-27T00:00:00Z"),
+            ]),
+        ]),
+        "edges": .array([]),
+    ])
+    #expect(entityIds(s.searchEntities("Widget", now: now)) == ["fresh", "stale"])
+}
+
+/// The bound that keeps this a tiebreak. A year-old EXACT NAME match must still
+/// outrank a fresh weaker match — recency may not re-rank across match classes.
+@Test func recencyNeverOutweighsAStrongerMatch() {
+    let now = ISO8601DateFormatter().date(from: "2026-08-28T00:00:00Z")!
+    let s = store([
+        "entities": obj([
+            "fresh-weak": obj([
+                "id": .string("fresh-weak"), "name": .string("Something else"),
+                "type": .string("concept"),
+                "summary": .string("mentions Widget in passing"),
+                "last_seen": .string("2026-08-27T00:00:00Z"),
+            ]),
+            "stale-exact": obj([
+                "id": .string("stale-exact"), "name": .string("Widget"),
+                "type": .string("concept"),
+                "last_seen": .string("2024-01-01T00:00:00Z"),
+            ]),
+        ]),
+        "edges": .array([]),
+    ])
+    #expect(entityIds(s.searchEntities("Widget", now: now)).first == "stale-exact")
+}
+
+/// Absent or unparseable timestamps score zero rather than guessing — which is
+/// also what keeps every pre-existing fixture's ordering byte-identical.
+@Test func recencyScoreIsZeroWithoutAUsableTimestamp() {
+    let now = ISO8601DateFormatter().date(from: "2026-08-28T00:00:00Z")!
+    #expect(KnowledgeGraphStore.recencyScore(lastSeen: nil, now: now) == 0)
+    #expect(KnowledgeGraphStore.recencyScore(lastSeen: "   ", now: now) == 0)
+    #expect(KnowledgeGraphStore.recencyScore(lastSeen: "not a date", now: now) == 0)
+    #expect(KnowledgeGraphStore.recencyScore(lastSeen: "2020-01-01T00:00:00Z", now: now) == 0)
+    // A future timestamp cannot buy rank either.
+    #expect(KnowledgeGraphStore.recencyScore(lastSeen: "2027-01-01T00:00:00Z", now: now) == 0)
+    // Bounded by the popularity term's ceiling, so it can never dominate.
+    #expect(
+        KnowledgeGraphStore.recencyScore(lastSeen: "2026-08-27T00:00:00Z", now: now)
+            == KnowledgeGraphStore.recencyMaximumScore
+    )
+    #expect(KnowledgeGraphStore.recencyMaximumScore <= 0.3)
 }

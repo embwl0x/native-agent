@@ -11,7 +11,8 @@ import ToolRegistry
 // Ports the daemon's promote_tool flow
 // into Swift. Out of scope here: proposal lifecycle (sibling worker) and the
 // run sandbox (sibling worker). This file owns:
-//   1. validation gate (delegated to caller-supplied closure)
+//   1. preliminary validation gate (delegated to caller-supplied closure),
+//      followed by authoritative validation of the isolated staged copy
 //   2. risky-permission intersection gate
 //   3. staged activation (U5 W-B): proposals/<id>/ → active/.staging-<id>-<t>/,
 //      sign + fingerprint THERE, then a true atomic exchange
@@ -77,11 +78,11 @@ public typealias ToolValidator = @Sendable ([String: JSONValue]) async -> ToolVa
 /// autoPromotable. U5 W-B fix-round (gpt-5.5 NIT): this is NOT the engine's
 /// default anymore — a ToolPromoteEngine constructed without an explicit
 /// validator now resolves the REAL SwiftToolValidator against the proposal
-/// dir at promote time. This hook exists only so unit tests that don't care
-/// about validation semantics (signature/fingerprint round-trip pinning,
-/// concurrency tests) can opt out without staging a fake tool body; it is
-/// deliberately `internal` (reachable via `@testable import ToolExecution`)
-/// so no production module can wire it.
+/// dir at promote time. This hook exists only so unit tests can isolate the
+/// preliminary proposal-dir gate. Every copied tool is still authoritatively
+/// validated in its staged directory before signing; this hook cannot bypass
+/// that activation boundary. It is deliberately `internal` (reachable via
+/// `@testable import ToolExecution`) so no production module can wire it.
 let permissivePromoteValidatorForTesting: ToolValidator = { _ in
     ToolValidationResult(valid: true, errors: [], autoPromotable: true)
 }
@@ -327,6 +328,13 @@ public actor ToolPromoteEngine {
     private let persistence: SwiftNativePersistenceCore
     private let clock: @Sendable () -> Date
     private var mutationTail: Task<Void, Never>? = nil
+    private var afterDirectorySwapForTesting: (@Sendable () throws -> Void)?
+
+    /// Fault injection at the directory/registry commit seam; never installed
+    /// by production callers.
+    func _setAfterDirectorySwapForTesting(_ hook: @escaping @Sendable () throws -> Void) {
+        afterDirectorySwapForTesting = hook
+    }
 
     /// Mirrors the retired daemon `RISKY_TOOL_PERMISSIONS`. KEEP IN SYNC.
     public static let riskyToolPermissions: Set<String> = [
@@ -336,7 +344,8 @@ public actor ToolPromoteEngine {
 
     /// `validator`: pass nil (the default) to validate with the REAL
     /// SwiftToolValidator, resolved per-promote against the proposal dir.
-    /// Tests inject explicit validators to isolate other machinery.
+    /// Tests inject explicit validators to isolate the preliminary gate; the
+    /// staged activation bytes always pass the real validator.
     public init(
         signer: SwiftNativeManifestSigner,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -380,7 +389,7 @@ public actor ToolPromoteEngine {
         //    by the entry sweep below.
         guard Self.isSafePromoteId(proposalId) else {
             throw ToolPromoteError.validationFailed(errors: [
-                "tool id must be a single safe path component and may not use the reserved \(Self.stagingPrefix)/\(Self.retiredPrefix) prefixes"
+                "tool id must be a single safe path component and may not use the reserved \(Self.stagingPrefix)/\(Self.retiredPrefix)/\(Self.recoveryPrefix) prefixes"
             ])
         }
         let proposalDir = proposalsRoot.appendingPathComponent(proposalId, isDirectory: true)
@@ -404,23 +413,7 @@ public actor ToolPromoteEngine {
             throw ToolPromoteError.validationFailed(errors: validation.errors)
         }
 
-        // 3. Risky-permission intersection.
-        var perms: [String] = []
-        if case .array(let arr)? = manifest["permissions"] {
-            for v in arr {
-                if case .string(let s) = v { perms.append(s) }
-            }
-        }
-        let riskyHits = perms.filter { Self.riskyToolPermissions.contains($0) }
-        let risky = !riskyHits.isEmpty
-        if !validation.autoPromotable && !(allowRisky && risky) {
-            throw ToolPromoteError.riskyWithoutAllowRisky(permissions: riskyHits)
-        }
-        if risky && !allowRisky {
-            throw ToolPromoteError.riskyWithoutAllowRisky(permissions: riskyHits)
-        }
-
-        // 4. Compute swap identities, then run the ENTIRE mutation sequence
+        // 3. Compute swap identities, then run the ENTIRE mutation sequence
         //    (sweep → stage → sign → fingerprint → swap → registry upsert)
         //    inside the actor's serialized mutation chain. Pre-U5 only the
         //    registry upsert was serialized, so two same-id promotes could
@@ -442,8 +435,12 @@ public actor ToolPromoteEngine {
         let stagingDir = activeRoot.appendingPathComponent(
             Self.stagingPrefix + proposalId + "-" + token, isDirectory: true
         )
+        let recoveryDir = activeRoot.appendingPathComponent(
+            Self.recoveryPrefix + proposalId + "-" + token, isDirectory: true
+        )
         let signer = self.signer
         let persistence = self.persistence
+        let afterDirectorySwapForTesting = self.afterDirectorySwapForTesting
 
         let work: @Sendable () async throws -> [String: JSONValue] = {
             let fm = FileManager.default
@@ -451,7 +448,9 @@ public actor ToolPromoteEngine {
 
             // 5. Sweep crash litter a prior promote left behind when the
             //    process died mid-flight (age-gated; see the helper doc).
-            Self.sweepStaleSwapLitter(activeRoot: activeRoot, now: now)
+            try await persistence.withFileLock(registryPath) {
+                Self.sweepStaleSwapLitter(activeRoot: activeRoot, now: now)
+            }
 
             // 6. Stage proposals/<id>/ → active/.staging-<id>-<token>/ and
             //    sign + fingerprint THERE. The live active/<id> dir is not
@@ -460,17 +459,10 @@ public actor ToolPromoteEngine {
             //    tool intact. (Pre-U5 this was remove-then-copy: the old
             //    tool was already destroyed before signing could fail.)
             defer {
-                // Cleanup of whatever occupies the staging path on exit:
-                //   - throw BEFORE the swap → the never-swapped-in staged
-                //     copy (garbage);
-                //   - successful EXCHANGE → the displaced old tool body
-                //     (renamex_np parks it here) — deleting it is the old
-                //     "drop the retired copy" success step;
-                //   - registry-failure rollback → the staged copy, after the
-                //     rollback exchanged it back out of active/<id>;
-                //   - first-promote rename path → nothing (no-op).
-                // Crash-path litter is handled by the entry sweep on the
-                // NEXT promote.
+                // This invocation's staging path never receives displaced old
+                // bytes: exchanges use recoveryDir, whose cleanup belongs to
+                // the locked commit/rollback below. A failed rollback must not
+                // let this unconditional defer destroy the recovery copy.
                 if fm.fileExists(atPath: stagingDir.path) {
                     try? fm.removeItem(at: stagingDir)
                 }
@@ -481,11 +473,43 @@ public actor ToolPromoteEngine {
                 throw ToolPromoteError.copyFailed(error.localizedDescription)
             }
 
-            // 6a. Re-read manifest from the staging dir, sign in place.
+            // 6a. Re-read and AUTHORITATIVELY validate the staged copy before
+            //     signing it. Preliminary validation above reads the mutable
+            //     proposal directory; without this second gate, another writer
+            //     can replace the manifest or entrypoint between validation and
+            //     copy, and the different body would still be signed and
+            //     activated. The staged directory is private to this promotion,
+            //     so validation, authorization, signing, and fingerprinting now
+            //     all operate on the same isolated staged copy.
             let stagedManifestURL = stagingDir.appendingPathComponent("manifest.json")
             let stagedManifestRaw = await persistence.readJSON(stagedManifestURL, defaultValue: .object([:]))
             guard case .object(var activeManifest) = stagedManifestRaw else {
                 throw ToolPromoteError.persistenceFailed("staged manifest unparseable")
+            }
+            let stagedValidation = await SwiftToolValidator.validate(
+                manifest: activeManifest,
+                proposalDir: stagingDir
+            )
+            if !stagedValidation.valid {
+                throw ToolPromoteError.validationFailed(errors: stagedValidation.errors)
+            }
+            var stagedPermissions: [String] = []
+            if case .array(let values)? = activeManifest["permissions"] {
+                for value in values {
+                    if case .string(let permission) = value {
+                        stagedPermissions.append(permission)
+                    }
+                }
+            }
+            let riskyHits = stagedPermissions.filter {
+                Self.riskyToolPermissions.contains($0)
+            }
+            let risky = !riskyHits.isEmpty
+            if !stagedValidation.autoPromotable && !(allowRisky && risky) {
+                throw ToolPromoteError.riskyWithoutAllowRisky(permissions: riskyHits)
+            }
+            if risky && !allowRisky {
+                throw ToolPromoteError.riskyWithoutAllowRisky(permissions: riskyHits)
             }
             let signedManifest: [String: JSONValue]
             do {
@@ -516,8 +540,7 @@ public actor ToolPromoteEngine {
             //     + promote-side overrides). Mirrors Python
             //     `{**record, **manifest, ...}`. activePath points at the
             //     FINAL active dir, not the staging dir.
-            var promoted: [String: JSONValue] = manifest
-            for (k, v) in activeManifest { promoted[k] = v }
+            var promoted: [String: JSONValue] = activeManifest
             promoted["codeFingerprint"] = .string(fingerprint)
             promoted["status"] = .string("active")
             promoted["phase"] = .string("active")
@@ -565,8 +588,8 @@ public actor ToolPromoteEngine {
             //    The swap itself is renamex_np(RENAME_SWAP): a TRUE atomic
             //    exchange — there is no instant where active/<id> is absent
             //    or half-written. The displaced old tool body lands at the
-            //    staging path (cleaned by the defer above on success, and the
-            //    rollback medium on registry failure). First-ever promote has
+            //    recovery path (cleaned only after commit or successful
+            //    rollback). First-ever promote has
             //    no live dir to exchange; a single same-volume rename is
             //    equally windowless. Registry mutators all resolve through
             //    this same flock, so even the lock-internal half-states
@@ -577,12 +600,42 @@ public actor ToolPromoteEngine {
             let promotedSnapshot = promoted
             let lockedSwapAndUpsert: @Sendable () async throws -> Void = {
                 let fm = FileManager.default
+                // A missing registry is a fresh install. Existing malformed or
+                // unreadable bytes are NOT an empty registry: replacing them
+                // would silently discard every other registered tool. Check
+                // under the same registry lock and before swapping active code.
+                var items: [JSONValue] = []
+                if fm.fileExists(atPath: registryPath.path) {
+                    do {
+                        guard case .array(let existing) = try JSONValue.parse(
+                            Data(contentsOf: registryPath)
+                        ) else {
+                            throw ToolPromoteError.persistenceFailed(
+                                "registry is not a JSON array; promotion refused"
+                            )
+                        }
+                        items = existing
+                    } catch let error as ToolPromoteError {
+                        throw error
+                    } catch {
+                        throw ToolPromoteError.persistenceFailed(
+                            "registry unreadable; promotion refused: \(error.localizedDescription)"
+                        )
+                    }
+                }
                 // --- swap (inside the lock) ---
-                var exchangedOldIntoStaging = false
+                var exchangedOldIntoRecovery = false
                 if fm.fileExists(atPath: activeDir.path) {
-                    try Self.atomicExchangeDirectories(stagingDir, activeDir)
-                    // Old tool body now parked at stagingDir (rollback copy).
-                    exchangedOldIntoStaging = true
+                    try fm.moveItem(at: stagingDir, to: recoveryDir)
+                    do {
+                        try Self.atomicExchangeDirectories(recoveryDir, activeDir)
+                    } catch {
+                        // Atomic exchange did not occur: recovery still holds
+                        // only the never-activated incoming copy.
+                        try? fm.removeItem(at: recoveryDir)
+                        throw error
+                    }
+                    exchangedOldIntoRecovery = true
                 } else {
                     do {
                         try fm.moveItem(at: stagingDir, to: activeDir)
@@ -593,9 +646,7 @@ public actor ToolPromoteEngine {
 
                 // --- registry upsert (same lock) ---
                 do {
-                    let raw = await persistence.readJSON(registryPath, defaultValue: .array([]))
-                    var items: [JSONValue] = []
-                    if case .array(let arr) = raw { items = arr }
+                    try afterDirectorySwapForTesting?()
                     var foundIdx: Int? = nil
                     for (idx, item) in items.enumerated() {
                         if case .object(let obj) = item,
@@ -626,17 +677,23 @@ public actor ToolPromoteEngine {
                         throw ToolPromoteError.persistenceFailed("registry write: \(error.localizedDescription)")
                     }
                 } catch {
-                    // Roll the swap back — still inside the lock, so no
-                    // registry consumer can observe the half-state. Disk and
-                    // registry stay consistent: previously-active tool
-                    // restored, registry untouched.
-                    if exchangedOldIntoStaging {
-                        try? Self.atomicExchangeDirectories(stagingDir, activeDir)
-                    } else {
-                        try? fm.removeItem(at: activeDir)
+                    let commitError = error
+                    do {
+                        if exchangedOldIntoRecovery {
+                            try Self.atomicExchangeDirectories(recoveryDir, activeDir)
+                            try? fm.removeItem(at: recoveryDir)
+                        } else {
+                            try fm.removeItem(at: activeDir)
+                        }
+                    } catch {
+                        let retained = exchangedOldIntoRecovery ? recoveryDir : activeDir
+                        throw ToolPromoteError.swapFailed(
+                            "commit failed: \(commitError.localizedDescription); rollback failed: \(error.localizedDescription); recovery body retained at \(retained.path)"
+                        )
                     }
-                    throw error
+                    throw commitError
                 }
+                if exchangedOldIntoRecovery { try? fm.removeItem(at: recoveryDir) }
             }
             try await persistence.withFileLock(registryPath, lockedSwapAndUpsert)
             return promoted
@@ -680,6 +737,7 @@ public actor ToolPromoteEngine {
 
     static let stagingPrefix = ".staging-"
     static let retiredPrefix = ".retired-"
+    static let recoveryPrefix = ".recovery-"
 
     /// Litter younger than this is skipped by the entry sweep. A SECOND
     /// engine instance (SwiftNativeToolExecution builds one engine per
@@ -695,15 +753,35 @@ public actor ToolPromoteEngine {
     /// mid-flight (power loss, kill -9 — throw paths clean up inline; this
     /// handles the windows no defer can reach). Policy per entry older than
     /// `swapLitterMinAge`:
-    ///   - `.staging-<id>-<token>`: never was the live tool — delete.
+    ///   - `.staging-<id>-<token>` and `.recovery-<id>-<token>`: may hold
+    ///     displaced active bytes from an interrupted exchange. Delete ONLY
+    ///     when the live active body matches the committed registry fingerprint.
     ///   - `.retired-<id>-<token>` with active/<id> PRESENT: the swap
-    ///     completed before the crash; the retired copy is a stale backup —
-    ///     delete.
+    ///     completed before the crash only if its current fingerprint matches
+    ///     the registry; otherwise retain the ambiguous old copy.
     ///   - `.retired-<id>-<token>` with active/<id> MISSING: the crash hit
     ///     between move-aside and move-in — restore the retired dir to
     ///     active/<id> so the previously-active tool comes back.
     static func sweepStaleSwapLitter(activeRoot: URL, now: Date) {
         let fm = FileManager.default
+        // Callers hold registry.json's lock, matching the directory swap and
+        // registry upsert. A directory's mere existence is not commit proof.
+        let registryPath = activeRoot.deletingLastPathComponent().appendingPathComponent("registry.json")
+        let registry = (try? Data(contentsOf: registryPath)).flatMap { try? JSONValue.parse($0) }
+        func activeMatchesCommittedRegistry(_ id: String, activeDir: URL) -> Bool {
+            guard case .array(let records)? = registry,
+                  let record = records.first(where: {
+                      guard case .object(let fields) = $0 else { return false }
+                      return fields["id"] == .string(id)
+                  }), case .object(let fields) = record,
+                  case .string(let expected)? = fields["codeFingerprint"], !expected.isEmpty,
+                  let bytes = try? Data(contentsOf: activeDir.appendingPathComponent("manifest.json")),
+                  case .object(let manifest) = try? JSONValue.parse(bytes),
+                  case .string(let entrypoint)? = manifest["entrypoint"],
+                  !entrypoint.isEmpty, !entrypoint.hasPrefix("/"),
+                  !entrypoint.split(separator: "/").contains("..") else { return false }
+            return computeToolCodeFingerprint(toolRoot: activeDir, entrypointName: entrypoint) == expected
+        }
         guard let entries = try? fm.contentsOfDirectory(
             at: activeRoot,
             includingPropertiesForKeys: [.contentModificationDateKey]
@@ -712,22 +790,19 @@ public actor ToolPromoteEngine {
             let name = entry.lastPathComponent
             let isStaging = name.hasPrefix(stagingPrefix)
             let isRetired = name.hasPrefix(retiredPrefix)
-            if !isStaging && !isRetired { continue }
+            let isRecovery = name.hasPrefix(recoveryPrefix)
+            if !isStaging && !isRetired && !isRecovery { continue }
             let mtime = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate ?? .distantPast
             if now.timeIntervalSince(mtime) < swapLitterMinAge { continue }
-            if isStaging {
-                try? fm.removeItem(at: entry)
-                continue
-            }
-            guard let id = toolId(fromSwapDirName: name, prefix: retiredPrefix) else {
-                try? fm.removeItem(at: entry)
-                continue
-            }
+            let prefix = isStaging ? stagingPrefix : (isRecovery ? recoveryPrefix : retiredPrefix)
+            guard let id = toolId(fromSwapDirName: name, prefix: prefix) else { continue }
             let activeDir = activeRoot.appendingPathComponent(id, isDirectory: true)
-            if fm.fileExists(atPath: activeDir.path) {
+            if activeMatchesCommittedRegistry(id, activeDir: activeDir) {
                 try? fm.removeItem(at: entry)
-            } else {
+            } else if isRetired && !fm.fileExists(atPath: activeDir.path) {
+                // Legacy retired directories came from move-aside-before-
+                // install. Unlike exchange recovery, their ownership is known.
                 try? fm.moveItem(at: entry, to: activeDir)
             }
         }
@@ -740,7 +815,7 @@ public actor ToolPromoteEngine {
     nonisolated static func isSafePromoteId(_ id: String) -> Bool {
         guard !id.isEmpty, id != ".", id != ".." else { return false }
         if id.contains("/") || id.contains("\\") || id.contains("\0") { return false }
-        if id.hasPrefix(stagingPrefix) || id.hasPrefix(retiredPrefix) { return false }
+        if id.hasPrefix(stagingPrefix) || id.hasPrefix(retiredPrefix) || id.hasPrefix(recoveryPrefix) { return false }
         return true
     }
 

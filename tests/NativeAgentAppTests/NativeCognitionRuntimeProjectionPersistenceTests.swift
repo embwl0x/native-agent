@@ -1,7 +1,9 @@
 import Foundation
 import Testing
+import ApprovalInbox
 import CognitiveSubstrate
 import NativeAgentCore
+import PersistenceCore
 @testable import NativeAgentApp
 
 private func enabledNativeCognitionConfiguration() -> CognitiveConfiguration {
@@ -60,7 +62,58 @@ private func projection(
 
 @Suite("NativeCognitionRuntime projection and persistence", .serialized)
 struct NativeCognitionRuntimeProjectionPersistenceTests {
-    @Test func turnProjectionIsFixedTimeAndPresentationCommitIsDeferred() async throws {
+    @Test func providerRestoreCollectsProviderRowsFromInterleavedTraceTail() async throws {
+        let root = try makeNativeCognitionRuntimeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tracePath = root.appendingPathComponent("traces/events.jsonl")
+        try FileManager.default.createDirectory(
+            at: tracePath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        var bytes = Data()
+        for index in 0..<40 {
+            let createdAt = ISO8601DateFormatter().string(
+                from: Date(timeIntervalSince1970: Double(10_000 + index))
+            )
+            let provider = JSONValue.object([
+                "id": .string("provider-\(index)"),
+                "kind": .string("llm.call"),
+                "createdAt": .string(createdAt),
+                "status": .string(index == 39 ? "failed" : "ok"),
+                "payload": .object([
+                    "provider": .string("fixture"),
+                    "model": .string("fixture-1"),
+                ]),
+            ])
+            let tool = JSONValue.object([
+                "id": .string("tool-\(index)"),
+                "kind": .string("tool.dispatch"),
+                "createdAt": .string(createdAt),
+                "status": .string("ok"),
+                "payload": .object([:]),
+            ])
+            bytes.append(Data((try provider.serialize(pretty: false) + "\n").utf8))
+            bytes.append(Data((try tool.serialize(pretty: false) + "\n").utf8))
+        }
+        try bytes.write(to: tracePath)
+
+        let runtime = NativeCognitionRuntime(
+            dataRoot: root,
+            configurationOverride: enabledNativeCognitionConfiguration(),
+            organismConfigurationOverride: .enabled
+        )
+        await runtime.restoreProviderLifecycleEvidence()
+        let evidence = await runtime.providerPathEvidence(at: Date(timeIntervalSince1970: 20_000))
+        #expect(evidence.count == NativeCognitionRuntime.maximumProviderLifecycleEvidence)
+        #expect(evidence.contains { $0.outcome == .failed })
+    }
+
+    @Test(arguments: [
+        "please keep going",
+        "What changed in the report from codex?",
+        "Explain verification ping messages.",
+    ])
+    func turnProjectionIsFixedTimeAndPresentationCommitIsDeferred(message: String) async throws {
         let root = try makeNativeCognitionRuntimeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let fixedAt = Date(timeIntervalSince1970: 9_000)
@@ -71,7 +124,9 @@ struct NativeCognitionRuntimeProjectionPersistenceTests {
             now: { fixedAt }
         )
         _ = try await runtime.setOrganismDebugBodyOverride(scenario: "provider_brittle")
-        let request = liveCapsuleRequest(maximumCharacters: 1_200)
+        var request = liveCapsuleRequest(maximumCharacters: 1_200)
+        request.userMessage = message
+        request.turnKind = .live
 
         let projection = await runtime.prepareTurnProjection(request)
         let capsule = try #require(projection.capsule)
@@ -132,6 +187,54 @@ struct NativeCognitionRuntimeProjectionPersistenceTests {
         )
         #expect(belief.estimate == 0.5)
         #expect(belief.bodySchemaProvidersHealthy == nil)
+    }
+
+    @Test func cumulativeProviderCapabilityBridgesAnEmptyTraceSensor() {
+        let at = Date(timeIntervalSince1970: 20_000)
+        let capability = OrganismCapabilityBelief(
+            kind: .providerCompletion,
+            successLikelihood: 0.96,
+            uncertainty: 0.1,
+            evidenceCount: 114,
+            resolvedEvidenceCount: 110,
+            expiredEvidenceCount: 4,
+            freshness: 0.99,
+            lastEvidenceAt: at,
+            evidenceBasis: .cumulativeOutcomes
+        )
+
+        let belief = NativeCognitionRuntime.providerCapabilityFallbackProjection(
+            capability,
+            now: at.addingTimeInterval(60)
+        )
+        #expect(belief?.evidenceCount == 114)
+        #expect(belief?.newestEvidenceAt == at)
+        #expect(belief?.state == .healthy)
+        #expect(belief?.bodySchemaProvidersHealthy == true)
+    }
+
+    @Test func oldPendingApprovalIsRearmedAtBootstrap() async throws {
+        let root = try makeNativeCognitionRuntimeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let createdAt = Date(timeIntervalSince1970: 1_000)
+        _ = try await SwiftNativeApprovalInbox(root: root, clock: { createdAt }).create(.object([
+            "title": .string("Still waiting for review"),
+            "action": .string("self_improvement.apply"),
+            "payload": .object([:]),
+        ]))
+        let current = Date(timeIntervalSince1970: 20_000)
+        let runtime = NativeCognitionRuntime(
+            dataRoot: root,
+            configurationOverride: enabledNativeCognitionConfiguration(),
+            organismConfigurationOverride: .enabled,
+            now: { current },
+            microcycleSchedulingMode: .manuallyFlushed
+        )
+
+        await runtime.reconcilePendingApprovalExpectationsAtBootstrap()
+        #expect(await runtime.organismSnapshot().predictionSummary.pendingCount == 1)
+        await runtime.reconcilePendingApprovalExpectationsAtBootstrap()
+        #expect(await runtime.organismSnapshot().predictionSummary.pendingCount == 1)
     }
 
     @Test func runtimeFrozenMindReadDoesNotAdvanceOwnerRevisions() async throws {

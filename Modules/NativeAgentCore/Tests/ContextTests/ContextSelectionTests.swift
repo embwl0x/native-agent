@@ -6,6 +6,107 @@ import Testing
 struct ContextSelectionTests {
     private let now = Date(timeIntervalSince1970: 10_000)
 
+    @Test(arguments: ["hello", "How is it going?", "What is the watering frequency?"])
+    func newTopicDoesNotRetrievePriorConversationWork(message: String) throws {
+        let oldWork = atom("old-work", source: "work", kind: .runtimeTruth,
+                           body: "Orchard migration deployment awaits verification.")
+        let currentFact = atom("watering", source: "memory", kind: .memory,
+                               body: "Watering frequency is weekly.")
+        let correction = atom("boundary", source: "correction", kind: .correction,
+                              body: "Respect the user's explicit boundaries.", policy: .always)
+        let fixture = generation([oldWork, currentFact, correction])
+        let packet = try ContextSelector().select(signal(
+            message,
+            generation: fixture,
+            recentTurns: ["Orchard migration deployment", "It awaits verification."]
+        ), from: fixture)
+
+        #expect(!packet.receipt.selectedAtomIDs.contains(oldWork.draft.id))
+        #expect(!packet.expandablePointers.contains { $0.atomID == oldWork.draft.id })
+        #expect(packet.receipt.selectedAtomIDs.contains(correction.draft.id))
+        if message.contains("watering") {
+            #expect(packet.receipt.selectedAtomIDs.contains(currentFact.draft.id))
+        }
+    }
+
+    @Test(arguments: ["Continue that", "What is the orchard migration status?"])
+    func requestedConversationWorkStillRetrieves(message: String) throws {
+        let work = atom("work", source: "work", kind: .runtimeTruth,
+                        body: "Orchard migration deployment awaits verification.")
+        let fixture = generation([work])
+        let packet = try ContextSelector().select(signal(
+            message,
+            generation: fixture,
+            recentTurns: ["Orchard migration deployment", "It awaits verification."]
+        ), from: fixture)
+
+        #expect(packet.receipt.selectedAtomIDs == [work.draft.id])
+    }
+
+    @Test func referentialLexicalCarryUsesOnlyTwoBoundedExcerpts() throws {
+        let oldWork = atom("old-work", source: "old", kind: .runtimeTruth,
+                           body: "Orchard migration deployment awaits verification.")
+        let tailOnly = atom("tail", source: "tail", kind: .memory,
+                            body: "Telescope collimation requires calibration.")
+        let recent = atom("recent", source: "recent", kind: .memory,
+                          body: "Watering frequency is weekly.")
+        let fixture = generation([oldWork, tailOnly, recent])
+        let packet = try ContextSelector().select(signal(
+            "Continue that",
+            generation: fixture,
+            recentTurns: [
+                "Orchard migration deployment awaits verification.",
+                "Watering frequency is weekly.",
+                String(repeating: "Watering ", count: 80) + "Telescope collimation calibration",
+            ]
+        ), from: fixture)
+
+        #expect(packet.receipt.selectedAtomIDs == [recent.draft.id])
+    }
+
+    @Test func inflectedTopicMatchesResidentSingularFact() throws {
+        let answer = atom("answer", source: "answer-source", kind: .memory,
+                          body: "The user dislikes verbose search narration.")
+        let fixture = generation([answer])
+        let packet = try ContextSelector().select(signal("searches", generation: fixture), from: fixture)
+        #expect(packet.selectedItems.first?.pointer.atomID == answer.draft.id)
+    }
+
+    @Test func ubiquitousNamesDoNotOutvoteSpecificTopicEvidence() throws {
+        let answer = atom("answer", source: "answer-source", kind: .memory,
+                          body: "Watering is needed weekly.", embedding: [1, 0])
+        let tangents = (0..<15).map { index in
+            atom("tangent-\(index)", source: "source-\(index)", kind: .memory,
+                 body: "Orion orchard meeting number \(index)", embedding: [0.5, 0.866])
+        }
+        let fixture = generation([answer] + tangents)
+        let packet = try ContextSelector(configuration: ContextSelectionConfiguration(maximumDynamicAtoms: 1))
+            .select(signal("Orion orchard watering frequency", generation: fixture, queryEmbedding: [1, 0]), from: fixture)
+        #expect(packet.selectedItems.first?.pointer.atomID == answer.draft.id)
+        let answerScore = try #require(packet.receipt.candidateScores.first { $0.atomID == answer.draft.id })
+        let tangentScore = try #require(packet.receipt.candidateScores.first { $0.atomID == tangents[0].draft.id })
+        #expect(answerScore.features.messageCoverage > tangentScore.features.messageCoverage)
+    }
+
+    @Test(arguments: ["should", "could", "would", "can", "does", "did", "must"])
+    func auxiliaryVerbsDoNotRouteQuestionsToUnrelatedInstructions(auxiliary: String) throws {
+        let answer = atom("answer", source: "answer-source", kind: .memory,
+                          body: "The user prefers concise search summaries.")
+        let tangents = (0..<15).map { index in
+            atom("tangent-\(index)", source: "source-\(index)", kind: .memory,
+                 body: "\(auxiliary) the assistant schedule orchard watering number \(index)")
+        }
+        let generation = generation([answer] + tangents)
+        let packet = try ContextSelector().select(
+            signal("\(auxiliary) search summaries be concise?", generation: generation), from: generation
+        )
+        #expect(packet.selectedItems.first?.pointer.atomID == answer.draft.id)
+        for candidate in packet.receipt.candidateScores where candidate.atomID != answer.draft.id {
+            #expect(candidate.features.messageCoverage == 0)
+            #expect(candidate.features.tokenOverlap == 0)
+        }
+    }
+
     // MARK: - Score-weight seam (selection-score-rebalance)
 
     /// Every default is a deliberate, evidenced value: the first twelve are
@@ -567,6 +668,88 @@ struct ContextSelectionTests {
     }
 
     @Test
+    func saturatedMemoryQuotaPreservesSelectionAndFinalScoreReceiptsAtScale() throws {
+        // Synthetic quota-saturated shape: after eight selections, the
+        // remaining 248 memories cannot fill the four unused dynamic slots.
+        // This is not an installed-latency or answer-quality measurement.
+        let atoms = (0..<256).map { index in
+            let name = String(format: "memory-%03d", index)
+            return atom(
+                name, source: name, kind: .memory,
+                body: "Atlas continuity memory carries the same shared context."
+            )
+        }
+        let fixture = generation(atoms)
+        let snapshot = try ContextGenerationSnapshot(
+            generationID: 1,
+            sourceFingerprint: fixture.generation.sourceFingerprint,
+            selectionIndex: Dictionary(uniqueKeysWithValues: atoms.map {
+                ($0.draft.id, ContextSelectionIndexEntry(atom: $0.draft))
+            })
+        )
+        let need = signal("Atlas continuity memory", generation: fixture, budget: 32_000)
+        let selector = ContextSelector()
+        let packet = try selector.select(need, from: fixture, pinnedTo: snapshot)
+        let expectedIDs = (0..<8).map {
+            ContextAtomID(rawValue: String(format: "atom:memory-%03d", $0))
+        }
+        #expect(packet.receipt.selectedAtomIDs == expectedIDs)
+        #expect(packet.receipt.candidateScores.count == 256)
+        #expect(packet.receipt.candidateScores.compactMap(\.selectionOrdinal) == Array(1...8))
+        let unselected = packet.receipt.candidateScores.filter { $0.selectionOrdinal == nil }
+        #expect(unselected.count == 248)
+        let finalFeatures = try #require(unselected.first?.features)
+        #expect(unselected.allSatisfy { $0.features == finalFeatures })
+        #expect(finalFeatures.redundancyPenalty == 1)
+        #expect(finalFeatures.diversityBonus == ContextScoreWeights().diversityNewSourceBonus)
+
+        var samples: [Int] = []
+        for _ in 0..<12 {
+            let started = DispatchTime.now().uptimeNanoseconds
+            let replayed = try selector.select(need, from: fixture, pinnedTo: snapshot)
+            samples.append(Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000))
+            #expect(replayed == packet)
+        }
+        let ordered = samples.sorted()
+        print("[context-quota-synthetic] atoms=256 selected=8 replay-identical=12 "
+            + "p50=\(ordered[ordered.count / 2])us max=\(ordered.last ?? 0)us")
+    }
+
+    @Test
+    func memoryKindOverrideAdmitsMoreMemoryAtomsThanUniformPerKindCap() throws {
+        let memories = (0..<6).map { index in
+            atom(
+                "memory-\(index)",
+                source: "memory-src-\(index)",
+                kind: .memory,
+                body: "Atlas memory \(index).",
+                activation: 1
+            )
+        }
+        let projects = (0..<6).map { index in
+            atom(
+                "project-\(index)",
+                source: "project-src-\(index)",
+                kind: .project,
+                body: "Atlas project \(index).",
+                activation: 1
+            )
+        }
+        let generation = generation(memories + projects)
+        // Shipped defaults: uniform per-kind cap 4, `.memory` override 8.
+        let selector = ContextSelector()
+
+        let packet = try selector.select(
+            signal("Atlas", generation: generation),
+            from: generation
+        )
+        let kinds = packet.selectedItems.map(\.pointer.kind)
+
+        #expect(kinds.filter { $0 == .memory }.count == 6)
+        #expect(kinds.filter { $0 == .project }.count == 4)
+    }
+
+    @Test
     func hybridScoreExposesEveryPositiveFeatureAndSelectionPenalties() throws {
         let primary = atom(
             "hybrid-primary",
@@ -764,6 +947,7 @@ struct ContextSelectionTests {
         deleted: Set<ContextAtomID> = [],
         allowedPrivacy: Set<ContextPrivacy> = [.localPrivate, .trustedRemote, .publicSafe],
         allowedSourceIDs: Set<ContextSourceID>? = nil,
+        recentTurns: [String] = [],
         queryEmbedding: [Float]? = nil,
         queryEmbeddingModelFingerprint: String? = nil,
         feedbackUtilityOverrides: [ContextAtomID: Double] = [:],
@@ -781,6 +965,7 @@ struct ContextSelectionTests {
                 allowedSourceIDs: allowedSourceIDs
                     ?? Set(generation.sources.map(\.descriptor.id))
             ),
+            recentTurns: recentTurns,
             feedbackUtilityOverrides: feedbackUtilityOverrides,
             feedbackDecayOverrides: feedbackDecayOverrides,
             mandatoryAtomIDs: mandatory,

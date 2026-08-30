@@ -640,10 +640,17 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     }
 
     public func deleteMemory(id: String) async throws -> DeleteMemoryResult {
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        _ = try await storage.deleteMemory(id: id)
-        await flushDerivedMemoryChanges()
+        _ = try await deleteMemoryIfPresent(id: id)
         return .ok
+    }
+
+    /// Foreground callers that distinguish a missing row use the atomic
+    /// deletion result while sharing the canonical projection completion.
+    public func deleteMemoryIfPresent(id: String) async throws -> Bool {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        let deleted = try await storage.deleteMemory(id: id)
+        await flushDerivedMemoryChanges()
+        return deleted
     }
 
     public func v2Status() async throws -> JSONValue {
@@ -749,6 +756,10 @@ public actor SwiftNativeMemoryV2: MemoryV2Protocol {
     }
 
     func flushDerivedMemoryChanges() async {
+        if let bridge = storage as? MemoryStorageBridge {
+            let underlying = await bridge.underlyingStorage()
+            await underlying.flushProjectionHooks()
+        }
         await DerivedStateInvalidationCenter.shared.flush()
     }
 

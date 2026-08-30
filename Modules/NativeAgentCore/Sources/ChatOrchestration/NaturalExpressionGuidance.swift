@@ -78,11 +78,7 @@ struct NaturalExpressionGuidance {
     /// the newest six assistant rows bounds CPU work and makes the cue cool as
     /// soon as the latest reply stops matching the shared template.
     static func pendingRutCue(from messages: [ChatMessage]) -> String? {
-        let newestAssistantReplies = messages.reversed().lazy
-            .filter { $0.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "assistant" }
-            .prefix(6)
-            .map(\.content)
-            .reversed()
+        let newestAssistantReplies = recentCompletedReplies(from: messages, limit: 6).reversed()
 
         guard let latestReply = newestAssistantReplies.last,
               let latest = fingerprint(latestReply) else {
@@ -117,16 +113,59 @@ struct NaturalExpressionGuidance {
     /// Fine 😏 … There. Now go make it" — announce, deliver, then grade. The
     /// markers below are DETECTION anchors only; the cue never bans them.
     static func pendingStanceCue(from messages: [ChatMessage]) -> String? {
-        let newest = messages.reversed().lazy
-            .filter { $0.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "assistant" }
-            .prefix(3)
-            .map(\.content)
+        let newest = recentCompletedReplies(from: messages, limit: 3)
         let flagged = newest.filter { isSelfNarrating($0) }.count
         guard let latest = newest.first else { return nil }
         // The latest reply must itself narrate (the cue cools as soon as she
         // stops), plus at least one earlier reply in the window.
         guard isSelfNarrating(latest), flagged >= 2 else { return nil }
         return stanceCue
+    }
+
+    /// Expression recurrence belongs to completed replies, not stream fragments.
+    /// Persistence retains interrupted output as assistant rows and can retain
+    /// multiple rows for one run. Use that existing provenance without changing
+    /// the transcript or interpreting its meaning. Legacy rows with no run ID
+    /// remain independent replies. A hard row bound prevents a tool-heavy tail
+    /// from reaching arbitrarily far back for enough expression evidence.
+    private static func recentCompletedReplies(from messages: [ChatMessage], limit: Int) -> [String] {
+        var replies: [String] = []
+        var seenRunIDs: Set<String> = []
+        for message in messages.suffix(64).reversed() {
+            guard message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "assistant"
+            else { continue }
+
+            if case .object(let extras)? = message.extras {
+                if case .bool(true)? = extras["cancelled"] { continue }
+                if case .object(let metadata)? = extras["metadata"] {
+                    if case .bool(true)? = metadata["partial"] { continue }
+                    if case .bool(true)? = metadata["cancelled"] { continue }
+                    // The failure writer emits its own assistant notice, not
+                    // persona-authored prose. Decode only failed candidates and
+                    // bind the existing receipt to this exact transcript row.
+                    if case .object(let fields)? = metadata["outcomeObservation"],
+                       case .string("failed")? = fields["responsePersistence"],
+                       let outcome = ResponseOutcomeObservationV2(jsonValue: .object(fields)),
+                       case .string(let messageID)? = extras["id"],
+                       outcome.messageID == messageID {
+                        let matchesRecordedTrace: Bool
+                        switch metadata["turnTraceId"] {
+                        case nil: matchesRecordedTrace = true
+                        case .string(let traceID)?: matchesRecordedTrace = traceID == outcome.turnID
+                        default: matchesRecordedTrace = false
+                        }
+                        if matchesRecordedTrace { continue }
+                    }
+                }
+                if case .string(let runID)? = extras["runId"], !runID.isEmpty {
+                    guard seenRunIDs.insert(runID).inserted else { continue }
+                }
+            }
+
+            replies.append(message.content)
+            if replies.count == limit { break }
+        }
+        return replies
     }
 
     static func isSelfNarrating(_ raw: String) -> Bool {

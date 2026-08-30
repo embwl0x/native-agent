@@ -15,6 +15,16 @@ let sessionStorage = {};
 let nextCreatedTabId = 42;
 let rejectNextTypeReply = false;
 let typeDispatchCount = 0;
+let nextTypeResult = null;
+let nextFillOrSelectError = null;
+let fillOrSelectDispatchCount = 0;
+const invalidatedLeases = [];
+let nextSnapshotNodes = null;
+let lastClickedLocalNode = null;
+let snapshotReplyHook = null;
+let waitReplyHook = null;
+let tabUpdateHook = null;
+let tabGetHook = null;
 let webFrames = [{ frameId: 0, parentFrameId: -1, url: "https://example.com/fixture" }];
 
 const nativePort = {
@@ -65,6 +75,7 @@ globalThis.chrome = {
     async get(tabId) {
       const tab = tabs.get(tabId);
       if (!tab) throw new Error("tab missing");
+      if (tabGetHook) await tabGetHook(tab);
       return structuredClone(tab);
     },
     async update(tabId, options) {
@@ -73,11 +84,19 @@ globalThis.chrome = {
       if (!tab) throw new Error("tab missing");
       tab.url = options.url;
       tab.status = "complete";
+      if (tabUpdateHook) await tabUpdateHook(tab);
       return structuredClone(tab);
     },
     async sendMessage(tabId, message, options = {}) {
+      if (message.type === "nativeagent.page.lease.invalidated") {
+        invalidatedLeases.push(message.leaseId);
+        return { ok: true, result: { invalidated: true } };
+      }
       assert.ok(tabs.has(tabId));
       if (message.type === "nativeagent.page.snapshot") {
+        const nodes = nextSnapshotNodes ?? [{ nodeId: "n1", parentNodeId: null, actions: ["click", "fill", "type", "select", "keypress", "set_checked", "double_click", "wait"] }];
+        nextSnapshotNodes = null;
+        if (snapshotReplyHook) await snapshotReplyHook(tabId, options.frameId ?? 0);
         return { ok: true, result: {
           snapshotId: `snapshot-frame-${options.frameId ?? 0}`, leaseId: message.leaseId, tabId,
           userSequence: message.userSequence,
@@ -87,22 +106,35 @@ globalThis.chrome = {
           viewport: { width: 1200, height: 800, scrollX: 0, scrollY: 0, documentWidth: 1200, documentHeight: 2000 },
           summary: { text: options.frameId === 0 ? "Top frame" : "Child frame", nodeCount: 1, truncated: false, truncationReasons: [] },
           frame: { name: options.frameId === 0 ? "Fixture" : "Child", url: webFrames.find((frame) => frame.frameId === (options.frameId ?? 0))?.url },
-          nodes: [{ nodeId: "n1", parentNodeId: null, actions: ["click", "fill", "type", "select", "keypress", "set_checked", "double_click", "wait"] }],
+          nodes,
         } };
       }
       if (message.type === "nativeagent.page.click") {
+        lastClickedLocalNode = message.nodeId;
         return { ok: true, result: { snapshotId: message.snapshotId, nodeId: message.nodeId, clicked: true } };
+      }
+      if (["nativeagent.page.fill", "nativeagent.page.select"].includes(message.type)) {
+        fillOrSelectDispatchCount += 1;
+        if (nextFillOrSelectError) {
+          const error = nextFillOrSelectError;
+          nextFillOrSelectError = null;
+          return { ok: false, error };
+        }
       }
       if (message.type === "nativeagent.page.fill") {
         return { ok: true, result: { snapshotId: message.snapshotId, nodeId: message.nodeId, filled: true, valueLength: message.value.length } };
       }
       if (message.type === "nativeagent.page.type") {
         typeDispatchCount += 1;
+        assert.equal(typeof message.leaseId, "string");
+        assert.ok(message.leaseExpiresAtMs > Date.now());
         if (rejectNextTypeReply) {
           rejectNextTypeReply = false;
           throw new Error("frame navigated");
         }
-        return { ok: true, result: { snapshotId: message.snapshotId, nodeId: message.nodeId, typed: true, characterCount: message.text.length } };
+        const result = nextTypeResult ?? { snapshotId: message.snapshotId, nodeId: message.nodeId, typed: true, completed: true, characterCount: Array.from(message.text).length };
+        nextTypeResult = null;
+        return { ok: true, result };
       }
       if (message.type === "nativeagent.page.select") {
         return { ok: true, result: { snapshotId: message.snapshotId, nodeId: message.nodeId, selected: true, values: message.values } };
@@ -117,6 +149,9 @@ globalThis.chrome = {
         return { ok: true, result: { snapshotId: message.snapshotId, nodeId: message.nodeId, doubleClicked: true } };
       }
       if (message.type === "nativeagent.page.wait") {
+        assert.equal(typeof message.leaseId, "string");
+        assert.ok(Number.isFinite(message.leaseExpiresAtMs));
+        if (waitReplyHook) await waitReplyHook(tabId, message);
         return { ok: true, result: { snapshotId: message.snapshotId, nodeId: message.nodeId, state: message.state, matched: true } };
       }
       if (message.type === "nativeagent.page.scroll") {
@@ -399,6 +434,27 @@ test("frame walker aggregates frame-scoped nodes and routes acts to their owning
   webFrames = [{ frameId: 0, parentFrameId: -1, url: "https://example.com/fixture" }];
 });
 
+test("fill and select readback failures return outcome_unknown receipts without retrying", async () => {
+  for (const [action, fields] of [["fill", { value: "requested" }], ["select", { values: ["pro"] }]]) {
+    const acquire = await sendRequest(`acquire-${action}-readback`, "lease.acquire", { mode: "create" });
+    const snapshot = await sendRequest(`snapshot-${action}-readback`, "page.snapshot.read", { leaseId: acquire.result.leaseId });
+    const before = fillOrSelectDispatchCount;
+    nextFillOrSelectError = { code: "action_outcome_unknown", message: "Immediate state unconfirmed. Observe before retrying." };
+    const response = await sendRequest(`${action}-readback`, `page.element.${action}`, {
+      leaseId: acquire.result.leaseId,
+      expectedUserSequence: 0,
+      snapshotId: snapshot.result.snapshotId,
+      nodeId: snapshot.result.nodes[0].nodeId,
+      ...fields,
+    });
+    assert.equal(response.ok, true);
+    assert.equal(response.result.outcome, "outcome_unknown");
+    assert.equal(response.result.receipt.verification, "outcome_unknown");
+    assert.equal(response.result.receipt.retry, "never_automatic");
+    assert.equal(fillOrSelectDispatchCount, before + 1);
+  }
+});
+
 test("lost type reply returns one outcome_unknown receipt and never retries", async () => {
   const acquire = await sendRequest("acquire-unknown", "lease.acquire", { mode: "create" });
   const snapshot = await sendRequest("snapshot-unknown", "page.snapshot.read", {
@@ -418,4 +474,243 @@ test("lost type reply returns one outcome_unknown receipt and never retries", as
   assert.equal(typed.result.receipt.verification, "outcome_unknown");
   assert.equal(typed.result.receipt.retry, "never_automatic");
   assert.equal(typeDispatchCount, before + 1);
+});
+
+test("partial type progress stays partial and lease release reaches in-flight page actions", async () => {
+  const acquire = await sendRequest("acquire-partial", "lease.acquire", { mode: "create" });
+  const snapshot = await sendRequest("snapshot-partial", "page.snapshot.read", { leaseId: acquire.result.leaseId });
+  nextTypeResult = {
+    typed: false, completed: false, characterCount: 1, requestedCharacterCount: 3,
+    remainingCharacterCount: 2, nextCharacterIndex: 1, nextUTF16Offset: 2,
+    characterUnit: "unicode_code_point", stopReason: "execution_deadline",
+  };
+  const typed = await sendRequest("type-partial", "page.element.type", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0,
+    snapshotId: snapshot.result.snapshotId, nodeId: snapshot.result.nodes[0].nodeId, text: "🙂xy",
+  });
+  assert.equal(typed.ok, true);
+  assert.equal(typed.result.outcome, "partially_completed");
+  assert.equal(typed.result.characterCount, 1);
+  assert.equal(typed.result.nextUTF16Offset, 2);
+  assert.equal(typed.result.receipt.retry, "fresh_snapshot_then_remaining_text_only");
+  await sendRequest("release-partial", "lease.release", { leaseId: acquire.result.leaseId, closeCreatedTab: false });
+  assert.ok(invalidatedLeases.includes(acquire.result.leaseId));
+});
+
+test("encoded snapshot budget preserves retained targets and truthful counts", async () => {
+  const acquire = await sendRequest("acquire-byte-budget", "lease.acquire", { mode: "create" });
+  nextSnapshotNodes = Array.from({ length: 500 }, (_, index) => ({
+    nodeId: `source-${index}`, parentNodeId: index === 0 ? null : "source-0",
+    kind: "link", role: "link", name: "🙂".repeat(100), text: "界".repeat(200), value: null,
+    url: `https://example.com/${"a".repeat(2_028)}`, actions: ["click"],
+    visible: true, bounds: { x: 0, y: index, width: 100, height: 20 },
+  }));
+  const snapshot = await sendRequest("snapshot-byte-budget", "page.snapshot.read", { leaseId: acquire.result.leaseId });
+  assert.equal(snapshot.ok, true);
+  const retained = snapshot.result.nodes;
+  assert.ok(retained.length > 0 && retained.length < 500);
+  assert.equal(snapshot.result.summary.nodeCount, retained.length);
+  assert.equal(snapshot.result.frames[0].nodeCount, retained.length);
+  assert.equal(snapshot.result.summary.truncated, true);
+  assert.ok(snapshot.result.summary.truncationReasons.includes("encoded_size_limit"));
+  assert.ok(new TextEncoder().encode(JSON.stringify(snapshot)).byteLength < 1_048_576);
+  const clicked = await sendRequest("click-byte-budget", "page.element.click", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0,
+    snapshotId: snapshot.result.snapshotId, nodeId: retained.at(-1).nodeId,
+  });
+  assert.equal(clicked.ok, true);
+  assert.equal(lastClickedLocalNode, `source-${retained.length - 1}`);
+  const omitted = await sendRequest("click-omitted-byte-budget", "page.element.click", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0,
+    snapshotId: snapshot.result.snapshotId, nodeId: `n${retained.length + 1}`,
+  });
+  assert.equal(omitted.ok, false);
+  assert.equal(omitted.error.code, "node_stale");
+});
+
+test("in-flight snapshot capture preserves invalidation and takeover evidence", async (t) => {
+  webFrames = [
+    { frameId: 0, parentFrameId: -1, url: "https://example.com/top" },
+    { frameId: 7, parentFrameId: 0, url: "https://example.net/child" },
+  ];
+  t.after(() => {
+    snapshotReplyHook = null;
+    webFrames = [{ frameId: 0, parentFrameId: -1, url: "https://example.com/fixture" }];
+  });
+  for (const cause of ["mutation", "takeover"]) {
+    const acquire = await sendRequest(`acquire-inflight-${cause}`, "lease.acquire", { mode: "create" });
+    snapshotReplyHook = async (tabId, frameId) => {
+      if (frameId !== 7) return;
+      snapshotReplyHook = null;
+      if (cause === "mutation") {
+        runtimeMessageListeners[0](
+          { type: "nativeagent.page.mutated", snapshotIds: ["snapshot-frame-0"] },
+          { tab: { id: tabId }, frameId: 0 },
+        );
+      } else {
+        activatedListeners[0]({ tabId });
+        await eventFor("lease.yielded", acquire.result.leaseId);
+      }
+    };
+    const snapshot = await sendRequest(`snapshot-inflight-${cause}`, "page.snapshot.read", { leaseId: acquire.result.leaseId });
+    assert.equal(snapshot.ok, false);
+    assert.equal(snapshot.error.code, cause === "mutation" ? "snapshot_stale" : "lease_not_found");
+    if (cause === "mutation") {
+      const retry = await sendRequest("snapshot-inflight-retry", "page.snapshot.read", { leaseId: acquire.result.leaseId });
+      assert.equal(retry.ok, true);
+      assert.equal(retry.result.nodes.length, 2);
+    }
+  }
+});
+
+test("a newer snapshot supersedes an older pending capture without stale publication", async (t) => {
+  t.after(() => { snapshotReplyHook = null; });
+  const acquire = await sendRequest("acquire-superseded", "lease.acquire", { mode: "create" });
+  let releaseFirst;
+  let firstEntered;
+  const paused = new Promise((resolve) => { releaseFirst = resolve; });
+  const entered = new Promise((resolve) => { firstEntered = resolve; });
+  snapshotReplyHook = async () => {
+    snapshotReplyHook = null;
+    firstEntered();
+    await paused;
+  };
+  const first = sendRequest("snapshot-superseded-first", "page.snapshot.read", { leaseId: acquire.result.leaseId });
+  await entered;
+  const second = await sendRequest("snapshot-superseded-second", "page.snapshot.read", { leaseId: acquire.result.leaseId });
+  releaseFirst();
+  const obsolete = await first;
+  assert.equal(second.ok, true);
+  assert.equal(obsolete.ok, false);
+  assert.equal(obsolete.error.code, "snapshot_superseded");
+});
+
+test("navigation completion after takeover is unknown rather than a false success", async (t) => {
+  t.after(() => { tabUpdateHook = null; });
+  const acquire = await sendRequest("acquire-navigation-takeover", "lease.acquire", { mode: "create" });
+  tabUpdateHook = async (tab) => {
+    tabUpdateHook = null;
+    activatedListeners[0]({ tabId: tab.id });
+    await eventFor("lease.yielded", acquire.result.leaseId);
+  };
+  const response = await sendRequest("navigate-takeover", "navigate", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0, url: "https://example.com/requested",
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.result.outcome, "outcome_unknown");
+  assert.equal(response.result.receipt.retry, "never_automatic");
+  assert.equal(response.result.verified, false);
+  assert.equal(updatedListeners.length, 0);
+});
+
+test("navigation completion preserves redirects without claiming verified causality", async (t) => {
+  t.after(() => { tabUpdateHook = null; });
+  const acquire = await sendRequest("acquire-navigation-redirect", "lease.acquire", { mode: "create" });
+  tabUpdateHook = async (tab) => { tabUpdateHook = null; tab.url = "https://example.com/redirected"; };
+  const response = await sendRequest("navigate-redirect", "navigate", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0, url: "https://example.com/requested",
+  });
+  assert.equal(response.result.status, "complete");
+  assert.equal(response.result.requestedUrl, "https://example.com/requested");
+  assert.equal(response.result.url, "https://example.com/redirected");
+  assert.equal(response.result.verified, false);
+  assert.equal(response.result.receipt.verification, "not_verified");
+});
+
+test("superseded navigation cannot claim the newer page as its own completion", async (t) => {
+  t.after(() => { tabUpdateHook = null; });
+  const acquire = await sendRequest("acquire-navigation-superseded", "lease.acquire", { mode: "create" });
+  let releaseFirst;
+  let firstEntered;
+  const paused = new Promise((resolve) => { releaseFirst = resolve; });
+  const entered = new Promise((resolve) => { firstEntered = resolve; });
+  tabUpdateHook = async () => { tabUpdateHook = null; firstEntered(); await paused; };
+  const first = sendRequest("navigate-superseded-first", "navigate", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0, url: "https://example.com/first",
+  });
+  await entered;
+  const second = await sendRequest("navigate-superseded-second", "navigate", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0, url: "https://example.com/second",
+  });
+  releaseFirst();
+  const obsolete = await first;
+  assert.equal(obsolete.result.outcome, "outcome_unknown");
+  assert.equal(obsolete.result.error.code, "navigation_superseded");
+  assert.equal(second.result.url, "https://example.com/second");
+  assert.equal(second.result.requestedUrl, "https://example.com/second");
+  assert.equal(second.result.status, "complete");
+  assert.equal(second.result.verified, false);
+  assert.equal(second.result.receipt.verification, "not_verified");
+  assert.equal(updatedListeners.length, 0);
+});
+
+test("pending navigation wait is released promptly on lease takeover", async (t) => {
+  t.after(() => { tabUpdateHook = null; });
+  const acquire = await sendRequest("acquire-navigation-pending", "lease.acquire", { mode: "create" });
+  tabUpdateHook = async (tab) => { tabUpdateHook = null; tab.status = "loading"; };
+  const pending = sendRequest("navigate-pending-takeover", "navigate", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0, url: "https://example.com/loading",
+  });
+  for (let count = 0; count < 50 && updatedListeners.length === 0; count += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(updatedListeners.length, 1);
+  activatedListeners[0]({ tabId: acquire.result.tabId });
+  const response = await pending;
+  assert.equal(response.result.outcome, "outcome_unknown");
+  assert.equal(response.result.error.code, "lease_not_found");
+  assert.equal(updatedListeners.length, 0);
+});
+
+test("navigation settlement rereads the tab instead of verifying an old complete event", async (t) => {
+  t.after(() => { tabGetHook = null; });
+  const acquire = await sendRequest("acquire-navigation-settle", "lease.acquire", { mode: "create" });
+  tabs.get(acquire.result.tabId).status = "complete";
+  let reads = 0;
+  tabGetHook = async (tab) => {
+    reads += 1;
+    if (reads === 2) { tab.status = "loading"; tabGetHook = null; }
+  };
+  const response = await sendRequest("wait-navigation-fresh", "page.wait", {
+    leaseId: acquire.result.leaseId, expectedUserSequence: 0, condition: "navigation_settled", timeoutMs: 100,
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.result.matched, false);
+  assert.equal(response.result.outcome, "not_settled");
+  assert.equal(response.result.receipt.verification, "not_verified");
+  assert.equal(updatedListeners.length, 0);
+});
+
+test("node wait revalidates its lease before publishing a matched receipt", async (t) => {
+  t.after(() => { waitReplyHook = null; });
+  let clock = Date.now();
+  t.mock.method(Date, "now", () => clock);
+  for (const cause of ["release", "takeover", "expiry"]) {
+    const acquire = await sendRequest(`acquire-node-wait-${cause}`, "lease.acquire", { mode: "create" });
+    assert.equal(acquire.ok, true);
+    const lease = acquire.result;
+    const snapshot = await sendRequest(`snapshot-node-wait-${cause}`, "page.snapshot.read", { leaseId: lease.leaseId });
+    waitReplyHook = async (tabId, message) => {
+      waitReplyHook = null;
+      assert.equal(message.leaseId, lease.leaseId);
+      if (cause === "release") {
+        await sendRequest("release-node-wait", "lease.release", { leaseId: lease.leaseId, closeCreatedTab: false });
+      } else if (cause === "takeover") {
+        runtimeMessageListeners[0]({ type: "nativeagent.user-touch", kind: "pointer" }, { tab: { id: tabId } });
+        await eventFor("lease.yielded", lease.leaseId);
+      } else {
+        clock = message.leaseExpiresAtMs + 1;
+      }
+    };
+    const response = await sendRequest(`node-wait-${cause}`, "page.wait", {
+      leaseId: lease.leaseId, expectedUserSequence: 0, condition: "element_state",
+      snapshotId: snapshot.result.snapshotId, nodeId: snapshot.result.nodes[0].nodeId,
+      state: "enabled", timeoutMs: 100,
+    });
+    assert.equal(response.ok, false, "a late matched=true page response is not a current verified receipt");
+    assert.equal(response.error.code, cause === "expiry" ? "lease_expired" : "lease_not_found");
+    if (cause === "expiry") {
+      await sendRequest("release-expired-node-wait", "lease.release", { leaseId: lease.leaseId, closeCreatedTab: false });
+    }
+  }
 });

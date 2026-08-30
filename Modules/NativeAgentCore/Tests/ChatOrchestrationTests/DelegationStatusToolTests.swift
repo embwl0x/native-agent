@@ -23,6 +23,19 @@ struct DelegationStatusToolTests {
     // 2026-08-05T19:00:00Z — a fixed instant every fixture is written against.
     private static let now = Date(timeIntervalSince1970: 1_785_956_400)
 
+    @Test func paginationRejectsUnrepresentableNumbersWithoutTrapping() {
+        for number in [Double.nan, .infinity, -.infinity, .greatestFiniteMagnitude,
+                       -.greatestFiniteMagnitude, Double(Int.max)] {
+            #expect(SwiftToolDispatcher.delegationStatusLimit(["limit": .double(number)]) == 8)
+            #expect(SwiftToolDispatcher.delegationStatusOffset(["offset": .double(number)]) == 0)
+        }
+        #expect(SwiftToolDispatcher.delegationStatusLimit(["limit": .double(3.9)]) == 3)
+        #expect(SwiftToolDispatcher.delegationStatusOffset(["offset": .double(3.9)]) == 3)
+        #expect(SwiftToolDispatcher.delegationStatusLimit(["limit": .int(.max)]) == 12)
+        #expect(SwiftToolDispatcher.delegationStatusOffset(["offset": .int(.max)]) == Int.max)
+        #expect(SwiftToolDispatcher.delegationStatusOffset(["offset": .double(-3.9)]) == 0)
+    }
+
     /// The clock constant is itself load-bearing: every elapsed and stall
     /// expectation below is arithmetic against it, so an off-by-N epoch would
     /// silently retune all of them at once. Pin it against the ISO string.
@@ -52,6 +65,12 @@ struct DelegationStatusToolTests {
         return dir
     }
 
+    private func codexDeliveryFile(_ root: URL) -> URL {
+        let bridge = root.appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
+        try? FileManager.default.createDirectory(at: bridge, withIntermediateDirectories: true)
+        return bridge.appendingPathComponent("reply-deliveries.jsonl")
+    }
+
     private func ompDir(_ root: URL) -> URL {
         let dir = root.appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -68,6 +87,101 @@ struct DelegationStatusToolTests {
 
     private func job(_ rows: [DelegationJobProjection], _ id: String) -> DelegationJobProjection? {
         rows.first { $0.id == id }
+    }
+
+    private func lookup(_ root: URL, _ input: [String: JSONValue]) async throws -> [String: JSONValue] {
+        let dispatcher = SwiftToolDispatcher(dataRoot: root, agentBridgeConfigRoot: root)
+        let result = try await dispatcher.dispatch(tool: "delegation_status", input: input, surface: "chat")
+        guard case .object(let object) = result else { throw PersistenceCoreError.ioFailure("missing status envelope") }
+        return object
+    }
+
+    @Test func acceptedMessageLookupFindsRunningBatchBeforePagingWithoutBindingMotorOwner() async throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dir = codexDir(root)
+        let batch = #"{"id":"internal-batch","phase":"watching_turn","createdAt":"2026-08-05T17:00:00Z","threadId":"thread-exact","turnId":"turn-exact","entries":[{"payload":{"messageId":"accepted-A"}},{"payload":{"messageId":"accepted-B"}}]}"#
+        write(batch, to: dir, named: "opaque-job-file.json")
+        write(#"{"id":"internal-newer","phase":"watching_turn","createdAt":"2026-08-05T17:30:00Z","threadId":"initial-thread","turnId":"initial-turn","entries":[{"payload":{"messageId":"accepted-B"}}],"completedExecution":{"threadId":"terminal-thread","turnId":"terminal-turn","turnResult":{"status":"completed","completedAt":"2026-08-05T17:30:00Z"}}}"#,
+              to: dir, named: "second.json")
+        for index in 0..<10 {
+            write("{\"id\":\"unrelated-\(index)\",\"phase\":\"watching_turn\",\"createdAt\":\"2026-08-05T18:30:00Z\",\"entries\":[{\"payload\":{\"messageId\":\"other-\(index)\"}}]}",
+                  to: dir, named: "unrelated-\(index).json")
+        }
+        let plain = try await lookup(root, ["agent": .string("codex")])
+        #expect(plain["matched_count"] == .int(12))
+        #expect(plain["returned_count"] == .int(8))
+        #expect(plain["lookup_status"] == nil)
+        let input: [String: JSONValue] = ["agent": .string("codex"), "message_id": .string("accepted-B"), "limit": .int(1)]
+        let first = try await lookup(root, input)
+        #expect(first["lookup_status"] == .string("matched"))
+        #expect(first["matched_count"] == .int(2))
+        #expect(first["returned_count"] == .int(1))
+        #expect(first["has_more"] == .bool(true))
+        #expect(first["next_offset"] == .int(1))
+        #expect(first["source_availability"] == plain["source_availability"])
+        guard case .array(let firstJobs)? = first["jobs"], case .object(let terminal)? = firstJobs.first else {
+            Issue.record("missing terminal match"); return
+        }
+        #expect(terminal["thread_id"] == .string("terminal-thread"))
+        #expect(terminal["turn_id"] == .string("terminal-turn"))
+        let second = try await lookup(root, input.merging(["offset": .int(1), "detail": .string("full")]) { _, new in new })
+        guard case .array(let jobs)? = second["jobs"], case .object(let row)? = jobs.first else {
+            Issue.record("missing exact batch match"); return
+        }
+        #expect(row["id"] == .string("internal-batch"))
+        #expect(row["matched_message_id"] == .string("accepted-B"))
+        #expect(row["thread_id"] == .string("thread-exact"))
+        #expect(row["turn_id"] == .string("turn-exact"))
+        #expect(row["motor_owner_id"] == nil)
+        #expect(row["message_ids"] == nil)
+        #expect(row["conversation_id"] == nil)
+        #expect(second["has_more"] == .bool(false))
+        #expect(second["next_offset"] == nil)
+        let end = try await lookup(root, input.merging(["offset": .int(2)]) { _, new in new })
+        #expect(end["returned_count"] == .int(0))
+        #expect(end["lookup_status"] == .string("matched"))
+        let missing = try await lookup(root, ["agent": .string("codex"), "message_id": .string("unobserved")])
+        #expect(missing["status"] == .string("ok"))
+        #expect(missing["lookup_status"] == .string("not_observed"))
+        #expect(missing["matched_count"] == .int(0))
+        #expect(try String(contentsOf: dir.appendingPathComponent("opaque-job-file.json"), encoding: .utf8) == batch)
+    }
+
+    @Test func acceptedMessageLookupUsesOnlyCanonicalIDsAndKeepsLegacyListing() async throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let codex = codexDir(root)
+        write(#"{"id":"accepted","phase":"watching_turn","entries":[{"payload":{"messageId":false}},{"messageId":"accepted"}]}"#,
+              to: codex, named: "accepted.json")
+        write(#"{"state":"claimed","payload":{"topic":"accepted"}}"#, to: claudeDir(root), named: "accepted.json")
+        write(#"{"messageId":"accepted","state":"claimed"}"#, to: ompDir(root), named: "other-filename.json")
+        let delivered = #"{"createdAt":"2026-08-05T18:59:00Z","messageIds":["delivered-exact"],"threadId":"recorded-thread","turnId":"recorded-turn","turnResult":{"status":"completed"},"bridge":{"status":"delivered"}}"#
+        try Data((delivered + "\n").utf8).write(to: codexDeliveryFile(root))
+        let result = try await lookup(root, ["message_id": .string("accepted")])
+        #expect(result["matched_count"] == .int(1))
+        guard case .array(let jobs)? = result["jobs"], case .object(let row)? = jobs.first else {
+            Issue.record("missing canonical OMP match"); return
+        }
+        #expect(row["agent"] == .string("omp"))
+        let receipt = try await lookup(root, ["agent": .string("codex"), "message_id": .string("delivered-exact")])
+        guard case .array(let deliveries)? = receipt["jobs"], case .object(let delivery)? = deliveries.first else {
+            Issue.record("missing canonical delivery match"); return
+        }
+        #expect(delivery["thread_id"] == .string("recorded-thread"))
+        #expect(delivery["turn_id"] == .string("recorded-turn"))
+        for absent in [JSONValue.null, .string(""), .string("  ")] {
+            let listing = try await lookup(root, ["message_id": absent])
+            #expect(listing["matched_count"] == .int(4))
+            #expect(listing["lookup_status"] == nil)
+        }
+        for invalid in [JSONValue.bool(false), .int(1), .array([]), .object([:]), .string(String(repeating: "x", count: 161))] {
+            let response = try await lookup(root, ["message_id": invalid])
+            #expect(response["reason"] == .string("delegation_message_id_invalid"))
+        }
+        let swarm = try await lookup(root, ["agent": .string("swarm"), "message_id": .bool(false)])
+        #expect(swarm["reason"] == .string("swarm_run_id_required"))
+        #expect(try String(contentsOf: codexDeliveryFile(root), encoding: .utf8) == delivered + "\n")
     }
 
     // MARK: - Fixtures (relative to `now` = 19:00:00Z)
@@ -148,7 +262,7 @@ struct DelegationStatusToolTests {
         {"id":"CODEX-UNDELIVERED","phase":"watching_turn","createdAt":"2026-08-05T18:45:00.000Z",
          "threadId":"t-2","turnId":"u-2","clientUserMessageId":"nativeagent-codex-xyz",
          "boundAt":"2026-08-05T18:45:00.200Z",
-         "entries":[{"id":"e2","key":null,"payload":{"messageId":"m2","topic":"gh command"}}],
+         "entries":[{"id":"e2","key":null,"payload":{"messageId":"m2","topic":"gh command","deskHandle":"desk_bound"}}],
          "completedExecution":{"threadId":"t-2","turnId":"u-2","attempts":[],
            "turnResult":{"status":"completed","completedAt":"2026-08-05T18:46:00.000Z",
                          "durationMs":57772,"message":"\(String(repeating: "A", count: 260))",
@@ -304,6 +418,51 @@ struct DelegationStatusToolTests {
         #expect(try! #require(job(rows, "SILENT-1")).deliveryLost == nil)
     }
 
+    @Test func blockedDeliveryPreservesExecutionAndOnlyExposesKnownReason() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for agent in ["claude", "omp"] {
+            for status in ["completed", "failed"] {
+                for reason in ["missing_origin_session", "PRIVATE arbitrary helper diagnostic"] {
+                    let id = "\(agent)-\(status)-\(reason == "missing_origin_session" ? "known" : "unknown")"
+                    var record: [String: JSONValue] = [
+                        "messageId": .string(id), "state": .string("settled"), "status": .string(status),
+                        "createdAt": .string("2026-08-05T18:00:00Z"), "completedAt": .string("2026-08-05T18:10:00Z"),
+                        "completionText": .string("retained terminal evidence"), "idleSeconds": .int(1),
+                    ]
+                    if agent == "claude" {
+                        record["runStatus"] = .string(status)
+                        record["bridgeStatus"] = .string("blocked")
+                        record["bridgeReason"] = .string(reason)
+                        record["deliveryLost"] = .bool(false)
+                    } else {
+                        record["bridge"] = .object(["status": .string("blocked"), "reason": .string(reason), "deliveryAttempted": .bool(false)])
+                    }
+                    let dir = agent == "claude" ? claudeDir(root) : ompDir(root)
+                    try JSONValue.object(record).serializedData(pretty: false).write(to: dir.appendingPathComponent("\(id).json"))
+                }
+            }
+        }
+        let rows = projector(root).allJobs(now: Self.now)
+        #expect(rows.count == 8)
+        for row in rows {
+            #expect(row.deliveryOutcome == "blocked")
+            #expect(row.deliveryLost != true)
+            #expect(!row.stalled)
+            #expect(row.stallBasis == .terminal)
+            #expect(row.status == (row.id.contains("-completed-") ? "completed" : "failed"))
+            #expect(row.completionTextHead == "retained terminal evidence")
+            for representation in [row.toJSON(), row.toCompactJSON()] {
+                guard case .object(let object) = representation else { Issue.record("missing projection"); continue }
+                #expect(object["delivery_outcome"] == .string("blocked"))
+                #expect(object["delivery_reason"] == (row.id.hasSuffix("-known") ? .string("missing_origin_session") : nil))
+                let rendered = String(decoding: try representation.serializedData(pretty: false), as: UTF8.self)
+                #expect(!rendered.contains("PRIVATE"))
+            }
+        }
+        #expect(projector(root).nextStallDeadline(after: Self.now) == nil)
+    }
+
     @Test func stallSecondsDrivesTheVerdictWhenNoDeadlineExists() {
         let root = makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -327,6 +486,69 @@ struct DelegationStatusToolTests {
         let live = try! #require(job(rows, "LIVE-1"))
         #expect(live.stalled == false)
         #expect(live.stallBasis == .stallSeconds)
+    }
+
+    @Test func nextStallDeadlineUsesTheExistingLivenessRulesWithoutPolling() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        writeRunningJob(claudeDir(root)) // recorded deadline: 19:50:00.900Z
+        write("""
+        {"messageId":"OMP-DEADLINE","state":"running","status":"running",
+         "createdAt":"2026-08-05T18:50:00.000Z","updatedAt":"2026-08-05T18:59:00.000Z",
+         "idleSeconds":120,"payload":{"topic":"reviewer-step"}}
+        """, to: ompDir(root), named: "OMP-DEADLINE.json")
+        writeCodexInFlightJob(codexDir(root)) // no computable stall rule
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let first = try #require(projector(root).nextStallDeadline(after: Self.now))
+        #expect(formatter.string(from: first) == "2026-08-05T19:01:00.000Z")
+
+        // Once OMP's crossing is in the past, the next exact crossing is the
+        // Claude record's own deadline. No synthetic cadence is introduced.
+        let afterOMP = Self.now.addingTimeInterval(121)
+        let second = try #require(projector(root).nextStallDeadline(after: afterOMP))
+        #expect(formatter.string(from: second) == "2026-08-05T19:50:00.900Z")
+    }
+
+    @Test func persistedOMPOutputKeepsMovingTheExactStallCrossingUntilOutputStops() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dir = ompDir(root)
+        let file = dir.appendingPathComponent("OMP-LIVE.json")
+
+        write("""
+        {"messageId":"OMP-LIVE","state":"running","status":"running",
+         "createdAt":"2026-08-05T18:50:00.000Z","startedAt":"2026-08-05T18:50:00.000Z",
+         "updatedAt":"2026-08-05T18:50:00.000Z","lastActivityAt":"2026-08-05T18:59:50.000Z",
+         "idleSeconds":30,"payload":{"topic":"builder-step"}}
+        """, to: dir, named: file.lastPathComponent)
+
+        let first = try #require(job(projector(root).recentJobs(now: Self.now), "OMP-LIVE"))
+        #expect(first.stalled == false)
+        #expect(first.lastLiveness == "2026-08-05T18:59:50.000Z")
+
+        // Another stdout/stderr observation lands before the prior 30-second
+        // crossing. The persisted timestamp, not process-local knowledge,
+        // moves the projector's exact deadline while the job remains running.
+        write("""
+        {"messageId":"OMP-LIVE","state":"running","status":"running",
+         "createdAt":"2026-08-05T18:50:00.000Z","startedAt":"2026-08-05T18:50:00.000Z",
+         "updatedAt":"2026-08-05T18:50:00.000Z","lastActivityAt":"2026-08-05T19:00:15.000Z",
+         "idleSeconds":30,"payload":{"topic":"builder-step"}}
+        """, to: dir, named: file.lastPathComponent)
+        let whileActive = Self.now.addingTimeInterval(25)
+        let active = try #require(job(projector(root).recentJobs(now: whileActive), "OMP-LIVE"))
+        #expect(active.stalled == false)
+        #expect(projector(root).nextStallDeadline(after: whileActive)
+            == Self.now.addingTimeInterval(45))
+
+        // Once output truly stops, the same recorded threshold crosses. This
+        // keeps the true-stall verdict; only the false active-run verdict moves.
+        let afterSilence = Self.now.addingTimeInterval(45)
+        let stalled = try #require(job(projector(root).recentJobs(now: afterSilence), "OMP-LIVE"))
+        #expect(stalled.stalled == true)
+        #expect(stalled.stallBasis == .stallSeconds)
     }
 
     @Test func legacyRecordEmitsWhatExistsAndFabricatesNothing() {
@@ -355,6 +577,38 @@ struct DelegationStatusToolTests {
         #expect(obj["completed_at"] == nil)
         #expect(obj["delivery_lost"] == nil)
         #expect(obj["stall_basis"] == .string("none"))
+    }
+
+    @Test func producerIdentityProjectsAcrossAllBridgeRecordShapes() {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let revision = "1234567890abcdef1234567890abcdef12345678"
+        write("""
+        {"messageId":"CLAUDE-STAMPED","createdAt":"2026-08-05T18:59:00.000Z","state":"claimed",
+         "payload":{"producerSchemaVersion":1,"producerSourceRevision":"\(revision)"}}
+        """, to: claudeDir(root), named: "CLAUDE-STAMPED.json")
+        write("""
+        {"id":"CODEX-STAMPED","phase":"watching_turn","createdAt":"2026-08-05T18:58:00.000Z",
+         "entries":[{"payload":{"messageId":"m1","producerSchemaVersion":1,
+         "producerSourceRevision":"\(revision)"}}]}
+        """, to: codexDir(root), named: "CODEX-STAMPED.json")
+        write("""
+        {"messageId":"OMP-STAMPED","createdAt":"2026-08-05T18:57:00.000Z","state":"claimed",
+         "payload":{"producerSchemaVersion":1,"producerSourceRevision":"\(revision)"}}
+        """, to: ompDir(root), named: "OMP-STAMPED.json")
+
+        let rows = projector(root).recentJobs(now: Self.now)
+        for id in ["CLAUDE-STAMPED", "CODEX-STAMPED", "OMP-STAMPED"] {
+            let projected = try! #require(job(rows, id))
+            #expect(projected.producerSchemaVersion == 1)
+            #expect(projected.producerSourceRevision == revision)
+            guard case .object(let json) = projected.toJSON() else {
+                Issue.record("not an object: \(id)")
+                continue
+            }
+            #expect(json["producer_schema_version"] == .int(1))
+            #expect(json["producer_source_revision"] == .string(revision))
+        }
     }
 
     @Test func projectsCodexRecordsAcrossItsDifferentShape() {
@@ -387,6 +641,8 @@ struct DelegationStatusToolTests {
 
         let lost = try! #require(job(rows, "CODEX-UNDELIVERED"))
         #expect(lost.runStatus == "completed")
+        #expect(lost.state == "delivery_unknown")
+        #expect(lost.deskHandle == "desk_bound")
         #expect(lost.status == nil)  // codex writes no delivery status onto the job
         #expect(lost.completedAt == "2026-08-05T18:46:00.000Z")
         #expect(lost.elapsedSeconds == 60)
@@ -398,8 +654,34 @@ struct DelegationStatusToolTests {
         // this tool exists to replace.
         #expect(lost.deliveryLost == nil)
         #expect(lost.deliveryOutcome == "unknown")
+        #expect(lost.motorOwnerID == "m2")
         // Completion text is capped at 200 chars.
         #expect(lost.completionTextHead?.count == 200)
+    }
+
+    @Test func deliveredCodexLedgerClosesTheDispatchIdentityAfterReplyJobRemoval() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let delivery = #"{"id":"delivery-1","createdAt":"2026-08-05T18:59:50.000Z","messageIds":["MESSAGE-1","MESSAGE-2"],"turnResult":{"status":"completed","completedAt":"2026-08-05T18:59:45.000Z","messagePreview":"Codex completed the requested architecture audit."},"bridge":{"status":"delivered","replyStatus":"ok","nativeAgentReplyPreview":"The result reached its bound NativeAgent session."}}"#
+        try Data((delivery + "\n").utf8).write(to: codexDeliveryFile(root))
+
+        // Successful delivery intentionally leaves reply-jobs empty. The
+        // sibling ledger must still carry the terminal state for each exact
+        // message identity returned by codex_message.
+        _ = codexDir(root)
+        let rows = projector(root).allJobs(now: Self.now)
+        for id in ["MESSAGE-1", "MESSAGE-2"] {
+            let row = try #require(job(rows, id))
+            #expect(row.source == "codex")
+            #expect(row.state == "settled")
+            #expect(row.status == "delivered")
+            #expect(row.runStatus == "completed")
+            #expect(row.completedAt == "2026-08-05T18:59:45.000Z")
+            #expect(row.deliveryOutcome == "delivered")
+            #expect(row.motorOwnerID == id)
+            #expect(row.stallBasis == .terminal)
+            #expect(row.completionTextHead == "The result reached its bound NativeAgent session.")
+        }
     }
 
     @Test func projectsOMPRecordAndNestedBridgeDelivery() throws {
@@ -485,6 +767,88 @@ struct DelegationStatusToolTests {
 
     // MARK: - Dispatcher surface
 
+    @Test func availabilityDistinguishesAbsentEmptyAndUnreadableWithoutInventingNoWork() async throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dispatcher = SwiftToolDispatcher(dataRoot: root.appendingPathComponent("data"), agentBridgeConfigRoot: root)
+        let absent = try await dispatcher.dispatch(tool: "delegation_status", input: [:], surface: "chat")
+        guard case .object(let absentObject) = absent,
+              case .array(let absentSources)? = absentObject["source_availability"] else {
+            Issue.record("missing source availability"); return
+        }
+        #expect(absentObject["status"] == .string("no_evidence"))
+        #expect(absentObject["count"] == .int(0))
+        #expect(absentSources.count == 5)
+        #expect(absentSources.allSatisfy { source in
+            guard case .object(let object) = source else { return false }
+            return object["status"] == .string("absent")
+        })
+        _ = claudeDir(root)
+        let empty = try await dispatcher.dispatch(tool: "delegation_status", input: ["agent": .string("claude")], surface: "chat")
+        guard case .object(let emptyObject) = empty else { Issue.record("missing empty projection"); return }
+        #expect(emptyObject["status"] == .string("ok"))
+        #expect(emptyObject["count"] == .int(0))
+        let ompPath = root.appendingPathComponent("omp-bridge/wake-jobs")
+        try FileManager.default.createDirectory(at: ompPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("not a directory".utf8).write(to: ompPath)
+        let unavailable = try await dispatcher.dispatch(tool: "delegation_status", input: ["agent": .string("omp")], surface: "chat")
+        guard case .object(let unavailableObject) = unavailable else { Issue.record("missing unavailable projection"); return }
+        #expect(unavailableObject["status"] == .string("unavailable"))
+        #expect(unavailableObject["count"] == .int(0))
+        let stillEmpty = try await dispatcher.dispatch(tool: "delegation_status", input: ["agent": .string("claude")], surface: "chat")
+        #expect(stillEmpty == empty, "unrelated unavailable bridge must not contaminate selected source")
+    }
+
+    @Test func partialAvailabilityRetainsReadableJobsAndCountsSkippedEvidence() async throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = claudeDir(root)
+        writeRunningJob(directory)
+        write("{invalid", to: directory, named: "PRIVATE-BROKEN.json")
+        write("[]", to: directory, named: "PRIVATE-ARRAY.json")
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("PRIVATE-DIRECTORY.json"), withIntermediateDirectories: true)
+        let ledger = codexDeliveryFile(root)
+        let ledgerText = """
+        {"messageIds":["DELIVERED-1"],"createdAt":"2026-08-05T18:30:00Z","turnResult":{"status":"completed"},"bridge":{"status":"delivered"}}
+        {broken
+        []
+        {"unprojectable":"no originating identity"}
+
+        """
+        try Data(ledgerText.utf8).write(to: ledger)
+        let dispatcher = SwiftToolDispatcher(dataRoot: root.appendingPathComponent("data"), agentBridgeConfigRoot: root)
+        let result = try await dispatcher.dispatch(tool: "delegation_status", input: [:], surface: "chat")
+        guard case .object(let object) = result,
+              case .array(let sources)? = object["source_availability"] else { Issue.record("missing availability"); return }
+        #expect(object["status"] == .string("partial"))
+        #expect(object["count"] == .int(2))
+        let sourceObjects = sources.compactMap { value -> [String: JSONValue]? in
+            if case .object(let object) = value { return object }; return nil
+        }
+        let claude = try #require(sourceObjects.first { $0["source"] == .string("claude_jobs") })
+        #expect(claude["status"] == .string("partial"))
+        #expect(claude["readable_records"] == .int(1))
+        #expect(claude["malformed_records"] == .int(2))
+        #expect(claude["unreadable_files"] == .int(1))
+        let deliveries = try #require(sourceObjects.first { $0["source"] == .string("codex_deliveries") })
+        #expect(deliveries["status"] == .string("partial"))
+        #expect(deliveries["readable_records"] == .int(1))
+        #expect(deliveries["malformed_records"] == .int(3))
+        let retainedIDs = Set(projector(root).allJobs(now: Self.now).map(\.id))
+        #expect(retainedIDs == Set(["RUNNING-1", "DELIVERED-1"]))
+        let filtered = try await dispatcher.dispatch(tool: "delegation_status", input: ["agent": .string("codex")], surface: "chat")
+        guard case .object(let filteredObject) = filtered,
+              case .array(let filteredSources)? = filteredObject["source_availability"] else { Issue.record("missing filtered sources"); return }
+        #expect(filteredObject["status"] == .string("partial"))
+        #expect(filteredObject["count"] == .int(1))
+        #expect(filteredSources.count == 3)
+        let metadata = String(decoding: try JSONValue.array(sources).serializedData(pretty: false), as: UTF8.self)
+        #expect(!metadata.contains("PRIVATE"))
+        #expect(!metadata.contains(root.path))
+        #expect(try String(contentsOf: ledger, encoding: .utf8) == ledgerText)
+        #expect(try String(contentsOf: directory.appendingPathComponent("PRIVATE-BROKEN.json"), encoding: .utf8) == "{invalid")
+    }
+
     @Test func dispatcherReturnsProjectionWithStorePathsAndCounts() async throws {
         let root = makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -514,6 +878,11 @@ struct DelegationStatusToolTests {
         // proven lost. The two counts must stay separate.
         #expect(obj["delivery_lost_count"] == .int(0))
         #expect(obj["delivery_unknown_count"] == .int(1))
+        #expect(obj["projection_schema_version"] == .int(2))
+        #expect(obj["current_build_count"] == .int(0))
+        #expect(obj["current_build_delivery_unknown_count"] == .int(0))
+        #expect(obj["legacy_or_other_build_count"] == .int(4))
+        #expect(obj["legacy_or_other_build_delivery_unknown_count"] == .int(1))
         guard case .object(let stores)? = obj["stores"] else { Issue.record("no stores"); return }
         // Model-visible store labels are REDACTED (gpt-5.5 BLOCKING: absolute
         // paths leak the account name on public installs): home-relative for
@@ -561,6 +930,62 @@ struct DelegationStatusToolTests {
         #expect(try await ids(["limit": .string("2")]).count == 2)
     }
 
+    @Test func dispatcherFiltersBeforeCompactPagination() async throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        writeCodexInFlightJob(codexDir(root))
+        for index in 0..<15 {
+            write("""
+            {"messageId":"OMP-NEW-\(index)","state":"settled","status":"completed",
+             "createdAt":"2026-08-06T18:00:00.000Z","completedAt":"2026-08-06T18:30:00.000Z",
+             "payload":{"topic":"newer-omp-work"}}
+            """, to: ompDir(root), named: "OMP-NEW-\(index).json")
+        }
+
+        let dataRoot = root.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.createDirectory(at: dataRoot, withIntermediateDirectories: true)
+        let dispatcher = SwiftToolDispatcher(dataRoot: dataRoot, agentBridgeConfigRoot: root)
+        let filtered = try await dispatcher.dispatch(
+            tool: "delegation_status",
+            input: ["agent": .string("codex"), "limit": .int(20)],
+            surface: "chat")
+        guard case .object(let filteredObj) = filtered,
+              case .array(let filteredJobs)? = filteredObj["jobs"],
+              case .object(let codex)? = filteredJobs.first else {
+            Issue.record("expected filtered codex page"); return
+        }
+        #expect(filteredObj["matched_count"] == .int(1))
+        #expect(filteredObj["returned_count"] == .int(1))
+        #expect(codex["id"] == .string("CODEX-1"))
+        #expect(codex["created_at"] == nil)
+        #expect(filteredObj["detail"] == .string("compact"))
+
+        let firstPage = try await dispatcher.dispatch(
+            tool: "delegation_status",
+            input: ["limit": .int(20)], surface: "chat")
+        guard case .object(let firstObj) = firstPage else {
+            Issue.record("expected first page"); return
+        }
+        #expect(firstObj["returned_count"] == .int(12))
+        #expect(firstObj["matched_count"] == .int(16))
+        #expect(firstObj["has_more"] == .bool(true))
+        #expect(firstObj["next_offset"] == .int(12))
+
+        let secondPage = try await dispatcher.dispatch(
+            tool: "delegation_status",
+            input: ["limit": .int(20), "offset": .int(12), "detail": .string("full")],
+            surface: "chat")
+        guard case .object(let secondObj) = secondPage,
+              case .array(let secondJobs)? = secondObj["jobs"],
+              case .object(let fullRow)? = secondJobs.first else {
+            Issue.record("expected full second page"); return
+        }
+        #expect(secondObj["returned_count"] == .int(4))
+        #expect(secondObj["has_more"] == .bool(false))
+        #expect(secondObj["detail"] == .string("full"))
+        #expect(fullRow["created_at"] != nil)
+    }
+
     // MARK: - Wiring canon
 
     @Test func delegationStatusIsALazyLoadedBuiltIn() {
@@ -583,6 +1008,12 @@ struct DelegationStatusToolTests {
         }
         #expect(required == [])
         #expect(props["limit"] != nil)
+        #expect(props["offset"] != nil)
         #expect(props["agent"] != nil)
+        #expect(props["detail"] != nil)
+        guard case .object(let messageID)? = props["message_id"] else {
+            Issue.record("missing exact accepted-message selector"); return
+        }
+        #expect(messageID["type"] == .array([.string("string"), .string("null")]))
     }
 }

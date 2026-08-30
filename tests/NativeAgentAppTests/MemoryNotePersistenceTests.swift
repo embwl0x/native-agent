@@ -8,6 +8,52 @@ import TelegramBot
 
 @Suite("Memory note persistence", .serialized)
 struct MemoryNotePersistenceTests {
+    @Test func manualAddUsesOverrideOwnerForAnExistingFactWithoutEmbedding() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let targetRoot = root.appendingPathComponent("target")
+        let otherRoot = root.appendingPathComponent("other")
+        let target = try MemoryStorage(dataRoot: targetRoot)
+        let other = try MemoryStorage(dataRoot: otherRoot)
+        let text = "The orchard gate opens at dusk."
+        _ = try await target.insertMemory(StoredMemory(id: "target-fact", content: text))
+        _ = try await other.insertMemory(StoredMemory(id: "other-fact", content: text))
+        let client = NativeClient(baseURL: "", dataRootOverride: targetRoot)
+        let receipt = try await client.addMemory(text: text)
+        #expect(receipt.id == "target-fact")
+        #expect(receipt.text == text)
+        #expect(try await target.listMemories().count == 1)
+        let untouched = try #require(try await other.memory(id: "other-fact"))
+        #expect(untouched.metadata == nil)
+    }
+
+    @Test func manualAddWithInjectedOwnerSavesCanonicalFactAndCompletesProjection() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(dataRoot: root)
+        let recorder = ManualMemoryAddProjectionRecorder()
+        await storage.attachKnowledgeGraphHook { row, deleted in
+            if !deleted { await recorder.record(row.id) }
+        }
+        let memory = SwiftNativeMemoryV2(embedder: MockEmbeddingProvider(), storage: MemoryStorageBridge(storage: storage))
+        let client = NativeClient(baseURL: "", dataRootOverride: root)
+        let receipt = try await client.addMemory(
+            text: "The orchard fence is painted blue.", source: "mac.session-lineage",
+            metadata: .object(["kind": .string("user_selected_session_learning"), "message_id": .string("selected-message")]),
+            memory: memory
+        )
+        let row = try #require(try await storage.memory(id: receipt.id))
+        #expect(row.content == receipt.text)
+        #expect(row.source == "mac.session-lineage")
+        guard case .object(let metadata)? = row.metadata else {
+            Issue.record("missing canonical source metadata")
+            return
+        }
+        #expect(metadata["message_id"] == .string("selected-message"))
+        #expect(await recorder.ids == [receipt.id])
+        #expect(legacyNoteFiles(under: root).isEmpty)
+    }
+
     private func makeTempRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("memory-note-persistence-\(UUID().uuidString)", isDirectory: true)
@@ -208,4 +254,9 @@ struct MemoryNotePersistenceTests {
         #expect(try await relaunchedStore.memory(id: "private-note") == nil)
         #expect(legacyNoteFiles(under: root).count == 1)
     }
+}
+
+private actor ManualMemoryAddProjectionRecorder {
+    private(set) var ids: [String] = []
+    func record(_ id: String) { ids.append(id) }
 }

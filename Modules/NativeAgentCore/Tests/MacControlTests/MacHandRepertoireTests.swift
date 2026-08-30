@@ -42,6 +42,26 @@ extension Array {
 
 // MARK: - Pointer: move / hover / press / release
 
+@Test func heldKeySetIsSimultaneousDeduplicatedAndKeepsSequentialKeysSeparate() throws {
+    let held = try MacKeySyntax.parseHeldKeys("w d shift w ctrl+d")
+    #expect(held.keys == [13, 2])
+    #expect(held.modifiers == [.shift, .control])
+    let plan = try MacHandRepertoire.hold(modifiers: held.modifiers, keys: held.keys) {
+        [.wait(milliseconds: 200)]
+    }
+    let dwell = try #require(plan.firstIndex { if case .wait = $0 { return true }; return false })
+    #expect(keys(Array(plan[..<dwell])).allSatisfy { $0.down })
+    #expect(keys(Array(plan[(dwell + 1)...])).allSatisfy { !$0.down })
+    #expect(MacHandRepertoire.isBalanced(plan))
+    let sequence = try MacKeySyntax.parseChords("w d").flatMap(MacHandRepertoire.chord)
+    #expect(keys(sequence).map(\.down) == [true, false, true, false])
+    #expect(throws: (any Error).self) { try MacKeySyntax.parseHeldKeys("w not-a-key") }
+    #expect(throws: (any Error).self) { try MacKeySyntax.parseHeldKeys("") }
+    #expect(throws: (any Error).self) {
+        try MacKeySyntax.parseHeldKeys(Array(repeating: "w", count: 65).joined(separator: " "))
+    }
+}
+
 @Test func moveEmitsExactlyOneMoveAtThePoint() {
     let plan = MacHandRepertoire.move(to: CGPoint(x: 120, y: 340))
     #expect(plan == [.mouse(MacMouseEvent(phase: .move, button: .left, x: 120, y: 340, clickCount: 1))])
@@ -256,6 +276,24 @@ extension Array {
     #expect(MacHandRepertoire.isBalanced(plan))
 }
 
+@Test func pacedDragDistributesExactTravelAcrossMovesWithoutEndpointDwell() throws {
+    let plan = try MacHandRepertoire.drag(button: .right, from: .zero,
+        to: CGPoint(x: 100, y: 50), steps: 18, travelMs: 301)
+    let waits = plan.compactMap { step -> Int? in
+        if case .wait(let milliseconds) = step { return milliseconds }; return nil
+    }
+    #expect(waits.count == 18)
+    #expect(waits.reduce(0, +) == 301)
+    #expect(waits.allSatisfy { $0 == 16 || $0 == 17 })
+    #expect(mice(plan).count == 20)
+    #expect(mice(plan).allSatisfy { $0.button == .right })
+    #expect(plan.last?.mouseEvent?.phase == .up)
+    #expect(plan.dropLast().last?.mouseEvent?.phase == .drag)
+    #expect(MacHandRepertoire.isBalanced(plan))
+    let legacy = try MacHandRepertoire.drag(from: .zero, to: CGPoint(x: 1, y: 1), steps: 4)
+    #expect(legacy.count == mice(legacy).count)
+}
+
 @Test func dragStepsAreClampedSoOneGestureCannotFloodTheHost() throws {
     let tiny = try MacHandRepertoire.drag(from: .zero, to: CGPoint(x: 1, y: 1), steps: 0)
     #expect(mice(tiny).count == MacHandRepertoire.minimumDragSteps + 2)
@@ -390,7 +428,7 @@ extension Array {
     let keyEvents = keys(plan)
     #expect(keyEvents.count == 2)
     #expect(keyEvents[safe: 0] == MacKeyEvent(keyCode: MacHandRepertoire.ModifierKeyCode.option, down: true, modifiers: .option))
-    #expect(keyEvents[safe: 1] == MacKeyEvent(keyCode: MacHandRepertoire.ModifierKeyCode.option, down: false, modifiers: .option))
+    #expect(keyEvents[safe: 1] == MacKeyEvent(keyCode: MacHandRepertoire.ModifierKeyCode.option, down: false))
     // Ordering: the modifier is down BEFORE the press and up AFTER the release.
     #expect(plan.first?.keyEvent?.down == true)
     #expect(plan.last?.keyEvent?.down == false)
@@ -408,6 +446,7 @@ extension Array {
     let held = MacHandRepertoire.modifierKeyCodes([.command, .shift, .control])
     #expect(downs.prefix(held.count) == ArraySlice(held))
     #expect(ups.suffix(held.count) == ArraySlice(held.reversed()))
+    #expect(keys(plan).suffix(held.count).map(\.modifiers) == [[.command, .control], [.command], []])
     #expect(MacHandRepertoire.residualHeldKeys(in: plan).isEmpty)
 }
 
@@ -456,16 +495,30 @@ extension Array {
     #expect(inner.allSatisfy { $0.modifiers.contains(.shift) && $0.modifiers.contains(.option) })
 }
 
-@Test func holdLeavesMouseAndScrollStepsUntouchedButPhysicallyHeld() throws {
-    // Mouse events at this seam carry no modifier field — which is exactly why
-    // the physical modifier key is held around them.
+@Test func holdCarriesModifiersOnMouseAndScrollWithoutChangingGeometry() throws {
     let plan = try MacHandRepertoire.hold(modifiers: .command) {
         try MacHandRepertoire.click(button: .left, at: CGPoint(x: 7, y: 7))
             + MacHandRepertoire.scroll(dx: 0, dy: 3)
     }
-    #expect(mice(plan) == mice(try MacHandRepertoire.click(button: .left, at: CGPoint(x: 7, y: 7))))
-    #expect(scrolls(plan) == [MacScrollEvent(deltaX: 0, deltaY: 3, unit: .line)])
+    #expect(mice(plan).map(\.phase) == [.move, .down, .up])
+    #expect(mice(plan).allSatisfy { $0.x == 7 && $0.y == 7 && $0.modifiers == .command })
+    #expect(scrolls(plan) == [MacScrollEvent(deltaX: 0, deltaY: 3, unit: .line, modifiers: .command)])
+    #expect(keys(plan).last?.modifiers.isEmpty == true)
     #expect(MacHandRepertoire.isBalanced(plan))
+}
+
+@Test func holdUnionsExistingPointerFlagsAndReleasesNestedModifiers() throws {
+    let plan = try MacHandRepertoire.hold(modifiers: .control) {
+        try MacHandRepertoire.hold(modifiers: .shift) {
+            [.mouse(MacMouseEvent(phase: .drag, button: .right, x: 8, y: 9,
+                                  clickCount: 2, modifiers: .option)),
+             .scroll(MacScrollEvent(deltaX: 2, deltaY: 3, unit: .pixel, modifiers: .option))]
+        }
+    }
+    #expect(mice(plan).first?.modifiers == [.control, .shift, .option])
+    #expect(mice(plan).first?.button == .right && mice(plan).first?.clickCount == 2)
+    #expect(scrolls(plan).first?.modifiers == [.control, .shift, .option])
+    #expect(keys(plan).filter { !$0.down }.map(\.modifiers) == [[.control], []])
 }
 
 @Test func nestedHoldsUnwindInOrder() throws {

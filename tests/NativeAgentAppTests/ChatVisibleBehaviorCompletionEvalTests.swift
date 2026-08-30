@@ -75,14 +75,42 @@ struct ChatVisibleBehaviorCompletionEvalTests {
         // Capture the target before a switch, as a tap can race a sidebar
         // selection on the same run loop.
         let tappedSessionId = model.activeChatSessionId
-        model.injectChatDraft("Run the audit", sessionId: tappedSessionId)
+        model.injectChatDraft("Draft a reply in my voice", sessionId: tappedSessionId)
         model.activeChatSessionId = second
 
         #expect(model.chatDraft(for: second).isEmpty)
-        #expect(model.chatDraft(for: first) == "Run the audit")
+        #expect(model.chatDraft(for: first) == "Draft a reply in my voice")
 
         model.activeChatSessionId = first
-        #expect(model.chatDraft(for: model.activeChatSessionId) == "Run the audit")
+        #expect(model.chatDraft(for: model.activeChatSessionId) == "Draft a reply in my voice")
+    }
+
+    @Test("chat empty-state chips teach real capabilities and the sidebar distinguishes blank from searched empty")
+    func emptyStateAndSidebarEmptyCopyStayHonest() {
+        #expect(
+            ChatEmptyStatePresentation.suggestions
+                == [
+                    "What's on my calendar today?",
+                    "Summarize a file on my Mac",
+                    "Remember something about me",
+                    "Add a task to my Desk",
+                ]
+        )
+        // Each chip must read as something a first-timer would type, not as an
+        // internal capability name.
+        for suggestion in ChatEmptyStatePresentation.suggestions {
+            for jargon in ["tool", "MCP", "dispatcher", "session", "agent", "prompt", "context"] {
+                #expect(
+                    !suggestion.localizedCaseInsensitiveContains(jargon),
+                    "Suggestion chip \"\(suggestion)\" leaks developer vocabulary: \(jargon)"
+                )
+            }
+        }
+        #expect(ChatSessionListEmptyStatePresentation.message(totalSessionCount: 0, searchQuery: "") == "No conversations yet")
+        #expect(ChatSessionListEmptyStatePresentation.message(totalSessionCount: 0, searchQuery: "audit") == "No matching sessions")
+        #expect(ChatSessionListEmptyStatePresentation.message(totalSessionCount: 0, searchQuery: "   ") == "No conversations yet")
+        #expect(ChatSessionListEmptyStatePresentation.message(totalSessionCount: 3, searchQuery: "") == "No matching sessions")
+        #expect(ChatSessionListEmptyStatePresentation.message(totalSessionCount: 3, searchQuery: "audit") == "No matching sessions")
     }
 
     @MainActor

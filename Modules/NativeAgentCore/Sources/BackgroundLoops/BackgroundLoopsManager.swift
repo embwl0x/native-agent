@@ -62,6 +62,17 @@ public struct LoopStatus: Sendable, Equatable {
     public let executionTimeout: TimeInterval
     /// nil for loops that are not event-driven at all.
     public let eventListener: LoopEventListenerHealth?
+    /// Outcome text of the most recent tick ("completed", "skipped: …",
+    /// "failed"). C8 surfaces it so a dormancy verdict can name the reason the
+    /// lane is doing nothing instead of just reporting that it is.
+    public let lastResult: String?
+    /// When this loop last COMPLETED real work. Durable across relaunch; nil
+    /// means it has never completed a tick. Distinct from `lastRun`, which
+    /// advances on failures and skips too (C8).
+    public let lastSuccessfulWorkAt: Date?
+    /// When this loop was first registered on this machine (durable). Dormancy
+    /// is measured from max(firstSeen, lastSuccessfulWork).
+    public let firstSeenAt: Date?
 
     public init(
         name: String,
@@ -73,7 +84,10 @@ public struct LoopStatus: Sendable, Equatable {
         executing: Bool = false,
         executionStartedAt: Date? = nil,
         executionTimeout: TimeInterval = 300,
-        eventListener: LoopEventListenerHealth? = nil
+        eventListener: LoopEventListenerHealth? = nil,
+        lastResult: String? = nil,
+        lastSuccessfulWorkAt: Date? = nil,
+        firstSeenAt: Date? = nil
     ) {
         self.name = name
         self.lastRun = lastRun
@@ -85,6 +99,9 @@ public struct LoopStatus: Sendable, Equatable {
         self.executionStartedAt = executionStartedAt
         self.executionTimeout = executionTimeout
         self.eventListener = eventListener
+        self.lastResult = lastResult
+        self.lastSuccessfulWorkAt = lastSuccessfulWorkAt
+        self.firstSeenAt = firstSeenAt
     }
 }
 
@@ -380,6 +397,15 @@ private struct ManagedLoopRunner: LoopRunner {
 
         switch result {
         case .finished(let outcome):
+            // C6: the tick body has returned, so whatever it wrote is on disk.
+            // Stamp the watched paths' generation NOW — every watcher event
+            // that still observes this generation is this loop's own echo.
+            // A health-neutral skip never ran the body, so it must not stamp:
+            // doing so would swallow a foreign write that arrived while the
+            // loop was coalescing or backing off.
+            if !outcome.isHealthNeutralSkip {
+                PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: loopId)
+            }
             await gate.finish(at: clock(), token: token)
             await onFinished()
             return outcome
@@ -460,9 +486,9 @@ public actor BackgroundLoopsManager {
     /// surfaces the problem in `status()` instead of a respawn loop hiding it.
     /// `internal` so a test can compress the schedule; production never sets it.
     internal var eventListenerRestartBackoff: [TimeInterval] = [1, 5, 30]
-    /// Deterministic test seam for the due-read → gate-admission race. nil in
+    /// Deterministic test seam for the automatic wake → gate-admission race. nil in
     /// production; it carries no runtime policy or state.
-    internal var dueWakePreAdmissionHook: (@Sendable () async -> Void)?
+    internal var automaticWakePreAdmissionHook: (@Sendable () async -> Void)?
 
     public init(
         scheduler: SwiftNativeLoopScheduler = SwiftNativeLoopScheduler(),
@@ -479,6 +505,12 @@ public actor BackgroundLoopsManager {
         _ push: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
     ) async {
         await scheduler.setFailureTransitionPush(push)
+    }
+
+    public func setFailureRecoveryPush(
+        _ push: (@Sendable (_ loopId: String, _ healthyAt: Date) async -> Bool)?
+    ) async {
+        await scheduler.setFailureRecoveryPush(push)
     }
 
     /// Injects the app-assembled manifest and starts its periodic tasks. Once
@@ -586,7 +618,10 @@ public actor BackgroundLoopsManager {
                 // to be invisible.
                 eventListener: physiologyRunners[state.loopId] == nil
                     ? nil
-                    : (physiologyListenerHealth[state.loopId] ?? LoopEventListenerHealth())
+                    : (physiologyListenerHealth[state.loopId] ?? LoopEventListenerHealth()),
+                lastResult: state.lastResult,
+                lastSuccessfulWorkAt: state.lastCompletedAt,
+                firstSeenAt: state.firstSeenAt
             ))
         }
         return result
@@ -623,13 +658,17 @@ public actor BackgroundLoopsManager {
 
     private func executeAndRecord(
         loopId: String,
-        runner: any LoopRunner
+        runner: any LoopRunner,
+        automaticLifecycle: UInt64? = nil
     ) async -> LoopTickOutcome {
         do {
             let outcome = try await tickWithTimeoutOutcome(
                 runner,
                 timeout: runner.tickTimeoutOverride ?? 300
             )
+            guard automaticLifecycleIsCurrent(automaticLifecycle) else {
+                return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+            }
             switch outcome {
             case .completed(let result):
                 await scheduler.recordResult(loopId: loopId, result: result ?? "completed")
@@ -640,16 +679,29 @@ public actor BackgroundLoopsManager {
                 // go through it — same accounting as the periodic path in
                 // SwiftNativeLoopScheduler.record.
                 if !outcome.isHealthNeutralSkip {
-                    await scheduler.recordResult(loopId: loopId, result: "skipped: \(reason)")
+                    // C8: a skip is a TICK, not WORK. Recording it as a
+                    // completion is what let an unconfigured lane read as
+                    // productive forever.
+                    await scheduler.recordResult(
+                        loopId: loopId,
+                        result: "skipped: \(reason)",
+                        completedWork: false
+                    )
                 }
             case .failed(let error):
                 await scheduler.recordFailure(loopId: loopId, error: error)
             }
             return outcome
         } catch is CancellationError {
+            guard automaticLifecycleIsCurrent(automaticLifecycle) else {
+                return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+            }
             await reschedulePhysiologyDeadline(loopId: loopId)
             return .skipped(reason: "cancelled")
         } catch is TickTimeoutError {
+            guard automaticLifecycleIsCurrent(automaticLifecycle) else {
+                return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+            }
             let error = "timeout after \(formatTimeout(runner.tickTimeoutOverride ?? 300))"
             // A TIMED-OUT tick did not complete its body, so it must NOT book a
             // fresh durable last-run stamp — same accounting as the periodic
@@ -665,6 +717,9 @@ public actor BackgroundLoopsManager {
             await reschedulePhysiologyDeadline(loopId: loopId)
             return .failed(error: error)
         } catch {
+            guard automaticLifecycleIsCurrent(automaticLifecycle) else {
+                return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+            }
             let detail = String(describing: error)
             await scheduler.recordFailure(loopId: loopId, error: detail)
             await reschedulePhysiologyDeadline(loopId: loopId)
@@ -683,10 +738,10 @@ public actor BackgroundLoopsManager {
     /// from invoking the body.
     @discardableResult
     public func runTickIfDue(loopId: String) async -> LoopTickOutcome {
+        let lifecycle = lifecycleGeneration
         if starting { await waitForStartTransition() }
-        if !started { _ = await start() }
-        guard started else {
-            return .failed(error: "background loop manager unavailable")
+        guard automaticLifecycleIsCurrent(lifecycle) else {
+            return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
         }
         guard let registration = registrations[loopId] else {
             return .failed(error: "loop not registered: \(loopId)")
@@ -697,24 +752,53 @@ public actor BackgroundLoopsManager {
         guard await scheduler.isDue(loopId: loopId) == true else {
             return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
         }
-        await dueWakePreAdmissionHook?()
+        return await executeAutomaticTick(
+            loopId: loopId, registration: registration, lifecycle: lifecycle, requiresDue: true
+        )
+    }
+
+    /// Automatic wakes never start the manager. Validate their captured
+    /// lifecycle after suspension and again inside the execution gate; retained
+    /// registrations alone cannot authorize work after stop or stop/start.
+    private func executeAutomaticTick(
+        loopId: String,
+        registration: ManagedLoopRegistration,
+        lifecycle: UInt64,
+        requiresDue: Bool
+    ) async -> LoopTickOutcome {
+        guard automaticRegistrationIsCurrent(loopId: loopId, gate: registration.gate, lifecycle: lifecycle) else {
+            return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        }
+        await automaticWakePreAdmissionHook?()
+        guard automaticRegistrationIsCurrent(loopId: loopId, gate: registration.gate, lifecycle: lifecycle) else {
+            return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        }
         let dueRunner = DueAwareManagedLoopRunner(
             base: registration.runner,
             isDue: { [weak self, scheduler, gate = registration.gate] in
-                guard let self,
-                      await self.registrationGateIsCurrent(loopId: loopId, gate: gate)
-                else { return false }
-                return await scheduler.isDue(loopId: loopId) == true
+                guard let self else { return false }
+                if requiresDue, await scheduler.isDue(loopId: loopId) != true { return false }
+                return await self.automaticRegistrationIsCurrent(
+                    loopId: loopId, gate: gate, lifecycle: lifecycle
+                )
             }
         )
-        return await executeAndRecord(loopId: loopId, runner: dueRunner)
+        return await executeAndRecord(
+            loopId: loopId, runner: dueRunner, automaticLifecycle: lifecycle
+        )
     }
 
-    private func registrationGateIsCurrent(
+    private func automaticLifecycleIsCurrent(_ lifecycle: UInt64?) -> Bool {
+        guard let lifecycle else { return true } // Explicit manual execution.
+        return !Task.isCancelled && started && lifecycleGeneration == lifecycle
+    }
+
+    private func automaticRegistrationIsCurrent(
         loopId: String,
-        gate: LoopExecutionGate
+        gate: LoopExecutionGate,
+        lifecycle: UInt64
     ) -> Bool {
-        registrations[loopId]?.gate === gate
+        automaticLifecycleIsCurrent(lifecycle) && registrations[loopId]?.gate === gate
     }
 
     /// Replaces or removes exactly one registration. The old target is
@@ -852,7 +936,7 @@ public actor BackgroundLoopsManager {
     }
 
     private func physiologyEventArrived(loopId: String, generation: UUID) {
-        guard started,
+        guard !Task.isCancelled, started,
               physiologyGenerations[loopId] == generation,
               let runner = physiologyRunners[loopId]
         else { return }
@@ -879,12 +963,19 @@ public actor BackgroundLoopsManager {
     }
 
     private func firePhysiology(loopId: String, generation: UUID) async {
-        guard started, physiologyGenerations[loopId] == generation else { return }
+        let lifecycle = lifecycleGeneration
+        guard automaticLifecycleIsCurrent(lifecycle), physiologyGenerations[loopId] == generation else { return }
         physiologyDebounceTasks.removeValue(forKey: loopId)
-        _ = await runTickOnce(loopId: loopId)
+        guard await waitUntilPhysiologyEligible(loopId: loopId, generation: generation, lifecycle: lifecycle),
+              physiologyGenerations[loopId] == generation,
+              let registration = registrations[loopId] else { return }
+        _ = await executeAutomaticTick(
+            loopId: loopId, registration: registration, lifecycle: lifecycle, requiresDue: false
+        )
     }
 
     private func reschedulePhysiologyDeadline(loopId: String) async {
+        let lifecycle = lifecycleGeneration
         physiologyDeadlineTasks.removeValue(forKey: loopId)?.cancel()
         physiologyDeadlines.removeValue(forKey: loopId)
         guard started,
@@ -893,6 +984,8 @@ public actor BackgroundLoopsManager {
         else { return }
         let current = clock()
         guard let deadline = await runner.nextMeaningfulDeadline(after: current),
+              started, lifecycleGeneration == lifecycle,
+              physiologyGenerations[loopId] == generation,
               deadline.timeIntervalSince(current).isFinite,
               deadline > current
         else { return }
@@ -914,13 +1007,37 @@ public actor BackgroundLoopsManager {
         generation: UUID,
         deadline: Date
     ) async {
-        guard started,
+        let lifecycle = lifecycleGeneration
+        guard automaticLifecycleIsCurrent(lifecycle),
               physiologyGenerations[loopId] == generation,
               physiologyDeadlines[loopId] == deadline
         else { return }
         physiologyDeadlineTasks.removeValue(forKey: loopId)
         physiologyDeadlines.removeValue(forKey: loopId)
-        _ = await runTickOnce(loopId: loopId)
+        guard await waitUntilPhysiologyEligible(loopId: loopId, generation: generation, lifecycle: lifecycle),
+              physiologyGenerations[loopId] == generation,
+              let registration = registrations[loopId] else { return }
+        _ = await executeAutomaticTick(
+            loopId: loopId, registration: registration, lifecycle: lifecycle, requiresDue: false
+        )
+    }
+
+    private func waitUntilPhysiologyEligible(loopId: String, generation: UUID, lifecycle: UInt64) async -> Bool {
+        while automaticLifecycleIsCurrent(lifecycle), physiologyGenerations[loopId] == generation {
+            guard let eligibleAt = await scheduler.nextPhysiologyEligibleAt(
+                loopId: loopId,
+                at: clock()
+            ), automaticLifecycleIsCurrent(lifecycle),
+               physiologyGenerations[loopId] == generation else { return false }
+            let delay = max(0, eligibleAt.timeIntervalSince(clock()))
+            guard delay > 0 else { return true }
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return false
+            }
+        }
+        return false
     }
 
     private func cancelPhysiology(loopId: String) {
@@ -935,6 +1052,9 @@ public actor BackgroundLoopsManager {
         physiologyDeadlines.removeValue(forKey: loopId)
         physiologyGenerations.removeValue(forKey: loopId)
         physiologyRunners.removeValue(forKey: loopId)
+        // C6: suppression state belongs to a REGISTRATION. A replacement runner
+        // must not inherit the retired one's stamp.
+        PhysiologySelfWriteRegistry.shared.clear(loopId: loopId)
     }
 
     private func cancelAllPhysiologyTasks() {
@@ -986,10 +1106,10 @@ public actor BackgroundLoopsManager {
         await scheduler._testRunOneTick(loopId: loopId)
     }
 
-    internal func _testSetDueWakePreAdmissionHook(
+    internal func _testSetAutomaticWakePreAdmissionHook(
         _ hook: (@Sendable () async -> Void)?
     ) {
-        dueWakePreAdmissionHook = hook
+        automaticWakePreAdmissionHook = hook
     }
 
     internal func _testTaskHandle(loopId: String) async -> Task<Void, Never>? {

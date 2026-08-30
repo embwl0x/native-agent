@@ -593,6 +593,13 @@ private func writeSeed(
         return .object(object)
     }
 
+    func withNullAuthority(_ record: ApprovalRecord) -> JSONValue {
+        guard case .object(var object) = record.toJSON() else { return .null }
+        object["remoteResolvable"] = .null
+        object["localOnly"] = .null
+        return .object(object)
+    }
+
     let legacy = seedRecord(
         id: "legacy-terminal",
         status: "resolved",
@@ -603,6 +610,20 @@ private func writeSeed(
     try JSONValue.array([withoutAuthority(legacy)])
         .serializedData(pretty: true).write(to: path)
     #expect(try await inbox.get("legacy-terminal").localOnly == false)
+
+    let modernPending = seedRecord(
+        id: "modern-pending", createdAt: "2026-05-30T02:30:00+00:00"
+    )
+    try JSONValue.array([withNullAuthority(legacy), modernPending.toJSON()])
+        .serializedData(pretty: true).write(to: path)
+    #expect(try await inbox.list(filter: .pending).map(\.id) == ["modern-pending"])
+    let created = try await inbox.create(.object([
+        "title": .string("New approval after legacy history"),
+        "action": .string("memory.update"),
+        "payload": .object([:]),
+    ]))
+    #expect(created.localOnly)
+    #expect(try await inbox.get("legacy-terminal").status == "resolved")
 
     let pending = seedRecord(
         id: "legacy-pending", createdAt: "2026-05-30T03:00:00+00:00"

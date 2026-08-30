@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import NativeAgentSharedTestSupport
 @testable import NativeAgentShared
 
 #if canImport(CloudKit) && !os(Linux)

@@ -16,6 +16,42 @@ import SwarmRuns
 import MacIntegration
 
 extension SwiftToolDispatcher {
+
+    /// Stamp every delegated wake with the runtime contract that produced it.
+    /// Older job records deliberately remain unstamped: readers can then keep
+    /// historical uncertainty separate from evidence produced by this build.
+    private static func stampDelegationProducer(on payload: inout [String: JSONValue]) {
+        payload["producerSchemaVersion"] = .int(1)
+        guard let raw = Bundle.main.object(forInfoDictionaryKey: "NativeAgentSourceRevision") as? String else {
+            return
+        }
+        let revision = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard revision.count == 40, revision.allSatisfy({ $0.isHexDigit }) else { return }
+        payload["producerSourceRevision"] = .string(revision)
+    }
+
+    /// Optional exact Desk binding for delegated work. The visible alias is
+    /// accepted at the tool edge, but only the stable live handle crosses into
+    /// bridge job evidence. No fuzzy title/topic inference is allowed.
+    private func delegationDeskHandle(_ input: [String: JSONValue]) async throws -> String? {
+        guard let raw = input["desk_item"] else { return nil }
+        guard case .string(let value) = raw else {
+            throw AutonomyGateError.toolDenied(reason: "delegation: desk_item must be a string")
+        }
+        let reference = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !reference.isEmpty else {
+            throw AutonomyGateError.toolDenied(reason: "delegation: desk_item must be non-empty")
+        }
+        let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
+        guard let item = state.items.first(where: {
+            $0.handle == reference || $0.alias == reference
+        }) else {
+            throw AutonomyGateError.toolDenied(
+                reason: "delegation: desk_item '\(reference)' is not a live Desk item"
+            )
+        }
+        return item.handle
+    }
     /// Delegated bridge transcripts contain prompts and replies, so retain a
     /// bounded recent audit window rather than letting an unobserved side feed
     /// grow forever. Session pointers are not audits; a last-message sidecar
@@ -64,8 +100,15 @@ extension SwiftToolDispatcher {
         let topic: String?
     }
 
+    private enum BuilderConversationMode: String, Equatable {
+        case new
+        case resume
+    }
+
     private enum BuilderConversationReferenceError: Error {
         case malformed(expectedAgent: BuilderConversationAgent)
+        case invalidMode
+        case modeConflict(mode: BuilderConversationMode)
         case agentMismatch(expected: BuilderConversationAgent, actual: String)
         case topicMismatch(conversationId: String, topic: String)
 
@@ -76,6 +119,21 @@ extension SwiftToolDispatcher {
                     "status": .string("failed"),
                     "reason": .string("invalid_conversation_id"),
                     "fix": .string("Pass the exact \(expectedAgent.rawValue):… conversationId returned by the first builder message."),
+                ])
+            case .invalidMode:
+                return .object([
+                    "status": .string("failed"),
+                    "reason": .string("invalid_conversation_mode"),
+                    "fix": .string("Use conversation_mode='new' with no conversation_id, or conversation_mode='resume' with the exact returned conversationId."),
+                ])
+            case .modeConflict(let mode):
+                return .object([
+                    "status": .string("failed"),
+                    "reason": .string("conversation_mode_conflict"),
+                    "conversationMode": .string(mode.rawValue),
+                    "fix": .string(mode == .new
+                        ? "Remove conversation_id when starting new work."
+                        : "Pass the exact conversationId returned by the earlier builder message when resuming."),
                 ])
             case .agentMismatch(let expected, let actual):
                 return .object([
@@ -97,22 +155,65 @@ extension SwiftToolDispatcher {
         }
     }
 
+    /// The ONE answer to "did the caller actually reference a conversation?".
+    /// `builderConversationSelection` treats an empty `conversation_id` as
+    /// absent; the worktree allocator's `isFollowUp` has to agree or empty is
+    /// only half-absent — it would take the follow-up branch and reject a
+    /// caller-supplied working_directory as a `follow_up_directory_conflict`
+    /// on what is, by the same rule, brand new work.
+    static func builderConversationReferenceSupplied(in input: [String: JSONValue]) -> Bool {
+        guard case .string(let raw)? = input["conversation_id"] else {
+            // A non-string value is malformed, not absent —
+            // builderConversationSelection rejects it before this is read.
+            return input["conversation_id"] != nil
+        }
+        return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private static func builderConversationSelection(
         input: [String: JSONValue],
         agent: BuilderConversationAgent,
         topic: String?,
         messageId: String
     ) -> Result<BuilderConversationSelection, BuilderConversationReferenceError> {
+        let requestedMode: BuilderConversationMode?
+        if let rawMode = input["conversation_mode"] {
+            guard case .string(let raw) = rawMode,
+                  let mode = BuilderConversationMode(
+                    rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                  ) else {
+                return .failure(.invalidMode)
+            }
+            requestedMode = mode
+        } else {
+            requestedMode = nil
+        }
+
         let suppliedReference: String?
         if let rawReference = input["conversation_id"] {
             guard case .string(let raw) = rawReference else {
                 return .failure(.malformed(expectedAgent: agent))
             }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !value.isEmpty else { return .failure(.malformed(expectedAgent: agent)) }
-            suppliedReference = value
+            // 2026-08-28 (upgrade-sweep C9-1): an EMPTY conversation_id means
+            // "no conversation", which is exactly what omitting the key means —
+            // the tool description already says "omit it for new work". Many
+            // tool-calling models cannot emit an absent optional and send "".
+            // Rejecting that as `invalid_conversation_id` cost 75 of the 101
+            // live claude_message failures in traces/events.jsonl (turn_traces
+            // 2026-08-*, all with `"conversation_id": ""`). Empty is absent.
+            suppliedReference = value.isEmpty ? nil : value
         } else {
             suppliedReference = nil
+        }
+
+        if requestedMode == .new, suppliedReference != nil {
+            // Never discard a non-empty stale handle and silently start a
+            // different job. The caller must make the new-work intent exact.
+            return .failure(.modeConflict(mode: .new))
+        }
+        if requestedMode == .resume, suppliedReference == nil {
+            return .failure(.modeConflict(mode: .resume))
         }
 
         guard let suppliedReference else {
@@ -198,6 +299,24 @@ extension SwiftToolDispatcher {
         return string
     }
 
+    private struct BuilderReviewPairError: Error {
+        let value: JSONValue
+    }
+
+    private static func pairReviewerRequested(
+        in input: [String: JSONValue]
+    ) -> Result<Bool, BuilderReviewPairError> {
+        guard let value = input["pair_reviewer"] else { return .success(false) }
+        guard case .bool(let requested) = value else {
+            return .failure(BuilderReviewPairError(value: .object([
+                "status": .string("failed"),
+                "reason": .string("invalid_pair_reviewer"),
+                "fix": .string("pair_reviewer must be true or false."),
+            ])))
+        }
+        return .success(requested)
+    }
+
     // MARK: - time_now handler
 
     /// Return current date/time in multiple representations. Zero-input,
@@ -261,6 +380,12 @@ extension SwiftToolDispatcher {
                 "fix": .string("claude_message requires a non-empty 'text' parameter."),
             ])
         }
+        let deskHandle = try await delegationDeskHandle(input)
+        let pairReviewer: Bool
+        switch Self.pairReviewerRequested(in: input) {
+        case .success(let requested): pairReviewer = requested
+        case .failure(let error): return error.value
+        }
         let priority: String = {
             if case .string(let p)? = input["priority"] {
                 let lower = p.lowercased()
@@ -273,10 +398,10 @@ extension SwiftToolDispatcher {
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? nil : value
         }()
-        let workingDirectory: String?
+        let requestedWorkingDirectory: String?
         switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
         case .success(let path):
-            workingDirectory = path
+            requestedWorkingDirectory = path
         case .failure(let envelope):
             return envelope
         }
@@ -328,6 +453,22 @@ extension SwiftToolDispatcher {
         case .failure(let error): return error.envelope
         }
         let topic = conversation.topic
+        let worktreeResult = await BuilderWorktreeAllocator.shared.resolve(
+            agent: .claude,
+            conversationId: conversation.conversationId,
+            messageId: messageId,
+            isFollowUp: Self.builderConversationReferenceSupplied(in: input),
+            requestedDirectory: requestedWorkingDirectory,
+            defaultDirectory: nil,
+            configRoot: builderWorktreeConfigRoot
+        )
+        let workingDirectory: String?
+        switch worktreeResult {
+        case .unchanged(let path): workingDirectory = path
+        case .assigned(let assignment): workingDirectory = assignment.workingDirectory
+        case .failed(let reason, let detail):
+            return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
+        }
         let timestamp = ISO8601DateFormatter().string(from: Date())
         var entry: [String: JSONValue] = [
             "id": .string(messageId),
@@ -342,7 +483,13 @@ extension SwiftToolDispatcher {
         if let conversationId = conversation.conversationId {
             entry["conversationId"] = .string(conversationId)
         }
+        let requireExistingConversation = Self.builderConversationReferenceSupplied(in: input)
+        if requireExistingConversation { entry["requireExistingConversation"] = .bool(true) }
         if let workingDirectory { entry["workingDirectory"] = .string(workingDirectory) }
+        if let deskHandle { entry["deskHandle"] = .string(deskHandle) }
+        if pairReviewer { entry["pairReviewer"] = .bool(true) }
+        if !originSessionId.isEmpty { entry["sessionId"] = .string(originSessionId) }
+        if let timeoutSeconds { entry["timeoutSeconds"] = .int(Int64(timeoutSeconds)) }
         let inboxEntry = entry
 
         // 2026-07-21 audit: mirror the codex_message twin — flock'd
@@ -350,20 +497,29 @@ extension SwiftToolDispatcher {
         // and route the append through the shared line cap so the inbox
         // cannot grow unbounded.
         let persistence = SwiftNativePersistenceCore()
-        let appendStatus: String
+        let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
-            appendStatus = try await persistence.withFileLock(inboxURL) {
-                let existing = try await persistence.readJSONL(inboxURL).first { row in
-                    guard case .object(let object) = row else { return false }
-                    return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
-                }
+            appendResult = try await persistence.withFileLock(inboxURL) {
+                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence)
                 if case .object(let object)? = existing {
                     guard object["text"] == .string(text),
                           object["topic"] == inboxEntry["topic"],
-                          object["workingDirectory"] == inboxEntry["workingDirectory"] else {
-                        return "conflict"
+                          object["conversationId"] == inboxEntry["conversationId"],
+                          (object["requireExistingConversation"] == .bool(true)) == requireExistingConversation,
+                          object["workingDirectory"] == inboxEntry["workingDirectory"],
+                          object["deskHandle"] == inboxEntry["deskHandle"],
+                          object["pairReviewer"] == inboxEntry["pairReviewer"] else {
+                        return ("conflict", false, timestamp)
                     }
-                    return "duplicate"
+                    if let session = Self.stringField("sessionId", in: .object(object)), !session.isEmpty {
+                        guard object["sessionId"] == inboxEntry["sessionId"],
+                              object["priority"] == inboxEntry["priority"],
+                              object["timeoutSeconds"] == inboxEntry["timeoutSeconds"] else {
+                            return ("conflict", false, timestamp)
+                        }
+                    }
+                    return ("duplicate", Self.builderInboxAllowsExplicitWakeRetry(object),
+                            Self.stringField("createdAt", in: .object(object)) ?? timestamp)
                 }
                 try await appendJSONLCapped(
                     .object(inboxEntry),
@@ -373,7 +529,7 @@ extension SwiftToolDispatcher {
                     logLabel: "SwiftToolDispatcher.claudeMessage",
                     takeLock: false
                 )
-                return "appended"
+                return ("appended", false, timestamp)
             }
         } catch {
             return .object([
@@ -383,46 +539,112 @@ extension SwiftToolDispatcher {
             ])
         }
         let path = inboxURL.path
-        guard appendStatus != "conflict" else {
+        guard appendResult.status != "conflict" else {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("message_id_conflict"),
                 "messageId": .string(messageId),
             ])
         }
-        let deduplicated = appendStatus == "duplicate"
+        let deduplicated = appendResult.status == "duplicate"
         var response: [String: JSONValue] = [
             "status": .string("queued"),
             "messageId": .string(messageId),
             "deduplicated": .bool(deduplicated),
             "filePath": .string(path),
             "priority": .string(priority),
-            "queuedAt": .string(timestamp),
-            "note": .string("The durable inbox row is written and a real Claude session is waking. Her final reply returns as a separate bridge event. Use conversationId with claude_message for a contextual follow-up; omit it for new work."),
+            "queuedAt": .string(appendResult.queuedAt),
         ]
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
+        if let deskHandle { response["deskHandle"] = .string(deskHandle) }
+        if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
         if let conversationId = conversation.conversationId {
             response["conversationId"] = .string(conversationId)
             response["replyWith"] = .string("claude_message")
         }
-        if deduplicated {
-            // A duplicate message_id means this exact event already claimed its
-            // wake job on first delivery. Re-firing would double-wake Claude.
+        if deduplicated && !appendResult.retryWake {
             response["wakeup"] = .object(["status": .string("deduplicated")])
         } else {
+            // Only this explicit same-id call retries helper admission. The
+            // canonical helper still deduplicates execution and preserves
+            // unknown effects; an inbox append alone is not a wake claim.
+            if deduplicated { response["wakeupRetried"] = .bool(true) }
             response["wakeup"] = await postClaudeThreadWakeup(
                 messageId: messageId,
                 text: text,
                 priority: priority,
                 topic: topic,
-                queuedAt: timestamp,
+                requireExistingConversation: requireExistingConversation,
+                queuedAt: appendResult.queuedAt,
                 inboxPath: path,
                 originSessionId: originSessionId,
                 timeoutSeconds: timeoutSeconds,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                deskHandle: deskHandle,
+                pairReviewer: pairReviewer
             )
         }
+        response["note"] = .string(Self.claudeWakeupReceiptNote(response["wakeup"]))
         return .object(response)
+    }
+
+    static func claudeWakeupReceiptNote(_ wakeup: JSONValue?) -> String {
+        let state: String
+        switch stringField("status", in: wakeup ?? .null) {
+        case "sent", "started":
+            state = "The durable inbox row is written and Claude's wake was accepted. Her final reply returns as a separate bridge event; this receipt does not prove the work completed."
+        case "queued":
+            state = "The durable inbox row is written and Claude's wake is queued, not yet confirmed running."
+        case "completed", "replayed":
+            state = "The durable inbox row is written and the helper returned a result. Inspect the wakeup result and final reply before judging task completion."
+        case "deduplicated":
+            state = "This inbox message already exists; no new wake was launched by this call. Inspect delegation_status for its actual lifecycle."
+        default:
+            state = "The durable inbox row is written, but this call did not confirm a new Claude wake. Inspect wakeup and delegation_status; uncertain admission must be reconciled before resending."
+        }
+        return state + " For a contextual follow-up, use claude_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id."
+    }
+
+    private static func checkedBuilderInboxMessage(
+        _ messageId: String,
+        inboxURL: URL,
+        persistence: SwiftNativePersistenceCore
+    ) async throws -> JSONValue? {
+        let scan = try await persistence.readJSONLReporting(inboxURL)
+        guard scan.report.isClean,
+              scan.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else {
+            throw PersistenceCoreError.ioFailure("builder inbox is malformed; original bytes preserved")
+        }
+        let matching = scan.rows.filter { row in
+            guard case .object(let object) = row else { return false }
+            return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
+        }
+        guard matching.count <= 1 else {
+            throw PersistenceCoreError.ioFailure("builder inbox message identity is ambiguous; original bytes preserved")
+        }
+        if case .object(let row)? = matching.first,
+           let id = row["id"], let canonicalId = row["messageId"], id != canonicalId {
+            throw PersistenceCoreError.ioFailure("builder inbox message identity conflicts; original bytes preserved")
+        }
+        return matching.first
+    }
+
+    private static func builderInboxAllowsExplicitWakeRetry(
+        _ row: [String: JSONValue],
+        requiresSession: Bool = true
+    ) -> Bool {
+        guard row["read"] == .bool(false),
+              let createdAt = stringField("createdAt", in: .object(row)),
+              !createdAt.isEmpty else { return false }
+        if requiresSession {
+            guard let session = stringField("sessionId", in: .object(row)),
+                  !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        }
+        switch row["consumedAt"] {
+        case nil, .null: return true
+        case .string(let value): return value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        default: return false
+        }
     }
 
     // MARK: - claude_message wakeup spawn
@@ -437,11 +659,14 @@ extension SwiftToolDispatcher {
         text: String,
         priority: String,
         topic: String?,
+        requireExistingConversation: Bool,
         queuedAt: String,
         inboxPath: String,
         originSessionId: String,
         timeoutSeconds: Int? = nil,
-        workingDirectory: String? = nil
+        workingDirectory: String? = nil,
+        deskHandle: String? = nil,
+        pairReviewer: Bool = false
     ) async -> JSONValue {
         var payload: [String: JSONValue] = [
             "messageId": .string(messageId),
@@ -452,9 +677,13 @@ extension SwiftToolDispatcher {
             "source": .string("claude_message"),
         ]
         if let topic { payload["topic"] = .string(topic) }
+        if requireExistingConversation { payload["requireExistingConversation"] = .bool(true) }
         if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
         if let timeoutSeconds { payload["timeoutSeconds"] = .int(Int64(timeoutSeconds)) }
         if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
+        if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
+        if pairReviewer { payload["pairReviewer"] = .bool(true) }
+        Self.stampDelegationProducer(on: &payload)
 
         if let claudeMessageWakeupOverride {
             return await claudeMessageWakeupOverride(payload)
@@ -538,8 +767,7 @@ extension SwiftToolDispatcher {
             inputData: inputData,
             cwd: cwd,
             environment: childEnvironment,
-            timeoutSeconds: claudeWakeupHelperTimeoutSeconds(),
-            successfulNoJSONStatus: "failed"
+            timeoutSeconds: claudeWakeupHelperTimeoutSeconds()
         )
     }
 
@@ -564,6 +792,7 @@ extension SwiftToolDispatcher {
                 "fix": .string("omp_message requires a non-empty 'text' parameter."),
             ])
         }
+        let deskHandle = try await delegationDeskHandle(input)
         let priority: String = {
             guard case .string(let raw)? = input["priority"] else { return "info" }
             let value = raw.lowercased()
@@ -583,9 +812,9 @@ extension SwiftToolDispatcher {
             }
             return 900
         }()
-        let workingDirectory: String?
+        let requestedWorkingDirectory: String?
         switch await resolveAgentBridgeWorkingDirectory(input: input, surface: surface) {
-        case .success(let path): workingDirectory = path
+        case .success(let path): requestedWorkingDirectory = path
         case .failure(let envelope): return envelope
         }
 
@@ -626,6 +855,22 @@ extension SwiftToolDispatcher {
         case .failure(let error): return error.envelope
         }
         let topic = conversation.topic
+        let worktreeResult = await BuilderWorktreeAllocator.shared.resolve(
+            agent: .omp,
+            conversationId: conversation.conversationId,
+            messageId: messageId,
+            isFollowUp: Self.builderConversationReferenceSupplied(in: input),
+            requestedDirectory: requestedWorkingDirectory,
+            defaultDirectory: nil,
+            configRoot: builderWorktreeConfigRoot
+        )
+        let workingDirectory: String?
+        switch worktreeResult {
+        case .unchanged(let path): workingDirectory = path
+        case .assigned(let assignment): workingDirectory = assignment.workingDirectory
+        case .failed(let reason, let detail):
+            return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
+        }
         let queuedAt = ISO8601DateFormatter().string(from: Date())
         let originSessionId = Self.extractSessionId(from: input)
         var row: [String: JSONValue] = [
@@ -642,25 +887,36 @@ extension SwiftToolDispatcher {
         if let conversationId = conversation.conversationId {
             row["conversationId"] = .string(conversationId)
         }
+        let requireExistingConversation = Self.builderConversationReferenceSupplied(in: input)
+        if requireExistingConversation { row["requireExistingConversation"] = .bool(true) }
         if let workingDirectory { row["workingDirectory"] = .string(workingDirectory) }
+        if let deskHandle { row["deskHandle"] = .string(deskHandle) }
         if !originSessionId.isEmpty { row["sessionId"] = .string(originSessionId) }
         let inboxEntry = row
 
         let persistence = SwiftNativePersistenceCore()
-        let appendStatus: String
+        let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
-            appendStatus = try await persistence.withFileLock(inboxURL) {
-                let existing = try await persistence.readJSONL(inboxURL).first { value in
-                    guard case .object(let object) = value else { return false }
-                    return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
-                }
+            appendResult = try await persistence.withFileLock(inboxURL) {
+                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence)
                 if case .object(let object)? = existing {
                     guard object["text"] == .string(text),
                           object["topic"] == inboxEntry["topic"],
-                          object["workingDirectory"] == inboxEntry["workingDirectory"] else {
-                        return "conflict"
+                          object["conversationId"] == inboxEntry["conversationId"],
+                          (object["requireExistingConversation"] == .bool(true)) == requireExistingConversation,
+                          object["workingDirectory"] == inboxEntry["workingDirectory"],
+                          object["deskHandle"] == inboxEntry["deskHandle"] else {
+                        return ("conflict", false, queuedAt)
                     }
-                    return "duplicate"
+                    if let session = Self.stringField("sessionId", in: .object(object)), !session.isEmpty {
+                        guard object["sessionId"] == inboxEntry["sessionId"],
+                              object["priority"] == inboxEntry["priority"],
+                              object["timeoutSeconds"] == inboxEntry["timeoutSeconds"] else {
+                            return ("conflict", false, queuedAt)
+                        }
+                    }
+                    return ("duplicate", Self.builderInboxAllowsExplicitWakeRetry(object),
+                            Self.stringField("createdAt", in: .object(object)) ?? queuedAt)
                 }
                 try await appendJSONLCapped(
                     .object(inboxEntry),
@@ -670,7 +926,7 @@ extension SwiftToolDispatcher {
                     logLabel: "SwiftToolDispatcher.ompMessage",
                     takeLock: false
                 )
-                return "appended"
+                return ("appended", false, queuedAt)
             }
         } catch {
             return .object([
@@ -679,7 +935,7 @@ extension SwiftToolDispatcher {
                 "detail": .string(String(describing: error)),
             ])
         }
-        guard appendStatus != "conflict" else {
+        guard appendResult.status != "conflict" else {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("message_id_conflict"),
@@ -690,12 +946,12 @@ extension SwiftToolDispatcher {
         var response: [String: JSONValue] = [
             "status": .string("queued"),
             "messageId": .string(messageId),
-            "deduplicated": .bool(appendStatus == "duplicate"),
+            "deduplicated": .bool(appendResult.status == "duplicate"),
             "filePath": .string(inboxURL.path),
             "priority": .string(priority),
-            "queuedAt": .string(queuedAt),
+            "queuedAt": .string(appendResult.queuedAt),
             "timeoutSeconds": .int(Int64(timeoutSeconds)),
-            "note": .string("OMP's final reply returns as a separate bridge event. Use conversationId with omp_message for a contextual follow-up; omit it for new work."),
+            "note": .string("OMP's final reply returns as a separate bridge event. For a contextual follow-up, call omp_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id."),
         ]
         if let topic { response["topic"] = .string(topic) }
         if let conversationId = conversation.conversationId {
@@ -703,19 +959,23 @@ extension SwiftToolDispatcher {
             response["replyWith"] = .string("omp_message")
         }
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
-        if appendStatus == "duplicate" {
+        if let deskHandle { response["deskHandle"] = .string(deskHandle) }
+        if appendResult.status == "duplicate" && !appendResult.retryWake {
             response["wakeup"] = .object(["status": .string("deduplicated")])
         } else {
+            if appendResult.status == "duplicate" { response["wakeupRetried"] = .bool(true) }
             response["wakeup"] = await postOMPThreadWakeup(
                 messageId: messageId,
                 text: text,
                 priority: priority,
                 topic: topic,
-                queuedAt: queuedAt,
+                requireExistingConversation: requireExistingConversation,
+                queuedAt: appendResult.queuedAt,
                 inboxPath: inboxURL.path,
                 originSessionId: originSessionId,
                 timeoutSeconds: timeoutSeconds,
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                deskHandle: deskHandle
             )
         }
         return .object(response)
@@ -726,11 +986,13 @@ extension SwiftToolDispatcher {
         text: String,
         priority: String,
         topic: String?,
+        requireExistingConversation: Bool,
         queuedAt: String,
         inboxPath: String,
         originSessionId: String,
         timeoutSeconds: Int,
-        workingDirectory: String?
+        workingDirectory: String?,
+        deskHandle: String?
     ) async -> JSONValue {
         var payload: [String: JSONValue] = [
             "messageId": .string(messageId),
@@ -742,8 +1004,11 @@ extension SwiftToolDispatcher {
             "timeoutSeconds": .int(Int64(timeoutSeconds)),
         ]
         if let topic { payload["topic"] = .string(topic) }
+        if requireExistingConversation { payload["requireExistingConversation"] = .bool(true) }
         if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
         if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
+        if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
+        Self.stampDelegationProducer(on: &payload)
         if let ompMessageWakeupOverride { return await ompMessageWakeupOverride(payload) }
         // L1#14 replay guard — see postClaudeThreadWakeup for the four
         // conditions, why a lost/failed prior run is never suppressed, and why
@@ -813,8 +1078,7 @@ extension SwiftToolDispatcher {
             inputData: inputData,
             cwd: cwd,
             environment: childEnvironment,
-            timeoutSeconds: 30,
-            successfulNoJSONStatus: "failed"
+            timeoutSeconds: 30
         )
     }
 
@@ -1049,13 +1313,10 @@ extension SwiftToolDispatcher {
             return .success(nil)
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return .failure(.object([
-                "status": .string("failed"),
-                "reason": .string("working_directory_invalid"),
-                "detail": .string("working_directory must name an existing directory."),
-            ]))
-        }
+        // Optional string fields are sometimes serialized as "" by tool-calling
+        // models. Match conversation_id's omission semantics: an empty cwd does
+        // not request a path, while a non-empty invalid path still fails closed.
+        guard !trimmed.isEmpty else { return .success(nil) }
         let expanded = NSString(string: trimmed).expandingTildeInPath
         let url = URL(fileURLWithPath: expanded)
             .standardizedFileURL
@@ -1113,6 +1374,12 @@ extension SwiftToolDispatcher {
                 "fix": .string("codex_message requires a non-empty 'text' parameter."),
             ])
         }
+        let deskHandle = try await delegationDeskHandle(input)
+        let pairReviewer: Bool
+        switch Self.pairReviewerRequested(in: input) {
+        case .success(let requested): pairReviewer = requested
+        case .failure(let error): return error.value
+        }
         let priority: String = {
             if case .string(let p)? = input["priority"] {
                 let lower = p.lowercased()
@@ -1124,6 +1391,12 @@ extension SwiftToolDispatcher {
             guard case .string(let raw)? = input["topic"] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? nil : value
+        }()
+        let completionMode: String = {
+            guard case .string(let raw)? = input["completion_mode"],
+                  raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "receipt_only"
+            else { return "report" }
+            return "receipt_only"
         }()
         // Resolve the builder conversation before repository inference so a
         // follow-up remains the same worker thread while still using the new
@@ -1159,6 +1432,7 @@ extension SwiftToolDispatcher {
         case .success(let path): requestedDirectory = path
         case .failure(let envelope): return envelope
         }
+        let isFollowUp = Self.builderConversationReferenceSupplied(in: input)
 
         // Any caller may name an owner/name GitHub repository.
         // It is NOT a path -- the app resolves it through the same
@@ -1167,7 +1441,8 @@ extension SwiftToolDispatcher {
         // than "the model said so". An unresolvable or malformed repository
         // yields nil and the send proceeds with today's no-profile behavior.
         let repositoryResolvedDirectory: String? = {
-            guard requestedDirectory == nil,
+            guard !isFollowUp,
+                  requestedDirectory == nil,
                   case .string(let raw)? = input["repository"] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard Self.isWellFormedRepositorySlug(value) else { return nil }
@@ -1184,14 +1459,37 @@ extension SwiftToolDispatcher {
         // path B -- this only removes the caller's obligation to remember the
         // parameter, which is what cost the 2026-08-05 turn every GitHub path.
         let inferredRepositoryDirectory: String? = {
-            guard requestedDirectory == nil,
+            guard !isFollowUp,
+                  requestedDirectory == nil,
                   repositoryResolvedDirectory == nil else { return nil }
             return inferredRepositoryCheckout(fromRequestText: [text, topic ?? ""].joined(separator: "\n"))
         }()
 
-        let workingDirectory = requestedDirectory
+        let resolvedBaseDirectory = requestedDirectory
             ?? repositoryResolvedDirectory
             ?? inferredRepositoryDirectory
+        let callerSelectedDirectory = requestedDirectory ?? repositoryResolvedDirectory
+        let worktreeResult = await BuilderWorktreeAllocator.shared.resolve(
+            agent: .codex,
+            conversationId: conversation.conversationId,
+            messageId: messageId,
+            isFollowUp: isFollowUp,
+            requestedDirectory: callerSelectedDirectory,
+            defaultDirectory: resolvedBaseDirectory,
+            configRoot: builderWorktreeConfigRoot
+        )
+        let workingDirectory: String?
+        let worktreeAssignment: BuilderWorktreeAllocator.Assignment?
+        switch worktreeResult {
+        case .unchanged(let path):
+            workingDirectory = path
+            worktreeAssignment = nil
+        case .assigned(let assignment):
+            workingDirectory = assignment.workingDirectory
+            worktreeAssignment = assignment
+        case .failed(let reason, let detail):
+            return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
+        }
         // This capability marker is created only from a remote-verified
         // repository checkout. It is never accepted from caller-supplied
         // working_directory, topic text, or repository-controlled prose.
@@ -1246,38 +1544,37 @@ extension SwiftToolDispatcher {
         if let fast = brain.fast { entry["fast"] = .bool(fast) }
         if let workingDirectory { entry["workingDirectory"] = .string(workingDirectory) }
         if let executionProfile { entry["executionProfile"] = .string(executionProfile) }
+        if let deskHandle { entry["deskHandle"] = .string(deskHandle) }
+        if pairReviewer { entry["pairReviewer"] = .bool(true) }
+        if completionMode == "receipt_only" { entry["completionMode"] = .string(completionMode) }
         let inboxEntry = entry
 
         let persistence = SwiftNativePersistenceCore()
-        let appendResult: (status: String, priorWakeAccepted: Bool)
+        let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
             appendResult = try await persistence.withFileLock(inboxURL) {
-                let existing = try await persistence.readJSONL(inboxURL).first { row in
-                    guard case .object(let object) = row else { return false }
-                    return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
-                }
+                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence)
                 if case .object(let object)? = existing {
-                    // executionProfile is part of the equality contract: a row
-                    // queued WITHOUT the network profile is not the same work
-                    // order as one queued with it. Without this, a resend that
-                    // newly resolves a repository is answered "duplicate" while
-                    // the durable row still carries no profile -- the response
-                    // would advertise a capability the queued turn never gets
-                    // (gpt-5.5 review, 2026-08-05).
-                    guard object["text"] == .string(text),
-                          object["conversationId"] == inboxEntry["conversationId"],
-                          object["workingDirectory"] == inboxEntry["workingDirectory"],
-                          object["executionProfile"] == inboxEntry["executionProfile"] else {
-                        return ("conflict", false)
+                    // Inbox persistence precedes helper admission. An explicit
+                    // retry must keep that exact work order, including its
+                    // reply route and requested brain, even if no helper job
+                    // exists yet to supply canonical duplicate protection.
+                    let operationFields = [
+                        "text", "topic", "conversationId", "workingDirectory",
+                        "executionProfile", "deskHandle", "completionMode", "pairReviewer",
+                        "sessionId", "origin", "brain", "priority",
+                        "model", "reasoningEffort", "serviceTier", "fast",
+                    ]
+                    guard operationFields.allSatisfy({ object[$0] == inboxEntry[$0] }) else {
+                        return ("conflict", false, timestamp)
                     }
-                    let consumedAt: String? = {
-                        guard case .string(let value)? = object["consumedAt"] else { return nil }
-                        return value.isEmpty ? nil : value
-                    }()
-                    return ("duplicate", object["read"] == .bool(true) || consumedAt != nil)
+                    // GitHub commands intentionally may have no chat session;
+                    // equality of the stored origin still binds their route.
+                    return ("duplicate", Self.builderInboxAllowsExplicitWakeRetry(object, requiresSession: false),
+                            Self.stringField("createdAt", in: .object(object)) ?? timestamp)
                 }
                 try await persistence.appendJSONL(.object(inboxEntry), to: inboxURL)
-                return ("appended", false)
+                return ("appended", false, timestamp)
             }
         } catch {
             return .object([
@@ -1295,19 +1592,24 @@ extension SwiftToolDispatcher {
             ])
         }
         let deduplicated = appendResult.status == "duplicate"
-        let retryUnacceptedWake = deduplicated && !appendResult.priorWakeAccepted
+        let retryUnacceptedWake = deduplicated && appendResult.retryWake
         var response: [String: JSONValue] = [
             "status": .string("queued"),
             "messageId": .string(messageId),
             "deduplicated": .bool(deduplicated),
             "filePath": .string(path),
             "priority": .string(priority),
-            "queuedAt": .string(timestamp),
+            "queuedAt": .string(appendResult.queuedAt),
             "origin": origin,
             "brain": brain.jsonValue,
-            "note": .string("NativeAgent queues the inbox row, attempts a Mac notification, wakes Codex, and watches for the final answer. Use the returned conversationId with codex_message for a contextual follow-up; omit it for new work. If Codex is busy, the wake remains queued until that thread is idle."),
+            "completionMode": .string(completionMode),
+            "note": .string(completionMode == "receipt_only"
+                ? "NativeAgent queues the note and records Codex's terminal receipt without creating another Agent chat turn. Failures still return visibly."
+                : "NativeAgent queues the inbox row, attempts a Mac notification, wakes Codex, and watches for the final answer. For a contextual follow-up, call codex_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id. If Codex is busy, the wake remains queued until that thread is idle."),
         ]
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
+        if let deskHandle { response["deskHandle"] = .string(deskHandle) }
+        if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
         if let executionProfile {
             // Make repository attachment observable: a silently-applied profile is
             // indistinguishable from a silently-missing one at the call site.
@@ -1345,14 +1647,17 @@ extension SwiftToolDispatcher {
                 text: text,
                 priority: priority,
                 topic: topic,
-                queuedAt: timestamp,
+                queuedAt: appendResult.queuedAt,
                 inboxPath: path,
                 originSessionId: originSessionId,
                 origin: origin,
                 brain: brain,
                 threadId: conversation.resumeId,
                 workingDirectory: workingDirectory,
-                executionProfile: executionProfile
+                executionProfile: executionProfile,
+                deskHandle: deskHandle,
+                pairReviewer: pairReviewer,
+                completionMode: completionMode
             )
             response["wakeup"] = wakeup
             let conversationId = conversation.conversationId
@@ -1361,8 +1666,38 @@ extension SwiftToolDispatcher {
                 response["conversationId"] = .string(conversationId)
                 response["replyWith"] = .string("codex_message")
             }
+            if let worktreeAssignment,
+               let threadId = Self.stringField("threadId", in: wakeup) {
+                let binding = await BuilderWorktreeAllocator.shared.bind(
+                    worktreeAssignment,
+                    agent: .codex,
+                    conversationId: "codex:\(threadId)",
+                    configRoot: builderWorktreeConfigRoot
+                )
+                if case .failed(let reason, let detail) = binding {
+                    response["worktreeFollowUpWarning"] = .string("\(reason): \(detail)")
+                }
+            }
         }
         return .object(response)
+    }
+
+    private var builderWorktreeConfigRoot: URL {
+        agentBridgeConfigRoot
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config", isDirectory: true)
+    }
+
+    private static func builderWorktreeFailureEnvelope(
+        reason: String,
+        detail: String
+    ) -> JSONValue {
+        .object([
+            "status": .string("failed"),
+            "reason": .string(reason),
+            "detail": .string(detail),
+            "fix": .string("Repair the selected Git checkout or its isolated worktree, then retry the builder message."),
+        ])
     }
 
     private static func bridgeConfigDirectory(named name: String, configRootOverride: URL? = nil) -> URL {
@@ -1484,7 +1819,10 @@ extension SwiftToolDispatcher {
         brain: CodexBrainControls,
         threadId: String?,
         workingDirectory: String?,
-        executionProfile: String?
+        executionProfile: String?,
+        deskHandle: String?,
+        pairReviewer: Bool,
+        completionMode: String
     ) async -> JSONValue {
         if let codexMessageWakeupOverride {
             var payload: [String: JSONValue] = [
@@ -1506,6 +1844,10 @@ extension SwiftToolDispatcher {
             if let threadId { payload["threadId"] = .string(threadId) }
             if let workingDirectory { payload["workingDirectory"] = .string(workingDirectory) }
             if let executionProfile { payload["executionProfile"] = .string(executionProfile) }
+            if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
+            if pairReviewer { payload["pairReviewer"] = .bool(true) }
+            if completionMode == "receipt_only" { payload["completionMode"] = .string(completionMode) }
+            Self.stampDelegationProducer(on: &payload)
             return await codexMessageWakeupOverride(payload)
         }
 
@@ -1566,6 +1908,10 @@ extension SwiftToolDispatcher {
         if let threadId { payload["threadId"] = .string(threadId) }
         if let workingDirectory { payload["workingDirectory"] = .string(workingDirectory) }
         if let executionProfile { payload["executionProfile"] = .string(executionProfile) }
+        if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
+        if pairReviewer { payload["pairReviewer"] = .bool(true) }
+        if completionMode == "receipt_only" { payload["completionMode"] = .string(completionMode) }
+        Self.stampDelegationProducer(on: &payload)
 
         let inputData: Data
         do {
@@ -1594,8 +1940,7 @@ extension SwiftToolDispatcher {
         inputData: Data,
         cwd: URL,
         environment: [String: String],
-        timeoutSeconds: TimeInterval,
-        successfulNoJSONStatus: String
+        timeoutSeconds: TimeInterval
     ) async -> JSONValue {
         let result: ProcessRunResult
         do {
@@ -1613,6 +1958,8 @@ extension SwiftToolDispatcher {
                 "status": .string("failed"),
                 "reason": .string("helper_cancelled"),
                 "helper": .string(helper.path),
+                "admissionOutcome": .string("unknown"),
+                "note": .string("The helper was cancelled after possible dispatch. Inspect the original message's delegation status before any resend."),
             ])
         } catch {
             return .object([
@@ -1623,18 +1970,29 @@ extension SwiftToolDispatcher {
             ])
         }
 
+        return builderWakeupHelperReceipt(result: result, helper: helper)
+    }
+
+    /// Pure interpretation of the shared process owner's evidence. A helper
+    /// exit code is never a substitute for its structured admission receipt.
+    static func builderWakeupHelperReceipt(result: ProcessRunResult, helper: URL) -> JSONValue {
         let stderrText = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-        if result.timedOut {
+        func unavailable(_ reason: String) -> JSONValue {
             var envelope: [String: JSONValue] = [
                 "status": .string("failed"),
-                "reason": .string("helper_timeout"),
+                "reason": .string(reason),
                 "helper": .string(helper.path),
+                "exitCode": .int(Int64(result.exitCode)),
+                "admissionOutcome": .string("unknown"),
+                "note": .string("No trustworthy helper receipt was received. Work may already have been admitted; inspect the original message's delegation status before any resend."),
             ]
             if !stderrText.isEmpty {
                 envelope["stderrPreview"] = .string(String(stderrText.prefix(500)))
             }
             return .object(envelope)
         }
+        if result.timedOut { return unavailable("helper_timeout") }
+        if result.stdoutTruncated { return unavailable("helper_output_truncated") }
 
         let stdoutText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let lastLine = stdoutText.split(separator: "\n").last.map(String.init) ?? ""
@@ -1644,25 +2002,25 @@ extension SwiftToolDispatcher {
             .compactMap { $0.data(using: .utf8) }
             .compactMap { try? JSONValue.parse($0) }
             .first
-        if let parsed {
-            if case .object(var object) = parsed {
-                object["helper"] = .string(helper.path)
-                object["exitCode"] = .int(Int64(result.exitCode))
-                if !stderrText.isEmpty {
-                    object["stderrPreview"] = .string(String(stderrText.prefix(500)))
-                }
-                return .object(object)
-            }
-            return parsed
+        guard let parsed else { return unavailable("helper_returned_no_json") }
+        guard case .object(var object) = parsed,
+              case .string(let status)? = object["status"],
+              !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return unavailable("helper_invalid_receipt")
         }
-
-        return .object([
-            "status": .string(result.exitCode == 0 ? successfulNoJSONStatus : "failed"),
-            "reason": .string(result.stdoutTruncated ? "helper_output_truncated" : "helper_returned_no_json"),
-            "helper": .string(helper.path),
-            "exitCode": .int(Int64(result.exitCode)),
-            "stderrPreview": .string(String(stderrText.prefix(500))),
-        ])
+        if result.exitCode != 0 && !["failed", "skipped"].contains(status) {
+            guard case .object(var failure) = unavailable("helper_exit_conflict") else {
+                return unavailable("helper_exit_conflict")
+            }
+            failure["helperReportedReceipt"] = parsed
+            return .object(failure)
+        }
+        object["helper"] = .string(helper.path)
+        object["exitCode"] = .int(Int64(result.exitCode))
+        if !stderrText.isEmpty {
+            object["stderrPreview"] = .string(String(stderrText.prefix(500)))
+        }
+        return .object(object)
     }
 
     private static func runCodexWakeupHelper(helper: URL, inputData: Data, cwd: URL) async -> JSONValue {
@@ -1686,8 +2044,7 @@ extension SwiftToolDispatcher {
             inputData: inputData,
             cwd: cwd,
             environment: childEnvironment,
-            timeoutSeconds: codexWakeupHelperTimeoutSeconds(),
-            successfulNoJSONStatus: "completed"
+            timeoutSeconds: codexWakeupHelperTimeoutSeconds()
         )
     }
 

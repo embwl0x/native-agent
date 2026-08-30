@@ -403,8 +403,11 @@ public enum TelegramReplyPromptRenderer {
         } else {
             clippedQuote = rawQuote
         }
+        // Telegram's is_bot identifies a bot, not necessarily this assistant.
+        // Group replies can quote another bot; the transport has not compared
+        // the quoted sender with our own identity here.
         let source = replyTo.fromIsBot == true
-            ? "Telegram message from the assistant"
+            ? "a Telegram bot message"
             : "a Telegram message"
         let userLine = trimmed.isEmpty ? "(empty message)" : trimmed
         return """

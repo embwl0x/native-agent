@@ -175,15 +175,56 @@ private func feedLineCount(_ root: URL) -> Int {
     #expect(FileManager.default.fileExists(atPath: store.basePath.path))
     let goodBase = try Data(contentsOf: store.basePath)
 
-    // Corrupt the base, then force enough terminal churn to trigger compaction.
-    try Data("not json{{".utf8).write(to: store.basePath)
-    _ = try await store.applyApproval(proposalId: "p3")
-    _ = try await store.applyApproval(proposalId: "p4")
+    // Corrupt the base. Authority-changing decisions now fail before touching
+    // the feed, while append-only admission remains available as a recovery
+    // lane and simply skips compaction.
+    let corruptBase = Data("not json{{".utf8)
+    try corruptBase.write(to: store.basePath)
+    await #expect(throws: REMProposalStoreError.storeUnavailable(
+        "compaction base is unreadable; bytes were preserved"
+    )) {
+        _ = try await store.applyApproval(proposalId: "p3")
+    }
+    #expect(try await store.appendPending([prop(6)]) == 1)
 
-    // The corrupt base bytes are untouched — compaction refused to rewrite it.
-    #expect(try Data(contentsOf: store.basePath) == Data("not json{{".utf8))
+    // The corrupt base bytes are untouched — neither mutation path rewrites it.
+    #expect(try Data(contentsOf: store.basePath) == corruptBase)
 
     // Restore the original base: the previously folded row is intact.
     try goodBase.write(to: store.basePath)
     #expect(store.loadAll().first { $0.id == "p0" }?.status == "approved")
+}
+
+@Test func partiallyMalformedBaseSkipsCompactionInsteadOfDroppingApprovedRows() async throws {
+    let root = compactionTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = REMProposalStore(dataRoot: root, compactionThreshold: 4, keepTail: 1)
+
+    _ = try await store.appendPending((0..<6).map(prop))
+    _ = try await store.applyApproval(proposalId: "p0")
+    let validBase = try JSONValue.parse(Data(contentsOf: store.basePath))
+    guard case .object(var object) = validBase,
+          case .array(var rows)? = object["rows"] else {
+        Issue.record("expected generated compaction base")
+        return
+    }
+    rows.append(.string("malformed-row"))
+    object["rows"] = .array(rows)
+    let mixedBase = try JSONValue.object(object).serializedData(pretty: true)
+    try mixedBase.write(to: store.basePath)
+    #expect(store.readBaseRows() == nil)
+
+    // Decisions fail before mutation, including denial before it can write a
+    // tombstone. Append-only admission remains available but cannot compact
+    // from the partial base.
+    await #expect(throws: REMProposalStoreError.storeUnavailable(
+        "compaction base is unreadable; bytes were preserved"
+    )) {
+        _ = try await store.applyDenial(proposalId: "p3", reason: "no")
+    }
+    #expect(!FileManager.default.fileExists(
+        atPath: root.appendingPathComponent("harness/.rem_tombstones.json").path
+    ))
+    #expect(try await store.appendPending([prop(6)]) == 1)
+    #expect(try Data(contentsOf: store.basePath) == mixedBase)
 }

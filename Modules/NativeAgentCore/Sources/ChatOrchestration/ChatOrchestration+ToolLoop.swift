@@ -52,13 +52,24 @@ extension TurnEngineError {
 
 // MARK: - Tool-loop-exhausted fallback reply
 
-/// The single wording for a tool loop that ran out of iterations without a
-/// final reply. All three loops (structured streaming, structured
-/// non-streaming, and TextCompatibility) build their best-effort fallback
-/// reply from this so the phrasing can't drift between them again.
+/// The single wording for a tool loop that stopped without a final reply.
+/// All three loops (structured streaming, structured non-streaming, and
+/// TextCompatibility) build their best-effort fallback reply from this so the
+/// phrasing can't drift between them again. The message names the actual
+/// rounds run and WHY the loop stopped — the old wording printed the LIMIT
+/// unconditionally, so a wall-clock-cut turn (188s, ~10 rounds, 2026-08-27)
+/// reported "exhausted after 180 iterations" and misled diagnosis.
 enum ToolLoopExhaustion {
-    static func fallbackReply(iterationLimit: Int, dispatchCount: Int) -> String {
-        "(tool loop exhausted after \(iterationLimit) iterations — dispatched \(dispatchCount) tool calls, no final reply)"
+    static func fallbackReply(
+        iterationLimit: Int,
+        dispatchCount: Int,
+        providerRounds: Int,
+        wallClockElapsedSeconds: Int? = nil
+    ) -> String {
+        if let seconds = wallClockElapsedSeconds {
+            return "(turn stopped by wall-clock budget after \(seconds)s / \(providerRounds) provider rounds — dispatched \(dispatchCount) tool calls, no final reply)"
+        }
+        return "(tool loop exhausted after \(providerRounds)/\(iterationLimit) iterations — dispatched \(dispatchCount) tool calls, no final reply)"
     }
 }
 
@@ -113,6 +124,12 @@ public enum ToolLoopBudget {
         // (same three strings as the open-coded list this replaces).
         case "autonomy", "background":
             return 80
+        // Agent-to-agent bridge lanes run delegation marathons (dispatch,
+        // audit, merge, restart in one turn); 60 kept exhausting mid-pipeline
+        // and dropping the tail steps (User, 2026-08-27: "that ain't enough
+        // for her to do stuff"). Telegram-tier.
+        case "claude-bridge", "codex-bridge":
+            return 180
         case let s where WorkshopSurfaceVocabulary.isWorkshopGateSurface(s):
             return 80
         default:
@@ -123,6 +140,81 @@ public enum ToolLoopBudget {
     public static func resolve(surface: String, requested: Int? = nil) -> Int {
         let desired = requested ?? defaultIterations(for: surface)
         return min(max(1, desired), hardCap)
+    }
+}
+
+// MARK: - Whole-turn wall-clock budget (A6, 2026-08-27)
+
+/// A monotonic, surface-scoped ceiling for the complete tool-loop turn.
+///
+/// This is deliberately a checkpoint budget, not a cancellation deadline. A
+/// loop observes it only before starting another provider iteration, after any
+/// current provider round and tool dispatch (including an explicitly requested
+/// `timeout_seconds` window) has settled. Expiry therefore takes the loop's
+/// existing exhausted-turn terminal path; it never manufactures a new error,
+/// fallback, receipt, cancellation, or provider-failure shape.
+///
+/// The `nowNanoseconds` TaskLocal is the shared injection seam for the
+/// structured and text-compatible loops. Production uses uptime nanoseconds;
+/// deterministic tests bind a manual monotonic clock without sleeping.
+struct WholeTurnWallClockBudget: Sendable {
+    typealias MonotonicClock = @Sendable () -> UInt64
+
+    /// 600, not 180: the original 180 sat BELOW the measured p95 of User's
+    /// own heavy chat turns (188s, 2026-08-27 instrument run), so the brake
+    /// was clipping legitimate deep turns the day it shipped. A runaway loop
+    /// still dies; a real deliberate turn cannot be touched (>3x worst case).
+    static let defaultInteractiveSeconds: TimeInterval = 600
+    static let defaultTelegramSeconds: TimeInterval = 300
+    static let defaultUnattendedSeconds: TimeInterval = 3_900
+
+    @TaskLocal static var nowNanoseconds: MonotonicClock = {
+        DispatchTime.now().uptimeNanoseconds
+    }
+
+    private let startedAtNanoseconds: UInt64
+    private let deadlineNanoseconds: UInt64
+    private let clock: MonotonicClock
+
+    static func defaultSeconds(for surface: String) -> TimeInterval {
+        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized == "telegram" {
+            return defaultTelegramSeconds
+        }
+        switch normalized {
+        case "autonomy", "background",
+             "swarm", "swarms", "worker", "workers", "training":
+            return defaultUnattendedSeconds
+        case let value where WorkshopSurfaceVocabulary.isWorkshopGateSurface(value):
+            // Includes canonical `workshop` plus both shipped legacy gate
+            // spellings (`mission` / `missions`) through the vocabulary owner.
+            return defaultUnattendedSeconds
+        default:
+            return defaultInteractiveSeconds
+        }
+    }
+
+    static func start(surface: String, requestedSeconds: TimeInterval? = nil) -> Self {
+        let clock = nowNanoseconds
+        let startedAt = clock()
+        // A caller-scoped override (the bridge profile's marathon budget)
+        // wins over the surface default, clamped to the unattended ceiling.
+        let seconds = min(requestedSeconds ?? defaultSeconds(for: surface), defaultUnattendedSeconds)
+        let duration = UInt64(seconds * 1_000_000_000)
+        let deadline = startedAt > UInt64.max - duration
+            ? UInt64.max
+            : startedAt + duration
+        return Self(startedAtNanoseconds: startedAt, deadlineNanoseconds: deadline, clock: clock)
+    }
+
+    var isExhausted: Bool {
+        clock() >= deadlineNanoseconds
+    }
+
+    /// Whole-turn wall time so far, on the SAME clock isExhausted reads, so
+    /// the exhaustion fallback message reports the budget's own elapsed value.
+    var elapsedSeconds: Int {
+        Int((clock() &- startedAtNanoseconds) / 1_000_000_000)
     }
 }
 
@@ -237,7 +329,7 @@ public enum ToolDispatchDeadline {
             // ms/s label so a sub-second deadline doesn't render as "0s"
             // (loop #1's diagnostic lesson).
             let label = seconds >= 1 ? "\(Int(seconds))s" : "\(Int(seconds * 1000))ms"
-            return "tool '\(tool)' exceeded the \(label) dispatch deadline and was abandoned; retry with narrower work, an explicit timeout_seconds value, or the asynchronous message tool"
+            return "tool '\(tool)' exceeded the \(label) dispatch deadline; the outcome is uncertain and effects may already have occurred. Inspect the original receipt and current state before retrying. After reconciliation, any authorized new attempt can use narrower work, an explicit timeout_seconds value, or the asynchronous message tool"
         }
     }
 }
@@ -721,6 +813,60 @@ enum ParallelToolDispatch {
         return safeReadKeywords.contains(where: { lower.contains($0) })
     }
 
+    /// Fleet-dispatch exception (User, 2026-08-27): `invoke_codex` is serial by
+    /// name (explicitSerialNames) because two spawns sharing a checkout stash
+    /// each other's edits. But when EVERY invoke_codex call in the iteration
+    /// carries an explicit cwd and those cwds are pairwise distinct (per-lane
+    /// worktrees), the spawns share no mutable state and may run concurrently —
+    /// that is exactly Agent's lane-burn shape. Any missing, blank, or
+    /// duplicate cwd disables the override for the whole iteration (fail
+    /// closed, back to serial). `invoke_claude` is deliberately never
+    /// overridden: it resumes ONE pinned session, and concurrent resumes of
+    /// the same session corrupt it.
+    ///
+    /// Returns one entry per call: `true` to force parallel-safe, `nil` to
+    /// keep the name-based verdict.
+    static func fleetParallelOverrides(
+        names: [String], inputs: [[String: JSONValue]]
+    ) -> [Bool?] {
+        let none: [Bool?] = Array(repeating: nil, count: names.count)
+        let codexIdx = names.indices.filter { names[$0] == "invoke_codex" }
+        guard codexIdx.count >= 2 else { return none }
+        // Distinctness must be FILESYSTEM identity, not string identity:
+        // symlinked or case-aliased paths on APFS can name the same checkout
+        // (gpt-5.5 review BLOCKING, 2026-08-27). Each cwd must exist and
+        // resolve to a unique (device, inode); anything else fails closed.
+        var identities: Set<FleetCwdIdentity> = []
+        for i in codexIdx {
+            guard case .string(let c)? = inputs[i]["cwd"],
+                  !c.trimmingCharacters(in: .whitespaces).isEmpty,
+                  let identity = Self.fleetCwdIdentity(path: c),
+                  identities.insert(identity).inserted else {
+                return none
+            }
+        }
+        var out = none
+        for i in codexIdx { out[i] = true }
+        return out
+    }
+
+    struct FleetCwdIdentity: Hashable {
+        let device: UInt64
+        let inode: UInt64
+    }
+
+    /// (device, inode) of the resolved directory — nil when it does not
+    /// exist. Symlinks are resolved before stat so aliases collapse.
+    static func fleetCwdIdentity(path: String) -> FleetCwdIdentity? {
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: resolved),
+              let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value,
+              let device = (attrs[.systemNumber] as? NSNumber)?.uint64Value else {
+            return nil
+        }
+        return FleetCwdIdentity(device: device, inode: inode)
+    }
+
     // MARK: Iteration planning
 
     /// One iteration's execution plan: consecutive parallel-safe indices
@@ -777,18 +923,27 @@ struct ToolCallProtocolViolation: Equatable {
     enum Kind: Equatable {
         case markdownToolCallBlock
         case formattedToolUseMarker
+        case malformedToolUseMarker
     }
 
     let kind: Kind
 
     var modelFeedback: String {
-        """
+        if kind == .malformedToolUseMarker {
+            return """
+            NativeAgent tool protocol error: your previous response contained a truncated or malformed tool_use marker. That response was not delivered and no tool was executed. Retry now through the provider's native tool-call channel. If no tool is needed, answer the user directly.
+            """
+        }
+        return """
         NativeAgent tool protocol error: your previous response looked like a tool call but used Markdown formatting instead of the executable tool protocol. That response was not delivered and no tool was executed. Retry now by emitting only one or more exact <tool_use name="tool_name">{"arg":"value"}</tool_use> markers, with no Tool Call header, code fence, inline-code/emphasis wrapper, or invented Tool Result. If no tool is needed, answer the user directly.
         """
     }
 
     var terminalReply: String {
-        "(tool protocol error: the model repeatedly formatted a tool call as Markdown; no formatted call was delivered or executed)"
+        if kind == .malformedToolUseMarker {
+            return "(tool protocol error: the model repeatedly emitted a malformed tool call; no malformed call was delivered or executed)"
+        }
+        return "(tool protocol error: the model repeatedly formatted a tool call as Markdown; no formatted call was delivered or executed)"
     }
 }
 
@@ -1130,6 +1285,17 @@ enum ToolCallParser {
     /// strict and let each tool-loop owner feed `modelFeedback` into its next
     /// provider call instead of surfacing the malformed response.
     static func formattedToolCallViolation(in raw: String) -> ToolCallProtocolViolation? {
+        // Live Telegram incident (2026-08-14): the provider emitted
+        // `ool_use name="commit_memory">…</tool_use>`, dropping the opening
+        // `<t`. It was neither executable nor caught by the exact-marker
+        // detector, so it shipped as assistant prose. Require an opening-line
+        // protocol shape, a name attribute, and the real closing tag; ordinary
+        // discussion of the word "tool_use" remains valid prose.
+        let malformedOpeningPattern = #"(?is)(?:^|[\r\n])[ \t]*(?:tool_use|ool_use)[ \t]+(?:id=\"[^\"]*\"[ \t]+)?name=\"[^\"]+\"[ \t]*>[\s\S]*?</tool_use>"#
+        if regexMatches(malformedOpeningPattern, in: raw) {
+            return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
+        }
+
         // A syntactically valid marker inside a code fence or inline Markdown
         // is still protocol-invalid. Check this before parseAnthropic, whose
         // intentionally unanchored marker regex otherwise finds the inner tag.
@@ -1161,7 +1327,10 @@ enum ToolCallParser {
     /// protocol block. Streaming paths hold this suffix until the completed
     /// iteration can be parsed, so marker-shaped text never reaches a draft.
     static func earliestPotentialProtocolMarker(in raw: String) -> Range<String.Index>? {
-        let needles = ["<tool", "**tool call", "__tool call", "tool call:"]
+        let needles = [
+            "<tool", "tool_use name=\"", "ool_use name=\"",
+            "**tool call", "__tool call", "tool call:",
+        ]
         var candidates = needles.compactMap { needle in
             raw.range(of: needle, options: [.caseInsensitive])
         }
@@ -1527,7 +1696,8 @@ extension SwiftNativeTurnEngine {
             toolDispatches: dispatches,
             elapsedMs: elapsedMs,
             rawLLMResponse: rawLLMResponse,
-            providerCallCount: providerCallCount
+            providerCallCount: providerCallCount,
+            completionState: .completed
         )
     }
 
@@ -1656,6 +1826,7 @@ extension SwiftNativeTurnEngine {
         lastProtocolViolation: ToolCallProtocolViolation?,
         loopRecoveryReply: String?,
         iterationLimit: Int,
+        wallClockElapsedSeconds: Int?,
         dispatches: [TurnEngineResult.ToolDispatchRecord],
         startNs: UInt64,
         providerCallCount: Int,
@@ -1675,7 +1846,10 @@ extension SwiftNativeTurnEngine {
             final = lastProtocolViolation.terminalReply
         } else if fallbackText.isEmpty || rawWasOnlyStructuredToolCall {
             final = ToolLoopExhaustion.fallbackReply(
-                iterationLimit: iterationLimit, dispatchCount: dispatches.count
+                iterationLimit: iterationLimit,
+                dispatchCount: dispatches.count,
+                providerRounds: providerCallCount,
+                wallClockElapsedSeconds: wallClockElapsedSeconds
             )
         } else {
             final = fallbackText
@@ -1697,7 +1871,8 @@ extension SwiftNativeTurnEngine {
             toolDispatches: dispatches,
             elapsedMs: elapsedMs,
             rawLLMResponse: lastRawResponse,
-            providerCallCount: providerCallCount
+            providerCallCount: providerCallCount,
+            completionState: .incomplete
         )
     }
 
@@ -1710,8 +1885,13 @@ extension SwiftNativeTurnEngine {
         surface: String = "chat",
         userMessage: String,
         sessionId: String? = nil,
+        /// Request-scoped identity used only for tool loading/dispatch. This is
+        /// distinct from `sessionId`: ephemeral turns need a verified tool
+        /// identity without becoming a chat transcript or provider session.
+        toolSessionId: String? = nil,
         runId: String? = nil,
         maxIterations: Int? = nil,
+        turnWallClockSecondsOverride: TimeInterval? = nil,
         llm: any LLMClient,
         tools: any ToolDispatchClient,
         preBuiltContext: TurnContext? = nil,
@@ -1733,7 +1913,7 @@ extension SwiftNativeTurnEngine {
             throw TurnEngineError.emptyMessage
         }
         let recoveryScope = ProviderToolResultRecoveryStore.Scope(
-            sessionId: sessionId,
+            sessionId: toolSessionId ?? sessionId,
             turnId: TurnTraceContext.turnId
         )
         defer {
@@ -1741,6 +1921,7 @@ extension SwiftNativeTurnEngine {
                 Task { await ProviderToolResultRecoveryStore.shared.remove(scope: recoveryScope) }
             }
         }
+        let wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface, requestedSeconds: turnWallClockSecondsOverride)
         let startNs = DispatchTime.now().uptimeNanoseconds
         // Shared pre-loop context resolution (C2): prefer preBuiltContext, else
         // build + lazy-filter through the session's active tools, then fire the
@@ -1789,6 +1970,7 @@ extension SwiftNativeTurnEngine {
         var noProgressGuard = ToolLoopNoProgressGuard()
         var loopRecoveryReply: String?
         var providerCallCount = 0
+        var wallClockElapsedSeconds: Int?
         let iterationLimit = ToolLoopBudget.resolve(surface: surface, requested: maxIterations)
 
         for _ in 0..<iterationLimit {
@@ -1799,6 +1981,14 @@ extension SwiftNativeTurnEngine {
             if let flag = cancelFlagPath,
                FileManager.default.fileExists(atPath: flag.path) {
                 throw CancellationError()
+            }
+            // A6: stop only at the safe iteration boundary. Cancellation keeps
+            // its prior precedence. Falling through here reuses
+            // finishExhaustedTurn below, including its existing abandoned
+            // outcome, promotion, fallback, and receipt behavior.
+            if wholeTurnBudget.isExhausted {
+                wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                break
             }
             // U1 step 4: thread the session id task-locally so the OpenAI
             // Responses adapter can derive a stable per-session
@@ -1911,7 +2101,7 @@ extension SwiftNativeTurnEngine {
                 iterationRawText: raw,
                 ctx: ctx,
                 surface: surface,
-                sessionId: sessionId,
+                sessionId: toolSessionId ?? sessionId,
                 tools: tools,
                 progress: progress,
                 conversation: &conversation,
@@ -1932,6 +2122,7 @@ extension SwiftNativeTurnEngine {
             lastProtocolViolation: lastProtocolViolation,
             loopRecoveryReply: loopRecoveryReply,
             iterationLimit: iterationLimit,
+            wallClockElapsedSeconds: wallClockElapsedSeconds,
             dispatches: dispatches,
             startNs: startNs,
             providerCallCount: providerCallCount,
@@ -1951,6 +2142,7 @@ extension SwiftNativeTurnEngine {
         sessionId: String? = nil,
         runId: String? = nil,
         maxIterations: Int? = nil,
+        turnWallClockSecondsOverride: TimeInterval? = nil,
         llm: any LLMClient,
         tools: any ToolDispatchClient,
         preBuiltContext: TurnContext? = nil,
@@ -1972,6 +2164,7 @@ extension SwiftNativeTurnEngine {
                 Task { await ProviderToolResultRecoveryStore.shared.remove(scope: recoveryScope) }
             }
         }
+        let wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface, requestedSeconds: turnWallClockSecondsOverride)
         let startNs = DispatchTime.now().uptimeNanoseconds
         // Shared pre-loop context resolution (C2): same build + lazy-filter +
         // snapshot as the non-streaming path so the streaming surface doesn't
@@ -2031,9 +2224,16 @@ extension SwiftNativeTurnEngine {
         // One streamMessages call per iteration; count it like the non-streaming
         // loop does, and thread it into both TurnEngineResult returns below.
         var providerCallCount = 0
+        var wallClockElapsedSeconds: Int?
         let iterationLimit = ToolLoopBudget.resolve(surface: surface, requested: maxIterations)
 
         for _ in 0..<iterationLimit {
+            // A6: do not interrupt an active provider stream or dispatch. At
+            // this boundary, expiry falls through to the one exhaustion tail.
+            if wholeTurnBudget.isExhausted {
+                wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                break
+            }
             providerCallCount += 1
             var iterAccumulated = ""
             // Bytes this iteration actually handed to the surface (marker-safe
@@ -2149,6 +2349,15 @@ extension SwiftNativeTurnEngine {
                         // still ran, so a keepalive is also a valid stop checkpoint.
                         break
                     }
+                }
+                // Cancellation can resume AsyncThrowingStream.next() with nil
+                // rather than throw or deliver another event. Check the same
+                // stop signals at EOF before treating visible prose as complete
+                // or dispatching any tool calls buffered by this iteration.
+                try Task.checkCancellation()
+                if let flag = cancelFlagPath,
+                   FileManager.default.fileExists(atPath: flag.path) {
+                    throw CancellationError()
                 }
             } catch is CancellationError {
                 // 2026-07-21 audit fix: a user stop mid-stream CARRIES the
@@ -2364,6 +2573,7 @@ extension SwiftNativeTurnEngine {
             lastProtocolViolation: lastProtocolViolation,
             loopRecoveryReply: loopRecoveryReply,
             iterationLimit: iterationLimit,
+            wallClockElapsedSeconds: wallClockElapsedSeconds,
             dispatches: dispatches,
             startNs: startNs,
             providerCallCount: providerCallCount,
@@ -2391,7 +2601,10 @@ extension SwiftNativeTurnEngine {
     ///
     /// This is the single implementation behind both the non-streaming and
     /// streaming loops, so the serial/parallel split cannot drift between
-    /// them. Semantics preserved from the serial code, per slot:
+    /// them. The planning + concurrency window itself lives one level down in
+    /// `runIterationDispatchGroups`, which the Claude text-compat loop also
+    /// calls (A1, 2026-08-28) with its own slot finalization.
+    /// Semantics preserved from the serial code, per slot:
     ///   .toolUse progress → dispatch (notice bus + runtime ctx bound) →
     ///   record → .toolResult progress → redact → tool_result block.
     /// For a `.concurrent` group the .toolUse events for the whole group are
@@ -2427,46 +2640,118 @@ extension SwiftNativeTurnEngine {
                 )
             )
         }
-        let groups = ParallelToolDispatch.plan(
-            parallelSafe: prepared.map {
-                ParallelToolDispatch.isParallelSafe(internalToolName: $0.internalName)
+        let slots = await Self.runIterationDispatchGroups(
+            prepared: prepared,
+            modelId: modelId,
+            surface: surface,
+            personaID: personaID,
+            fluidContextTurn: fluidContextTurn,
+            tools: tools,
+            progress: progress,
+            onToolUse: { p in
+                await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
             },
+            onOutcome: { p, result, _ in
+                await progress?(.toolResult(name: p.internalName, output: result))
+            }
+        )
+
+        var blocks: [LLMContentBlock] = []
+        var records: [TurnEngineResult.ToolDispatchRecord] = []
+        blocks.reserveCapacity(slots.count)
+        records.reserveCapacity(slots.count)
+        for slot in slots {
+            let out = await Self.makeSlotOutputs(
+                prepared: slot.prepared,
+                result: slot.result,
+                isError: slot.isError,
+                sessionId: sessionId
+            )
+            records.append(out.record)
+            blocks.append(out.block)
+        }
+        return (blocks, records)
+    }
+
+    /// One slot's dispatch outcome, carried back to the caller in ORIGINAL
+    /// INDEX ORDER. Slot FINALIZATION (result-block shape, transcript rows)
+    /// belongs to the caller: the structured loops and the Claude text-compat
+    /// loop carry different result-block formats, but the safety veto, the
+    /// grouping and the event ORDER contract must stay one implementation.
+    struct DispatchedSlot: Sendable {
+        let index: Int
+        let prepared: PreparedToolCall
+        let result: JSONValue
+        let isError: Bool
+    }
+
+    /// Plan and execute ONE iteration's tool calls under the fail-closed
+    /// `ParallelToolDispatch` veto table, the fleet cwd overrides and the
+    /// `effectiveForceSerial` escape hatch, returning every slot's outcome in
+    /// original index order.
+    ///
+    /// EVENT CONTRACT (identical for every caller, which is the point of
+    /// this being one function): for a `.concurrent` group `onToolUse` fires
+    /// for the whole group up-front in index order, the children dispatch
+    /// concurrently under the `maxConcurrentPerIteration` window with notices
+    /// streaming live, then `onOutcome` fires in index order once the group
+    /// has completed. A `.sequential` slot is onToolUse → dispatch →
+    /// onOutcome. Errors never escape a slot and never cancel siblings; turn
+    /// cancellation cancels all in-flight children (structured task group).
+    ///
+    /// Task-local bindings the caller installs around this call (the tool
+    /// loop's `LLMCallContext.$turnActiveTools`, for one) propagate into the
+    /// task-group children, so per-call re-binding is unnecessary.
+    nonisolated static func runIterationDispatchGroups(
+        prepared: [PreparedToolCall],
+        modelId: String,
+        surface: String,
+        personaID: String? = nil,
+        fluidContextTurn: ContextPreparedTurn? = nil,
+        tools: any ToolDispatchClient,
+        progress: ChatOrchestrationProgressHandler?,
+        onToolUse: @Sendable (PreparedToolCall) async -> Void,
+        onOutcome: @Sendable (PreparedToolCall, JSONValue, Bool) async -> Void
+    ) async -> [DispatchedSlot] {
+        let baseSafe = prepared.map {
+            ParallelToolDispatch.isParallelSafe(internalToolName: $0.internalName)
+        }
+        let fleetOverrides = ParallelToolDispatch.fleetParallelOverrides(
+            names: prepared.map(\.internalName),
+            inputs: prepared.map(\.dispatchInput)
+        )
+        let groups = ParallelToolDispatch.plan(
+            parallelSafe: zip(baseSafe, fleetOverrides).map { $1 ?? $0 },
             forceSerial: ParallelToolDispatch.effectiveForceSerial
         )
 
-        var outcomes: [Int: (result: JSONValue, isError: Bool)] = [:]
-        var blocks: [LLMContentBlock] = []
-        var records: [TurnEngineResult.ToolDispatchRecord] = []
+        var slots: [DispatchedSlot] = []
+        slots.reserveCapacity(prepared.count)
 
         for group in groups {
             switch group {
             case .sequential(let idx):
                 let p = prepared[idx]
-                await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
+                await onToolUse(p)
                 let (result, isError) = await Self.runSingleDispatch(
                     prepared: p, modelId: modelId, surface: surface,
                     personaID: personaID,
                     fluidContextTurn: fluidContextTurn,
                     tools: tools, progress: progress
                 )
-                let out = await Self.makeSlotOutputs(
-                    prepared: p,
-                    result: result,
-                    isError: isError,
-                    sessionId: sessionId
-                )
-                records.append(out.record)
-                await progress?(.toolResult(name: p.internalName, output: result))
-                blocks.append(out.block)
+                await onOutcome(p, result, isError)
+                slots.append(DispatchedSlot(
+                    index: idx, prepared: p, result: result, isError: isError
+                ))
 
             case .concurrent(let indices):
                 // .toolUse for the whole group up-front, in index order —
                 // keeps the progress stream deterministic while children
                 // complete in arbitrary order.
                 for idx in indices {
-                    let p = prepared[idx]
-                    await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
+                    await onToolUse(prepared[idx])
                 }
+                var outcomes: [Int: (result: JSONValue, isError: Bool)] = [:]
                 // Window of maxConcurrentPerIteration: refill on completion.
                 await withTaskGroup(
                     of: (Int, JSONValue, Bool).self
@@ -2500,23 +2785,21 @@ extension SwiftNativeTurnEngine {
                 // to tool_use blocks by id AND expects consistent ordering.
                 for idx in indices {
                     let outcome = outcomes[idx] ?? (
-                        result: .object(["error": .string("parallel dispatch produced no result")]),
+                        result: JSONValue.object([
+                            "error": .string("parallel dispatch produced no result"),
+                        ]),
                         isError: true
                     )
                     let p = prepared[idx]
-                    let out = await Self.makeSlotOutputs(
-                        prepared: p,
-                        result: outcome.result,
-                        isError: outcome.isError,
-                        sessionId: sessionId
-                    )
-                    records.append(out.record)
-                    await progress?(.toolResult(name: p.internalName, output: outcome.result))
-                    blocks.append(out.block)
+                    await onOutcome(p, outcome.result, outcome.isError)
+                    slots.append(DispatchedSlot(
+                        index: idx, prepared: p,
+                        result: outcome.result, isError: outcome.isError
+                    ))
                 }
             }
         }
-        return (blocks, records)
+        return slots
     }
 
     /// Slot finalization, pure: dispatch record + redacted tool_result

@@ -168,21 +168,30 @@ extension NativeClient {
             chatPathImpact: "No model call; validates local Swift surfaces only.",
             createdAt: ISO8601DateFormatter().string(from: Date())
         )
-        try? await Self.persistHarnessBenchmarkRun(run)
+        try? await Self.persistHarnessBenchmarkRun(
+            run,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
         return run
     }
 
-    private static func persistHarnessBenchmarkRun(_ run: HarnessBenchmarkRun) async throws {
+    static func persistHarnessBenchmarkRun(
+        _ run: HarnessBenchmarkRun,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async throws {
         let data = try JSONEncoder().encode(run)
         let row = try JSONValue.parse(data)
-        let path = PersistenceCore.defaultDataRoot()
+        let path = dataRoot
             .appendingPathComponent("harness", isDirectory: true)
             .appendingPathComponent("benchmark", isDirectory: true)
             .appendingPathComponent("runs.jsonl")
         let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            try await persistence.appendJSONL(row, to: path)
-        }
+        try await appendPathOwnedJSONL(
+            row,
+            to: path,
+            using: persistence,
+            logLabel: "NativeClient.harnessBenchmark"
+        )
     }
 
     // PATCH-2026-05-08: improve-review-loop — diff/promote/discard client methods

@@ -14,6 +14,47 @@ import NativeAgentShared
 private let decisionActionPollTimeoutSeconds: Double = 300
 private let decisionActionPollIntervalSeconds: Double = 0.75
 
+/// The exact Mac-owned tuple returned by an authenticated action. A successful
+/// transport receipt alone is not enough to confirm a picker selection.
+struct MobileSurfaceSelectionReceipt: Equatable, Sendable {
+    let surface: String
+    let providerID: String
+    let model: String
+    let reasoningEffort: String
+    let serviceTier: String
+
+    init(response: [String: String], expectedSurface: String) throws {
+        func required(_ key: String) throws -> String {
+            guard let value = response[key], !value.isEmpty,
+                  value == value.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                throw SyncError.persistence("Mac selection response omitted canonical \(key) state")
+            }
+            return value
+        }
+        let expected = expectedSurface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let canonicalExpected = expected == "missions" ? "workshop" : expected
+        surface = try required("surface")
+        providerID = try required("provider_id")
+        model = try required("model")
+        reasoningEffort = try required("reasoning_effort")
+        serviceTier = try required("service_tier")
+        guard response["ok"] == "true", ["ok", "completed", "success"].contains(response["status"] ?? ""),
+              surface == canonicalExpected, ["default", "priority"].contains(serviceTier) else {
+            throw SyncError.persistence("Mac selection response did not confirm the requested surface's canonical tuple")
+        }
+    }
+
+    /// Old Drive snapshots may omit provider/control metadata. Known fields
+    /// must match before a snapshot can retire the existing local stale fence.
+    func isAcknowledged(by preference: SurfaceModelPref?) -> Bool {
+        guard let preference, preference.model == model else { return false }
+        if let provider = preference.providerId, provider != providerID { return false }
+        if let effort = preference.reasoningEffort, effort != reasoningEffort { return false }
+        if let tier = preference.serviceTier, tier != serviceTier { return false }
+        return true
+    }
+}
+
 extension iCloudSyncEngine {
     private func beginSendAction() throws {
         _sendLock.lock()
@@ -50,6 +91,9 @@ extension iCloudSyncEngine {
             try await Task.detached(priority: .utility) {
                 try data.write(to: url, options: .atomic)
             }.value
+            // E2: the response is durable — wake whoever is parked on it instead
+            // of making them find it on their next poll tick.
+            ActionResponseWaiters.shared.signal(actionID)
             return true
         } catch {
             syncError = "CloudKit action response could not be persisted: \(error.localizedDescription)"
@@ -253,7 +297,7 @@ extension iCloudSyncEngine {
         defer { finishSendAction() }
 
         guard let secret = pairingStore?.iCloudPairingSecret else {
-            let msg = "iCloud sync paused — pairing key not configured. Scan the QR code from Mac Settings → Pair iPhone / iPad."
+            let msg = IOSPairingPresentation.notSignedSyncMessage
             syncError = msg
             print("[iCloudSyncEngine] \(msg)")
             throw SyncError.notSigned
@@ -575,7 +619,7 @@ extension iCloudSyncEngine {
                     expectedAction: retryAction.action
                 ) {
                     if retryResp["code"] == "signature_required" || retryResp["code"] == "signature_invalid" || retryResp["ok"] == "false" {
-                        let errMsg = retryResp["error"] ?? "Signature validation failed. Re-scan the pairing QR from Mac Settings → Pair iPhone / iPad."
+                        let errMsg = retryResp["error"] ?? IOSPairingPresentation.signatureRetryMessage
                         syncError = errMsg
                     }
                     return retryResp
@@ -629,7 +673,18 @@ extension iCloudSyncEngine {
         return response
     }
 
-    /// Poll the responses directory for `msgId` until the file appears or timeout elapses.
+    /// E2: wait for the response to `msgId`.
+    ///
+    /// The expensive half of this loop was never the local mailbox read — it
+    /// was the CloudKit drain that ran on EVERY tick. A 300s decision action at
+    /// 0.75s spent ~400 drains per tap. The response now normally arrives on a
+    /// push that drains the transport, persists `responses/<msgId>.json`, and
+    /// signals the waiter, so that path costs zero extra requests; a drain is
+    /// only paid when `backstopInterval` elapses with no signal.
+    ///
+    /// The free local read keeps `interval`: the iCloud Drive lane has nothing
+    /// to signal it, and slowing it there would trade real responsiveness for
+    /// requests that were never being made.
     func pollWithTimeout(
         msgId: String,
         timeout: Double,
@@ -637,17 +692,29 @@ extension iCloudSyncEngine {
         expectedAction: String? = nil
     ) async -> [String: String]? {
         let deadline = Date().addingTimeInterval(timeout)
+        let waiters = ActionResponseWaiters.shared
+        let backstop = ActionResponseWaiters.backstopInterval
+        var lastDrainAt = Date.distantPast
+        waiters.arm(msgId)
+        defer { waiters.disarm(msgId) }
         while Date() < deadline {
             if Task.isCancelled { return nil }
-            if iCloudBridge.shared.usesCloudKitDeviceTransport {
-                await iCloudBridge.shared.pollIncomingNow()
-            }
             if let resp = await pollResponse(msgId: msgId, expectedAction: expectedAction) { return resp }
-            do {
-                try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-            } catch {
-                return nil
+            let now = Date()
+            // A signalled arrival is already durable locally, so only an
+            // unpushed backstop window has to pay for a drain.
+            if iCloudBridge.shared.usesCloudKitDeviceTransport,
+               !waiters.hasArrived(msgId),
+               now.timeIntervalSince(lastDrainAt) >= backstop {
+                lastDrainAt = now
+                await iCloudBridge.shared.pollIncomingNow()
+                continue
             }
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { break }
+            // Wakes early on a push; otherwise ticks the cheap local read.
+            _ = await waiters.wait(msgId, timeout: min(interval, remaining))
+            if Task.isCancelled { return nil }
         }
         return nil
     }
@@ -1028,7 +1095,7 @@ extension iCloudSyncEngine {
         model: String,
         reasoningEffort: String,
         serviceTier: String
-    ) async throws -> String {
+    ) async throws -> MobileSurfaceSelectionReceipt {
         let action = InboxAction.make(action: "configure_surface_selection", payload: [
             "surface": surface,
             "provider_id": providerId,
@@ -1037,7 +1104,7 @@ extension iCloudSyncEngine {
             "service_tier": serviceTier,
         ])
         let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
-        return result["result"] ?? result["status"] ?? ""
+        return try MobileSurfaceSelectionReceipt(response: result, expectedSurface: surface)
     }
 
     /// Mutate Mac integration authority through the signed action ledger and

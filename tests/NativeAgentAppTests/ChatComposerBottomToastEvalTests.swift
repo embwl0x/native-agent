@@ -3,30 +3,50 @@ import Testing
 @testable import NativeAgentApp
 
 @MainActor
-private func waitForComposerToast(
-    _ queue: ChatToastQueue,
-    equalTo expected: String,
-    timeout: TimeInterval = 1
-) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if ChatComposerBottomToastPresentation.visibleEntry(from: queue) == expected { return true }
-        try? await Task.sleep(for: .milliseconds(2))
+private final class ComposerToastTransitionProbe {
+    enum Transition: Equatable, Sendable {
+        case visible(String)
+        case cleared
     }
-    return ChatComposerBottomToastPresentation.visibleEntry(from: queue) == expected
-}
 
-@MainActor
-private func waitForComposerToastToClear(
-    _ queue: ChatToastQueue,
-    timeout: TimeInterval = 1
-) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if ChatComposerBottomToastPresentation.visibleEntry(from: queue) == nil { return true }
-        try? await Task.sleep(for: .milliseconds(2))
+    private let events: AsyncStream<Transition>
+    private let continuation: AsyncStream<Transition>.Continuation
+    private var recorded: [Transition] = []
+
+    init() {
+        let stream = AsyncStream<Transition>.makeStream()
+        events = stream.stream
+        continuation = stream.continuation
     }
-    return ChatComposerBottomToastPresentation.visibleEntry(from: queue) == nil
+
+    func record(_ entry: String?) {
+        let transition = entry.map(Transition.visible) ?? .cleared
+        recorded.append(transition)
+        continuation.yield(transition)
+    }
+
+    func next(within timeout: Duration) async -> Transition? {
+        await withTaskGroup(of: Transition?.self) { group in
+            let events = self.events
+            group.addTask {
+                var iterator = events.makeAsyncIterator()
+                return await iterator.next()
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: timeout)
+                } catch {
+                    return nil
+                }
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
+    func transitions() -> [Transition] { recorded }
 }
 
 /// Drives the exact occurrence-preserving sink used by ChatView.showToast and
@@ -37,7 +57,11 @@ struct ChatComposerBottomToastEvalTests {
     // EVAL FENCE: app.chat / ui.chat.composer.bottomToast
     @Test("every chat toast occurrence reaches the composer even when normalization matches")
     func composerToastShowsEveryProducerOccurrence() async {
-        let queue = ChatToastQueue(displayDuration: 0.02)
+        let probe = ComposerToastTransitionProbe()
+        let queue = ChatToastQueue(
+            displayDuration: 0.02,
+            visibleEntryDidChange: { probe.record($0) }
+        )
         let messages = [
             "Pinned tabs could not be updated at 2026-08-24T10:00:00Z",
             "Pinned tabs could not be updated at 2026-08-24T10:00:01Z",
@@ -49,13 +73,14 @@ struct ChatComposerBottomToastEvalTests {
             ChatComposerBottomToastPresentation.show(message, in: queue)
         }
 
-        var observed: [String] = []
-        for message in messages {
-            let appeared = await waitForComposerToast(queue, equalTo: message)
-            #expect(appeared, "composer never rendered toast: \(message)")
-            if appeared { observed.append(message) }
+        let expected = messages.flatMap {
+            [ComposerToastTransitionProbe.Transition.visible($0), .cleared]
         }
-        #expect(observed == messages)
-        #expect(await waitForComposerToastToClear(queue))
+        for transition in expected {
+            #expect(await probe.next(within: .seconds(1)) == transition)
+        }
+        #expect(await probe.next(within: .milliseconds(500)) == nil)
+        #expect(probe.transitions() == expected)
+        #expect(ChatComposerBottomToastPresentation.visibleEntry(from: queue) == nil)
     }
 }

@@ -3,6 +3,17 @@ import Testing
 @testable import NativeAgentApp
 
 @MainActor
+@Test func chatSurfacesShareOneProductionCapabilitiesStore() {
+    #expect(CapabilitiesStore.shared === CapabilitiesStore.shared)
+
+    let mainChatSource = try? AppSourceScraping.appSource("ChatView.swift")
+    let detachedChatSource = try? AppSourceScraping.appSource("DetachedChatPanelView.swift")
+    #expect(mainChatSource?.contains("CapabilitiesStore.shared") == true)
+    #expect(detachedChatSource?.contains("CapabilitiesStore.shared") == true)
+    #expect(mainChatSource?.contains("capabilitiesStore = CapabilitiesStore()") == false)
+}
+
+@MainActor
 @Test func capabilitiesStoreLoadsTheInProcessDispatcherManifest() async throws {
     let manifest: JSONValue = .object([
         "tools": .array([
@@ -43,6 +54,7 @@ import Testing
     #expect(store.fetchError == nil)
     #expect(store.tools.map(\.name) == ["messages_send", "time_now"])
     #expect(store.slashCommandTools().map(\.name) == ["time_now"])
+    #expect(store.slashCommandNames == ["time_now"])
 }
 
 @MainActor

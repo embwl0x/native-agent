@@ -263,6 +263,30 @@ public enum MacKeySyntax {
         return chords
     }
 
+    /// A held set is simultaneous, unlike the ordinary sequential key syntax.
+    /// Keep the same chord grammar, including bare modifiers, and deduplicate
+    /// physical keys so every press has exactly one release.
+    public static func parseHeldKeys(_ spec: String) throws -> (modifiers: MacKeyModifiers, keys: [UInt16]) {
+        let tokens = spec.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard !tokens.isEmpty else { throw MacKeySyntaxError.empty }
+        guard tokens.count <= maxChords else {
+            throw MacKeySyntaxError.tooManyChords(tokens.count, limit: maxChords)
+        }
+        var modifiers: MacKeyModifiers = []
+        var keys: [UInt16] = []
+        for token in tokens {
+            if let modifier = modifier(token.lowercased()) {
+                modifiers.formUnion(modifier)
+            } else {
+                for chord in try parseChords(token) {
+                    modifiers.formUnion(chord.modifiers)
+                    if !keys.contains(chord.keyCode) { keys.append(chord.keyCode) }
+                }
+            }
+        }
+        return (modifiers, keys)
+    }
+
     /// Validate literal text for the `text:` path. Unicode is emitted through
     /// `keyboardSetUnicodeString`, so no keycode table is involved and any
     /// layout works — the only limit is length.
@@ -311,13 +335,15 @@ public struct MacMouseEvent: Sendable, Equatable {
     public let x: Double
     public let y: Double
     public let clickCount: Int
+    public let modifiers: MacKeyModifiers
 
-    public init(phase: MacMousePhase, button: MacMouseButton, x: Double, y: Double, clickCount: Int = 1) {
+    public init(phase: MacMousePhase, button: MacMouseButton, x: Double, y: Double, clickCount: Int = 1, modifiers: MacKeyModifiers = []) {
         self.phase = phase
         self.button = button
         self.x = x
         self.y = y
         self.clickCount = clickCount
+        self.modifiers = modifiers
     }
 }
 
@@ -330,11 +356,13 @@ public struct MacScrollEvent: Sendable, Equatable {
     public let deltaX: Int32
     public let deltaY: Int32
     public let unit: MacScrollUnit
+    public let modifiers: MacKeyModifiers
 
-    public init(deltaX: Int32, deltaY: Int32, unit: MacScrollUnit) {
+    public init(deltaX: Int32, deltaY: Int32, unit: MacScrollUnit, modifiers: MacKeyModifiers = []) {
         self.deltaX = deltaX
         self.deltaY = deltaY
         self.unit = unit
+        self.modifiers = modifiers
     }
 }
 
@@ -422,6 +450,9 @@ public struct CGEventSink: MacEventSink {
         if event.phase != .move {
             cg.setIntegerValueField(.mouseEventClickState, value: Int64(max(1, event.clickCount)))
         }
+        // Do not race the asynchronously posted modifier key-down against
+        // creation of this event. Preserve any genuine HID flags as before.
+        cg.flags.formUnion(flags(event.modifiers))
         // A bare cursor move (`mac_nudge`) changes no app/focus state and must
         // not hide nearby genuine human activity. Button/drag events can.
         if event.phase != .move { NativeAgentMotorEpoch.noteAgentMotorEvent() }
@@ -442,6 +473,7 @@ public struct CGEventSink: MacEventSink {
             .eventSourceUserData,
             value: NativeAgentMacEventIdentity.sourceUserData
         )
+        cg.flags.formUnion(flags(event.modifiers))
         NativeAgentMotorEpoch.noteAgentMotorEvent()
         cg.post(tap: .cghidEventTap)
     }
@@ -829,6 +861,13 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
 
     private func resolveOnExecutionLane(path: [Int], pid: Int32) -> MacAXPidResolution {
         #if canImport(AppKit)
+        // NEVER resolve into our own process: an AX read of our own tree
+        // (describe() calls AXUIElementCopyActionNames) re-enters AppKit
+        // in-process and can deadlock against the main thread — the same class
+        // as the 2026-08-28 P1 in the reader. The frontmost resolve(path:)
+        // funnels through here too, so a self-frontmost target dies at this
+        // one gate.
+        guard pid != getpid() else { return .appGone }
         // The process itself first: an AXUIElement for a dead pid is a perfectly
         // constructible object whose every read fails, so "the app is gone" has
         // to be asked directly rather than inferred from an empty window list.
@@ -858,6 +897,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
 
     private func windowsOnExecutionLane(pid: Int32) -> [MacAXWindowRef] {
         #if canImport(AppKit)
+        // Same self-process fence as `resolveOnExecutionLane(path:pid:)`.
+        guard pid != getpid() else { return [] }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return [] }
         let appElement = AXUIElementCreateApplication(pid)
         let windows = MacAXWindowInventory.union(
@@ -893,6 +934,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     /// recorded window with the ordinary matcher rather than by title alone.
     private func focusedWindowOnExecutionLane(pid: Int32) -> MacAXWindowRef? {
         #if canImport(AppKit)
+        // Same self-process fence as `resolveOnExecutionLane(path:pid:)`.
+        guard pid != getpid() else { return nil }
         guard NSRunningApplication(processIdentifier: pid) != nil else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
         guard let focused = copyElement(appElement, kAXFocusedWindowAttribute) else { return nil }
@@ -937,6 +980,8 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         // a stale Automation note surviving an `.invalidTarget` would be
         // attached to the next refusal, which is a diagnosis of the wrong call.
         setRaiseDiagnostic(nil)
+        // Same self-process fence as `resolveOnExecutionLane(path:pid:)`.
+        guard window.identity.pid != getpid() else { return .invalidTarget }
         guard let app = NSRunningApplication(processIdentifier: window.identity.pid) else {
             return .invalidTarget
         }
@@ -1112,6 +1157,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
 
     private func resolveOnExecutionLane(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution {
         #if canImport(AppKit)
+        // Same self-process fence as `resolveOnExecutionLane(path:pid:)` — a
+        // stale self window handle already minted in the table must not be
+        // walkable either.
+        guard window.identity.pid != getpid() else { return .appGone }
         guard NSRunningApplication(processIdentifier: window.identity.pid) != nil else { return .appGone }
         // The window element handle the identity match already picked. No
         // focused/main/first fallback here on purpose: falling back would put

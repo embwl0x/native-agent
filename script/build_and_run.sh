@@ -149,11 +149,16 @@ if [[ "${NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
   SWIFTPM_SANDBOX_FLAG=(--disable-sandbox)
 fi
 
-swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT"
+# Development builds/installations consume the reviewed dependency pins. A
+# manifest originHash refresh must not silently resolve a newer compatible
+# release; deliberate updates belong in an explicit package-update workflow.
 swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
-  --package-path "$ROOT" --product NativeAgentChromeRelay
+  --force-resolved-versions --skip-update --package-path "$ROOT"
+swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
+  --force-resolved-versions --skip-update --package-path "$ROOT" --product NativeAgentChromeRelay
 
-BIN_DIR="$(swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} --package-path "$ROOT" --show-bin-path)"
+BIN_DIR="$(swift build ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
+  --force-resolved-versions --skip-update --package-path "$ROOT" --show-bin-path)"
 BIN="$BIN_DIR/$PRODUCT"
 CHROME_RELAY_BIN="$BIN_DIR/NativeAgentChromeRelay"
 [[ -x "$CHROME_RELAY_BIN" ]] || {

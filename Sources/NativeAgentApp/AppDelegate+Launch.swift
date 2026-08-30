@@ -182,14 +182,16 @@ extension AppDelegate {
                 return
             }
 
-            // Rebuildable projections converge only after the canonical
-            // migration boundary. Keeping this sequence in one utility task
-            // prevents first-launch USER/KG/Spotlight snapshots from racing an
-            // empty pre-migration store.
-            do {
-                _ = try await SwiftNativeMemoryV2.shared.reconcileKnowledgeGraphProjection()
-            } catch {
-                logger.error("MemoryV2 Knowledge Graph reconciliation failed: \(String(describing: error), privacy: .public)")
+            // A full graph rebuild is only required when this launch actually
+            // crossed the canonical migration boundary. On healthy launches,
+            // the shared MemoryV2 startup hook performs a bounded additive
+            // backfill instead of deleting and recreating every graph row.
+            if !report.skippedAlreadyMigrated {
+                do {
+                    _ = try await SwiftNativeMemoryV2.shared.reconcileKnowledgeGraphProjection()
+                } catch {
+                    logger.error("MemoryV2 Knowledge Graph reconciliation failed: \(String(describing: error), privacy: .public)")
+                }
             }
             if let generator = await SwiftNativeMemoryV2.shared.bindUserMDGenerator(
                 dataRoot: NativeAgentPaths.dataRoot,
@@ -514,6 +516,14 @@ extension AppDelegate {
         MacControlBridge.shared.stop()
         MainActor.assumeIsolated {
             BrowserWindowController.shared.stopIPCServer()
+            // The phone bridge and its snapshot projection are ingress too.
+            // Stop them before cognition/loop drains: otherwise a late iCloud
+            // action or cognition-change observation can start new snapshot
+            // work while the process is trying to reach a terminal state.
+            iCloudBridge.shared.tearDown()
+            // tearDown also schedules this stop for non-termination callers;
+            // perform it synchronously here so shutdown ordering is explicit.
+            MacSyncEngine.shared.stop()
         }
 
         let group = DispatchGroup()
@@ -537,14 +547,6 @@ extension AppDelegate {
             // on the turn path; drain its chain at quit so a trace enqueued
             // moments before termination isn't lost.
             await TurnPlanTraceWriter.shared.drain()
-            group.leave()
-        }
-        group.enter()
-        Task.detached {
-            // Interoception review (gpt-5.5): the vitals snapshot is never
-            // written on the observe path — persist it here, at termination,
-            // so the telemetry survives across runs.
-            await NativeCognitionRuntime.shared.persistProviderVitalsSnapshot()
             group.leave()
         }
         group.enter()

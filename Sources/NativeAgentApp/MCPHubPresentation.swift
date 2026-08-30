@@ -2,6 +2,46 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 
+/// Server metadata can lag the inventory already displayed below its row.
+/// Only the selected server's successful read proves a current visible count.
+enum MCPHubServerCountPresentation: Equatable {
+    case loaded(Int)
+    case reported(Int)
+    case unknown
+
+    static func resolve(
+        isSelected: Bool,
+        isCurrent: Bool,
+        visibleCount: Int,
+        reportedCount: Int?
+    ) -> Self {
+        if isSelected, isCurrent { return .loaded(visibleCount) }
+        guard let reportedCount, reportedCount >= 0 else { return .unknown }
+        return .reported(reportedCount)
+    }
+
+    func label(noun: String) -> String {
+        switch self {
+        case let .loaded(count):
+            return "\(count) \(noun)\(count == 1 ? "" : "s")"
+        case let .reported(count):
+            return "\(count) \(noun)\(count == 1 ? "" : "s") reported"
+        case .unknown:
+            return "\(noun.capitalized) count unknown"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .loaded:
+            return "Count from this server's successfully loaded inventory."
+        case .reported:
+            return "Last reported by the server; its current inventory has not been verified here."
+        case .unknown:
+            return "This server has not reported a usable count, and its current inventory has not been loaded."
+        }
+    }
+}
 enum MCPHubResourceReadState: Equatable {
     case notLoaded
     case loading

@@ -15,27 +15,32 @@ extension ChatView {
         // send (instead of clicking from the popover), dispatch it instead of
         // shipping it as a chat message. Otherwise `/model gpt-5.5` would go
         // to the LLM as text, which the agent would echo back at us.
-        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         // B.2: only intercept known slash commands; /tmp/foo or any other
         // non-command text falls through to regular chat send.
-        if trimmed.hasPrefix("/") {
-            let firstToken = trimmed.dropFirst().components(separatedBy: .whitespacesAndNewlines).first ?? ""
-            let firstTokenLC = firstToken.lowercased()
-            if ChatSlashCommandRegistry.commandNames.contains(firstTokenLC) {
-                handleSlashCommand(String(trimmed.dropFirst()))
-                // handleSlashCommand clears `text` itself; clear pending attachments too
-                pendingAttachments = []
-                return
-            }
-            // Phase 13 (item 7): also match dynamically-registered capability tools.
-            // If the user typed /recall_search, /workspace_list, or any other tool
-            // exposed by capabilitiesStore, dispatch it instead of falling through to chat.
-            let dynamicTools = capabilitiesStore.slashCommandTools()
-            if dynamicTools.contains(where: { $0.name == firstTokenLC }) {
-                handleSlashCommand(String(trimmed.dropFirst()))
-                pendingAttachments = []
-                return
-            }
+        //
+        // Phase 13 (item 7): dynamically-registered capability tools count too
+        // — /recall_search, /workspace_list and friends dispatch rather than
+        // reaching the LLM as text.
+        //
+        // D2 (2026-08-28): the prefix check itself now lives in
+        // ChatSlashCommandRouting so the detached panel makes the same call.
+        switch ChatSlashCommandRouting.decide(
+            text: message,
+            dynamicToolNames: capabilitiesStore.slashCommandNames,
+            supportsDispatch: true
+        ) {
+        case .dispatch(let commandLine):
+            handleSlashCommand(commandLine)
+            // handleSlashCommand clears `text` itself; clear pending attachments too
+            pendingAttachments = []
+            return
+        case .unsupportedHere(let command):
+            // Unreachable with supportsDispatch: true; kept exhaustive so a new
+            // decision case cannot silently fall through to a chat send.
+            showToast(ChatSlashCommandRouting.unsupportedMessage(command: command))
+            return
+        case .sendAsMessage:
+            break
         }
         Task { @MainActor in
             let acceptance = await appModel.startActiveChatTurn(

@@ -159,6 +159,44 @@ private struct PhysiologyStubLoop: EventDeadlineLoopRunner {
     }
 }
 
+private actor PhysiologyOutcomePlan {
+    private var outcomes: [LoopTickOutcome]
+    private(set) var count = 0
+    /// Wall-clock stamp per tick entry, so a test can assert the SPACING the
+    /// manager imposed between event-driven fires, not just that they happened.
+    private(set) var stamps: [Date] = []
+
+    init(_ outcomes: [LoopTickOutcome]) {
+        self.outcomes = outcomes
+    }
+
+    func next() -> LoopTickOutcome {
+        count += 1
+        stamps.append(Date())
+        if !outcomes.isEmpty {
+            return outcomes.removeFirst()
+        }
+        return .completed(result: nil)
+    }
+
+    func gap(from: Int, to: Int) -> TimeInterval? {
+        guard stamps.indices.contains(from), stamps.indices.contains(to) else { return nil }
+        return stamps[to].timeIntervalSince(stamps[from])
+    }
+}
+
+private struct FailureAwarePhysiologyLoop: EventDeadlineLoopRunner {
+    let loopId: String
+    let interval: TimeInterval = 86_400
+    let eventCoalescingDelay: TimeInterval = 0
+    let source: PhysiologyEventSource
+    let plan: PhysiologyOutcomePlan
+
+    func tickOutcome() async -> LoopTickOutcome { await plan.next() }
+    func physiologyEvents() -> AsyncStream<Void> { source.stream }
+    func nextMeaningfulDeadline(after now: Date) async -> Date? { nil }
+}
+
 private func stubManifest() -> [any LoopRunner] {
     [
         StubLoop("doctor_auto_run"),
@@ -384,7 +422,7 @@ struct BackgroundLoopsManagerTests {
         clock.advance(loop.interval)
 
         let pause = DueWakeAdmissionPause()
-        await manager._testSetDueWakePreAdmissionHook { await pause.pause() }
+        await manager._testSetAutomaticWakePreAdmissionHook { await pause.pause() }
         let osWake = Task { await manager.runTickIfDue(loopId: loop.loopId) }
         await pause.waitUntilStarted() // the OS wake's initial durable read was due
 
@@ -406,8 +444,76 @@ struct BackgroundLoopsManagerTests {
             await scheduler._testPersistedLastRun(loopId: loop.loopId) == periodicStamp,
             "the post-gate not-due wake advanced the durable cadence"
         )
-        await manager._testSetDueWakePreAdmissionHook(nil)
+        await manager._testSetAutomaticWakePreAdmissionHook(nil)
         await manager.stop()
+    }
+
+    @Test("an admitted OS wake cannot outlive stop or restart", arguments: [false, true])
+    func dueWakeRejectsRetiredLifecycle(restartBeforeRelease: Bool) async {
+        let clock = DueAwareClock(Date(timeIntervalSince1970: 5_000_000))
+        let scheduler = SwiftNativeLoopScheduler(
+            clock: { clock.read() }, startupStagger: 3_600, durableFlushWindow: 0
+        )
+        let manager = BackgroundLoopsManager(scheduler: scheduler, clock: { clock.read() })
+        let counter = TickCounter()
+        let loop = AsyncStubLoop("retired_due_wake", interval: 3_600) { await counter.bump() }
+        await manager.start(loops: [loop])
+        clock.advance(loop.interval)
+        let originalStamp = await scheduler._testPersistedLastRun(loopId: loop.loopId)
+        let pause = DueWakeAdmissionPause()
+        await manager._testSetAutomaticWakePreAdmissionHook { await pause.pause() }
+        let wake = Task { await manager.runTickIfDue(loopId: loop.loopId) }
+        await pause.waitUntilStarted()
+
+        await manager.stop()
+        if restartBeforeRelease { await manager.start() }
+        await pause.release()
+        #expect(await wake.value == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true))
+        #expect(await counter.value == 0)
+        #expect(await scheduler._testPersistedLastRun(loopId: loop.loopId) == originalStamp)
+        #expect(await manager.status().first { $0.name == loop.loopId }?.runCount == 0)
+        await manager.stop()
+        #expect(await manager.runTickIfDue(loopId: loop.loopId)
+            == .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true))
+        #expect(!(await manager.isRunning()))
+
+        // Only the explicit manual entry retains permission to start/run.
+        await manager._testSetAutomaticWakePreAdmissionHook(nil)
+        #expect(await manager.runTickOnce(loopId: loop.loopId) == .completed(result: nil))
+        #expect(await counter.value == 1)
+        await manager.stop()
+    }
+
+    @Test("a pending physiology deadline cannot restart a stopped manager")
+    func physiologyWakeRejectsRetiredLifecycle() async {
+        let clock = DueAwareClock(Date())
+        let scheduler = SwiftNativeLoopScheduler(
+            clock: { clock.read() }, startupStagger: 0, durableFlushWindow: 0
+        )
+        let manager = BackgroundLoopsManager(scheduler: scheduler, clock: { clock.read() })
+        let counter = TickCounter()
+        let loop = PhysiologyStubLoop(
+            loopId: "retired_physiology_wake", eventCoalescingDelay: 0,
+            source: PhysiologyEventSource(), counter: counter,
+            deadlineState: PhysiologyDeadlineState(Date().addingTimeInterval(3_600))
+        )
+        await manager.start(loops: [loop])
+        await manager._testWaitForPhysiologyStartup(loopId: loop.loopId)
+        #expect(await counter.value == 1)
+        let originalStamp = await scheduler._testPersistedLastRun(loopId: loop.loopId)
+        clock.advance(10)
+        let pause = DueWakeAdmissionPause()
+        await manager._testSetAutomaticWakePreAdmissionHook { await pause.pause() }
+        let wake = Task { await manager._testFirePhysiologyDeadline(loopId: loop.loopId) }
+        await pause.waitUntilStarted()
+        await manager.stop()
+        await pause.release()
+        await wake.value
+
+        #expect(!(await manager.isRunning()))
+        #expect(await counter.value == 1)
+        #expect(await scheduler._testPersistedLastRun(loopId: loop.loopId) == originalStamp)
+        #expect(await manager._testPhysiologyDeadline(loopId: loop.loopId) == nil)
     }
 
     @Test("status distinguishes an active tick from a merely registered loop")
@@ -707,6 +813,149 @@ struct BackgroundLoopsManagerTests {
         await deadlineState.set(deadline)
         await manager._testRunPeriodicTick(loopId: loop.loopId)
         #expect(await manager._testPhysiologyDeadline(loopId: loop.loopId) == deadline)
+        await manager.stop()
+    }
+
+    @Test("event physiology respects active failure backoff before refiring")
+    func physiologyEventHonorsFailureBackoff() async throws {
+        let source = PhysiologyEventSource()
+        let plan = PhysiologyOutcomePlan([
+            .failed(error: "boom"),
+            .completed(result: nil),
+        ])
+        let scheduler = SwiftNativeLoopScheduler(
+            failureBackoff: LoopFailureBackoffPolicy(
+                baseDelay: 0.05,
+                maxDelay: 0.05,
+                multiplier: 2,
+                jitterRange: 1.0...1.0
+            ),
+            minimumTickSpacing: 0.01,
+            jitter: { _ in 1.0 }
+        )
+        let manager = BackgroundLoopsManager(scheduler: scheduler)
+        let loop = FailureAwarePhysiologyLoop(
+            loopId: "failure_event_lane",
+            source: source,
+            plan: plan
+        )
+        await manager.start(loops: [loop])
+        await manager._testWaitForPhysiologyStartup(loopId: loop.loopId)
+        #expect(await plan.count == 1)
+
+        source.emit()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await plan.count == 1)
+
+        let deadline = Date().addingTimeInterval(2)
+        while await plan.count < 2, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await plan.count == 2)
+        await manager.stop()
+    }
+
+    /// A FAILING event-driven loop must not refire at event rate. This is the
+    /// github_tracking shape: a broken loop whose stream kept delivering wrote
+    /// 740 failure receipts because the event lane never consulted backoff.
+    @Test("a failing event-driven loop is spaced by its backoff, not by event rate")
+    func physiologyFailingLoopIsSpacedNotStormed() async throws {
+        let source = PhysiologyEventSource()
+        let plan = PhysiologyOutcomePlan([
+            .failed(error: "boom"),
+            .failed(error: "boom"),
+        ])
+        let scheduler = SwiftNativeLoopScheduler(
+            failureBackoff: LoopFailureBackoffPolicy(
+                baseDelay: 0.4,
+                maxDelay: 0.4,
+                multiplier: 2,
+                jitterRange: 1.0...1.0
+            ),
+            minimumTickSpacing: 0.01,
+            jitter: { _ in 1.0 }
+        )
+        let manager = BackgroundLoopsManager(scheduler: scheduler)
+        let loop = FailureAwarePhysiologyLoop(
+            loopId: "storming_event_lane",
+            source: source,
+            plan: plan
+        )
+        await manager.start(loops: [loop])
+        await manager._testWaitForPhysiologyStartup(loopId: loop.loopId)
+        #expect(await plan.count == 1)
+
+        // Storm the lane: every emit would previously have fired a tick.
+        for _ in 0..<40 { source.emit() }
+
+        let deadline = Date().addingTimeInterval(3)
+        while await plan.count < 2, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await plan.count == 2)
+        let gap = await plan.gap(from: 0, to: 1)
+        #expect(gap != nil)
+        // Spaced by the 0.4s backoff. A loaded host can only make this LARGER,
+        // so the lower bound is the safe direction to assert.
+        #expect((gap ?? 0) >= 0.3)
+
+        // Deterministic half: the spacing the scheduler itself computes for a
+        // loop that is mid-failure-streak, independent of host timing.
+        let lastTickAt = await scheduler.loopState(loopId: loop.loopId)?.lastTickAt
+        #expect(lastTickAt != nil)
+        if let lastTickAt {
+            let eligible = await scheduler.nextPhysiologyEligibleAt(
+                loopId: loop.loopId,
+                at: lastTickAt
+            )
+            #expect(eligible != nil)
+            // 0.39, not 0.4: Date round-trips through Double seconds.
+            #expect((eligible?.timeIntervalSince(lastTickAt) ?? 0) >= 0.39)
+        }
+        await manager.stop()
+    }
+
+    /// The other half of the constraint: spacing is for FAILING loops only. A
+    /// healthy event-driven loop must still fire well inside a second, or the
+    /// churn fix would have made every event lane feel laggy.
+    @Test("a healthy event-driven loop still fires sub-second on its event")
+    func physiologyHealthyLoopFiresSubSecond() async throws {
+        let source = PhysiologyEventSource()
+        let plan = PhysiologyOutcomePlan([])
+        // Production defaults deliberately: this pins that the shipped
+        // minimum event-fire spacing is itself sub-second.
+        let scheduler = SwiftNativeLoopScheduler()
+        let manager = BackgroundLoopsManager(scheduler: scheduler)
+        let loop = FailureAwarePhysiologyLoop(
+            loopId: "healthy_event_lane",
+            source: source,
+            plan: plan
+        )
+        await manager.start(loops: [loop])
+        await manager._testWaitForPhysiologyStartup(loopId: loop.loopId)
+        #expect(await plan.count == 1)
+
+        source.emit()
+        let deadline = Date().addingTimeInterval(5)
+        while await plan.count < 2, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await plan.count == 2)
+
+        // The sub-second requirement is asserted STRUCTURALLY, not as an
+        // elapsed wall-clock bound: a loaded host inflates observed latency,
+        // but the spacing the scheduler imposes on a healthy loop is a pure
+        // computation and must stay well under a second.
+        let lastTickAt = await scheduler.loopState(loopId: loop.loopId)?.lastTickAt
+        #expect(lastTickAt != nil)
+        if let lastTickAt {
+            let eligible = await scheduler.nextPhysiologyEligibleAt(
+                loopId: loop.loopId,
+                at: lastTickAt
+            )
+            #expect(eligible != nil)
+            #expect((eligible?.timeIntervalSince(lastTickAt) ?? 99) < 1.0)
+        }
         await manager.stop()
     }
 }

@@ -91,9 +91,26 @@ find_ios_snapshot() {
     printf '%s\n' "$IOS_SNAPSHOT_PATH"
     return 0
   fi
-  if command -v mdfind >/dev/null 2>&1; then
-    mdfind 'kMDItemFSName == "organism_living_status.json"' | head -n 1
+  # The resident Mac runtime's cache is the canonical local projection of the
+  # iOS snapshot. Prefer it deterministically; Spotlight ordering is undefined
+  # and previously selected a 2023 test fixture while fresh live data existed.
+  local cached="$DATA_ROOT/mobile_snapshot_cache/snapshots/organism_living_status.json"
+  if [ -f "$cached" ]; then
+    printf '%s\n' "$cached"
     return 0
+  fi
+  if command -v mdfind >/dev/null 2>&1; then
+    local candidate
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      case "$candidate" in
+        "$REPO_ROOT"/tests/*|"$REPO_ROOT"/Tests/*|"$REPO_ROOT"/Modules/*/Tests/*)
+          continue
+          ;;
+      esac
+      printf '%s\n' "$candidate"
+      return 0
+    done < <(mdfind 'kMDItemFSName == "organism_living_status.json"' 2>/dev/null || true)
   fi
   return 1
 }
@@ -172,7 +189,22 @@ if [ "$bridge_rc" -eq 0 ]; then
   memory="$(jq -r '.organism.bodySchema.memoryHealthy // false' "$state_file")"
   resource="$(jq -r '.organism.bodySchema.resourcePressure // "unknown"' "$state_file")"
 
-  bool_status "$providers" "providers healthy" "false; expect careful/verify posture"
+  provider_available="$(jq -r '.organism.bodySchema.providersAvailable | if type == "boolean" then tostring else "unknown" end' "$state_file")"
+  provider_belief="$(jq -r '.organism.bodySchema.providerPathBelief.state // "unknown"' "$state_file")"
+  # The compatibility Boolean collapses stale/uncertain evidence to false.
+  # Report the canonical belief instead of implying an observed outage.
+  if [ "$provider_available" = "false" ]; then
+    status WARN "provider path" "unavailable; no configured usable provider"
+  else
+    case "$provider_belief" in
+      healthy) status PASS "provider path" "healthy; availability=$provider_available" ;;
+      brittle) status WARN "provider path" "brittle; recent lifecycle evidence indicates failures" ;;
+      uncertain|stale|unobserved)
+        status WARN "provider path" "$provider_belief; health not established, not proof of an outage; availability=$provider_available"
+        ;;
+      *) bool_status "$providers" "providers healthy" "health not established; detailed provider evidence unavailable" ;;
+    esac
+  fi
   bool_status "$tools" "tools available" "false; expect careful/verify posture"
   bool_status "$approvals" "approval path open" "false; expect approval-bound posture"
   bool_status "$memory" "memory healthy" "false; expect context-first posture"
@@ -185,6 +217,10 @@ if [ "$bridge_rc" -eq 0 ]; then
     status PASS "resource pressure" "$resource"
   else
     status WARN "resource pressure" "$resource; expect conserve/sleep loop budget"
+  fi
+  resource_causes="$(jq -r '.organism.bodySchema.resourcePressureReading | if type == "object" then "thermal=\(.thermalPressure // "unknown") lowPowerMode=\(if (.lowPowerMode | type) == "boolean" then .lowPowerMode else "unknown" end)" else empty end' "$state_file")"
+  if [ -n "$resource_causes" ]; then
+    status INFO "resource pressure source" "$resource_causes; not a RAM-usage reading"
   fi
 
   last_signal_age="$(jq -r 'if .organism.lastSignalAt == null then "unknown" else ((now - (.organism.lastSignalAt | fromdateiso8601)) | floor | tostring) end' "$state_file" 2>/dev/null || echo unknown)"
@@ -223,7 +259,14 @@ if [ -n "$snapshot_path" ] && [ -f "$snapshot_path" ]; then
     ios_biases="$(jq -r '.counters.approvedReflexBiases // 0' "$snapshot_path")"
     ios_candidates="$(jq -r '(.reflexCandidates // []) | length' "$snapshot_path")"
     ios_proposals="$(jq -r '(.standingViewProposals // []) | length' "$snapshot_path")"
-    status PASS "organism_living_status" "generatedAt=$generated posture=$ios_posture reviews=$ios_reviews biases=$ios_biases candidates=$ios_candidates proposals=$ios_proposals"
+    snapshot_mtime="$(stat -f '%m' "$snapshot_path" 2>/dev/null || echo 0)"
+    snapshot_age="$(( $(date +%s) - snapshot_mtime ))"
+    if [ "$snapshot_age" -lt 0 ]; then snapshot_age=0; fi
+    if [ "$snapshot_mtime" -gt 0 ] && [ "$snapshot_age" -le 600 ]; then
+      status PASS "organism_living_status" "generatedAt=$generated age=${snapshot_age}s posture=$ios_posture reviews=$ios_reviews biases=$ios_biases candidates=$ios_candidates proposals=$ios_proposals"
+    else
+      status WARN "organism_living_status" "stale snapshot generatedAt=$generated age=${snapshot_age}s posture=$ios_posture"
+    fi
     status INFO "snapshot path" "$snapshot_path"
   else
     status FAIL "organism_living_status" "found but invalid JSON: $snapshot_path"

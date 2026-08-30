@@ -69,7 +69,8 @@ private struct GitHubTrackingRunner: EventDeadlineLoopRunner {
     func physiologyEvents() -> AsyncStream<Void> {
         return EventDeadlinePhysiology.storeAndFileEvents(
             paths: BackgroundLoopsAssembly.githubTrackingWatchedPaths(dataRoot: dataRoot),
-            stores: [.desk, .githubCommand]
+            stores: [.desk, .githubCommand],
+            loopId: loopId
         )
     }
 

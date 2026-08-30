@@ -475,72 +475,76 @@ public actor SwiftNativeToolRegistry: ToolRegistryProtocol {
             let sourceDir = try Self._resolveSourceDir(record: obj, toolsRoot: toolsRoot, id: id)
             let fm = FileManager.default
             try fm.createDirectory(at: quarantineRoot, withIntermediateDirectories: true)
-            // SAFE-SWAP REORDER (Finding #5):
-            //   Old order: rmtree(existing quarantine) → copy(src→tmp) → move(tmp→final).
-            //   Risk: if src is missing or copy fails mid-flight, the prior
-            //   quarantined body is already gone — data loss.
-            //   New order:
-            //     1. copy src → .incoming-<uuid>
-            //     2. move existing quarantineDir → .backup-<uuid> (atomic)
-            //     3. move .incoming-<uuid> → quarantineDir       (atomic)
-            //     4. on success: rm .backup-<uuid>
-            //     5. on any failure: clean .incoming, restore .backup.
-            if let src = sourceDir, fm.fileExists(atPath: src.path) {
-                let incoming = quarantineRoot.appendingPathComponent(
-                    ".incoming-\(id)-\(UUID().uuidString)", isDirectory: true)
-                let backup = quarantineRoot.appendingPathComponent(
-                    ".backup-\(id)-\(UUID().uuidString)", isDirectory: true)
-                // Step 1: copy into sibling tmp. If this throws, no existing
-                // state has been disturbed yet.
-                try fm.copyItem(at: src, to: incoming)
-                var backedUp = false
-                do {
-                    // Step 2: rotate existing quarantine aside.
-                    if fm.fileExists(atPath: quarantineDir.path) {
-                        try fm.moveItem(at: quarantineDir, to: backup)
-                        backedUp = true
-                    }
-                    // Step 3: swing incoming into place.
-                    try fm.moveItem(at: incoming, to: quarantineDir)
-                    // Step 4: discard the backup.
-                    if backedUp {
-                        try? fm.removeItem(at: backup)
-                    }
-                } catch {
-                    // Step 5: restore prior state, drop incoming.
+            // Keep the old body until the REGISTRY commit succeeds, not just
+            // until the incoming directory lands. The registry and directory
+            // replacement are one transaction under the enclosing file lock.
+            var incoming: URL?
+            var backup: URL?
+            var installedReplacement = false
+            defer {
+                // copyItem can leave a partial destination before throwing.
+                // Cleanup must cover that failure as well as later failures.
+                if let incoming, fm.fileExists(atPath: incoming.path) {
                     try? fm.removeItem(at: incoming)
-                    if backedUp && !fm.fileExists(atPath: quarantineDir.path) {
-                        try? fm.moveItem(at: backup, to: quarantineDir)
-                    } else if backedUp {
-                        try? fm.removeItem(at: backup)
-                    }
-                    throw error
                 }
             }
-            // If sourceDir is nil or missing, do NOT touch an existing
-            // quarantine dir — preserving prior body is strictly safer than
-            // mirroring the old delete-only branch.
+            do {
+                if let src = sourceDir, fm.fileExists(atPath: src.path) {
+                    let incomingPath = quarantineRoot.appendingPathComponent(
+                        ".incoming-\(id)-\(UUID().uuidString)", isDirectory: true)
+                    incoming = incomingPath
+                    try fm.copyItem(at: src, to: incomingPath)
+                    if fm.fileExists(atPath: quarantineDir.path) {
+                        let backupPath = quarantineRoot.appendingPathComponent(
+                            ".backup-\(id)-\(UUID().uuidString)", isDirectory: true)
+                        try fm.moveItem(at: quarantineDir, to: backupPath)
+                        backup = backupPath
+                    }
+                    try fm.moveItem(at: incomingPath, to: quarantineDir)
+                    installedReplacement = true
+                }
+                // If sourceDir is nil or missing, do NOT touch an existing
+                // quarantine dir — preserving prior body is strictly safer than
+                // mirroring the old delete-only branch.
 
-            let stamp = isoTimestamp(now)
-            // Flip status + phase to quarantined; stamp quarantinedAt + reason
-            // + quarantinePath. Mirrors daemon L34027-34034.
-            obj["status"] = .string("quarantined")
-            obj["phase"] = .string("quarantined")
-            obj["updatedAt"] = .string(stamp)
-            obj["quarantinedAt"] = .string(stamp)
-            obj["quarantineReason"] = .string(reason)
-            obj["quarantinePath"] = .string(quarantineDir.path)
-            // CARVED OUT (NOT TOUCHED):
-            //   manifestSignature / signedAt / codeFingerprint — the signing
-            //                    block is invariant under quarantine; it's
-            //                    proof of WHAT was quarantined, not metadata
-            //                    about the quarantine.
-            mutated[idx] = .object(obj)
-            try await persistence.writeJSON(.array(mutated), to: registryPath)
-            guard let rec = ToolRecord(json: .object(obj)) else {
-                throw ToolRegistryError.registryUnreadable(reason: "post-quarantine record unparseable")
+                let stamp = isoTimestamp(now)
+                // Flip status + phase to quarantined; stamp quarantinedAt + reason
+                // + quarantinePath. Mirrors daemon L34027-34034.
+                obj["status"] = .string("quarantined")
+                obj["phase"] = .string("quarantined")
+                obj["updatedAt"] = .string(stamp)
+                obj["quarantinedAt"] = .string(stamp)
+                obj["quarantineReason"] = .string(reason)
+                obj["quarantinePath"] = .string(quarantineDir.path)
+                // CARVED OUT (NOT TOUCHED):
+                //   manifestSignature / signedAt / codeFingerprint — the signing
+                //                    block is invariant under quarantine; it's
+                //                    proof of WHAT was quarantined, not metadata
+                //                    about the quarantine.
+                mutated[idx] = .object(obj)
+                guard let rec = ToolRecord(json: .object(obj)) else {
+                    throw ToolRegistryError.registryUnreadable(reason: "post-quarantine record unparseable")
+                }
+                try await persistence.writeJSON(.array(mutated), to: registryPath)
+                // Durable registry commit is the point at which the old backup
+                // becomes disposable. A failed cleanup only leaves recoverable
+                // litter; it cannot destroy the authoritative body.
+                if let backup { try? fm.removeItem(at: backup) }
+                return rec
+            } catch {
+                let mutationError = error
+                do {
+                    if installedReplacement { try fm.removeItem(at: quarantineDir) }
+                    if let backup { try fm.moveItem(at: backup, to: quarantineDir) }
+                } catch {
+                    // Never delete the only old copy when rollback fails.
+                    let recoveryPath = backup?.path ?? quarantineDir.path
+                    throw ToolRegistryError.underlying(
+                        "quarantine failed: \(mutationError.localizedDescription); rollback failed: \(error.localizedDescription); recovery body retained at \(recoveryPath)"
+                    )
+                }
+                throw mutationError
             }
-            return rec
         }
 
         // Cross-process flock around the R-M-W of registry.json + the file

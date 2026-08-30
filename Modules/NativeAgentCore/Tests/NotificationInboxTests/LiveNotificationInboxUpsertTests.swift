@@ -30,6 +30,26 @@ private func upsertFixture(_ id: String, status: String = "unread", body: String
     ])
 }
 
+private func informationalFixture(
+    _ id: String,
+    severity: String = "info",
+    status: String = "unread",
+    createdAt: String,
+    body: String
+) -> JSONValue {
+    .object([
+        "id": .string(id),
+        "created_at": .string(createdAt),
+        "source": .string("recurring-health-note"),
+        "severity": .string(severity),
+        "title": .string("Recurring health note"),
+        "summary": .string(body),
+        "actions": .array([]),
+        "status": .string(status),
+        "read_at": status == "read" ? .string("2026-08-23T00:01:00Z") : .null,
+    ])
+}
+
 private func upsertTestPath() throws -> URL {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("live-inbox-upsert-\(UUID().uuidString)", isDirectory: true)
@@ -151,6 +171,81 @@ func liveInboxUpsertCoexistsWithAppendUnique() async throws {
     let rows = try await inbox.rows()
     #expect(rows.count == 1)
     #expect(summaries(rows) == ["twice"])
+}
+
+@Test("opted-in repeated info notices roll up into one resurfaced card")
+func informationalNoticesRollUpWithoutUnreadPile() async throws {
+    let path = try upsertTestPath()
+    defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+    let inbox = LiveNotificationInbox(path: path)
+
+    let first = try await inbox.appendOrRollUpInformational(
+        informationalFixture(
+            "first", createdAt: "2026-08-23T00:00:00Z", body: "first occurrence"
+        ),
+        id: "first",
+        rollupKey: "health:provider-a"
+    )
+    #expect(first == .init(inserted: true, cardID: "first", occurrenceCount: 1))
+    #expect(try await inbox.updateStatus(
+        id: "first", status: "read", readAt: "2026-08-23T00:01:00Z"
+    ))
+
+    let repeated = try await inbox.appendOrRollUpInformational(
+        informationalFixture(
+            "second", createdAt: "2026-08-24T00:00:00Z", body: "second occurrence"
+        ),
+        id: "second",
+        rollupKey: "health:provider-a"
+    )
+    #expect(repeated == .init(inserted: false, cardID: "first", occurrenceCount: 2))
+
+    let rows = try await inbox.rows()
+    #expect(rows.count == 1)
+    guard case .object(let row)? = rows.first else {
+        Issue.record("missing rolled-up informational card")
+        return
+    }
+    #expect(row["id"] == .string("first"))
+    #expect(row["summary"] == .string("second occurrence"))
+    #expect(row["status"] == .string("unread"))
+    #expect(row["read_at"] == .null)
+    #expect(row["occurrence_count"] == .int(2))
+    #expect(row["first_created_at"] == .string("2026-08-23T00:00:00Z"))
+    #expect(row["last_created_at"] == .string("2026-08-24T00:00:00Z"))
+}
+
+@Test("roll-up never consolidates important or archived informational cards")
+func informationalRollupProtectsAttentionAndHandledHistory() async throws {
+    let path = try upsertTestPath()
+    defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
+    let inbox = LiveNotificationInbox(path: path)
+
+    _ = try await inbox.appendOrRollUpInformational(
+        informationalFixture(
+            "handled", status: "archived", createdAt: "2026-08-23T00:00:00Z", body: "handled"
+        ),
+        id: "handled",
+        rollupKey: "health:provider-a"
+    )
+    _ = try await inbox.appendOrRollUpInformational(
+        informationalFixture(
+            "fresh", createdAt: "2026-08-24T00:00:00Z", body: "fresh"
+        ),
+        id: "fresh",
+        rollupKey: "health:provider-a"
+    )
+    _ = try await inbox.appendOrRollUpInformational(
+        informationalFixture(
+            "important", severity: "important", createdAt: "2026-08-25T00:00:00Z",
+            body: "needs individual identity"
+        ),
+        id: "important",
+        rollupKey: "health:provider-a"
+    )
+
+    let rows = try await inbox.rows()
+    #expect(Set(ids(rows)) == ["handled", "fresh", "important"])
 }
 
 @Test("upsert enforces the same retention bound as append")

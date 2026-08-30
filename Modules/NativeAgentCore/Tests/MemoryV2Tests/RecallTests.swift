@@ -36,6 +36,208 @@ private func makeActor() -> (SwiftNativeMemoryV2, InMemoryMemoryStorage, MockEmb
     }
 }
 
+/// Deliberately cancellation-unaware suspension, modeling a provider/storage
+/// operation that finishes after its caller has stopped. No sleeps or polling.
+private actor RecallCancellationGate {
+    private var entered = false
+    private var arrival: CheckedContinuation<Void, Never>?
+    private var release: CheckedContinuation<Void, Never>?
+
+    func pause() async {
+        entered = true
+        arrival?.resume()
+        arrival = nil
+        await withCheckedContinuation { release = $0 }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { arrival = $0 }
+    }
+
+    func open() {
+        release?.resume()
+        release = nil
+    }
+}
+
+private struct RecallCancellationEmbedder: EmbeddingProvider {
+    enum ResultMode: Sendable, CaseIterable { case transientCancellation, zero, dense }
+    let dimensions = 2
+    let modelId = "recall-cancellation-fixture"
+    let mode: ResultMode
+    var gate: RecallCancellationGate? = nil
+
+    func embed(_ texts: [String]) async throws -> [[Float]] {
+        if let gate { await gate.pause() }
+        switch mode {
+        case .transientCancellation: throw CancellationError()
+        case .zero: return texts.map { _ in [0, 0] }
+        case .dense: return texts.map { _ in [1, 0] }
+        }
+    }
+}
+
+private actor RecallCancellationStorage: KeywordRecallStorageProtocol {
+    private(set) var denseCalls = 0
+    private(set) var keywordCalls = 0
+    private(set) var usageCalls = 0
+    let gate: RecallCancellationGate?
+
+    init(gate: RecallCancellationGate? = nil) { self.gate = gate }
+
+    private func hits() async -> [ScoredMemoryRecord] {
+        if let gate { await gate.pause() }
+        return [ScoredMemoryRecord(record: MemoryRecord(
+            id: "orchard-fact", text: "Orchard watering is measured.",
+            createdAt: "2026-08-01T00:00:00Z"
+        ), score: 0.9)]
+    }
+    func recall(embedding: [Float], topK: Int, persona: String?) async throws -> [ScoredMemoryRecord] {
+        denseCalls += 1
+        return await hits()
+    }
+    func recallByKeyword(queryText: String, topK: Int, persona: String?) async throws -> [ScoredMemoryRecord] {
+        keywordCalls += 1
+        return await hits()
+    }
+    func recordRecallHits(ids: [String]) async throws { usageCalls += 1 }
+
+    // Unused write/proposal doors stay inert and fail loudly in this fixture.
+    func listMemory(kind: String?) async throws -> [MemoryRecord] { [] }
+    func insert(record: MemoryRecord, embedding: [Float]?) async throws -> MemoryRecord { throw MemoryV2Error.storageUnavailable }
+    func updateMemory(id: String, patch: JSONValue, newEmbedding: [Float]?) async throws -> MemoryRecord { throw MemoryV2Error.storageUnavailable }
+    func deleteMemory(id: String) async throws -> Bool { throw MemoryV2Error.storageUnavailable }
+    func isTombstoned(content: String) async throws -> Bool { false }
+    func recordTombstone(content: String, reason: String?) async throws { throw MemoryV2Error.storageUnavailable }
+    func insertProposal(_ proposal: ProposalRecord, embedding: [Float]?) async throws { throw MemoryV2Error.storageUnavailable }
+    func getProposal(id: String) async throws -> ProposalRecord? { nil }
+    func acceptProposal(id: String) async throws -> MemoryRecord { throw MemoryV2Error.storageUnavailable }
+    func updateProposalStatus(id: String, status: String, rejectionReason: String?) async throws { throw MemoryV2Error.storageUnavailable }
+    func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> ProposalRecord { throw MemoryV2Error.storageUnavailable }
+    func listProposals(status: String?) async throws -> [ProposalRecord] { [] }
+}
+
+@Test(arguments: RecallCancellationEmbedder.ResultMode.allCases)
+private func wiring_canceled_embedding_does_not_start_retrieval(
+    mode: RecallCancellationEmbedder.ResultMode
+) async throws {
+    let gate = RecallCancellationGate()
+    let storage = RecallCancellationStorage()
+    let memory = SwiftNativeMemoryV2(
+        embedder: RecallCancellationEmbedder(mode: mode, gate: gate), storage: storage
+    )
+    let task = Task { try await memory.recall(MemoryV2RecallRequest(text: "orchard", topK: 1)) }
+    await gate.waitUntilEntered()
+    task.cancel()
+    await gate.open()
+    do {
+        _ = try await task.value
+        Issue.record("canceled recall returned a result")
+    } catch is CancellationError {}
+    #expect(await storage.denseCalls == 0)
+    #expect(await storage.keywordCalls == 0)
+    #expect(await storage.usageCalls == 0)
+}
+
+@Test(arguments: [RecallCancellationEmbedder.ResultMode.zero, .dense])
+private func wiring_canceled_retrieval_does_not_return_hits_or_record_usage(
+    mode: RecallCancellationEmbedder.ResultMode
+) async throws {
+    let gate = RecallCancellationGate()
+    let storage = RecallCancellationStorage(gate: gate)
+    let memory = SwiftNativeMemoryV2(embedder: RecallCancellationEmbedder(mode: mode), storage: storage)
+    let task = Task { try await memory.recall(MemoryV2RecallRequest(text: "orchard", topK: 1)) }
+    await gate.waitUntilEntered()
+    task.cancel()
+    await gate.open()
+    do {
+        _ = try await task.value
+        Issue.record("canceled recall returned a result")
+    } catch is CancellationError {}
+    #expect(await storage.usageCalls == 0)
+}
+
+@Test(arguments: [RecallCancellationEmbedder.ResultMode.transientCancellation, .zero])
+private func wiring_uncanceled_cold_embedder_preserves_keyword_fallback(
+    mode: RecallCancellationEmbedder.ResultMode
+) async throws {
+    let storage = RecallCancellationStorage()
+    let memory = SwiftNativeMemoryV2(embedder: RecallCancellationEmbedder(mode: mode), storage: storage)
+    let result = try await memory.recall(MemoryV2RecallRequest(text: "orchard", topK: 1))
+    #expect(result.hits.count == 1)
+    let hit = try #require(result.hits.first)
+    guard case .object(let extras)? = hit.extras else {
+        Issue.record("missing recall identity metadata")
+        return
+    }
+    #expect(extras["id"] == .string("orchard-fact"))
+    #expect(await storage.keywordCalls == 1)
+    #expect(await storage.denseCalls == 0)
+}
+
+@Test func wiring_recall_preserves_only_explicit_canonical_temporal_fields() async throws {
+    let (mem, storage, embedder) = makeActor()
+    let query = "The studio opens at nine."
+    let vector = try #require(try await embedder.embed([query]).first)
+    let canonical = MemoryRecord(
+        id: "dated-fact", text: query,
+        createdAt: "2026-07-01T00:00:00Z",
+        validFrom: "2026-03-01T00:00:00Z",
+        validTo: "2026-05-31T23:59:59Z",
+        observedAt: "2026-06-01T12:00:00Z",
+        evidence: .object(["private_detail": .string("not part of the recall date projection")])
+    )
+    _ = try await storage.insert(record: canonical, embedding: vector)
+    let response = try await mem.recall(MemoryV2RecallRequest(text: query, topK: 1))
+    let hit = try #require(response.hits.first)
+    guard case .object(let extras)? = hit.extras else {
+        Issue.record("missing recall metadata")
+        return
+    }
+    #expect(extras["valid_from"] == .string("2026-03-01T00:00:00Z"))
+    #expect(extras["valid_to"] == .string("2026-05-31T23:59:59Z"))
+    #expect(extras["observed_at"] == .string("2026-06-01T12:00:00Z"))
+    #expect(extras["evidence"] == nil)
+    #expect(hit.content == query)
+    #expect(hit.ts == "2026-07-01T00:00:00Z")
+
+    let (undatedMemory, _, _) = makeActor()
+    _ = try await undatedMemory.store(content: query, source: "fixture")
+    let undated = try await undatedMemory.recall(MemoryV2RecallRequest(text: query, topK: 1))
+    guard case .object(let undatedExtras)? = undated.hits.first?.extras else {
+        Issue.record("missing undated recall metadata")
+        return
+    }
+    #expect(undatedExtras["valid_from"] == nil)
+    #expect(undatedExtras["valid_to"] == nil)
+    #expect(undatedExtras["observed_at"] == nil)
+}
+
+@Test func wiring_recall_labels_the_exact_per_hit_excerpt_boundary() async throws {
+    let (mem, storage, embedder) = makeActor()
+    let query = "Orchard watering instructions"
+    let fullText = String(repeating: "The orchard needs measured watering. ", count: 80)
+    let vector = try #require(try await embedder.embed([query]).first)
+    _ = try await storage.insert(record: MemoryRecord(
+        id: "long-fact", text: fullText, createdAt: "2026-08-01T00:00:00Z"
+    ), embedding: vector)
+    let response = try await mem.recall(MemoryV2RecallRequest(text: query, topK: 1))
+    let hit = try #require(response.hits.first)
+    let content = try #require(hit.content)
+    let displayText = MemoryTextClip.memoryDisplayText(fullText)
+    #expect(content.count <= memoryRecallContentCap)
+    #expect(content.count < displayText.count)
+    #expect(displayText.hasPrefix(content))
+    guard case .object(let extras)? = hit.extras else {
+        Issue.record("missing excerpt metadata")
+        return
+    }
+    #expect(extras["content_truncated"] == .bool(true))
+    #expect(extras["full_content_chars"] == .int(Int64(displayText.count)))
+    #expect(response.scored.first?.record.text == fullText)
+}
+
 @Test func wiring_store_rejects_tombstoned_content() async throws {
     let (mem, storage, _) = makeActor()
     try await storage.recordTombstone(content: "the user lives in Mars", reason: "wrong")

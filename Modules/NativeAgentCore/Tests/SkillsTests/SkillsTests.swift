@@ -605,6 +605,80 @@ private func clientFor(_ root: URL) -> SwiftNativeSkillsClient {
     #expect(SkillMutation.slugify("UPPER_case 123") == "upper-case-123")
 }
 
+@Test(arguments: [false, true], ["research-notes", "Research-Notes"])
+func createSkill_slugCollisionPreservesUnrelatedBodyAndIdentity(legacyMissingID: Bool, protectedID: String) async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let protectedPath = root.appendingPathComponent("skills/bodies/\(protectedID).md")
+    try FileManager.default.createDirectory(at: protectedPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let protectedBody = "# Research Notes\n\nUse when keeping original orchard observations."
+    try Data(protectedBody.utf8).write(to: protectedPath)
+    let protectedRow = obj([
+        "id": .string(protectedID), "name": .string("Research Notes"),
+        "bodyPath": .string(protectedPath.path), "status": .string("active"),
+    ])
+    var initial = [protectedRow]
+    if legacyMissingID { initial.append(obj(["name": .string("Research / Notes")])) }
+    try writeJSON(.array(initial), to: root.appendingPathComponent("skills/registry.json"))
+    let newBody = "# Separate Procedure\n\nUse when formatting reviewed orchard notes."
+    let client = clientFor(root)
+    let saved = try await client.createSkill(body: obj([
+        "name": .string("Research / Notes"), "content": .string(newBody),
+    ]))
+    let id = try #require(stringField(saved, "id"))
+    #expect(id.hasPrefix("research-notes-"))
+    #expect(id.lowercased() != protectedID.lowercased())
+    let savedPath = try #require(stringField(saved, "bodyPath"))
+    #expect(savedPath == root.appendingPathComponent("skills/bodies/\(id).md").path)
+    #expect(try String(contentsOfFile: savedPath, encoding: .utf8) == newBody)
+    #expect(try String(contentsOf: protectedPath, encoding: .utf8) == protectedBody)
+    let registry = try readRegistry(root)
+    #expect(registry.count == 2)
+    #expect(Set(idsOf(registry)).count == 2)
+    #expect(registry.contains(protectedRow))
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("skills/history/research-notes.json").path))
+    if legacyMissingID {
+        let versions = try await client.listSkillVersions(id: id)
+        let before = try #require(versions.first { stringField($0, "reason") == "before-create-update" })
+        #expect(stringField(before, "body") == nil)
+    }
+    // The assigned identity is stable on the next intentional same-name save.
+    let updated = try await client.createSkill(body: obj([
+        "name": .string("RESEARCH / NOTES"), "content": .string(newBody + " Keep dates."),
+    ]))
+    #expect(stringField(updated, "id") == id)
+    #expect(try String(contentsOf: protectedPath, encoding: .utf8) == protectedBody)
+}
+
+@Test func createSkill_updateReceiptAndHistoryUseActualWrittenBodyPath() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let oldPath = root.appendingPathComponent("skills/bodies/legacy-location.md")
+    try FileManager.default.createDirectory(at: oldPath.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let oldBody = "# Notes\n\nUse when retaining old orchard observations."
+    try Data(oldBody.utf8).write(to: oldPath)
+    try writeJSON(.array([obj([
+        "id": .string("stable"), "name": .string("Notes"), "bodyPath": .string(oldPath.path),
+    ])]), to: root.appendingPathComponent("skills/registry.json"))
+    let newBody = "# Notes\n\nUse when recording new orchard observations."
+    let client = clientFor(root)
+    let saved = try await client.createSkill(body: obj(["name": .string("Notes"), "content": .string(newBody)]))
+    let expectedPath = root.appendingPathComponent("skills/bodies/stable.md").path
+    #expect(stringField(saved, "id") == "stable")
+    #expect(stringField(saved, "bodyPath") == expectedPath)
+    #expect(try String(contentsOfFile: expectedPath, encoding: .utf8) == newBody)
+    #expect(try String(contentsOf: oldPath, encoding: .utf8) == oldBody)
+    let versions = try await client.listSkillVersions(id: "stable")
+    let latest = try #require(versions.first { stringField($0, "reason") == "created-update" })
+    #expect(stringField(latest, "body") == newBody)
+    guard case .object(let history) = latest, let captured = history["skill"] else {
+        Issue.record("missing captured skill"); return
+    }
+    #expect(stringField(captured, "bodyPath") == expectedPath)
+    let previous = try #require(versions.first { stringField($0, "reason") == "before-create-update" })
+    #expect(stringField(previous, "body") == oldBody)
+}
+
 @Test func registryWrite_isPrettySortedKeysParity() async throws {
     // The persisted registry.json must match json.dumps(indent=2, sort_keys=True).
     let root = try makeTempRoot()
@@ -814,4 +888,31 @@ private func clientFor(_ root: URL) -> SwiftNativeSkillsClient {
     let rows = try await client.listSkills()
     #expect(rows.contains { stringField($0, "id") == "stable" && stringField($0, "status") == "active" })
     #expect(try Data(contentsOf: history) == Data("{broken".utf8))
+}
+
+@Test func createSkill_corruptRegistryFailsClosedAndPreservesBytes() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let registry = root.appendingPathComponent("skills/registry.json")
+    try FileManager.default.createDirectory(
+        at: registry.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let corrupt = Data("[{broken".utf8)
+    try corrupt.write(to: registry)
+
+    let client = clientFor(root)
+    await #expect(throws: SkillsError.invalidRegistry(
+        "Skill registry is unreadable; mutation was refused."
+    )) {
+        _ = try await client.createSkill(body: obj([
+            "name": .string("Must Not Replace Registry"),
+            "content": .string("# Must Not Replace Registry\n\nPreserve the existing registry bytes."),
+        ]))
+    }
+
+    #expect(try Data(contentsOf: registry) == corrupt)
+    #expect(!FileManager.default.fileExists(
+        atPath: root.appendingPathComponent("skills/bodies/must-not-replace-registry.md").path
+    ))
 }

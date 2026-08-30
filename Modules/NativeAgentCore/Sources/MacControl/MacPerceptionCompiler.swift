@@ -1897,6 +1897,11 @@ public extension SystemMacAXElementSource {
     @discardableResult
     static func setEnhancedAccessibility(pid: Int32, enabled: Bool) -> Bool {
         MacAXExecutionLane.sync {
+            // Self-process fence — writing AX flags onto our own app element
+            // is the same in-process AppKit re-entry class as the 2026-08-28
+            // P1 deadlock in the reader. Unreachable once snapshots refuse
+            // self, kept as the last wall for a direct caller.
+            guard pid != getpid() else { return false }
             let app = AXUIElementCreateApplication(pid)
             let value: CFTypeRef = (enabled ? kCFBooleanTrue : kCFBooleanFalse)
             _ = AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, value)

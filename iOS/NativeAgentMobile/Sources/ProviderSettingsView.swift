@@ -114,6 +114,15 @@ enum ProviderSelectionRollbackPresentation {
     ) -> Selection? {
         currentGeneration == requestGeneration ? previous : nil
     }
+
+    static func acceptReceipt(
+        _ receipt: MobileSurfaceSelectionReceipt,
+        currentGeneration: UInt64,
+        requestGeneration: UInt64
+    ) -> Selection? {
+        guard currentGeneration == requestGeneration else { return nil }
+        return Selection(providerID: receipt.providerID, modelID: receipt.model)
+    }
 }
 
 // MARK: - Main View
@@ -143,6 +152,7 @@ struct ProviderSettingsView: View {
     // Active provider per surface (local UI state; saves on change)
     @State private var activeSurface: [String: String] = [:]
     @State private var requestedModel: [String: String] = [:]
+    @State private var pendingSurfaceReceipts: [String: MobileSurfaceSelectionReceipt] = [:]
     @State private var selectionGeneration: [String: UInt64] = [:]
     @State private var configSheet: ProviderInfo? = nil
     @State private var statusText = ""
@@ -340,6 +350,10 @@ struct ProviderSettingsView: View {
         let synced = sync.trustPolicy?.providerPolicy?.activePerSurface ?? [:]
         let readyProviderIds = Set(selectableProviders.map(\.provider_id))
         for surface in renderedSurfaces {
+            if let receipt = pendingSurfaceReceipts[surface] {
+                guard receipt.isAcknowledged(by: sync.surfaceModels[surface]) else { continue }
+                pendingSurfaceReceipts.removeValue(forKey: surface)
+            }
             if let providerId = sync.surfaceModels[surface]?.providerId,
                readyProviderIds.contains(providerId) {
                 activeSurface[surface] = providerId
@@ -373,6 +387,7 @@ struct ProviderSettingsView: View {
         let previous = currentSelection(for: surface)
         let requestGeneration = (selectionGeneration[surface] ?? 0) &+ 1
         selectionGeneration[surface] = requestGeneration
+        pendingSurfaceReceipts.removeValue(forKey: surface)
         activeSurface[surface] = selection.providerID
         requestedModel[surface] = selection.modelID
         sendSelection(
@@ -399,16 +414,24 @@ struct ProviderSettingsView: View {
                     )
                 }
                 let preference = sync.surfaceModels[surface]
-                _ = try await iCloudSyncEngine.shared.configureSurfaceSelection(
+                let receipt = try await iCloudSyncEngine.shared.configureSurfaceSelection(
                     surface: surface,
                     providerId: selection.providerID,
                     model: selection.modelID,
                     reasoningEffort: preference?.reasoningEffort ?? "high",
                     serviceTier: preference?.serviceTier ?? "default"
                 )
-                guard selectionGeneration[surface] == requestGeneration else { return }
-                await refreshProviders()
-                statusText = "\(surfaceLabel(surface)) now uses \(selection.modelID)."
+                guard let committed = ProviderSelectionRollbackPresentation.acceptReceipt(
+                    receipt, currentGeneration: selectionGeneration[surface] ?? 0,
+                    requestGeneration: requestGeneration
+                ) else { return }
+                activeSurface[surface] = committed.providerID
+                requestedModel[surface] = committed.modelID
+                pendingSurfaceReceipts[surface] = receipt
+                // The signed reply is already authoritative. Do not await a
+                // second refresh whose stale snapshot could race a newer pick.
+                seedActiveSurface()
+                statusText = "\(surfaceLabel(surface)) now uses \(receipt.model)."
             } catch {
                 guard let restored = ProviderSelectionRollbackPresentation.rollback(
                     currentGeneration: selectionGeneration[surface] ?? 0,

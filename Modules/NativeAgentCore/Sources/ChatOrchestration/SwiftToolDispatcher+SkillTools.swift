@@ -42,31 +42,39 @@ extension SwiftToolDispatcher {
 
     func impl_read_skill(input: [String: JSONValue]) async throws -> JSONValue {
         let name = try requireString(input, "name")
-        // Accept manifest display names or stable ids, but never a path.
-        if name.contains("/") || name.contains("..") || name.hasPrefix(".") {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: invalid skill name '\(name)'"
-            )
-        }
+        // A registered display name may contain punctuation that is not safe
+        // in a body path. Resolve that alias to its canonical id first; only
+        // validated handles below may participate in filesystem resolution.
         var handles = [name]
-        let requested = name.hasSuffix(".md") ? String(name.dropLast(3)) : name
         let registry = InstalledSkillInventory.list(
             dataRoot: dataRoot,
             sourceRoot: rootForRead,
             personaRoot: personaRootForTools()
         )
-        if let match = registry.first(where: { row in
-            guard case .object(let object) = row else { return false }
-            let rowName: String = if case .string(let value)? = object["name"] { value } else { "" }
-            let rowID: String = if case .string(let value)? = object["id"] { value } else { "" }
-            return rowName.caseInsensitiveCompare(requested) == .orderedSame
-                || rowID.caseInsensitiveCompare(requested) == .orderedSame
-        }), case .object(let object) = match,
+        func registeredMatch(_ requested: String) -> JSONValue? {
+            registry.first { row in
+                guard case .object(let object) = row else { return false }
+                let rowName: String = if case .string(let value)? = object["name"] { value } else { "" }
+                let rowID: String = if case .string(let value)? = object["id"] { value } else { "" }
+                return rowName.caseInsensitiveCompare(requested) == .orderedSame
+                    || rowID.caseInsensitiveCompare(requested) == .orderedSame
+            }
+        }
+        // '.md' may be part of an actual display name, not a filename suffix.
+        // Exact registered spelling wins; stripping is legacy fallback only.
+        let match = registeredMatch(name)
+            ?? (name.hasSuffix(".md") ? registeredMatch(String(name.dropLast(3))) : nil)
+        if let match, case .object(let object) = match,
            case .string(let id)? = object["id"], !id.isEmpty {
             handles.insert(id, at: 0)
         }
         handles = handles.filter {
             !$0.contains("/") && !$0.contains("..") && !$0.hasPrefix(".")
+        }
+        guard !handles.isEmpty else {
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: invalid skill name '\(name)'"
+            )
         }
         var seen: Set<String> = []
         let fileNames = handles

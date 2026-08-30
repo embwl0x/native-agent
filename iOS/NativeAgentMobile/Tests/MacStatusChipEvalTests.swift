@@ -37,9 +37,21 @@ final class MacStatusChipEvalTests: XCTestCase {
         XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .online), "Live")
         XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .awaitingMacActivity), "Waiting for Mac")
         XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .offline), "No iCloud")
-        XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .macUnreachable), "Mac asleep")
+        XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .macUnreachable), "Mac unavailable")
+        XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .deviceOffline), "iPhone offline")
         XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .stale(minutesAgo: 4)), "4m ago")
         XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .connecting), "Connecting")
+    }
+
+    func test_unreachableCopyDoesNotInventSleepOrHealthyICloud() {
+        let explanation = MacStatusChipPresentation.explanation(for: .macUnreachable)
+        XCTAssertFalse(explanation.contains("iCloud is fine"))
+        XCTAssertTrue(explanation.contains("may be asleep or offline"))
+        XCTAssertTrue(explanation.contains("iCloud may be unavailable"))
+
+        let recent = MacStatusChipPresentation.explanation(for: .online)
+        XCTAssertTrue(recent.contains("checked in recently"))
+        XCTAssertFalse(recent.contains("picking up what you send"))
     }
 
     func test_everyMacSnapshotSurfaceMountsTheSharedConnectionChip() throws {

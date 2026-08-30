@@ -53,6 +53,7 @@ public enum ToolRunError: Error, LocalizedError {
     case entrypointMissing(path: String)
     case spawnFailed(String)
     case timeout
+    case outputLimitExceeded(stream: String, limitBytes: Int)
     case nonZeroExit(code: Int32, stderr: String)
 
     public var errorDescription: String? {
@@ -67,6 +68,8 @@ public enum ToolRunError: Error, LocalizedError {
             return "Failed to spawn tool subprocess: \(why)"
         case .timeout:
             return "Tool subprocess exceeded timeout and was killed"
+        case .outputLimitExceeded(let stream, let limitBytes):
+            return "Tool subprocess exceeded the \(limitBytes)-byte \(stream) capture limit and was killed"
         case .nonZeroExit(let code, let stderr):
             return "Tool subprocess exited \(code): \(stderr)"
         }
@@ -108,6 +111,11 @@ public enum ToolRunEscalationEvent: Sendable, Equatable {
 }
 
 public actor ToolRunSandboxRunner {
+    /// A tool result is provider-bound data, not an archival log. Keep each
+    /// pipe comfortably above ordinary structured results while preventing a
+    /// noisy or compromised subprocess from retaining memory until timeout.
+    private static let maximumCapturedBytesPerStream = 4 * 1_024 * 1_024
+
     public init() {}
 
     /// Grace window (ms) between SIGTERM and SIGKILL in the reap escalation.
@@ -169,6 +177,10 @@ public actor ToolRunSandboxRunner {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        let stdinWriter = try PipeInputWriter(
+            handle: stdinPipe.fileHandleForWriting,
+            input: inputBytes
+        )
         // Two-channel wake accounting so cancellation can never corrupt the
         // kill escalation (W3d review, finding 1):
         //   • terminationSignal — signaled ONLY by the process terminationHandler
@@ -191,22 +203,32 @@ public actor ToolRunSandboxRunner {
             wakeSignal.signal()
         }
 
-        let stdoutBuf = PipeCaptureBuffer()
-        let stderrBuf = PipeCaptureBuffer()
+        let outputLimitBox = OutputLimitBox()
+        let stdoutBuf = PipeCaptureBuffer(
+            stream: "stdout",
+            limitBytes: Self.maximumCapturedBytesPerStream,
+            overflow: outputLimitBox
+        )
+        let stderrBuf = PipeCaptureBuffer(
+            stream: "stderr",
+            limitBytes: Self.maximumCapturedBytesPerStream,
+            overflow: outputLimitBox
+        )
         // Drain stdout/stderr continuously while the tool runs. This deliberately
         // avoids FileHandle.readabilityHandler: Foundation implements it with a
         // dispatch source, and full-suite parallel subprocess churn can close the
         // pipe while libdispatch still owns that source, tripping
         // "Unexpected EV_VANISHED". A nonblocking POSIX read loop has an explicit
         // stop point and no hidden descriptor owner.
-        let stdoutDrain = PipeDrainLoop(
+        let stdoutDrain = try PipeDrainLoop(
             fileDescriptor: stdoutPipe.fileHandleForReading.fileDescriptor,
             buffer: stdoutBuf
         )
-        let stderrDrain = PipeDrainLoop(
+        let stderrDrain = try PipeDrainLoop(
             fileDescriptor: stderrPipe.fileHandleForReading.fileDescriptor,
             buffer: stderrBuf
         )
+        outputLimitBox.setWakeHandler { wakeSignal.signal() }
         stdoutDrain.start()
         stderrDrain.start()
 
@@ -228,22 +250,15 @@ public actor ToolRunSandboxRunner {
         ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(childPid)
         defer {
             if process.isRunning {
-                ProcessTreeReaper.signal(
-                    ProcessTreeReaper.snapshot(rootPID: childPid),
-                    signal: SIGKILL
+                ProcessTreeReaper.quiesceAndKill(
+                    ProcessTreeReaper.snapshot(rootPID: childPid)
                 )
             }
         }
 
-        // Feed stdin off-thread: a synchronous write of more than the pipe
-        // buffer to a tool that never reads stdin would otherwise pin this
-        // cooperative-pool thread until the watchdog kill. Child exit closes
-        // the read end, which unblocks the writer with EPIPE (swallowed).
-        let stdinWriter = Thread {
-            try? stdinPipe.fileHandleForWriting.write(contentsOf: inputBytes)
-            try? stdinPipe.fileHandleForWriting.close()
-        }
-        stdinWriter.qualityOfService = .userInitiated
+        // Feed stdin off-thread without a blocking write. A descendant may
+        // retain the read end after the direct child exits, so child exit alone
+        // does not guarantee EPIPE or release this writer's input/thread.
         stdinWriter.start()
 
         let timeoutSeconds = max(1, sandbox.timeoutSeconds)
@@ -275,22 +290,24 @@ public actor ToolRunSandboxRunner {
                     while true {
                         if terminatedBox.get() { break }
                         if cancelledBox.get() { break }
+                        if outputLimitBox.exceeded != nil { break }
                         if wakeSignal.wait(timeout: deadline) == .timedOut { break }
                     }
 
                     let didExit = terminatedBox.get()
                     let wasCancelled = cancelledBox.get()
+                    let exceededOutputLimit = outputLimitBox.exceeded != nil
                     observer?(.initialWaitEnded(
                         exited: didExit,
                         cancelled: wasCancelled,
-                        timedOut: !didExit && !wasCancelled
+                        timedOut: !didExit && !wasCancelled && !exceededOutputLimit
                     ))
 
                     if !didExit {
                         // Timeout or cancel — escalate to reap the child.
                         // Cancellation takes priority over timeout for the
                         // surfaced error; only stamp timedOut when NOT cancelled.
-                        if !wasCancelled { timedOutBox.set(true) }
+                        if !wasCancelled && !exceededOutputLimit { timedOutBox.set(true) }
                         let terminationTree = ProcessTreeReaper.snapshot(rootPID: childPid)
                         ProcessTreeReaper.signal(terminationTree, signal: SIGTERM)
                         observer?(.sigterm)
@@ -310,7 +327,12 @@ public actor ToolRunSandboxRunner {
                         )
                         if (graceExpired && !terminatedBox.get())
                             || ProcessTreeReaper.hasLiveDescendant(in: killTree) {
-                            ProcessTreeReaper.signal(killTree, signal: SIGKILL)
+                            // Freeze the verified tree, rescan it, then kill.
+                            // A one-shot leaf-first SIGKILL leaves a narrow
+                            // scan-vs-fork race where the tool can create a new
+                            // child after the snapshot and orphan it as the
+                            // parent dies.
+                            ProcessTreeReaper.quiesceAndKill(killTree)
                             observer?(.sigkill)
                         }
                         // Do not make prompt cancellation depend on the
@@ -334,6 +356,7 @@ public actor ToolRunSandboxRunner {
             wakeSignal.signal()
         }
         process.terminationHandler = nil
+        stdinWriter.stopAndWait()
 
         let endNs = DispatchTime.now().uptimeNanoseconds
         let duration = Double(endNs &- startNs) / 1_000_000_000.0
@@ -354,6 +377,13 @@ public actor ToolRunSandboxRunner {
         // because a cancel never stamps `timedOutBox`.
         if cancelledBox.get() {
             throw CancellationError()
+        }
+
+        if let exceeded = outputLimitBox.exceeded {
+            throw ToolRunError.outputLimitExceeded(
+                stream: exceeded.stream,
+                limitBytes: exceeded.limitBytes
+            )
         }
 
         let stdoutData = stdoutBuf.data
@@ -417,24 +447,191 @@ private final class TerminatedFlag: @unchecked Sendable {
 
 // Thread-safe capture buffer for subprocess pipes — appended from drain
 // workers, read on the actor after exit.
-private final class PipeCaptureBuffer: @unchecked Sendable {
+final class OutputLimitBox: @unchecked Sendable {
+    struct Exceeded: Sendable {
+        let stream: String
+        let limitBytes: Int
+    }
+
+    private let lock = NSLock()
+    private var value: Exceeded?
+    private var wakeHandler: (@Sendable () -> Void)?
+
+    var exceeded: Exceeded? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func setWakeHandler(_ handler: @escaping @Sendable () -> Void) {
+        lock.lock()
+        wakeHandler = handler
+        let shouldWake = value != nil
+        lock.unlock()
+        if shouldWake { handler() }
+    }
+
+    func markExceeded(stream: String, limitBytes: Int) {
+        lock.lock()
+        guard value == nil else {
+            lock.unlock()
+            return
+        }
+        value = Exceeded(stream: stream, limitBytes: limitBytes)
+        let handler = wakeHandler
+        lock.unlock()
+        handler?()
+    }
+}
+
+final class PipeCaptureBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var storage = Data()
-    func append(_ chunk: Data) { lock.lock(); storage.append(chunk); lock.unlock() }
+    private let stream: String
+    private let limitBytes: Int
+    private let overflow: OutputLimitBox
+
+    init(stream: String, limitBytes: Int, overflow: OutputLimitBox) {
+        self.stream = stream
+        self.limitBytes = limitBytes
+        self.overflow = overflow
+    }
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        let available = max(0, limitBytes - storage.count)
+        if available > 0 {
+            storage.append(chunk.prefix(available))
+        }
+        let exceeded = chunk.count > available
+        lock.unlock()
+        if exceeded {
+            overflow.markExceeded(stream: stream, limitBytes: limitBytes)
+        }
+    }
     var data: Data { lock.lock(); defer { lock.unlock() }; return storage }
 }
 
-private final class PipeDrainLoop: @unchecked Sendable {
+/// Foundation Pipe handles are not close-on-exec by default. A subprocess
+/// inheriting a stop-channel writer could keep our POLLHUP edge from arriving.
+func makeToolSandboxWakePipe() throws -> Pipe {
+    let pipe = Pipe()
+    for handle in [pipe.fileHandleForReading, pipe.fileHandleForWriting] {
+        let flags = fcntl(handle.fileDescriptor, F_GETFD, 0)
+        guard flags >= 0,
+              fcntl(handle.fileDescriptor, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+            throw ToolRunError.spawnFailed("stop pipe setup failed (errno \(errno))")
+        }
+    }
+    return pipe
+}
+
+/// One input payload, with an explicit lifetime bounded by the tool invocation.
+/// Full stdin waits on writability OR a private stop pipe, with no polling tick.
+final class PipeInputWriter: @unchecked Sendable {
+    private let handle: FileHandle
+    private let input: Data
+    private let wake: Pipe
+    private let lock = NSLock()
+    private let done = DispatchGroup()
+    private var started = false
+    private var stopped = false
+
+    init(handle: FileHandle, input: Data) throws {
+        self.handle = handle
+        self.input = input
+        self.wake = try makeToolSandboxWakePipe()
+        let fd = handle.fileDescriptor
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0,
+              fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0,
+              fcntl(fd, F_SETNOSIGPIPE, 1) == 0 else {
+            throw ToolRunError.spawnFailed("stdin pipe setup failed (errno \(errno))")
+        }
+    }
+
+    func start() {
+        lock.lock()
+        guard !started, !stopped else { lock.unlock(); return }
+        started = true
+        done.enter()
+        lock.unlock()
+        let thread = Thread { [self] in
+            defer {
+                try? handle.close()
+                done.leave()
+            }
+            input.withUnsafeBytes { bytes in
+                guard let base = bytes.baseAddress else { return }
+                var offset = 0
+                while offset < bytes.count {
+                    if isStopped() { return }
+                    let written = Darwin.write(handle.fileDescriptor, base.advanced(by: offset), bytes.count - offset)
+                    if written > 0 { offset += written; continue }
+                    if written == 0 { return }
+                    if errno == EINTR { continue }
+                    guard errno == EAGAIN || errno == EWOULDBLOCK else { return }
+                    guard waitUntilWritable() else { return }
+                }
+            }
+        }
+        thread.name = "ToolRunSandbox.stdin"
+        thread.qualityOfService = .userInitiated
+        thread.start()
+    }
+
+    func stopAndWait() {
+        lock.lock()
+        let signalStop = !stopped
+        stopped = true
+        let wasStarted = started
+        lock.unlock()
+        // Closing this private write end wakes poll with POLLHUP. No write can
+        // block, and the data descriptor stays owned by the writer until join.
+        if signalStop { try? wake.fileHandleForWriting.close() }
+        if wasStarted { done.wait() } else { try? handle.close() }
+    }
+
+    private func waitUntilWritable() -> Bool {
+        while !isStopped() {
+            var descriptors = [
+                pollfd(fd: handle.fileDescriptor, events: Int16(POLLOUT), revents: 0),
+                pollfd(fd: wake.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0),
+            ]
+            let result = descriptors.withUnsafeMutableBufferPointer {
+                Darwin.poll($0.baseAddress, nfds_t($0.count), -1)
+            }
+            if result < 0 {
+                if errno == EINTR { continue }
+                return false
+            }
+            if descriptors[1].revents != 0 { return false }
+            if descriptors[0].revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0 { return false }
+            if descriptors[0].revents & Int16(POLLOUT) != 0 { return true }
+        }
+        return false
+    }
+
+    private func isStopped() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped
+    }
+}
+
+final class PipeDrainLoop: @unchecked Sendable {
     private let fd: Int32
     private let buffer: PipeCaptureBuffer
+    private let wake: Pipe
     private let done = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var stopped = false
     private var started = false
 
-    init(fileDescriptor: Int32, buffer: PipeCaptureBuffer) {
+    init(fileDescriptor: Int32, buffer: PipeCaptureBuffer) throws {
         self.fd = fileDescriptor
         self.buffer = buffer
+        self.wake = try makeToolSandboxWakePipe()
     }
 
     func start() {
@@ -452,13 +649,30 @@ private final class PipeDrainLoop: @unchecked Sendable {
         let thread = Thread { [self] in
             defer { done.signal() }
             var chunk = [UInt8](repeating: 0, count: 65_536)
+            var stopBytesRemaining: Int?
             while true {
-                var madeProgress = false
                 while true {
-                    let n = read(fd, &chunk, chunk.count)
+                    if stopBytesRemaining == nil, isStopped() {
+                        // A surviving descendant can refill the pipe forever,
+                        // so EAGAIN is not a shutdown boundary. Preserve only
+                        // the finite backlog already queued at stop, then join
+                        // before the caller closes (and may reuse) this FD.
+                        var available: Int32 = 0
+                        // Darwin FIONREAD = _IOR('f', 127, int). Swift cannot
+                        // import the sizeof-based C macro from sys/filio.h.
+                        let fionread: UInt = 0x4000_0000 | (UInt(MemoryLayout<Int32>.size) << 16)
+                            | (UInt(0x66) << 8) | 127
+                        guard ioctl(fd, fionread, &available) == 0 else { return }
+                        stopBytesRemaining = max(0, Int(available))
+                    }
+                    let count = min(chunk.count, stopBytesRemaining ?? chunk.count)
+                    if count == 0 { return }
+                    let n = read(fd, &chunk, count)
                     if n > 0 {
-                        madeProgress = true
                         buffer.append(Data(bytes: chunk, count: n))
+                        if let remaining = stopBytesRemaining {
+                            stopBytesRemaining = remaining - n
+                        }
                         continue
                     }
                     if n == 0 { return } // EOF: all writers closed.
@@ -467,12 +681,21 @@ private final class PipeDrainLoop: @unchecked Sendable {
                     return
                 }
 
-                if isStopped() { return }
-                if madeProgress {
-                    usleep(1_000)
-                } else {
-                    usleep(5_000)
+                // Stop may have arrived just after EAGAIN while the exiting
+                // parent queued its final bytes. Re-enter the snapshot path
+                // instead of dropping that tail here.
+                if isStopped() { continue }
+                // Quiet tools need no heartbeat. Wait for readable bytes/EOF
+                // or our private stop edge; unlike readabilityHandler this
+                // has no hidden dispatch-source descriptor owner.
+                var descriptors = [
+                    pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
+                    pollfd(fd: wake.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0),
+                ]
+                let ready = descriptors.withUnsafeMutableBufferPointer {
+                    Darwin.poll($0.baseAddress, nfds_t($0.count), -1)
                 }
+                if ready < 0, errno != EINTR { return }
             }
         }
         thread.qualityOfService = .userInitiated
@@ -481,11 +704,15 @@ private final class PipeDrainLoop: @unchecked Sendable {
 
     func stopAndWait() {
         lock.lock()
+        let signalStop = !stopped
         stopped = true
         let wasStarted = started
         lock.unlock()
+        if signalStop { try? wake.fileHandleForWriting.close() }
         if wasStarted {
-            _ = done.wait(timeout: .now() + .seconds(5))
+            // The stopped reader consumes a finite nonblocking snapshot. Do
+            // not time out and close its descriptor while it still owns it.
+            done.wait()
         }
     }
 

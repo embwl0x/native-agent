@@ -152,8 +152,11 @@ public enum TurnLifecycleTelemetry {
         observedBy: String,
         since startNs: UInt64? = nil,
         counts: [String: Int64] = [:],
-        flags: [String: Bool] = [:]
+        flags: [String: Bool] = [:],
+        turnId: String? = TurnTraceContext.turnId,
+        on bus: TurnTraceBus? = nil
     ) {
+        guard let turnId else { return }
         var payload: [String: JSONValue] = [
             "schema": .string("turn.lifecycle.v1"),
             "milestone": .string(milestone.rawValue),
@@ -168,12 +171,13 @@ public enum TurnLifecycleTelemetry {
         if !flags.isEmpty {
             payload["flags"] = .object(flags.mapValues(JSONValue.bool))
         }
-        TurnTraceBus.fireFromContext(
+        TurnTraceBus.fire(TurnTraceEvent(
+            turnId: turnId,
             kind: milestone.rawValue,
             sessionId: sessionId,
             surface: surface,
             payload: .object(payload)
-        )
+        ), on: bus ?? TurnTraceContext.bus ?? .shared)
     }
 
     private static func elapsedMs(since startNs: UInt64) -> Int64 {
@@ -283,6 +287,28 @@ struct ContextStageTrace: Sendable {
         timings.append(Timing(name: name, elapsedMs: elapsed))
     }
 
+    /// Microsecond-resolution stage clock (A7, 2026-08-28).
+    ///
+    /// `stageMs` is a whole-millisecond lane, so a stage whose real work is
+    /// sub-millisecond truncates to 0 and reads as DARK to the instrument even
+    /// though it ran — which is exactly how `persona.compile` and
+    /// `memory.recall` went dark once ContextFlow moved their work off the
+    /// per-turn bracket. Any positive sample therefore rounds UP to 1ms (0 keeps
+    /// meaning "no work measured", never "too fast to see"), and the raw
+    /// microseconds ride along as a count so the lane keeps real resolution.
+    mutating func setMicroseconds(_ name: ContextStageName, microseconds: Int64) {
+        let bounded = max(0, microseconds)
+        setTiming(name, milliseconds: bounded == 0 ? 0 : (bounded + 999) / 1_000)
+        counts[name.rawValue + "Micros"] = bounded
+    }
+
+    /// Same clock as `record(_:since:)` but preserved at microsecond
+    /// resolution — for stages whose per-turn work is sub-millisecond.
+    mutating func recordMicroseconds(_ name: ContextStageName, since startNs: UInt64) {
+        let elapsed = Int64((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000)
+        setMicroseconds(name, microseconds: elapsed)
+    }
+
     mutating func setTiming(_ name: ContextStageName, milliseconds: Int64) {
         timings.removeAll { $0.name == name.rawValue }
         timings.append(Timing(name: name.rawValue, elapsedMs: max(0, milliseconds)))
@@ -354,7 +380,8 @@ struct ContextStageTrace: Sendable {
         elapsedMs: Int64,
         surface: String,
         counts: [String: Int64] = [:],
-        flags: [String: Bool] = [:]
+        flags: [String: Bool] = [:],
+        labels: [String: String] = [:]
     ) {
         var countObject: [String: JSONValue] = [:]
         for (key, value) in counts {
@@ -373,6 +400,7 @@ struct ContextStageTrace: Sendable {
                 "elapsedMs": .int(max(0, elapsedMs)),
                 "counts": .object(countObject),
                 "flags": .object(flagObject),
+                "labels": .object(labels.mapValues(JSONValue.string)),
             ])
         )
     }

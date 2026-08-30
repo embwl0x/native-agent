@@ -533,6 +533,18 @@ extension AppModel {
     /// touch `activeChatSessionId` — the main window stays where it is.
     @MainActor
     func loadDetachedSessionMessages(_ sessionId: String) async {
+        await loadDetachedSessionMessages(
+            sessionId,
+            loadMessages: { [client] in try await client.getChatMessages(sessionId: $0) },
+            loadReceipt: { [client] in try await client.getLatestContextReceipt(sessionId: $0) })
+    }
+
+    @MainActor
+    func loadDetachedSessionMessages(
+        _ sessionId: String,
+        loadMessages: (String) async throws -> [ChatMessage],
+        loadReceipt: (String) async throws -> ContextReceipt
+    ) async {
         guard !sessionId.isEmpty else { return }
         // Skip if a stream is already populating this slot — overwriting
         // would clobber live deltas (mirrors selectChatSession's guard).
@@ -540,10 +552,11 @@ extension AppModel {
            !(chatMessagesBySession[sessionId] ?? []).isEmpty {
             return
         }
+        let lifecycleAtLoadStart = chatTurnLifecycle(for: sessionId)
         var messageFailures: [String] = []
         let fetched: [ChatMessage]?
         do {
-            fetched = try await client.getChatMessages(sessionId: sessionId)
+            fetched = try await loadMessages(sessionId)
         } catch {
             fetched = nil
             messageFailures.append("messages")
@@ -557,33 +570,39 @@ extension AppModel {
         // the slot when no stream has taken ownership of it.
         let streamTookOver = streamingSessions.contains(sessionId)
             && !(chatMessagesBySession[sessionId] ?? []).isEmpty
-        if let fetched, !streamTookOver {
-            setChatMessages(fetched, for: sessionId)
+        let lifecycleAfterMessages = chatTurnLifecycle(for: sessionId)
+        guard !streamTookOver,
+              lifecycleAfterMessages == nil || lifecycleAfterMessages == lifecycleAtLoadStart
+        else { return }
+        if let fetched {
+            applyLoadedChatMessages(fetched, for: sessionId)
         }
         detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
             previous: detachedChatRefreshStatus[sessionId],
             failedEndpoints: messageFailures,
             at: Date()
         )
-        // Receipt is independent of the message-bubble stream state, but
-        // still skip the write if a stream owns the slot so we don't stomp
-        // a fresher in-flight receipt.
-        if !streamTookOver {
-            var receiptFailures: [String] = []
-            do {
-                setLatestContextReceipt(
-                    try await client.getLatestContextReceipt(sessionId: sessionId),
-                    for: sessionId
-                )
-            } catch {
-                receiptFailures.append("context receipt")
-            }
-            detachedChatContextReceiptRefreshStatus[sessionId] = Self.nextRefreshStatus(
-                previous: detachedChatContextReceiptRefreshStatus[sessionId],
-                failedEndpoints: receiptFailures,
-                at: Date()
-            )
+        var receiptFailures: [String] = []
+        let receipt: ContextReceipt?
+        do {
+            receipt = try await loadReceipt(sessionId)
+        } catch {
+            receipt = nil
+            receiptFailures.append("context receipt")
         }
+        // Recheck AFTER this separate await too. A new turn may now own the
+        // slot, or may already have completed and cleared its streaming flag.
+        // Retained lifecycle evidence covers both without another generation.
+        let lifecycleAfterReceipt = chatTurnLifecycle(for: sessionId)
+        guard !streamingSessions.contains(sessionId),
+              lifecycleAfterReceipt == nil || lifecycleAfterReceipt == lifecycleAtLoadStart
+        else { return }
+        if let receipt { setLatestContextReceipt(receipt, for: sessionId) }
+        detachedChatContextReceiptRefreshStatus[sessionId] = Self.nextRefreshStatus(
+            previous: detachedChatContextReceiptRefreshStatus[sessionId],
+            failedEndpoints: receiptFailures,
+            at: Date()
+        )
     }
 
     /// Add a session to the pinned-chat strip from outside ChatView (the

@@ -100,7 +100,13 @@ private func oracleRecall(
             updatedAt: m.updatedAt,
             now: now
         )
-        scored.append((m, (sim + lexicalBoost) * decay * MemoryLifecycle.rankingFactor(m.lifecycle)))
+        scored.append((
+            m,
+            (sim + lexicalBoost)
+                * decay
+                * MemoryLifecycle.rankingFactor(m.lifecycle)
+                * MemoryRecallScoring.useCountFactor(m.useCount)
+        ))
     }
     scored.sort { $0.1 > $1.1 }
     return oracleUnique(scored, limit: topK)

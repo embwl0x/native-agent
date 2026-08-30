@@ -6,6 +6,30 @@ import Testing
 
 @Suite("GitHubCommandRuntime")
 struct GitHubCommandRuntimeTests {
+    @Test("concurrent launch branches share one resident baseline read")
+    func concurrentLaunchBaselineIsCoalesced() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let loads = ResidentBaselineLoadCounter()
+        let runtime = GitHubCommandRuntime(
+            dataRoot: root,
+            observationLoader: { _ in throw CocoaError(.fileNoSuchFile) },
+            notificationSender: { _ in ("skipped", "test") },
+            residentStateLoader: {
+                await loads.increment()
+                try await Task.sleep(nanoseconds: 200_000_000)
+                return []
+            }
+        )
+
+        async let credentialBranch: Void = runtime.replayResidentStateAtLaunch()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        async let loopBranch: Void = runtime.replayResidentStateAtLaunch()
+        _ = await (credentialBranch, loopBranch)
+
+        #expect(await loads.value == 1)
+        #expect(await runtime._testResidentBaselineLoadCount() == 1)
+    }
+
     private func root() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("github-command-runtime-\(UUID().uuidString)", isDirectory: true)
@@ -263,6 +287,11 @@ struct GitHubCommandRuntimeTests {
         process.waitUntilExit()
         #expect(process.terminationStatus == 0)
     }
+}
+
+private actor ResidentBaselineLoadCounter {
+    private(set) var value = 0
+    func increment() { value += 1 }
 }
 
 private actor RuntimeRecorder {

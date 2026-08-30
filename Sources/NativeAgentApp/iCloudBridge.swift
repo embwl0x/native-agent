@@ -12,6 +12,7 @@ import AppKit
 import SwiftUI
 import NativeAgentShared
 import PersistenceCore
+import ProviderRouting
 
 // MARK: - iCloudBridge (Mac)
 // BridgeMessage, BridgeError, and all HMAC helpers are now in NativeAgentShared.
@@ -37,8 +38,19 @@ enum ChatDeliveryReceiptStatus: String, Sendable {
     case queuedForICloudSync = "queued_for_icloud_sync"
     /// CloudKit accepted the outbound record, but iOS has not acknowledged it.
     case acceptedByTransport = "accepted_by_transport"
+    /// The Mac verified and delivered the inbound peer message to the runtime.
+    case deliveredToMac = "delivered_to_mac"
+    /// The peer later confirmed delivery of a Mac-originated notification.
+    case confirmedByPeer = "confirmed_by_peer"
 
-    var deliveryConfirmed: Bool { false }
+    var deliveryConfirmed: Bool {
+        switch self {
+        case .queuedForICloudSync, .acceptedByTransport:
+            return false
+        case .deliveredToMac, .confirmedByPeer:
+            return true
+        }
+    }
 }
 
 @MainActor
@@ -82,6 +94,9 @@ final class iCloudBridge: ObservableObject {
     private var deviceDrainInFlight = false
     private var deviceDrainQueued = false
     private var deviceDrainTimerTask: Task<Void, Never>?
+    /// E3: decides whether each fallback tick actually spends a CloudKit fetch.
+    var drainPolicy = AdaptiveDrainPolicy()
+    private var lastDeviceDrainAt = Date.distantPast
     /// Last successfully published deterministic provider projection. Repeated
     /// UI refreshes often discover identical state; skip those CloudKit writes.
     private var lastPublishedProviderCatalogStatus: String?
@@ -430,14 +445,30 @@ final class iCloudBridge: ObservableObject {
         NSApplication.shared.registerForRemoteNotifications(matching: [])
     }
 
+    /// `interval` is the FAST cadence while a peer correlation is outstanding
+    /// or the phone was recently active. The fallback is one-shot: after each
+    /// drain it arms directly for the next policy deadline. Pushes drain
+    /// immediately, and outbound state changes re-arm the deadline, so an idle
+    /// Mac no longer wakes every eight seconds just to reject an early tick.
     private func startDeviceDrainFallback(every interval: TimeInterval) {
+        drainPolicy.fastInterval = interval
+        scheduleNextDeviceDrainFallback()
+    }
+
+    private func scheduleNextDeviceDrainFallback() {
         deviceDrainTimerTask?.cancel()
+        guard deviceTransport != nil else {
+            deviceDrainTimerTask = nil
+            return
+        }
+        let now = Date()
+        drainPolicy.prune(now: now)
+        let delay = drainPolicy.nextDrainDelay(now: now, lastDrainAt: lastDeviceDrainAt)
+        let delayNanoseconds = UInt64(delay * 1_000_000_000)
         deviceDrainTimerTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                if Task.isCancelled { break }
-                await self?.drainDeviceTransport()
-            }
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard !Task.isCancelled, let self else { return }
+            await self.drainDeviceTransport()
         }
     }
 
@@ -462,6 +493,10 @@ final class iCloudBridge: ObservableObject {
     }
 
     func handleCloudKitPushWake() async {
+        // E3: a push IS peer activity — reset the cadence to fast before the
+        // drain so the follow-up traffic of this exchange is not sitting behind
+        // a 120s idle interval.
+        drainPolicy.notePeerActivity(at: Date())
         _ = await drainDeviceTransport()
     }
 
@@ -553,6 +588,7 @@ final class iCloudBridge: ObservableObject {
                 kvs.set(triggerValue, forKey: KVSKey.newMessageInDrive)
                 return kvs.synchronize()
             }
+            noteOutboundToPeer(correlationID: correlationID, metadata: metadata)
             lastSyncAt = Date()
             syncStatus = "CloudKit accepted message — waiting for iOS"
             return msg
@@ -593,9 +629,29 @@ final class iCloudBridge: ObservableObject {
         }
         await scheduleDeliveryNudges(for: msg.id)
 
+        noteOutboundToPeer(correlationID: correlationID, metadata: metadata)
         lastSyncAt = Date()
         syncStatus = "Queued for iCloud sync — waiting for iOS"
         return msg
+    }
+
+    /// E3: a delivered outbound message settles the drain cadence. Only a
+    /// terminal message retires the correlation — a text_delta or progress
+    /// frame proves the turn is still running, so it refreshes peer activity
+    /// instead of declaring the reply sent.
+    private func noteOutboundToPeer(correlationID: String?, metadata: [String: String]?) {
+        defer { scheduleNextDeviceDrainFallback() }
+        let now = Date()
+        guard let correlationID, !correlationID.isEmpty else {
+            drainPolicy.notePeerActivity(at: now)
+            return
+        }
+        switch metadata?["kind"] {
+        case "text_delta", "progress":
+            drainPolicy.notePeerActivity(at: now)
+        default:
+            drainPolicy.resolve(correlationID, at: now)
+        }
     }
 
     /// Return the existing MacSyncEngine-signed action response over CloudKit.
@@ -620,7 +676,17 @@ final class iCloudBridge: ObservableObject {
         )
         let secret = try testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
         do {
-            try await deviceTransport.send(unsigned.signed(with: secret))
+            let signed = try unsigned.signed(with: secret)
+            try await deviceTransport.send(signed)
+            await Self.appendActionResponseDeliveryReceipt(
+                response: response,
+                correlationID: correlationID,
+                transport: "cloudkit",
+                status: .acceptedByTransport,
+                dataRoot: testDataRoot ?? PersistenceCore.defaultDataRoot()
+            )
+            drainPolicy.resolve(correlationID, at: Date())
+            scheduleNextDeviceDrainFallback()
             lastSyncAt = Date()
             syncStatus = "Sent action response via CloudKit"
         } catch {
@@ -636,10 +702,12 @@ final class iCloudBridge: ObservableObject {
         _ message: BridgeMessage,
         transport: String,
         status: ChatDeliveryReceiptStatus,
-        secret: Data
+        secret: Data,
+        direction: String = "mac_to_ios"
     ) async {
         await Self.appendChatDeliveryReceipt(
             message,
+            direction: direction,
             transport: transport,
             status: status,
             secret: secret,
@@ -652,18 +720,19 @@ final class iCloudBridge: ObservableObject {
     /// exact persisted evidence without opening a live transport.
     static func appendChatDeliveryReceipt(
         _ message: BridgeMessage,
+        direction: String,
         transport: String,
         status: ChatDeliveryReceiptStatus,
         secret: Data,
         dataRoot: URL
     ) async {
-        let row: JSONValue = .object([
+        var fields: [String: JSONValue] = [
             "at": .string(ISO8601DateFormatter().string(from: Date())),
             "messageId": .string(message.id),
             "correlationId": message.correlationID.map { .string($0) } ?? .null,
             "sessionId": message.sessionID.map { .string($0) } ?? .null,
             "sender": .string(message.sender),
-            "direction": .string("mac_to_ios"),
+            "direction": .string(direction),
             "transport": .string(transport),
             "status": .string(status.rawValue),
             "deliveryConfirmed": .bool(status.deliveryConfirmed),
@@ -672,17 +741,233 @@ final class iCloudBridge: ObservableObject {
             "targetSourceKey": message.metadata?["targetSourceKey"].map { .string($0) } ?? .null,
             "textPreview": .string(String(message.text.prefix(240))),
             "attachmentCount": .int(Int64(message.attachments?.count ?? 0)),
+        ]
+        if let eventID = message.metadata?["userInfo.eventId"] ?? message.metadata?["eventId"] {
+            fields["eventId"] = .string(eventID)
+        }
+        _ = try? await upsertChatDeliveryReceipt(
+            appendRow: .object(fields),
+            dataRoot: dataRoot
+        )
+    }
+
+    static func appendActionResponseDeliveryReceipt(
+        response: [String: String],
+        correlationID: String,
+        transport: String,
+        status: ChatDeliveryReceiptStatus,
+        dataRoot: URL
+    ) async {
+        let preview = String((response["message"] ?? response["status"] ?? "").prefix(240))
+        let row: JSONValue = .object([
+            "at": .string(ISO8601DateFormatter().string(from: Date())),
+            "messageId": response["msgId"].map { .string($0) } ?? .null,
+            "correlationId": .string(correlationID),
+            "sessionId": .null,
+            "sender": .string("mac"),
+            "direction": .string("mac_to_ios"),
+            "transport": .string(transport),
+            "status": .string(status.rawValue),
+            "deliveryConfirmed": .bool(status.deliveryConfirmed),
+            "signatureVerified": .bool(true),
+            "kind": .string("icloud_action_response"),
+            "targetSourceKey": .null,
+            "textPreview": .string(preview),
+            "attachmentCount": .int(0),
         ])
-        let path = dataRoot
+        _ = try? await upsertChatDeliveryReceipt(appendRow: row, dataRoot: dataRoot)
+    }
+
+    static func appendInboundSuccessReceipt(
+        _ message: BridgeMessage,
+        transport: String,
+        secret: Data,
+        dataRoot: URL
+    ) async {
+        await appendChatDeliveryReceipt(
+            message,
+            direction: "ios_to_mac",
+            transport: transport,
+            status: .deliveredToMac,
+            secret: secret,
+            dataRoot: dataRoot
+        )
+    }
+
+    static func appendInboundActionSuccessReceipt(
+        messageID: String,
+        action: String,
+        transport: String,
+        dataRoot: URL
+    ) async {
+        let row: JSONValue = .object([
+            "at": .string(ISO8601DateFormatter().string(from: Date())),
+            "messageId": .string(messageID),
+            "correlationId": .string(messageID),
+            "sessionId": .null,
+            "sender": .string("ios"),
+            "direction": .string("ios_to_mac"),
+            "transport": .string(transport),
+            "status": .string(ChatDeliveryReceiptStatus.deliveredToMac.rawValue),
+            "deliveryConfirmed": .bool(true),
+            "signatureVerified": .bool(true),
+            "kind": .string("icloud_action"),
+            "targetSourceKey": .null,
+            "textPreview": .string(String(action.prefix(240))),
+            "attachmentCount": .int(0),
+        ])
+        _ = try? await upsertChatDeliveryReceipt(appendRow: row, dataRoot: dataRoot)
+    }
+
+    @discardableResult
+    static func confirmChatDeliveryReceipt(
+        direction: String,
+        eventID: String,
+        channel: String,
+        dataRoot: URL
+    ) async -> Bool {
+        let cleanDirection = direction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleanDirection == "mac_to_ios" || cleanDirection == "ios_to_mac" else {
+            return false
+        }
+        let cleanEventID = eventID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard NativeAgentDeviceEventIdentity.isCanonical(cleanEventID) else {
+            return false
+        }
+        let cleanChannel = String(channel.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
+        let confirmedAt = ISO8601DateFormatter().string(from: Date())
+        let fallback: JSONValue = .object([
+            "at": .string(confirmedAt),
+            "messageId": .null,
+            "correlationId": .null,
+            "sessionId": .null,
+            "sender": .string(cleanDirection == "mac_to_ios" ? "mac" : "ios"),
+            "direction": .string(cleanDirection),
+            "transport": .string("notification_receipt"),
+            "status": .string(ChatDeliveryReceiptStatus.confirmedByPeer.rawValue),
+            "deliveryConfirmed": .bool(true),
+            "signatureVerified": .bool(cleanDirection == "ios_to_mac"),
+            "kind": .string("notification"),
+            "targetSourceKey": .null,
+            "textPreview": .string(""),
+            "attachmentCount": .int(0),
+            "eventId": .string(cleanEventID),
+            "confirmedAt": .string(confirmedAt),
+            "confirmationChannel": .string(cleanChannel),
+        ])
+        do {
+            return try await upsertChatDeliveryReceipt(
+                appendRow: fallback,
+                match: ChatDeliveryReceiptMatch(
+                    direction: cleanDirection,
+                    eventID: cleanEventID,
+                    correlationID: nil,
+                    kind: nil
+                ),
+                updateFields: [
+                    "direction": .string(cleanDirection),
+                    "deliveryConfirmed": .bool(true),
+                    "status": .string(ChatDeliveryReceiptStatus.confirmedByPeer.rawValue),
+                    "eventId": .string(cleanEventID),
+                    "confirmedAt": .string(confirmedAt),
+                    "confirmationChannel": .string(cleanChannel),
+                    "kind": .string("notification"),
+                ],
+                dataRoot: dataRoot
+            )
+        } catch {
+            return false
+        }
+    }
+
+    nonisolated static func chatDeliveryReceiptsURL(dataRoot: URL) -> URL {
+        dataRoot
             .appendingPathComponent("icloud", isDirectory: true)
             .appendingPathComponent("chat_delivery_receipts.jsonl")
-        try? await appendJSONLCapped(
-            row,
-            to: path,
-            using: SwiftNativePersistenceCore(),
-            maxLines: 500,
-            logLabel: "iCloudBridge.chatDelivery"
+    }
+
+    private struct ChatDeliveryReceiptMatch: Sendable {
+        let direction: String
+        let eventID: String?
+        let correlationID: String?
+        let kind: String?
+
+        func matches(_ fields: [String: JSONValue]) -> Bool {
+            guard stringField(fields["direction"]) == direction else { return false }
+            if let eventID, stringField(fields["eventId"]) != eventID { return false }
+            if let correlationID, stringField(fields["correlationId"]) != correlationID { return false }
+            if let kind, stringField(fields["kind"]) != kind { return false }
+            return true
+        }
+    }
+
+    @discardableResult
+    private static func upsertChatDeliveryReceipt(
+        appendRow: JSONValue,
+        match: ChatDeliveryReceiptMatch? = nil,
+        updateFields: [String: JSONValue]? = nil,
+        dataRoot: URL
+    ) async throws -> Bool {
+        let path = chatDeliveryReceiptsURL(dataRoot: dataRoot)
+        let persistence = SwiftNativePersistenceCore()
+        return try await persistence.withFileLock(path) {
+            let existing = try loadChatDeliveryReceiptRows(path: path)
+            var rows = existing
+            var matchedIndex: Int?
+            if let match {
+                for index in rows.indices.reversed() {
+                    if match.matches(rows[index]) {
+                        matchedIndex = index
+                        break
+                    }
+                }
+            }
+            if let matchedIndex, let updateFields {
+                var merged = rows[matchedIndex]
+                for (key, value) in updateFields {
+                    merged[key] = value
+                }
+                rows[matchedIndex] = merged
+            } else if case .object(let fields) = appendRow {
+                rows.append(fields)
+            }
+            if rows.count > 500 {
+                rows = Array(rows.suffix(500))
+            }
+            try saveChatDeliveryReceiptRows(rows, path: path)
+            return matchedIndex != nil
+        }
+    }
+
+    nonisolated private static func loadChatDeliveryReceiptRows(path: URL) throws -> [[String: JSONValue]] {
+        guard let data = try? Data(contentsOf: path) else { return [] }
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        return try text
+            .split(whereSeparator: \.isNewline)
+            .map { line in
+                guard case .object(let object) = try JSONValue.parse(Data(String(line).utf8)) else {
+                    throw NSError(domain: "iCloudBridge.chatDelivery", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "Invalid chat delivery receipt row"
+                    ])
+                }
+                return object
+            }
+    }
+
+    nonisolated private static func saveChatDeliveryReceiptRows(_ rows: [[String: JSONValue]], path: URL) throws {
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true
         )
+        let serialized = try rows.map { try JSONValue.object($0).serialize(pretty: false) }
+            .joined(separator: "\n")
+        let data = Data((serialized.isEmpty ? "" : serialized + "\n").utf8)
+        try data.write(to: path, options: .atomic)
+    }
+
+    nonisolated private static func stringField(_ value: JSONValue?) -> String? {
+        guard case .string(let string)? = value else { return nil }
+        return string
     }
 
     /// Phase 14e-iCloud HMAC self-heal: write an UNSIGNED BridgeMessage to the
@@ -819,8 +1104,9 @@ final class iCloudBridge: ObservableObject {
             } else {
                 providers = try await api.listProviders()
             }
-            let preferences = try await api.getModelPreferences()
-            let activeProviders = try await NativeClient.readActiveProvidersFromDisk()
+            let snapshot = try await SwiftNativeProviderRouting(
+                dataRoot: testDataRoot ?? PersistenceCore.defaultDataRoot()
+            ).checkedRoutingSnapshot()
 
             let providerRows = providers.map { provider in
                 NAProviderCatalogProvider(
@@ -844,18 +1130,9 @@ final class iCloudBridge: ObservableObject {
                     }
                 )
             }
-            var surfaces: [String: NAProviderSurfaceSelection] = [:]
-            for preference in preferences.preferences where !preference.surface.isEmpty && !preference.model.isEmpty {
-                surfaces[preference.surface] = NAProviderSurfaceSelection(
-                    providerID: activeProviders[preference.surface],
-                    model: preference.model,
-                    reasoningEffort: preference.reasoningEffort.isEmpty ? nil : preference.reasoningEffort,
-                    serviceTier: preference.serviceTier
-                )
-            }
             let catalog = NAProviderCatalogStatus(
                 providers: providerRows,
-                surfaces: surfaces
+                surfaces: Self.providerSurfaceSelections(from: snapshot)
             )
             let value = try NAProviderCatalogStatusCodec.encode(catalog)
             let outcome = await ICloudBridgeStatusPublication.publish(
@@ -869,6 +1146,23 @@ final class iCloudBridge: ObservableObject {
         } catch {
             NSLog("[iCloudBridge] provider catalog publication failed: \(error.localizedDescription)")
             return false
+        }
+    }
+
+    /// A credential-free projection of one frozen routing generation. Never
+    /// reread a second picker file while constructing the phone's tuple.
+    nonisolated static func providerSurfaceSelections(
+        from snapshot: ProviderRoutingSnapshot
+    ) -> [String: NAProviderSurfaceSelection] {
+        snapshot.preferences.reduce(into: [:]) { surfaces, entry in
+            let (surface, preference) = entry
+            guard !surface.isEmpty, !preference.model.isEmpty else { return }
+            surfaces[surface] = NAProviderSurfaceSelection(
+                providerID: snapshot.activeProviders[surface],
+                model: preference.model,
+                reasoningEffort: preference.reasoningEffort.isEmpty ? nil : preference.reasoningEffort,
+                serviceTier: preference.serviceTier
+            )
         }
     }
 
@@ -1107,6 +1401,8 @@ final class iCloudBridge: ObservableObject {
         if msg.metadata?["kind"] == "icloud_action" {
             let handled = await MacSyncEngine.shared.processCloudKitActionMessage(msg)
             if handled {
+                // E3: the action's signed response is owed on the same id.
+                drainPolicy.noteOutstanding(msg.id, at: Date())
                 recordSeenMessageID(msg.id)
                 persistCKSeenIDs()
                 lastSyncAt = Date()
@@ -1130,6 +1426,15 @@ final class iCloudBridge: ObservableObject {
             if await handler(msg) { delivered = true }
         }
         if delivered {
+            // E3: this turn's reply is owed — hold the fast drain cadence until
+            // it is sent (or the correlation ages out).
+            drainPolicy.noteOutstanding(msg.id, at: Date())
+            await Self.appendInboundSuccessReceipt(
+                msg,
+                transport: "cloudkit",
+                secret: secret,
+                dataRoot: testDataRoot ?? PersistenceCore.defaultDataRoot()
+            )
             recordSeenMessageID(msg.id)
             // CK-3c: persist the CK-consumed id so a restart within the cursor's
             // 30s clock-skew re-pull window doesn't re-deliver it (gpt-5.5 CK-3c
@@ -1197,12 +1502,15 @@ final class iCloudBridge: ObservableObject {
     func drainDeviceTransport() async -> Bool {
         guard let ck = deviceTransport else { return false }
         if deviceDrainInFlight { deviceDrainQueued = true; return false }
+        lastDeviceDrainAt = Date()
         deviceDrainInFlight = true
         defer {
             deviceDrainInFlight = false
             if deviceDrainQueued {
                 deviceDrainQueued = false
                 Task { await self.drainDeviceTransport() }
+            } else {
+                scheduleNextDeviceDrainFallback()
             }
         }
         let dispatched = await ck.drainIncoming()
@@ -1339,6 +1647,14 @@ final class iCloudBridge: ObservableObject {
                             }
                         }
                         if delivered {
+                            // E3: same owed-reply bookkeeping as the CloudKit lane.
+                            self.drainPolicy.noteOutstanding(pending.message.id, at: Date())
+                            await Self.appendInboundSuccessReceipt(
+                                pending.message,
+                                transport: "icloud_drive",
+                                secret: secret,
+                                dataRoot: self.testDataRoot ?? NativeAgentPaths.dataRoot
+                            )
                             await self.markIosMessageProcessed(pending, docsURL: docsURL)
                         } else {
                             self.markMacRuntimeUnavailable()

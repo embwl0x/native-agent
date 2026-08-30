@@ -1009,9 +1009,12 @@ public enum ToolPreloadHeuristics {
         ])
         let persistence = SwiftNativePersistenceCore()
         do {
-            try await persistence.withFileLock(tracesPath) {
-                try await persistence.appendJSONL(row, to: tracesPath)
-            }
+            try await appendPathOwnedJSONL(
+                row,
+                to: tracesPath,
+                using: persistence,
+                logLabel: "ToolPreloadHeuristics.trace"
+            )
         } catch {
             FileHandle.standardError.write(
                 Data("ToolPreloadHeuristics: trace append failed: \(error)\n".utf8)

@@ -42,6 +42,29 @@ private func queuedTurnSession(_ id: String) throws -> ChatSession {
 @MainActor
 @Suite("Chat send-next queue")
 struct ChatSendNextQueueTests {
+    @Test func composerDescribesPausedAndExistingQueuesWithoutPromisingAnImmediateSend() {
+        #expect(ChatComposerSendAction.resolve(isRunning: false, hasQueuedTurns: false, isQueuePaused: false) == .send)
+        #expect(ChatComposerSendAction.resolve(isRunning: true, hasQueuedTurns: false, isQueuePaused: false) == .queueNext)
+        for running in [false, true] {
+            #expect(ChatComposerSendAction.resolve(isRunning: running, hasQueuedTurns: true, isQueuePaused: false) == .appendToQueue)
+            let paused = ChatComposerSendAction.resolve(isRunning: running, hasQueuedTurns: true, isQueuePaused: true)
+            #expect(paused == .appendToPausedQueue)
+            #expect(paused.label == "Add message to paused queue")
+            #expect(paused.hint.contains("stays paused"))
+        }
+        // A stale pause marker with no queued turns does not pause a new send.
+        #expect(ChatComposerSendAction.resolve(isRunning: false, hasQueuedTurns: false, isQueuePaused: true) == .send)
+    }
+
+    @Test func busyQueueMenuDisclosesThatRunningTheSelectedMessageInterruptsTheResponse() {
+        let items = ChatQueuePresentation.menuItems([
+            QueuedChatTurn(id: "hidden", text: "internal", hideUserBubble: true),
+            QueuedChatTurn(id: "visible", text: "follow up"),
+        ])
+        #expect(items.first?.actionLabel(isBusy: false) == "Send 1 now: follow up")
+        #expect(items.first?.actionLabel(isBusy: true) == "Stop current response and send 1: follow up")
+    }
+
     @Test func queueChromeStaysSingleLineInsteadOfReservingAChatObscuringList() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

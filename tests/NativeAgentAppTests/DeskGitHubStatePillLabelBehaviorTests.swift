@@ -56,14 +56,14 @@ struct DeskGitHubStatePillLabelBehaviorTests {
             callbackStatus: "  \(DeskGitHubStatePillPresentation.stalledCallbackStatus.uppercased())  "
         ))
         #expect(stalled.label == "Codex stalled")
-        #expect(stalled.tone == .failure)
+        #expect(stalled.tone == .danger)
 
         let noResult = DeskGitHubStatePillPresentation.pill(for: item(
             state: .attention(.codexFailed),
             callbackStatus: "failed"
         ))
         #expect(noResult.label == "Codex no result")
-        #expect(noResult.tone == .failure)
+        #expect(noResult.tone == .danger)
     }
 
     // app.desk / desk.github.statePillLabel

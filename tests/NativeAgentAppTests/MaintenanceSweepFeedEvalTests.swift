@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import BackgroundLoops
+import Context
 import NativeAgentCore
 import PersistenceCore
 @testable import NativeAgentApp
@@ -32,6 +33,15 @@ struct MaintenanceSweepFeedEvalTests {
             ofItemAtPath: orphanLock.path
         )
 
+        let contextDirectory = root.appendingPathComponent("context", isDirectory: true)
+        try FileManager.default.createDirectory(at: contextDirectory, withIntermediateDirectories: true)
+        let legacyReceipt = contextDirectory.appendingPathComponent("unreferenced-old.json")
+        try Data("{\"runId\":\"unreferenced-old\"}".utf8).write(to: legacyReceipt)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-LegacyContextReceiptFeed.maximumUnprotectedAge - 1)],
+            ofItemAtPath: legacyReceipt.path
+        )
+
         let loop: any LoopRunner = BackgroundLoopsAssembly.makeTurnTraceRetentionLoop(dataRoot: root)
         let outcome = await loop.tickOutcome()
         guard case .completed = outcome else {
@@ -47,12 +57,13 @@ struct MaintenanceSweepFeedEvalTests {
             }
 
         let removalRows = rows.filter { $0["event"] as? String == "maintenance_sweep.removed" }
-        #expect(removalRows.count == 3)
+        #expect(removalRows.count == 4)
         let removalPaths = Set(removalRows.compactMap { $0["path"] as? String })
         #expect(removalPaths == Set([
             "turn_traces/\(oldDay).jsonl",
             "turn_traces/\(oldDay).jsonl.lock",
             "abandoned-receipt.json.lock",
+            "context/unreferenced-old.json",
         ]))
         #expect(removalRows.allSatisfy { !($0["path"] as? String ?? "").hasPrefix(root.path) })
 
@@ -62,6 +73,14 @@ struct MaintenanceSweepFeedEvalTests {
         #expect((summary?["turnTraceDaysRemoved"] as? NSNumber)?.intValue == 1)
         #expect((summary?["turnTraceLocksRemoved"] as? NSNumber)?.intValue == 1)
         #expect((summary?["orphanLockSidecarsReaped"] as? NSNumber)?.intValue == 1)
+
+        let contextSummary = rows.first {
+            $0["event"] as? String == "maintenance_sweep.completed"
+                && $0["source"] as? String == "legacy_context_receipt_retention"
+        }
+        #expect((contextSummary?["removed"] as? NSNumber)?.intValue == 1)
+        #expect((contextSummary?["discovered"] as? NSNumber)?.intValue == 1)
+        #expect((contextSummary?["failedRemovals"] as? NSNumber)?.intValue == 0)
     }
 
     private func dayName(_ days: Int, before now: Date) -> String {

@@ -106,6 +106,24 @@ if ! grep -Fq 'BlueprintName = "NativeAgentMobileTests"' <<<"$TEST_ACTION"; then
   echo "[test-inventory] NativeAgentMobileTests is missing from the shared scheme TestAction" >&2
   failures=$((failures + 1))
 fi
+if ! python3 - "$SCHEME" <<'PY'
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+    testables = [node for node in root.findall("./TestAction/Testables/TestableReference")
+                 if any(ref.get("BlueprintName") == "NativeAgentMobileTests"
+                        for ref in node.findall("BuildableReference"))]
+    if len(testables) != 1 or testables[0].get("skipped") != "NO":
+        raise ValueError("NativeAgentMobileTests must have exactly one unskipped TestableReference")
+    if any(len(node) for tag in ("SkippedTests", "SelectedTests") for node in testables[0].findall(tag)):
+        raise ValueError("NativeAgentMobileTests scheme must not filter out test discovery")
+except Exception as error:
+    print("[test-inventory] " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  failures=$((failures + 1))
+fi
 
 [[ "$failures" -eq 0 ]] \
   || { echo "[test-inventory] FAIL: $failures iOS project inventory error(s)" >&2; exit 1; }

@@ -161,8 +161,11 @@ func fusedSemanticTargetUsesVisionPointAndFreshReceipt() async throws {
     #expect(reply.text.contains("fresh screen changed"), "\(reply.text)")
     #expect(reply.detail["observed_after"] == .bool(true))
     #expect(reply.detail["screen_changed"] == .bool(true))
-    #expect(reply.detail["verification"] == .string(MotorVerificationState.satisfied.rawValue))
-    #expect(reply.detail["verification_evidence"] == .string("fresh_visible_screen_change"))
+    // A changed window title is visible evidence, but it cannot establish
+    // pointer landing. This fixture supplies no independent pointer position.
+    #expect(reply.detail["verification"] == .string(MotorVerificationState.unverified.rawValue))
+    #expect(reply.detail["verification_evidence"] == nil)
+    #expect(reply.detail["pointer_on_target"] == .null)
 
     let calls = host.recordedCalls()
     #expect(calls.map(\.0) == ["look", "look", "hand", "look"])

@@ -77,6 +77,22 @@ public struct KnowledgeGraphGCReport: Sendable, Equatable {
     public var staleIndexRowsDeleted: Int
 }
 
+/// Result of the age+provenance stale-entity sweep. Separate from
+/// `KnowledgeGraphGCReport` because the two sweeps answer different questions:
+/// GC removes entities whose SOURCE MEMORY is gone, this one removes entities
+/// that are merely old and unattributed. Neither subsumes the other.
+public struct KnowledgeGraphStaleSweepReport: Sendable, Equatable {
+    /// The `last_seen` boundary this run used, echoed back so a report can be
+    /// read without knowing which default was in force.
+    public var cutoff: String
+    public var candidates: [KnowledgeGraphGCCandidate]
+    public var applied: Bool
+    public var candidateSetDiverged: Bool
+    public var entitiesDeleted: Int
+    public var edgesDeleted: Int
+    public var staleIndexRowsDeleted: Int
+}
+
 extension SwiftNativeKnowledgeGraphIndexer {
 
     /// Apply-mode refusal threshold: more than this many candidates requires
@@ -238,6 +254,160 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 staleIndexRowsDeleted: staleDeleted
             )
         }
+    }
+
+    /// Default cutoff for the stale-entity sweep. Entities last seen before
+    /// this date AND carrying no provenance are pre-consolidation residue.
+    public static let staleSweepDefaultCutoff = "2026-06-01"
+
+    /// Sweep entities matching `last_seen < cutoff AND provenance IS NULL`,
+    /// deleting their incident edges and any now-orphaned bookkeeping rows in
+    /// the same transaction.
+    ///
+    /// ── WHY THE PREDICATE IS A CONJUNCTION ──────────────────────────────────
+    /// A provenance-only predicate is WRONG and destructive here. The live
+    /// indexer still writes rows with NULL provenance today, so
+    /// `provenance IS NULL` alone matches 53 entities created this August —
+    /// current, load-bearing rows (re-verified against the live store
+    /// 2026-08-28). The age half is what makes the set actually stale, and the
+    /// provenance half is what keeps the sweep off anything an identifiable
+    /// writer claims. Both halves, always.
+    ///
+    /// NULL `last_seen` is EXCLUDED, and that is SQL's own doing rather than an
+    /// accident: `NULL < '2026-06-01'` evaluates to NULL, not true. An entity
+    /// that never recorded when it was last seen cannot prove it is stale, so
+    /// it survives — same fail-closed instinct as GC's `created_by_indexer`
+    /// condition. The primary-user role hub is additionally never a candidate
+    /// (mirrors `scanForOrphans` condition 4): identity is not sweepable
+    /// however old its timestamp gets.
+    ///
+    /// Trigger contract matches `collectGarbage`: `apply: false` is a pure
+    /// read, `apply: true` mutates. Nothing calls this on a timer.
+    public func sweepStaleUnprovenancedEntities(
+        cutoff: String = SwiftNativeKnowledgeGraphIndexer.staleSweepDefaultCutoff,
+        apply: Bool = false,
+        expectedCandidateIDs: Set<String>? = nil
+    ) async throws -> KnowledgeGraphStaleSweepReport {
+        let dbPool = try await gcPool()
+        if !apply {
+            return try await dbPool.read { db in
+                KnowledgeGraphStaleSweepReport(
+                    cutoff: cutoff,
+                    candidates: try Self.scanForStaleEntities(db, cutoff: cutoff),
+                    applied: false,
+                    candidateSetDiverged: false,
+                    entitiesDeleted: 0,
+                    edgesDeleted: 0,
+                    staleIndexRowsDeleted: 0
+                )
+            }
+        }
+        return try await dbPool.write { db in
+            // Re-scan inside the write transaction for the same reason
+            // collectGarbage does: a preview is never permission to delete a
+            // later state.
+            let candidates = try Self.scanForStaleEntities(db, cutoff: cutoff)
+            if let expectedCandidateIDs,
+               Set(candidates.map(\.id)) != expectedCandidateIDs {
+                return KnowledgeGraphStaleSweepReport(
+                    cutoff: cutoff,
+                    candidates: candidates,
+                    applied: false,
+                    candidateSetDiverged: true,
+                    entitiesDeleted: 0,
+                    edgesDeleted: 0,
+                    staleIndexRowsDeleted: 0
+                )
+            }
+            var edgesDeleted = 0
+            let ids = candidates.map(\.id)
+            for chunk in Self.gcChunks(ids) {
+                let qs = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+                try db.execute(
+                    sql: "DELETE FROM kg_relationships WHERE from_id IN (\(qs)) OR to_id IN (\(qs))",
+                    arguments: StatementArguments(chunk + chunk)
+                )
+                edgesDeleted += db.changesCount
+                try db.execute(
+                    sql: "DELETE FROM kg_entities WHERE id IN (\(qs))",
+                    arguments: StatementArguments(chunk)
+                )
+            }
+            try db.execute(sql: """
+                DELETE FROM kg_relationships
+                WHERE from_id NOT IN (SELECT id FROM kg_entities)
+                   OR to_id NOT IN (SELECT id FROM kg_entities)
+                """)
+            edgesDeleted += db.changesCount
+            let staleIndexRowsDeleted = try Self.deleteIndexRowsWithoutFactEntity(db)
+            return KnowledgeGraphStaleSweepReport(
+                cutoff: cutoff,
+                candidates: candidates,
+                applied: true,
+                candidateSetDiverged: false,
+                entitiesDeleted: ids.count,
+                edgesDeleted: edgesDeleted,
+                staleIndexRowsDeleted: staleIndexRowsDeleted
+            )
+        }
+    }
+
+    /// The predicate, in one place, used by both the dry run and the apply.
+    private static func scanForStaleEntities(
+        _ db: Database,
+        cutoff: String
+    ) throws -> [KnowledgeGraphGCCandidate] {
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT id, name, type, mention_count, metadata_json FROM kg_entities
+            WHERE last_seen < ? AND provenance IS NULL
+            ORDER BY id
+            """, arguments: [cutoff])
+        return rows.compactMap { r -> KnowledgeGraphGCCandidate? in
+            let id: String = r["id"] ?? ""
+            guard !id.isEmpty else { return nil }
+            if let raw: String = r["metadata_json"],
+               let data = raw.data(using: .utf8),
+               let parsed = try? JSONValue.parse(data),
+               case .object(let meta) = parsed,
+               case .string(let role)? = meta["role"],
+               role == "primary_user" {
+                return nil
+            }
+            return KnowledgeGraphGCCandidate(
+                id: id,
+                name: r["name"] ?? "",
+                type: r["type"] ?? "",
+                mentionCount: (r["mention_count"] as Int64?).map(Int.init) ?? 0
+            )
+        }
+    }
+
+    /// Bookkeeping half of "delete entities and their edges/index rows
+    /// coherently": a `kg_memory_index` row whose derived memory-fact entity no
+    /// longer exists is describing an indexing that has been undone. The
+    /// memory→fact-entity id is a one-way hash, so this maps FORWARD from each
+    /// surviving index row rather than trying to invert a swept entity id.
+    private static func deleteIndexRowsWithoutFactEntity(_ db: Database) throws -> Int {
+        let memoryIDs = try String.fetchAll(
+            db, sql: "SELECT memory_id FROM kg_memory_index WHERE memory_id IS NOT NULL"
+        )
+        guard !memoryIDs.isEmpty else { return 0 }
+        let surviving = Set(try String.fetchAll(
+            db, sql: "SELECT id FROM kg_entities WHERE id LIKE 'memfact_%'"
+        ))
+        let orphaned = memoryIDs.filter {
+            !surviving.contains(memoryFactEntityID(for: $0))
+        }
+        var deleted = 0
+        for chunk in gcChunks(orphaned) {
+            let qs = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+            try db.execute(
+                sql: "DELETE FROM kg_memory_index WHERE memory_id IN (\(qs))",
+                arguments: StatementArguments(chunk)
+            )
+            deleted += db.changesCount
+        }
+        return deleted
     }
 
     /// Referential reconcile of kg_memory_index: delete rows whose memory_id

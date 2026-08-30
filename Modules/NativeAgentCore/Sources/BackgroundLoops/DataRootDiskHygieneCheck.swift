@@ -18,6 +18,13 @@ public struct DiskHygieneOffender: Sendable, Equatable {
 public struct DiskHygieneReport: Sendable, Equatable {
     /// Single files larger than `singleFileThreshold`, largest first.
     public let largeFiles: [DiskHygieneOffender]
+    /// F1: directories whose SUBTREE exceeds `directoryThreshold`, largest
+    /// first. Reported at the deepest offending level (a directory with an
+    /// over-threshold child is not itself listed) so the card names the actual
+    /// culprit rather than every ancestor of it. `sizeBytes` is the subtree
+    /// total, and protected stores are excluded — same rule the file tier and
+    /// the cleanup pass use.
+    public let largeDirectories: [DiskHygieneOffender]
     /// Total bytes of every regular file walked (bounded by `maxDepth`).
     public let totalBytes: Int64
     /// Whether `totalBytes` exceeded `totalThreshold`.
@@ -34,16 +41,20 @@ public struct DiskHygieneReport: Sendable, Equatable {
     public let depthTruncated: Bool
 
     /// True when the scan found anything worth a notification.
-    public var tripped: Bool { !largeFiles.isEmpty || totalOverBudget }
+    public var tripped: Bool {
+        !largeFiles.isEmpty || !largeDirectories.isEmpty || totalOverBudget
+    }
 
     public init(
         largeFiles: [DiskHygieneOffender],
         totalBytes: Int64,
         totalOverBudget: Bool,
         truncated: Bool = false,
-        depthTruncated: Bool = false
+        depthTruncated: Bool = false,
+        largeDirectories: [DiskHygieneOffender] = []
     ) {
         self.largeFiles = largeFiles
+        self.largeDirectories = largeDirectories
         self.totalBytes = totalBytes
         self.totalOverBudget = totalOverBudget
         self.truncated = truncated
@@ -61,8 +72,23 @@ public enum DataRootDiskHygiene {
     /// the old bound permanently flagged the 86.7 MB MiniLM embedder blob, a
     /// wanted file nobody should delete, so the card was a daily false alarm.
     public static let defaultSingleFileThreshold: Int64 = 1024 * 1024 * 1024
-    /// Total `dataRoot` bytes this large trips a notification (default 2 GB).
-    public static let defaultTotalThreshold: Int64 = 2 * 1024 * 1024 * 1024
+    /// Total `dataRoot` bytes this large trips a notification.
+    ///
+    /// F1 (2026-08-28): lowered 2 GB → 1 GB. The 2 GB bound was the SAME number
+    /// as the storage limit it was supposed to warn ahead of, so it was not a
+    /// backstop at all — it could only fire once the problem had already
+    /// arrived. The live root measured 567 MB against it, and the 1 GB
+    /// single-file tier could not fire either (largest real file: the 87 MB
+    /// MiniLM blob). User asked for a backstop that can actually fire.
+    public static let defaultTotalThreshold: Int64 = 1024 * 1024 * 1024
+
+    /// A DIRECTORY whose subtree exceeds this trips a notification (default
+    /// 128 MB). The gap the file tier could not see: a data root does not grow
+    /// by one giant file, it grows by ten thousand small ones under one branch.
+    /// Calibrated against the live root (largest branch: memory/ at 102 MB,
+    /// extras/ at 88 MB) — close enough that real growth trips it, far enough
+    /// that today's steady state does not.
+    public static let defaultDirectoryThreshold: Int64 = 128 * 1024 * 1024
 
     /// Walk `dataRoot` to `maxDepth` (dataRoot itself is depth 0), summing every
     /// regular file's size and collecting the ones over `singleFileThreshold`.
@@ -89,7 +115,8 @@ public enum DataRootDiskHygiene {
         maxDepth: Int = defaultMaxDepth,
         singleFileThreshold: Int64 = defaultSingleFileThreshold,
         totalThreshold: Int64 = defaultTotalThreshold,
-        maxScannedEntries: Int = defaultMaxScannedEntries
+        maxScannedEntries: Int = defaultMaxScannedEntries,
+        directoryThreshold: Int64 = defaultDirectoryThreshold
     ) -> DiskHygieneReport {
         let fm = FileManager.default
         var total: Int64 = 0
@@ -97,24 +124,45 @@ public enum DataRootDiskHygiene {
         var scanned = 0
         var truncated = false
         var depthTruncated = false
+        /// relative path → subtree bytes, for every directory descended into.
+        var directoryBytes: [String: Int64] = [:]
+        /// Relative paths of directories holding an over-threshold descendant,
+        /// so only the deepest offender in a branch is reported.
+        var hasOffendingChild: Set<String> = []
 
-        func walk(_ dir: URL, depth: Int) {
+        /// Returns the bytes `dir`'s subtree contributed.
+        @discardableResult
+        func walk(_ dir: URL, depth: Int) -> Int64 {
+            var subtree: Int64 = 0
+            defer {
+                if depth > 0 {
+                    let rel = relativePath(of: dir, under: dataRoot)
+                    directoryBytes[rel] = subtree
+                    if subtree > directoryThreshold {
+                        var parent = (rel as NSString).deletingLastPathComponent
+                        while !parent.isEmpty {
+                            hasOffendingChild.insert(parent)
+                            parent = (parent as NSString).deletingLastPathComponent
+                        }
+                    }
+                }
+            }
             guard !truncated,
                   let entries = try? fm.contentsOfDirectory(
                 at: dir,
                 includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey],
                 options: []
-            ) else { return }
+            ) else { return subtree }
             for entry in entries {
                 scanned += 1
-                if scanned > maxScannedEntries { truncated = true; return }
+                if scanned > maxScannedEntries { truncated = true; return subtree }
                 let values = try? entry.resourceValues(forKeys: [
                     .isDirectoryKey, .isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey,
                 ])
                 if values?.isSymbolicLink == true { continue }
                 if values?.isDirectory == true {
                     if depth < maxDepth {
-                        walk(entry, depth: depth + 1)
+                        subtree += walk(entry, depth: depth + 1)
                     } else {
                         // A real directory sat past the depth bound — its files
                         // are UNSCANNED, so flag it rather than silently
@@ -126,6 +174,7 @@ public enum DataRootDiskHygiene {
                 if values?.isRegularFile == true {
                     let size = Int64(values?.fileSize ?? 0)
                     total += size
+                    subtree += size
                     if size > singleFileThreshold {
                         offenders.append(DiskHygieneOffender(
                             relativePath: relativePath(of: entry, under: dataRoot),
@@ -134,19 +183,40 @@ public enum DataRootDiskHygiene {
                     }
                 }
             }
+            return subtree
         }
 
         if fm.fileExists(atPath: dataRoot.path) {
             walk(dataRoot, depth: 0)
         }
         offenders.sort { $0.sizeBytes > $1.sizeBytes }
+        let directoryOffenders = directoryBytes
+            .filter { rel, bytes in
+                bytes > directoryThreshold
+                    && !hasOffendingChild.contains(rel)
+                    && !isProtected(relativePath: rel)
+            }
+            .map { DiskHygieneOffender(relativePath: $0.key, sizeBytes: $0.value) }
+            .sorted { $0.sizeBytes > $1.sizeBytes }
         return DiskHygieneReport(
             largeFiles: offenders,
             totalBytes: total,
             totalOverBudget: total > totalThreshold,
             truncated: truncated,
-            depthTruncated: depthTruncated
+            depthTruncated: depthTruncated,
+            largeDirectories: directoryOffenders
         )
+    }
+
+    /// True when `relativePath` names, or sits under, a protected store. Case
+    /// folded because APFS is typically case-insensitive — the same reasoning
+    /// (and the same list) the cleanup pass uses.
+    static func isProtected(relativePath: String) -> Bool {
+        let normalized = relativePath.lowercased()
+        return protectedRelativePrefixes.contains { prefix in
+            let p = prefix.lowercased()
+            return normalized == p || normalized.hasPrefix(p + "/")
+        }
     }
 
     /// `entry`'s path relative to `root`, falling back to the last path
@@ -317,6 +387,7 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
     private let maxDepth: Int
     private let singleFileThreshold: Int64
     private let totalThreshold: Int64
+    private let directoryThreshold: Int64
     /// Files ONE inbox card for the tripped report; returns whether the card
     /// actually landed. Injected so this module gains no NotificationInbox
     /// dependency. A `false` return rolls back the daily reservation so the
@@ -331,8 +402,10 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
         maxDepth: Int = DataRootDiskHygiene.defaultMaxDepth,
         singleFileThreshold: Int64 = DataRootDiskHygiene.defaultSingleFileThreshold,
         totalThreshold: Int64 = DataRootDiskHygiene.defaultTotalThreshold,
+        directoryThreshold: Int64 = DataRootDiskHygiene.defaultDirectoryThreshold,
         fileNotice: @escaping @Sendable (DiskHygieneReport) async -> Bool
     ) {
+        self.directoryThreshold = directoryThreshold
         self.interval = interval
         self.dataRoot = dataRoot
         self.clock = clock
@@ -377,7 +450,8 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
             dataRoot: dataRoot,
             maxDepth: maxDepth,
             singleFileThreshold: singleFileThreshold,
-            totalThreshold: totalThreshold
+            totalThreshold: totalThreshold,
+            directoryThreshold: directoryThreshold
         )
         guard report.tripped else {
             return .completed(result: "disk clean (\(DataRootDiskHygiene.humanSize(report.totalBytes)))"
@@ -393,6 +467,7 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
         }
         return .completed(result:
             "disk hygiene flagged \(report.largeFiles.count) large file(s), "
+            + "\(report.largeDirectories.count) large director(ies), "
             + "total \(DataRootDiskHygiene.humanSize(report.totalBytes))"
             + (report.truncated ? " [scan truncated at file budget]" : "")
             + (report.depthTruncated ? " [depth-truncated: a store past maxDepth is unscanned]" : ""))

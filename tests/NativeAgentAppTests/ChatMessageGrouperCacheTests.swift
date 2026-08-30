@@ -53,6 +53,17 @@ private func grouperProjection(_ groups: [MessageGroup]) -> [String] {
 @Suite("Chat message grouper cache")
 struct ChatMessageGrouperCacheTests {
 
+    @Test func streamingCacheDoesNotHashTheGrowingMessageOrBuildCompositeKeys() throws {
+        let source = try AppSourceScraping.appSource("ChatMessageListView.swift")
+        let cacheStart = try #require(source.range(of: "private final class _MessageGroupCache"))
+        let grouperStart = try #require(source.range(of: "enum MessageGrouper", range: cacheStart.upperBound..<source.endIndex))
+        let cacheSource = source[cacheStart.lowerBound..<grouperStart.lowerBound]
+
+        #expect(!cacheSource.contains("hashValue"))
+        #expect(cacheSource.contains("private struct StableKey: Equatable"))
+        #expect(cacheSource.contains("patched.messages[0] = last"))
+    }
+
     /// Every mutation shape the transcript actually undergoes must leave the
     /// cached grouping identical to a fresh `_compute`. A stale slot is exactly
     /// how a hidden row survives on screen.

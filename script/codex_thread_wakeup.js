@@ -19,12 +19,36 @@ const PENDING_PATH = process.env.NATIVE_AGENT_CODEX_PENDING_PATH ||
   path.join(BRIDGE_DIR, "pending-wakeups.json");
 const QUEUE_LOCK_DIR = process.env.NATIVE_AGENT_CODEX_PENDING_LOCK ||
   path.join(BRIDGE_DIR, ".pending-wakeups.lock");
-const DRAIN_LOCK_DIR = process.env.NATIVE_AGENT_CODEX_DRAIN_LOCK ||
-  path.join(BRIDGE_DIR, ".pending-wakeups-drain.lock");
+/// Resolved PER CALL, not at module load. A caller (a test, a one-off repair
+/// script) that redirects the queue with an env var after `require` would
+/// otherwise silently operate on the REAL bridge queue — which is exactly the
+/// mistake that made the first version of this file's dead-letter test rewrite
+/// production state instead of its own temp dir.
+function deadLetterPath() {
+  return process.env.NATIVE_AGENT_CODEX_DEAD_LETTER_PATH ||
+    path.join(BRIDGE_DIR, "dead-letter-wakeups.jsonl");
+}
+
+function pendingPath() {
+  return process.env.NATIVE_AGENT_CODEX_PENDING_PATH || PENDING_PATH;
+}
+
+function queueLockDir() {
+  return process.env.NATIVE_AGENT_CODEX_PENDING_LOCK || QUEUE_LOCK_DIR;
+}
+const WAKE_LANES_DIR = process.env.NATIVE_AGENT_CODEX_WAKE_LANES_DIR ||
+  path.join(BRIDGE_DIR, ".wake-lanes");
+const WAKE_CAPACITY_DIR = process.env.NATIVE_AGENT_CODEX_WAKE_CAPACITY_DIR ||
+  path.join(BRIDGE_DIR, ".wake-capacity");
+const STALE_WAKE_RECOVERIES_PATH = process.env.NATIVE_AGENT_CODEX_STALE_WAKE_RECOVERIES_PATH ||
+  path.join(BRIDGE_DIR, "stale-wake-recoveries.jsonl");
 const DRAINER_HEARTBEAT_PATH = process.env.NATIVE_AGENT_CODEX_DRAINER_HEARTBEAT_PATH ||
   path.join(BRIDGE_DIR, "drainer-heartbeat.jsonl");
 const INBOX_LOCK_DIR = process.env.NATIVE_AGENT_CODEX_INBOX_LOCK ||
   path.join(BRIDGE_DIR, ".codex-inbox.lock");
+function inboxLockDir() {
+  return process.env.NATIVE_AGENT_CODEX_INBOX_LOCK || INBOX_LOCK_DIR;
+}
 const REPLY_JOBS_DIR = process.env.NATIVE_AGENT_CODEX_REPLY_JOBS_DIR ||
   path.join(BRIDGE_DIR, "reply-jobs");
 const REPLY_DELIVERIES_PATH = process.env.NATIVE_AGENT_CODEX_REPLY_DELIVERIES_PATH ||
@@ -40,6 +64,8 @@ const UNHEALTHY_THREAD_STATUS_TYPES = new Set(["systemError"]);
 const FRESH_THREAD_MODE = "fresh_thread";
 const PINNED_THREAD_MODE = "pinned_thread";
 const GITHUB_COMMAND_EXECUTION_PROFILE = "github-command-repository-network-v1";
+const DEFAULT_WAKE_CONCURRENCY = 4;
+const UNKNOWN_WAKE_LANE = "serial:unknown";
 
 function readStdin() {
   return fs.readFileSync(0, "utf8");
@@ -107,6 +133,24 @@ function nowISO() {
   return new Date().toISOString();
 }
 
+// JavaScript String.slice counts UTF-16 code units, so an exact preview cap can
+// cut between an emoji's surrogate pair. JSON.stringify then persists a lone
+// `\uD83D` that Node accepts but strict JSON readers reject. Walk code points
+// and slice only at a complete scalar boundary.
+function unicodePrefix(value, maxCodePoints) {
+  const text = String(value ?? "");
+  const limit = Math.max(0, Math.floor(Number(maxCodePoints) || 0));
+  if (text.length <= limit) return text;
+  let end = 0;
+  let count = 0;
+  for (const scalar of text) {
+    if (count >= limit) break;
+    end += scalar.length;
+    count += 1;
+  }
+  return text.slice(0, end);
+}
+
 function safeFilePart(value) {
   return String(value || "")
     .replace(/[^a-zA-Z0-9._-]/g, "_")
@@ -119,6 +163,95 @@ function stableUUID(value) {
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/// Values that are NOT a thread id at all.
+///
+/// Wave 2, 2026-08-27: `codex:new` was stripped to the literal string "new" and
+/// enqueued as a PINNED thread id. The app-server answered "invalid thread id:
+/// ... found `n` at 1" — an unretryable PARSE failure — and the drain retried it
+/// forever (741 attempts in ~5 minutes), starving the two rows queued behind it
+/// in the same `thread:new` lane.
+///
+/// DELIBERATELY A SENTINEL LIST, NOT A UUID CHECK. Lane identities are allowed
+/// to be non-UUID aliases (`thread-a`, and `codex:thread-a` must normalize to
+/// the same lane — see the alias-normalization contract in
+/// script/tests/codex_thread_wakeup.test.js). Demanding UUIDs here broke that
+/// contract and two of its tests. What was actually wrong was narrower: a
+/// handful of words that mean "I have no thread", plus the nil UUID, were being
+/// treated as thread NAMES.
+const CODEX_NIL_THREAD_ID = "00000000-0000-0000-0000-000000000000";
+const CODEX_NON_THREAD_SENTINELS = new Set([
+  "new", "fresh", "latest", "none", "null", "undefined", CODEX_NIL_THREAD_ID,
+]);
+
+function isCodexNonThreadSentinel(value) {
+  const text = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!text) return true;
+  return CODEX_NON_THREAD_SENTINELS.has(text);
+}
+
+function canonicalCodexThreadId(value) {
+  let result = typeof value === "string" ? value.trim() : "";
+  while (/^codex:/i.test(result)) result = result.slice("codex:".length).trim();
+  if (!result) return null;
+  // `new`, an empty conversation_id, the nil UUID: the caller has no thread.
+  // `null` is exactly what downstream already means by that — wakeLaneKey routes
+  // it to a per-message fresh lane and fresh-thread mode opens a real
+  // conversation, instead of pinning to a name nothing can resolve.
+  if (isCodexNonThreadSentinel(result)) return null;
+  return result;
+}
+
+/// One logical Codex conversation maps to one lane even when callers use the
+/// public `codex:<id>` handle in one place and the raw app-server thread id in
+/// another. Fresh work has no thread yet, so its durable message/correlation
+/// identity is the intended lane. Truly identity-free work fails closed onto
+/// one serial lane instead of guessing that two invocations are independent.
+function wakeLaneKey(payload = {}, threadId = null, mode = null) {
+  const canonicalThread = canonicalCodexThreadId(
+    threadId || payload.threadId || payload.conversationId
+  );
+  if (canonicalThread) return `thread:${canonicalThread}`;
+
+  const messageId = typeof payload.messageId === "string" && payload.messageId.trim()
+    ? payload.messageId.trim()
+    : (typeof payload.id === "string" && payload.id.trim() ? payload.id.trim() : null);
+  if (messageId) return `fresh-message:${messageId}`;
+
+  const correlationId = payload.origin && typeof payload.origin === "object"
+    && typeof payload.origin.correlationId === "string"
+    && payload.origin.correlationId.trim()
+    ? payload.origin.correlationId.trim()
+    : null;
+  if (correlationId && mode === FRESH_THREAD_MODE) {
+    return `fresh-correlation:${correlationId}`;
+  }
+  return UNKNOWN_WAKE_LANE;
+}
+
+function wakeLaneLockPath(laneKey, root = WAKE_LANES_DIR) {
+  const normalized = String(laneKey || UNKNOWN_WAKE_LANE);
+  const digest = crypto.createHash("sha256").update(normalized).digest("hex");
+  // No user/thread identifier reaches the filesystem path. The fixed prefix
+  // remains readable while the full digest prevents sanitized-alias clashes.
+  return path.join(root, `lane-${digest}.lock`);
+}
+
+function wakeConcurrencyCap(config = {}) {
+  const configured = nonnegativeIntegerSetting(
+    config,
+    "wakeConcurrency",
+    "NATIVE_AGENT_CODEX_WAKE_CONCURRENCY",
+    DEFAULT_WAKE_CONCURRENCY
+  );
+  // Four is a safety ceiling, not merely the default. A local config may
+  // deliberately lower admission for diagnostics, but can never expand the
+  // production pool beyond the contract shared by every helper process.
+  return Math.max(
+    1,
+    Math.min(DEFAULT_WAKE_CONCURRENCY, configured || DEFAULT_WAKE_CONCURRENCY)
+  );
 }
 
 let cachedCurrentProcessStartIdentity;
@@ -225,7 +358,12 @@ function normalizeWakeupMode(value) {
 }
 
 function wakeupMode(config, payload = {}) {
-  if (payload && typeof payload.threadId === "string" && payload.threadId.trim() !== "") {
+  // CANONICALIZE BEFORE CLASSIFYING. This used to pin on any non-empty string,
+  // so `codex:new` was classified PINNED and then failed
+  // `target_thread_missing` once canonicalization turned it into null — the
+  // caller's work simply vanished with a confusing error. A value that is not a
+  // real thread id means "no thread yet", which is exactly fresh-thread mode.
+  if (payload && canonicalCodexThreadId(payload.threadId)) {
     return PINNED_THREAD_MODE;
   }
   if (process.env.NATIVE_AGENT_CODEX_THREAD_ID) {
@@ -703,6 +841,11 @@ function parseFrames(state, chunk, onText, socket) {
   }
 }
 
+function pairedReviewInstruction(payload) {
+  if (!payload || payload.pairReviewer !== true) return null;
+  return "PAIRED REVIEW: At the start of this implementation task, pair exactly one reviewer through Codex's normal sub-agent collaboration. You remain the builder and owner. Finish the coherent change and commit it before review, then send that reviewer the exact committed SHA to inspect. Findings return to you; fix valid findings yourself, commit the fixes, and have the same reviewer inspect the resulting SHA before you report the final candidate. Do not create reviewer waves, and do not hand implementation to the reviewer.";
+}
+
 function formatPrompt(payload) {
   const lines = [
     "NativeAgent sent Codex this message through its codex_message bridge.",
@@ -716,6 +859,8 @@ function formatPrompt(payload) {
     lines.push("This unattended GitHub bridge cannot answer Codex client approval, interactive-input, or app/MCP connector requests. Work in the verified local checkout with already-permitted noninteractive tools. If an external write is unavailable, return the exact blocker in the final text instead of waiting for a client response.");
   }
   lines.push("", payload.text || "", "");
+  const reviewInstruction = pairedReviewInstruction(payload);
+  if (reviewInstruction) lines.push(reviewInstruction, "");
   lines.push("Treat this as the local assistant speaking to Codex. If it needs work, handle it in this thread; if it is just status, acknowledge briefly. Always produce a final text answer, even when the task fails or no changes are needed, because NativeAgent uses that answer as the async completion receipt.");
   return lines.join("\n");
 }
@@ -769,6 +914,8 @@ function formatBatchPrompt(entries) {
     if (payload.messageId) lines.push(`Message id: ${payload.messageId}`);
     if (payload.queuedAt) lines.push(`Queued at: ${payload.queuedAt}`);
     lines.push("", payload.text || "", "");
+    const reviewInstruction = pairedReviewInstruction(payload);
+    if (reviewInstruction) lines.push(reviewInstruction, "");
   }
   lines.push("Treat these as the local assistant speaking to Codex. Handle anything actionable in this thread; if they are just status, acknowledge briefly. Always produce a final text answer, even when the task fails or no changes are needed, because NativeAgent uses that answer as the async completion receipt.");
   return lines.join("\n");
@@ -1138,7 +1285,8 @@ function readLocalRolloutState(threadId, config) {
     }
   }
 
-  const freshOpenTurns = [...openTurns.values()].filter((turn) => {
+  const allOpenTurns = [...openTurns.values()];
+  const freshOpenTurns = allOpenTurns.filter((turn) => {
     let rolloutMtimeMs = 0;
     try {
       rolloutMtimeMs = fs.statSync(rolloutPath).mtimeMs;
@@ -1155,35 +1303,17 @@ function readLocalRolloutState(threadId, config) {
     statusType: freshOpenTurns.length > 0 ? "active" : "idle",
     activeFlags: [],
     inProgressTurnIds: freshOpenTurns.map((turn) => turn.turnId),
+    staleInProgressTurnIds: allOpenTurns
+      .filter((turn) => !freshOpenTurns.includes(turn))
+      .map((turn) => turn.turnId),
   };
 }
 
-function combineThreadStates(primary, secondary) {
-  if (!primary) return secondary;
-  if (!secondary) return primary;
-  const unhealthy = isUnhealthyThreadState(primary)
-    ? primary
-    : (isUnhealthyThreadState(secondary) ? secondary : null);
-  const ids = new Set([
-    ...(primary.inProgressTurnIds || []),
-    ...(secondary.inProgressTurnIds || []),
-  ]);
-  return {
-    threadId: primary.threadId || secondary.threadId,
-    source: `${primary.source || "primary"}+${secondary.source || "secondary"}`,
-    rolloutPath: primary.rolloutPath || secondary.rolloutPath,
-    active: Boolean(primary.active || secondary.active),
-    statusType: unhealthy ? unhealthy.statusType : (primary.active || secondary.active ? "active" : (primary.statusType || secondary.statusType || "idle")),
-    activeFlags: [...new Set([...(primary.activeFlags || []), ...(secondary.activeFlags || [])])],
-    inProgressTurnIds: [...ids],
-  };
-}
-
-function stateExcludingDeclaredHungTurn(state, entry) {
-  const retryCount = Number(entry && entry.hangRetryCount || 0);
-  const hungTurnId = entry && entry.hungTurnId;
-  if (!state || retryCount <= 0 || !hungTurnId) return state;
-  const inProgressTurnIds = (state.inProgressTurnIds || []).filter((id) => id !== hungTurnId);
+function stateExcludingTurnIds(state, turnIds) {
+  if (!state) return state;
+  const ignored = new Set((Array.isArray(turnIds) ? turnIds : []).filter(Boolean));
+  if (ignored.size === 0) return state;
+  const inProgressTurnIds = (state.inProgressTurnIds || []).filter((id) => !ignored.has(id));
   return {
     ...state,
     active: inProgressTurnIds.length > 0,
@@ -1211,12 +1341,15 @@ async function startTurnForEntries(
   entries,
   config,
   respectActive = true,
-  ignoredActiveTurnId = null
+  ignoredActiveTurnIds = []
 ) {
+  const ignored = Array.isArray(ignoredActiveTurnIds)
+    ? ignoredActiveTurnIds
+    : (ignoredActiveTurnIds ? [ignoredActiveTurnIds] : []);
   const resume = await client.request("thread/resume", { threadId });
-  const resumeState = stateExcludingDeclaredHungTurn(
+  const resumeState = stateExcludingTurnIds(
     threadStateFromThread(resume && resume.thread, threadId),
-    ignoredActiveTurnId ? { hangRetryCount: 1, hungTurnId: ignoredActiveTurnId } : null
+    ignored
   );
   if (isUnhealthyThreadState(resumeState)) {
     return unhealthyThreadResult(threadId, resumeState, { delivery: "codex_app_server_resume" });
@@ -1462,13 +1595,14 @@ async function startFreshThreadForEntries(client, entries, config) {
 }
 
 function pendingKey(payload, threadId) {
-  if (payload.messageId) return `${threadId}:${payload.messageId}`;
+  const canonicalThread = canonicalCodexThreadId(threadId);
+  if (payload.messageId) return `${canonicalThread || "fresh"}:${payload.messageId}`;
   const digest = crypto
     .createHash("sha256")
-    .update(`${threadId}\n${payload.topic || ""}\n${payload.text || ""}`)
+    .update(`${canonicalThread || "fresh"}\n${payload.topic || ""}\n${payload.text || ""}`)
     .digest("hex")
     .slice(0, 32);
-  return `${threadId}:sha256:${digest}`;
+  return `${canonicalThread || "fresh"}:sha256:${digest}`;
 }
 
 function sanitizePayload(payload) {
@@ -1486,6 +1620,18 @@ function sanitizePayload(payload) {
   if (payload.reasoningEffort) clean.reasoningEffort = String(payload.reasoningEffort);
   if (payload.serviceTier) clean.serviceTier = String(payload.serviceTier);
   if (typeof payload.fast === "boolean") clean.fast = payload.fast;
+  if (payload.pairReviewer === true) clean.pairReviewer = true;
+  if (payload.completionMode === "receipt_only") clean.completionMode = "receipt_only";
+  if (Number.isInteger(payload.producerSchemaVersion) && payload.producerSchemaVersion > 0) {
+    clean.producerSchemaVersion = payload.producerSchemaVersion;
+  }
+  if (typeof payload.producerSourceRevision === "string"
+      && /^[0-9a-f]{40}$/i.test(payload.producerSourceRevision)) {
+    clean.producerSourceRevision = payload.producerSourceRevision.toLowerCase();
+  }
+  if (typeof payload.deskHandle === "string" && /^desk_[A-Za-z0-9-]+$/.test(payload.deskHandle)) {
+    clean.deskHandle = payload.deskHandle;
+  }
   if (typeof payload.workingDirectory === "string" && path.isAbsolute(payload.workingDirectory)) {
     clean.workingDirectory = path.normalize(payload.workingDirectory);
   }
@@ -1565,6 +1711,79 @@ async function withDirLock(lockDir, fn, options = {}) {
   }
 }
 
+async function withWakeCapacity(laneKey, config, fn, options = {}) {
+  const capacityRoot = options.capacityRoot || WAKE_CAPACITY_DIR;
+  const requestedCap = options.cap == null ? wakeConcurrencyCap(config) : Number(options.cap);
+  const cap = Math.max(
+    1,
+    Math.min(
+      DEFAULT_WAKE_CONCURRENCY,
+      Number.isFinite(requestedCap) ? Math.floor(requestedCap) : wakeConcurrencyCap(config)
+    )
+  );
+  fs.mkdirSync(capacityRoot, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(capacityRoot, 0o700); } catch {}
+
+  // Spread independent lanes across the fixed slot set so simultaneous
+  // processes do not all contend for slot zero first. Every slot is still
+  // attempted, and mkdir remains the cross-process admission authority.
+  const seed = Number.parseInt(
+    crypto.createHash("sha256").update(String(laneKey)).digest("hex").slice(0, 8),
+    16
+  );
+  let lastBusy = null;
+  for (let offset = 0; offset < cap; offset += 1) {
+    const index = (seed + offset) % cap;
+    const slotDir = path.join(capacityRoot, `slot-${index}.lock`);
+    try {
+      return await withDirLock(slotDir, fn, {
+        waitMs: 0,
+        staleMs: 60 * 60 * 1000,
+        preserveLiveOwner: true,
+        dirLockOwnerAlive: options.dirLockOwnerAlive,
+      });
+    } catch (error) {
+      if (!error || error.message !== "lock_busy") throw error;
+      lastBusy = error;
+    }
+  }
+  const error = lastBusy || new Error("lock_busy");
+  error.message = "lock_busy";
+  error.reason = "wake_capacity_busy";
+  error.capacity = cap;
+  error.capacityRoot = capacityRoot;
+  throw error;
+}
+
+async function withWakeExecutionLane(laneKey, config, fn, options = {}) {
+  const lockDir = options.laneLockDir || wakeLaneLockPath(
+    laneKey,
+    options.lanesRoot || WAKE_LANES_DIR
+  );
+  fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(path.dirname(lockDir), 0o700); } catch {}
+  try {
+    return await withDirLock(lockDir, async () => withWakeCapacity(
+      laneKey,
+      config,
+      fn,
+      options
+    ), {
+      waitMs: options.laneWaitMs == null ? 0 : options.laneWaitMs,
+      staleMs: 60 * 60 * 1000,
+      preserveLiveOwner: true,
+      dirLockOwnerAlive: options.dirLockOwnerAlive,
+    });
+  } catch (error) {
+    if (error && error.message === "lock_busy" && !error.reason) {
+      error.reason = "wake_lane_lock_busy";
+      error.laneKey = laneKey;
+      error.lockDir = lockDir;
+    }
+    throw error;
+  }
+}
+
 function ensureBridgeDir() {
   fs.mkdirSync(BRIDGE_DIR, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(BRIDGE_DIR, 0o700); } catch {}
@@ -1580,11 +1799,11 @@ function readPendingAtPath(pendingPath) {
 }
 
 function readPendingUnlocked() {
-  return readPendingAtPath(PENDING_PATH);
+  return readPendingAtPath(pendingPath());
 }
 
 function writePendingUnlocked(entries) {
-  writeJSONAtomic(PENDING_PATH, entries);
+  writeJSONAtomic(pendingPath(), entries);
 }
 
 function appendJSONL(file, obj) {
@@ -1843,6 +2062,20 @@ async function appendHangWatchdogReceipt(receipt, config) {
   return receiptsPath;
 }
 
+async function appendStaleWakeRecoveryReceipt(receipt, config) {
+  const receiptsPath = stringSetting(
+    config,
+    "staleWakeRecoveriesPath",
+    "NATIVE_AGENT_CODEX_STALE_WAKE_RECOVERIES_PATH",
+    STALE_WAKE_RECOVERIES_PATH
+  );
+  fs.mkdirSync(path.dirname(receiptsPath), { recursive: true, mode: 0o700 });
+  await withDirLock(`${receiptsPath}.append.lock`, async () => {
+    appendJSONL(receiptsPath, receipt);
+  }, { waitMs: 10000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+  return receiptsPath;
+}
+
 async function waitForPIDExit(pid, timeoutMs, operations) {
   const deadline = operations.now() + Math.max(0, timeoutMs);
   do {
@@ -1879,7 +2112,7 @@ async function terminateKnownHungAppServer(job, operations = {}) {
     return {
       action: "app_server_kill_failed",
       pidKilled: null,
-      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
     };
   }
   if (await waitForPIDExit(pid, operations.termWaitMs ?? 3000, ops)) {
@@ -1891,7 +2124,7 @@ async function terminateKnownHungAppServer(job, operations = {}) {
     return {
       action: "app_server_kill_failed",
       pidKilled: null,
-      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
     };
   }
   if (await waitForPIDExit(pid, operations.killWaitMs ?? 2000, ops)) {
@@ -1900,22 +2133,40 @@ async function terminateKnownHungAppServer(job, operations = {}) {
   return { action: "app_server_kill_failed_still_alive", pidKilled: null };
 }
 
-function clearStaleDrainLock(lockDir = DRAIN_LOCK_DIR, operations = {}) {
-  if (!fs.existsSync(lockDir)) {
-    return { action: "drain_lock_absent", pidKilled: null };
+function clearStaleWakeLaneLock(laneKey, lockDir = null, operations = {}) {
+  const resolvedLockDir = lockDir || wakeLaneLockPath(laneKey);
+  if (!fs.existsSync(resolvedLockDir)) {
+    return {
+      action: "wake_lane_lock_absent",
+      laneKey,
+      lockDir: resolvedLockDir,
+      pidKilled: null,
+    };
   }
   const ownerAlive = operations.dirLockOwnerAlive || dirLockOwnerAlive;
-  if (ownerAlive(lockDir)) {
-    return { action: "drain_lock_preserved_live_owner", pidKilled: null };
+  if (ownerAlive(resolvedLockDir)) {
+    return {
+      action: "wake_lane_lock_preserved_live_owner",
+      laneKey,
+      lockDir: resolvedLockDir,
+      pidKilled: null,
+    };
   }
   try {
-    fs.rmSync(lockDir, { recursive: true, force: true });
-    return { action: "stale_drain_lock_cleared", pidKilled: null };
+    fs.rmSync(resolvedLockDir, { recursive: true, force: true });
+    return {
+      action: "stale_wake_lane_lock_cleared",
+      laneKey,
+      lockDir: resolvedLockDir,
+      pidKilled: null,
+    };
   } catch (error) {
     return {
-      action: "stale_drain_lock_clear_failed",
+      action: "stale_wake_lane_lock_clear_failed",
+      laneKey,
+      lockDir: resolvedLockDir,
       pidKilled: null,
-      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
     };
   }
 }
@@ -1961,16 +2212,23 @@ async function recoverHungTurn(job, execution, config, options = {}) {
       retryCount: result.retryCount ?? retryCount,
       timestamp: new Date(nowFn()).toISOString(),
     };
+    if (result.laneKey) receipt.laneKey = result.laneKey;
+    if (result.lockDir) receipt.lockDir = result.lockDir;
     await writeReceipt(receipt, config);
     receipts.push(receipt);
     return result;
   }
 
   const processOperations = options.processOperations || {};
+  const laneKey = wakeLaneKey({}, job && job.threadId, PINNED_THREAD_MODE);
   const killed = await record(await terminateKnownHungAppServer(job, processOperations));
-  const lock = await record(clearStaleDrainLock(options.drainLockDir || DRAIN_LOCK_DIR, {
-    dirLockOwnerAlive: options.dirLockOwnerAlive,
-  }));
+  const lock = await record(clearStaleWakeLaneLock(
+    laneKey,
+    options.laneLockDir || null,
+    {
+      dirLockOwnerAlive: options.dirLockOwnerAlive,
+    }
+  ));
   const respawn = await record(respawnAppServerAfterHang(processOperations));
 
   if (retryCount >= maxRetries) {
@@ -1999,7 +2257,7 @@ async function recoverHungTurn(job, execution, config, options = {}) {
       lock,
       respawn,
       receipts,
-      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
     };
   }
   const drain = (options.startDrainProcess || startDrainProcess)(config);
@@ -2059,15 +2317,15 @@ function rowMessageIds(row) {
   return ids.filter(Boolean);
 }
 
-async function markInboxConsumed(entries, sent) {
+async function rewriteInboxEntries(entries, rewriteRow, successStatus) {
   const targetsByPath = new Map();
   for (const entry of entries) {
     const payload = entry && entry.payload ? entry.payload : {};
     const messageId = messageIdForPayload(payload);
     if (!messageId) continue;
     const inboxPath = inboxPathForPayload(payload);
-    if (!targetsByPath.has(inboxPath)) targetsByPath.set(inboxPath, new Set());
-    targetsByPath.get(inboxPath).add(messageId);
+    if (!targetsByPath.has(inboxPath)) targetsByPath.set(inboxPath, new Map());
+    targetsByPath.get(inboxPath).set(messageId, entry);
   }
   if (targetsByPath.size === 0) {
     return { status: "skipped", reason: "message_id_missing" };
@@ -2076,9 +2334,9 @@ async function markInboxConsumed(entries, sent) {
   const changed = [];
   const missing = [];
   const errors = [];
-  for (const [inboxPath, targetIds] of targetsByPath.entries()) {
+  for (const [inboxPath, targets] of targetsByPath.entries()) {
     try {
-      const result = await withDirLock(INBOX_LOCK_DIR, async () => {
+      const result = await withDirLock(inboxLockDir(), async () => {
         let raw;
         try {
           raw = fs.readFileSync(inboxPath, "utf8");
@@ -2101,17 +2359,10 @@ async function markInboxConsumed(entries, sent) {
             return line;
           }
           const ids = rowMessageIds(row);
-          const match = ids.find((id) => targetIds.has(id));
+          const match = ids.find((id) => targets.has(id));
           if (!match) return line;
           seen.add(match);
-          row.read = true;
-          row.messageId = row.messageId || row.id || match;
-          row.readAt = row.readAt || nowISO();
-          row.consumedAt = row.consumedAt || row.readAt;
-          row.consumedBy = row.consumedBy || "codex_thread_wakeup";
-          row.consumedThreadId = sent.threadId || row.consumedThreadId || null;
-          row.consumedTurnId = sent.turnId || row.consumedTurnId || null;
-          return JSON.stringify(row);
+          return JSON.stringify(rewriteRow(row, targets.get(match), match));
         });
         const tmp = `${inboxPath}.${process.pid}.${Date.now()}.tmp`;
         fs.writeFileSync(tmp, next.join("\n"), { mode: 0o600 });
@@ -2121,7 +2372,7 @@ async function markInboxConsumed(entries, sent) {
           status: "ok",
           inboxPath,
           marked: [...seen],
-          missing: [...targetIds].filter((id) => !seen.has(id)),
+          missing: [...targets.keys()].filter((id) => !seen.has(id)),
         };
       }, { waitMs: 5000, staleMs: 10 * 60 * 1000 });
       if (result.status === "ok") {
@@ -2150,21 +2401,59 @@ async function markInboxConsumed(entries, sent) {
     };
   }
   return {
-    status: missing.length > 0 ? "partial" : "marked_read",
+    status: missing.length > 0 ? "partial" : successStatus,
     markedCount: changed.length,
     changed,
     missing,
   };
 }
 
+async function markInboxConsumed(entries, sent) {
+  return await rewriteInboxEntries(entries, (row, _entry, match) => {
+    row.read = true;
+    row.messageId = row.messageId || row.id || match;
+    row.readAt = row.readAt || nowISO();
+    row.consumedAt = row.consumedAt || row.readAt;
+    row.consumedBy = row.consumedBy || "codex_thread_wakeup";
+    row.consumedThreadId = sent.threadId || row.consumedThreadId || null;
+    row.consumedTurnId = sent.turnId || row.consumedTurnId || null;
+    return row;
+  }, "marked_read");
+}
+
+/// A dead-letter is a terminal DELIVERY failure, not an unconsumed message
+/// still waiting in the queue. Project that exact distinction onto the durable
+/// inbox row without marking the brief read/consumed or deleting its contents.
+async function markInboxTerminal(entries) {
+  return await rewriteInboxEntries(entries, (row, entry, match) => {
+    const terminal = entry && entry.terminalDisposition || {};
+    row.messageId = row.messageId || row.id || match;
+    row.deliveryStatus = "dead_letter";
+    row.deliveryTerminalAt = row.deliveryTerminalAt
+      || terminal.deadLetteredAt
+      || nowISO();
+    row.deliveryFailureReason = terminal.reason || "terminal_failure";
+    return row;
+  }, "marked_terminal");
+}
+
 async function appendPending(payload, threadId, options = {}) {
   const cleanPayload = sanitizePayload(payload);
-  const key = pendingKey(cleanPayload, threadId);
+  const canonicalThread = canonicalCodexThreadId(threadId);
+  const mode = options.mode === FRESH_THREAD_MODE || !canonicalThread
+    ? FRESH_THREAD_MODE
+    : PINNED_THREAD_MODE;
+  const laneKey = options.laneKey || wakeLaneKey(
+    options.laneIdentityPayload || payload,
+    canonicalThread,
+    mode
+  );
+  const key = pendingKey(cleanPayload, canonicalThread);
   const requestedRetryCount = Number(options.hangRetryCount);
   const hangRetryCount = Number.isInteger(requestedRetryCount) && requestedRetryCount >= 0
     ? requestedRetryCount
     : 0;
-  return await withDirLock(QUEUE_LOCK_DIR, async () => {
+  return await withDirLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const existing = queue.find((entry) => entry.key === key);
     if (existing) {
@@ -2177,12 +2466,17 @@ async function appendPending(payload, threadId, options = {}) {
         entry: existing,
         alreadyQueued: true,
         pendingCount: queue.length,
+        lanePosition: queue
+          .filter((entry) => entryLaneKey(entry) === laneKey)
+          .findIndex((entry) => entry.id === existing.id),
       };
     }
     const entry = {
       id: crypto.randomUUID(),
       key,
-      threadId,
+      threadId: canonicalThread,
+      mode,
+      laneKey,
       payload: cleanPayload,
       addedAt: nowISO(),
       attempts: 0,
@@ -2195,13 +2489,14 @@ async function appendPending(payload, threadId, options = {}) {
       entry,
       alreadyQueued: false,
       pendingCount: queue.length,
+      lanePosition: queue.filter((candidate) => entryLaneKey(candidate) === laneKey).length - 1,
     };
   });
 }
 
 async function removePending(ids) {
   const idSet = new Set(ids);
-  return await withDirLock(QUEUE_LOCK_DIR, async () => {
+  return await withDirLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const next = queue.filter((entry) => !idSet.has(entry.id));
     writePendingUnlocked(next);
@@ -2209,8 +2504,68 @@ async function removePending(ids) {
   });
 }
 
+/// Errors that RETRYING CANNOT FIX. A parse failure on the thread id, or a
+/// thread the app-server will never load, is the same answer on attempt 1 and
+/// attempt 741 — and 741 is not hypothetical, it is what wave 2 actually
+/// reached in five minutes while starving the rows queued behind it.
+const TERMINAL_WAKE_ERROR_RE =
+  /invalid thread id|thread not loaded|malformed .*thread|no such thread/i;
+
+/// Attempts cap for everything the matcher does NOT recognise. A transient
+/// failure that has failed this many times in a row is indistinguishable from a
+/// permanent one, and an unbounded retry is a hot loop with a queue behind it.
+const MAX_WAKE_ATTEMPTS = 25;
+
+function isTerminalWakeFailure(entry, errorText) {
+  // The app-server's own words are authoritative: a parse failure or an
+  // unloadable thread is the same answer on attempt 1 and attempt 741.
+  if (TERMINAL_WAKE_ERROR_RE.test(String(errorText || ""))) return true;
+  // A sentinel that slipped through as a pinned id can never resolve. Note this
+  // asks "is it a non-thread WORD", not "is it a UUID" — aliases are valid.
+  const rawThreadId = entry && entry.threadId;
+  if (typeof rawThreadId === "string" && rawThreadId.trim() !== ""
+      && isCodexNonThreadSentinel(rawThreadId)) {
+    return true;
+  }
+  // Everything else gets a bounded number of tries. A fresh-thread row carries
+  // `threadId: null` BY DESIGN and must keep retrying transient failures —
+  // dead-lettering it on attempt 1 would turn a hot-loop fix into work loss.
+  return Number(entry && entry.attempts || 0) + 1 >= MAX_WAKE_ATTEMPTS;
+}
+
+/// Retire a row that can never succeed: off the queue, into a dated
+/// dead-letter file, so the lane behind it drains and the payload is still
+/// recoverable. Deleting it outright would lose the caller's brief.
+async function deadLetterPendingEntry(entry, errorText, reason) {
+  const deadLetteredAt = nowISO();
+  const terminalReason = reason || "terminal_failure";
+  try {
+    const path = deadLetterPath();
+    await withDirLock(`${path}.append.lock`, async () => {
+      appendJSONLineAtomicUnlocked(path, {
+        deadLetteredAt,
+        reason: terminalReason,
+        lastError: errorText ? unicodePrefix(errorText, 500) : null,
+        entry,
+      });
+    }, { waitMs: 5000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+  } catch (error) {
+    // A dead-letter write failure must not resurrect the hot loop; the row
+    // still comes off the queue and the reason is reported to the caller.
+    console.error(`dead-letter write failed: ${error && error.message}`);
+  }
+  const terminal = await markInboxTerminal([{
+    ...entry,
+    terminalDisposition: { deadLetteredAt, reason: terminalReason },
+  }]);
+  if (terminal.status === "failed" || terminal.status === "partial") {
+    console.error(`dead-letter inbox projection ${terminal.status}: ${entry && entry.id}`);
+  }
+  return await removePending([entry.id]);
+}
+
 async function bumpPendingAttempt(id, errorText) {
-  return await withDirLock(QUEUE_LOCK_DIR, async () => {
+  return await withDirLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const next = queue.map((entry) => {
       if (entry.id !== id) return entry;
@@ -2218,7 +2573,7 @@ async function bumpPendingAttempt(id, errorText) {
         ...entry,
         attempts: Number(entry.attempts || 0) + 1,
         lastAttemptAt: nowISO(),
-        lastError: errorText ? String(errorText).slice(0, 500) : null,
+        lastError: errorText ? unicodePrefix(errorText, 500) : null,
       };
     });
     writePendingUnlocked(next);
@@ -2226,13 +2581,186 @@ async function bumpPendingAttempt(id, errorText) {
   });
 }
 
-function firstPendingPerThread(queue) {
-  const byThread = new Map();
+function entryLaneKey(entry) {
+  if (entry && typeof entry.laneKey === "string" && entry.laneKey) return entry.laneKey;
+  return wakeLaneKey(
+    entry && entry.payload || {},
+    entry && entry.threadId || null,
+    entry && entry.mode || (entry && entry.threadId ? PINNED_THREAD_MODE : FRESH_THREAD_MODE)
+  );
+}
+
+function firstPendingPerLane(queue) {
+  const byLane = new Map();
   for (const entry of queue) {
-    if (!entry || !entry.threadId || !entry.payload || !entry.payload.text) continue;
-    if (!byThread.has(entry.threadId)) byThread.set(entry.threadId, entry);
+    if (!entry || !entry.payload || !entry.payload.text) continue;
+    const laneKey = entryLaneKey(entry);
+    if (!byLane.has(laneKey)) byLane.set(laneKey, entry);
   }
-  return [...byThread.values()];
+  return [...byLane.values()];
+}
+
+async function pendingHeadForLane(entryId, laneKey) {
+  return await withDirLock(queueLockDir(), async () => {
+    const queue = readPendingUnlocked();
+    const head = queue.find((entry) => entryLaneKey(entry) === laneKey) || null;
+    return {
+      isHead: Boolean(head && head.id === entryId),
+      head,
+      pendingCount: queue.length,
+    };
+  }, { waitMs: 2000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+}
+
+async function markPendingStaleRecovery(entry, recovery) {
+  return await withDirLock(queueLockDir(), async () => {
+    const queue = readPendingUnlocked();
+    const index = queue.findIndex((candidate) => candidate.id === entry.id);
+    if (index < 0) return { status: "missing", entry: null };
+    const current = queue[index];
+    if (current.key !== entry.key || entryLaneKey(current) !== entryLaneKey(entry)) {
+      return { status: "identity_conflict", entry: current };
+    }
+    const updated = {
+      ...current,
+      // id/key/addedAt/payload and array position deliberately do not change:
+      // recovery is a fresh admission attempt for the same ordered work, not
+      // a new message that could jump behind later work or lose audit lineage.
+      staleRecoveryCount: Number(current.staleRecoveryCount || 0) + 1,
+      requeuedAt: recovery.recoveredAt,
+      staleRecovery: recovery,
+    };
+    queue[index] = updated;
+    writePendingUnlocked(queue);
+    return { status: "requeued", entry: updated, pendingCount: queue.length };
+  }, { waitMs: 2000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+}
+
+async function recoverStaleQueuedWake(entry, state, config, options = {}) {
+  const nowFn = options.now || Date.now;
+  const staleAgeMs = numberSetting(
+    config,
+    "staleWakeAgeMs",
+    "NATIVE_AGENT_CODEX_STALE_WAKE_AGE_MS",
+    15 * 60 * 1000
+  );
+  const addedAtMs = Date.parse(entry && entry.addedAt || "");
+  const ageMs = Number.isFinite(addedAtMs) ? Math.max(0, nowFn() - addedAtMs) : 0;
+  if (ageMs < staleAgeMs) {
+    return { status: "not_old_enough", ageMs, staleAgeMs, retryAfterMs: staleAgeMs - ageMs };
+  }
+
+  const turnIds = [...new Set([
+    ...(state && state.inProgressTurnIds || []),
+    ...(state && state.staleInProgressTurnIds || []),
+  ].filter(Boolean))];
+  if (turnIds.length === 0) {
+    return { status: "unproven", reason: "owning_turn_unknown", ageMs, staleAgeMs };
+  }
+
+  // A recovery proof belongs to this exact durable queue row. If admission
+  // later fails for an unrelated reason (for example the app-server restarts),
+  // reuse the already-confirmed dead-turn evidence instead of probing and
+  // appending another receipt forever. Any newly observed turn still needs its
+  // own two-probe proof below.
+  const candidatePriorRecovery = entry && entry.staleRecovery;
+  const priorRecovery = candidatePriorRecovery
+    && candidatePriorRecovery.status === "requeued"
+    && candidatePriorRecovery.queueEntryId === entry.id
+    && candidatePriorRecovery.laneKey === entryLaneKey(entry)
+    && candidatePriorRecovery.originalAddedAt === (entry.addedAt || null)
+    && candidatePriorRecovery.messageId === (messageIdForPayload(entry.payload) || null)
+    ? candidatePriorRecovery
+    : null;
+  const previouslyRecoveredTurnIds = new Set(
+    priorRecovery && Array.isArray(priorRecovery.deadTurnIds)
+      ? priorRecovery.deadTurnIds.filter(Boolean)
+      : []
+  );
+  const unresolvedTurnIds = turnIds.filter((turnId) => !previouslyRecoveredTurnIds.has(turnId));
+  if (unresolvedTurnIds.length === 0) {
+    return {
+      status: "requeued",
+      ageMs,
+      staleAgeMs,
+      ignoredTurnIds: turnIds,
+      entry,
+      receiptPath: null,
+      recovery: priorRecovery,
+      reusedRecovery: true,
+    };
+  }
+
+  const probe = options.probeTurnLiveness || probeTurnLiveness;
+  const pause = options.sleep || sleep;
+  const confirmDelayMs = numberSetting(
+    config,
+    "staleWakeProbeConfirmDelayMs",
+    "NATIVE_AGENT_CODEX_STALE_WAKE_PROBE_CONFIRM_DELAY_MS",
+    5000
+  );
+  const proofs = [];
+  for (const turnId of unresolvedTurnIds) {
+    const first = await probe(entry.threadId, turnId, config);
+    const firstDead = !first.serverReachable || !first.turnFound;
+    if (!firstDead) {
+      return {
+        status: first.turnClaimsInProgress ? "preserved_live" : "released_terminal",
+        ageMs,
+        staleAgeMs,
+        turnId,
+        proof: first,
+      };
+    }
+    await pause(confirmDelayMs);
+    const confirm = await probe(entry.threadId, turnId, config);
+    const confirmedDead = !confirm.serverReachable || !confirm.turnFound;
+    proofs.push({ turnId, first, confirm });
+    if (!confirmedDead) {
+      return {
+        status: confirm.turnClaimsInProgress ? "preserved_live" : "released_terminal",
+        ageMs,
+        staleAgeMs,
+        turnId,
+        proof: confirm,
+      };
+    }
+  }
+
+  const recoveredAt = new Date(nowFn()).toISOString();
+  const recovery = {
+    status: "requeued",
+    recoveredAt,
+    originalAddedAt: entry.addedAt || null,
+    ageMs,
+    staleAgeMs,
+    laneKey: entryLaneKey(entry),
+    queueEntryId: entry.id,
+    messageId: messageIdForPayload(entry.payload) || null,
+    deadTurnIds: [...new Set([...previouslyRecoveredTurnIds, ...unresolvedTurnIds])],
+    proof: [
+      ...(priorRecovery && Array.isArray(priorRecovery.proof) ? priorRecovery.proof : []),
+      ...proofs,
+    ],
+  };
+  const requeue = options.markPendingStaleRecovery
+    ? await options.markPendingStaleRecovery(entry, recovery)
+    : await markPendingStaleRecovery(entry, recovery);
+  if (!requeue || requeue.status !== "requeued") {
+    return { status: "unproven", reason: "queue_identity_changed", ageMs, staleAgeMs, requeue };
+  }
+  const receiptPath = options.appendReceipt
+    ? await options.appendReceipt(recovery, config)
+    : await appendStaleWakeRecoveryReceipt(recovery, config);
+  return {
+    status: "requeued",
+    ageMs,
+    staleAgeMs,
+    ignoredTurnIds: recovery.deadTurnIds,
+    entry: requeue.entry,
+    receiptPath,
+    recovery,
+  };
 }
 
 function startDrainProcess(config) {
@@ -2247,9 +2775,11 @@ function startDrainProcess(config) {
       env: {
         ...process.env,
         NATIVE_AGENT_CODEX_WAKEUP_CONFIG: CONFIG_PATH,
-        NATIVE_AGENT_CODEX_PENDING_PATH: PENDING_PATH,
-        NATIVE_AGENT_CODEX_PENDING_LOCK: QUEUE_LOCK_DIR,
-        NATIVE_AGENT_CODEX_DRAIN_LOCK: DRAIN_LOCK_DIR,
+        NATIVE_AGENT_CODEX_PENDING_PATH: pendingPath(),
+        NATIVE_AGENT_CODEX_PENDING_LOCK: queueLockDir(),
+        NATIVE_AGENT_CODEX_WAKE_LANES_DIR: WAKE_LANES_DIR,
+        NATIVE_AGENT_CODEX_WAKE_CAPACITY_DIR: WAKE_CAPACITY_DIR,
+        NATIVE_AGENT_CODEX_STALE_WAKE_RECOVERIES_PATH: STALE_WAKE_RECOVERIES_PATH,
       },
     });
     child.unref();
@@ -2263,9 +2793,11 @@ function replyJobChildEnvironment() {
   return {
     ...process.env,
     NATIVE_AGENT_CODEX_WAKEUP_CONFIG: CONFIG_PATH,
-    NATIVE_AGENT_CODEX_PENDING_PATH: PENDING_PATH,
-    NATIVE_AGENT_CODEX_PENDING_LOCK: QUEUE_LOCK_DIR,
-    NATIVE_AGENT_CODEX_DRAIN_LOCK: DRAIN_LOCK_DIR,
+    NATIVE_AGENT_CODEX_PENDING_PATH: pendingPath(),
+    NATIVE_AGENT_CODEX_PENDING_LOCK: queueLockDir(),
+    NATIVE_AGENT_CODEX_WAKE_LANES_DIR: WAKE_LANES_DIR,
+    NATIVE_AGENT_CODEX_WAKE_CAPACITY_DIR: WAKE_CAPACITY_DIR,
+    NATIVE_AGENT_CODEX_STALE_WAKE_RECOVERIES_PATH: STALE_WAKE_RECOVERIES_PATH,
     NATIVE_AGENT_CODEX_REPLY_JOBS_DIR: REPLY_JOBS_DIR,
     NATIVE_AGENT_CODEX_REPLY_DELIVERIES_PATH: REPLY_DELIVERIES_PATH,
     NATIVE_AGENT_CODEX_REPLY_RECOVERY_LOCK: REPLY_RECOVERY_LOCK_DIR,
@@ -2485,7 +3017,7 @@ function parseConnectorSchemaMismatch(text) {
   return {
     diagnostic: "connector_schema_mismatch",
     properties,
-    message: redactDiagnosticText(text.trim().slice(0, 600)),
+    message: redactDiagnosticText(unicodePrefix(text.trim(), 600)),
   };
 }
 
@@ -2842,10 +3374,10 @@ async function waitForPendingDrainInvalidation(
     } catch {}
   }
 
-  const pendingPath = typeof config.pendingPath === "string" && config.pendingPath
+  const watchedPendingPath = typeof config.pendingPath === "string" && config.pendingPath
     ? config.pendingPath
-    : PENDING_PATH;
-  watchFile(pendingPath, "pending_queue_event");
+    : pendingPath();
+  watchFile(watchedPendingPath, "pending_queue_event");
 
   const watchedRollouts = new Set();
   const unresolvedThreadIds = new Set();
@@ -2883,7 +3415,7 @@ async function waitForPendingDrainInvalidation(
   // Close registration races once. Further reads happen only after an exact
   // queue/rollout/RPC event or a failure-specific retry deadline.
   await new Promise((resolve) => setImmediate(resolve));
-  if (queueFingerprint(readPendingAtPath(pendingPath)) !== expectedQueueFingerprint) {
+  if (queueFingerprint(readPendingAtPath(watchedPendingPath)) !== expectedQueueFingerprint) {
     signal("initial_queue_change");
   }
   if (!settled) {
@@ -3555,7 +4087,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
   lines.push("", "Original request:");
   for (const [index, entry] of entries.entries()) {
     const original = entry && entry.payload && typeof entry.payload.text === "string"
-      ? entry.payload.text.trim().slice(0, 8000)
+      ? unicodePrefix(entry.payload.text.trim(), 8000)
       : "";
     if (entries.length > 1) lines.push(`Request ${index + 1}:`);
     lines.push(original || "(original request unavailable)", "");
@@ -3638,6 +4170,13 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
   return lines.join("\n");
 }
 
+function shouldSuppressCompletionDelivery(entries, turnResult) {
+  return turnResult && turnResult.status === "completed"
+    && Array.isArray(entries) && entries.length > 0
+    && entries.every((entry) => entry && entry.payload
+      && entry.payload.completionMode === "receipt_only");
+}
+
 function postBridgeMessage(text, sessionId, config, metadata = {}) {
   if (process.env.NATIVE_AGENT_CODEX_REPLY_DRY_RUN === "1") {
     return Promise.resolve({
@@ -3647,7 +4186,7 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
       deliveryId: metadata.deliveryId || null,
       origin: metadata.origin || null,
       completion: metadata.completion || null,
-      textPreview: text.slice(0, 500),
+      textPreview: unicodePrefix(text, 500),
     });
   }
 
@@ -3717,9 +4256,9 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
           sessionId: sessionId || null,
           replyStatus,
           nativeAgentSessionId: parsed && parsed.sessionId ? parsed.sessionId : null,
-          nativeAgentReplyPreview: parsed && typeof parsed.reply === "string" ? parsed.reply.slice(0, 1000) : null,
+          nativeAgentReplyPreview: parsed && typeof parsed.reply === "string" ? unicodePrefix(parsed.reply, 1000) : null,
           completionDelivery: parsed && parsed.completionDelivery ? parsed.completionDelivery : null,
-          rawPreview: raw.slice(0, 1000),
+          rawPreview: unicodePrefix(raw, 1000),
         });
       });
     });
@@ -3779,7 +4318,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
         status: "failed",
         reason: "reply_admission_recovery_unavailable",
         jobPath,
-        error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+        error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
       };
     }
     if (!admission || admission.status !== "sent" || !admission.turn || !admission.turn.id) {
@@ -3841,8 +4380,15 @@ async function deliverReplyJobUnlocked(jobPath, config) {
   }
   if (!job.completedExecution) {
     job.completedExecution = execution;
+    job.phase = "execution_completed";
     delete job.lastWait;
     delete job.stallProbe;
+    writeJSONAtomic(jobPath, job);
+  } else if (job.phase === "watching_turn") {
+    // Legacy/recovered jobs could already carry the terminal execution while
+    // retaining the pre-terminal watcher label. The execution is finished;
+    // only bridge delivery remains unsettled.
+    job.phase = "execution_completed";
     writeJSONAtomic(jobPath, job);
   }
   const turnResult = execution.turnResult;
@@ -3853,7 +4399,8 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     .map((entry) => entry && entry.payload && entry.payload.origin)
     .find((value) => value && typeof value === "object" && !Array.isArray(value)) || null;
   const messageIds = entries.map((entry) => entry && entry.payload && entry.payload.messageId).filter(Boolean);
-  const text = formatCodexReplyForNativeAgent({
+  const receiptOnly = shouldSuppressCompletionDelivery(entries, turnResult);
+  const text = receiptOnly ? "" : formatCodexReplyForNativeAgent({
     ...job,
     turnId: execution.turnId,
     attemptCount: execution.attempts.length,
@@ -3878,23 +4425,35 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       connectorDiagnostics: turnResult.connectorDiagnostics || null,
     },
   };
-  const bridge = await postBridgeMessageWithRetry(
-    () => postBridgeMessage(text, sessionId || "", config, completionMetadata),
-    {
-      maxAttempts: numberSetting(
-        config, "bridgeDeliveryMaxAttempts",
-        "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_MAX_ATTEMPTS", 4
-      ),
-      baseMs: numberSetting(
-        config, "bridgeDeliveryRetryBaseMs",
-        "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_RETRY_BASE_MS", 500
-      ),
-      capMs: numberSetting(
-        config, "bridgeDeliveryRetryCapMs",
-        "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_RETRY_CAP_MS", 8000
-      ),
+  const bridge = receiptOnly
+    ? {
+      status: "delivered",
+      reason: null,
+      delivery: "receipt_only",
+      sessionId: sessionId || null,
+      replyStatus: "ok",
+      nativeAgentSessionId: sessionId || null,
+      nativeAgentReplyPreview: null,
+      completionDelivery: { status: "not_requested", delivery: "receipt_only" },
     }
-  );
+    : await postBridgeMessageWithRetry(
+      () => postBridgeMessage(text, sessionId || "", config, completionMetadata),
+      {
+        maxAttempts: numberSetting(
+          config, "bridgeDeliveryMaxAttempts",
+          "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_MAX_ATTEMPTS", 4
+        ),
+        baseMs: numberSetting(
+          config, "bridgeDeliveryRetryBaseMs",
+          "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_RETRY_BASE_MS", 500
+        ),
+        capMs: numberSetting(
+          config, "bridgeDeliveryRetryCapMs",
+          "NATIVE_AGENT_CODEX_BRIDGE_DELIVERY_RETRY_CAP_MS", 8000
+        ),
+      }
+    );
+  persistReplyJobDeliveryState(jobPath, job, bridge);
   const receipt = {
     id: crypto.randomUUID(),
     createdAt: nowISO(),
@@ -3927,7 +4486,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       hangRecovery: turnResult.hangRecovery || null,
       connectorDiagnostics: turnResult.connectorDiagnostics || null,
       brain: turnResult.brain || null,
-      messagePreview: (turnResult.message || "").slice(0, 1000),
+      messagePreview: unicodePrefix(turnResult.message || "", 1000),
     },
     bridge,
   };
@@ -3939,7 +4498,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     status: terminalBridgeReply
       ? bridge.replyStatus
       : (bridge.status === "delivered" || bridge.status === "dry_run" ? "delivered" : "failed"),
-    delivery: "nativeagent_bridge_message_after_codex_turn",
+    delivery: receiptOnly ? "receipt_only_after_codex_turn" : "nativeagent_bridge_message_after_codex_turn",
     threadId: execution.threadId,
     turnId: execution.turnId,
     initialThreadId: job.threadId,
@@ -3971,14 +4530,14 @@ function quarantineReplyJob(jobPath, error) {
       reason: "reply_job_corrupt",
       jobPath,
       quarantinePath: target,
-      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
     };
   } catch (quarantineError) {
     return {
       status: "failed",
       reason: "reply_job_read_failed_and_quarantine_failed",
       jobPath,
-      error: redactDiagnosticText(String(quarantineError && quarantineError.message || quarantineError)).slice(0, 500),
+      error: unicodePrefix(redactDiagnosticText(String(quarantineError && quarantineError.message || quarantineError)), 500),
     };
   }
 }
@@ -4039,7 +4598,7 @@ async function postBridgeMessageWithRetry(post, options = {}) {
     if (!bridgeDeliveryRetryable(bridge)) break;
     attempts.push({
       attempt,
-      reason: bridge && bridge.reason ? String(bridge.reason).slice(0, 200) : null,
+      reason: bridge && bridge.reason ? unicodePrefix(bridge.reason, 200) : null,
       httpStatus: bridge && bridge.httpStatus != null ? bridge.httpStatus : null,
     });
     if (attempt === maxAttempts) break;
@@ -4074,6 +4633,27 @@ function replyJobDisposition(bridge) {
     : "unlink";
 }
 
+// Keep execution and delivery as separate truths on the durable job. A Codex
+// turn that ended must never continue to present as `watching_turn` merely
+// because the later NativeAgent handoff was ambiguous or temporarily failed.
+function persistReplyJobDeliveryState(jobPath, job, bridge) {
+  const disposition = replyJobDisposition(bridge);
+  const outcome = bridge && (bridge.status === "delivered" || bridge.status === "dry_run")
+    ? "delivered"
+    : (disposition === "preserve" ? "unknown" : null);
+  job.phase = outcome === "delivered"
+    ? "settled"
+    : (outcome === "unknown" ? "delivery_unknown" : "delivery_pending");
+  job.delivery = {
+    observedAt: nowISO(),
+    status: bridge && bridge.status || "unknown",
+    replyStatus: bridge && bridge.replyStatus || null,
+    outcome,
+  };
+  writeJSONAtomic(jobPath, job);
+  return job.delivery;
+}
+
 // Preserve out of the *.json scan path: recoverReplyJobs only reads files
 // directly in jobsDir (see readdirSync + isFile filter), so a subdirectory is
 // never rescanned and can never relaunch a turn.
@@ -4082,22 +4662,46 @@ function replyJobDisposition(bridge) {
 // (gpt-5.5 review MED): a stuck lifecycle 409-ing distinct completions for
 // days would otherwise grow this directory forever.
 const UNDELIVERED_REPLY_JOBS_CAP = 200;
+// The count cap alone never expires anything below it: the live store sat at
+// 21 files with the oldest 16 days old and no path to zero, and
+// DelegationOutcomeLoop re-cards that whole backlog as "N undelivered replies
+// preserved" for as long as the files exist (2026-08-28 upgrade-sweep C9-4).
+// These are TERMINAL replies — the recovery scan never reads this
+// subdirectory, so nothing but a human ever consumes them. 30 days is the
+// forensic window; past it the file is noise that keeps a card alive.
+const UNDELIVERED_REPLY_JOBS_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
-function pruneUndeliveredReplyJobs(undeliveredDir, cap = UNDELIVERED_REPLY_JOBS_CAP) {
+function pruneUndeliveredReplyJobs(
+  undeliveredDir,
+  cap = UNDELIVERED_REPLY_JOBS_CAP,
+  maxAgeMs = UNDELIVERED_REPLY_JOBS_MAX_AGE_MS
+) {
   let entries;
   try {
     entries = fs.readdirSync(undeliveredDir).filter((name) => name.endsWith(".json"));
   } catch {
     return;
   }
-  if (entries.length <= cap) return;
   const stamped = entries.map((name) => {
     let mtimeMs = 0;
     try { mtimeMs = fs.statSync(path.join(undeliveredDir, name)).mtimeMs; } catch {}
     return { name, mtimeMs };
   });
   stamped.sort((a, b) => a.mtimeMs - b.mtimeMs);
-  for (const victim of stamped.slice(0, stamped.length - cap)) {
+  // Age out first, then enforce the count cap on whatever survived. A file
+  // whose stat failed carries mtimeMs 0 and would age out on every run, so it
+  // is left to the count cap instead of being deleted on an unread stat.
+  const ageCutoff = maxAgeMs > 0 ? Date.now() - maxAgeMs : null;
+  const survivors = [];
+  for (const entry of stamped) {
+    if (ageCutoff !== null && entry.mtimeMs > 0 && entry.mtimeMs < ageCutoff) {
+      try { fs.unlinkSync(path.join(undeliveredDir, entry.name)); } catch {}
+      continue;
+    }
+    survivors.push(entry);
+  }
+  if (survivors.length <= cap) return;
+  for (const victim of survivors.slice(0, survivors.length - cap)) {
     try { fs.unlinkSync(path.join(undeliveredDir, victim.name)); } catch {}
   }
 }
@@ -4121,7 +4725,7 @@ function preserveUndeliverableReplyJob(jobPath, bridge) {
   } catch (error) {
     return {
       preserved: false,
-      error: redactDiagnosticText(String(error && error.message || error)).slice(0, 300),
+      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 300),
     };
   }
 }
@@ -4202,7 +4806,7 @@ async function recoverReplyJobs(config, options = {}) {
               status: "failed",
               reason: "reply_job_recovery_failed",
               jobPath,
-              error: redactDiagnosticText(String(error && error.message || error)).slice(0, 500),
+              error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
             };
           }
         }
@@ -4283,22 +4887,245 @@ async function repairConsumedFromDeliveries(config) {
   };
 }
 
-async function deferUntilIdle(payload, threadId, state, config) {
-  const queued = await appendPending(payload, threadId);
-  const drain = startDrainProcess(config);
+/// Reconcile historical dead-letter receipts onto their original inbox rows.
+/// This is metadata-only recovery: the brief stays unread and recoverable, but
+/// no longer masquerades as a live queue item that nobody has consumed.
+async function repairTerminalFromDeadLetters(options = {}) {
+  const path = options.path || deadLetterPath();
+  let raw;
+  try {
+    raw = fs.readFileSync(path, "utf8");
+  } catch (error) {
+    return {
+      status: "skipped",
+      reason: "dead_letters_missing",
+      deadLetterPath: path,
+      error: String(error.message || error),
+    };
+  }
+
+  const byMessageId = new Map();
+  let malformed = 0;
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let receipt;
+    try {
+      receipt = JSON.parse(line);
+    } catch {
+      malformed += 1;
+      continue;
+    }
+    const original = receipt && receipt.entry;
+    const payload = original && original.payload || {};
+    const messageId = messageIdForPayload(payload);
+    if (!messageId) continue;
+    byMessageId.set(messageId, {
+      ...(original || {}),
+      payload: { ...payload, messageId },
+      terminalDisposition: {
+        deadLetteredAt: receipt.deadLetteredAt || null,
+        reason: receipt.reason || "terminal_failure",
+      },
+    });
+  }
+  const entries = [...byMessageId.values()];
+  if (entries.length === 0) {
+    return {
+      status: malformed > 0 ? "partial" : "completed",
+      deadLetterPath: path,
+      receipts: 0,
+      malformed,
+      markedCount: 0,
+    };
+  }
+  const projection = await (options.markInboxTerminal || markInboxTerminal)(entries);
   return {
-    status: "queued_pending_idle",
-    reason: "thread_active",
+    status: projection.status === "failed" ? "failed"
+      : (malformed > 0 || projection.status === "partial" ? "partial" : "completed"),
+    deadLetterPath: path,
+    receipts: entries.length,
+    malformed,
+    markedCount: Number(projection.markedCount || 0),
+    projection,
+  };
+}
+
+function pendingBusyResult(entry, state, reason, extra = {}) {
+  return {
+    status: "busy",
+    reason,
     delivery: "codex_app_server_deferred_until_idle",
-    threadId,
-    pendingPath: PENDING_PATH,
+    threadId: entry && entry.threadId || null,
+    laneKey: entryLaneKey(entry),
+    activeStatus: state && state.statusType || "unknown",
+    activeFlags: state && state.activeFlags || [],
+    inProgressTurnIds: state && state.inProgressTurnIds || [],
+    busySource: state && state.source || "unknown",
+    rolloutPath: state && state.rolloutPath || null,
+    ...extra,
+  };
+}
+
+async function consumePendingEntry(entry, config, options = {}) {
+  const laneKey = entryLaneKey(entry);
+  const runInLane = options.withWakeExecutionLane || withWakeExecutionLane;
+  const readHead = options.pendingHeadForLane || pendingHeadForLane;
+  const connect = options.withRpc || withRpc;
+  const attach = options.attachConsumeAndReplyDelivery || attachConsumeAndReplyDelivery;
+  const remove = options.removePending || removePending;
+  const recoverStale = options.recoverStaleQueuedWake || recoverStaleQueuedWake;
+  const laneOptions = options.laneOptions || {};
+
+  try {
+    return await runInLane(laneKey, config, async () => {
+      // The filesystem lane lock decides exclusivity; the queue lock decides
+      // order. Re-read the head only after owning the lane so a later process
+      // cannot win an OS scheduling race over an earlier durable row.
+      const head = await readHead(entry.id, laneKey);
+      if (!head.isHead || !head.head) {
+        return pendingBusyResult(entry, null, "lane_queue_order", {
+          pendingCount: head.pendingCount,
+          headEntryId: head.head && head.head.id || null,
+        });
+      }
+      let current = head.head;
+      if (options.executeEntry) return await options.executeEntry(current);
+
+      const mode = current.mode === FRESH_THREAD_MODE || !current.threadId
+        ? FRESH_THREAD_MODE
+        : PINNED_THREAD_MODE;
+      const timeoutMs = numberSetting(
+        config,
+        "requestTimeoutMs",
+        "NATIVE_AGENT_CODEX_WAKEUP_REQUEST_TIMEOUT_MS",
+        12000
+      );
+      let ignoredTurnIds = Number(current.hangRetryCount || 0) > 0 && current.hungTurnId
+        ? [current.hungTurnId]
+        : [];
+      let staleRecovery = null;
+
+      if (mode === PINNED_THREAD_MODE) {
+        const localState = stateExcludingTurnIds(
+          readLocalRolloutState(current.threadId, config),
+          ignoredTurnIds
+        );
+        const localCandidate = localState && (
+          localState.active || (localState.staleInProgressTurnIds || []).length > 0
+        );
+        if (localCandidate) {
+          staleRecovery = await recoverStale(current, localState, config, options.staleRecoveryOptions || {});
+          if (staleRecovery.status === "requeued") {
+            current = staleRecovery.entry || current;
+            ignoredTurnIds = [...new Set([...ignoredTurnIds, ...staleRecovery.ignoredTurnIds])];
+          } else if (staleRecovery.status === "released_terminal") {
+            ignoredTurnIds = [...new Set([...ignoredTurnIds, staleRecovery.turnId])];
+          } else if (localState.active || staleRecovery.status === "preserved_live") {
+            return pendingBusyResult(current, localState, "thread_active", {
+              staleRecovery,
+              retryAfterMs: staleRecovery.retryAfterMs || null,
+            });
+          }
+        }
+      }
+
+      const result = await connect(async (client) => {
+        if (mode === FRESH_THREAD_MODE) {
+          return await startFreshThreadForEntries(client, [current], config);
+        }
+
+        const rpcState = await readThreadState(client, current.threadId);
+        let state = stateExcludingTurnIds(rpcState, ignoredTurnIds);
+        if (isUnhealthyThreadState(state)) {
+          return unhealthyThreadResult(current.threadId, state, {
+            delivery: "codex_app_server_thread_read",
+          });
+        }
+        if (state.active) {
+          staleRecovery = await recoverStale(current, state, config, options.staleRecoveryOptions || {});
+          if (staleRecovery.status === "requeued") {
+            current = staleRecovery.entry || current;
+            ignoredTurnIds = [...new Set([...ignoredTurnIds, ...staleRecovery.ignoredTurnIds])];
+            state = stateExcludingTurnIds(state, ignoredTurnIds);
+          } else if (staleRecovery.status === "released_terminal") {
+            ignoredTurnIds = [...new Set([...ignoredTurnIds, staleRecovery.turnId])];
+            state = stateExcludingTurnIds(state, ignoredTurnIds);
+          }
+          if (state.active || staleRecovery.status === "preserved_live") {
+            return pendingBusyResult(current, state, "thread_active", {
+              staleRecovery,
+              retryAfterMs: staleRecovery.retryAfterMs || null,
+            });
+          }
+        }
+        return await startTurnForEntries(
+          client,
+          current.threadId,
+          [current],
+          config,
+          true,
+          ignoredTurnIds
+        );
+      }, timeoutMs);
+
+      if (result.status !== "sent") return result;
+      const sent = await attach(result, [current], config);
+      await remove([current.id]);
+      if (staleRecovery && staleRecovery.status === "requeued") {
+        sent.staleRecovery = staleRecovery.recovery;
+      }
+      return sent;
+    }, laneOptions);
+  } catch (error) {
+    if (error && error.message === "lock_busy") {
+      return pendingBusyResult(entry, null, error.reason || "wake_lane_lock_busy", {
+        lockDir: error.lockDir || null,
+        capacity: error.capacity || null,
+      });
+    }
+    return rpcFailure(error, entry && entry.threadId || null, { laneKey });
+  }
+}
+
+async function enqueueWake(payload, threadId, mode, config) {
+  const canonicalThread = canonicalCodexThreadId(threadId);
+  const laneKey = wakeLaneKey(payload, canonicalThread, mode);
+  const queued = await appendPending(payload, canonicalThread, {
+    mode,
+    laneKey,
+    laneIdentityPayload: payload,
+  });
+  const result = await consumePendingEntry(queued.entry, config);
+  if (result.status === "sent") return result;
+
+  const drain = startDrainProcess(config);
+  if (result.status === "busy") {
+    return {
+      status: "queued_pending_idle",
+      reason: result.reason,
+      delivery: "codex_app_server_deferred_until_idle",
+      mode,
+      threadId: canonicalThread,
+      laneKey,
+      pendingPath: pendingPath(),
+      pendingCount: queued.pendingCount,
+      alreadyQueued: queued.alreadyQueued,
+      lanePosition: queued.lanePosition,
+      activeStatus: result.activeStatus,
+      activeFlags: result.activeFlags,
+      inProgressTurnIds: result.inProgressTurnIds,
+      busySource: result.busySource,
+      rolloutPath: result.rolloutPath,
+      staleRecovery: result.staleRecovery || null,
+      drain,
+    };
+  }
+  return {
+    ...result,
+    pendingPath: pendingPath(),
     pendingCount: queued.pendingCount,
     alreadyQueued: queued.alreadyQueued,
-    activeStatus: state.statusType,
-    activeFlags: state.activeFlags,
-    inProgressTurnIds: state.inProgressTurnIds,
-    busySource: state.source || "unknown",
-    rolloutPath: state.rolloutPath || null,
+    laneKey,
     drain,
   };
 }
@@ -4309,40 +5136,7 @@ async function requestTurnStart(payload, threadId, config) {
     return { status: "dry_run", threadId, promptBytes: Buffer.byteLength(prompt) };
   }
 
-  const timeoutMs = numberSetting(config, "requestTimeoutMs", "NATIVE_AGENT_CODEX_WAKEUP_REQUEST_TIMEOUT_MS", 12000);
-  const deferWhenActive = boolSetting(config, "deferWhenActive", "NATIVE_AGENT_CODEX_WAKEUP_DEFER_WHEN_ACTIVE", true);
-  try {
-    const localState = readLocalRolloutState(threadId, config);
-    if (deferWhenActive && localState && localState.active) {
-      return await deferUntilIdle(payload, threadId, localState, config);
-    }
-    return await withRpc(async (client) => {
-      const rpcState = await readThreadState(client, threadId);
-      const state = combineThreadStates(localState, rpcState);
-      if (isUnhealthyThreadState(state)) {
-        return unhealthyThreadResult(threadId, state, { delivery: "codex_app_server_thread_read" });
-      }
-      if (deferWhenActive && state.active) {
-        return await deferUntilIdle(payload, threadId, state, config);
-      }
-      const entries = [{
-        id: crypto.randomUUID(),
-        threadId,
-        payload: sanitizePayload(payload),
-      }];
-      const sent = await startTurnForEntries(client, threadId, entries, config, deferWhenActive);
-      if (sent.status === "busy") {
-        return await deferUntilIdle(payload, threadId, {
-          statusType: sent.activeStatus || "active",
-          activeFlags: sent.activeFlags || [],
-          inProgressTurnIds: sent.inProgressTurnIds || [],
-        }, config);
-      }
-      return await attachConsumeAndReplyDelivery(sent, entries, config);
-    }, timeoutMs);
-  } catch (error) {
-    return rpcFailure(error, threadId);
-  }
+  return await enqueueWake(payload, threadId, PINNED_THREAD_MODE, config);
 }
 
 async function requestFreshThreadTurnStart(payload, config) {
@@ -4369,19 +5163,10 @@ async function requestFreshThreadTurnStart(payload, config) {
     };
   }
 
-  const timeoutMs = numberSetting(config, "requestTimeoutMs", "NATIVE_AGENT_CODEX_WAKEUP_REQUEST_TIMEOUT_MS", 12000);
-  try {
-    return await withRpc(async (client) => {
-      const sent = await startFreshThreadForEntries(client, entries, config);
-      return await attachConsumeAndReplyDelivery(sent, entries, config);
-    }, timeoutMs);
-  } catch (error) {
-    return rpcFailure(error, null, { mode: FRESH_THREAD_MODE });
-  }
+  return await enqueueWake(payload, null, FRESH_THREAD_MODE, config);
 }
 
 async function drainPending(config, options = {}) {
-  const timeoutMs = numberSetting(config, "requestTimeoutMs", "NATIVE_AGENT_CODEX_WAKEUP_REQUEST_TIMEOUT_MS", 12000);
   const drainTimeoutMs = numberSetting(config, "drainTimeoutMs", "NATIVE_AGENT_CODEX_DRAIN_TIMEOUT_MS", 30 * 60 * 1000);
   const failureRetryBaseMs = numberSetting(
     config,
@@ -4396,7 +5181,7 @@ async function drainPending(config, options = {}) {
   let lastReplyDelivery = null;
   let lastWakeSource = null;
   const heartbeat = options.heartbeat || createDrainerHeartbeat(config, options.heartbeatOptions || {});
-  heartbeat.update(readPendingAtPath(PENDING_PATH).length, null);
+  heartbeat.update(readPendingAtPath(pendingPath()).length, null);
   const heartbeatStartup = await heartbeat.start();
   if (heartbeatStartup.status === "refused") {
     return {
@@ -4407,10 +5192,11 @@ async function drainPending(config, options = {}) {
       receipt: heartbeatStartup.receipt,
     };
   }
+  const consume = options.consumePendingEntry || consumePendingEntry;
 
-  return await withDirLock(DRAIN_LOCK_DIR, async () => {
+  try {
     while (Date.now() < deadline) {
-      const queue = await withDirLock(QUEUE_LOCK_DIR, async () => readPendingUnlocked(), { waitMs: 2000 });
+      const queue = await withDirLock(queueLockDir(), async () => readPendingUnlocked(), { waitMs: 2000 });
       heartbeat.update(queue.length, null);
       if (queue.length === 0) {
         return { status: "drained", delivered, pendingCount: 0 };
@@ -4420,103 +5206,108 @@ async function drainPending(config, options = {}) {
       let iterationFailure = false;
       let retryAttempt = 0;
       const busyStates = [];
-      for (const entry of firstPendingPerThread(queue)) {
+      let capacityRetryMs = 0;
+      const heads = firstPendingPerLane(queue);
+      const results = await Promise.all(heads.map(async (entry) => {
         try {
-          const localState = stateExcludingDeclaredHungTurn(
-            readLocalRolloutState(entry.threadId, config),
-            entry
-          );
-          if (localState && localState.active) {
-            lastBusy = localState;
-            busyStates.push(localState);
-            heartbeat.update(queue.length, localState.inProgressTurnIds && localState.inProgressTurnIds[0] || null);
-            continue;
-          }
-          const result = await withRpc(async (client) => {
-            const rpcState = await readThreadState(client, entry.threadId);
-            const state = stateExcludingDeclaredHungTurn(
-              combineThreadStates(localState, rpcState),
-              entry
-            );
-            if (isUnhealthyThreadState(state)) {
-              return unhealthyThreadResult(entry.threadId, state, { delivery: "codex_app_server_thread_read" });
-            }
-            if (state.active) {
-              return {
-                status: "busy",
-                threadId: entry.threadId,
-                activeStatus: state.statusType,
-                activeFlags: state.activeFlags,
-                inProgressTurnIds: state.inProgressTurnIds,
-              };
-            }
-            return await startTurnForEntries(
-              client,
-              entry.threadId,
-              [entry],
-              config,
-              true,
-              Number(entry.hangRetryCount || 0) > 0 ? entry.hungTurnId || null : null
-            );
-          }, timeoutMs);
-
-          if (result.status === "busy") {
-            lastBusy = result;
-            busyStates.push(result);
-            heartbeat.update(queue.length, result.inProgressTurnIds && result.inProgressTurnIds[0] || null);
-            continue;
-          }
-          if (result.status === "sent") {
-            const sent = await attachConsumeAndReplyDelivery(result, [entry], config);
-            lastReplyDelivery = sent.replyDelivery || null;
-            await removePending([entry.id]);
-            delivered += 1;
-            madeProgress = true;
-            heartbeat.update(Math.max(0, queue.length - 1), null);
-            break;
-          }
-          lastFailure = result;
-          iterationFailure = true;
-          retryAttempt = Math.max(retryAttempt, Number(entry.attempts || 0) + 1);
-          await bumpPendingAttempt(entry.id, JSON.stringify(result));
+          return { entry, result: await consume(entry, config, options.consumeOptions || {}) };
         } catch (error) {
-          lastFailure = rpcFailure(error, entry.threadId);
+          return { entry, error };
+        }
+      }));
+
+      for (const item of results) {
+        const { entry } = item;
+        if (item.error) {
+          lastFailure = rpcFailure(item.error, entry.threadId);
           iterationFailure = true;
           retryAttempt = Math.max(retryAttempt, Number(entry.attempts || 0) + 1);
-          await bumpPendingAttempt(entry.id, error && error.message ? error.message : String(error));
+          {
+            const errorText = item.error && item.error.message
+              ? item.error.message
+              : String(item.error);
+            if (isTerminalWakeFailure(entry, errorText)) {
+              await deadLetterPendingEntry(entry, errorText, "terminal_rpc_failure");
+              console.error(
+                `wake ${entry.id} dead-lettered (threadId=${JSON.stringify(entry.threadId)}): ${errorText}`
+              );
+            } else {
+              await bumpPendingAttempt(entry.id, errorText);
+            }
+          }
+          continue;
+        }
+        const result = item.result;
+        if (result.status === "busy") {
+          lastBusy = result;
+          busyStates.push(result);
+          heartbeat.update(queue.length, result.inProgressTurnIds && result.inProgressTurnIds[0] || null);
+          if (result.reason === "wake_capacity_busy" || result.reason === "wake_lane_lock_busy") {
+            capacityRetryMs = capacityRetryMs === 0 ? 50 : Math.min(capacityRetryMs, 50);
+          } else if (Number.isFinite(result.retryAfterMs) && result.retryAfterMs > 0) {
+            capacityRetryMs = capacityRetryMs === 0
+              ? result.retryAfterMs
+              : Math.min(capacityRetryMs, result.retryAfterMs);
+          }
+          continue;
+        }
+        if (result.status === "sent") {
+          lastReplyDelivery = result.replyDelivery || null;
+          delivered += 1;
+          madeProgress = true;
+          continue;
+        }
+        lastFailure = result;
+        iterationFailure = true;
+        retryAttempt = Math.max(retryAttempt, Number(entry.attempts || 0) + 1);
+        {
+          const errorText = JSON.stringify(result);
+          if (isTerminalWakeFailure(entry, errorText)) {
+            await deadLetterPendingEntry(entry, errorText, "terminal_result");
+            console.error(
+              `wake ${entry.id} dead-lettered (threadId=${JSON.stringify(entry.threadId)}): ${unicodePrefix(errorText, 200)}`
+            );
+          } else {
+            await bumpPendingAttempt(entry.id, errorText);
+          }
         }
       }
 
-      if (!madeProgress) {
-        const retryDelayMs = iterationFailure
-          ? Math.min(30_000, failureRetryBaseMs * (2 ** Math.min(5, Math.max(0, retryAttempt - 1))))
-          : 0;
-        const event = await waitForPendingDrainInvalidation(
-          busyStates,
-          queueFingerprint(queue),
-          config,
-          deadline,
-          retryDelayMs
-        );
-        lastWakeSource = event.source;
-        if (event.source === "drain_timeout") break;
+      if (madeProgress) {
+        heartbeat.update(Math.max(0, queue.length - delivered), null);
+        continue;
       }
+
+      const retryDelayMs = capacityRetryMs || (iterationFailure
+          ? Math.min(30_000, failureRetryBaseMs * (2 ** Math.min(5, Math.max(0, retryAttempt - 1))))
+          : 0);
+      const event = await waitForPendingDrainInvalidation(
+        busyStates,
+        queueFingerprint(queue),
+        config,
+        deadline,
+        retryDelayMs
+      );
+      lastWakeSource = event.source;
+      if (event.source === "drain_timeout") break;
     }
 
-    const remaining = await withDirLock(QUEUE_LOCK_DIR, async () => readPendingUnlocked().length, { waitMs: 2000 });
+    const remaining = await withDirLock(queueLockDir(), async () => readPendingUnlocked().length, { waitMs: 2000 });
     heartbeat.update(remaining, lastBusy && lastBusy.inProgressTurnIds && lastBusy.inProgressTurnIds[0] || null);
     return {
       status: "pending",
       reason: "drain_timeout",
       delivered,
       pendingCount: remaining,
-      pendingPath: PENDING_PATH,
+      pendingPath: pendingPath(),
       lastBusy,
       lastFailure,
       lastReplyDelivery,
       lastWakeSource,
     };
-  }, { waitMs: 0, staleMs: 60 * 60 * 1000, preserveLiveOwner: true }).finally(() => heartbeat.stop());
+  } finally {
+    await heartbeat.stop();
+  }
 }
 
 async function main() {
@@ -4538,7 +5329,9 @@ async function main() {
 
   if (process.argv.includes("--recover-reply-jobs")) {
     try {
-      jsonOut(await recoverReplyJobs(config));
+      const recovery = await recoverReplyJobs(config);
+      recovery.inboxTerminalRepair = await repairTerminalFromDeadLetters();
+      jsonOut(recovery);
     } catch (error) {
       jsonOut({
         status: "failed",
@@ -4565,7 +5358,9 @@ async function main() {
 
   if (process.argv.includes("--probe")) {
     const mode = wakeupMode(config);
-    const threadId = process.env.NATIVE_AGENT_CODEX_THREAD_ID || (mode === PINNED_THREAD_MODE ? config.threadId : null);
+    const threadId = canonicalCodexThreadId(
+      process.env.NATIVE_AGENT_CODEX_THREAD_ID || (mode === PINNED_THREAD_MODE ? config.threadId : null)
+    );
     if (mode === PINNED_THREAD_MODE && !threadId) {
       fail("target_thread_missing", {
         mode,
@@ -4622,11 +5417,7 @@ async function main() {
     try {
       jsonOut(await drainPending(config));
     } catch (error) {
-      if (error && error.message === "lock_busy") {
-        jsonOut({ status: "already_running", reason: "drain_lock_busy", lockDir: DRAIN_LOCK_DIR });
-      } else {
-        jsonOut({ status: "failed", reason: "drain_failed", error: String(error && error.message || error) });
-      }
+      jsonOut({ status: "failed", reason: "drain_failed", error: String(error && error.message || error) });
     }
     return;
   }
@@ -4639,7 +5430,9 @@ async function main() {
   }
 
   const mode = wakeupMode(config, payload);
-  const threadId = payload.threadId || process.env.NATIVE_AGENT_CODEX_THREAD_ID || (mode === PINNED_THREAD_MODE ? config.threadId : null);
+  const threadId = canonicalCodexThreadId(
+    payload.threadId || process.env.NATIVE_AGENT_CODEX_THREAD_ID || (mode === PINNED_THREAD_MODE ? config.threadId : null)
+  );
   if (mode === PINNED_THREAD_MODE && !threadId) {
     fail("target_thread_missing", {
       mode,
@@ -4668,19 +5461,34 @@ if (require.main === module) {
 }
 
 module.exports = {
+  appendPending,
   attachConsumeAndReplyDelivery,
   brainControlsForEntries,
   createDrainerHeartbeat,
+  consumePendingEntry,
+  canonicalCodexThreadId,
+  isCodexNonThreadSentinel,
+  isTerminalWakeFailure,
+  deadLetterPendingEntry,
+  markInboxTerminal,
+  repairTerminalFromDeadLetters,
+  removePending,
+  wakeupMode,
   daemonVersionsMismatch,
   daemonWorkingDirectoryMismatch,
   daemonWorkingDirectoryState,
   parseLsofWorkingDirectory,
   deliverReplyJob,
   dirLockOwnerAlive,
+  drainPending,
+  entryLaneKey,
   extractTurnResultFromRollout,
   extractTurnResultFromThread,
   extractTurnResultFromTurn,
   formatCodexReplyForNativeAgent,
+  unicodePrefix,
+  shouldSuppressCompletionDelivery,
+  formatBatchPrompt,
   formatPrompt,
   executionPolicyForEntries,
   freshThreadStartParams,
@@ -4693,6 +5501,7 @@ module.exports = {
   bridgeDeliveryBackoffMs,
   postBridgeMessageWithRetry,
   replyJobDisposition,
+  persistReplyJobDeliveryState,
   finalizeReplyJobFile,
   pruneUndeliveredReplyJobs,
   quarantineReplyJob,
@@ -4700,9 +5509,11 @@ module.exports = {
   redactDiagnosticText,
   recoverReplyJobs,
   recoverHungTurn,
+  recoverStaleQueuedWake,
   runCodexExecFallback,
   sanitizePayload,
   stableUUID,
+  firstPendingPerLane,
   startTurnWithDurableReplyAdmission,
   turnStartParams,
   unattendedServerRequestReply,
@@ -4710,5 +5521,10 @@ module.exports = {
   waitForDurableTerminalExecution,
   waitForTurnResultWithEmptyRetry,
   waitForTurnResultEventFirst,
+  wakeConcurrencyCap,
+  wakeLaneKey,
+  wakeLaneLockPath,
+  withWakeCapacity,
+  withWakeExecutionLane,
   withDirLock,
 };

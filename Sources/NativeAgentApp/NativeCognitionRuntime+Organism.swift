@@ -1,6 +1,7 @@
 // Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
 
 import Foundation
+import ApprovalInbox
 import ChatOrchestration
 import CognitiveSubstrate
 import Context
@@ -22,6 +23,97 @@ private struct OrganismReflexReviewIntent: Codable, Sendable {
 }
 
 extension NativeCognitionRuntime {
+    func startApprovalLifecycleObservationIfNeeded() async {
+        guard approvalLifecycleObservationTask == nil else { return }
+        let stream = await ApprovalLifecycleBus.shared.events()
+        approvalLifecycleObservationTask = Task { [weak self] in
+            for await event in stream {
+                guard !Task.isCancelled else { return }
+                await self?.ingestApprovalLifecycleEvent(event)
+            }
+        }
+    }
+
+    /// Restore only still-pending expectations. Old terminal decisions are not
+    /// replayed as fresh relief, while a pending approval survives restart as
+    /// the same correlated expectation. Duplicate timestamps are ignored by
+    /// the predictive ledger.
+    func reconcilePendingApprovalExpectationsAtBootstrap() async {
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        guard let pending = try? await inbox.list(filter: .pending) else { return }
+        for record in pending {
+            let source = Self.approvalLifecycleSource(for: record)
+            let existing = await organismKernel.prediction(
+                ofKind: .approvalResolution,
+                sourceOrgan: source,
+                correlationID: record.id
+            )
+            // Continuity already owns this live expectation. Replaying it on
+            // every launch would inflate evidence and keep shifting its due
+            // horizon. An expired or missing row is re-armed because the
+            // canonical inbox still says a human decision is outstanding.
+            if existing?.status == .pending { continue }
+            await ingestApprovalLifecycleEvent(
+                ApprovalLifecycleEvent(phase: .requested, record: record),
+                persistSynchronously: false,
+                occurredAtOverride: now(),
+                bootstrapIfNeeded: false
+            )
+        }
+    }
+
+    private func ingestApprovalLifecycleEvent(
+        _ event: ApprovalLifecycleEvent,
+        persistSynchronously: Bool = false,
+        occurredAtOverride: Date? = nil,
+        bootstrapIfNeeded: Bool = true
+    ) async {
+        let record = event.record
+        let timestamp = occurredAtOverride ?? Self.approvalLifecycleDate(
+            event.phase == .resolved ? record.resolvedAt : record.createdAt
+        ) ?? now()
+        let source = Self.approvalLifecycleSource(for: record)
+        let signal = SomaticSignal(
+            id: UUID(),
+            kind: event.phase == .requested ? .approvalRequested : .approvalResolved,
+            sourceOrgan: source,
+            occurredAt: timestamp,
+            intensity: event.phase == .requested ? 0.45 : 0.6,
+            valence: event.phase == .resolved ? 0.2 : nil,
+            arousal: event.phase == .requested ? 0.4 : nil,
+            metadata: [
+                "predictionCorrelationId": .string(record.id),
+                "approvalAction": .string(record.action),
+                "approvalDecision": .string(record.decision ?? "pending"),
+            ]
+        )
+        if bootstrapIfNeeded {
+            await ingestPreparedOrganismSignal(
+                signal,
+                persistSynchronously: persistSynchronously,
+                prewarmContext: false
+            )
+        } else {
+            await ingestPreparedOrganismSignalAfterBootstrap(
+                signal,
+                persistSynchronously: persistSynchronously,
+                prewarmContext: false
+            )
+        }
+    }
+
+    private nonisolated static func approvalLifecycleDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: raw) { return date }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+
+    private nonisolated static func approvalLifecycleSource(for record: ApprovalRecord) -> String {
+        "approval.\(record.action.isEmpty ? "unknown" : record.action)"
+    }
+
     /// Round 3 Wave A2: notable resolutions the body just felt (relief /
     /// earned disappointment) become substrate nodes with real aboutness.
     /// Straight into ingestResident — never back through the somatic bus, so
@@ -104,6 +196,18 @@ extension NativeCognitionRuntime {
         prewarmContext: Bool = true
     ) async {
         await bootstrap()
+        await ingestPreparedOrganismSignalAfterBootstrap(
+            signal,
+            persistSynchronously: persistSynchronously,
+            prewarmContext: prewarmContext
+        )
+    }
+
+    private func ingestPreparedOrganismSignalAfterBootstrap(
+        _ signal: SomaticSignal,
+        persistSynchronously: Bool,
+        prewarmContext: Bool
+    ) async {
         let kind = signal.kind
         await organismKernel.ingest(signal)
         await drainFeltResolutionsIntoSubstrate()
@@ -498,10 +602,15 @@ extension NativeCognitionRuntime {
             cachedBodyRead = (liveRead, fixedAt)
         }
         if liveRead.providersAvailable == true {
-            liveRead.providerPathBelief = ProviderPathBeliefProjector.project(
-                evidence: providerPathEvidence(at: fixedAt),
-                now: fixedAt
-            )
+            let providerEvidence = providerPathEvidence(at: fixedAt)
+            liveRead.providerPathBelief = if providerEvidence.isEmpty {
+                Self.providerCapabilityFallbackProjection(
+                    await organismKernel.capabilityBelief(ofKind: .providerCompletion),
+                    now: fixedAt
+                ) ?? ProviderPathBeliefProjector.project(evidence: [], now: fixedAt)
+            } else {
+                ProviderPathBeliefProjector.project(evidence: providerEvidence, now: fixedAt)
+            }
             // Availability is exact configuration truth; health is derived
             // exclusively from the lifecycle belief above.
             liveRead.providersHealthy = nil
@@ -1059,10 +1168,34 @@ extension NativeCognitionRuntime {
         ]
         let readableStores = storePaths.filter(hasReadableContent)
         let hygienePath = memoryRoot.appendingPathComponent("hygiene_last_run.json")
-        let status = stringValue(inJSONAt: hygienePath, key: "status")?.lowercased()
-        let maintenanceSucceeded = status.map {
-            ["ok", "complete", "completed", "success", "succeeded"].contains($0)
-        }
+        let hygieneExists = FileManager.default.fileExists(atPath: hygienePath.path)
+        let hygieneObject = jsonObject(at: hygienePath) as? [String: Any]
+        let status = (hygieneObject?["status"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let successfulStatuses = ["ok", "complete", "completed", "success", "succeeded"]
+        var matchingAppliedReceiptPath: URL?
+        let maintenanceSucceeded: Bool? = {
+            guard let status else { return hygieneExists ? false : nil }
+            if successfulStatuses.contains(status) { return true }
+            guard status == "staged",
+                  let runId = (hygieneObject?["consolidationRunId"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !runId.isEmpty
+            else { return false }
+            let receiptPath = memoryRoot
+                .appendingPathComponent("consolidation/receipts", isDirectory: true)
+                .appendingPathComponent("\(runId).json")
+            guard let receipt = jsonObject(at: receiptPath) as? [String: Any],
+                  (receipt["run_id"] as? String) == runId,
+                  let receiptStatus = (receipt["status"] as? String)?.lowercased(),
+                  ["applied", "applied_prior"].contains(receiptStatus),
+                  let at = receipt["at"] as? String,
+                  parseISODate(at) != nil
+            else { return false }
+            matchingAppliedReceiptPath = receiptPath
+            return true
+        }()
         var evidence = readableStores.compactMap { path -> BodyEvidenceReference? in
             guard let receivedAt = modificationDate(path) else { return nil }
             return BodyEvidenceReference(
@@ -1075,6 +1208,15 @@ extension NativeCognitionRuntime {
         if let receivedAt = modificationDate(hygienePath) {
             evidence.append(BodyEvidenceReference(
                 id: "memory-maintenance:\(receivedAt.timeIntervalSince1970):\(status ?? "unknown")",
+                evidenceClass: .maintenanceReceipt,
+                observedAt: receivedAt,
+                receivedAt: receivedAt
+            ))
+        }
+        if let matchingAppliedReceiptPath,
+           let receivedAt = modificationDate(matchingAppliedReceiptPath) {
+            evidence.append(BodyEvidenceReference(
+                id: "memory-consolidation-applied:\(receivedAt.timeIntervalSince1970)",
                 evidenceClass: .maintenanceReceipt,
                 observedAt: receivedAt,
                 receivedAt: receivedAt

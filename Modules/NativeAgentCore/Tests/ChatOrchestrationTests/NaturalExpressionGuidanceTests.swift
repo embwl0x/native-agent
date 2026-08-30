@@ -1,4 +1,6 @@
 import Testing
+import PersistenceCore
+import Foundation
 @testable import ChatOrchestration
 import NativeAgentCore
 import TrustCenter
@@ -171,6 +173,134 @@ struct NaturalExpressionGuidanceTests {
 
 private func chatRow(_ role: String, _ content: String) -> ChatMessage {
     ChatMessage(role: role, content: content, timestamp: "2026-08-11T09:00:00Z", extras: nil)
+}
+
+@Suite("Natural expression completed-reply provenance")
+struct NaturalExpressionReplyProvenanceTests {
+    private func reply(_ content: String, runID: String? = nil, id: String? = nil,
+                       metadata: [String: JSONValue] = [:], cancelled: Bool = false) -> ChatMessage {
+        var extras: [String: JSONValue] = [
+            "metadata": .object(metadata),
+            "cancelled": .bool(cancelled),
+        ]
+        if let runID { extras["runId"] = .string(runID) }
+        if let id { extras["id"] = .string(id) }
+        return ChatMessage(role: "assistant", content: content,
+                           timestamp: "2026-08-30T17:00:00Z", extras: .object(extras))
+    }
+
+    private let narrated = "Caught me. That was the old habit again. There."
+
+    private func outcome(_ status: String, messageID: String) throws -> JSONValue {
+        let observation = try #require(ResponseOutcomeObservationV2.make(
+            turnID: "trace-fixture", messageID: messageID, sessionID: "s-fixture", surface: "chat",
+            observedAt: Date(timeIntervalSince1970: 1_700_000_000), responsePersistence: status))
+        return observation.jsonValue
+    }
+
+    @Test("synthetic failure notices cannot create or displace voice recurrence")
+    func failedPersistenceNoticesStayOutsideVoiceEvidence() throws {
+        let failure = reply(narrated, id: "failed-notice", metadata: [
+            "outcomeObservation": try outcome("failed", messageID: "failed-notice"),
+            "turnTraceId": .string("trace-fixture"),
+        ])
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: [reply(narrated), failure]) == nil)
+
+        let notices = try (0..<6).map { index in
+            reply("Chat error: provider unavailable", id: "notice-\(index)", metadata: [
+                "outcomeObservation": try outcome("failed", messageID: "notice-\(index)"),
+                "turnTraceId": .string("trace-fixture"),
+            ])
+        }
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: [reply(narrated), reply(narrated)] + notices)
+                == NaturalExpressionGuidance.stanceCue)
+        let shapes = repeatedConversationalShape.map { reply($0) }
+        #expect(NaturalExpressionGuidance.pendingRutCue(from: shapes + notices) == NaturalExpressionGuidance.rutCue)
+    }
+
+    @Test("missing malformed or mismatched outcome receipts do not suppress legacy voice")
+    func onlyValidatedMatchingFailureReceiptsAreExcluded() throws {
+        let validFailure = try outcome("failed", messageID: "expected-row")
+        let preserved = [
+            reply(narrated),
+            reply(narrated, id: "expected-row", metadata: [
+                "outcomeObservation": .object(["responsePersistence": .string("failed")]),
+            ]),
+            reply(narrated, id: "different-row", metadata: ["outcomeObservation": validFailure]),
+            reply(narrated, id: "expected-row", metadata: [
+                "outcomeObservation": validFailure, "turnTraceId": .string("different-trace"),
+            ]),
+            reply(narrated, id: "expected-row", metadata: [
+                "outcomeObservation": try outcome("persisted", messageID: "expected-row"),
+            ]),
+        ]
+        for row in preserved {
+            #expect(NaturalExpressionGuidance.pendingStanceCue(from: [reply(narrated), row])
+                    == NaturalExpressionGuidance.stanceCue)
+        }
+    }
+
+    @Test("interrupted fragments cannot create stance or shape recurrence")
+    func incompleteRowsCannotCreateRecurrence() {
+        let interrupted = [
+            reply(narrated, metadata: ["partial": .bool(true)]),
+            reply(narrated, metadata: ["cancelled": .bool(true)]),
+            reply(narrated, cancelled: true),
+            reply(narrated),
+        ]
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: interrupted) == nil)
+
+        let shapes = repeatedConversationalShape.enumerated().map { index, content in
+            reply(content, metadata: ["partial": .bool(index != 2)])
+        }
+        #expect(NaturalExpressionGuidance.pendingRutCue(from: shapes) == nil)
+    }
+
+    @Test("an interrupted fragment cannot cool genuine completed-reply recurrence")
+    func incompleteRowsDoNotCoolRecurrence() {
+        let stance = [reply(narrated, runID: "one"), reply(narrated, runID: "two"),
+                      reply("A different unfinished opening", metadata: ["partial": .bool(true)])]
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: stance)
+                == NaturalExpressionGuidance.stanceCue)
+
+        let shapes = repeatedConversationalShape.enumerated().map { index, content in
+            reply(content, runID: "shape-\(index)")
+        } + [reply("An unfinished opening", cancelled: true)]
+        #expect(NaturalExpressionGuidance.pendingRutCue(from: shapes)
+                == NaturalExpressionGuidance.rutCue)
+    }
+
+    @Test("one run contributes only its newest completed reply")
+    func repeatedRunCountsOnce() {
+        let sameRun = repeatedConversationalShape.map { reply($0, runID: "same-run") }
+        #expect(NaturalExpressionGuidance.pendingRutCue(from: sameRun) == nil)
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: [
+            reply(narrated, runID: "same-run"), reply(narrated, runID: "same-run"),
+        ]) == nil)
+
+        let replaced = [reply(narrated, runID: "older"), reply(narrated, runID: "newest"),
+                        reply("The quieter ending fits this moment.", runID: "newest")]
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: replaced) == nil)
+    }
+
+    @Test("legacy rows remain eligible and real completed variation still cools the cue")
+    func legacyAndVariedRepliesRemainNatural() {
+        let legacy = [chatRow("assistant", narrated), chatRow("assistant", narrated)]
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: legacy)
+                == NaturalExpressionGuidance.stanceCue)
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: legacy + [
+            reply("That small difference is enough.", metadata: ["partial": .bool(false)]),
+        ]) == nil)
+    }
+
+    @Test("tool-heavy history cannot revive distant expression evidence")
+    func evidenceWindowHasHardRowBound() {
+        let old = [reply(narrated), reply(narrated)]
+        let tools = (0..<64).map { chatRow("tool", "receipt \($0)") }
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: old + tools) == nil)
+        #expect(NaturalExpressionGuidance.pendingStanceCue(from: tools + old)
+                == NaturalExpressionGuidance.stanceCue)
+    }
 }
 
 @Suite("Stance and serve cues")

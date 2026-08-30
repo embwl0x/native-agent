@@ -52,7 +52,8 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         return EventDeadlinePhysiology.storeAndFileEvents(
             paths: [store.opsPath, store.statePath],
-            stores: [.desk]
+            stores: [.desk],
+            loopId: loopId
         )
     }
 

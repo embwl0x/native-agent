@@ -32,6 +32,20 @@ extension CognitiveStandingView {
 }
 
 extension CognitiveSubstrate {
+    /// Term match for standing-view surfacing: exact, or the longer term is
+    /// the shorter plus a common inflection suffix ("carry"/"carrying").
+    /// A bare shared prefix over-matches ("inter" would hit "internal"), so
+    /// this is morphology, not stem wildcarding. Static so the rule itself
+    /// is pinned by tests.
+    static func standingViewTermsMatch(_ queryTerm: String, _ documentTerm: String) -> Bool {
+        if queryTerm == documentTerm { return true }
+        let inflectionSuffixes: Set<String> = ["s", "es", "ed", "ing", "er", "ers", "ion", "ions"]
+        let (short, long) = queryTerm.count < documentTerm.count
+            ? (queryTerm, documentTerm) : (documentTerm, queryTerm)
+        guard short.count >= appraisalLivedConcernMinimumTermLength,
+              long.hasPrefix(short) else { return false }
+        return inflectionSuffixes.contains(String(long.dropFirst(short.count)))
+    }
 
     // MARK: - Tuning knobs (the ONE standing-views surface)
 
@@ -302,14 +316,24 @@ extension CognitiveSubstrate {
             .compactMap { view in
                 let text = capsuleLineText(view.body, maxCharacters: 180)
                 guard !text.isEmpty else { return nil }
-                let lowered = "\(view.title) \(view.body)".lowercased()
-                let keywords = concerns
-                    .filter { Self.concernMatches($0, in: lowered) }
-                    .flatMap(\.keywords)
+                let viewText = "\(view.title) \(view.body)"
+                let lowered = viewText.lowercased()
+                // What this view is ABOUT. Every matched concern's keywords
+                // used to be flattened in together, so a view that merely
+                // mentions "fix" carried the whole shipped `repair` lexicon
+                // and answered to messages it has nothing to say about. Her
+                // own distinctive terms are the discriminating signal; the
+                // matched-concern lexicon is the FALLBACK for a view too
+                // short to have any (it is all a bare "I fix it, I own it"
+                // can be recognised by).
+                let distinctive = Self.appraisalConcernTerms(in: viewText)
+                let effective = distinctive.isEmpty
+                    ? concerns.filter { Self.concernMatches($0, in: lowered) }.flatMap(\.keywords)
+                    : distinctive
                 return CognitiveStandingViewCapsuleCandidate(
                     id: view.id,
                     line: "- Inner: \(text)",
-                    concernKeywords: Array(Set(keywords)).sorted(),
+                    concernKeywords: Array(Set(effective)).sorted(),
                     updatedAt: view.updatedAt
                 )
             }
@@ -329,11 +353,98 @@ extension CognitiveSubstrate {
         guard let newest = candidates.first else { return nil }
         let enabled = relevanceEnabled ?? configuration.standingViewCapsuleRelevanceEnabled
         guard enabled else { return newest.line }
-        let lowered = userMessage.lowercased()
-        guard !lowered.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return candidates.first { candidate in
-            candidate.concernKeywords.contains { lowered.contains($0) }
-        }?.line
+        guard !userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return Self.bestRelevantCandidate(in: candidates, for: userMessage)?.line
+    }
+
+    // MARK: - Relevance (BM25)
+
+    /// Substring containment made a single incidental word enough: an
+    /// unrelated message that happens to contain "memory" surfaced an old
+    /// worldview every turn. Scoring instead asks HOW MUCH of what the
+    /// message is about this view actually covers.
+    ///
+    /// Okapi BM25 over the candidate set (documents = a view's frozen concern
+    /// keywords, tf capped at 1 because they are a SET), normalized against
+    /// the score a hypothetical average-length view covering EVERY query term
+    /// would earn. So the score is a 0…1 idf-weighted coverage fraction with
+    /// BM25's length penalty intact — comparable across candidate sets, which
+    /// a raw BM25 score is not, and therefore the only form an absolute floor
+    /// can be stated against.
+    ///
+    /// Ties (equal score) keep the incoming order, which is newest-first —
+    /// the historical behavior.
+    static let standingViewRelevanceFloor = 0.18
+    static let standingViewRelevanceK1 = 1.2
+    static let standingViewRelevanceB = 0.75
+    static let standingViewRelevanceMinimumIDF = 0.5
+    static let standingViewRelevanceMaximumIDF = 2.0
+
+    static func bestRelevantCandidate(
+        in candidates: [CognitiveStandingViewCapsuleCandidate],
+        for userMessage: String
+    ) -> CognitiveStandingViewCapsuleCandidate? {
+        let queryTerms = appraisalConcernTerms(in: userMessage)
+        guard !queryTerms.isEmpty else { return nil }
+        let documents = candidates.map { Set($0.concernKeywords) }
+        let total = documents.count
+        guard total > 0 else { return nil }
+        let averageLength = Double(documents.reduce(0) { $0 + $1.count }) / Double(total)
+        guard averageLength > 0 else { return nil }
+
+        // Term-level, not free substring: "carrying" still reaches a view
+        // about "carry", but "simple" can no longer be found inside an
+        // unrelated sentence's middle. A bare shared prefix over-matches
+        // ("inter" would hit "internal"/"interesting"), so the longer term
+        // must be the shorter one plus a common inflection suffix — morphology,
+        // not stem wildcarding. The shorter side still clears the 5-character
+        // floor, so a 3-letter lexicon entry like "fix" matches only exactly.
+        func matches(_ queryTerm: String, _ documentTerm: String) -> Bool {
+            CognitiveSubstrate.standingViewTermsMatch(queryTerm, documentTerm)
+        }
+        func document(_ index: Int, covers term: String) -> Bool {
+            documents[index].contains { matches(term, $0) }
+        }
+
+        // ln(1 + (N - n + 0.5) / (n + 0.5)), CLAMPED. The active set is ≤5
+        // views, and at that corpus size raw idf degenerates: every term a
+        // view carries scores ~0.29 while any term absent from all of them
+        // scores ~1.4, so a genuinely on-topic message that also mentions one
+        // other thing could never clear any floor. The clamp keeps idf's
+        // ordering (rarer still outranks common) without letting a
+        // one-document corpus decide the outcome by itself.
+        func idf(_ term: String) -> Double {
+            let containing = Double(documents.indices.reduce(0) {
+                $0 + (document($1, covers: term) ? 1 : 0)
+            })
+            let raw = log(1 + (Double(total) - containing + 0.5) / (containing + 0.5))
+            return min(standingViewRelevanceMaximumIDF, max(standingViewRelevanceMinimumIDF, raw))
+        }
+        let idfByTerm = Dictionary(uniqueKeysWithValues: queryTerms.map { ($0, idf($0)) })
+        // The denominator: total query mass. Terms NO view carries stay in it
+        // on purpose — a long message mostly about something else cannot be
+        // fully "covered" by one incidental hit.
+        // Summed over the ORDERED terms, not the dictionary's values: float
+        // addition is not associative, and an unordered sum could shift the
+        // last bits between runs and flip a candidate sitting on the floor.
+        let queryMass = queryTerms.reduce(0.0) { $0 + (idfByTerm[$1] ?? 0) }
+        guard queryMass > 0 else { return nil }
+
+        let k1 = standingViewRelevanceK1
+        let b = standingViewRelevanceB
+        var best: (candidate: CognitiveStandingViewCapsuleCandidate, score: Double)?
+        for (index, candidate) in candidates.enumerated() {
+            let matched = queryTerms.filter { document(index, covers: $0) }
+            guard !matched.isEmpty else { continue }
+            let lengthNorm = 1 - b + b * Double(documents[index].count) / averageLength
+            // Reference denominator uses |d| = avgdl, where the factor is
+            // (k1 + 1) / (1 + k1); the (k1 + 1) cancels, leaving this.
+            let lengthFactor = (1 + k1) / (k1 * lengthNorm + 1)
+            let score = min(1.0, matched.reduce(0) { $0 + (idfByTerm[$1] ?? 0) } * lengthFactor / queryMass)
+            guard score >= standingViewRelevanceFloor else { continue }
+            if best == nil || score > best!.score { best = (candidate, score) }
+        }
+        return best?.candidate
     }
 
     /// Compatibility read for non-turn diagnostics. It intentionally retains

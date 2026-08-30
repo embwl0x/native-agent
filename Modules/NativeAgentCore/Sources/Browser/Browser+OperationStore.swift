@@ -405,7 +405,8 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
             try await appendDerivedOnce(
                 trace, projectionID: projectionID,
                 to: tracesPath, label: "Browser.trace",
-                maxLines: JSONLLineCaps.activityEvents
+                maxLines: JSONLLineCaps.traceEvents,
+                usesPathOwnedCap: true
             )
 
             try await withCanonicalRunsLock {
@@ -449,7 +450,8 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
         projectionID: String,
         to path: URL,
         label: String,
-        maxLines: Int = JSONLLineCaps.actionReceipts
+        maxLines: Int = JSONLLineCaps.actionReceipts,
+        usesPathOwnedCap: Bool = false
     ) async throws {
         let work: @Sendable () async throws -> Void = {
             let existing = (try? await self.persistenceCore.tailJSONL(
@@ -458,10 +460,17 @@ extension SwiftNativeBrowserClient: BrowserOperationCommanding {
             guard !existing.contains(where: {
                 Self.objectString($0, "transitionId") == projectionID
             }) else { return }
-            try await appendJSONLCapped(
-                value, to: path, using: self.persistenceCore,
-                maxLines: maxLines, logLabel: label, takeLock: false
-            )
+            if usesPathOwnedCap {
+                try await appendPathOwnedJSONL(
+                    value, to: path, using: self.persistenceCore,
+                    logLabel: label, takeLock: false
+                )
+            } else {
+                try await appendJSONLCapped(
+                    value, to: path, using: self.persistenceCore,
+                    maxLines: maxLines, logLabel: label, takeLock: false
+                )
+            }
         }
         // Uniform locking (L7, 2026-08-01): `withFileLock` is a
         // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so

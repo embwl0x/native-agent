@@ -39,7 +39,8 @@ struct WorkshopOutcomeScoreboardPureSuite {
             completedSteps: 3,
             rerunCount: 1,
             triggerSource: "manual",
-            wasStub: false
+            wasStub: false,
+            verificationStatus: .satisfied
         )
         let roundTrip = try #require(WorkshopDirectedTaskReceipt.fromJSON(receipt.toJSON()))
         #expect(roundTrip == receipt)
@@ -47,6 +48,33 @@ struct WorkshopOutcomeScoreboardPureSuite {
         #expect(outcome.id == "exec_123")
         #expect(outcome.deskHandle == "desk_abc")
         #expect(outcome.wallSeconds == 120)
+    }
+
+    @Test
+    func unverifiedReceiptIsTerminalButNotCompleted() throws {
+        let receipt = WorkshopDirectedTaskReceipt(
+            handle: "desk_unverified",
+            executionId: "exec_unverified",
+            status: "completed",
+            summary: "tool returned",
+            createdAt: "2026-07-11T12:00:00Z",
+            completedAt: "2026-07-11T12:02:00Z",
+            totalSteps: 1,
+            completedSteps: 1,
+            rerunCount: 0,
+            triggerSource: "manual",
+            wasStub: false,
+            verificationStatus: .unverified
+        )
+        let outcome = try #require(WorkshopOutcomeScoreboard.sample(from: receipt))
+        #expect(outcome.status == "unverified")
+        #expect(outcome.isTerminal)
+        #expect(!outcome.isCompleted)
+        let week = try #require(WorkshopOutcomeScoreboard.weekly(from: [outcome]).first)
+        #expect(week.terminal == 1)
+        #expect(week.completed == 0)
+        #expect(week.unverified == 1)
+        #expect(week.completionRate == 0)
     }
 
     @Test
@@ -444,5 +472,13 @@ struct WorkshopDeskReceiptBridgeSuite {
         #expect(current.waitingOn == "domain verification")
         #expect(current.blockedReason?.contains("remains unverified") == true)
         #expect(current.closedAt == nil)
+        #expect(current.notes.contains {
+            $0.text == "[execution_completed_unverified] Tool returned success"
+        })
+        let rows = try await SwiftNativePersistenceCore().readJSONL(
+            root.appendingPathComponent("workshop/receipts.jsonl")
+        ).compactMap(WorkshopDirectedTaskReceipt.fromJSON)
+        #expect(rows.count == 1)
+        #expect(rows[0].verificationStatus == .unverified)
     }
 }

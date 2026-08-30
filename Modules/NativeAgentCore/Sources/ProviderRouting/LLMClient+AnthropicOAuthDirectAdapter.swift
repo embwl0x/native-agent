@@ -1095,6 +1095,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "stream"))
             }
+            defer { bytes.task.cancel() }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 401, attempt == 0 { continue }
             if status == 429 {
@@ -1104,12 +1105,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     retryAfterSeconds: parseRetryAfterSeconds(from: response))
             }
             if !(200..<300).contains(status) {
-                var body = Data()
-                for try await byte in bytes {
-                    if body.count < 4096 {
-                        body.append(byte)
-                    }
-                }
+                let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
                 // A3.1: refresh already ran (attempt 1) and the token is still
                 // rejected → genuinely revoked, not "unconfigured".
                 if status == 401 {
@@ -1280,6 +1276,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             } catch {
                 throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: "streamMessages"))
             }
+            defer { bytes.task.cancel() }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 401, attempt == 0 { continue }
             if status == 429 {
@@ -1289,12 +1286,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     retryAfterSeconds: parseRetryAfterSeconds(from: response))
             }
             if !(200..<300).contains(status) {
-                var body = Data()
-                for try await byte in bytes {
-                    if body.count < 4096 {
-                        body.append(byte)
-                    }
-                }
+                let body = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
                 // A3.1: refresh already ran (attempt 1) and the token is still
                 // rejected → genuinely revoked, not "unconfigured".
                 if status == 401 {

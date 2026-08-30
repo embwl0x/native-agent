@@ -47,6 +47,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     static let shared = ClaudeBridge()
 
     static let port: UInt16 = 8771
+    static let listenerPortPlan = NativeLoopbackPortPlan(preferredPort: port)
     private static let maxRequestBodyBytes = 4 * 1024 * 1024
     private static let claudeSurfaceName = "claude-bridge"
     private static let codexSurfaceName = "codex-bridge"
@@ -112,7 +113,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     }
 
     private let bridgeListener = NativeLoopbackPortFallbackListener(
-        preferredPort: ClaudeBridge.port,
+        plan: ClaudeBridge.listenerPortPlan,
         label: "ClaudeBridge"
     )
     private let stateLock = NSLock()
@@ -178,6 +179,33 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     func eventRouteSnapshot() -> (connectionCount: Int, subscriberCount: Int, latestSequence: UInt64) {
         stateLock.lock(); defer { stateLock.unlock() }
         return (connections.count, eventSubscribers.count, eventSeq)
+    }
+
+    /// Bounded projection used by the state endpoint and hermetic route evals.
+    /// Callers receive values, never access to the mutable event ring.
+    func recentEventPayloads() -> [[String: Any]] {
+        stateLock.lock()
+        let recent = recentToolCalls
+        stateLock.unlock()
+        return recent.map { $0.asJSON }
+    }
+
+    /// A returned envelope proves dispatch completed, not that the requested
+    /// operation succeeded. Share chat's exact classification; do not turn
+    /// queued/approval/unknown results into success or retain result content.
+    func publishToolResultEvent(name: String, surface: String, result: JSONValue, durationMs: Int) {
+        let outcome = ChatToolOutcome.exactResultClass(result)
+        let ok: Any
+        switch outcome {
+        case .succeeded: ok = true
+        case .failed, .cancelled, .timeout: ok = false
+        case .unknown: ok = NSNull()
+        }
+        publishEvent(kind: "tool", payload: [
+            "name": name, "surface": surface, "ok": ok,
+            "resultClass": outcome.rawValue, "dispatchCompleted": true,
+            "durationMs": durationMs,
+        ])
     }
 
     /// The compact, auditable event emitted for every organism reflex review
@@ -264,6 +292,26 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             let clipped = bounded(value, maximum: maximum)
             return clipped.isEmpty ? nil : clipped
         }
+    }
+
+    /// Canonical organism-debug event seam shared by the HTTP endpoint and
+    /// no-network eval harness. Optional fields are omitted rather than
+    /// serialized as null so reset/settle/clear events stay minimal.
+    func publishOrganismDebugEvent(
+        status: String,
+        scenario: String? = nil,
+        ttlSeconds: Int? = nil
+    ) {
+        var payload: [String: Any] = ["status": status]
+        if let scenario { payload["scenario"] = scenario }
+        if let ttlSeconds { payload["ttlSeconds"] = ttlSeconds }
+        publishEvent(kind: "organism_debug", payload: payload)
+    }
+
+    /// Canonical review event seam. The typed telemetry owns redaction and
+    /// mutation attribution; this method owns its bridge kind routing.
+    func publishOrganismReflexReviewEvent(_ telemetry: OrganismReflexReviewTelemetry) {
+        publishEvent(kind: "organism_reflex_review", payload: telemetry.payload)
     }
 
     var token: String { stateLock.lock(); defer { stateLock.unlock() }; return _token }
@@ -680,7 +728,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // model prefix as a best-effort signal.
         let activeProvider = inferProvider(model: activeModel)
         let activePersona = readActivePersona(dataRoot: dataRoot)
-        let (activeSessionId, _) = readMostRecentSession(dataRoot: dataRoot)
+        let (activeSessionId, _) = readBridgeActiveSession(dataRoot: dataRoot)
         let recentInbox = readRecentInbox(dataRoot: dataRoot, limit: 10)
 
         let uptime = Int(Date().timeIntervalSince(startedAt))
@@ -691,7 +739,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // so Claude can see what the configured agent has just been doing
         // having to subscribe to the SSE stream. The full live feed is at
         // GET /claude/events.
-        let recentToolCallsJSON = recentToolCallPayloads()
+        let recentToolCallsJSON = recentEventPayloads()
 
         var payload: [String: Any] = [
             "activeSessionId": activeSessionId ?? NSNull(),
@@ -827,13 +875,6 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         ]
     }
 
-    private func recentToolCallPayloads() -> [[String: Any]] {
-        stateLock.lock()
-        let recent = recentToolCalls
-        stateLock.unlock()
-        return recent.map { $0.asJSON }
-    }
-
     private static func organismSnapshotJSON(_ snapshot: OrganismSnapshot) -> [String: Any] {
         let iso = ISO8601DateFormatter()
         let lastSignalAt: Any = snapshot.lastSignalAt.map { iso.string(from: $0) } ?? NSNull()
@@ -844,27 +885,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             "hasPromptVisibleBodyLine": snapshot.projectedBodyLine != nil,
             "signalCount": snapshot.signalCount,
             "lastSignalAt": lastSignalAt,
-            "bodySchema": [
-                "macAwake": snapshot.bodySchema.macAwake,
-                "iPhoneReachable": snapshot.bodySchema.iPhoneReachable,
-                "providersHealthy": snapshot.bodySchema.providersHealthy,
-                "providerPathBelief": snapshot.bodySchema.providerPathBelief.map { belief -> Any in
-                    [
-                        "estimate": belief.estimate,
-                        "freshness": belief.freshness,
-                        "uncertainty": belief.uncertainty,
-                        "evidenceCount": belief.evidenceCount,
-                        "newestEvidenceAt": belief.newestEvidenceAt.map { iso.string(from: $0) } ?? NSNull(),
-                        "state": belief.state.rawValue,
-                    ] as [String: Any]
-                } ?? NSNull(),
-                "memoryHealthy": snapshot.bodySchema.memoryHealthy,
-                "dreamHealthy": snapshot.bodySchema.dreamHealthy,
-                "toolHandsAvailable": snapshot.bodySchema.toolHandsAvailable,
-                "approvalChannelsOpen": snapshot.bodySchema.approvalChannelsOpen,
-                "notificationPathHealthy": snapshot.bodySchema.notificationPathHealthy,
-                "resourcePressure": snapshot.bodySchema.resourcePressure.rawValue,
-            ],
+            "bodySchema": Self.organismBodySchemaJSON(snapshot.bodySchema, iso: iso),
             "chemicalState": [
                 "warmth": snapshot.chemicalState.warmth,
                 "vigilance": snapshot.chemicalState.vigilance,
@@ -909,6 +930,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     "expiredEvidenceCount": belief.expiredEvidenceCount,
                     "freshness": belief.freshness,
                     "lastEvidenceAt": belief.lastEvidenceAt.map { iso.string(from: $0) } ?? NSNull(),
+                    "evidenceBasis": belief.evidenceBasis.rawValue,
                 ] as [String: Any]
             },
             "reflex": Self.reflexSummaryJSON(
@@ -918,6 +940,122 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             ),
             "behavior": Self.organismBehaviorJSON(OrganismBehaviorPosture.from(snapshot: snapshot)),
         ]
+    }
+
+    static func organismBodySchemaJSON(
+        _ body: BodySchema,
+        iso: ISO8601DateFormatter = ISO8601DateFormatter()
+    ) -> [String: Any] {
+        [
+            "macAwake": body.macAwake,
+            "iPhoneReachable": body.iPhoneReachable,
+            "providersAvailable": body.providersAvailable,
+            "providersHealthy": body.providersHealthy,
+            "providerPathBelief": body.providerPathBelief.map { belief -> Any in
+                [
+                    "estimate": belief.estimate,
+                    "freshness": belief.freshness,
+                    "uncertainty": belief.uncertainty,
+                    "evidenceCount": belief.evidenceCount,
+                    "newestEvidenceAt": belief.newestEvidenceAt.map { iso.string(from: $0) } ?? NSNull(),
+                    "state": belief.state.rawValue,
+                ] as [String: Any]
+            } ?? NSNull(),
+            "peerPresenceBelief": body.peerPresenceBelief.map { belief -> Any in
+                Self.bodyBeliefJSON(
+                    category: belief.category.rawValue,
+                    metrics: belief.metrics,
+                    iso: iso
+                )
+            } ?? NSNull(),
+            "notificationDeliveryBelief": body.notificationDeliveryBelief.map { belief -> Any in
+                Self.bodyBeliefJSON(
+                    category: belief.category.rawValue,
+                    metrics: belief.metrics,
+                    iso: iso,
+                    details: [
+                        "transportConfigured": belief.transportConfigured,
+                        "transportAccepted": belief.transportAccepted,
+                        "deviceReceived": belief.deviceReceived,
+                        "displayed": belief.displayed,
+                        "userSeen": belief.userSeen,
+                        "transportFailed": belief.transportFailed,
+                    ]
+                )
+            } ?? NSNull(),
+            "memoryIntegrityReading": body.memoryIntegrityReading.map { reading -> Any in
+                Self.bodyBeliefJSON(
+                    category: reading.category.rawValue,
+                    metrics: reading.metrics,
+                    iso: iso
+                )
+            } ?? NSNull(),
+            "dreamIntegrityReading": body.dreamIntegrityReading.map { reading -> Any in
+                Self.bodyBeliefJSON(
+                    category: reading.category.rawValue,
+                    metrics: reading.metrics,
+                    iso: iso,
+                    details: ["storeAvailable": reading.storeAvailable]
+                )
+            } ?? NSNull(),
+            "toolCapabilityReading": body.toolCapabilityReading.map { reading -> Any in
+                Self.bodyBeliefJSON(
+                    category: reading.category.rawValue,
+                    metrics: reading.metrics,
+                    iso: iso,
+                    details: [
+                        "configured": reading.configured,
+                        "liveCapabilityObserved": reading.liveCapabilityObserved,
+                    ]
+                )
+            } ?? NSNull(),
+            "approvalPathReading": body.approvalPathReading.map { reading -> Any in
+                Self.bodyBeliefJSON(
+                    category: reading.category.rawValue,
+                    metrics: reading.metrics,
+                    iso: iso,
+                    details: ["writable": reading.writable]
+                )
+            } ?? NSNull(),
+            "resourcePressureReading": body.resourcePressureReading.map { reading -> Any in
+                Self.bodyBeliefJSON(
+                    category: reading.category.rawValue,
+                    metrics: reading.metrics,
+                    iso: iso,
+                    details: [
+                        "thermalPressure": reading.thermalPressure.rawValue,
+                        "lowPowerMode": reading.lowPowerMode,
+                    ]
+                )
+            } ?? NSNull(),
+            "memoryHealthy": body.memoryHealthy,
+            "dreamHealthy": body.dreamHealthy,
+            "toolHandsAvailable": body.toolHandsAvailable,
+            "approvalChannelsOpen": body.approvalChannelsOpen,
+            "notificationPathHealthy": body.notificationPathHealthy,
+            "resourcePressure": body.resourcePressure.rawValue,
+        ]
+    }
+
+    private static func bodyBeliefJSON(
+        category: String,
+        metrics: BodyBeliefMetrics,
+        iso: ISO8601DateFormatter,
+        details: [String: Any] = [:]
+    ) -> [String: Any] {
+        var result: [String: Any] = [
+            "category": category,
+            "estimate": metrics.estimate,
+            "uncertainty": metrics.uncertainty,
+            "freshness": metrics.freshness,
+            "evidenceCount": metrics.evidence.count,
+            "evidenceClasses": Array(Set(metrics.evidence.map { $0.evidenceClass.rawValue })).sorted(),
+            "observedAt": metrics.observedAt.map { iso.string(from: $0) } ?? NSNull(),
+            "receivedAt": metrics.receivedAt.map { iso.string(from: $0) } ?? NSNull(),
+            "nextMeaningfulExpiry": metrics.nextMeaningfulExpiry.map { iso.string(from: $0) } ?? NSNull(),
+        ]
+        for (key, value) in details { result[key] = value }
+        return result
     }
 
     static func organismBehaviorJSON(_ posture: OrganismBehaviorPosture?) -> Any {
@@ -1094,9 +1232,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             let runtime = NativeCognitionRuntime.shared
             if action == "reset" || action == "reset_continuity" {
                 let snapshot = await runtime.resetOrganismContinuity()
-                self.publishEvent(kind: "organism_debug", payload: [
-                    "status": "reset",
-                ])
+                self.publishOrganismDebugEvent(status: "reset")
                 respond(200, [
                     "status": "reset",
                     "organism": Self.organismSnapshotJSON(snapshot),
@@ -1106,9 +1242,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             }
             if action == "settle" || action == "settle_continuity" {
                 let snapshot = await runtime.settleOrganismContinuity()
-                self.publishEvent(kind: "organism_debug", payload: [
-                    "status": "settled",
-                ])
+                self.publishOrganismDebugEvent(status: "settled")
                 respond(200, [
                     "status": "settled",
                     "organism": Self.organismSnapshotJSON(snapshot),
@@ -1134,7 +1268,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     decision: decision,
                     outcome: outcome
                 )
-                self.publishEvent(kind: "organism_reflex_review", payload: telemetry.payload)
+                self.publishOrganismReflexReviewEvent(telemetry)
 
                 guard telemetry.mutationRecorded else {
                     respond(Self.organismReflexReviewHTTPStatus(for: outcome.status), [
@@ -1161,9 +1295,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             }
             if shouldClear {
                 let snapshot = await runtime.clearOrganismDebugBodyOverride()
-                self.publishEvent(kind: "organism_debug", payload: [
-                    "status": "cleared",
-                ])
+                self.publishOrganismDebugEvent(status: "cleared")
                 respond(200, [
                     "status": "cleared",
                     "organism": Self.organismSnapshotJSON(snapshot),
@@ -1186,11 +1318,11 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     ttlSeconds: ttlSeconds
                 )
                 let debug = await runtime.organismDebugBodyOverrideStatus()
-                self.publishEvent(kind: "organism_debug", payload: [
-                    "status": "active",
-                    "scenario": rawScenario,
-                    "ttlSeconds": Int(ttlSeconds),
-                ])
+                self.publishOrganismDebugEvent(
+                    status: "active",
+                    scenario: rawScenario,
+                    ttlSeconds: Int(ttlSeconds)
+                )
                 respond(200, [
                     "status": "active",
                     "organism": Self.organismSnapshotJSON(snapshot),
@@ -1283,13 +1415,28 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return nil
     }
 
-    private func readMostRecentSession(dataRoot: URL) -> (id: String?, updatedAt: String?) {
+    private func readBridgeActiveSession(dataRoot: URL) -> (id: String?, updatedAt: String?) {
         let url = dataRoot.appendingPathComponent("chat/sessions.json")
         guard let data = try? Data(contentsOf: url),
               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return (nil, nil)
         }
-        let live = arr.filter { ($0["archived"] as? Bool) != true }
+        return Self.bridgeActiveSession(
+            preferred: UserDefaults.standard.string(forKey: "activeChatSessionId"),
+            rows: arr
+        )
+    }
+
+    static func bridgeActiveSession(
+        preferred: String?,
+        rows: [[String: Any]]
+    ) -> (id: String?, updatedAt: String?) {
+        let live = rows.filter { ($0["archived"] as? Bool) != true }
+        let preferred = preferred?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !preferred.isEmpty,
+           let selected = live.first(where: { ($0["id"] as? String) == preferred }) {
+            return (selected["id"] as? String, selected["updatedAt"] as? String)
+        }
         let sorted = live.sorted { (a, b) in
             let ta = (a["updatedAt"] as? String) ?? ""
             let tb = (b["updatedAt"] as? String) ?? ""
@@ -1333,8 +1480,30 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             writeJSON(conn, status: 400, obj: ["error": "missing_text"])
             return
         }
-        let sessionId = json["sessionId"] as? String
         let isCodexCompletion = defaultSender == "codex" && json["completion"] is [String: Any]
+        let requestedSessionId = json["sessionId"] as? String
+        // Plain bridge messages are documented as turns in the current chat.
+        // The state route already publishes the selected live session as
+        // `activeSessionId`, but the message route historically passed nil
+        // through when callers omitted that optional field. Persistence then
+        // rejected the turn as "missing chat session id", making a bridge that
+        // reported chatReady=true fail its simplest documented request.
+        // Completion callbacks keep their explicit routing semantics; only a
+        // normal inbound agent message inherits the same live session the
+        // state route advertises.
+        let sessionId = Self.bridgeMessageSessionID(
+            requested: requestedSessionId,
+            active: isCodexCompletion
+                ? nil
+                : readBridgeActiveSession(dataRoot: NativeAgentPaths.dataRoot).id
+        )
+        if !isCodexCompletion, sessionId == nil {
+            writeJSON(conn, status: 409, obj: [
+                "error": "no_active_chat_session",
+                "detail": "Create or select a chat in NativeAgent, then retry.",
+            ])
+            return
+        }
         let deliveryId: String? = {
             guard let value = json["deliveryId"] as? String else { return nil }
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1769,6 +1938,15 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         }
     }
 
+    static func bridgeMessageSessionID(requested: String?, active: String?) -> String? {
+        for candidate in [requested, active] {
+            guard let candidate else { continue }
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+
     /// Ack-on-enqueue lane for /claude/message and plain /codex/message
     /// (wake-delivery-classification, 2026-07-25). Two phases, one response:
     ///
@@ -2085,12 +2263,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 let result = try await tools.dispatch(tool: name, input: inputJV, surface: surface)
                 let resultAny = jsonValueToAny(result)
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
-                self.publishEvent(kind: "tool", payload: [
-                    "name": name,
-                    "surface": surface,
-                    "ok": true,
-                    "durationMs": durationMs,
-                ])
+                self.publishToolResultEvent(name: name, surface: surface, result: result, durationMs: durationMs)
                 guard workLatch.claim() else { return }
                 self.writeJSON(conn, status: 200, obj: [
                     "name": name,

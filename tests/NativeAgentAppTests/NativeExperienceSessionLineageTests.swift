@@ -16,6 +16,7 @@ private func lineageWrite(_ value: JSONValue, to path: URL) throws {
     try value.serializedData(pretty: false).write(to: path, options: .atomic)
 }
 
+@MainActor
 @Test func conversationForkCopiesExactPrefixAndPreservesSource() async throws {
     let root = try lineageRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -28,9 +29,22 @@ private func lineageWrite(_ value: JSONValue, to path: URL) throws {
     ])]), to: sessions)
     let sourcePath = root.appendingPathComponent("chat/messages/source-session.jsonl")
     let messages: [JSONValue] = [
-        .object(["id": .string("m1"), "role": .string("user"), "content": .string("one"), "createdAt": .string("2026-08-08T12:00:01Z")]),
-        .object(["id": .string("m2"), "role": .string("assistant"), "content": .string("two"), "createdAt": .string("2026-08-08T12:00:02Z")]),
-        .object(["id": .string("m3"), "role": .string("user"), "content": .string("three"), "createdAt": .string("2026-08-08T12:00:03Z")]),
+        .object([
+            "id": .string("m1"), "sessionId": .string("source-session"), "role": .string("user"),
+            "content": .string("one"), "createdAt": .string("2026-08-08T12:00:01Z"),
+            "metadata": .object(["origin": .object(["surface": .string("codex-bridge"), "agent": .string("codex")])]),
+        ]),
+        .object([
+            "id": .string("m2"), "sessionId": .string("source-session"), "role": .string("assistant"),
+            "content": .string("two"), "createdAt": .string("2026-08-08T12:00:02Z"),
+            "metadata": .object([
+                "turnTraceId": .string("original-turn"),
+                "outcomeObservation": .object([
+                    "sessionID": .string("source-session"), "messageID": .string("m2"), "turnID": .string("original-turn"),
+                ]),
+            ]),
+        ]),
+        .object(["id": .string("m3"), "sessionId": .string("source-session"), "role": .string("user"), "content": .string("three"), "createdAt": .string("2026-08-08T12:00:03Z")]),
     ]
     let sourceBytes = try messages.reduce(into: Data()) { data, value in
         data.append(try value.serializedData(pretty: false)); data.append(0x0A)
@@ -49,6 +63,27 @@ private func lineageWrite(_ value: JSONValue, to path: URL) throws {
     #expect(try Data(contentsOf: sourcePath) == sourceBytes)
     let forkBytes = try Data(contentsOf: root.appendingPathComponent("chat/messages/\(fork.id).jsonl"))
     #expect(forkBytes.split(separator: 0x0A).count == 2)
+    let expectedPrefix = try messages.prefix(2).reduce(into: Data()) { data, value in
+        data.append(try value.serializedData(pretty: false)); data.append(0x0A)
+    }
+    #expect(forkBytes == expectedPrefix)
+
+    let forkMessages = try await NativeClient.getChatMessages(sessionId: fork.id, dataRoot: root)
+    let sourceMessages = try await NativeClient.getChatMessages(sessionId: "source-session", dataRoot: root)
+    #expect(forkMessages.map(\.id) == ["m1", "m2"])
+    #expect(forkMessages.allSatisfy { $0.sessionId == fork.id })
+    #expect(sourceMessages.allSatisfy { $0.sessionId == "source-session" })
+    #expect(forkMessages.first?.metadata?.origin?.surface == "codex-bridge")
+    let target = try #require(forkMessages.last)
+    let targetSessionID = try #require(target.sessionId)
+    let retry = try #require(MacChatRetrySnapshot.capture(
+        target: target, messages: forkMessages, sessionId: targetSessionID, isSyntheticNotice: false
+    ))
+    #expect(retry.sessionId == fork.id)
+    #expect(retry.assistantMessageId == "m2")
+    #expect(retry.priorUserMessageId == "m1")
+    #expect(try Data(contentsOf: sourcePath) == sourceBytes)
+    #expect(try Data(contentsOf: root.appendingPathComponent("chat/messages/\(fork.id).jsonl")) == expectedPrefix)
 }
 
 @Test func conversationForkMissingPointLeavesNoNewTranscriptOrIndexRow() async throws {

@@ -113,6 +113,190 @@ final class DeskStoreTests: XCTestCase {
         XCTAssertEqual(row.notes.map { $0.text }, ["halfway"])
     }
 
+    func test_append_note_if_absent_is_idempotent_under_the_store_lock() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let item = try await store.createItem(kind: .plan, project: "na", title: "settle delegation")
+        let marker = "delegation-settlement:codex:job-1"
+        let text = "\(marker) — Codex run completed; delivery delivered."
+
+        let first = try await store.appendNoteIfAbsent(item.handle, marker: marker, text: text)
+        let replay = try await store.appendNoteIfAbsent(item.handle, marker: marker, text: text)
+
+        XCTAssertNotNil(first)
+        XCTAssertNil(replay)
+        let state = try await store.liveState()
+        let row = try XCTUnwrap(state.items.first { $0.handle == item.handle })
+        XCTAssertEqual(row.notes.filter { $0.text.hasPrefix(marker) }.map(\.text), [text])
+    }
+
+    func test_live_activity_metadata_and_latest_explicit_progress_survive_replay() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+
+        let program = try await store.createItem(
+            kind: .project,
+            project: "Desk 790",
+            title: "Wave 2"
+        )
+        let lane = try await store.createItem(
+            kind: .plan,
+            project: "Desk 790",
+            title: "Desk Live Part 1",
+            assignee: "codex",
+            laneOf: program.handle
+        )
+        let first = try XCTUnwrap(DeskProgress(done: 1, total: 4, note: "store wired"))
+        let latest = try XCTUnwrap(DeskProgress(done: 3, total: 4, note: "schema wired"))
+        _ = try await store.setStatus(lane.handle, status: .now, progress: first)
+        _ = try await store.setStatus(lane.handle, status: .now, progress: latest)
+        // An ordinary later status event does not fabricate or erase progress;
+        // the latest explicitly reported value remains the projection source.
+        _ = try await store.setStatus(lane.handle, status: .next)
+
+        let replayedState = try await SwiftNativeDeskStore(dataRoot: root).liveState()
+        let replayed = try XCTUnwrap(replayedState.items.first { $0.handle == lane.handle })
+        XCTAssertEqual(replayed.assignee, "codex")
+        XCTAssertEqual(replayed.laneOf, program.handle)
+        XCTAssertEqual(replayed.progress, latest)
+        XCTAssertNil(replayed.parent, "laneOf is projection metadata, not Desk hierarchy")
+
+        let stateJSON = await SwiftNativePersistenceCore().readJSON(store.statePath, defaultValue: .null)
+        guard case .object(let stateObject) = stateJSON,
+              case .array(let rows)? = stateObject["items"],
+              let laneJSON = rows.first(where: {
+                  guard case .object(let row) = $0 else { return false }
+                  return row["handle"] == .string(lane.handle)
+              }),
+              let decoded = DeskItem.fromJSON(laneJSON) else {
+            return XCTFail("materialized lane row did not decode")
+        }
+        XCTAssertEqual(decoded, replayed)
+    }
+
+    func test_set_status_updates_existing_item_metadata_and_omission_preserves_it() async throws {
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let firstProgram = try await store.createItem(
+            kind: .project,
+            project: "Desk 790",
+            title: "Wave 2"
+        )
+        let secondProgram = try await store.createItem(
+            kind: .project,
+            project: "Desk 790",
+            title: "Wave 2 follow-up"
+        )
+        let existing = try await store.createItem(
+            kind: .plan,
+            project: "Desk 790",
+            title: "Existing lane"
+        )
+
+        _ = try await store.setStatus(
+            existing.handle,
+            status: .now,
+            assignee: "claude",
+            laneOf: firstProgram.handle
+        )
+        _ = try await store.setStatus(
+            existing.handle,
+            status: .next,
+            assignee: "codex",
+            laneOf: secondProgram.handle
+        )
+        _ = try await store.setStatus(existing.handle, status: .todo)
+
+        let state = try await store.liveState()
+        let row = try XCTUnwrap(state.items.first { $0.handle == existing.handle })
+        XCTAssertEqual(row.assignee, "codex")
+        XCTAssertEqual(row.laneOf, secondProgram.handle)
+        XCTAssertNil(row.parent, "status metadata must not mutate Desk hierarchy")
+
+        let rawRows = try await SwiftNativePersistenceCore().readJSONL(store.opsPath)
+        let statusRows = rawRows.compactMap { value -> [String: JSONValue]? in
+            guard case .object(let object) = value,
+                  object["op"] == .string("set_status"),
+                  object["handle"] == .string(existing.handle) else { return nil }
+            return object
+        }
+        XCTAssertEqual(statusRows.count, 3)
+        XCTAssertEqual(statusRows[0]["assignee"], .string("claude"))
+        XCTAssertEqual(statusRows[0]["laneOf"], .string(firstProgram.handle))
+        XCTAssertEqual(statusRows[1]["assignee"], .string("codex"))
+        XCTAssertEqual(statusRows[1]["laneOf"], .string(secondProgram.handle))
+        XCTAssertNil(statusRows[2]["assignee"])
+        XCTAssertNil(statusRows[2]["laneOf"])
+
+        let beforeRefusals = rawRows.count
+        do {
+            _ = try await store.setStatus(existing.handle, status: .now, assignee: "   ")
+            XCTFail("blank assignee should be refused")
+        } catch {
+            XCTAssertEqual(error as? DeskError, .liveActivityMetadataEmpty(field: "assignee"))
+        }
+        do {
+            _ = try await store.setStatus(existing.handle, status: .now, laneOf: "desk_missing_program")
+            XCTFail("unknown laneOf should be refused")
+        } catch {
+            XCTAssertEqual(
+                error as? DeskError,
+                .laneOfUnknown(handle: existing.handle, laneOf: "desk_missing_program")
+            )
+        }
+        do {
+            _ = try await store.setStatus(existing.handle, status: .now, laneOf: existing.handle)
+            XCTFail("self laneOf should be refused")
+        } catch {
+            XCTAssertEqual(error as? DeskError, .laneOfSelf(handle: existing.handle))
+        }
+        let afterRefusals = try await SwiftNativePersistenceCore().readJSONL(store.opsPath)
+        XCTAssertEqual(afterRefusals.count, beforeRefusals)
+    }
+
+    func test_live_activity_fields_are_optional_validated_and_forward_compatible() async throws {
+        XCTAssertNil(DeskProgress(done: -1, total: 4))
+        XCTAssertNil(DeskProgress(done: 5, total: 4))
+        XCTAssertNil(DeskProgress(done: 0, total: 0))
+
+        let root = tmpRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let persistence = SwiftNativePersistenceCore()
+        let handle = "desk_legacy_live_activity"
+
+        // Old rows have none of the new keys; future unknown keys are ignored.
+        try await persistence.appendJSONL(.object([
+            "opId": .string("deskop_legacy_create"),
+            "ts": .string("2026-08-27T00:00:00.000000+00:00"),
+            "op": .string("create_item"),
+            "handle": .string(handle),
+            "alias": .string("1"),
+            "kind": .string("plan"),
+            "project": .string("Desk 790"),
+            "title": .string("Legacy lane"),
+            "futureCreateField": .object(["version": .int(2)]),
+        ]), to: store.opsPath)
+        try await persistence.appendJSONL(.object([
+            "opId": .string("deskop_legacy_status"),
+            "ts": .string("2026-08-27T00:00:01.000000+00:00"),
+            "op": .string("set_status"),
+            "handle": .string(handle),
+            "status": .string("now"),
+            "futureStatusField": .string("ignored"),
+        ]), to: store.opsPath)
+
+        let live = try await store.liveState()
+        let row = try XCTUnwrap(live.items.first { $0.handle == handle })
+        XCTAssertEqual(row.status, .now)
+        XCTAssertNil(row.assignee)
+        XCTAssertNil(row.laneOf)
+        XCTAssertNil(row.progress)
+    }
+
     // MARK: rebuild-from-ops == in-memory fold; state.json in-lock
 
     func test_rebuild_equals_fold_and_state_written_in_lock() async throws {
@@ -520,7 +704,7 @@ final class DeskStoreTests: XCTestCase {
         XCTAssertEqual(opsAfter, opsBefore)
     }
 
-    func test_reconcile_terminal_parents_appends_prior_nonterminal_status_and_is_idempotent() async throws {
+    func test_reconcile_terminal_parents_restores_status_preserves_aliases_and_is_idempotent() async throws {
         let root = tmpRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let store = SwiftNativeDeskStore(dataRoot: root)
@@ -533,13 +717,18 @@ final class DeskStoreTests: XCTestCase {
             handle: parent.handle,
             body: .closeItem(outcomeSummary: "claimed done", status: .done)
         ), to: store)
+        let contradictory = try await store.liveState()
+        XCTAssertEqual(contradictory.items.first { $0.handle == parent.handle }?.status, .done)
+        XCTAssertEqual(contradictory.items.first { $0.handle == child.handle }?.status, .next)
+        XCTAssertEqual(contradictory.items.first { $0.handle == parent.handle }?.alias, "1")
+        XCTAssertEqual(contradictory.items.first { $0.handle == child.handle }?.alias, "1.1")
         let before = try await store.readOpsUnlocked()
 
         let repairs = try await store.reconcileTerminalParentsWithNonTerminalDescendants()
 
         XCTAssertEqual(repairs.count, 1)
         XCTAssertEqual(repairs.first?.handle, parent.handle)
-        if case .setStatus(let status, _, _)? = repairs.first?.body {
+        if case .setStatus(let status, _, _, _, _, _)? = repairs.first?.body {
             XCTAssertEqual(status, .now)
         } else {
             XCTFail("expected append-only set_status repair")
@@ -554,11 +743,16 @@ final class DeskStoreTests: XCTestCase {
         let live = try await store.liveState()
         XCTAssertEqual(live.items.first { $0.handle == parent.handle }?.status, .now)
         XCTAssertEqual(live.items.first { $0.handle == child.handle }?.status, .next)
+        XCTAssertEqual(live.items.first { $0.handle == parent.handle }?.alias, "1")
+        XCTAssertEqual(live.items.first { $0.handle == child.handle }?.alias, "1.1")
 
         let secondRepairs = try await store.reconcileTerminalParentsWithNonTerminalDescendants()
         let finalCount = try await store.readOpsUnlocked().count
         XCTAssertEqual(secondRepairs, [])
         XCTAssertEqual(finalCount, after.count)
+
+        let sibling = try await store.addChild(parentHandle: parent.handle, title: "later child")
+        XCTAssertEqual(sibling.alias, "1.2", "repair must not reset or reuse the parent's child-alias sequence")
     }
 
     func test_archive_refuses_standing() async throws {
@@ -1434,7 +1628,8 @@ final class DeskStoreTests: XCTestCase {
         ])))
     }
 
-    /// A pre-wave row (no blockedOn / deferUntil) serializes with NO new keys —
+    /// A pre-wave row (no blockedOn / deferUntil / live-activity metadata)
+    /// serializes with NO new keys —
     /// byte-identical to before the wave, so the compaction base's shape gate
     /// still passes on an existing snapshot.
     func test_item_without_sequencing_fields_emits_no_new_keys() throws {
@@ -1444,6 +1639,9 @@ final class DeskStoreTests: XCTestCase {
         guard case .object(let obj) = item.toJSON() else { return XCTFail("not an object") }
         XCTAssertNil(obj["blockedOn"])
         XCTAssertNil(obj["deferUntil"])
+        XCTAssertNil(obj["assignee"])
+        XCTAssertNil(obj["laneOf"])
+        XCTAssertNil(obj["progress"])
         // Round-trip is stable (the base gate re-encodes and compares shape).
         let back = try XCTUnwrap(DeskItem.fromJSON(item.toJSON(), strictCollections: true))
         XCTAssertEqual(back.toJSON(), item.toJSON())

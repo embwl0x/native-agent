@@ -58,6 +58,53 @@ public struct SecurityToolEnvelope: Codable, Sendable, Equatable, Identifiable {
     public var untrustedInputKeys: [String]
     public var redactedInputPreview: JSONValue
     public var auditReceiptsEnabled: Bool
+
+    /// Canonical effect truth derived from the same capability vocabulary used
+    /// by Security Center. Presentation layers must not maintain a second,
+    /// partial write list: doing so can make a correctly profiled mutation look
+    /// like a read-only command.
+    public var hasSideEffects: Bool {
+        SecurityCapabilityClassifier.hasSideEffects(capabilities)
+    }
+}
+
+public enum SecurityCapabilityClassifier {
+    /// Capabilities that can change app state, host state, remote state, or a
+    /// user's visible environment. Sensitivity-only tags such as `secrets` and
+    /// read tags such as `network_read` intentionally stay out of this set.
+    public static let sideEffecting: Set<String> = [
+        "agent_delegate",
+        "approval_stage",
+        "app_data_write",
+        "browser_interaction",
+        "destructive",
+        "evolution_apply_trigger",
+        "evolution_write",
+        "external_send",
+        "file_write",          // normalized policy vocabulary
+        "filesystem_delete",   // canonical tool-profile vocabulary
+        "filesystem_write",
+        "image_generation",
+        "ledger_write",
+        "mac_control",
+        "memory_write",
+        "money",
+        "network_write",
+        "notification",
+        "organism_state_write",
+        "outside_app_data_write",
+        "process_spawn",
+        "remote_effect",
+        "shell",
+        "skill_write",
+        "system_control",
+        "system_permission_reset",
+        "workshop_write",
+    ]
+
+    public static func hasSideEffects(_ capabilities: [String]) -> Bool {
+        !sideEffecting.isDisjoint(with: capabilities)
+    }
 }
 
 public struct SecurityStatusFlag: Codable, Sendable, Equatable, Identifiable {

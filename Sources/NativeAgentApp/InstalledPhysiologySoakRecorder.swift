@@ -40,6 +40,9 @@ actor InstalledPhysiologySoakRecorder {
     private let flushDrainDeadlineNanoseconds: UInt64
     private var sequence: UInt64 = 0
     private var pending: [InstalledPhysiologySoakRecord] = []
+    /// In-flight rows still occupy the buffer: a failed append must be able
+    /// to restore them ahead of newer arrivals without exceeding the bound.
+    private var inFlightRecordCount = 0
     private var drainTask: Task<Void, Never>?
     private var drainInProgress = false
     private var droppedByBackpressure: UInt64 = 0
@@ -85,6 +88,16 @@ actor InstalledPhysiologySoakRecorder {
 
     func recordRuntimeStopped(reason: String?) {
         enqueue(kind: .runtimeStopped, reason: reason)
+    }
+
+    /// The runtime's pre-recorder queue shares this recorder's loss authority.
+    /// Aggregate drops without retaining discarded event payloads or creating
+    /// another writer, and keep longitudinal claims explicitly unqualified.
+    func recordSubmissionLoss(_ count: UInt64) {
+        guard count > 0 else { return }
+        droppedByBackpressure &+= count
+        totalDroppedByBackpressure &+= count
+        scheduleCoalescedDrainIfNeeded(resetFailureBudget: true)
     }
 
     func recordCognitiveEvent(
@@ -206,7 +219,7 @@ actor InstalledPhysiologySoakRecorder {
 
     func diagnostics() -> InstalledPhysiologySoakRecorderDiagnostics {
         InstalledPhysiologySoakRecorderDiagnostics(
-            pending: pending.count,
+            pending: pending.count + inFlightRecordCount,
             dropped: droppedByBackpressure,
             totalDropped: totalDroppedByBackpressure,
             consecutiveWriteFailures: consecutiveWriteFailures,
@@ -270,7 +283,7 @@ actor InstalledPhysiologySoakRecorder {
         localRepairPerformed: Bool? = nil,
         operationalConsolidationPerformed: Bool? = nil
     ) {
-        guard pending.count < Self.maximumPendingRecords else {
+        guard pending.count + inFlightRecordCount < Self.maximumPendingRecords else {
             droppedByBackpressure &+= 1
             totalDroppedByBackpressure &+= 1
             // The full buffer may be retained from an exhausted failure
@@ -338,7 +351,9 @@ actor InstalledPhysiologySoakRecorder {
             }
         }
         while !pending.isEmpty || droppedByBackpressure > 0 {
-            if droppedByBackpressure > 0 {
+            // Loss evidence is a row too. If all slots are occupied, retain
+            // only its bounded counter until a successful batch frees a slot.
+            if droppedByBackpressure > 0, pending.count < Self.maximumPendingRecords {
                 let dropped = droppedByBackpressure
                 droppedByBackpressure = 0
                 sequence &+= 1
@@ -357,8 +372,10 @@ actor InstalledPhysiologySoakRecorder {
             }
             let batch = pending
             pending.removeAll(keepingCapacity: true)
+            inFlightRecordCount = batch.count
             do {
                 try await store.append(batch)
+                inFlightRecordCount = 0
                 lastWriteError = nil
                 consecutiveWriteFailures = 0
             } catch {
@@ -369,6 +386,7 @@ actor InstalledPhysiologySoakRecorder {
                 // Preserve order and exact sequence across transient failures.
                 // A later event or termination flush retries the same batch.
                 pending.insert(contentsOf: batch, at: 0)
+                inFlightRecordCount = 0
                 return
             }
         }

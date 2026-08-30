@@ -98,7 +98,7 @@ struct CustomRootHermeticityTests {
         let codexHome = root.appendingPathComponent("codex_home", isDirectory: true)
         try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
-        try Data(#"{"fixture":{"model":"alternate-root-model","reasoningEffort":"low"}}"#.utf8)
+        try Data(#"{"ios":{"model":"gpt-5.6-luna","reasoningEffort":"low"}}"#.utf8)
             .write(to: providers.appendingPathComponent("surfaces.json"))
         try Data(#"{"tokens":{"access_token":"fixture-not-a-real-token"}}"#.utf8)
             .write(to: codexHome.appendingPathComponent("auth.json"))
@@ -109,7 +109,7 @@ struct CustomRootHermeticityTests {
         let authStatus = try await client.getCodexAuthStatus(dataRoot: root)
 
         #expect(preferences.preferences.contains(where: {
-            $0.surface == "fixture" && $0.model == "alternate-root-model"
+            $0.surface == "ios" && $0.model == "gpt-5.6-luna"
         }))
         #expect(verification.ok)
         #expect(authStatus.appOwnedLoggedIn)

@@ -345,15 +345,26 @@ struct SlimSettingsView: View {
                 Section {
                     HStack {
                         Label("Auto-compact threshold", systemImage: "rectangle.compress.vertical")
+                            .accessibilityHidden(true)
                         Spacer()
                         Text(formatThresholdTokens(compactionThresholdTokens))
                             .font(.system(.body, design: .monospaced))
                             .foregroundStyle(.secondary)
-                        Stepper("",
+                            .accessibilityHidden(true)
+                        Stepper("Auto-compact threshold",
                                 value: $compactionThresholdTokens,
                                 in: 50_000...500_000,
                                 step: 10_000)
                             .labelsHidden()
+                            // NSStepper exposes its two visual arrows as
+                            // separate, unnamed AX buttons unless SwiftUI is
+                            // told to present the control as one adjustable
+                            // element. VoiceOver now lands once, announces the
+                            // setting and value, and can increment/decrement it.
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel("Auto-compact threshold")
+                            .accessibilityValue(formatThresholdTokens(compactionThresholdTokens))
+                            .accessibilityHint("Adjusts the maximum chat transcript size before automatic compaction")
                     }
                 } header: {
                     Text("Chat")

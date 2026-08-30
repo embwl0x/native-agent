@@ -31,6 +31,45 @@ enum ProviderControlsRefreshOutcome: Equatable, Sendable {
     }
 }
 
+enum AdvancedSnapshotRefreshOutcome: Equatable, Sendable {
+    case refreshed
+    case partial
+    case unavailable
+    case superseded
+}
+
+struct SettingsSnapshotRefreshOutcome: Equatable, Sendable {
+    enum Field: CaseIterable, Hashable, Sendable {
+        case trustPolicy, personality, connectors, health
+    }
+
+    enum State: Equatable, Sendable {
+        case refreshed, partial, unavailable, superseded
+    }
+
+    var availableFields: Set<Field>
+    var wasSuperseded = false
+
+    var state: State {
+        if wasSuperseded { return .superseded }
+        if availableFields.count == Field.allCases.count { return .refreshed }
+        return availableFields.isEmpty ? .unavailable : .partial
+    }
+
+    var feedbackMessage: String? {
+        switch state {
+        case .refreshed:
+            nil
+        case .partial:
+            "Some Settings snapshots are still downloading from iCloud."
+        case .unavailable:
+            "Settings snapshots are still downloading from iCloud. Try again in a moment."
+        case .superseded:
+            "Settings refresh was interrupted by an iCloud reconfiguration. Try again."
+        }
+    }
+}
+
 extension iCloudSyncEngine {
     /// Apply the credential-free CloudKit projection published by the Mac.
     /// Decode/validation is all-or-nothing so malformed or future payloads
@@ -344,103 +383,104 @@ extension iCloudSyncEngine {
         }
     }
 
-    func refreshDeskSnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshDeskSnapshot() async -> Bool {
+        guard let snapshotDir else { return false }
         let lifecycle = lifecycleGeneration
         if let latest: [MobileDeskItem] = await Self.loadSnapshotArrayOnly(named: "desk.json", in: snapshotDir) {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard lifecycle == lifecycleGeneration else { return false }
             deskItems = latest
             lastSyncAt = Date()
             syncError = nil
+            return true
         } else {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard lifecycle == lifecycleGeneration else { return false }
             syncError = "Desk is still syncing from the Mac. Try again in a moment."
+            return false
         }
     }
 
-    func refreshCommandCenterSnapshot() async {
-        guard let snapshotDir else { return }
-        let lifecycle = lifecycleGeneration
-        async let latestHealth: RuntimeHealth? = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
-        async let latestTrust: TrustPolicy? = Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
-        async let latestApprovals: [ApprovalRequest]? = Self.loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
-        let (healthRow, trustRow, approvalRows) = await (latestHealth, latestTrust, latestApprovals)
-        guard lifecycle == lifecycleGeneration else { return }
-        if let healthRow { health = healthRow }
-        if let trustRow { trustPolicy = trustRow }
-        if let approvalRows { approvals = approvalRows }
-        if healthRow != nil && trustRow != nil && approvalRows != nil {
-            lastSyncAt = Date()
-            syncError = nil
-        } else if healthRow != nil || trustRow != nil || approvalRows != nil {
-            syncError = "Some Command Center snapshots are still downloading from iCloud."
-        } else {
-            syncError = "Command Center snapshots are still downloading from iCloud. Try again in a moment."
+    @discardableResult
+    func refreshSettingsSnapshot() async -> SettingsSnapshotRefreshOutcome {
+        guard let snapshotDir else {
+            return SettingsSnapshotRefreshOutcome(availableFields: [])
         }
-    }
-
-    func refreshSettingsSnapshot() async {
-        guard let snapshotDir else { return }
         let lifecycle = lifecycleGeneration
         async let latestTrust: TrustPolicy? = Self.loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
         async let latestPersonality: PersonalityProfile? = Self.loadSnapshotObjectOnly(named: "personality.json", in: snapshotDir)
         async let latestConnectors: [ConnectorRecord]? = Self.loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let latestHealth: RuntimeHealth? = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
         let (trustRow, personalityRow, connectorRows, healthRow) = await (latestTrust, latestPersonality, latestConnectors, latestHealth)
-        guard lifecycle == lifecycleGeneration else { return }
+        guard lifecycle == lifecycleGeneration else {
+            return SettingsSnapshotRefreshOutcome(availableFields: [], wasSuperseded: true)
+        }
+        var availableFields: Set<SettingsSnapshotRefreshOutcome.Field> = []
+        if trustRow != nil { availableFields.insert(.trustPolicy) }
+        if personalityRow != nil { availableFields.insert(.personality) }
+        if connectorRows != nil { availableFields.insert(.connectors) }
+        if healthRow != nil { availableFields.insert(.health) }
+        let outcome = SettingsSnapshotRefreshOutcome(availableFields: availableFields)
         if let trustRow { trustPolicy = trustRow }
         if let personalityRow { personality = personalityRow }
         if let connectorRows { connectors = connectorRows }
         if let healthRow { health = healthRow }
-        if trustRow != nil && personalityRow != nil && connectorRows != nil && healthRow != nil {
+        if outcome.state == .refreshed {
             lastSyncAt = Date()
             syncError = nil
-        } else if trustRow != nil || personalityRow != nil || connectorRows != nil || healthRow != nil {
-            syncError = "Some Settings snapshots are still downloading from iCloud."
         } else {
-            syncError = "Settings snapshots are still downloading from iCloud. Try again in a moment."
+            syncError = outcome.feedbackMessage
         }
+        return outcome
     }
 
-    func refreshHealthSnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshHealthSnapshot() async -> AdvancedSnapshotRefreshOutcome {
+        guard let snapshotDir else {
+            health = nil
+            organismLivingStatus = nil
+            return .unavailable
+        }
         let lifecycle = lifecycleGeneration
         async let latestHealth: RuntimeHealth? = Self.loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
         async let latestOrganism: OrganismLivingStatusFile? = Self.loadSnapshotObjectOnly(named: "organism_living_status.json", in: snapshotDir)
         let (latest, organism) = await (latestHealth, latestOrganism)
-        guard lifecycle == lifecycleGeneration else { return }
-        if let latest {
-            health = latest
-        }
+        guard lifecycle == lifecycleGeneration else { return .superseded }
         // A missing/corrupt file is an explicit absent state for this focused
         // health consumer. Keeping the prior object here would let the Status
         // screen render yesterday's posture as if the current file existed.
+        health = latest
         organismLivingStatus = organism
         if latest != nil && organism != nil {
             lastSyncAt = Date()
             syncError = nil
+            return .refreshed
         } else if latest != nil || organism != nil {
             syncError = "Some Health snapshots are still downloading from iCloud."
+            return .partial
         } else {
             syncError = "Health snapshot is still downloading from iCloud. Try again in a moment."
+            return .unavailable
         }
     }
 
     // R25: targeted runs loader mirroring refreshHealthSnapshot — AdvancedView
     // is the only consumer, so it loads on demand rather than riding the full
     // snapshot bundle.
-    func refreshRunsSnapshot() async {
-        guard let snapshotDir else { return }
+    @discardableResult
+    func refreshRunsSnapshot() async -> AdvancedSnapshotRefreshOutcome {
+        guard let snapshotDir else { return .unavailable }
         let lifecycle = lifecycleGeneration
         if let latest: [RunRecord] = await Self.loadSnapshotArrayOnly(named: "runs.json", in: snapshotDir) {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard lifecycle == lifecycleGeneration else { return .superseded }
             runs = latest
             lastSyncAt = Date()
             syncError = nil
+            return .refreshed
         } else if runs.isEmpty {
-            guard lifecycle == lifecycleGeneration else { return }
+            guard lifecycle == lifecycleGeneration else { return .superseded }
             syncError = "Runs snapshot is still downloading from iCloud. Try again in a moment."
         }
+        return .unavailable
     }
 
     @discardableResult

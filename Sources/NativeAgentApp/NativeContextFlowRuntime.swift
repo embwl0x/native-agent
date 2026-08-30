@@ -95,7 +95,8 @@ actor PersonaContextFlowProvider:
     }
 
     private func makeBuild() async throws -> Build {
-        let selectedOverride = personaOverride()
+        let requestedOverride = personaOverride()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedOverride = requestedOverride?.isEmpty == false ? requestedOverride : nil
         var snapshots: [PersonaContextSourceSnapshot] = []
         for surface in Self.surfaces {
             // The Mac chat picker is a per-turn override. Remote and autonomous
@@ -142,9 +143,11 @@ actor PersonaContextFlowProvider:
         }
 
         for root in allowedRoots.sorted(by: { $0.path < $1.path }) {
-            guard let catalog = try? NativeMarkdownContextSourceCatalog(personaRoot: root) else {
-                continue
-            }
+            // A complete owner inventory may retire prior sources. An unreadable
+            // or rejected catalog is not an empty inventory: fail before replacing
+            // any registrations or cached mirrors so reconciliation keeps its last
+            // good generation. A valid missing/empty directory still returns [].
+            let catalog = try NativeMarkdownContextSourceCatalog(personaRoot: root)
             for catalogRoot in catalog.allowedRoots { allowedRoots.insert(catalogRoot) }
             for registration in catalog.registrations {
                 registrations[registration.descriptor.id] = registration
@@ -156,7 +159,8 @@ actor PersonaContextFlowProvider:
             try Self.makeMirror(
                 personaID: personaID,
                 snapshots: grouped[personaID] ?? [],
-                mode: mode
+                mode: mode,
+                requestedPersonaOverride: selectedOverride
             )
         }
         return Build(
@@ -169,7 +173,8 @@ actor PersonaContextFlowProvider:
     static func makeMirror(
         personaID: String,
         snapshots: [PersonaContextSourceSnapshot],
-        mode: ContextFlowMode
+        mode: ContextFlowMode,
+        requestedPersonaOverride: String? = nil
     ) throws -> RequiredDocumentMirror {
         guard let canonical = snapshots.first else {
             throw CocoaError(.fileReadNoSuchFile)
@@ -220,7 +225,9 @@ actor PersonaContextFlowProvider:
                 key: key,
                 renderedPrompt: renderedPrompt,
                 includedDocumentIDs: includedIDs,
-                tokenCount: estimatedTokenCount(renderedPrompt)
+                tokenCount: estimatedTokenCount(renderedPrompt),
+                requestedPersonaOverride: snapshot.packet.surface == ContextSurface.chat.rawValue
+                    ? requestedPersonaOverride : nil
             )
         }
         return try RequiredDocumentMirror(
@@ -325,10 +332,6 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
     private let personaOverride: @Sendable () -> String?
     private var coordinator: ContextFlowCoordinator?
     private var personaProvider: PersonaContextFlowProvider?
-    /// The picker value whose persona sources were last reconciled into the
-    /// resident generation. This is an ordering fence, not a second persona
-    /// owner: the closure still reads the canonical picker preference.
-    private var reconciledPersonaOverride: String?
     private var memoryRuntime: SwiftNativeMemoryV2?
     private let memoryPressureObserver: (any NativeContextMemoryPressureObserving)?
     /// One kqueue-backed invalidation reader over the canonical Desk feed and
@@ -337,11 +340,13 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
     private var residentWorkObservationTask: Task<Void, Never>?
     private var residentWorkObservationPathsSnapshot: [URL] = []
     private var residentWorkInvalidationCount = 0
+    private var terminalResidentWorkRecordPaths: Set<String> = []
     private var starting = false
     private var startupWaiters: [CheckedContinuation<Void, Never>] = []
     private var semanticQueryCache: [String: ContextQueryEmbeddingValue] = [:]
     private var semanticQueryCacheOrder: [String] = []
-    private var semanticQueryWaiters: [String: [ContextQueryEmbeddingTicket]] = [:]
+    static let maximumConcurrentSemanticQueries = 8
+    private var semanticQueryTickets: [String: ContextQueryEmbeddingTicket] = [:]
     private var semanticQueryTasks: [String: Task<Void, Never>] = [:]
     private var semanticQueryEpoch: UInt64 = 0
     private var startupFailedClosed = false
@@ -437,7 +442,8 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
                 mirrorProvider: provider,
                 compiledProjectionProviders: [NativeMemoryContextProjection(
                     memory: memory,
-                    provenanceIndex: memoryProvenanceIndex
+                    provenanceIndex: memoryProvenanceIndex,
+                    dataRoot: dataRoot
                 ), NativeResidentWorkContextProjection(dataRoot: dataRoot)]
             )
             memoryRuntime = memory
@@ -449,7 +455,6 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
             }
             installMemoryPressureSource()
             await coordinator.start()
-            reconciledPersonaOverride = normalizedPersonaOverride()
             let health = await coordinator.health()
             NSLog(
                 "[context-flow] started mode=%@ generation=%lld sources=%d arena_bytes=%d",
@@ -464,7 +469,6 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
             }
             coordinator = nil
             personaProvider = nil
-            reconciledPersonaOverride = nil
             memoryRuntime = nil
             startupFailedClosed = true
             await memoryPressureObserver?.stop()
@@ -480,7 +484,7 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
         semanticQueryEpoch &+= 1
         semanticQueryTasks.values.forEach { $0.cancel() }
         semanticQueryTasks.removeAll()
-        semanticQueryWaiters.removeAll()
+        semanticQueryTickets.removeAll()
         semanticQueryCache.removeAll()
         semanticQueryCacheOrder.removeAll()
         await memoryPressureObserver?.stop()
@@ -492,7 +496,6 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
         await coordinator?.stop()
         coordinator = nil
         personaProvider = nil
-        reconciledPersonaOverride = nil
         memoryRuntime = nil
     }
 
@@ -553,18 +556,28 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     private func reconcilePersonaPickerIfNeeded() async {
-        let selectedPersona = normalizedPersonaOverride()
-        guard selectedPersona != reconciledPersonaOverride,
-              let coordinator,
-              let personaProvider else { return }
+        guard let coordinator, let personaProvider else { return }
+        // Only the immutable published kernel can acknowledge a selection.
+        // Sampling preferences before/after an awaited build loses changes
+        // (including ABA); a cached provider build may not have published yet.
+        let lease = try? await coordinator.acquireSnapshot()
+        let chatKernels = lease?.snapshot.requiredDocumentMirrors.compactMap {
+            $0.kernel(for: ContextSurfaceVariant(rawValue: ContextSurface.chat.rawValue))
+        } ?? []
+        let selectionPublished = chatKernels.count == 1
+            && chatKernels[0].requestedPersonaOverride == normalizedPersonaOverride()
+        lease?.release()
+        // Missing publication is not an acknowledged default/nil selection.
+        guard !selectionPublished else { return }
         await personaProvider.invalidateCachedBuild()
-        await coordinator.sourceDidChange(DerivedSourceChange(
+        _ = await coordinator.reconcileSourceChanges([DerivedSourceChange(
             namespace: "persona-picker",
             stableID: "chat",
             operation: .reconcile,
             reason: "chat_persona_picker_changed"
-        ))
-        reconciledPersonaOverride = selectedPersona
+        )])
+        // Failure retains the old kernel receipt, so the next ordinary turn
+        // or picker edge retries without a separate acknowledgment to undo.
     }
 
     func health() async -> ContextFlowCoordinatorHealth? {
@@ -620,6 +633,7 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     func beginQueryEmbedding(_ text: String) async -> ContextQueryEmbeddingTicket? {
+        let epoch = semanticQueryEpoch
         guard let coordinator, await coordinator.mode == .active,
               let memory = memoryRuntime else { return nil }
         let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -630,6 +644,10 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
                 || runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend else {
             return nil
         }
+        // Backend inspection suspends. A stop/reload during that await must
+        // not admit a task against the retired runtime after its drain.
+        guard epoch == semanticQueryEpoch, self.coordinator != nil,
+              !Task.isCancelled else { return nil }
         let normalized = query.split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
             .lowercased()
@@ -642,19 +660,20 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
             embeddingEpoch,
             normalized,
         ])
-        let ticket = ContextQueryEmbeddingTicket()
         if let cached = semanticQueryCache[key] {
             touchSemanticQueryCacheKey(key)
+            let ticket = ContextQueryEmbeddingTicket()
             ticket.publish(cached.values, modelFingerprint: cached.modelFingerprint)
             return ticket
         }
-        if semanticQueryWaiters[key] != nil {
-            semanticQueryWaiters[key, default: []].append(ticket)
-            return ticket
-        }
+        if let pending = semanticQueryTickets[key] { return pending }
 
-        semanticQueryWaiters[key] = [ticket]
-        let epoch = semanticQueryEpoch
+        // Semantic query vectors are optional. Keep a wedged provider or burst
+        // of turns from building an unbounded task/ticket backlog; overflow
+        // follows the existing lexical-only path without delaying the turn.
+        guard semanticQueryTickets.count < Self.maximumConcurrentSemanticQueries else { return nil }
+        let ticket = ContextQueryEmbeddingTicket()
+        semanticQueryTickets[key] = ticket
         semanticQueryTasks[key] = Task(priority: .utility) { [weak self, memory] in
             let value: ContextQueryEmbeddingValue?
             do {
@@ -668,7 +687,9 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
             } catch {
                 value = nil
             }
-            await self?.completeSemanticQuery(key: key, epoch: epoch, value: value)
+            await self?.completeSemanticQuery(
+                key: key, epoch: epoch, expectedEmbeddingEpoch: embeddingEpoch, value: value
+            )
         }
         return ticket
     }
@@ -676,24 +697,28 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
     private func completeSemanticQuery(
         key: String,
         epoch: UInt64,
+        expectedEmbeddingEpoch: String,
         value: ContextQueryEmbeddingValue?
     ) {
         guard epoch == semanticQueryEpoch else { return }
         semanticQueryTasks[key] = nil
-        let tickets = semanticQueryWaiters.removeValue(forKey: key) ?? []
+        let ticket = semanticQueryTickets.removeValue(forKey: key)
         guard let value,
               !value.values.isEmpty,
               value.values.allSatisfy(\.isFinite),
-              !value.modelFingerprint.isEmpty else { return }
+              value.modelFingerprint == expectedEmbeddingEpoch else { return }
+        // The embedder can change while prediction is suspended. Never bind
+        // a vector from the new space to the old snapshot's cache key: after
+        // a switch back, that poisoned hit would keep disabling semantic
+        // relevance for this query. Failure retains the bounded nil fallback;
+        // removing the in-flight ticket above permits a fresh exact-epoch retry.
         semanticQueryCache[key] = value
         touchSemanticQueryCacheKey(key)
         while semanticQueryCacheOrder.count > 32 {
             let evicted = semanticQueryCacheOrder.removeFirst()
             semanticQueryCache[evicted] = nil
         }
-        for ticket in tickets {
-            ticket.publish(value.values, modelFingerprint: value.modelFingerprint)
-        }
+        ticket?.publish(value.values, modelFingerprint: value.modelFingerprint)
     }
 
     private func touchSemanticQueryCacheKey(_ key: String) {
@@ -756,7 +781,9 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     func prepareFrozenContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
-        await reconcilePersonaPickerIfNeeded()
+        // Frozen reads pin the already-published generation. Picker changes
+        // belong to the explicit picker edge or the next ordinary turn, never
+        // a read that promises not to recover or publish derived state.
         guard let coordinator else {
             throw ContextTurnPreparationError.coordinatorNotStarted
         }
@@ -810,11 +837,7 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     private func observeResidentWorkChanges() async {
-        refreshResidentWorkObservationSnapshot()
-        var observation = FileChangeEvents(
-            paths: residentWorkObservationPaths(),
-            emitInitial: false
-        )
+        var observation = makeResidentWorkObservation()
         defer { observation.cancel() }
         while !Task.isCancelled {
             let changed = await waitForResidentWorkChange(observation)
@@ -823,11 +846,7 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
 
             // Re-arm first. The projection read below can suspend on Desk or
             // Workshop I/O while the canonical owner commits a related edge.
-            observation = FileChangeEvents(
-                paths: residentWorkObservationPaths(),
-                emitInitial: false
-            )
-            refreshResidentWorkObservationSnapshot()
+            observation = makeResidentWorkObservation()
             guard let coordinator else { return }
             await coordinator.sourceDidChange(DerivedSourceChange(
                 namespace: "resident-work",
@@ -864,6 +883,7 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
         // missing target. Watching the exact feed/root avoids duplicate wakes
         // from their parent directories while still detecting first creation.
         var paths = [deskOps, executionRoot]
+        var discoveredRecordPaths: Set<String> = []
         if let directories = try? FileManager.default.contentsOfDirectory(
             at: executionRoot,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -885,11 +905,36 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
                     // resolve() yields the canonical name and
                     // FileChangeWatcher falls back to the directory itself, so
                     // first creation still wakes us.
-                    paths.append(ExecutionRecordFile.resolve(in: directory))
+                    let record = ExecutionRecordFile.resolve(in: directory)
+                    discoveredRecordPaths.insert(record.path)
+                    if terminalResidentWorkRecordPaths.contains(record.path) {
+                        continue
+                    }
+                    if Self.shouldObserveResidentWorkExecutionRecord(at: record) {
+                        paths.append(record)
+                    } else {
+                        terminalResidentWorkRecordPaths.insert(record.path)
+                    }
                 }
             }
         }
+        terminalResidentWorkRecordPaths.formIntersection(discoveredRecordPaths)
         return paths
+    }
+
+    /// Canonical Workshop executors commit verification and terminal status in
+    /// the same locked write. Once that record is terminal, keeping an EVTONLY
+    /// descriptor open forever only watches immutable history. Missing,
+    /// malformed, and active records remain observed fail-safe; the execution
+    /// root watcher discovers newly-created directories.
+    nonisolated static func shouldObserveResidentWorkExecutionRecord(at url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = object["status"] as? String
+        else {
+            return true
+        }
+        return !WorkshopOutcomeScoreboard.terminalStatuses.contains(status.lowercased())
     }
 
     func residentWorkObservationStatus() -> NativeResidentWorkObservationStatus {
@@ -903,8 +948,12 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
         )
     }
 
-    private func refreshResidentWorkObservationSnapshot() {
-        residentWorkObservationPathsSnapshot = residentWorkObservationPaths()
+    private func makeResidentWorkObservation() -> FileChangeEvents {
+        // Resolve once per arm: status describes the exact subscribed paths,
+        // and every canonical edge pays for only one execution-directory scan.
+        let paths = residentWorkObservationPaths()
+        residentWorkObservationPathsSnapshot = paths
+        return FileChangeEvents(paths: paths, emitInitial: false)
     }
 
     private func waitForStartup() async {

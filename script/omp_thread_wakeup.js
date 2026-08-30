@@ -67,7 +67,7 @@ function readJSON(file) {
 }
 function processAlive(pid) {
   if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return false;
-  try { process.kill(Number(pid), 0); return true; } catch (error) { return error && error.code === "EPERM"; }
+  try { process.kill(Number(pid), 0); return true; } catch (error) { return !error || error.code !== "ESRCH"; }
 }
 function processTree(rootPid) {
   const probe = spawnSync("/bin/ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf8", timeout: 3000 });
@@ -136,7 +136,9 @@ function acquireLock(slug, messageId) {
     } catch (error) {
       if (!error || error.code !== "EEXIST") return { acquired: false, reason: "topic_lock_unavailable", owner: null, release() {} };
       const owner = readJSON(path.join(file, "owner.json"));
-      if (owner && processAlive(owner.pid)) return { acquired: false, reason: "topic_busy", owner, release() {} };
+      // Missing/unreadable owner may be another claimant between mkdir and
+      // owner publication. Absence is not proof that this lock is abandoned.
+      if (!owner || !Number.isInteger(Number(owner.pid)) || Number(owner.pid) <= 0 || processAlive(owner.pid)) return { acquired: false, reason: "topic_busy", owner, release() {} };
       try { fs.rmSync(file, { recursive: true, force: true }); } catch {}
     }
   }
@@ -194,7 +196,7 @@ function collectText(value) {
 function parseOMPOutput(stdout) {
   const values = [];
   const trimmed = String(stdout || "").trim();
-  if (!trimmed) return { reply: "", sessionId: null, parsedEvents: 0 };
+  if (!trimmed) return { reply: "", partialReply: "", stopReason: null, errorMessage: null, sessionId: null, parsedEvents: 0 };
   try { values.push(JSON.parse(trimmed)); }
   catch {
     for (const line of trimmed.split("\n")) {
@@ -202,7 +204,10 @@ function parseOMPOutput(stdout) {
     }
   }
   let sessionId = null;
-  const replies = [];
+  let reply = "";
+  let lastNonemptyReply = "";
+  let stopReason = null;
+  let errorMessage = null;
   const visit = (value) => {
     if (!value || typeof value !== "object") return;
     const type = String(value.type || value.event || "").toLowerCase();
@@ -214,8 +219,19 @@ function parseOMPOutput(stdout) {
     }
     const role = String(value.role || value.author || "").toLowerCase();
     if (role === "assistant" || role === "agent") {
-      const text = collectText(value);
-      if (text.trim()) replies.push(text.trim());
+      const text = collectText(value).trim();
+      const terminalReason = typeof value.stopReason === "string" && value.stopReason.trim()
+        ? value.stopReason.trim().toLowerCase() : null;
+      // OMP JSON print mode can exit zero after an assistant error/abort.
+      // A terminal message is evidence even when its content is empty; never
+      // let an earlier assistant answer turn that terminal failure into success.
+      const finalAssistant = ["stop", "error", "aborted"].includes(terminalReason);
+      if (finalAssistant || text) {
+        reply = text;
+        stopReason = terminalReason;
+        errorMessage = typeof value.errorMessage === "string" ? value.errorMessage : null;
+      }
+      if (text) lastNonemptyReply = text;
     }
     for (const child of Object.values(value)) {
       if (child && typeof child === "object") {
@@ -224,10 +240,11 @@ function parseOMPOutput(stdout) {
     }
   };
   values.forEach(visit);
-  return { reply: replies.at(-1) || "", sessionId, parsedEvents: values.length };
+  const failedTerminal = stopReason === "error" || stopReason === "aborted";
+  return { reply, partialReply: failedTerminal && !reply ? lastNonemptyReply : "", stopReason, errorMessage, sessionId, parsedEvents: values.length };
 }
 
-function runOMP({ payload, pointer, cwd, timeout, idle }) {
+function runOMP({ payload, pointer, cwd, timeout, idle, onActivity }) {
   return new Promise((resolve) => {
     const bin = process.env.NATIVE_AGENT_OMP_WAKE_BIN || "omp";
     const args = ["--model", "kimi", "-p", prompt(payload), "--mode", "json", "--max-time", `${timeout}s`];
@@ -258,6 +275,7 @@ function runOMP({ payload, pointer, cwd, timeout, idle }) {
     catch (error) { return finish({ exitCode: null, signal: null, spawnError: String(error && error.message || error) }); }
     const capture = (kind, chunk) => {
       lastActivityAt = Date.now();
+      if (typeof onActivity === "function") onActivity(new Date(lastActivityAt).toISOString());
       const text = chunk.toString("utf8");
       if (kind === "stdout") stdout = (stdout + text).slice(-MAX_OUTPUT);
       else stderr = (stderr + text).slice(-MAX_OUTPUT);
@@ -281,6 +299,9 @@ function classify(run) {
     durationMs: run.durationMs,
     lastActivityAt: run.lastActivityAt,
     reply: parsed.reply,
+    partialReply: parsed.partialReply,
+    assistantStopReason: parsed.stopReason,
+    assistantError: parsed.errorMessage ? tail(parsed.errorMessage) : null,
     sessionId: parsed.sessionId,
     parsedEvents: parsed.parsedEvents,
     stderrTail: tail(run.stderr),
@@ -292,6 +313,9 @@ function classify(run) {
   if (run.stalled) return { ...base, status: "failed", reason: "omp_idle_timeout" };
   if (run.timedOut) return { ...base, status: "failed", reason: "omp_wall_timeout" };
   if (run.exitCode !== 0) return { ...base, status: "failed", reason: `omp_exit_${run.exitCode == null ? "null" : run.exitCode}` };
+  if (parsed.stopReason === "error" || parsed.stopReason === "aborted") {
+    return { ...base, status: "failed", reason: `omp_assistant_${parsed.stopReason}` };
+  }
   if (!parsed.reply) return { ...base, status: "failed", reason: parsed.parsedEvents ? "omp_empty_reply" : "omp_json_parse_failed" };
   return { ...base, status: "completed", reason: null };
 }
@@ -312,10 +336,12 @@ function completionText(result, payload) {
   if (result.status === "completed") lines.push("--- OMP's reply ---", result.reply, "--- end reply ---");
   else {
     lines.push(`OMP wake FAILED: ${result.reason}`);
+    if (result.reason === "continuation_unavailable") lines.push("The explicitly requested conversation pointer is unavailable. No OMP work or fresh conversation was started. Inspect the original conversation pointer before explicitly choosing how to continue; do not automatically rerun this job as new work.");
+    if (result.assistantError) lines.push(`Assistant error: ${result.assistantError}`);
     if (result.timedOut) lines.push("The OMP process exceeded its wall-clock guard, was terminated, and only then classified as timed out.");
     if (result.stalled) lines.push(`The OMP process produced no stdout/stderr activity after ${result.lastActivityAt}; it was terminated and only then classified as stalled.`);
     if (result.stderrTail) lines.push("", "stderr tail:", result.stderrTail);
-    if (result.reply) lines.push("", "partial parsed reply:", result.reply);
+    if (result.reply || result.partialReply) lines.push("", "partial parsed reply:", result.reply || result.partialReply);
   }
   return lines.join("\n");
 }
@@ -326,7 +352,16 @@ function bridgeURL() {
   if (descriptor && typeof descriptor.url === "string") return new URL("/omp/message", descriptor.url).toString();
   return "http://127.0.0.1:8771/omp/message";
 }
+function missingCompletionOrigin(sessionId) {
+  if (typeof sessionId === "string" && sessionId.trim()) return null;
+  return { status: "blocked", reason: "missing_origin_session", deliveryAttempted: false,
+    note: "Completion retained without posting. Identify the original Agent session and inspect this job before explicitly delivering the saved result; do not rerun the worker or guess from the current chat." };
+}
+
 function postBridge(text, sessionId) {
+  const missingOrigin = missingCompletionOrigin(sessionId);
+  if (missingOrigin) return Promise.resolve(missingOrigin);
+  sessionId = sessionId.trim();
   if (process.env.NATIVE_AGENT_OMP_WAKE_DRY_RUN === "1") return Promise.resolve({ status: "dry_run", text });
   let token;
   try { token = fs.readFileSync(TOKEN_PATH, "utf8").trim(); } catch { return Promise.resolve({ status: "failed", reason: "bridge_token_missing" }); }
@@ -356,43 +391,144 @@ function postBridge(text, sessionId) {
 }
 
 async function runJob(payload, file, claimId) {
+  const admitted = readJSON(file);
+  if (!admitted || admitted.claimId !== claimId) return { status: "failed", reason: "claim_lost", messageId: payload.messageId };
+  if (!["claimed", "dispatching"].includes(admitted.state)) return { status: "skipped", reason: "execution_already_admitted", messageId: payload.messageId, existingState: admitted.state || "unknown" };
   const slug = topicSlug(payload.topic);
   const lock = acquireLock(slug, payload.messageId);
   if (!lock.acquired) {
+    if (lock.owner && lock.owner.messageId === payload.messageId) {
+      return { status: "skipped", reason: "execution_already_admitted", messageId: payload.messageId };
+    }
     const result = { status: "failed", reason: lock.reason, durationMs: 0, stderrTail: "", reply: "", timedOut: false, stalled: false };
     const text = completionText(result, payload);
     const bridge = await postBridge(text, payload.sessionId || "");
-    updateJob(file, { state: "settled", ...result, bridge, completedAt: now() }, claimId);
+    updateJob(file, { state: "settled", ...result, bridge,
+      completionText: bridge.reason === "missing_origin_session" ? text : null, completedAt: now() }, claimId);
     appendJSONL(DELIVERIES, { createdAt: now(), messageId: payload.messageId, topicSlug: slug, ...result, bridge, inFlightMessageId: lock.owner && lock.owner.messageId || null });
     return { ...result, delivery: "omp_thread_wakeup", messageId: payload.messageId, topicSlug: slug, bridge, jobPath: file };
   }
   try {
     const pointer = readPointer(slug);
+    const continuationUnavailable = payload.requireExistingConversation === true
+      && (!pointer || !pointer.sessionId.trim());
     const cwd = resolveCwd(payload, pointer);
     const timeout = timeoutSeconds(payload);
     const idle = idleSeconds(payload, timeout);
-    updateJob(file, { state: "running", runnerPid: process.pid, startedAt: now(), cwd, sessionMode: pointer ? "resume" : "new", resumedSessionId: pointer && pointer.sessionId || null, timeoutSeconds: timeout, idleSeconds: idle }, claimId);
-    const run = await runOMP({ payload, pointer, cwd, timeout, idle });
-    const result = classify(run);
+    if (!continuationUnavailable && !updateJob(file, { state: "running", runnerPid: process.pid, startedAt: now(), cwd, sessionMode: pointer ? "resume" : "new", resumedSessionId: pointer && pointer.sessionId || null, timeoutSeconds: timeout, idleSeconds: idle }, claimId)) {
+      return { status: "failed", reason: "claim_lost", messageId: payload.messageId };
+    }
+    const run = continuationUnavailable ? null : await runOMP({
+      payload, pointer, cwd, timeout, idle,
+      onActivity: (lastActivityAt) => updateJob(file, { lastActivityAt }, claimId),
+    });
+    const result = continuationUnavailable
+      ? { status: "failed", reason: "continuation_unavailable", durationMs: 0, stderrTail: "", reply: "", timedOut: false, stalled: false }
+      : classify(run);
     if (result.status === "completed" && !result.sessionId && pointer) result.sessionId = pointer.sessionId;
     let pointerFile = null;
     if (result.status === "completed" && result.sessionId) pointerFile = writePointer(slug, result.sessionId, cwd);
     const text = completionText(result, payload);
     const bridge = await postBridge(text, payload.sessionId || "");
-    const receipt = { createdAt: now(), messageId: payload.messageId, topicSlug: slug, sessionMode: pointer ? "resume" : "new", pointerPath: pointerFile, ...result, bridge };
+    const sessionMode = continuationUnavailable ? "resume_unavailable" : pointer ? "resume" : "new";
+    const receipt = { createdAt: now(), messageId: payload.messageId, topicSlug: slug, sessionMode, pointerPath: pointerFile, ...result, bridge };
     appendJSONL(DELIVERIES, receipt);
-    updateJob(file, { state: "settled", ...result, bridge, pointerPath: pointerFile, completionText: bridge.status === "delivered" || bridge.status === "dry_run" ? null : text, completedAt: now() }, claimId);
-    const envelope = { ...result, delivery: "omp_thread_wakeup", messageId: payload.messageId, topicSlug: slug, sessionMode: pointer ? "resume" : "new", pointerPath: pointerFile, bridge, jobPath: file, receiptPath: DELIVERIES };
+    updateJob(file, { state: "settled", ...result, bridge, sessionMode, pointerPath: pointerFile, completionText: bridge.status === "delivered" || bridge.status === "dry_run" ? null : text, completedAt: now() }, claimId);
+    const envelope = { ...result, delivery: "omp_thread_wakeup", messageId: payload.messageId, topicSlug: slug, sessionMode, pointerPath: pointerFile, bridge, jobPath: file, receiptPath: DELIVERIES };
     if (bridge.status === "dry_run") envelope.wouldSendText = bridge.text;
     return envelope;
   } finally { lock.release(); }
 }
 
-function detach(file, claimId) {
-  const child = spawn(process.execPath, [__filename, "--run", file, "--claim", claimId], { detached: true, stdio: "ignore", env: process.env });
+async function detach(file, claimId) {
+  // Admission precedes spawn. A crash in the spawn/PID-write window is an
+  // uncertain dispatch, not a safe-to-retry claim. The child alone publishes
+  // running/settled state and its PID before invoking OMP; the parent must not
+  // rewind a fast child's settled record with a late "dispatched" write.
+  if (!updateJob(file, { state: "dispatching" }, claimId)) throw new Error("claim_lost");
+  let child;
+  try {
+    child = spawn(process.execPath, [__filename, "--run", file, "--claim", claimId], { detached: true, stdio: "ignore", env: process.env });
+    await new Promise((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+  } catch (error) {
+    updateJob(file, { state: "spawn_failed", reason: "runner_spawn_failed" }, claimId);
+    throw error;
+  }
   child.unref();
-  updateJob(file, { state: "dispatched", runnerPid: child.pid }, claimId);
   return child.pid;
+}
+
+function knownUnstartedJob(job) {
+  // Only this schema records dispatch admission BEFORE spawning. A legacy
+  // claimed row can hide an unrecorded child, and dead PIDs cannot prove that
+  // a running worker made no filesystem or external changes.
+  const rejectedBeforeExecution = job && job.schemaVersion === 2
+    && job.state === "settled" && job.status === "failed" && job.reason === "topic_busy";
+  return job && job.schemaVersion >= 2
+    && (["claimed", "spawn_failed"].includes(job.state) || rejectedBeforeExecution)
+    && !job.startedAt && !job.lastActivityAt && !job.runnerPid
+    && job.payload && typeof job.payload.text === "string" && job.payload.text.trim()
+    && job.payload.messageId === job.messageId;
+}
+
+async function recoverExistingJob(file, payload, record, claimId) {
+  const existing = readJSON(file);
+  if (!existing) return { status: "skipped", reason: "existing_job_unreadable", messageId: payload.messageId, jobPath: file };
+  if (existing.messageId !== payload.messageId) return { status: "failed", reason: "message_id_conflict", messageId: payload.messageId, jobPath: file };
+  const slug = topicSlug(existing.payload && existing.payload.topic);
+  // Reuse the existing conversation lock for duplicate recovery; two retries
+  // must not both POST the same known-unsent completion or rename a new claim.
+  const lock = acquireLock(slug, payload.messageId);
+  if (!lock.acquired) return { status: "skipped", reason: "duplicate", messageId: payload.messageId, jobPath: file, existingState: existing.state || "unknown" };
+  try {
+    const job = readJSON(file);
+    if (!job || job.claimId !== existing.claimId) return { status: "skipped", reason: "claim_changed", messageId: payload.messageId, jobPath: file };
+    if (job.state === "settled" && job.bridge && job.bridge.reason === "missing_origin_session") {
+      return { status: "blocked", reason: "missing_origin_session", messageId: payload.messageId,
+        bridge: job.bridge, jobPath: file, note: job.bridge.note };
+    }
+    if (job.state === "settled" && typeof job.completionText === "string" && job.completionText) {
+      if (!job.bridge || job.bridge.status !== "failed") {
+        return { status: "skipped", reason: "delivery_outcome_unknown", messageId: payload.messageId, bridge: job.bridge || { status: "unknown" }, jobPath: file, note: "Completion retained. Reconcile the original delivery before any resend; a timeout is not proof of non-delivery." };
+      }
+      const missingOrigin = missingCompletionOrigin(job.payload && job.payload.sessionId);
+      if (missingOrigin) {
+        updateJob(file, { bridge: missingOrigin }, job.claimId);
+        return { status: "blocked", reason: missingOrigin.reason, messageId: payload.messageId,
+          bridge: missingOrigin, jobPath: file, note: missingOrigin.note };
+      }
+      // Persist uncertainty BEFORE POST. If this process dies, a later retry
+      // cannot mistake the previous proven-unsent state for the new attempt.
+      if (!updateJob(file, { bridge: { status: "unknown", reason: "completion_replay_in_flight" } }, job.claimId)) {
+        return { status: "failed", reason: "claim_lost", messageId: payload.messageId, jobPath: file };
+      }
+      const bridge = await postBridge(job.completionText, job.payload && job.payload.sessionId || "");
+      updateJob(file, { bridge, completionText: bridge.status === "delivered" || bridge.status === "dry_run" ? null : job.completionText, replayedAt: now() }, job.claimId);
+      appendJSONL(DELIVERIES, { createdAt: now(), kind: "delivery_replay", messageId: payload.messageId, status: job.status || "unknown", reason: job.reason || null, bridge });
+      return { status: bridge.status === "delivered" || bridge.status === "dry_run" ? "replayed" : "skipped", reason: "duplicate_delivery_replay", messageId: payload.messageId, bridge, jobPath: file };
+    }
+    const owners = [job.claimantPid, job.runnerPid].filter((pid) => Number.isInteger(Number(pid)) && Number(pid) > 0);
+    // Settled topic-busy rejections are proven before OMP execution. Only an
+    // explicit same-id call can re-admit them; archive the rejection/delivery
+    // record and retain the original payload under this existing topic lock.
+    if ((job.state !== "settled" || knownUnstartedJob(job))
+        && owners.length > 0 && owners.every((pid) => !processAlive(pid))) {
+      if (!knownUnstartedJob(job)) {
+        return { status: "skipped", reason: "execution_outcome_unknown", messageId: payload.messageId, jobPath: file, existingState: job.state || "unknown", note: "The owner is gone, but effects may already have occurred. Inspect this job and the original conversation before explicitly authorizing new work." };
+      }
+      const stale = `${file}.stale-${crypto.randomUUID()}`;
+      fs.renameSync(file, stale);
+      // Recover the original accepted payload, never a replacement brief or
+      // session supplied alongside a reused message id.
+      if (claim(file, { ...record, payload: job.payload, takeover: { reason: "unstarted_owner_dead", staleJobPath: stale } })) {
+        return { recoveredPayload: job.payload };
+      }
+    }
+    return { status: "skipped", reason: "duplicate", messageId: payload.messageId, jobPath: file, existingState: job.state || "unknown" };
+  } finally { lock.release(); }
 }
 
 async function main() {
@@ -410,34 +546,17 @@ async function main() {
   payload.messageId = String(payload.messageId || crypto.randomUUID());
   const file = jobPath(payload.messageId);
   const claimId = crypto.randomUUID();
-  const record = { schemaVersion: 1, messageId: payload.messageId, claimId, state: "claimed", createdAt: now(), claimantPid: process.pid, payload };
+  const record = { schemaVersion: 2, messageId: payload.messageId, claimId, state: "claimed", createdAt: now(), claimantPid: process.pid, payload };
   if (!claim(file, record)) {
-    const existing = readJSON(file);
-    if (existing && existing.state === "settled" && typeof existing.completionText === "string" && existing.completionText) {
-      const bridge = await postBridge(existing.completionText, existing.payload && existing.payload.sessionId || "");
-      if (bridge.status === "delivered" || bridge.status === "dry_run") {
-        updateJob(file, { bridge, completionText: null, replayedAt: now() }, existing.claimId);
-      }
-      appendJSONL(DELIVERIES, {
-        createdAt: now(), kind: "delivery_replay", messageId: payload.messageId,
-        status: existing.status || "unknown", reason: existing.reason || null, bridge,
-      });
-      return out({ status: bridge.status === "delivered" || bridge.status === "dry_run" ? "replayed" : "skipped", reason: "duplicate_delivery_replay", messageId: payload.messageId, bridge, jobPath: file });
-    }
-    const owners = [existing && existing.claimantPid, existing && existing.runnerPid].filter((pid) => Number.isInteger(Number(pid)) && Number(pid) > 0);
-    if (existing && existing.state !== "settled" && owners.length > 0 && owners.every((pid) => !processAlive(pid))) {
-      const stale = `${file}.stale-${Math.floor(Date.now() / 1000)}`;
-      try { fs.renameSync(file, stale); } catch {}
-      if (claim(file, { ...record, takeover: { reason: "recorded_owners_dead", staleJobPath: stale } })) {
-        if (process.env.NATIVE_AGENT_OMP_WAKE_INLINE === "1") return out(await runJob(payload, file, claimId));
-        const runnerPid = detach(file, claimId);
-        return out({ status: "sent", mode: "detached", delivery: "omp_thread_wakeup", messageId: payload.messageId, runnerPid, jobPath: file, takeover: true });
-      }
-    }
-    return out({ status: "skipped", reason: "duplicate", messageId: payload.messageId, jobPath: file, existingState: existing && existing.state || "unknown" });
+    const resolution = await recoverExistingJob(file, payload, record, claimId);
+    if (!resolution.recoveredPayload) return out(resolution);
+    payload = resolution.recoveredPayload;
+    if (process.env.NATIVE_AGENT_OMP_WAKE_INLINE === "1") return out(await runJob(payload, file, claimId));
+    const runnerPid = await detach(file, claimId);
+    return out({ status: "sent", mode: "detached", delivery: "omp_thread_wakeup", messageId: payload.messageId, runnerPid, jobPath: file, takeover: true });
   }
   if (process.env.NATIVE_AGENT_OMP_WAKE_INLINE === "1") return out(await runJob(payload, file, claimId));
-  const runnerPid = detach(file, claimId);
+  const runnerPid = await detach(file, claimId);
   return out({ status: "sent", mode: "detached", delivery: "omp_thread_wakeup", messageId: payload.messageId, runnerPid, jobPath: file });
 }
 

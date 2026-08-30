@@ -234,7 +234,9 @@ struct AppEmptyState: View {
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityElement(children: .combine)
+        // Keep the optional recovery action as its own VoiceOver control.
+        // Static empty states remain a single concise announcement.
+        .accessibilityElement(children: action == nil ? .combine : .contain)
         .accessibilityLabel("\(kind.statusLabel): \(title)")
         .onAppear {
             guard !reduceMotion else { return }

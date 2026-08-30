@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentShared
+import NativeAgentSharedTestSupport
 import Testing
 @testable import NativeAgentApp
 

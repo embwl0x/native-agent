@@ -54,6 +54,32 @@ struct DeskChatToolDispatchTests {
             Issue.record("desk_add_item schema malformed"); return
         }
         #expect(areq == [.string("kind"), .string("project"), .string("title")])
+        guard case .object(let addProperties)? = ao["properties"] else {
+            Issue.record("desk_add_item properties missing"); return
+        }
+        #expect(addProperties["assignee"] != nil)
+        #expect(addProperties["lane_of"] != nil)
+        #expect(addProperties["allow_duplicate"] != nil)
+
+        let status = try #require(schemas.first { $0.name == "desk_set_status" })
+        let statusParsed = try JSONValue.parse(status.parametersJSON)
+        guard case .object(let so) = statusParsed,
+              case .object(let statusProperties)? = so["properties"],
+              case .object(let progress)? = statusProperties["progress"],
+              case .array(let progressRequired)? = progress["required"] else {
+            Issue.record("desk_set_status progress schema malformed"); return
+        }
+        #expect(progressRequired == [.string("done"), .string("total")])
+        #expect(progress["additionalProperties"] == .bool(false))
+        #expect(statusProperties["assignee"] != nil)
+        #expect(statusProperties["lane_of"] != nil)
+        for key in ["assignee", "lane_of"] {
+            guard case .object(let metadata)? = statusProperties[key] else {
+                Issue.record("missing optional metadata schema: \(key)"); return
+            }
+            #expect(metadata["type"] == .string("string"))
+            #expect(metadata["minLength"] == nil, "blank optional metadata preserves current values")
+        }
 
         let read = try #require(schemas.first { $0.name == "desk_read" })
         let readParsed = try JSONValue.parse(read.parametersJSON)
@@ -61,6 +87,261 @@ struct DeskChatToolDispatchTests {
             Issue.record("desk_read schema malformed"); return
         }
         #expect(rreq == [])
+        guard case .object(let readProperties)? = ro["properties"] else {
+            Issue.record("desk_read properties missing"); return
+        }
+        #expect(readProperties["handle"] != nil)
+        #expect(readProperties["query"] != nil)
+    }
+
+    @Test func delegationMetadataAndProgressFlowThroughRealDeskTools() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+
+        let programResult = try await d.impl_desk_add_item(input: [
+            "kind": .string("project"),
+            "project": .string("Desk 790"),
+            "title": .string("Wave 2"),
+        ])
+        guard case .object(let programObject) = programResult,
+              case .string(let programHandle)? = programObject["handle"],
+              case .string(let programAlias)? = programObject["alias"] else {
+            Issue.record("program add malformed"); return
+        }
+        let laneResult = try await d.impl_desk_add_item(input: [
+            "kind": .string("plan"),
+            "project": .string("Desk 790"),
+            "title": .string("Desk Live Part 1"),
+            "assignee": .string("codex"),
+            "lane_of": .string(programAlias),
+        ])
+        guard case .object(let laneObject) = laneResult,
+              case .string(let laneHandle)? = laneObject["handle"] else {
+            Issue.record("lane add malformed"); return
+        }
+
+        _ = try await d.impl_desk_set_status(input: [
+            "handle": .string(laneHandle),
+            "status": .string("now"),
+            "progress": .object([
+                "done": .int(2),
+                "total": .int(5),
+                "note": .string("store and schema wired"),
+            ]),
+        ])
+
+        let lane = try #require(
+            try await SwiftNativeDeskStore(dataRoot: root).liveState().items.first { $0.handle == laneHandle }
+        )
+        #expect(lane.assignee == "codex")
+        #expect(lane.laneOf == programHandle)
+        #expect(lane.progress == DeskProgress(done: 2, total: 5, note: "store and schema wired"))
+        #expect(lane.parent == nil, "lane_of must not mutate Desk hierarchy")
+    }
+
+    @Test func addReusesEquivalentLiveOwnerUnlessDuplicateIsExplicit() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        let first = try await d.impl_desk_add_item(input: [
+            "kind": .string("project"),
+            "project": .string("NativeAgent"),
+            "title": .string("Build Agent’s aesthetic life"),
+        ])
+        guard case .object(let firstObject) = first,
+              case .string(let firstHandle)? = firstObject["handle"] else {
+            Issue.record("first add malformed"); return
+        }
+        let reused = try await d.impl_desk_add_item(input: [
+            "kind": .string("plan"),
+            "project": .string(" nativeagent "),
+            "title": .string("Build Agent's aesthetic life"),
+        ])
+        guard case .object(let reusedObject) = reused else {
+            Issue.record("reused add malformed"); return
+        }
+        #expect(reusedObject["status"] == .string("ok"))
+        #expect(reusedObject["disposition"] == .string("existing"))
+        #expect(reusedObject["created"] == .bool(false))
+        #expect(reusedObject["handle"] == .string(firstHandle))
+        #expect(try await SwiftNativeDeskStore(dataRoot: root).liveState().items.count == 1)
+
+        let explicit = try await d.impl_desk_add_item(input: [
+            "kind": .string("plan"),
+            "project": .string("NativeAgent"),
+            "title": .string("Build Agent's aesthetic life"),
+            "allow_duplicate": .bool(true),
+        ])
+        guard case .object(let explicitObject) = explicit else {
+            Issue.record("explicit add malformed"); return
+        }
+        #expect(explicitObject["status"] == .string("ok"))
+        #expect(explicitObject["disposition"] == .string("created"))
+        #expect(explicitObject["created"] == .bool(true))
+        #expect(try await SwiftNativeDeskStore(dataRoot: root).liveState().items.count == 2)
+    }
+
+    @Test func impossibleProgressFailsBeforeAppendingAStatusOp() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        let created = try await d.impl_desk_add_item(input: [
+            "kind": .string("plan"),
+            "project": .string("Desk 790"),
+            "title": .string("Invalid progress"),
+        ])
+        guard case .object(let object) = created,
+              case .string(let handle)? = object["handle"] else {
+            Issue.record("add malformed"); return
+        }
+        let before = try await SwiftNativePersistenceCore().readJSONL(
+            SwiftNativeDeskStore(dataRoot: root).opsPath
+        ).count
+
+        await #expect(throws: AutonomyGateError.self) {
+            _ = try await d.impl_desk_set_status(input: [
+                "handle": .string(handle),
+                "status": .string("now"),
+                "progress": .object(["done": .int(6), "total": .int(5)]),
+            ])
+        }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        #expect(try await SwiftNativePersistenceCore().readJSONL(store.opsPath).count == before)
+        let row = try #require(try await store.liveState().items.first { $0.handle == handle })
+        #expect(row.status == .watch)
+        #expect(row.progress == nil)
+    }
+
+    @Test func statusAssignsAndLaneLinksAnExistingItemWithoutChangingHierarchy() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+
+        let programResult = try await d.impl_desk_add_item(input: [
+            "kind": .string("project"),
+            "project": .string("Desk 790"),
+            "title": .string("Wave 2"),
+        ])
+        guard case .object(let programObject) = programResult,
+              case .string(let programHandle)? = programObject["handle"],
+              case .string(let programAlias)? = programObject["alias"] else {
+            Issue.record("program add malformed"); return
+        }
+        let existingResult = try await d.impl_desk_add_item(input: [
+            "kind": .string("plan"),
+            "project": .string("Desk 790"),
+            "title": .string("Existing lane"),
+        ])
+        guard case .object(let existingObject) = existingResult,
+              case .string(let existingHandle)? = existingObject["handle"] else {
+            Issue.record("existing lane add malformed"); return
+        }
+
+        _ = try await d.impl_desk_set_status(input: [
+            "handle": .string(existingHandle),
+            "status": .string("now"),
+            "assignee": .string("  claude  "),
+            "lane_of": .string(programAlias),
+        ])
+        _ = try await d.impl_desk_set_status(input: [
+            "handle": .string(existingHandle),
+            "status": .string("next"),
+            "assignee": .string("codex"),
+            "lane_of": .string(programHandle),
+        ])
+        _ = try await d.impl_desk_set_status(input: [
+            "handle": .string(existingHandle),
+            "status": .string("todo"),
+        ])
+
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        var row = try #require(try await store.liveState().items.first { $0.handle == existingHandle })
+        #expect(row.assignee == "codex")
+        #expect(row.laneOf == programHandle)
+        #expect(row.parent == nil)
+
+        let before = try await SwiftNativePersistenceCore().readJSONL(store.opsPath).count
+        await #expect(throws: AutonomyGateError.self) {
+            _ = try await d.impl_desk_set_status(input: [
+                "handle": .string(existingHandle),
+                "status": .string("now"),
+                "lane_of": .string("desk_missing_program"),
+            ])
+        }
+        await #expect(throws: AutonomyGateError.self) {
+            _ = try await d.impl_desk_set_status(input: [
+                "handle": .string(existingHandle),
+                "status": .string("now"),
+                "lane_of": .string(existingHandle),
+            ])
+        }
+        #expect(try await SwiftNativePersistenceCore().readJSONL(store.opsPath).count == before)
+        row = try #require(try await store.liveState().items.first { $0.handle == existingHandle })
+        #expect(row.status == .todo)
+        #expect(row.assignee == "codex")
+        #expect(row.laneOf == programHandle)
+        #expect(row.parent == nil)
+    }
+
+    @Test(arguments: ["", " \n\t "])
+    func blankStatusMetadataPreservesAssignedAndUnassignedItems(blank: String) async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let parent = try await d.impl_desk_add_item(input: [
+            "kind": .string("project"), "project": .string("Blank metadata"),
+            "title": .string("Program"),
+        ])
+        guard case .object(let parentObject) = parent,
+              case .string(let parentHandle)? = parentObject["handle"] else {
+            Issue.record("program add malformed"); return
+        }
+        for assigned in [false, true] {
+            var input: [String: JSONValue] = [
+                "kind": .string("plan"), "project": .string("Blank metadata"),
+                "title": .string(assigned ? "Assigned lane" : "Ordinary task"),
+            ]
+            if assigned {
+                input["assignee"] = .string("codex")
+                input["lane_of"] = .string(parentHandle)
+            }
+            let created = try await d.impl_desk_add_item(input: input)
+            guard case .object(let createdObject) = created,
+                  case .string(let handle)? = createdObject["handle"] else {
+                Issue.record("item add malformed"); return
+            }
+            let before = try await SwiftNativePersistenceCore().readJSONL(store.opsPath).count
+            let result = try await d.impl_desk_set_status(input: [
+                "handle": .string(handle), "status": .string("now"),
+                "assignee": .string(blank), "lane_of": .string(blank),
+                "blocked_reason": .string(""), "waiting_on": .string(""),
+                "progress": .object(["done": .int(1), "total": .int(3)]),
+            ])
+            guard case .object(let resultObject) = result else {
+                Issue.record("status update malformed"); return
+            }
+            #expect(resultObject["status"] == .string("ok"))
+            #expect(try await SwiftNativePersistenceCore().readJSONL(store.opsPath).count == before + 1)
+            let row = try #require(try await store.liveState().items.first { $0.handle == handle })
+            #expect(row.status == .now)
+            #expect(row.assignee == (assigned ? "codex" : nil))
+            #expect(row.laneOf == (assigned ? parentHandle : nil))
+            #expect(row.parent == nil)
+            #expect(row.progress == DeskProgress(done: 1, total: 3))
+
+            for key in ["assignee", "lane_of"] {
+                for malformed: JSONValue in [.null, .int(0), .bool(false), .object([:]), .array([])] {
+                    await #expect(throws: AutonomyGateError.self) {
+                        _ = try await d.impl_desk_set_status(input: [
+                            "handle": .string(handle), "status": .string("next"), key: malformed,
+                        ])
+                    }
+                }
+            }
+            #expect(try await SwiftNativePersistenceCore().readJSONL(store.opsPath).count == before + 1)
+        }
     }
 
     // MARK: add → set_status → note → read round-trip
@@ -101,6 +382,50 @@ struct DeskChatToolDispatchTests {
         #expect(projection.contains("now"))
         #expect(projection.contains("NativeAgent"))
         #expect(projection.contains(alias))
+    }
+
+    @Test func boundedReadCanRecoverItemsByFullStoreQueryOrExactHandle() async throws {
+        let root = hermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let d = dispatcher(root)
+        var hiddenHandle = ""
+        for index in 1...30 {
+            let title = index == 30 ? "Museum and studio continuity" : "Older watch \(index)"
+            let created = try await d.impl_desk_add_item(input: [
+                "kind": .string("watch"),
+                "project": .string("NativeAgent"),
+                "title": .string(title),
+            ])
+            if index == 30, case .object(let object) = created,
+               case .string(let handle)? = object["handle"] {
+                hiddenHandle = handle
+            }
+        }
+
+        let bounded = try await d.impl_desk_read(input: [:])
+        guard case .object(let boundedObject) = bounded,
+              case .string(let boundedProjection)? = boundedObject["projection"] else {
+            Issue.record("bounded read malformed"); return
+        }
+        #expect(boundedObject["projectionIsBounded"] == .bool(true))
+        #expect(boundedProjection.contains("Older watch 25"))
+        #expect(!boundedProjection.contains("Museum and studio continuity"))
+
+        let searched = try await d.impl_desk_read(input: ["query": .string("museum")])
+        guard case .object(let searchedObject) = searched,
+              case .string(let searchedProjection)? = searchedObject["projection"] else {
+            Issue.record("query read malformed"); return
+        }
+        #expect(searchedObject["matchCount"] == .int(1))
+        #expect(searchedProjection.contains("Museum and studio continuity"))
+
+        let exact = try await d.impl_desk_read(input: ["handle": .string(hiddenHandle)])
+        guard case .object(let exactObject) = exact,
+              case .string(let exactProjection)? = exactObject["projection"] else {
+            Issue.record("exact read malformed"); return
+        }
+        #expect(exactObject["matchCount"] == .int(1))
+        #expect(exactProjection.contains("Museum and studio continuity"))
     }
 
     // MARK: ref + cadence + notify + close round-trip (full mutation surface)

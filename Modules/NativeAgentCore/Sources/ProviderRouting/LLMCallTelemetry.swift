@@ -130,11 +130,8 @@ public extension Notification.Name {
 // Appends ONE `llm.call` row per successful provider call to
 // `<dataRoot>/traces/events.jsonl` — the SAME feed ChatToolDispatchTracer
 // (ChatOrchestration/ChatToolDispatchTrace.swift) writes `tool.dispatch`
-// rows to. The writer is duplicated here rather than shared because the
-// module graph points the other way (ChatOrchestration depends on
-// ProviderRouting); the flock + non-fatal + tail-trim discipline is a
-// 1:1 mirror of ChatToolDispatchTracer so the two writers stay
-// interleaving-safe on the same file.
+// rows to. PersistenceCore owns the shared path cap and flock so every writer
+// observes one newest-N contract.
 //
 // PRIVACY (hard constraint, same as the tool tracer): rows carry token
 // COUNTS, timings, model/provider/surface identifiers only — never prompt
@@ -143,22 +140,12 @@ public extension Notification.Name {
 // Recording is non-fatal: an IO failure logs to stderr and the provider
 // call's result reaches the caller unchanged.
 public final class LLMCallTraceRecorder: @unchecked Sendable {
-    /// Cap mirrors ChatToolDispatchTracer.maxTraceLines.
-    static let maxTraceLines = 5000
-    // Public: referenced from the public init's default argument value.
-    public static let defaultTrimCheckInterval = 32
-    private static let trimByteTrigger = 4 * 1024 * 1024
-    private static let counterLock = NSLock()
-    // nonisolated(unsafe): every access is guarded by counterLock.
-    nonisolated(unsafe) private static var appendCounter = 0
-
     /// Test injection. Production leaves nil and the path resolves through
     /// `PersistenceCore.defaultDataRoot()` at append time (so the env-var /
     /// stamped-repo / cwd-walkup resolution happens in the live process,
     /// not at adapter-construction time).
     private let dataRootOverride: URL?
     private let persistence = SwiftNativePersistenceCore()
-    private let trimCheckInterval: Int
     /// Review nit (2026-06-10): the flock + append + possible tail-trim used
     /// to sit ON the provider call's return path — pure latency coupling for
     /// a telemetry row. Production now writes fire-and-forget on a detached
@@ -171,11 +158,9 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
 
     public init(
         dataRootOverride: URL? = nil,
-        trimCheckInterval: Int = LLMCallTraceRecorder.defaultTrimCheckInterval,
         synchronousWrites: Bool? = nil
     ) {
         self.dataRootOverride = dataRootOverride
-        self.trimCheckInterval = max(1, trimCheckInterval)
         self.synchronousWrites = synchronousWrites ?? (dataRootOverride != nil)
     }
 
@@ -364,35 +349,28 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             )
         }()
         let path = tracesPath
-        let counterTripped: Bool = {
-            Self.counterLock.lock()
-            defer { Self.counterLock.unlock() }
-            Self.appendCounter &+= 1
-            return Self.appendCounter % trimCheckInterval == 0
-        }()
         if synchronousWrites {
             await Self.performWrite(
-                row: row, path: path, counterTripped: counterTripped,
+                row: row, path: path,
                 persistence: persistence, provider: provider, model: model,
                 usageReceipt: usageReceipt
             )
         } else {
-            // Fire-and-forget: the flock/append/trim happens OFF the
+            // Fire-and-forget: the path-owned append happens OFF the
             // provider call's return path. Telemetry rows are advisory —
             // a row lost to process exit is acceptable; added latency on
             // every LLM call is not.
             // 2026-07-21 audit: route the detached write through ONE shared
             // actor queue. Concurrent provider calls used to each spawn a
             // detached task that serialized on the events.jsonl flock in
-            // nondeterministic order — a racing trimLocked could drop a
-            // sibling's fresh row. The actor makes append/trim order
+            // nondeterministic order. The actor makes append order
             // deterministic FIFO across every recorder instance (adapters
             // hold their own recorder but share this queue), mirroring the
             // SessionUsageReceiptWriter pattern.
             let persistence = self.persistence
             Task.detached(priority: .utility) {
                 await TraceWriteQueue.shared.enqueue(
-                    row: row, path: path, counterTripped: counterTripped,
+                    row: row, path: path,
                     persistence: persistence, provider: provider, model: model,
                     usageReceipt: usageReceipt
                 )
@@ -402,22 +380,21 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
 
     /// Single-process FIFO queue for fire-and-forget trace writes (see the
     /// 2026-07-21 audit note at the call site). One actor, shared across all
-    /// recorder instances, so the append→trim sequence for one row is never
-    /// interleaved with another row's flock turn.
+    /// recorder instances, so enqueue order is preserved before the shared
+    /// path-owned append boundary serializes cross-process writers.
     private actor TraceWriteQueue {
         static let shared = TraceWriteQueue()
 
         func enqueue(
             row: JSONValue,
             path: URL,
-            counterTripped: Bool,
             persistence: SwiftNativePersistenceCore,
             provider: String,
             model: String,
             usageReceipt: SessionUsageReceiptWrite?
         ) async {
             await LLMCallTraceRecorder.performWrite(
-                row: row, path: path, counterTripped: counterTripped,
+                row: row, path: path,
                 persistence: persistence, provider: provider, model: model,
                 usageReceipt: usageReceipt
             )
@@ -427,19 +404,18 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
     private static func performWrite(
         row: JSONValue,
         path: URL,
-        counterTripped: Bool,
         persistence: SwiftNativePersistenceCore,
         provider: String,
         model: String,
         usageReceipt: SessionUsageReceiptWrite?
     ) async {
         do {
-            try await persistence.withFileLock(path) {
-                try await persistence.appendJSONL(row, to: path)
-                if counterTripped || Self.fileSize(path) > Self.trimByteTrigger {
-                    Self.trimLocked(path, keepLast: Self.maxTraceLines)
-                }
-            }
+            try await appendPathOwnedJSONL(
+                row,
+                to: path,
+                using: persistence,
+                logLabel: "LLMCallTraceRecorder"
+            )
         } catch {
             FileHandle.standardError.write(
                 Data("LLMCallTraceRecorder: trace append failed (\(provider)/\(model)): \(error)\n".utf8)
@@ -450,32 +426,4 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         }
     }
 
-    private static func fileSize(_ path: URL) -> Int {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
-            return 0
-        }
-        return (attrs[.size] as? NSNumber)?.intValue ?? 0
-    }
-
-    /// Tail-trim to `keepLast` physical lines. Caller MUST hold the
-    /// events.jsonl flock. Mirrors ChatToolDispatchTracer.trimLocked.
-    private static func trimLocked(_ path: URL, keepLast: Int) {
-        guard let data = try? Data(contentsOf: path),
-              let text = String(data: data, encoding: .utf8) else { return }
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        if lines.last?.isEmpty == true { lines.removeLast() }
-        guard lines.count > keepLast else { return }
-        let trimmed = lines.suffix(keepLast).joined(separator: "\n") + "\n"
-        let tmp = path.appendingPathExtension("tmp")
-        defer { try? FileManager.default.removeItem(at: tmp) }
-        guard let out = trimmed.data(using: .utf8) else { return }
-        do {
-            try out.write(to: tmp, options: .atomic)
-            _ = try FileManager.default.replaceItemAt(path, withItemAt: tmp)
-        } catch {
-            FileHandle.standardError.write(
-                Data("LLMCallTraceRecorder: trace trim failed: \(error)\n".utf8)
-            )
-        }
-    }
 }

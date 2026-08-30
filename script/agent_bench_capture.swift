@@ -574,8 +574,8 @@ if !sessionFilter.isEmpty {
 // persist at `<dataRoot>/chat/messages/<sessionId>.jsonl`, one JSON object per
 // line with `role`, `content`, `createdAt`, `runId`, and — on assistant rows —
 // `metadata.turnTraceId`, which is the trace `turnId`. The user message for a
-// turn is therefore the nearest preceding `role == "user"` row before the
-// assistant row whose `turnTraceId` matches.
+// turn is the preceding user row with the assistant's runId. Only legacy
+// assistant rows without a runId may use the nearest preceding user row.
 func sessionMessagesPath(_ sessionId: String) -> String {
     dataRoot
         .appendingPathComponent("chat", isDirectory: true)
@@ -589,12 +589,12 @@ func userMessage(forTurn turnId: String, sessionId: String) -> (message: String,
     guard let stream = LineStream(path: sessionMessagesPath(sessionId)) else { return nil }
     var lastUser: (String, Int)?
     var matched: (String, Int)?
-    var matchedRunId: String?
+    var foundAssistant = false
     var runIdUser: [String: (String, Int)] = [:]
     var lineIndex = -1
     stream.forEachLine { raw in
         lineIndex += 1
-        guard matched == nil,
+        guard !foundAssistant,
               let object = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any],
               let role = object["role"] as? String else { return }
         let content = (object["content"] as? String) ?? ""
@@ -607,16 +607,18 @@ func userMessage(forTurn turnId: String, sessionId: String) -> (message: String,
         guard role == "assistant" else { return }
         let metadata = object["metadata"] as? [String: Any]
         if (metadata?["turnTraceId"] as? String) == turnId {
-            matched = lastUser
-            matchedRunId = runId
+            foundAssistant = true
+            if let runId, !runId.isEmpty {
+                // A later interleaved user message is not this turn's input.
+                // Never recover from rows after the matched assistant either:
+                // those were not available when the source turn assembled.
+                matched = runIdUser[runId]
+            } else {
+                matched = lastUser
+            }
         }
     }
     if let matched, !matched.0.isEmpty { return (matched.0, matched.1) }
-    // Fallback: the assistant row exists but the preceding user row was
-    // compacted away — recover through the shared runId when we have one.
-    if let matchedRunId, let viaRun = runIdUser[matchedRunId], !viaRun.0.isEmpty {
-        return (viaRun.0, viaRun.1)
-    }
     return nil
 }
 

@@ -408,6 +408,15 @@ extension SwiftToolDispatcher {
             if let desc { props.append(("description", .string(desc))) }
             return obj(props)
         }
+        // Recall has mutually exclusive search/page fields. Responses may
+        // require every property on the wire, so unused fields must admit
+        // null rather than forcing invented strings or integer placeholders.
+        func nullableRecallField(_ schema: JSONValue) -> JSONValue {
+            guard case .object(var properties) = schema,
+                  case .string(let type)? = properties["type"] else { return schema }
+            properties["type"] = .array([.string(type), .string("null")])
+            return .object(properties)
+        }
         func enumStringSchema(_ values: [String], _ desc: String? = nil) -> JSONValue {
             var props: [(String, JSONValue)] = [
                 ("type", .string("string")),
@@ -416,8 +425,14 @@ extension SwiftToolDispatcher {
             if let desc { props.append(("description", .string(desc))) }
             return obj(props)
         }
-        func intSchema(_ desc: String? = nil) -> JSONValue {
+        func intSchema(
+            _ desc: String? = nil,
+            minimum: Int? = nil,
+            maximum: Int? = nil
+        ) -> JSONValue {
             var props: [(String, JSONValue)] = [("type", .string("integer"))]
+            if let minimum { props.append(("minimum", .int(Int64(minimum)))) }
+            if let maximum { props.append(("maximum", .int(Int64(maximum)))) }
             if let desc { props.append(("description", .string(desc))) }
             return obj(props)
         }
@@ -426,8 +441,14 @@ extension SwiftToolDispatcher {
             if let desc { props.append(("description", .string(desc))) }
             return obj(props)
         }
-        func numSchema(_ desc: String? = nil) -> JSONValue {
+        func numSchema(
+            _ desc: String? = nil,
+            minimum: Double? = nil,
+            maximum: Double? = nil
+        ) -> JSONValue {
             var props: [(String, JSONValue)] = [("type", .string("number"))]
+            if let minimum { props.append(("minimum", .double(minimum))) }
+            if let maximum { props.append(("maximum", .double(maximum))) }
             if let desc { props.append(("description", .string(desc))) }
             return obj(props)
         }
@@ -502,6 +523,26 @@ extension SwiftToolDispatcher {
             // in practice. Fail-soft to `{}` to avoid crashing the chat turn.
             return (try? v.serializedData(pretty: false)) ?? Data("{}".utf8)
         }
+        func nonEmptyStringSchema(_ description: String) -> JSONValue {
+            obj([
+                ("type", .string("string")),
+                ("minLength", .int(1)),
+                ("description", .string(description)),
+            ])
+        }
+        func conversationModeSchema() -> JSONValue {
+            enumStringSchema(
+                ["new", "resume"],
+                "Choose new for unrelated work and omit conversation_id. Choose resume only for a contextual follow-up and pass the exact conversationId returned by this same tool. Omit this field for backward-compatible inference."
+            )
+        }
+        func conversationReferenceSchema(_ agent: String, _ tool: String) -> JSONValue {
+            strSchema(
+                "Resume only: exact \(agent):… conversationId returned by an earlier \(tool). "
+                + "For new work omit this field, or send an empty string when the caller serializes every optional field. "
+                + "Never invent a placeholder and never pass the originating chat session id."
+            )
+        }
 
         var schemas: [LLMToolSchema?] = [
             requestedSchema(
@@ -515,17 +556,9 @@ extension SwiftToolDispatcher {
                     required: ["path"]
                 )
             ),
-            requestedSchema(
-                name: "context_expand",
-                description: "Read one deeper context section offered for this turn. The atom id must come from the current context pointer list; expansion is read-only and pinned to this turn's immutable generation.",
-                parametersJSON: params(
-                    properties: [
-                        ("atom_id", strSchema("Atom id from the current turn's offered context pointers.")),
-                        ("max_characters", intSchema("Optional bounded character limit.")),
-                    ],
-                    required: ["atom_id"]
-                )
-            ),
+            requestedNames?.contains("context_expand") != false
+                ? TurnToolSchemaCatalogSeed.canonicalContextExpandSchema
+                : nil,
             requestedSchema(
                 name: "list_dir",
                 description: "List a workspace or user-approved directory. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace. Use persona_read/list_skills for persona or skill material instead of browsing NativeAgent's private data root. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths.",
@@ -548,24 +581,32 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "recall_memory",
-                description: "Search the assistant's long-term memory for relevant facts about the user or prior conversation context. Returns clean fact text with scores and memory ids; storage timestamps stay internal unless the fact itself is date-critical.",
+                description: "Search long-term memory with query (optional k), or recover an excerpt by exact memory_id with offset/max_characters. Use exactly one mode; set unused fields to null. ID pages return at most 2000 characters. Follow read_more with expected_content_sha256 to keep pages on one text version; record_changed means discard earlier pages and restart at 0. Only currently eligible, disclosed records are readable.",
                 parametersJSON: params(
                     properties: [
-                        ("query", strSchema()),
-                        ("k", intSchema("max results, default 5")),
+                        ("query", nullableRecallField(strSchema("Search text; null in ID page mode."))),
+                        ("k", nullableRecallField(intSchema("Search result count, default 5; null in ID page mode."))),
+                        ("memory_id", nullableRecallField(strSchema("Exact id from a recall hit; null in search mode. Set query/k to null when paging."))),
+                        ("offset", nullableRecallField(intSchema("ID mode only: character offset, default 0; follow next_offset. Null in search mode."))),
+                        ("max_characters", nullableRecallField(intSchema("ID mode only: positive page size, capped at 2000. Null in search mode."))),
+                        ("expected_content_sha256", nullableRecallField(strSchema("ID mode: content_sha256 from the previous page, supplied by read_more. Null for a first page or search. A mismatch returns record_changed without text."))),
                     ],
-                    required: ["query"]
+                    required: []
                 )
             ),
             requestedSchema(
                 name: "recall_search",
-                description: "Compatibility alias for recall_memory. Search the assistant's Swift-native long-term memory for relevant clean facts.",
+                description: "Compatibility alias for recall_memory. Use query (optional k) to search, OR memory_id with offset/max_characters to recover bounded pages of one eligible fact. Never mix the two modes; set unused fields to null. Follow read_more with expected_content_sha256 until next_offset is null; on record_changed discard earlier pages and restart at 0.",
                 parametersJSON: params(
                     properties: [
-                        ("query", strSchema()),
-                        ("k", intSchema("max results, default 5")),
+                        ("query", nullableRecallField(strSchema("Search text; null in ID page mode."))),
+                        ("k", nullableRecallField(intSchema("Search result count, default 5; null in ID page mode."))),
+                        ("memory_id", nullableRecallField(strSchema("Exact id from a recall hit; null in search mode. Set query/k to null when paging."))),
+                        ("offset", nullableRecallField(intSchema("ID mode only: character offset, default 0; follow next_offset. Null in search mode."))),
+                        ("max_characters", nullableRecallField(intSchema("ID mode only: positive page size, capped at 2000. Null in search mode."))),
+                        ("expected_content_sha256", nullableRecallField(strSchema("ID mode: content_sha256 from the previous page, supplied by read_more. Null for a first page or search. A mismatch returns record_changed without text."))),
                     ],
-                    required: ["query"]
+                    required: []
                 )
             ),
             requestedSchema(
@@ -588,8 +629,9 @@ extension SwiftToolDispatcher {
                         ("session_id", strSchema("Optional session id to restrict search to one chat, e.g. a Mac, iOS, or telegram session id.")),
                         ("scope", strSchema("Search scope: auto/current_session_first (default), current_session, or all_sessions.")),
                         ("role", strSchema("Optional role filter: user, assistant, tool, or system.")),
-                        ("mode", strSchema("Search mode: hybrid (default) token/phrase match, or exact for exact substring only.")),
-                        ("limit", intSchema("max results, default 8, capped at 25")),
+                        ("mode", strSchema("hybrid (default), exact substring, or continuity. Use continuity when asked to resume/revisit a conversation: up to four hits include bounded neighboring user/assistant messages so decisions and corrections retain context. Nothing is retrieved until you invoke this tool.")),
+                        ("limit", intSchema("results per page, default 8, capped at 12; refine the query before paging")),
+                        ("offset", intSchema("result offset for a follow-up page; omit on the first search")),
                     ],
                     required: ["query"]
                 )
@@ -603,8 +645,9 @@ extension SwiftToolDispatcher {
                         ("session_id", strSchema("Optional session id to restrict search to one chat.")),
                         ("scope", strSchema("Search scope: auto/current_session_first (default), current_session, or all_sessions.")),
                         ("role", strSchema("Optional role filter: user, assistant, tool, or system.")),
-                        ("mode", strSchema("Search mode: hybrid (default) or exact.")),
-                        ("limit", intSchema("max results, default 8, capped at 25")),
+                        ("mode", strSchema("hybrid (default), exact, or continuity (up to four hits with bounded neighboring messages for requested conversation resumption).")),
+                        ("limit", intSchema("results per page, default 8, capped at 12; refine the query before paging")),
+                        ("offset", intSchema("result offset for a follow-up page; omit on the first search")),
                     ],
                     required: ["query"]
                 )
@@ -656,13 +699,19 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "agent_introspect",
-                description: "Return the live Swift-native agent runtime status, active tool names, persona/data roots, and MCP bridge count. Use this to verify tool dispatch is actually working.",
-                parametersJSON: params(properties: [], required: [])
+                description: "Return compact live Swift-native runtime, provider, and conversation identity. Use tool_catalog for tool names. Request detail=full only for diagnostic roots, MCP names, and the seven-day outcome population audit.",
+                parametersJSON: params(
+                    properties: [("detail", strSchema("compact (default) or full diagnostic projection"))],
+                    required: []
+                )
             ),
             requestedSchema(
                 name: "daemon_introspect",
                 description: "Compatibility alias for agent_introspect. It is backed by the Swift runtime; no external runtime is used.",
-                parametersJSON: params(properties: [], required: [])
+                parametersJSON: params(
+                    properties: [("detail", strSchema("compact (default) or full diagnostic projection"))],
+                    required: []
+                )
             ),
             requestedSchema(
                 name: "tool_catalog",
@@ -1484,7 +1533,7 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "claude_message",
-                description: "Send a message to Claude (Claude Code CLI running locally) AND wake her to work on it now. The message is durably queued, then a headless Claude Code session works it and returns a '[claude-wake] Automated completion event'. The first send returns conversationId. To answer her question, request a change, or continue the same work with full Claude context, call claude_message again with that exact value in conversation_id. Omit conversation_id only for genuinely new work. Completion receipts should not trigger reflexive acknowledgments.",
+                description: "Send a message to Claude (Claude Code CLI running locally) AND wake her to work on it now. Set conversation_mode=new and omit conversation_id for unrelated work; set conversation_mode=resume and pass this tool's exact returned conversationId only for a contextual follow-up. A new coding conversation receives its own Git worktree and a resume reuses it. The message is durably queued, then a headless Claude Code session works it and returns a '[claude-wake] Automated completion event'. Completion receipts should not trigger reflexive acknowledgments.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The message to Claude — full prose, no markdown headers needed. Be specific about the requested work or review.")),
@@ -1497,9 +1546,12 @@ extension SwiftToolDispatcher {
                             ])),
                             ("description", .string("How prominently to surface this to Claude. 'info' = goes in the digest. 'important' = highlighted. 'urgent' = surfaces with a 🚨 tag.")),
                         ])),
-                        ("topic", strSchema("Optional short topic tag (e.g. 'bug-music-tcc', 'review-needed') so Claude can group related messages.")),
-                        ("conversation_id", strSchema("Exact claude:… conversationId from an earlier claude_message. Passing it resumes that same Claude Code session; omit it to start a new conversation.")),
-                        ("working_directory", strSchema("Optional existing absolute project directory for this Claude Code session. Canonical NativeAgent workspace/source paths work normally; any other directory requires active Full Mac YOLO with outside-workspace access allowed. Use the real target project for coding work instead of leaving Claude in NativeAgent's scratch workspace.")),
+                        ("conversation_mode", conversationModeSchema()),
+                        ("topic", strSchema("Optional short topic tag for new work only (e.g. 'bug-music-tcc'). Omit on resume; the conversationId already owns the topic.")),
+                        ("conversation_id", conversationReferenceSchema("claude", "claude_message")),
+                        ("pair_reviewer", boolSchema("Set true for an implementation dispatch that needs one paired reviewer. The builder pairs that reviewer at the start, commits before review, gives the reviewer the exact committed SHA, receives findings back, and remains responsible for fixes. Omit for notes, questions, and review-only work.")),
+                        ("desk_item", nonEmptyStringSchema("Optional exact live Desk number or handle this delegated work belongs to. NativeAgent binds terminal execution and delivery evidence back to that item.")),
+                        ("working_directory", strSchema("Optional existing absolute project directory for a new Claude Code conversation. Canonical NativeAgent workspace/source paths work normally; any other directory requires active Full Mac YOLO with outside-workspace access allowed. Follow-ups reuse their assigned private worktree and reject a conflicting directory.")),
                         ("timeout_seconds", intSchema("Optional wall-clock budget for Claude's spawned session, clamped 60-3600. Default 900. Build-sized work orders (multi-file Swift changes, test suites) MUST pass a larger value: 900s has killed real sessions mid-build.")),
                     ],
                     required: ["text"]
@@ -1507,7 +1559,7 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "omp_message",
-                description: "Send an asynchronous task to the local OMP CLI harness (Kimi K3). The message is durably queued and the final reply or honest failure/timeout receipt returns as an '[omp-wake] Automated completion event'. The first send returns conversationId. To continue the same work with full OMP context, call omp_message again with that exact value in conversation_id. Omit conversation_id only for genuinely new work.",
+                description: "Send an asynchronous task to the local OMP CLI harness (Kimi K3). Set conversation_mode=new and omit conversation_id for unrelated work; set conversation_mode=resume and pass this tool's exact returned conversationId only for a contextual follow-up. A new coding conversation receives its own Git worktree and a resume reuses it. The final reply or honest failure/timeout receipt returns as an '[omp-wake] Automated completion event'.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The complete task or question for OMP.")),
@@ -1516,9 +1568,11 @@ extension SwiftToolDispatcher {
                             ("enum", .array([.string("info"), .string("important"), .string("urgent")])),
                             ("description", .string("Receipt prominence.")),
                         ])),
-                        ("topic", strSchema("Short stable topic tag. Reusing it resumes the same OMP session.")),
-                        ("conversation_id", strSchema("Exact omp:… conversationId from an earlier omp_message. Passing it resumes that same OMP session; omit it to start a new conversation.")),
-                        ("working_directory", strSchema("Optional existing absolute project directory. External paths require Full Mac YOLO with outside-workspace access allowed.")),
+                        ("conversation_mode", conversationModeSchema()),
+                        ("topic", strSchema("Optional short stable topic for new work. Omit on resume; the conversationId already owns the topic.")),
+                        ("conversation_id", conversationReferenceSchema("omp", "omp_message")),
+                        ("desk_item", nonEmptyStringSchema("Optional exact live Desk number or handle this delegated work belongs to. NativeAgent binds terminal execution and delivery evidence back to that item.")),
+                        ("working_directory", strSchema("Optional existing absolute project directory for a new OMP conversation. External paths require Full Mac YOLO with outside-workspace access allowed. Follow-ups reuse their assigned private worktree and reject a conflicting directory.")),
                         ("timeout_seconds", intSchema("OMP wall-clock guard, clamped 60-3600 seconds. Default 900.")),
                     ],
                     required: ["text"]
@@ -1571,7 +1625,7 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "codex_message",
-                description: "Send an asynchronous note/task to Codex. NativeAgent durably queues it, starts or queues a Codex app-server turn, and returns Codex's final answer through the local bridge. The first successful wake returns conversationId. To answer Codex's question, request a change, or continue the same work with the exact Codex thread context, call codex_message again with that value in conversation_id. Omit conversation_id only for genuinely new work.",
+                description: "Send an asynchronous note/task to Codex. Set conversation_mode=new and omit conversation_id for unrelated work; set conversation_mode=resume and pass this tool's exact returned conversationId only for a contextual follow-up. A new coding conversation receives its own Git worktree and a resume reuses it. NativeAgent durably queues the task, starts or queues a Codex app-server turn, and returns Codex's final answer through the local bridge.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The message to Codex. Include enough context to be useful in a later Codex session.")),
@@ -1584,8 +1638,16 @@ extension SwiftToolDispatcher {
                             ])),
                             ("description", .string("How prominently to surface this in the Codex bridge inbox.")),
                         ])),
-                        ("topic", strSchema("Optional short topic tag, e.g. 'nativeagent-build' or 'review-needed'.")),
-                        ("conversation_id", strSchema("Exact codex:… conversationId from an earlier codex_message. Passing it resumes that exact Codex app-server thread; omit it to start a new conversation.")),
+                        ("conversation_mode", conversationModeSchema()),
+                        ("topic", strSchema("Optional short topic tag for new work. Omit on resume; the conversationId already owns the thread.")),
+                        ("conversation_id", conversationReferenceSchema("codex", "codex_message")),
+                        ("completion_mode", obj([
+                            ("type", .string("string")),
+                            ("enum", .array([.string("report"), .string("receipt_only")])),
+                            ("description", .string("How Codex's terminal result returns. Use report for delegated work or a question whose answer Agent must assess. Use receipt_only for a one-way acknowledgment, status note, approval, or handoff that should settle durably without creating another chat turn. Defaults to report.")),
+                        ])),
+                        ("pair_reviewer", boolSchema("Set true for an implementation dispatch that needs one paired reviewer. The builder pairs that reviewer at the start, commits before review, gives the reviewer the exact committed SHA, receives findings back, and remains responsible for fixes. Omit for notes, questions, and review-only work.")),
+                        ("desk_item", nonEmptyStringSchema("Optional exact live Desk number or handle this delegated work belongs to. NativeAgent binds terminal execution and delivery evidence back to that item.")),
                         ("model", obj([
                             ("type", .string("string")),
                             ("enum", .array([
@@ -1608,8 +1670,8 @@ extension SwiftToolDispatcher {
                             ("description", .string("Optional thinking level for this task. Sol/Terra support Low through Ultra; Luna supports Low through Max.")),
                         ])),
                         ("fast", boolSchema("Optional Fast mode for this task. true selects Codex priority service; false selects default service.")),
-                        ("working_directory", strSchema("Optional existing absolute project directory for this Codex session. Canonical NativeAgent workspace/source paths work normally; any other directory requires active Full Mac YOLO with outside-workspace access allowed. Use this for local projects that are not represented by an owner/name GitHub remote.")),
-                        ("repository", strSchema("Optional GitHub repository as 'owner/name' (never a filesystem path) when this task is work on a local checkout. NativeAgent resolves it to a local clone whose git remote actually points at that repository and runs Codex there with repository network access. Omit for ordinary messages; an unknown repository is ignored rather than failing the send.")),
+                        ("working_directory", strSchema("Optional existing absolute project directory for a new Codex conversation. Canonical NativeAgent workspace/source paths work normally; any other directory requires active Full Mac YOLO with outside-workspace access allowed. Follow-ups reuse their assigned private worktree and reject a conflicting directory.")),
+                        ("repository", strSchema("New work only: optional GitHub repository as 'owner/name' (never a filesystem path). NativeAgent resolves it to a local clone whose git remote actually points at that repository and runs Codex there with repository network access. Omit or send an empty string on resume because the saved conversation owns its checkout; any repository hint on a resume is ignored. An unknown repository is ignored rather than failing the send.")),
                     ],
                     required: ["text"]
                 )
@@ -1845,6 +1907,7 @@ extension SwiftToolDispatcher {
                         // R13: first-class correction lineage.
                         ("corrects", strSchema("Optional id of an existing memory this new fact CORRECTS (e.g. from recall_memory). The old memory is marked lifecycle=corrected with a lineage link to this one and drops out of recall.")),
                         ("correction_reason", strSchema("Optional one-line reason the old memory was wrong (stored on the corrected row's lineage).")),
+                        ("context_topics", stringArraySchema("For kind=correction only: 1–8 explicit topic/project phrases, at most 120 characters each. Use only when the user's correction is limited to those topics. Omit for global instructions/boundaries; never invent a scope to weaken them. This limits automatic injection, not explicit recall.")),
                     ],
                     required: ["text"]
                 )
@@ -1921,11 +1984,22 @@ extension SwiftToolDispatcher {
             // catalog-visible, LAZY-LOADED, safe_read/.low.
             requestedSchema(
                 name: "delegation_status",
-                description: "Check on work you delegated to Claude (Claude Code) or Codex: lists the newest wake-job records with their real lifecycle timestamps — created / claimed / started / last liveness / completed, elapsed seconds, and whether the runner's own deadline or stall threshold has been exceeded. Use this BEFORE reporting a job as stuck or asking whether something finished; the job files are the ground truth. Read-only. `stall_basis` names the evidence behind `stalled` — \"none\" means the record carries no deadline or stall threshold, so the job is unmeasurable, not verified healthy.",
+                description: "Read delegated work evidence. By default lists bridge jobs for Claude (Claude Code), Codex, and OMP with real lifecycle timestamps and current-build delivery uncertainty. Set message_id to the exact accepted messageId to find its recorded work, including batched Codex jobs. For a native swarm, set agent='swarm' and its exact run_id: returns compact report descriptors; select report_id to page one retained worker/synthesis report, never rerunning work. Discarded original text is not recoverable. Bridge stall_basis='none' means unmeasurable, not verified healthy.",
                 parametersJSON: params(
                     properties: [
-                        ("limit", intSchema("How many recent jobs to return, newest first. Default 20, max 100.")),
-                        ("agent", strSchema("Optional filter: 'claude' (or 'claude') for the Claude Code bridge, 'codex' for the Codex bridge. Omit for both.")),
+                        ("limit", intSchema("Bridge jobs per page: default 8, max 12. With agent='swarm' and report_id: retained text characters per page, default/max 2000.")),
+                        ("offset", intSchema("Bridge result offset, or character offset within the selected swarm report. Follow next_offset; omit on first page.")),
+                        ("agent", strSchema("Optional bridge filter: claude/claude, codex, omp/kimi. Omit for all bridges. Set swarm with exact run_id to inspect a native swarm receipt.")),
+                        ("message_id", obj([
+                            ("type", .array([.string("string"), .string("null")])),
+                            ("description", .string("Bridge mode only: exact accepted messageId from claude_message, codex_message, or omp_message, up to 160 characters. Filters recorded identities before paging; never matches topic or filename. Omit, null, or empty for ordinary listing. Missing evidence does not prove work never ran.")),
+                        ])),
+                        ("run_id", strSchema("Required only for agent='swarm': exact id returned by agent_swarm. This is an identifier, never a file path.")),
+                        ("report_id", obj([
+                            ("type", .array([.string("string"), .string("null")])),
+                            ("description", .string("For agent='swarm': exact worker report_id from descriptors, or synthesis. Omit, null, or empty for metadata only; provide to page retained output/error text.")),
+                        ])),
+                        ("detail", strSchema("Bridge compact (default) or full lifecycle metadata. Native swarm bodies require report_id; full alone still returns only compact descriptors.")),
                     ],
                     required: []
                 )
@@ -1947,17 +2021,19 @@ extension SwiftToolDispatcher {
             // always-on catalog block, LAZY-LOADED (NOT alwaysOnCoreNames).
             requestedSchema(
                 name: "desk_read",
-                description: "Read your Desk — the durable, compact view of everything the user told you to track (watches, plans, projects, GitHub items, standing concerns) with their status, cadence, and key refs. Returns the rendered projection text. Set include_archived to also list closed-out archived items. Read-only.",
+                description: "Read your Desk — the durable, compact view of what the user told you to track (watches, plans, projects, GitHub items, standing concerns) with status, cadence, and key refs. The default projection is bounded and reports when rows are omitted. Use handle for one exact live item (stable handle or visible alias), or query to search title, summary, project, alias, and handle across the full live store. Set include_archived to append closed-out archived items. Read-only.",
                 parametersJSON: params(
                     properties: [
                         ("include_archived", boolSchema("Also append a compact list of archived (closed-out) items. Default false.")),
+                        ("handle", strSchema("Optional exact live Desk handle or visible alias. Mutually exclusive with query.")),
+                        ("query", strSchema("Optional case-insensitive text search across the full live Desk. Mutually exclusive with handle; returns at most 25 matches.")),
                     ],
                     required: []
                 )
             ),
             requestedSchema(
                 name: "desk_add_item",
-                description: "Add a new item to your Desk. kind: watch | plan | project | gh | standing. Provide a project bucket and a short title; optionally nest under a parent (its handle) and add a one-line summary. Returns the new stable handle and its view alias (e.g. \"2\" or \"2.1\").",
+                description: "Add a new item to your Desk. kind: watch | plan | project | gh | standing. Provide a project bucket and a short title; optionally nest under a parent, name the delegated assignee, and link a lane to its program item with lane_of. A same-title/project/parent live item is returned with disposition=existing instead of silently creating a second owner; set allow_duplicate=true only when two equivalent live items are intentional. When delegating work, set assignee and lane_of here rather than burying them in prose. Returns status=ok, created, disposition, the stable handle, and view alias (e.g. \"2\" or \"2.1\").",
                 parametersJSON: params(
                     properties: [
                         ("kind", strSchema("Item kind: watch | plan | project | gh | standing.")),
@@ -1965,19 +2041,35 @@ extension SwiftToolDispatcher {
                         ("title", strSchema("Short item title.")),
                         ("parent", strSchema("Optional parent item handle to nest this item under.")),
                         ("summary", strSchema("Optional one-line summary.")),
+                        ("assignee", strSchema("Optional freeform delegation assignee, such as codex, claude, or agent.")),
+                        ("lane_of", strSchema("Optional parent program item handle (or visible alias) whose delegated lane this item represents. Projection metadata only; it does not change Desk hierarchy.")),
+                        ("allow_duplicate", boolSchema("Explicitly create a second equivalent live item instead of reusing the existing owner. Default false.")),
                     ],
                     required: ["kind", "project", "title"]
                 )
             ),
             requestedSchema(
                 name: "desk_set_status",
-                description: "Set a Desk item's status. status: watch | flag | now | next | todo | done | blocked | canceled. For blocked, pass blocked_reason and/or waiting_on. Returns the refreshed alias + status + title.",
+                description: "Set a Desk item's status. When fresh canonical evidence proves the exact tracked defect or outcome resolved, update that exact item in the same turn; never close from fuzzy title similarity, a merely completed execution, or an unattributed commit. status: watch | flag | now | next | todo | done | blocked | canceled. For blocked, pass blocked_reason and/or waiting_on. When assigning or updating a delegated lane, include assignee and lane_of; omitted metadata preserves its current value. When reporting concrete batch progress, include progress={done,total,note?}; omit it when no honest progress exists (the Desk never invents 0%). Returns the refreshed alias + status + title.",
                 parametersJSON: params(
                     properties: [
                         ("handle", strSchema("The item's stable handle.")),
                         ("status", strSchema("New status: watch | flag | now | next | todo | done | blocked | canceled.")),
                         ("blocked_reason", strSchema("Why it's blocked (when status=blocked).")),
                         ("waiting_on", strSchema("What/who it's waiting on (when status=blocked).")),
+                        ("assignee", strSchema("Optional assignee update for this existing item. Omitted or blank values preserve the current value; this field cannot clear an assignment.")),
+                        ("lane_of", strSchema("Optional live parent program handle (or visible alias) update for this existing lane. Omitted or blank values preserve the current value; this field cannot clear a lane link. Never use the item's own handle.")),
+                        ("progress", obj([
+                            ("type", .string("object")),
+                            ("description", .string("Optional explicit progress. Requires 0 <= done <= total and total > 0; omit when unknown.")),
+                            ("properties", obj([
+                                ("done", intSchema("Completed units.")),
+                                ("total", intSchema("Total units; must be greater than zero.")),
+                                ("note", strSchema("Optional concise progress note.")),
+                            ])),
+                            ("required", .array([.string("done"), .string("total")])),
+                            ("additionalProperties", .bool(false)),
+                        ])),
                     ],
                     required: ["handle", "status"]
                 )
@@ -2061,7 +2153,7 @@ extension SwiftToolDispatcher {
             ),
             requestedSchema(
                 name: "desk_close",
-                description: "Close out a Desk item with an outcome summary. Sets status to done (or canceled when canceled=true). The item stays visible briefly, then becomes archive-eligible.",
+                description: "Close out an exact Desk item after fresh canonical evidence verifies its tracked outcome. Include the specific commit, receipt, or observed result in outcome_summary; never close from fuzzy title similarity, execution completion alone, or an unattributed commit. Sets status to done (or canceled when canceled=true). The item stays visible briefly, then becomes archive-eligible.",
                 parametersJSON: params(
                     properties: [
                         ("handle", strSchema("The item's stable handle.")),
@@ -2531,7 +2623,7 @@ extension SwiftToolDispatcher {
                     description: "Look at the live screen, right now, in words. One structured page: SCREEN (which app and window, whether it is front), WHERE (your position in the app's own navigation), the dominant content as a numbered LIST/GRID (the numbers are addresses — say 'row 3' to point at one) or CANVAS when part of the screen is not controls, DO (everything you can act on, with its state inline), SAYS (status text worth knowing). Nothing to hold and nothing expires: look again by calling again. Pass `part` to lean in — the same shape scoped to the section or thing you name ('the list', 'the toolbar', 'the Send button').",
                     parametersJSON: params(
                         properties: [
-                            ("part", strSchema("Optional: a section or thing to zoom into, by name.")),
+                            ("part", strSchema("Optional: a section, thing, or status readout to inspect by name. Use hud/readouts for observed status values, or a label such as Last drag or Energy to reveal a readout hidden by the ordinary display cap.")),
                         ],
                         required: []
                     )
@@ -2634,18 +2726,20 @@ extension SwiftToolDispatcher {
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "act",
-                    description: "Do something naturally, by NAME or visible ordinal, against a fresh fused screen. Semantic actions: click/open/type/select/toggle/scroll/dismiss. Physical actions: hover, move, drag (give `to`), hold, or key (target may be a bounded key/chord sequence such as `w`, `cmd+s`, or `1 2 3`; `hold` can target `key w`). Prominent unlabeled pixel objects appear in the same screen as numbered visual regions; they accept literal physical actions without being misrepresented as semantic controls. Use `repeat` for a short continuous burst: the target is freshly seen and re-resolved before every attempt, so moving visual targets are followed instead of reusing an old point. Use `holding` to keep one or more keys/modifiers down around a physical move, drag, click, scroll, or key action (for example hold `w d` while dragging a world view). Accessibility targets use the app's own action; coordinated or pixel-only actions use the bounded physical hand. Every result includes the fresh screen and counts which attempts had visible proof. Ambiguity or a vanished target stops the burst and touches nothing further. Needs active Full Mac Accessibility app control; there is no per-call approval.",
+                    description: "Do something naturally, by NAME or visible ordinal, against a fresh fused screen. Semantic actions: click/open/type/select/toggle/scroll/dismiss. Physical actions: hover, move, drag (give `to`), hold, or key (target may be a bounded key/chord sequence such as `w`, `cmd+s`, or `1 2 3`; `hold` can target `key w`). Prominent unlabeled pixel objects appear in the same screen as numbered visual regions; they accept literal physical actions without being misrepresented as semantic controls. Use `repeat` for a short continuous burst: the target is freshly seen and re-resolved before every attempt, so moving visual targets are followed instead of reusing an old point. Use `holding` to keep one or more keys/modifiers down around a physical move, drag, click, scroll, or key action (for example hold `w d` while dragging a world view). Accessibility targets use the app's own action; coordinated or pixel-only actions use the bounded physical hand. Burst results distinguish requested, accepted, planned, completed, visibly verified, elapsed, and runtime-limited work. Ambiguity, drift, a vanished target, or the elapsed boundary stops the burst before another action. Needs active Full Mac Accessibility app control; there is no per-call approval.",
                     parametersJSON: params(
                         properties: [
                             ("verb", enumStringSchema(["click", "open", "type", "select", "toggle", "scroll", "dismiss", "hover", "move", "drag", "hold", "key"], "What to do.")),
-                            ("target", strSchema("The thing, by name as the screen shows it — a label, a partial label, an ordinal like 'row 3', or a numbered unlabeled target like 'visual region 2'.")),
+                            ("target", strSchema("The thing, by name as the screen shows it — a label, a partial label, an ordinal like 'row 3', or a numbered unlabeled target like 'visual region 2'. For hold, `key w d` holds W and D simultaneously for seconds; space-separated keys/chords and bare modifiers are supported. For key, a space-separated sequence remains sequential.")),
                             ("text", strSchema("For `type`: the text to put in the target.")),
-                            ("direction", enumStringSchema(["up", "down"], "For `scroll`: which way to move.")),
+                            ("direction", enumStringSchema(["up", "down", "left", "right"], "For `scroll`: which way to move. Left/right sends horizontal wheel input.")),
+                            ("scroll_amount", intSchema("For scroll: wheel magnitude in lines, 1 for fine adjustment through120. Use0 (or omit) for ordinary/default behavior, including all non-scroll verbs. An explicit amount requests wheel input rather than page-key fallback.", minimum: 0, maximum: 120)),
                             ("to", strSchema("For `drag`: the named/numbered destination.")),
-                            ("seconds", numSchema("For `hover` or `hold`: bounded duration, at most 10 seconds.")),
-                            ("repeat", intSchema("Optional bounded burst count, 1-12. The target is freshly re-resolved before every attempt; total requested hold/dwell time is capped at 30 seconds.")),
-                            ("interval", numSchema("Optional pause between repeated attempts, 0-2 seconds.")),
-                            ("holding", strSchema("Optional keys/modifiers to keep physically down around a physical action, space-separated, such as `w d`, `shift`, or `cmd+w`. Not valid with `hold` or literal `type`.")),
+                            ("seconds", numSchema("For hover or hold: duration up to10 seconds. For drag: paced travel duration, bounded0.08–2 seconds;0/omission uses0.24 seconds. Drag duration controls movement, not two endpoint pauses.", minimum: 0, maximum: 10)),
+                            ("repeat", intSchema("Optional bounded burst count. The target is freshly re-resolved before every attempt; planning and real elapsed execution are capped at 30 seconds.", minimum: 1, maximum: 12)),
+                            ("interval", numSchema("Optional pause between repeated attempts.", minimum: 0, maximum: 2)),
+                            ("holding", strSchema("Optional keys/modifiers held around a physical action, such as `w d`, `shift`, or `cmd+w`. Works with pointer hold, including right-button hold while movement keys are down. Not valid with a keyboard hold (put all keys in its target) or literal type.")),
+                            ("button", enumStringSchema(["auto", "left", "right"], "Use auto for the ordinary/default action, including key, type, scroll, move, and hover. Use left or right only to request an explicit mouse button on click, open (double-click), drag, or pointer hold. Right drag sends genuine right-button events, not Control-left-drag. Omission is equivalent to auto.")),
                         ],
                         required: ["verb", "target"]
                     )

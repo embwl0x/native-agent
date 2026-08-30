@@ -114,6 +114,7 @@ function payloadFor(overrides = {}) {
     priority: "important",
     topic: "wake parity",
     queuedAt: "2026-07-25T12:00:00Z",
+    sessionId: "fixture-origin-session",
     inboxPath: "/tmp/claude-inbox.jsonl",
     ...overrides,
   };
@@ -127,6 +128,50 @@ function receipts(ctx) {
     .filter(Boolean)
     .map((line) => JSON.parse(line));
 }
+
+for (const exitCode of [0, 7]) {
+  test(`missing completion origin retains Claude ${exitCode ? "failed" : "completed"} work without posting or rerunning`, () => {
+    const ctx = makeRoot(`missing-origin-${exitCode}`);
+    const marker = path.join(ctx.root, "invocations.txt");
+    const bin = fakeClaude(ctx.root, "terminal", `echo ran >> "${marker}"\necho 'retained terminal evidence'\nexit ${exitCode}`);
+    const payload = payloadFor({ messageId: `missing-origin-${exitCode}`, sessionId: null });
+    const env = baseEnv(ctx, bin, { NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN: "0", NATIVE_AGENT_CLAUDE_WAKE_BRIDGE_URL: "invalid://never-contact" });
+    const result = runHelper(env, payload);
+    assert.equal(result.status, exitCode ? "failed" : "completed");
+    assert.equal(result.bridge.status, "blocked");
+    assert.equal(result.bridge.reason, "missing_origin_session");
+    assert.equal(result.bridge.deliveryAttempted, false);
+    assert.match(result.bridge.note, /do not rerun/);
+    assert.equal(result.deliveryLost, false);
+    const retained = readJob(ctx, payload.messageId);
+    assert.match(retained.completionText, /retained terminal evidence/);
+    const duplicate = runHelper(env, { ...payload, sessionId: "different-current-chat" });
+    assert.equal(duplicate.status, "blocked");
+    assert.equal(duplicate.reason, "missing_origin_session");
+    assert.equal(readJob(ctx, payload.messageId).completionText, retained.completionText);
+    assert.equal(readJob(ctx, payload.messageId).payload.sessionId, undefined);
+    assert.equal(markerLines(marker).length, 1);
+    assert.equal(receipts(ctx).length, 1);
+  });
+}
+
+test("missing route on legacy lost delivery blocks replay and preserves the original result", () => {
+  const ctx = makeRoot("legacy-missing-origin");
+  const file = jobFileFor(ctx, "legacy-missing");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const job = { messageId: "legacy-missing", state: "settled", status: "completed", deliveryLost: true,
+    completionText: "only retained result", payload: { messageId: "legacy-missing", text: "prior work" } };
+  fs.writeFileSync(file, JSON.stringify(job));
+  const marker = path.join(ctx.root, "must-not-run");
+  const bin = fakeClaude(ctx.root, "never", `echo ran > "${marker}"`);
+  const result = runHelper(baseEnv(ctx, bin, { NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN: "0" }),
+    payloadFor({ messageId: job.messageId, sessionId: null }));
+  assert.equal(result.reason, "missing_origin_session");
+  assert.equal(result.bridge.deliveryAttempted, false);
+  assert.equal(result.deliveryLost, false);
+  assert.equal(readJob(ctx, "legacy-missing").completionText, job.completionText);
+  assert.equal(fs.existsSync(marker), false);
+});
 
 // ---------------------------------------------------------------- pure units
 
@@ -206,6 +251,52 @@ test("duplicate messageId is skipped without spawning claude a second time", () 
   assert.equal(receipts(ctx).length, 1);
 });
 
+for (const state of ["missing", "empty", "unreadable"]) {
+  test(`explicit continuation never starts fresh when pointer is ${state}`, () => {
+    const ctx = makeRoot(`required-resume-${state}`);
+    const marker = path.join(ctx.root, "invocations.txt");
+    const bin = fakeClaude(ctx.root, "must-not-run", `echo invoked >> "${marker}"\necho accidental`);
+    const pointer = path.join(ctx.bridgeDir, "wake-sessions", "wake-parity.txt");
+    fs.mkdirSync(path.dirname(pointer), { recursive: true });
+    if (state === "empty") fs.writeFileSync(pointer, "\n");
+    if (state === "unreadable") fs.mkdirSync(pointer);
+    const payload = payloadFor({ messageId: `required-${state}`, requireExistingConversation: true });
+    const result = runHelper(baseEnv(ctx, bin), payload);
+    assert.equal(result.status, "failed");
+    assert.equal(result.reason, "continuation_unavailable");
+    assert.equal(result.sessionMode, "resume_unavailable");
+    assert.equal(result.selfHeal, null);
+    assert.match(result.wouldSendText, /No fresh conversation was started/);
+    const job = readJob(ctx, payload.messageId);
+    assert.equal(job.state, "settled");
+    assert.equal(job.payload.requireExistingConversation, true);
+    assert.equal(job.startedAt, undefined);
+    assert.equal(markerLines(marker).length, 0);
+    runHelper(baseEnv(ctx, bin), { ...payload, requireExistingConversation: false });
+    assert.equal(markerLines(marker).length, 0);
+    if (state === "missing") assert.equal(fs.existsSync(pointer), false);
+    if (state === "empty") assert.equal(fs.readFileSync(pointer, "utf8"), "\n");
+    if (state === "unreadable") assert.equal(fs.statSync(pointer).isDirectory(), true);
+  });
+}
+
+test("explicit resume session-not-found preserves pointer without fresh retry", () => {
+  const ctx = makeRoot("required-resume-gone");
+  const pointer = path.join(ctx.bridgeDir, "wake-sessions", "wake-parity.txt");
+  fs.mkdirSync(path.dirname(pointer), { recursive: true });
+  const original = `dead-session-id\n${ctx.cwd}\n`;
+  fs.writeFileSync(pointer, original);
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "gone", `echo "$1 $2" >> "${marker}"\necho 'Error: No conversation found with session ID dead-session-id' >&2\nexit 1`);
+  const result = runHelper(baseEnv(ctx, bin), payloadFor({ messageId: "required-gone", requireExistingConversation: true }));
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "continuation_unavailable");
+  assert.equal(result.selfHeal, null);
+  assert.deepEqual(markerLines(marker), ["--resume dead-session-id"]);
+  assert.equal(fs.readFileSync(pointer, "utf8"), original);
+  assert.deepEqual(fs.readdirSync(path.dirname(pointer)), ["wake-parity.txt"]);
+});
+
 test("first wake creates the topic pointer and the next wake resumes it", () => {
   const ctx = makeRoot("pointer");
   const marker = path.join(ctx.root, "invocations.txt");
@@ -232,6 +323,11 @@ test("first wake creates the topic pointer and the next wake resumes it", () => 
   assert.equal(invocations.length, 2);
   assert.equal(invocations[0], `--session-id ${first.sessionId}`);
   assert.equal(invocations[1], `--resume ${first.sessionId}`);
+
+  const explicit = runHelper(env, payloadFor({ messageId: "pointer-explicit", topic: "Wake Parity", requireExistingConversation: true }));
+  assert.equal(explicit.status, "completed");
+  assert.equal(explicit.sessionMode, "resume");
+  assert.equal(explicit.sessionId, first.sessionId);
 
   // A different topic gets its own pointer and its own session.
   const other = runHelper(env, payloadFor({ messageId: "pointer-3", topic: "other work" }));
@@ -441,40 +537,134 @@ test("detached mode claims the job and returns before the turn finishes", () => 
 
 // ------------------------------------------------------- recovery / takeover
 
-test("a job whose runner pid is dead is taken over instead of poisoning the messageId", () => {
+test("a durably unstarted job whose runner died is recovered with its original payload", () => {
   const ctx = makeRoot("dead-pid");
   const marker = path.join(ctx.root, "invocations.txt");
   const bin = fakeClaude(ctx.root, "ok", `echo "$1 $2" >> "${marker}"\necho "recovered answer"`);
   const jobsDir = path.join(ctx.bridgeDir, "wake-jobs");
   fs.mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
 
-  // A runner that claimed the job and then died (crash / SIGKILL / sleep):
-  // state still says running, heartbeat is fresh, but the pid is gone.
+  // Schema2 queued phase proves the child never admitted a Claude attempt.
   // 999999 is above macOS's pid ceiling, so process.kill(pid, 0) is ESRCH.
   // Timestamps are aged past the spawn-grace window (default 30s) so this is a
   // GENUINELY orphaned claim, not a parent/child handoff still in flight.
   const payload = payloadFor({ messageId: "dead-pid-1" });
   fs.writeFileSync(jobFileFor(ctx, "dead-pid-1"), JSON.stringify({
+    schemaVersion: 2,
     messageId: "dead-pid-1",
+    claimId: "unstarted-claim",
     createdAt: new Date(Date.now() - 120_000).toISOString(),
     heartbeatAt: new Date(Date.now() - 120_000).toISOString(),
-    state: "running",
+    state: "queued",
     pid: 999999,
     topicSlug: "wake-parity",
     timeoutSeconds: 900,
     payload,
   }, null, 2), { mode: 0o600 });
 
-  const result = runHelper(baseEnv(ctx, bin), payload);
+  const result = runHelper(baseEnv(ctx, bin), { ...payload, text: "replacement text must not replace accepted brief" });
 
   assert.equal(result.status, "completed");
-  assert.equal(result.takeover.reason, "runner_pid_dead");
+  assert.equal(result.takeover.reason, "unstarted_owner_dead");
   assert.equal(markerLines(marker).length, 1, "the takeover must actually run the wake");
   // The dead job is renamed aside, never deleted.
   const stale = fs.readdirSync(jobsDir).filter((name) => name.startsWith("dead-pid-1.json.stale-"));
   assert.equal(stale.length, 1, `expected one renamed-aside job, saw ${JSON.stringify(fs.readdirSync(jobsDir))}`);
   assert.equal(JSON.parse(fs.readFileSync(path.join(jobsDir, stale[0]), "utf8")).pid, 999999);
   assert.equal(readJob(ctx, "dead-pid-1").state, "settled");
+  assert.equal(readJob(ctx, "dead-pid-1").payload.text, payload.text);
+});
+
+test("dead running Claude effects stay unknown while an explicit new message remains allowed", () => {
+  const ctx = makeRoot("running-unknown");
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "ok", `echo ran >> "${marker}"\necho "new authorized work"`);
+  fs.mkdirSync(path.join(ctx.bridgeDir, "wake-jobs"), { recursive: true });
+  const payload = payloadFor({ messageId: "running-unknown" });
+  const file = jobFileFor(ctx, payload.messageId);
+  const original = JSON.stringify({
+    schemaVersion: 2, messageId: payload.messageId, claimId: "original-claim",
+    state: "running", pid: 999999, runnerPid: 999998,
+    startedAt: "2026-08-01T00:00:00Z", attemptSessionId: "original-session", payload,
+  });
+  fs.writeFileSync(file, original, { mode: 0o600 });
+  const held = runHelper(baseEnv(ctx, bin), payload);
+  assert.equal(held.reason, "execution_outcome_unknown");
+  assert.equal(held.executionOutcome, "unknown");
+  assert.equal(fs.readFileSync(file, "utf8"), original);
+  assert.equal(markerLines(marker).length, 0);
+  const fresh = runHelper(baseEnv(ctx, bin), payloadFor({ messageId: "explicit-new-work" }));
+  assert.equal(fresh.status, "completed");
+  assert.equal(markerLines(marker).length, 1);
+});
+
+test("new-schema unstarted and proven spawn-failed Claude jobs retain recovery", () => {
+  for (const state of ["claimed", "spawn_failed"]) {
+    const ctx = makeRoot(`unstarted-${state}`);
+    const marker = path.join(ctx.root, "invocations.txt");
+    const bin = fakeClaude(ctx.root, "ok", `echo ran >> "${marker}"\necho "recovered"`);
+    fs.mkdirSync(path.join(ctx.bridgeDir, "wake-jobs"), { recursive: true });
+    const payload = payloadFor({ messageId: `unstarted-${state}` });
+    fs.writeFileSync(jobFileFor(ctx, payload.messageId), JSON.stringify({
+      schemaVersion: 2, messageId: payload.messageId, claimId: "unstarted-claim",
+      state, pid: 999999, createdAt: new Date().toISOString(), payload,
+    }), { mode: 0o600 });
+    const result = runHelper(baseEnv(ctx, bin), payload);
+    assert.equal(result.status, "completed");
+    assert.equal(result.takeover.reason, "unstarted_owner_dead");
+    assert.equal(markerLines(marker).length, 1);
+  }
+});
+
+test("concurrent recovery of one unstarted Claude claim admits only one worker", async () => {
+  const ctx = makeRoot("recovery-race");
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "ok", `echo ran >> "${marker}"\nsleep 0.2\necho "one result"`);
+  const jobs = path.join(ctx.bridgeDir, "wake-jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  const payload = payloadFor({ messageId: "recovery-race" });
+  fs.writeFileSync(jobFileFor(ctx, payload.messageId), JSON.stringify({
+    schemaVersion: 2, messageId: payload.messageId, claimId: "dead-claim",
+    state: "queued", pid: 999999, runnerPid: 999998, payload,
+  }), { mode: 0o600 });
+  const results = await Promise.all([
+    runHelperAsync(baseEnv(ctx, bin), payload),
+    runHelperAsync(baseEnv(ctx, bin), payload),
+  ]);
+  assert.equal(results.filter((result) => result.status === "completed").length, 1);
+  assert.equal(results.filter((result) => result.status === "skipped").length, 1);
+  assert.equal(markerLines(marker).length, 1);
+  assert.equal(fs.readdirSync(jobs).filter((name) => name.startsWith("recovery-race.json.stale-")).length, 1);
+});
+
+test("Claude does not invoke Claude when durable execution admission cannot be written", () => {
+  const ctx = makeRoot("admission-write-failure");
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "ok", `echo ran >> "${marker}"\necho "must not run"`);
+  const payload = payloadFor({ messageId: "admission-write-failure" });
+  const file = jobFileFor(ctx, payload.messageId);
+  const hook = path.join(ctx.root, "reject-running-write.cjs");
+  fs.writeFileSync(hook, `
+const fs = require('node:fs');
+const rename = fs.renameSync;
+fs.renameSync = function(from, to) {
+  if (to === ${JSON.stringify(file)}) {
+    let row;
+    try { row = JSON.parse(fs.readFileSync(from, 'utf8')); } catch {}
+    if (row && row.state === 'running') {
+      const error = new Error('injected admission write failure');
+      error.code = 'EIO';
+      throw error;
+    }
+  }
+  return rename.apply(this, arguments);
+};
+`);
+  const result = runHelper(baseEnv(ctx, bin, { NODE_OPTIONS: `--require=${hook}` }), payload);
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "execution_admission_unrecorded");
+  assert.equal(markerLines(marker).length, 0);
+  assert.equal(readJob(ctx, payload.messageId).startedAt, undefined);
 });
 
 test("a stale heartbeat NEVER takes over a live pid, no matter how old", () => {
@@ -587,7 +777,7 @@ test("claim-checked writes gate on the on-disk claimId", () => {
   assert.equal(wakeup.ownsClaim(jobPath, "mine"), false, "a vanished job file is lost ownership");
 });
 
-test("the parent/child spawn window is treated as live until the grace expires", () => {
+test("legacy parent/child spawn uncertainty is not permission to replay after a grace expires", () => {
   const ctx = makeRoot("spawn-grace");
   const marker = path.join(ctx.root, "invocations.txt");
   const bin = fakeClaude(ctx.root, "ok", `echo "$1 $2" >> "${marker}"\necho "took over"`);
@@ -620,28 +810,25 @@ test("the parent/child spawn window is treated as live until the grace expires",
   assert.equal(markerLines(marker).length, 0);
   assert.equal(readJob(ctx, "spawn-grace-1").claimId, "claim-spawn-grace-1");
 
-  // Past the grace with still no runnerPid: nothing is going to name a child
-  // now, so the claim really is orphaned and takeover proceeds.
+  // Passing the grace cannot prove that an unnamed child made no changes.
   writeOrphanedParent("spawn-grace-2", 120_000);
   const taken = runHelper(baseEnv(ctx, bin), payloadFor({ messageId: "spawn-grace-2" }));
-  assert.equal(taken.status, "completed");
-  assert.equal(taken.takeover.reason, "runner_pid_dead");
-  assert.equal(markerLines(marker).length, 1);
+  assert.equal(taken.status, "skipped");
+  assert.equal(taken.reason, "execution_outcome_unknown");
+  assert.equal(markerLines(marker).length, 0);
   const stale = fs.readdirSync(jobsDir).filter((name) => name.startsWith("spawn-grace-2.json.stale-"));
-  assert.equal(stale.length, 1);
-  // The winner re-claims with a FRESH claimId — the fence the old runner would
-  // fail if it ever came back.
-  assert.notEqual(readJob(ctx, "spawn-grace-2").claimId, "claim-spawn-grace-2");
+  assert.equal(stale.length, 0);
+  assert.equal(readJob(ctx, "spawn-grace-2").claimId, "claim-spawn-grace-2");
 
-  // The grace is env-overridable: 0 disables it entirely.
+  // Disabling the grace changes waiting, never grants effect replay authority.
   writeOrphanedParent("spawn-grace-3", 1000);
   const forced = runHelper(
     baseEnv(ctx, bin, { NATIVE_AGENT_CLAUDE_WAKE_SPAWN_GRACE_MS: "0" }),
     payloadFor({ messageId: "spawn-grace-3" })
   );
-  assert.equal(forced.status, "completed");
-  assert.equal(forced.takeover.reason, "runner_pid_dead");
-  assert.equal(markerLines(marker).length, 2);
+  assert.equal(forced.status, "skipped");
+  assert.equal(forced.reason, "execution_outcome_unknown");
+  assert.equal(markerLines(marker).length, 0);
 });
 
 test("a completed-but-undelivered reply is REPLAYED, never re-run", () => {
@@ -767,6 +954,44 @@ test("a wedged topic lock REJECTS the wake by id — never a silent fresh sessio
   assert.equal(job.reason, "rejected_topic_busy");
   assert.equal(job.deliveryLost, false);
   assert.equal(job.completionText, null);
+
+  const jobFile = path.join(ctx.bridgeDir, "wake-jobs", "reject-1.json");
+  const rejectionBytes = fs.readFileSync(jobFile, "utf8");
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  const retried = await runHelperAsync(env, payloadFor({ messageId: "reject-1", topic: "busy topic" }));
+  assert.equal(retried.status, "completed");
+  assert.equal(markerLines(marker).length, 1);
+  const archived = fs.readdirSync(path.dirname(jobFile)).find((name) => name.startsWith("reject-1.json.stale-"));
+  assert.ok(archived, "retain the original rejection and delivery evidence");
+  assert.equal(fs.readFileSync(path.join(path.dirname(jobFile), archived), "utf8"), rejectionBytes);
+  assert.deepEqual(readJob(ctx, "reject-1").payload, job.payload);
+  const duplicate = await runHelperAsync(env, payloadFor({ messageId: "reject-1", topic: "busy topic" }));
+  assert.equal(duplicate.reason, "duplicate");
+  assert.equal(markerLines(marker).length, 1);
+});
+
+test("topic-busy labels cannot recover legacy, attempted, generic-failed, or live-owned Claude jobs", () => {
+  for (const patch of [
+    { schemaVersion: 1 }, { startedAt: new Date().toISOString() },
+    { attempts: [{ exitCode: 1 }] }, { reason: "claude_exit_1" }, { pid: process.pid },
+  ]) {
+    const ctx = makeRoot("unsafe-topic-retry");
+    const marker = path.join(ctx.root, "invocations.txt");
+    const bin = fakeClaude(ctx.root, "ok", `echo ran >> "${marker}"`);
+    const payload = payloadFor({ messageId: "unsafe-topic-retry" });
+    const file = path.join(ctx.bridgeDir, "wake-jobs", `${payload.messageId}.json`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const bytes = JSON.stringify({
+      schemaVersion: 2, messageId: payload.messageId, claimId: "rejected-claim", payload,
+      state: "settled", status: "failed", reason: "rejected_topic_busy", pid: 999999,
+      bridgeStatus: "dry_run", ...patch,
+    });
+    fs.writeFileSync(file, bytes);
+    const result = runHelper(baseEnv(ctx, bin), payload);
+    assert.equal(result.status, "skipped");
+    assert.equal(markerLines(marker).length, 0);
+    assert.equal(fs.readFileSync(file, "utf8"), bytes);
+  }
 });
 
 // -------------------------------------------------- bridge endpoint discovery
@@ -973,14 +1198,15 @@ test("a fresh unreadable job file is a claimant mid-write, not a takeover target
   assert.equal(markerLines(marker).length, 0);
   assert.equal(fs.readdirSync(jobsDir).filter((n) => n.startsWith("mid-write-1.json.stale-")).length, 0);
 
-  // The same file aged past the write grace is genuinely corrupt: takeover.
+  // An old unreadable record remains unknown, never proof that nothing ran.
   const old = new Date(Date.now() - 60_000);
   fs.utimesSync(jobFileFor(ctx, "mid-write-1"), old, old);
   const taken = runHelper(baseEnv(ctx, bin), payloadFor({ messageId: "mid-write-1" }));
-  assert.equal(taken.status, "completed");
-  assert.equal(taken.takeover.reason, "job_unreadable");
-  assert.equal(markerLines(marker).length, 1);
-  assert.equal(fs.readdirSync(jobsDir).filter((n) => n.startsWith("mid-write-1.json.stale-")).length, 1);
+  assert.equal(taken.status, "skipped");
+  assert.equal(taken.reason, "execution_outcome_unknown");
+  assert.equal(markerLines(marker).length, 0);
+  assert.equal(fs.readFileSync(jobFileFor(ctx, "mid-write-1"), "utf8"), "");
+  assert.equal(fs.readdirSync(jobsDir).filter((n) => n.startsWith("mid-write-1.json.stale-")).length, 0);
 });
 
 test("a pid-less replay lock defers only within the acquire grace, then is stolen", () => {
@@ -1020,10 +1246,12 @@ test("a pid-less replay lock defers only within the acquire grace, then is stole
 /// A bridge that ACCEPTS the POST but never responds — the live failure shape
 /// of 2026-07-25: /claude/message blocks on Agent's whole turn past the
 /// client timeout while the message already sits durably in her session store.
-function startHangingBridge() {
+function startHangingBridge(onBody = null) {
   const sockets = new Set();
   const server = http.createServer((req) => {
-    req.on("data", () => {});
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => { if (onBody) onBody(JSON.parse(body)); });
   });
   server.on("connection", (socket) => {
     sockets.add(socket);
@@ -1095,18 +1323,136 @@ test("a bridge reply timeout is UNKNOWN — never deliveryLost, never replayed",
   }
 });
 
+test("an earlier same-ID rejection cannot confirm delivery of the later result", async () => {
+  const ctx = makeRoot("same-id-result-proof");
+  fs.writeFileSync(path.join(ctx.bridgeDir, "token"), "test-token\n", { mode: 0o600 });
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "ok", `echo "ran" >> "${marker}"\necho "new completed result"`);
+  const payload = payloadFor({ messageId: "same-id-result", sessionId: "SESS-EXACT" });
+  const rejection = wakeup.formatCompletionForAgent({
+    status: "failed", reason: "rejected_topic_busy", durationMs: 0, inFlightMessageId: "other-job",
+  }, payload);
+  const storePath = path.join(storeDirFor(ctx), "SESS-EXACT.jsonl");
+  fs.mkdirSync(storeDirFor(ctx), { recursive: true });
+  fs.writeFileSync(storePath, `${JSON.stringify({ role: "user", content: `[from: claude, via bridge] ${rejection}` })}\n`);
+  let posts = 0;
+  const bridge = await startHangingBridge(() => { posts += 1; });
+  try {
+    const env = unknownEnv(ctx, bin, bridge.url);
+    const first = await runHelperAsync(env, payload);
+    assert.equal(first.status, "completed");
+    assert.equal(first.bridge.status, "unknown", "old rejection is not this result's delivery");
+    assert.equal(first.sessionStoreCheck, "absent");
+    const job = readJob(ctx, payload.messageId);
+    assert.match(job.completionText, /new completed result/);
+    assert.equal(job.deliveryLost, false);
+
+    const early = await runHelperAsync(env, payload);
+    assert.equal(early.note, "unknown_absent_within_grace");
+    assert.equal(posts, 1, "ambiguity alone cannot repost the result");
+    assert.equal(readJob(ctx, payload.messageId).completionText, job.completionText);
+
+    // Legacy unknown records without expected text cannot be settled using
+    // a matching ID alone, and cannot invent a replay payload.
+    fs.writeFileSync(jobFileFor(ctx, payload.messageId), JSON.stringify({ ...job, completionText: null }));
+    const noText = await runHelperAsync(env, payload);
+    assert.equal(noText.note, "unknown_unresolved");
+    assert.equal(noText.sessionStoreCheck, "unreadable");
+    assert.equal(readJob(ctx, payload.messageId).bridgeStatus, "unknown");
+    assert.equal(posts, 1);
+    fs.writeFileSync(jobFileFor(ctx, payload.messageId), JSON.stringify(job));
+
+    // Only the exact later result, with the app's real prefix, confirms it.
+    fs.appendFileSync(storePath, `${JSON.stringify({ role: "user", content: `[from: claude, via bridge] ${job.completionText}` })}\n`);
+    const settled = await runHelperAsync(env, payload);
+    assert.equal(settled.note, "unknown_confirmed_delivered");
+    assert.equal(readJob(ctx, payload.messageId).completionText, null);
+    assert.equal(posts, 1);
+    assert.equal(markerLines(marker).length, 1, "delivery settlement never reruns the worker");
+  } finally {
+    await bridge.close();
+  }
+});
+
+for (const scenario of [
+  { name: "nonzero", body: 'echo "partial failure evidence"; exit 7', status: "failed", reason: "claude_exit_7", evidence: /partial failure evidence/ },
+  { name: "aborted", body: 'echo "partial interrupted evidence"; kill -TERM $$', status: "failed", reason: "claude_exit_null", evidence: /partial interrupted evidence/ },
+  { name: "timeout", body: 'echo "partial timed out evidence"; sleep 20', status: "failed", reason: "timeout_after_1s", evidence: /partial timed out evidence/, env: { NATIVE_AGENT_CLAUDE_WAKE_TIMEOUT_SECONDS: "1" } },
+  { name: "empty", body: 'exit 0', status: "completed_without_reply", reason: "empty_stdout", evidence: /produced NO output/ },
+]) {
+  test(`unknown delivery retains and reconciles ${scenario.name} result without rerunning work`, async () => {
+    const ctx = makeRoot(`terminal-${scenario.name}`);
+    fs.writeFileSync(path.join(ctx.bridgeDir, "token"), "test-token\n", { mode: 0o600 });
+    const marker = path.join(ctx.root, "invocations.txt");
+    const bin = fakeClaude(ctx.root, "terminal", `echo "ran" >> "${marker}"\n${scenario.body}`);
+    const payload = payloadFor({ messageId: `terminal-${scenario.name}`, sessionId: "SESS-TERMINAL" });
+    let posts = 0;
+    const bridge = await startHangingBridge(() => { posts += 1; });
+    try {
+      const env = unknownEnv(ctx, bin, bridge.url, scenario.env || {});
+      const first = await runHelperAsync(env, payload);
+      assert.equal(first.status, scenario.status);
+      assert.equal(first.reason, scenario.reason);
+      assert.equal(first.bridge.status, "unknown");
+      assert.equal(first.deliveryLost, false);
+      const retained = readJob(ctx, payload.messageId);
+      assert.equal(retained.status, scenario.status);
+      assert.match(retained.completionText, scenario.evidence);
+      assert.ok(retained.startedAt, "execution has been admitted; result replay must not rerun it");
+
+      const unresolved = await runHelperAsync(env, payload);
+      assert.equal(unresolved.note, "unknown_unresolved");
+      assert.equal(posts, 1);
+      assert.equal(readJob(ctx, payload.messageId).completionText, retained.completionText);
+
+      fs.mkdirSync(storeDirFor(ctx), { recursive: true });
+      fs.writeFileSync(path.join(storeDirFor(ctx), "SESS-TERMINAL.jsonl"),
+        `${JSON.stringify({ role: "user", content: `[from: claude, via bridge] ${retained.completionText}` })}\n`);
+      const settled = await runHelperAsync(env, payload);
+      assert.equal(settled.note, "unknown_confirmed_delivered");
+      assert.equal(readJob(ctx, payload.messageId).completionText, null);
+      assert.equal(readJob(ctx, payload.messageId).status, scenario.status, "delivery cannot rewrite execution status");
+      assert.equal(posts, 1);
+      assert.equal(markerLines(marker).length, 1);
+    } finally {
+      await bridge.close();
+    }
+  });
+}
+
+test("known-unsent failed result redelivers exact evidence without repeating execution", () => {
+  const ctx = makeRoot("failed-result-replay");
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "failed", `echo "ran" >> "${marker}"\necho "partial evidence"; exit 7`);
+  const payload = payloadFor({ messageId: "failed-result-replay", sessionId: "SESS-FAILED" });
+  // No token: proof the result POST could not have been sent.
+  const first = runHelper(baseEnv(ctx, bin, { NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN: "0" }), payload);
+  assert.equal(first.status, "failed");
+  assert.equal(first.bridge.reason, "bridge_token_missing");
+  assert.equal(first.deliveryLost, true);
+  const retained = readJob(ctx, payload.messageId);
+  assert.match(retained.completionText, /partial evidence/);
+  const replay = runHelper(baseEnv(ctx, bin), payload);
+  assert.equal(replay.status, "redelivered");
+  assert.equal(replay.wouldSendText, retained.completionText);
+  assert.equal(readJob(ctx, payload.messageId).status, "failed");
+  assert.equal(readJob(ctx, payload.messageId).completionText, null);
+  assert.equal(markerLines(marker).length, 1);
+});
+
 test("a reply timeout with the receipt in her session store settles as DELIVERED", async () => {
   const ctx = makeRoot("unknown-present");
   fs.writeFileSync(path.join(ctx.bridgeDir, "token"), "test-token\n", { mode: 0o600 });
   const bin = fakeClaude(ctx.root, "ok", 'echo "confirmed answer"');
-  // The bridge enqueued the row before its turn stalled: the marker is in the
+  // The bridge enqueued the row before its turn stalled: the exact text is in the
   // store even though the HTTP response never comes back.
   fs.mkdirSync(storeDirFor(ctx), { recursive: true });
-  fs.writeFileSync(
-    path.join(storeDirFor(ctx), "SESS-B.jsonl"),
-    `${JSON.stringify({ role: "user", content: `[from: claude, via bridge] [claude-wake] Automated completion event.\n\n${wakeup.deliveryMarker("unknown-2")}` })}\n`
-  );
-  const bridge = await startHangingBridge();
+  const bridge = await startHangingBridge((body) => {
+    fs.writeFileSync(
+      path.join(storeDirFor(ctx), "SESS-B.jsonl"),
+      `${JSON.stringify({ role: "user", content: `[from: claude, via bridge] ${body.text}` })}\n`
+    );
+  });
   try {
     const result = await runHelperAsync(
       unknownEnv(ctx, bin, bridge.url),
@@ -1216,7 +1562,7 @@ test("a settled UNKNOWN job is settled late once the store row appears", async (
     fs.mkdirSync(storeDirFor(ctx), { recursive: true });
     fs.writeFileSync(
       path.join(storeDirFor(ctx), "SESS-D.jsonl"),
-      `${JSON.stringify({ role: "user", content: `[claude-wake] ${wakeup.deliveryMarker("unknown-4")}` })}\n`
+      `${JSON.stringify({ role: "user", content: readJob(ctx, "unknown-4").completionText })}\n`
     );
 
     const settled = await runHelperAsync(
@@ -1322,7 +1668,7 @@ test("the replay re-reads the store under its lock and refuses to double-deliver
     // …then the row lands (the original POST had been received after all).
     fs.appendFileSync(
       storePath,
-      `${JSON.stringify({ role: "user", content: `[claude-wake] ${wakeup.deliveryMarker("unknown-6")}` })}\n`
+      `${JSON.stringify({ role: "user", content: `[from: claude, via bridge] ${armedJob.completionText}` })}\n`
     );
 
     // The replay must catch it under the lock and never POST.
@@ -1493,14 +1839,17 @@ for (const fixtureName of ["armed-replay-99D377A5.fixture.json", "armed-replay-7
 test("stall watchdog KILLS a wedged child and the process is provably dead", async () => {
   const ctx = makeRoot("stall-kill");
   const marker = path.join(ctx.root, "stall.pid");
-  // Burns no CPU at all: the exact shape of a wedged session. The ceiling is
+  const transcript = path.join(ctx.root, "stall-transcript.jsonl");
+  // Writes one canonical row and then goes silent: the exact shape of a wedged
+  // session. The ceiling is
   // set far above the stall window so a pass here can ONLY come from the stall
   // watchdog, never from the deadline timer.
   // `exec` matters: without it the shell's child would inherit the stdout pipe
   // and hold it open past the kill, so the runner could not settle. exec keeps
   // ONE pid (preserved across exec, so $$ is the pid that must die).
-  const bin = fakeClaude(ctx.root, "wedged", `echo $$ > ${marker}\nexec sleep 300\n`);
+  const bin = fakeClaude(ctx.root, "wedged", `echo $$ > ${marker}\necho '{}' > ${transcript}\nexec sleep 300\n`);
   const env = baseEnv(ctx, bin, {
+    NATIVE_AGENT_CLAUDE_WAKE_TRANSCRIPT_PATH: transcript,
     NATIVE_AGENT_CLAUDE_WAKE_STALL_SECONDS: "2",
     NATIVE_AGENT_CLAUDE_WAKE_STALL_SAMPLE_MS: "250",
     NATIVE_AGENT_CLAUDE_WAKE_TIMEOUT_SECONDS: "120",
@@ -1533,19 +1882,17 @@ test("stall watchdog KILLS a wedged child and the process is provably dead", asy
 
 test("CONTROL: a busy child survives well past the stall window (detector is not unconditional)", async () => {
   const ctx = makeRoot("stall-control");
-  // Exec one persistent CPU-burning process instead of a shell loop that forks
-  // `date` on every iteration. The fork-heavy shape can spend most of a loaded
-  // test run waiting on short-lived descendants that disappear between `ps`
-  // samples, making a genuinely busy control look idle. This process burns CPU
-  // for ~7s — more than 2x the 3s stall window. If the watchdog were
-  // unconditional, or keyed on stdout (which stays empty until exit), it would
-  // still be killed.
+  const transcript = path.join(ctx.root, "busy-transcript.jsonl");
+  // This process burns essentially no CPU and keeps stdout empty until exit,
+  // but appends canonical transcript movement for ~7s — more than 2x the 3s
+  // stall window. This is the production shape the CPU watchdog killed.
   const bin = fakeClaude(
     ctx.root,
     "busy",
-    `exec ${JSON.stringify(process.execPath)} -e 'const end = Date.now() + 7000; while (Date.now() < end) {} console.log("the real reply")'\n`
+    `: > ${transcript}\ni=0\nwhile [ "$i" -lt 7 ]; do echo '{}' >> ${transcript}; sleep 1; i=$((i + 1)); done\necho "the real reply"\n`
   );
   const env = baseEnv(ctx, bin, {
+    NATIVE_AGENT_CLAUDE_WAKE_TRANSCRIPT_PATH: transcript,
     NATIVE_AGENT_CLAUDE_WAKE_STALL_SECONDS: "3",
     NATIVE_AGENT_CLAUDE_WAKE_STALL_SAMPLE_MS: "250",
     NATIVE_AGENT_CLAUDE_WAKE_TIMEOUT_SECONDS: "120",
@@ -1559,9 +1906,12 @@ test("CONTROL: a busy child survives well past the stall window (detector is not
   assert.match(result.wouldSendText || "", /the real reply/);
 
   // And its liveness was actually observed, not merely assumed: progressAt is
-  // the CHILD's clock, distinct from the runner's heartbeatAt.
+  // the transcript's clock, distinct from the runner's heartbeatAt.
   const job = readJob(ctx, payload.messageId);
   assert.ok(job.progressAt, "no progressAt was ever stamped — the watchdog never saw the child work");
+  assert.equal(job.progressSource, "claude_transcript");
+  assert.ok(job.progressTranscriptBytes > 0);
+  assert.equal(job.progressCpuMs, null, "CPU must not remain a liveness input or receipt");
 });
 
 test("the hard ceiling is generous, and the stall window is far below it", () => {
@@ -1631,6 +1981,7 @@ test("stall kill reaps DESCENDANTS that inherited the stdout pipe (runner still 
   const ctx = makeRoot("stall-descendant");
   const parentMarker = path.join(ctx.root, "parent.pid");
   const childMarker = path.join(ctx.root, "child.pid");
+  const transcript = path.join(ctx.root, "descendant-transcript.jsonl");
   // NO `exec` here, and the background descendant inherits stdout. If the
   // watchdog killed only the direct child, the descendant would hold the pipe
   // open, node's 'close' would never fire, and the runner would hang forever
@@ -1638,9 +1989,10 @@ test("stall kill reaps DESCENDANTS that inherited the stdout pipe (runner still 
   const bin = fakeClaude(
     ctx.root,
     "leaky",
-    `echo $$ > ${parentMarker}\nsh -c 'echo $$ > ${childMarker}; sleep 300' &\nsleep 300\n`
+    `echo $$ > ${parentMarker}\necho '{}' > ${transcript}\nsh -c 'echo $$ > ${childMarker}; sleep 300' &\nsleep 300\n`
   );
   const env = baseEnv(ctx, bin, {
+    NATIVE_AGENT_CLAUDE_WAKE_TRANSCRIPT_PATH: transcript,
     NATIVE_AGENT_CLAUDE_WAKE_STALL_SECONDS: "2",
     NATIVE_AGENT_CLAUDE_WAKE_STALL_SAMPLE_MS: "250",
     NATIVE_AGENT_CLAUDE_WAKE_TIMEOUT_SECONDS: "120",
@@ -1669,6 +2021,144 @@ test("stall kill reaps DESCENDANTS that inherited the stdout pipe (runner still 
 // --- Commit hold (task #49, 2026-07-25) ---------------------------------
 
 const RELEASE_HELPER = path.join(__dirname, "..", "wake_hold_release.js");
+
+test("paired builder review reaches Claude prompt and stays absent from ordinary messages", () => {
+  const paired = wakeup.sanitizePayload({
+    messageId: "paired-review-1",
+    topic: "paired-review",
+    text: "build the change",
+    pairReviewer: true,
+    deskHandle: "desk_abc-123",
+  });
+  const pairedPrompt = wakeup.formatPrompt(paired, "/tmp/wake-jobs/paired-review-1.json");
+  assert.equal(paired.pairReviewer, true);
+  assert.equal(paired.deskHandle, "desk_abc-123");
+  assert.match(pairedPrompt, /pair exactly one reviewer/i);
+  assert.match(pairedPrompt, /exact committed SHA/i);
+  assert.match(pairedPrompt, /Findings return to you/i);
+  assert.match(pairedPrompt, /same reviewer inspect the resulting SHA/i);
+
+  const ordinary = wakeup.sanitizePayload({
+    messageId: "ordinary-1",
+    topic: "ordinary",
+    text: "answer a question",
+    pairReviewer: false,
+  });
+  assert.equal(ordinary.pairReviewer, undefined);
+  assert.doesNotMatch(
+    wakeup.formatPrompt(ordinary, "/tmp/wake-jobs/ordinary-1.json"),
+    /PAIRED REVIEW/
+  );
+});
+
+test("ordinary Claude wake follows the current brief without forced swarms or reviewer models", () => {
+  const brief = "Implement this small fix yourself. No delegated workers or review pass. Build the complete change, then validate once.";
+  const prompt = wakeup.formatPrompt({ messageId: "scoped-brief", topic: "small-fix", text: brief });
+  assert.ok(prompt.includes(brief));
+  assert.match(prompt, /current delegated brief and applicable current AGENTS\.md/);
+  assert.match(prompt, /latest user-requested scope and workflow govern/);
+  assert.match(prompt, /bridge adds no authority to create extra workers/);
+  assert.match(prompt, /You own the result and integration/);
+  assert.doesNotMatch(prompt, /dispatch swarm workers for build-sized tasks/);
+  assert.doesNotMatch(prompt, /every implementation diff through gpt-5\.5 review/);
+  assert.doesNotMatch(prompt, /sonnet-swarm and gpt-swarm MCPs are available/);
+  assert.doesNotMatch(prompt, /PAIRED REVIEW/);
+});
+
+test("Claude wake preserves a reviewer model explicitly selected in the accepted brief", () => {
+  const brief = "Use exactly one gpt-5.5 reviewer after this authorized change.";
+  const prompt = wakeup.formatPrompt({ messageId: "explicit-review", text: brief, pairReviewer: true });
+  assert.ok(prompt.includes(brief));
+  assert.match(prompt, /pair exactly one reviewer/i);
+  assert.match(prompt, /preserving any explicitly requested worker count and model/);
+});
+
+for (const [label, messageId] of [["ascii", "a".repeat(160)], ["emoji", "🍎".repeat(160)], ["combining", "e\u0301".repeat(160)]]) {
+  test(`accepted Claude ${label} message identity survives admission and completion`, () => {
+    const ctx = makeRoot(`exact-id-${label}`);
+    const marker = path.join(ctx.root, "invocations.txt");
+    const bin = fakeClaude(ctx.root, "ok", `echo ran >> "${marker}"\necho 'identity evidence'`);
+    // Mirrors the ID returned by Swift's accepted receipt (160 Characters).
+    const acceptedReceipt = { messageId };
+    const payload = payloadFor({ messageId: acceptedReceipt.messageId });
+    assert.equal(wakeup.sanitizePayload(payload).messageId, acceptedReceipt.messageId);
+    const env = baseEnv(ctx, bin);
+    const result = runHelper(env, payload);
+    assert.equal(result.status, "completed");
+    assert.equal(result.messageId, acceptedReceipt.messageId);
+    const job = JSON.parse(fs.readFileSync(result.jobPath, "utf8"));
+    assert.equal(job.messageId, acceptedReceipt.messageId);
+    assert.equal(job.payload.messageId, acceptedReceipt.messageId);
+    assert.ok(result.wouldSendText.includes(wakeup.deliveryMarker(acceptedReceipt.messageId)));
+    assert.equal(receipts(ctx).at(-1).messageId, acceptedReceipt.messageId);
+    const duplicate = runHelper(env, payload);
+    assert.equal(duplicate.reason, "duplicate");
+    assert.equal(duplicate.messageId, acceptedReceipt.messageId);
+    assert.equal(markerLines(marker).length, 1);
+  });
+}
+
+for (const messageId of ["a".repeat(161), "🍎".repeat(161), "e\u0301".repeat(161)]) {
+  test(`oversize direct Claude message ID is rejected rather than rewritten (${messageId.length} units)`, () => {
+    const ctx = makeRoot("oversize-id");
+    const marker = path.join(ctx.root, "invocations.txt");
+    const bin = fakeClaude(ctx.root, "never", `echo ran >> "${marker}"`);
+    const result = runHelper(baseEnv(ctx, bin), payloadFor({ messageId }));
+    assert.equal(result.reason, "message_id_too_long");
+    assert.equal(result.messageId, undefined);
+    assert.deepEqual(markerLines(marker), []);
+    assert.equal(fs.existsSync(path.join(ctx.bridgeDir, "wake-jobs")), false);
+  });
+}
+
+test("legacy truncated Claude identity refuses execution and delivery replay without rewriting its job", () => {
+  const ctx = makeRoot("legacy-id-ambiguity");
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "never", `echo ran >> "${marker}"`);
+  const messageId = "🍎".repeat(100);
+  const legacyId = messageId.slice(0, 160);
+  const legacyName = legacyId.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+  assert.equal(messageId.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120), legacyName);
+  const jobs = path.join(ctx.bridgeDir, "wake-jobs");
+  fs.mkdirSync(jobs, { recursive: true });
+  const jobPath = path.join(jobs, `${legacyName}.json`);
+  const original = JSON.stringify({
+    schemaVersion: 2, messageId: legacyId, claimId: "legacy-claim", state: "settled", status: "completed",
+    bridgeStatus: "failed", deliveryLost: true, completionText: "retained legacy result",
+    payload: payloadFor({ messageId: legacyId }),
+  });
+  fs.writeFileSync(jobPath, original);
+  const result = runHelper(baseEnv(ctx, bin), payloadFor({ messageId }));
+  assert.equal(result.reason, "legacy_message_id_ambiguous");
+  assert.equal(result.messageId, messageId);
+  assert.equal(result.executionOutcome, "unknown");
+  assert.match(result.guidance, /Inspect that job/);
+  assert.deepEqual(markerLines(marker), []);
+  assert.deepEqual(receipts(ctx), []);
+  assert.equal(fs.readFileSync(jobPath, "utf8"), original);
+  assert.deepEqual(fs.readdirSync(jobs), [`${legacyName}.json`]);
+});
+
+test("delegation producer identity survives Claude payload sanitization", () => {
+  const revision = "1234567890abcdef1234567890abcdef12345678";
+  const clean = wakeup.sanitizePayload({
+    messageId: "producer-stamp",
+    text: "do the bounded work",
+    producerSchemaVersion: 1,
+    producerSourceRevision: revision.toUpperCase(),
+  });
+  assert.equal(clean.producerSchemaVersion, 1);
+  assert.equal(clean.producerSourceRevision, revision);
+
+  const invalid = wakeup.sanitizePayload({
+    messageId: "invalid-producer-stamp",
+    text: "do the bounded work",
+    producerSchemaVersion: 0,
+    producerSourceRevision: "not-a-revision",
+  });
+  assert.equal(invalid.producerSchemaVersion, undefined);
+  assert.equal(invalid.producerSourceRevision, undefined);
+});
 
 function runRelease(bridgeDir, args) {
   const result = spawnSync(process.execPath, [RELEASE_HELPER, ...args], {
@@ -1700,8 +2190,10 @@ test("wake job record is created held; release script flips it atomically and id
   const jobsDir = path.join(bridgeDir, "wake-jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
   const jobId = "AAAA1111-HOLD-TEST";
+  const jobPath = path.join(jobsDir, `${jobId}.json`);
+  const releasePath = path.join(bridgeDir, "wake-releases", `${jobId}.json`);
   // Record shaped like claimRecord()'s output (hold fields present-and-null).
-  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), JSON.stringify({
+  fs.writeFileSync(jobPath, JSON.stringify({
     messageId: jobId, state: "claimed", claimId: "c1",
     commitPolicy: "hold", holdReleasedAt: null, holdReleasedBy: null,
   }, null, 2));
@@ -1710,35 +2202,41 @@ test("wake job record is created held; release script flips it atomically and id
   assert.equal(released.status, 0, released.stderr);
   assert.equal(released.out.status, "released");
   assert.equal(released.out.holdReleasedBy, "agent");
+  assert.equal(released.out.jobPath, jobPath);
+  assert.equal(released.out.releasePath, releasePath);
 
   // The AUTHORITY is the sidecar: it exists and carries the stamp.
-  const releasesDir = path.join(bridgeDir, "wake-releases");
-  const sidecar = JSON.parse(fs.readFileSync(path.join(releasesDir, `${jobId}.json`), "utf8"));
-  assert.equal(sidecar.holdReleasedBy, "agent");
-  assert.ok(sidecar.holdReleasedAt);
-  assert.equal(sidecar.messageId, jobId);
+  const sidecar = JSON.parse(fs.readFileSync(releasePath, "utf8"));
+  assert.deepEqual(sidecar, {
+    holdReleasedAt: released.out.holdReleasedAt,
+    holdReleasedBy: "agent",
+    messageId: jobId,
+  });
 
   // Job record gets the best-effort mirror; untouched fields survive.
-  const onDisk = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf8"));
+  const onDisk = JSON.parse(fs.readFileSync(jobPath, "utf8"));
   assert.equal(onDisk.commitPolicy, "released");
   assert.equal(onDisk.claimId, "c1");
+  assert.equal(onDisk.holdReleasedAt, sidecar.holdReleasedAt);
+  assert.equal(onDisk.holdReleasedBy, sidecar.holdReleasedBy);
+  assert.equal(onDisk.updatedAt, sidecar.holdReleasedAt);
 
   // BLOCKING-fix regression: a racing runner write that resurrects the held
   // job record must NOT un-release — the sidecar survives untouched.
-  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), JSON.stringify({
+  fs.writeFileSync(jobPath, JSON.stringify({
     messageId: jobId, state: "claimed", claimId: "c1",
     commitPolicy: "hold", holdReleasedAt: null, holdReleasedBy: null,
   }, null, 2));
-  assert.ok(fs.existsSync(path.join(releasesDir, `${jobId}.json`)),
-    "sidecar must survive a stale job-record rewrite");
+  assert.deepEqual(JSON.parse(fs.readFileSync(releasePath, "utf8")), sidecar,
+    "sidecar authority must survive a stale job-record rewrite unchanged");
 
   // Idempotent: second release reports the ORIGINAL stamp, changes nothing.
   const again = runRelease(bridgeDir, [`${jobId}.json`, "--by", "user"]);
   assert.equal(again.status, 0);
   assert.equal(again.out.status, "already_released");
   assert.equal(again.out.holdReleasedBy, "agent");
-  const sidecarAfter = JSON.parse(fs.readFileSync(path.join(releasesDir, `${jobId}.json`), "utf8"));
-  assert.equal(sidecarAfter.holdReleasedAt, sidecar.holdReleasedAt);
+  const sidecarAfter = JSON.parse(fs.readFileSync(releasePath, "utf8"));
+  assert.deepEqual(sidecarAfter, sidecar);
 });
 
 test("release script fails LOUD on an array-shaped job record (typeof [] === 'object' trap)", () => {
@@ -1771,87 +2269,56 @@ test("a job created through the REAL runner is born held (claimRecord fields)", 
 
 test("release script fails LOUD on unknown job, bad releaser, and path-shaped ids", () => {
   const { bridgeDir } = makeRoot("hold-release-loud");
-  fs.mkdirSync(path.join(bridgeDir, "wake-jobs"), { recursive: true });
+  const jobsDir = path.join(bridgeDir, "wake-jobs");
+  const releasesDir = path.join(bridgeDir, "wake-releases");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(jobsDir, "KNOWN-JOB.json"), JSON.stringify({
+    messageId: "KNOWN-JOB", commitPolicy: "hold",
+  }));
+
+  const missingId = runRelease(bridgeDir, ["--by", "user"]);
+  assert.equal(missingId.status, 1);
+  assert.equal(missingId.out.reason, "missing_job_id");
 
   const missing = runRelease(bridgeDir, ["NO-SUCH-JOB", "--by", "user"]);
   assert.equal(missing.status, 1);
   assert.equal(missing.out.status, "failed");
   assert.equal(missing.out.reason, "job_not_found_or_unreadable");
 
-  const badBy = runRelease(bridgeDir, ["whatever", "--by", "codex"]);
+  const badBy = runRelease(bridgeDir, ["KNOWN-JOB", "--by", "codex"]);
   assert.equal(badBy.status, 1);
   assert.equal(badBy.out.reason, "invalid_releaser");
 
   const traversal = runRelease(bridgeDir, ["../outside", "--by", "user"]);
   assert.equal(traversal.status, 1);
   assert.equal(traversal.out.reason, "invalid_job_id");
+  assert.equal(fs.existsSync(releasesDir), false,
+    "no failed invocation may create release authority");
 });
 
-// ------------------------------------------- stall watchdog progress (2026-08-22)
-// Wake 7FAB386B was killed as "stalled_after_600s" while its dispatched worker
-// was provably busy every minute: the live-tree CPU SUM dropped when a heavy
-// `swift test` grandchild exited, and a high-water-mark ratchet then read the
-// survivors' light work as "no advance" for the whole window. Progress must be
-// monotonic over a tree whose members come and go.
-test("tree CPU progress does not regress when a heavy grandchild exits", () => {
-  const p = new wakeup.TreeCpuProgress();
-  const claude = 100, server = 200, worker = 300, swiftTest = 400;
-  let s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 200], [swiftTest, 180_000]]));
-  assert.equal(s.advanced, true); // first sample establishes the baseline
-  // The test run finishes: 180 CPU-seconds leave the live tree; the worker did
-  // a little more work. The OLD ratchet saw 181_250 → 1_300 and called it idle.
-  s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 250]]));
-  assert.equal(s.advanced, true, "exited work is retired, not forgotten; +50 ms on the worker is progress");
-  assert.deepEqual(s.retiredPids, [swiftTest]);
-  assert.equal(s.total, 180_000 + 1000 + 50 + 250);
-  // Genuinely idle: identical sample → not advanced.
-  s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 250]]));
-  assert.equal(s.advanced, false);
-  // A brand-new pid (a fresh `swift build`) with 0 ms so far is work STARTING.
-  s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 250], [500, 0]]));
-  assert.equal(s.advanced, true);
-  assert.deepEqual(s.newPids, [500]);
-  // pid reuse: 500 comes back with LESS CPU than before → old one retired, new one counted.
-  p.observe(new Map([[claude, 1000], [server, 50], [worker, 250], [500, 9000]]));
-  s = p.observe(new Map([[claude, 1000], [server, 50], [worker, 250], [500, 10]]));
-  assert.equal(s.advanced, true);
-  assert.equal(s.total, 180_000 + 9000 + 1000 + 50 + 250 + 10);
+// -------------------------------------- transcript watchdog progress (2026-08-29)
+test("transcript progress advances on append or replacement and stays quiet when unchanged", () => {
+  const p = new wakeup.TranscriptProgress();
+  assert.equal(p.observe({ state: "missing" }), null);
+  assert.equal(p.observe({ state: "unreadable" }), null);
+  assert.equal(p.observe({ state: "present", bytes: 10, mtimeMs: 100 }).advanced, true);
+  assert.equal(p.observe({ state: "present", bytes: 10, mtimeMs: 100 }).advanced, false);
+  assert.equal(p.observe({ state: "present", bytes: 20, mtimeMs: 101 }).advanced, true);
+  // Atomic replacement/truncation is still movement, not regression.
+  assert.equal(p.observe({ state: "present", bytes: 5, mtimeMs: 102 }).advanced, true);
 });
 
-test("tree CPU progress: total is monotonic across any sequence of samples", () => {
-  const p = new wakeup.TreeCpuProgress();
-  let last = -1;
-  const samples = [
-    new Map([[1, 10], [2, 500]]),
-    new Map([[1, 12]]),
-    new Map([[1, 12], [3, 0]]),
-    new Map([[1, 12], [3, 700]]),
-    new Map([[1, 13]]),
-    new Map([[1, 13]]),
-  ];
-  for (const m of samples) {
-    const s = p.observe(m);
-    assert.ok(s.total >= last, `total regressed: ${s.total} < ${last}`);
-    last = s.total;
+test("canonical transcript path is cwd- and session-bound", () => {
+  const previousRoot = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_PROJECTS_DIR;
+  process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_PROJECTS_DIR = "/tmp/claude-projects";
+  try {
+    assert.equal(
+      wakeup.claudeTranscriptPath("/Users/user/Projects/NativeAgent", "session-1"),
+      "/tmp/claude-projects/-Users-user-Projects-NativeAgent/session-1.jsonl"
+    );
+    assert.equal(wakeup.claudeTranscriptPath("/tmp", "../escape"), null);
+  } finally {
+    if (previousRoot == null) delete process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_PROJECTS_DIR;
+    else process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_PROJECTS_DIR = previousRoot;
   }
-  assert.equal(p.observe("not a map"), null);
-});
-
-test("processTreeCpuByPid reads this process's own tree and finds itself", () => {
-  const per = wakeup.processTreeCpuByPid(process.pid);
-  assert.ok(per instanceof Map);
-  assert.ok(per.has(process.pid));
-});
-
-test("tree CPU progress: a member exiting with no other change still counts as activity", () => {
-  // gpt-5.5 review (2026-08-22): the incident test also had CPU advance, so a
-  // mutation dropping the retired-pids term could pass. Pin the policy on its own.
-  const p = new wakeup.TreeCpuProgress();
-  p.observe(new Map([[1, 100], [2, 50]]));
-  const s = p.observe(new Map([[1, 100]]));
-  assert.equal(s.advanced, true, "a process exiting is tree activity (the lifecycle event that broke the live-sum ratchet)");
-  assert.equal(s.total, 150, "the exited member's work is retired, not lost");
-  assert.deepEqual(s.retiredPids, [2]);
-  // And genuinely static afterwards: no churn, no CPU → not advanced.
-  assert.equal(p.observe(new Map([[1, 100]])).advanced, false);
 });

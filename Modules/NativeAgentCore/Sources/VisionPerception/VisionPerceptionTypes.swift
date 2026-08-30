@@ -286,6 +286,55 @@ public enum VisionEvidenceSource: String, Sendable, Equatable, CaseIterable {
 
 // MARK: - Candidates (the element layer's output, pre-fusion)
 
+/// A bounded visual colour fact carried from the sampled region. The compact
+/// name is deliberately perceptual rather than semantic: "yellow" is useful
+/// evidence; "quest marker" would be an invention.
+public struct VisionColorSample: Sendable, Equatable {
+    public let red: Double
+    public let green: Double
+    public let blue: Double
+
+    public init(red: Double, green: Double, blue: Double) {
+        self.red = VisionConfidence.clamp(red)
+        self.green = VisionConfidence.clamp(green)
+        self.blue = VisionConfidence.clamp(blue)
+    }
+
+    public var name: String {
+        let maximum = max(red, max(green, blue))
+        let minimum = min(red, min(green, blue))
+        let delta = maximum - minimum
+        let saturation = maximum > 0 ? delta / maximum : 0
+        if maximum < 0.16 { return "black" }
+        if saturation < 0.18 {
+            if maximum < 0.42 { return "dark gray" }
+            if maximum < 0.75 { return "gray" }
+            return "white"
+        }
+        let rawHue: Double
+        if maximum == red {
+            rawHue = 60 * ((green - blue) / delta).truncatingRemainder(dividingBy: 6)
+        } else if maximum == green {
+            rawHue = 60 * ((blue - red) / delta + 2)
+        } else {
+            rawHue = 60 * ((red - green) / delta + 4)
+        }
+        let hue = rawHue < 0 ? rawHue + 360 : rawHue
+        let hueName: String
+        switch hue {
+        case 15..<45: hueName = "orange"
+        case 45..<75: hueName = "yellow"
+        case 75..<165: hueName = "green"
+        case 165..<195: hueName = "cyan"
+        case 195..<255: hueName = "blue"
+        case 255..<285: hueName = "purple"
+        case 285..<345: hueName = "magenta"
+        default: hueName = "red"
+        }
+        return maximum < 0.42 ? "dark \(hueName)" : hueName
+    }
+}
+
 /// A candidate interactive region, before role/label/redaction/handles.
 public struct VisionCandidate: Sendable, Equatable {
     public let rect: VisionRect
@@ -297,19 +346,27 @@ public struct VisionCandidate: Sendable, Equatable {
     public let fillLuminance: Double?
     /// Saliency rank contribution, 0…1; 0 when saliency did not see it.
     public let salience: Double
+    public let fillColor: VisionColorSample?
+    /// Geometry-only silhouette evidence from a connected colour component.
+    /// Compact values are intentionally limited to `round` and `square`.
+    public let visualShape: String?
 
     public init(
         rect: VisionRect,
         sources: [VisionEvidenceSource],
         boundsConfidence: Double,
         fillLuminance: Double? = nil,
-        salience: Double = 0
+        salience: Double = 0,
+        fillColor: VisionColorSample? = nil,
+        visualShape: String? = nil
     ) {
         self.rect = rect
         self.sources = sources
         self.boundsConfidence = VisionConfidence.clamp(boundsConfidence)
         self.fillLuminance = fillLuminance
         self.salience = VisionConfidence.clamp(salience)
+        self.fillColor = fillColor
+        self.visualShape = visualShape
     }
 
     public func adding(source: VisionEvidenceSource, salience: Double? = nil) -> VisionCandidate {
@@ -318,7 +375,9 @@ public struct VisionCandidate: Sendable, Equatable {
             sources: sources.contains(source) ? sources : sources + [source],
             boundsConfidence: boundsConfidence,
             fillLuminance: fillLuminance,
-            salience: max(self.salience, salience ?? 0)
+            salience: max(self.salience, salience ?? 0),
+            fillColor: fillColor,
+            visualShape: visualShape
         )
     }
 }

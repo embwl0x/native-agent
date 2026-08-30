@@ -17,13 +17,13 @@ struct FeedAndBackgroundWave1ContractTests {
     }
 
     @Test("the unconditional loop manifest is exact and remote loops stay configuration-gated")
-    func assembleAllLoopsHasThePinnedManifestAndNegativeControls() throws {
+    func assembleAllLoopsHasThePinnedManifestAndNegativeControls() async throws {
         let root = try temporaryRoot("manifest")
         defer { try? FileManager.default.removeItem(at: root) }
 
         let loops = BackgroundLoopsAssembly.assembleAllLoops(dataRoot: root)
         let ids = loops.map(\.loopId)
-        let expected: Set<String> = [
+        let unconditional: Set<String> = [
             "doctor_auto_run", "full_mac_expiry", "turn_trace_retention",
             "evolution_proposal_retention", "data_root_disk_hygiene", "memory_consolidation",
             "self_improvement_sweep", "rem_cycle", "trigger_scheduler_due_work",
@@ -31,11 +31,33 @@ struct FeedAndBackgroundWave1ContractTests {
             "cognition_reflection", "heartbeat", "self_healing", "autonomy_promotion_proposals",
             "desk_notify", "delegation_outcome", "github_tracking",
         ]
+        // C8 (2026-08-28) CHANGED what "configuration-gated" means for the two
+        // remote surfaces. They used to be ABSENT from the manifest with no
+        // config on disk — which made "off because there is no token" and "we
+        // never built it" the same observable state: nothing in `status()`,
+        // nothing in Doctor, nothing in the app. They are now always REGISTERED,
+        // with a placeholder that skips every tick and never does remote work,
+        // so the lane is visible and (past the dormancy bound) flagged.
+        //
+        // The gate that actually matters is unchanged and is asserted below:
+        // with no config, the registered runner must not be the real one.
+        let expected = unconditional.union(["telegram_poll", "slack_socket_mode"])
         #expect(ids.count == expected.count, "a duplicate id overwrites a loop inside the manager")
         #expect(Set(ids) == expected, "a missing manifest id silently deletes its owner from production")
-        #expect(!ids.contains("telegram_poll"))
-        #expect(!ids.contains("slack_socket_mode"))
         #expect(!ids.contains("dream_cycle"), "the TriggerScheduler owns the nightly dream deadline")
+
+        for remoteId in ["telegram_poll", "slack_socket_mode"] {
+            let runner = try #require(loops.first { $0.loopId == remoteId })
+            #expect(
+                runner is BackgroundLoopsAssembly.UnconfiguredLaneLoop,
+                "\(remoteId) built a REAL remote loop with no configuration on disk"
+            )
+            guard case .skipped(let reason, _) = await runner.tickOutcome() else {
+                Issue.record("\(remoteId) placeholder did not skip")
+                continue
+            }
+            #expect(reason.contains("not configured"))
+        }
     }
 
     @Test("turn-summary vocabulary forces an explicit phone-snapshot decision for every declared kind")

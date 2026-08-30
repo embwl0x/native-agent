@@ -85,7 +85,7 @@ struct AppRuntimesBehaviorWave2EvalTests {
         )
     }
 
-    @Test("installed physiology gate preserves exclusion provenance and bootstrap emits generated proof evidence")
+    @Test("installed physiology is opt-in and bootstrap emits generated proof evidence")
     func physiologySoakEnableGate() async throws {
         let disabledRoot = try root("soak-off")
         defer { try? FileManager.default.removeItem(at: disabledRoot) }
@@ -96,7 +96,7 @@ struct AppRuntimesBehaviorWave2EvalTests {
         #expect(NativeCognitionRuntime.resolveInstalledPhysiologySoakEnablement(
             dataRoot: PersistenceCore.defaultDataRoot(),
             isTestProcess: false
-        ) == .installedElapsed)
+        ) == .disabledByDefault)
         #expect(NativeCognitionRuntime.resolveInstalledPhysiologySoakEnablement(
             dataRoot: PersistenceCore.defaultDataRoot(),
             isTestProcess: true

@@ -737,3 +737,161 @@ private final class OneShotAction: @unchecked Sendable {
     #expect(result.timedOut == false)
     #expect(result.stdout.count >= 262_144)
 }
+
+@Test func pipeDrain_stopPreservesQueuedBytesWithoutWaitingForWriterEOF() throws {
+    let pipe = Pipe()
+    defer {
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+    }
+    let queued = Data(repeating: 0x71, count: 8_192)
+    try pipe.fileHandleForWriting.write(contentsOf: queued)
+    let buffer = PipeCaptureBuffer(stream: "stdout", limitBytes: 1_048_576, overflow: OutputLimitBox())
+    let drain = try PipeDrainLoop(fileDescriptor: pipe.fileHandleForReading.fileDescriptor, buffer: buffer)
+    drain.start()
+    // The writer remains open. Stop must capture its existing queued tail,
+    // not wait for EOF or discard bytes merely because shutdown was requested.
+    drain.stopAndWait()
+    #expect(buffer.data == queued)
+    try pipe.fileHandleForWriting.write(contentsOf: Data("later".utf8))
+    #expect(buffer.data == queued, "the joined reader must no longer consume output")
+}
+
+@Test func pipeWake_descriptorsCannotLeakAcrossExec() throws {
+    let pipe = try makeToolSandboxWakePipe()
+    defer {
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+    }
+    for handle in [pipe.fileHandleForReading, pipe.fileHandleForWriting] {
+        let flags = fcntl(handle.fileDescriptor, F_GETFD, 0)
+        #expect(flags >= 0)
+        #expect(flags & FD_CLOEXEC != 0)
+    }
+}
+
+@Test func pipeInput_stopJoinsWhenOpenReaderNeverConsumesLargeInput() throws {
+    let pipe = Pipe()
+    defer { try? pipe.fileHandleForReading.close() }
+    let writer = try PipeInputWriter(handle: pipe.fileHandleForWriting, input: Data(repeating: 0x78, count: 1_048_576))
+    writer.start()
+    // Keep the read end alive without consuming input: the same pipe ownership
+    // as a descendant surviving its parent with inherited, unread stdin.
+    Thread.sleep(forTimeInterval: 0.02)
+    let start = Date()
+    writer.stopAndWait()
+    #expect(Date().timeIntervalSince(start) < 1)
+    let buffered = pipe.fileHandleForReading.readDataToEndOfFile()
+    #expect(!buffered.isEmpty)
+    #expect(buffered.count < 1_048_576)
+}
+
+@Test func pipeDrain_idleReaderWakesPromptlyOnStopWithoutWriterEOF() throws {
+    let pipe = Pipe()
+    defer {
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+    }
+    let buffer = PipeCaptureBuffer(stream: "stdout", limitBytes: 1_048_576, overflow: OutputLimitBox())
+    let drain = try PipeDrainLoop(fileDescriptor: pipe.fileHandleForReading.fileDescriptor, buffer: buffer)
+    drain.start()
+    // No data and no EOF: only the private stop pipe can release poll.
+    Thread.sleep(forTimeInterval: 0.02)
+    let started = Date()
+    drain.stopAndWait()
+    #expect(Date().timeIntervalSince(started) < 1)
+    #expect(buffer.data.isEmpty)
+}
+
+@Test func pipeInput_deliversCompleteLargeInputAndClosesForEOF() throws {
+    let pipe = Pipe()
+    defer { try? pipe.fileHandleForReading.close() }
+    let input = Data(repeating: 0x71, count: 1_048_576)
+    let writer = try PipeInputWriter(handle: pipe.fileHandleForWriting, input: input)
+    writer.start()
+    let received = pipe.fileHandleForReading.readDataToEndOfFile()
+    writer.stopAndWait()
+    #expect(received == input)
+}
+
+@Test func pipeDrain_stopJoinsWhileWriterContinuesProducing() throws {
+    let pipe = Pipe()
+    let fd = pipe.fileHandleForWriting.fileDescriptor
+    let flags = fcntl(fd, F_GETFL, 0)
+    #expect(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0)
+    let producerDone = DispatchSemaphore(value: 0)
+    let stopProducer = DispatchSemaphore(value: 0)
+    let buffer = PipeCaptureBuffer(stream: "stdout", limitBytes: 1_048_576, overflow: OutputLimitBox())
+    let drain = try PipeDrainLoop(fileDescriptor: pipe.fileHandleForReading.fileDescriptor, buffer: buffer)
+    let producer = Thread {
+        let bytes = [UInt8](repeating: 0x78, count: 65_536)
+        // A self-bound producer keeps test failure from orphaning a thread.
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline, stopProducer.wait(timeout: .now()) == .timedOut {
+            _ = bytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+        }
+        producerDone.signal()
+    }
+    defer {
+        stopProducer.signal()
+        producerDone.wait()
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
+    }
+    producer.start()
+    drain.start()
+    let readyDeadline = Date().addingTimeInterval(1)
+    while buffer.data.isEmpty, Date() < readyDeadline { usleep(1_000) }
+    #expect(!buffer.data.isEmpty, "producer must be active before shutdown is requested")
+    let started = Date()
+    drain.stopAndWait()
+    #expect(Date().timeIntervalSince(started) < 2, "shutdown must not wait for the continuing producer")
+    let captured = buffer.data
+    // Producer is still running after stop returns; a genuine join makes the
+    // capture immutable even though the FD remains valid and receives bytes.
+    Thread.sleep(forTimeInterval: 0.02)
+    #expect(buffer.data == captured)
+}
+
+@Test func runTool_unboundedOutput_isCappedAndProcessIsReaped() async throws {
+    // A tool can write much faster than its ordinary deadline. Capturing until
+    // timeout made one noisy tool an unbounded-memory operation even though the
+    // pipe itself was continuously drained.
+    let pidFile = FileManager.default.temporaryDirectory
+        .appendingPathComponent("RunSandboxTests-output-limit-\(UUID().uuidString).pid")
+    defer { try? FileManager.default.removeItem(at: pidFile) }
+    let body = """
+    import Foundation
+    try! String(ProcessInfo.processInfo.processIdentifier).write(
+        toFile: \(String(reflecting: pidFile.path)), atomically: true, encoding: .utf8
+    )
+    let chunk = String(repeating: "x", count: 65_536)
+    while true { print(chunk) }
+    """
+    let toolRoot = try makeTempTool(entrypointBody: body)
+    let runner = ToolRunSandboxRunner()
+
+    do {
+        _ = try await runner.runTool(
+            sandbox: ToolRunSandbox(toolRoot: toolRoot, timeoutSeconds: 60),
+            input: .object([:]),
+            expectedFingerprint: nil, actualFingerprint: nil
+        )
+        Issue.record("expected output-limit error")
+    } catch ToolRunError.outputLimitExceeded(let stream, let limitBytes) {
+        #expect(stream == "stdout")
+        #expect(limitBytes == 4 * 1_024 * 1_024)
+    } catch {
+        Issue.record("wrong error for excessive output: \(error)")
+    }
+
+    if let rawPID = try? String(contentsOf: pidFile, encoding: .utf8),
+       let pid = pid_t(rawPID.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        #expect(
+            waitForProcessExit(pid, timeout: 3),
+            "output-limited tool pid \(pid) was still running after the sandbox returned"
+        )
+    } else {
+        Issue.record("output-limited tool did not publish its pid")
+    }
+}

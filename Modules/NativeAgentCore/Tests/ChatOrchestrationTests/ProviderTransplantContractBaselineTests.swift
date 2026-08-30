@@ -291,12 +291,12 @@ struct ProviderTransplantContractBaselineTests {
 
         let firstBodyLine = try #require(bodyLines.first ?? nil)
         let secondBodyLine = try #require(bodyLines.dropFirst().first ?? nil)
-        #expect(firstBodyLine.contains("resources feel tight"))
+        #expect(firstBodyLine.contains("internal workload fatigue is high"))
         // Projection and posture intentionally use different bounded thresholds:
         // at two hours the private posture has moved from conserving to careful,
-        // while the lower capsule fatigue threshold still honestly says resources
-        // feel tight. Both return to neutral without a timer or provider call.
-        #expect(secondBodyLine.contains("resources feel tight"))
+        // while the lower capsule fatigue threshold still honestly names internal
+        // workload fatigue. Both return to neutral without a timer or provider call.
+        #expect(secondBodyLine.contains("internal workload fatigue is high"))
         #expect(bodyLines.last == .some(nil))
         #expect(kernel == originalKernel)
         #expect(kernel.stableMemory == originalKernel.stableMemory)

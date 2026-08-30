@@ -44,6 +44,20 @@ func slackSocketModeConfig_respectsExplicitHistoryFallbackDisable() throws {
     #expect(config.historyPollInterval == 30)
 }
 
+@Test
+func slackSocketModeConfig_acceptsEveryBotCredentialKeyReadinessAccepts() throws {
+    for key in ["access_token", "oauth_token", "token"] {
+        let root = try makeSlackConfigRoot([
+            key: "xoxb-test",
+            "socket_mode_app_token": "xapp-test",
+        ])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let config = try #require(SlackSocketModeConfig.load(dataRoot: root))
+        #expect(config.botToken == "xoxb-test")
+    }
+}
+
 // MARK: - A4.8(a): session recycle must beat the watchdog
 
 @Test

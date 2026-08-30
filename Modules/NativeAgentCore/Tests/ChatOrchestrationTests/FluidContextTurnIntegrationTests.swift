@@ -94,7 +94,10 @@ private actor FluidMemoryStub: MemoryRecalling {
     }
 }
 
-private func fluidPreparedTurn(mode: ContextFlowMode = .active) throws -> ContextPreparedTurn {
+private func fluidPreparedTurn(
+    mode: ContextFlowMode = .active,
+    selectionMicroseconds: Int? = 1
+) throws -> ContextPreparedTurn {
     let personaID = ContextPersonaID(rawValue: "canonical")
     let fingerprint = "persona-fingerprint"
     let document = try RequiredDocument(
@@ -150,7 +153,7 @@ private func fluidPreparedTurn(mode: ContextFlowMode = .active) throws -> Contex
         budget: budget,
         degradedSources: [],
         cacheState: .hit,
-        measuredSelectionMicroseconds: 1
+        measuredSelectionMicroseconds: selectionMicroseconds
     )
     let packet = ContextPacket(
         generationID: 1,
@@ -199,7 +202,8 @@ private func fluidPreparedTurn(mode: ContextFlowMode = .active) throws -> Contex
 private func fluidEngine(
     persona: any PersonaEngineProtocol,
     flow: (any ContextTurnPreparing)?,
-    memory: (any MemoryRecalling)? = nil
+    memory: (any MemoryRecalling)? = nil,
+    tools: any ToolDispatchClient = MockToolDispatchClient()
 ) -> SwiftNativeTurnEngine {
     SwiftNativeTurnEngine(
         persona: persona,
@@ -207,9 +211,124 @@ private func fluidEngine(
         router: FluidRoutingStub(),
         trust: hermeticTrust(),
         llm: MockLLMClient(scriptedResponses: ["ok"]),
-        tools: MockToolDispatchClient(),
+        tools: tools,
         contextFlow: flow
     )
+}
+
+private actor FluidCancellationGate {
+    private var entered = false
+    private var arrival: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        entered = true
+        arrival?.resume()
+        arrival = nil
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { arrival = $0 }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor GatedFluidContextStub: ContextTurnPreparing {
+    let prepared: ContextPreparedTurn
+    let gate: FluidCancellationGate
+    let throwsAfterGate: Bool
+
+    init(prepared: ContextPreparedTurn, gate: FluidCancellationGate, throwsAfterGate: Bool) {
+        self.prepared = prepared
+        self.gate = gate
+        self.throwsAfterGate = throwsAfterGate
+    }
+
+    func contextFlowMode() async -> ContextFlowMode { .active }
+    func prepareContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
+        await gate.suspend()
+        if throwsAfterGate { throw CancellationError() }
+        return prepared
+    }
+}
+
+private actor GatedFluidCatalog: ToolDispatchClient {
+    let gate: FluidCancellationGate
+    init(gate: FluidCancellationGate) { self.gate = gate }
+    func listAvailableTools() async throws -> [String] {
+        await gate.suspend()
+        return []
+    }
+    func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue { .null }
+}
+
+@Test(arguments: ["prepared_packet", "prepare_error", "later_catalog"])
+func cancelledContextAssemblyDoesNotReturnHealthyContextOrRecordServedMemories(boundary: String) async throws {
+    let prepared = try fluidPreparedTurn()
+    prepared.attachMemoryRecordProvenance(["cancelled-memory"])
+    let gate = FluidCancellationGate()
+    let memory = FluidMemoryStub()
+    let flow: any ContextTurnPreparing
+    let tools: any ToolDispatchClient
+    if boundary == "later_catalog" {
+        flow = FluidContextStub(mode: .active, prepared: prepared)
+        tools = GatedFluidCatalog(gate: gate)
+    } else {
+        flow = GatedFluidContextStub(prepared: prepared, gate: gate, throwsAfterGate: boundary == "prepare_error")
+        tools = MockToolDispatchClient()
+    }
+    let engine = fluidEngine(
+        persona: FluidPersonaStub(docs: [PersonaDoc(id: "SOUL", content: "fixture identity", sizeBytes: 16, mtime: .distantPast)]),
+        flow: flow, memory: memory, tools: tools
+    )
+    let preparation = Task { () -> Bool in
+        do {
+            _ = try await engine.buildTurnContext(
+                surface: "chat", userMessage: "hello", personaOverride: nil,
+                imageBlocks: [], includeClockContext: false
+            )
+            return false
+        } catch is CancellationError {
+            return true
+        } catch {
+            Issue.record("expected cancellation, received \(error)")
+            return false
+        }
+    }
+    await gate.waitUntilEntered()
+    preparation.cancel()
+    await gate.release()
+    #expect(await preparation.value, "cancelled assembly must not return a healthy context")
+    #expect(await memory.servedHits.isEmpty)
+    #expect(await memory.recallCount == 0, "cancellation is not ordinary fallback recall")
+}
+
+@Test func uncancelledProviderCancellationErrorRetainsOrdinaryContextFallback() async throws {
+    let gate = FluidCancellationGate()
+    let flow = GatedFluidContextStub(prepared: try fluidPreparedTurn(), gate: gate, throwsAfterGate: true)
+    let memory = FluidMemoryStub()
+    let engine = fluidEngine(
+        persona: FluidPersonaStub(docs: [PersonaDoc(id: "SOUL", content: "fixture identity", sizeBytes: 16, mtime: .distantPast)]),
+        flow: flow, memory: memory
+    )
+    let preparation = Task { () throws -> Bool in
+        let context = try await engine.buildTurnContext(
+            surface: "chat", userMessage: "hello", personaOverride: nil,
+            imageBlocks: [], includeClockContext: false
+        )
+        return context.fluidContextTurn == nil && context.recalled.count == 1
+    }
+    await gate.waitUntilEntered()
+    await gate.release()
+    #expect(try await preparation.value)
+    #expect(await memory.recallCount == 1)
+    #expect(await memory.servedHits.isEmpty)
 }
 
 @Test func activeFluidContextDoesNotRunTheDuplicateLegacyMemoryRecall() async throws {
@@ -620,4 +739,122 @@ struct PacketProvenanceTests {
     #expect(memoryRecall["outcome"] == .string("contextFlow"))
     #expect(memoryRecall["injectedHitCount"] == .int(3),
             "injected must follow the resolved lane: \(String(describing: memoryRecall["injectedHitCount"]))")
+}
+
+// MARK: - A7: the dark stage lanes (persona.compile / memory.recall), 2026-08-28
+//
+// Both lanes were PRESENT and structurally ZERO on every ContextFlow-active
+// turn (431/431 live turns in data/turn_traces/2026-08-25..28, max 1ms) because
+// (a) whole-millisecond truncation hides sub-ms work and (b) on the active path
+// the real memory retrieval happens inside the packet selector, not in the
+// engine's bracket. The stage-budget gate only checks key ABSENCE, so a lane
+// that reads 0 forever passes it — these tests are the teeth for the zero case.
+
+private func fluidContextSummaryPayload(
+    prepared: ContextPreparedTurn
+) async throws -> [String: JSONValue] {
+    let flow = FluidContextStub(mode: .active, prepared: prepared)
+    let engine = fluidEngine(persona: FluidPersonaStub(throwsOnRead: true), flow: flow)
+    let traceRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("stage-relight-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: traceRoot, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: traceRoot) }
+    let bus = TurnTraceBus(persistLane: TurnTracePersistLane(dataRootOverride: traceRoot))
+    let sub = await bus.subscribe()
+    let turnId = TurnTraceContext.mintTurnId()
+    let drain = Task { () -> TurnTraceEvent? in
+        for await event in sub.stream
+        where event.kind == "context.summary" && event.turnId == turnId {
+            return event
+        }
+        return nil
+    }
+    _ = try await TurnTraceContext.$bus.withValue(bus) {
+        try await TurnTraceContext.$turnId.withValue(turnId) {
+            try await engine.buildTurnContext(
+                surface: "chat",
+                userMessage: "hello",
+                personaOverride: nil,
+                imageBlocks: [],
+                includeClockContext: false
+            )
+        }
+    }
+    let stopper = Task {
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        await bus.unsubscribe(sub.id)
+    }
+    let event = try #require(await drain.value, "no context.summary receipt within 3s")
+    stopper.cancel()
+    await bus.unsubscribe(sub.id)
+    guard case .object(let payload) = event.payload else {
+        throw FluidStageRelightError.invalidPayload
+    }
+    return payload
+}
+
+private enum FluidStageRelightError: Error { case invalidPayload }
+
+@Test func activeTurnLightsPersonaCompileAndMemoryRecallStages() async throws {
+    // 1,500µs of selector latency: proves the lane carries the SELECTOR's real
+    // measurement (ceil → 2ms), not the engine's near-zero bracket.
+    let prepared = try fluidPreparedTurn(selectionMicroseconds: 1_500)
+    let payload = try await fluidContextSummaryPayload(prepared: prepared)
+    guard case .object(let stageMs)? = payload["stageMs"],
+          case .object(let counts)? = payload["counts"] else {
+        Issue.record("context.summary payload missing stageMs/counts")
+        return
+    }
+
+    #expect(stageMs["memory.recall"] == .int(2),
+            "memory.recall: \(String(describing: stageMs["memory.recall"]))")
+    #expect(counts["memory.recallMicros"] == .int(1_500))
+
+    // persona.compile brackets the mirror→document map: real work, tens of µs,
+    // which is exactly what truncated to a permanent 0 before.
+    guard case .int(let personaMs)? = stageMs["persona.compile"],
+          case .int(let personaMicros)? = counts["persona.compileMicros"] else {
+        Issue.record("persona.compile lane absent: \(stageMs)")
+        return
+    }
+    #expect(personaMs >= 1, "persona.compile still dark: \(personaMs)ms")
+    #expect(personaMicros > 0, "persona.compile micros: \(personaMicros)")
+}
+
+@Test func absentSelectorLatencySampleIsNotReportedAsFastRecall() async throws {
+    // Absence is evidence: the selector reports an unmeasured selection as nil,
+    // and on a prepared turn the lane must stay ABSENT — neither the selector's
+    // number (there is none) nor the engine bracket's atom-serving time, which
+    // is exactly the structural zero this fix removed.
+    let prepared = try fluidPreparedTurn(selectionMicroseconds: nil)
+    let payload = try await fluidContextSummaryPayload(prepared: prepared)
+    if case .object(let counts)? = payload["counts"],
+       case .int(let micros)? = counts["memory.recallMicros"] {
+        Issue.record("prepared turn with no selector sample reported memory.recallMicros=\(micros) — bracket time laundered into the recall lane")
+    }
+    if case .object(let stageMs)? = payload["stageMs"],
+       stageMs["memory.recall"] != nil {
+        Issue.record("prepared turn with no selector sample still carries a stageMs.memory.recall value")
+    }
+}
+
+// MARK: - B11: an empty preview must not occupy a recall slot
+
+@Test func emptyRecallPreviewsDoNotConsumeMemoryBlockSlots() throws {
+    let budget = ContextBudgetPolicy.resolve(windowTokens: nil, surface: "chat")
+    func hit(_ text: String) -> MemoryRecallHit {
+        MemoryRecallHit(
+            score: 1, sessionId: nil, role: nil, ts: nil,
+            preview: text, content: nil, source: "test"
+        )
+    }
+    // Every slot filled with blanks, then one real memory behind them.
+    var recalled = (0..<budget.recallRowLimit).map { _ in hit("   ") }
+    recalled.append(hit("User takes his espresso short"))
+
+    let block = try #require(
+        SwiftNativeTurnEngine.renderRecalledMemoryBlock(recalled, budget: budget),
+        "the real memory was starved by empty previews"
+    )
+    #expect(block.contains("User takes his espresso short"))
 }

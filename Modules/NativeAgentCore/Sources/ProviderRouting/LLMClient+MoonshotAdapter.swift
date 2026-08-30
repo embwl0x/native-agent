@@ -139,6 +139,7 @@ public final class MoonshotAdapter: LLMAdapter {
                     } catch {
                         throw mapTransportError(error, fallback: .transient(message: "connection failed: \(endpoint.host ?? "moonshot")"))
                     }
+                    defer { bytes.task.cancel() }
                     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                     guard (200..<300).contains(status) else {
                         // 2026-07-21 audit: route through the SAME mapping the

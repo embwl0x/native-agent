@@ -8,6 +8,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TOOL="$ROOT/script/agent_instrument.swift"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/tool-execution-inventory.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
+TOOL_BIN="$TMP/agent-instrument"
+swiftc "$TOOL" -o "$TOOL_BIN"
 
 failures=0
 pass() { printf '  ok   %s\n' "$1"; }
@@ -27,7 +29,7 @@ run_case() {
   mkdir -p "$root/traces"
   printf '%s\n' '{"kind":"llm.call","createdAt":"2026-08-24T12:00:00Z","payload":{"surface":"chat","model":"fixture"}}' \
     > "$root/traces/events.jsonl"
-  swift "$TOOL" --data-root "$root" --days 1 --no-bridge-config --no-machine-state \
+  "$TOOL_BIN" --data-root "$root" --days 1 --no-bridge-config --no-machine-state \
     --now 2026-08-24T12:00:00Z --out "$TMP/$name.md" >/dev/null
 }
 

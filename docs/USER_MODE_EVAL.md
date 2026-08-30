@@ -32,7 +32,7 @@ The healthy/stopped contradiction check is scoped to status-like AX text lines. 
 
 The app exposes hidden User Mode keyboard routes for surfaces that SwiftUI's sidebar rows do not reliably select through Accessibility. The harness still proves the destination by checking visible detail text outside the sidebar, so it fails if a shortcut routes to the wrong surface.
 
-The action-label inventory is user-surface scoped: SwiftUI rows/cells can satisfy the label check through visible child text, while hidden User Mode route controls, AppKit scroll-bar children, and standard macOS titlebar chrome are excluded from NativeAgent app-control accounting.
+The action-label inventory is user-surface scoped: SwiftUI rows/cells can satisfy the label check through visible child text, while hidden User Mode route controls, AppKit scroll-bar children, standard macOS titlebar chrome, and positive-size AX rows clipped outside their app window are excluded from NativeAgent app-control accounting. The Open Approvals journey temporarily places its probe first in the Inbox so the tested button is genuinely mounted. Installation and cleanup share the app's `inbox.jsonl.lock`; cleanup removes only the probe ID so notifications that arrive during the flow are preserved.
 
 Every run writes artifacts under `.runtime/user-mode-eval/<timestamp>/` by default:
 

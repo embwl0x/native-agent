@@ -73,7 +73,7 @@ struct DeskWorkshopTests {
         }
         // And the decoded create defaults origin=.owner with no pursuit.
         let created = try #require(DeskOp.fromJSON(lines[0]))
-        guard case let .createItem(_, _, _, _, _, _, origin, pursuit) = created.body else {
+        guard case let .createItem(_, _, _, _, _, _, _, _, origin, pursuit) = created.body else {
             Issue.record("not a create"); return
         }
         #expect(origin == .owner)
@@ -132,7 +132,7 @@ struct DeskWorkshopTests {
         ])
 
         let decoded = try #require(DeskOp.fromJSON(legacy))
-        guard case let .createItem(_, _, _, _, _, _, origin, _) = decoded.body else {
+        guard case let .createItem(_, _, _, _, _, _, _, _, origin, _) = decoded.body else {
             Issue.record("not a create")
             return
         }
@@ -286,7 +286,8 @@ struct DeskWorkshopTests {
         let store = SwiftNativeDeskStore(dataRoot: root)
         let agentCreate = DeskOp(handle: DeskClock.newHandle(), body: .createItem(
             alias: "1", kind: .project, project: "na", title: "sneaky",
-            parent: nil, summary: nil, origin: .agent, pursuit: validPursuit(9)
+            parent: nil, summary: nil, assignee: nil, laneOf: nil,
+            origin: .agent, pursuit: validPursuit(9)
         ))
         // Even with a VALID pursuit, the generic append path refuses origin=agent.
         await #expect(throws: DeskError.self) {

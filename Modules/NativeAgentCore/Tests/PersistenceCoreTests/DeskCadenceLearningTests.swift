@@ -7,8 +7,8 @@ import Foundation
 // The invariants worth failing a build over:
 //   1. EXPLICIT BEATS LEARNED, always. User's configured interval is not a
 //      suggestion the learner gets to overrule.
-//   2. THIN EVIDENCE PRODUCES NO NUMBER. Under three changes → nil, so the
-//      caller keeps its own default instead of inheriting a coin flip.
+//   2. THIN EVIDENCE PRODUCES NO CHANGE-RHYTHM NUMBER. Repeated observations
+//      over a full quiet day may still prove that a ref is stable.
 //   3. CLAMPED BOTH ENDS + BACKOFF WHILE QUIET, collapsing back on a change.
 //   4. UNKNOWN JSON KEYS SURVIVE A ROUND TRIP (two binaries, one file).
 //   5. Every store mutation is one locked transaction — concurrent recorders
@@ -106,6 +106,40 @@ struct DeskCadenceLearningTests {
         s = DeskCadenceLearner.record(s, fingerprint: "d", at: t0.addingTimeInterval(10_800)) // 3
         #expect(s.changes == 3)
         #expect(DeskCadenceLearner.learnedIntervalSeconds(s) != nil)
+    }
+
+    @Test("sustained unchanged observations become quiet evidence, not permanent ignorance")
+    func stableQuietEvidenceBacksOff() {
+        var stable = seed("stable")
+        for observation in 0..<DeskCadenceLearner.minStableObservationCount {
+            stable = DeskCadenceLearner.record(
+                stable,
+                fingerprint: "same",
+                at: t0.addingTimeInterval(TimeInterval(observation) * 3600)
+            )
+        }
+
+        #expect(stable.changes == 0)
+        #expect(DeskCadenceLearner.learnedIntervalSeconds(stable) == nil,
+                "silence must not fabricate a change rhythm")
+        #expect(DeskCadenceLearner.effectiveIntervalSeconds(
+            stable, now: t0.addingTimeInterval(23 * 3600)
+        ) == nil, "less than a full quiet day is still thin evidence")
+        #expect(DeskCadenceLearner.effectiveIntervalSeconds(
+            stable, now: t0.addingTimeInterval(24 * 3600)
+        ) == 43_200.0)
+        #expect(DeskCadenceLearner.effectiveIntervalSeconds(
+            stable, now: t0.addingTimeInterval(48 * 3600)
+        ) == DeskCadenceLearner.maxIntervalSeconds)
+
+        let moved = DeskCadenceLearner.record(
+            stable,
+            fingerprint: "changed",
+            at: t0.addingTimeInterval(48 * 3600)
+        )
+        #expect(DeskCadenceLearner.effectiveIntervalSeconds(
+            moved, now: t0.addingTimeInterval(48 * 3600)
+        ) == nil, "a real change must collapse the quiet backoff immediately")
     }
 
     // MARK: - Clamps
@@ -316,6 +350,33 @@ struct DeskCadenceLearningTests {
         #expect(fallback.seconds == 300)
     }
 
+    @Test("batch recording advances every ref in one coherent store mutation")
+    func batchRecordRoundTrip() async throws {
+        let root = hermeticRoot()
+        let store = DeskCadenceStore(dataRoot: root)
+
+        let first = try await store.recordObservations(
+            ["r1": "a", "r2": "b"], at: t0
+        )
+        #expect(first.count == 2)
+        #expect(first["r1"]?.observations == 1)
+        #expect(first["r2"]?.observations == 1)
+
+        let second = try await store.recordObservations(
+            ["r1": "a", "r2": "c", "r3": "d"],
+            at: t0.addingTimeInterval(600)
+        )
+        #expect(second["r1"]?.changes == 0)
+        #expect(second["r2"]?.changes == 1)
+        #expect(second["r3"]?.observations == 1)
+
+        let loaded = await store.load()
+        #expect(loaded.refs.count == 3)
+        #expect(loaded.refs["r1"]?.observations == 2)
+        #expect(loaded.refs["r2"]?.observations == 2)
+        #expect(loaded.refs["r2"]?.ewmaChangeIntervalSec == 600)
+    }
+
     @Test("concurrent recordObservation calls all land — no lost update")
     func concurrentRecordsAllLand() async throws {
         let root = hermeticRoot()
@@ -393,6 +454,29 @@ struct DeskCadenceLearningTests {
         #expect(DeskCadenceLearner.batchIntervalSeconds(
             refKeys: ["known", "never-seen"], stats: stats, configuredSeconds: 900, now: now
         ) == 900)
+    }
+
+    @Test("an unchanged but well-observed ref no longer pins the whole batch forever")
+    func stableQuietRefCanStretchBatch() {
+        let known = confident("known", every: 12 * 3600)
+        let now = atLastChange(known).addingTimeInterval(48 * 3600)
+        var stable = seed("stable")
+        for observation in 0..<DeskCadenceLearner.minStableObservationCount {
+            stable = DeskCadenceLearner.record(
+                stable,
+                fingerprint: "same",
+                at: t0.addingTimeInterval(TimeInterval(observation) * 3600)
+            )
+        }
+        let stats = DeskCadenceStats(refs: ["known": known, "stable": stable])
+        let interval = DeskCadenceLearner.batchIntervalSeconds(
+            refKeys: ["known", "stable"], stats: stats, configuredSeconds: 900, now: now
+        )
+        #expect(interval > 900)
+        #expect(interval == min(
+            DeskCadenceLearner.effectiveIntervalSeconds(known, now: now)!,
+            DeskCadenceLearner.effectiveIntervalSeconds(stable, now: now)!
+        ))
     }
 
     @Test("the configured interval is a FLOOR — learning never polls harder")

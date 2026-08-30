@@ -68,6 +68,32 @@ private struct EmptyErrorLoop: LoopRunner {
     #expect(!text.contains(#""error":"""#))
 }
 
+@Test func identicalConsecutiveFailuresCoalesceButRecoveryStartsANewIncident() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("FailureIncidentCoalescing-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let receipts = root.appendingPathComponent("failures.jsonl")
+    let sched = SwiftNativeLoopScheduler(failureReceiptsPath: receipts)
+
+    await sched.recordFailure(loopId: "L", error: "boom")
+    await sched.recordFailure(loopId: "L", error: "boom")
+    await sched.recordResult(loopId: "L", result: "completed")
+    await sched.recordFailure(loopId: "L", error: "boom")
+
+    let rows = await sched._testFailureReceiptRows()
+    #expect(rows.count == 2)
+
+    guard case .object(let first) = rows[0],
+          case .int(let occurrences)? = first["occurrences"] else {
+        Issue.record("expected coalesced receipt row")
+        return
+    }
+    #expect(occurrences == 2)
+    #expect(first["firstAt"] != nil)
+    #expect(first["lastAt"] != nil)
+}
+
 // MARK: - L4-15, the retirement tombstone
 
 @Test func retiredLoopStampsAreDroppedOnLoadAndAbsentFromTheNextFlush() async throws {

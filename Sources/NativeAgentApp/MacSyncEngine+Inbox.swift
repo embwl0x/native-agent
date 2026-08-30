@@ -319,6 +319,7 @@ extension MacSyncEngine {
                 in: responsesDir,
                 validatedID: ids.messageID
             ) else { continue }
+            let inboundActionVerified = true
             let responseWritten = await writeInboxResponse(response, to: responseURL)
             guard responseWritten else {
                 syncError = "Could not write iCloud response for \(action.msgId); command left pending."
@@ -327,6 +328,21 @@ extension MacSyncEngine {
                     try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: pendingURL.path)
                 }.value
                 continue
+            }
+            await iCloudBridge.appendActionResponseDeliveryReceipt(
+                response: response,
+                correlationID: action.msgId,
+                transport: "icloud_drive",
+                status: .queuedForICloudSync,
+                dataRoot: NativeAgentPaths.dataRoot
+            )
+            if inboundActionVerified {
+                await iCloudBridge.appendInboundActionSuccessReceipt(
+                    messageID: action.msgId,
+                    action: action.action,
+                    transport: "icloud_drive",
+                    dataRoot: NativeAgentPaths.dataRoot
+                )
             }
 
             let responseStatus = (response["status"] ?? "").lowercased()
@@ -467,7 +483,9 @@ extension MacSyncEngine {
         )
 
         let response: [String: String]
+        let inboundActionVerified: Bool
         if let validationError = await validateInboxAction(data: data, action: action) {
+            inboundActionVerified = false
             if validationError.contains("pairing secret unavailable") {
                 syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
                 return false
@@ -494,6 +512,7 @@ extension MacSyncEngine {
                 response: response
             )
         } else {
+            inboundActionVerified = true
             if let peerCreatedAt = ISO8601DateFormatter().date(from: action.createdAt) {
                 do {
                     try await SignedPeerEvidenceStore.record(
@@ -543,6 +562,14 @@ extension MacSyncEngine {
         guard await writeInboxResponse(response, to: responseURL) else {
             syncError = "Could not persist CloudKit response for \(action.msgId); action will not be acknowledged."
             return false
+        }
+        if inboundActionVerified {
+            await iCloudBridge.appendInboundActionSuccessReceipt(
+                messageID: action.msgId,
+                action: action.action,
+                transport: "cloudkit",
+                dataRoot: actionStateRoot
+            )
         }
         // Sweep R4 item 1 (CloudKit lane, same hazard as the Drive lane above):
         // the action has already executed. If the id window cannot be persisted

@@ -229,8 +229,12 @@ public struct VisionPixelGrid: Sendable {
 
 public enum VisionColorRegionLayer {
     static func distanceSquared(_ lhs: SIMD3<Double>, _ rhs: SIMD3<Double>) -> Double {
-        let delta = lhs - rhs
-        return (delta * delta).sum()
+        // Spell out the fixed three channels: generic SIMD reduction spends
+        // substantial time in element access in installed development builds.
+        let red = lhs.x - rhs.x
+        let green = lhs.y - rhs.y
+        let blue = lhs.z - rhs.z
+        return red * red + green * green + blue * blue
     }
 
     /// Coarse-grid scan → similar-colour box growth → dedupe. The spike's
@@ -264,6 +268,10 @@ public enum VisionColorRegionLayer {
             (Double(dominant.z) + 0.5) / 16
         )
         let backgroundLuminance = 0.2126 * background.x + 0.7152 * background.y + 0.0722 * background.z
+        // The background centroid is constant for this frame. Region growth
+        // revisits boundary cells many times; never recompute this distance
+        // for every seed/edge probe. No cache survives the current image.
+        let backgroundDistances = grid.samples.map { distanceSquared($0, background) }
 
         // 2. GROW: every non-background cell seeds a rectangular region that
         //    expands while its neighbours keep the seed's colour. Rectangular
@@ -279,7 +287,7 @@ public enum VisionColorRegionLayer {
                 let index = row * grid.columns + column
                 if visited[index] { continue }
                 let seed = grid.color(column: column, row: row)
-                guard distanceSquared(seed, background) > config.backgroundTolerance else {
+                guard backgroundDistances[index] > config.backgroundTolerance else {
                     visited[index] = true
                     continue
                 }
@@ -308,10 +316,11 @@ public enum VisionColorRegionLayer {
                 // and cannot make that mistake: a background-coloured cell is
                 // by definition closest to the background.
                 func belongs(_ column: Int, _ row: Int) -> Bool {
-                    let cell = grid.color(column: column, row: row)
+                    let cellIndex = row * grid.columns + column
+                    let cell = grid.samples[cellIndex]
                     let toSeed = distanceSquared(cell, seed)
                     guard toSeed <= config.colorTolerance else { return false }
-                    return toSeed < distanceSquared(cell, background)
+                    return toSeed < backgroundDistances[cellIndex]
                 }
                 func matchFraction(rowIndex r: Int, from a: Int, to b: Int) -> Double {
                     var matches = 0
@@ -354,14 +363,65 @@ public enum VisionColorRegionLayer {
                 // into the frame edge is a crop, and says so with less
                 // confidence rather than the same confidence.
                 let touchesEdge = c0 == 0 || r0 == 0 || c1 == grid.columns - 1 || r1 == grid.rows - 1
-                let contrast = min(1, distanceSquared(seed, background) / 0.08)
+                let contrast = min(1, backgroundDistances[index] / 0.08)
                 let boundsConfidence = (touchesEdge ? 0.45 : 0.75) + 0.2 * contrast
                 let luminance = 0.2126 * seed.x + 0.7152 * seed.y + 0.0722 * seed.z
+                // The rectangular grower deliberately owns action bounds, but
+                // it cannot distinguish a disk from a square: both occupy a
+                // near-square box. Walk the seed's connected colour component
+                // separately and retain only a conservative silhouette fact.
+                // This does not alter bounds, candidates, or motor points.
+                let visualShape: String? = {
+                    var queue: [(column: Int, row: Int)] = [(column, row)]
+                    var cursor = 0
+                    var component: Set<Int> = [index]
+                    var minColumn = column, maxColumn = column
+                    var minRow = row, maxRow = row
+                    while cursor < queue.count, component.count <= 10_000 {
+                        let cell = queue[cursor]
+                        cursor += 1
+                        let neighbors = [
+                            (cell.column - 1, cell.row), (cell.column + 1, cell.row),
+                            (cell.column, cell.row - 1), (cell.column, cell.row + 1),
+                        ]
+                        for (nextColumn, nextRow) in neighbors {
+                            guard nextColumn >= 0, nextColumn < grid.columns,
+                                  nextRow >= 0, nextRow < grid.rows,
+                                  belongs(nextColumn, nextRow) else { continue }
+                            let nextIndex = nextRow * grid.columns + nextColumn
+                            guard component.insert(nextIndex).inserted else { continue }
+                            queue.append((nextColumn, nextRow))
+                            minColumn = min(minColumn, nextColumn)
+                            maxColumn = max(maxColumn, nextColumn)
+                            minRow = min(minRow, nextRow)
+                            maxRow = max(maxRow, nextRow)
+                        }
+                    }
+                    guard component.count <= 10_000 else { return nil }
+                    let componentWidth = maxColumn - minColumn + 1
+                    let componentHeight = maxRow - minRow + 1
+                    guard componentWidth >= 3, componentHeight >= 3 else { return nil }
+                    let aspect = Double(componentWidth) / Double(componentHeight)
+                    guard aspect >= 0.75, aspect <= 1.33 else { return nil }
+                    let boxCells = componentWidth * componentHeight
+                    let occupancy = Double(component.count) / Double(boxCells)
+                    let corners = [
+                        minRow * grid.columns + minColumn,
+                        minRow * grid.columns + maxColumn,
+                        maxRow * grid.columns + minColumn,
+                        maxRow * grid.columns + maxColumn,
+                    ].filter { component.contains($0) }.count
+                    if occupancy >= 0.90, corners >= 3 { return "square" }
+                    if occupancy >= 0.45, occupancy <= 0.90, corners <= 1 { return "round" }
+                    return nil
+                }()
                 raw.append(VisionCandidate(
                     rect: rect,
                     sources: [.colorRegion],
                     boundsConfidence: boundsConfidence,
-                    fillLuminance: luminance
+                    fillLuminance: luminance,
+                    fillColor: VisionColorSample(red: seed.x, green: seed.y, blue: seed.z),
+                    visualShape: visualShape
                 ))
             }
         }

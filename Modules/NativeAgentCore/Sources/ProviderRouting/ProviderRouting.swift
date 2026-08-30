@@ -1429,40 +1429,6 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         )
     }
 
-    private func writeActiveProvider(
-        surface: String,
-        providerId: String,
-        overwriteExisting: Bool = true
-    ) async throws {
-        try FileManager.default.createDirectory(
-            at: surfaceTransactionPath.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try await persistence.withFileLock(surfaceTransactionPath) {
-            try await self.reconcilePendingSurfaceConfigurationLocked()
-            _ = try Self.loadProviderStateObjectChecked(
-                at: self.surfacesPath,
-                description: "surface preference"
-            )
-            let root = try Self.loadProviderStateObjectChecked(
-                at: self.activeProviderPath,
-                description: "active-provider"
-            )
-            _ = try Self.loadActiveProviderObjectChecked(root)
-            let updated = Self.updatedActiveRoot(
-                root,
-                surface: surface,
-                providerId: providerId,
-                overwriteExisting: overwriteExisting
-            )
-            guard updated != root else { return }
-            try Task.checkCancellation()
-            try await self.persistence.withFileLock(self.activeProviderPath) {
-                try await self.persistence.writeJSON(.object(updated), to: self.activeProviderPath)
-            }
-        }
-    }
-
     // MARK: Phase B — Swift-native picker
 
     /// Read Swift-native provider picker state and seed every MODEL_SURFACE.

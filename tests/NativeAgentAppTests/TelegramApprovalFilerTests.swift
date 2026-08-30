@@ -201,6 +201,103 @@ struct TelegramApprovalFilerTests {
         #expect(resultSummary.contains("\"available_tools\""))
     }
 
+    @Test(arguments: ["queued", "cancelled", "timed_out", "outcome_unknown", "succeeded"])
+    func approvalOutcomeReceiptPreservesExactClassThroughReplacement(status: String) async throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let inbox = SwiftNativeApprovalInbox(root: root)
+        let session = "approval-outcome-fixture"
+        let approval = try await inbox.create(.object([
+            "title": .string("Approve fixture"), "action": .string("tool_catalog"),
+            "risk": .string("confirm"), "reason": .string("fixture"),
+            "payload": .object([
+                "kind": .string("chat_tool_approval"), "toolName": .string("tool_catalog"),
+                "surface": .string("telegram"), "input": .object([:]),
+                "telegram": .object(["chatId": .string("77"), "sessionId": .string(session)]),
+            ]),
+        ]))
+        _ = try await inbox.resolve(approval.id, decision: .approved, decidedBy: "fixture")
+        let persistence = SwiftNativePersistenceCore()
+        let messages = root.appendingPathComponent("chat/messages", isDirectory: true)
+        try FileManager.default.createDirectory(at: messages, withIntermediateDirectories: true)
+        let transcript = messages.appendingPathComponent("\(session).jsonl")
+        try await persistence.appendJSONL(.object([
+            "id": .string("pending-row"), "createdAt": .string("2026-08-30T18:00:00Z"),
+            "role": .string("tool"), "content": .string(""),
+            "metadata": .object([
+                "kind": .string(ChatTranscriptToolMessageKind.approvalPending),
+                "approvalId": .string(approval.id), "resultClass": .string("unknown"),
+            ]),
+        ]), to: transcript)
+
+        // This is the same projection called immediately after actual dispatch,
+        // not a hand-built executedAction. Only a bounded redacted preview persists.
+        let receipt = NativeClient.chatToolApprovalExecutionReceipt(
+            toolName: "tool_catalog", surface: "telegram",
+            result: .object(["status": .string(status), "detail": .string(String(repeating: "x", count: 4_000))]))
+        #expect(receipt.preview.count <= 1_403)
+        guard case .object(var action) = receipt.action else {
+            Issue.record("expected execution annotation")
+            return
+        }
+        let expectedClass: String
+        let expectedPrefix: String
+        switch status {
+        case "cancelled": (expectedClass, expectedPrefix) = ("cancelled", "Cancelled")
+        case "timed_out": (expectedClass, expectedPrefix) = ("timeout", "Timed out")
+        case "succeeded": (expectedClass, expectedPrefix) = ("succeeded", "Completed")
+        default: (expectedClass, expectedPrefix) = ("unknown", "Outcome unconfirmed")
+        }
+        #expect(action["resultClass"] == .string(expectedClass))
+
+        // New annotations carry the class; old ones retain only canonical status.
+        // Both replace the same pending row and remain idempotent on replay.
+        for legacy in [false, true] {
+            if legacy { action["resultClass"] = nil }
+            try await NativeClient.annotateApprovalExecution(
+                id: approval.id, executedAction: .object(action), detail: "fixture result", root: root)
+            let annotated = try await inbox.get(approval.id)
+            await NativeClient.ensureChatToolApprovalOutcomeReceipt(from: annotated, dataRoot: root)
+            await NativeClient.ensureChatToolApprovalOutcomeReceipt(from: annotated, dataRoot: root)
+            let rows = try await persistence.readJSONL(transcript)
+            #expect(rows.count == 1)
+            guard case .object(let row)? = rows.first,
+                  case .object(let metadata)? = row["metadata"],
+                  case .string(let summary)? = metadata["resultSummary"] else {
+                Issue.record("expected settled tool receipt")
+                return
+            }
+            #expect(row["id"] == .string("pending-row"))
+            #expect(row["createdAt"] == .string("2026-08-30T18:00:00Z"))
+            #expect(metadata["kind"] == .string(ChatTranscriptToolMessageKind.toolUse))
+            #expect(metadata["resultClass"] == .string(expectedClass))
+            #expect(summary.hasPrefix("\(expectedPrefix) after approval"))
+            #expect(summary.contains("Completed after approval") == (status == "succeeded"))
+            #expect(metadata["ok"] == .bool(status != "cancelled" && status != "outcome_unknown"),
+                    "the existing UI/transport flag remains backward compatible")
+        }
+    }
+
+    @Test func approvalExecutionProjectionUsesOriginalOutcomeBeforePreview() {
+        let explicitFailure = NativeClient.chatToolApprovalExecutionReceipt(
+            toolName: "tool_catalog", surface: "chat",
+            result: .object(["status": .string("succeeded"), "ok": .bool(false)]))
+        guard case .object(let action) = explicitFailure.action else {
+            Issue.record("expected execution annotation")
+            return
+        }
+        #expect(action["resultClass"] == .string("failed"),
+                "the original result's explicit failure must not collapse to its status string")
+        let legacy = NativeClient.chatToolApprovalExecutionReceipt(
+            toolName: "tool_catalog", surface: "chat", result: .object(["ok": .bool(true)]))
+        guard case .object(let legacyAction) = legacy.action else {
+            Issue.record("expected legacy execution annotation")
+            return
+        }
+        #expect(legacyAction["resultClass"] == nil)
+        #expect(legacyAction["status"] == .string("succeeded"))
+    }
+
     @Test func applyResolvedChatToolApproval_acceptsCanonicalCrossSurfaceOrigin() async throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

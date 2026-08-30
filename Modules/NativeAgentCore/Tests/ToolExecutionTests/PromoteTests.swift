@@ -18,7 +18,7 @@ private func makeTempRoot() throws -> URL {
 private func seedProposal(
     root: URL,
     id: String,
-    permissions: [String] = [],
+    permissions: [String] = ["app_data_read"],
     entrypointName: String = "tool.swift",
     entrypointBody: String = "import Foundation\nprint(\"{}\")\n",
     extraManifest: [String: JSONValue] = [:],
@@ -79,6 +79,25 @@ private func makeEngine(root: URL, autoPromotable: Bool = true) -> ToolPromoteEn
 
 private func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
     digest.map { String(format: "%02x", $0) }.joined()
+}
+
+private final class OneShotProposalMutator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didMutate = false
+    private let bodyURL: URL
+
+    init(bodyURL: URL) {
+        self.bodyURL = bodyURL
+    }
+
+    func mutateAfterPreliminaryValidation() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didMutate else { return }
+        didMutate = true
+        try? Data("import Darwin\nprint(\"replaced after validation\")\n".utf8)
+            .write(to: bodyURL, options: .atomic)
+    }
 }
 
 // MARK: - Tests
@@ -253,6 +272,40 @@ func promote_signed_manifest_verifies_via_signer() async throws {
 }
 
 @Test
+func promote_revalidates_exact_staged_bytes_before_signing() async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try seedProposal(root: root, id: "tool_validation_race")
+    let proposalBody = root.appendingPathComponent(
+        "tools/proposals/tool_validation_race/tool.swift"
+    )
+    let mutator = OneShotProposalMutator(bodyURL: proposalBody)
+    let preliminaryValidator: ToolValidator = { _ in
+        mutator.mutateAfterPreliminaryValidation()
+        return ToolValidationResult(valid: true, errors: [], autoPromotable: true)
+    }
+    let engine = ToolPromoteEngine(
+        signer: SwiftNativeManifestSigner(dataRoot: root),
+        dataRoot: root,
+        validator: preliminaryValidator
+    )
+
+    do {
+        _ = try await engine.promote(proposalId: "tool_validation_race")
+        Issue.record("expected staged validation failure")
+    } catch ToolPromoteError.validationFailed(let errors) {
+        #expect(errors.contains { $0.contains("Darwin") })
+    }
+
+    let active = root.appendingPathComponent(
+        "tools/active/tool_validation_race",
+        isDirectory: true
+    )
+    #expect(!FileManager.default.fileExists(atPath: active.path))
+    #expect(try readRegistry(root).isEmpty)
+}
+
+@Test
 func promote_atomic_under_concurrent_callers_no_corruption() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -321,7 +374,7 @@ private func litterNames(_ root: URL) -> [String] {
         at: activeRootURL(root), includingPropertiesForKeys: nil
     )) ?? []
     return entries.map(\.lastPathComponent).filter {
-        $0.hasPrefix(".staging-") || $0.hasPrefix(".retired-")
+        $0.hasPrefix(".staging-") || $0.hasPrefix(".retired-") || $0.hasPrefix(".recovery-")
     }
 }
 
@@ -359,8 +412,8 @@ func promote_failure_after_staging_preserves_previous_active_and_registry() asyn
     let v1Body = try Data(contentsOf: activeDir.appendingPathComponent("tool.swift"))
 
     // Sabotage round 2: absolute entrypoint in the PROPOSAL manifest. The
-    // permissive test validator lets it through; the fingerprint step
-    // (running against the STAGED copy) throws. Also change the proposal
+    // permissive preliminary validator lets it through; authoritative staged
+    // validation rejects it before signing. Also change the proposal
     // body so any accidental replacement would be visible.
     try writeProposalManifest(root, id: "tool_swap", manifest: [
         "id": .string("tool_swap"),
@@ -375,9 +428,9 @@ func promote_failure_after_staging_preserves_previous_active_and_registry() asyn
 
     do {
         _ = try await engine.promote(proposalId: "tool_swap")
-        Issue.record("expected fingerprint failure")
-    } catch ToolPromoteError.persistenceFailed(let m) {
-        #expect(m.contains("fingerprint"))
+        Issue.record("expected staged validation failure")
+    } catch ToolPromoteError.validationFailed(let errors) {
+        #expect(errors.contains { $0.contains("unsafe") })
     }
 
     // Previously-active tool untouched, still signed, registry still v1.
@@ -429,8 +482,66 @@ func promote_signing_failure_leaves_previous_active_untouched() async throws {
     #expect(litterNames(root).isEmpty)
 }
 
+@Test(arguments: [false, true])
+func promote_post_swap_failure_preserves_recovery_through_sweep(rollbackFails: Bool) async throws {
+    let root = try makeTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let id = "recovery-proof"
+    try seedProposal(root: root, id: id)
+    let engine = makeEngine(root: root)
+    _ = try await engine.promote(proposalId: id)
+    let activeRoot = activeRootURL(root)
+    let activeDir = activeRoot.appendingPathComponent(id, isDirectory: true)
+    let oldBody = try Data(contentsOf: activeDir.appendingPathComponent("tool.swift"))
+    let registryPath = root.appendingPathComponent("tools/registry.json")
+    let originalRegistry = try Data(contentsOf: registryPath)
+    try Data("print(\"replacement\")\n".utf8).write(to: root.appendingPathComponent("tools/proposals/\(id)/tool.swift"))
+    let displacedNewBody = root.appendingPathComponent("injected-new-body")
+    await engine._setAfterDirectorySwapForTesting {
+        if rollbackFails {
+            // A filesystem fault removes the exchange target before rollback.
+            // Move, rather than delete, so every test-owned body is observable.
+            try FileManager.default.moveItem(at: activeDir, to: displacedNewBody)
+        }
+        throw ToolPromoteError.persistenceFailed("injected post-swap commit failure")
+    }
+    do {
+        _ = try await engine.promote(proposalId: id)
+        Issue.record("expected injected commit failure")
+    } catch {
+        #expect(error.localizedDescription.contains("injected post-swap commit failure"))
+        #expect(error.localizedDescription.contains("recovery body retained") == rollbackFails)
+    }
+    #expect(try Data(contentsOf: registryPath) == originalRegistry)
+    if !rollbackFails {
+        #expect(try Data(contentsOf: activeDir.appendingPathComponent("tool.swift")) == oldBody)
+        #expect(litterNames(root).isEmpty)
+        return
+    }
+    let recoveryName = try #require(litterNames(root).first { $0.hasPrefix(".recovery-") })
+    let recoveryDir = activeRoot.appendingPathComponent(recoveryName, isDirectory: true)
+    #expect(try Data(contentsOf: recoveryDir.appendingPathComponent("tool.swift")) == oldBody)
+    #expect(!FileManager.default.fileExists(atPath: activeDir.path))
+    try backdate(recoveryDir)
+    // Previous versions used .staging for the same displaced old body.
+    let legacyStaging = activeRoot.appendingPathComponent(".staging-\(id)-legacy", isDirectory: true)
+    try FileManager.default.copyItem(at: recoveryDir, to: legacyStaging)
+    try backdate(legacyStaging)
+    ToolPromoteEngine.sweepStaleSwapLitter(activeRoot: activeRoot, now: Date())
+    #expect(FileManager.default.fileExists(atPath: recoveryDir.path))
+    #expect(FileManager.default.fileExists(atPath: legacyStaging.path))
+    #expect(try Data(contentsOf: registryPath) == originalRegistry)
+
+    // Once an authoritative active copy exists again, both recovery names can
+    // be reclaimed. Preservation is not an unbounded parallel history store.
+    try FileManager.default.copyItem(at: recoveryDir, to: activeDir)
+    ToolPromoteEngine.sweepStaleSwapLitter(activeRoot: activeRoot, now: Date())
+    #expect(litterNames(root).isEmpty)
+    #expect(try Data(contentsOf: activeDir.appendingPathComponent("tool.swift")) == oldBody)
+}
+
 @Test
-func promote_registry_write_failure_restores_previous_active() async throws {
+func promote_registry_read_failure_preserves_previous_active() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     try seedProposal(root: root, id: "tool_reg_fail")
@@ -441,8 +552,8 @@ func promote_registry_write_failure_restores_previous_active() async throws {
     try FileManager.default.createDirectory(at: activeDir, withIntermediateDirectories: true)
     try Data("OLD".utf8).write(to: activeDir.appendingPathComponent("SENTINEL"))
 
-    // registry.json as a DIRECTORY → upsert's atomic write throws after the
-    // swap already happened → promote must roll the swap back.
+    // registry.json as a DIRECTORY → the strict locked read refuses before
+    // the active directory can be swapped.
     let registryPath = root
         .appendingPathComponent("tools", isDirectory: true)
         .appendingPathComponent("registry.json")
@@ -451,15 +562,44 @@ func promote_registry_write_failure_restores_previous_active() async throws {
     let engine = makeEngine(root: root)
     do {
         _ = try await engine.promote(proposalId: "tool_reg_fail")
-        Issue.record("expected registry write failure")
+        Issue.record("expected registry read failure")
     } catch {
         // Surfaced error shape depends on the write failure; the disk-state
         // assertions below are the contract.
     }
-    // The OLD dir is back (sentinel present, staged tool.swift absent).
+    // The OLD dir is untouched (sentinel present, staged tool.swift absent).
     #expect(FileManager.default.fileExists(atPath: activeDir.appendingPathComponent("SENTINEL").path))
     #expect(!FileManager.default.fileExists(atPath: activeDir.appendingPathComponent("tool.swift").path))
     #expect(litterNames(root).isEmpty)
+}
+
+@Test
+func promote_corrupt_registry_preserves_bytes_and_previous_active() async throws {
+    for contents in ["{truncated", "{\"unexpected\":true}"] {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try seedProposal(root: root, id: "tool_corrupt_registry")
+        let activeDir = activeRootURL(root).appendingPathComponent(
+            "tool_corrupt_registry", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: activeDir, withIntermediateDirectories: true)
+        let sentinel = activeDir.appendingPathComponent("SENTINEL")
+        try Data("OLD".utf8).write(to: sentinel)
+        let registryPath = root.appendingPathComponent("tools/registry.json")
+        let originalBytes = Data(contents.utf8)
+        try originalBytes.write(to: registryPath)
+
+        do {
+            _ = try await makeEngine(root: root).promote(proposalId: "tool_corrupt_registry")
+            Issue.record("expected corrupt registry refusal")
+        } catch ToolPromoteError.persistenceFailed(let detail) {
+            #expect(detail.contains("registry"))
+        }
+        #expect(try Data(contentsOf: registryPath) == originalBytes)
+        #expect(try Data(contentsOf: sentinel) == Data("OLD".utf8))
+        #expect(!FileManager.default.fileExists(atPath: activeDir.appendingPathComponent("tool.swift").path))
+        #expect(litterNames(root).isEmpty)
+    }
 }
 
 @Test
@@ -470,14 +610,16 @@ func promote_entry_sweep_cleans_stale_litter_and_restores_orphaned_retired() asy
     let activeRoot = activeRootURL(root)
     let fm = FileManager.default
 
-    // (1) Stale staging dir → deleted.
+    // (1) Legacy staging can be the displaced old live body after an exchange.
+    // Without an authoritative active copy, age alone cannot make it garbage.
     let staleStaging = activeRoot.appendingPathComponent(".staging-deadtool-abc123", isDirectory: true)
     try fm.createDirectory(at: staleStaging, withIntermediateDirectories: true)
     try Data("junk".utf8).write(to: staleStaging.appendingPathComponent("junk.txt"))
     try backdate(staleStaging)
 
-    // (2) Retired dir whose tool HAS a live active dir → retired deleted,
-    //     active kept.
+    // (2) A registry-committed live body proves its retired copy disposable.
+    try seedProposal(root: root, id: "completed")
+    _ = try await makeEngine(root: root).promote(proposalId: "completed")
     let retiredDone = activeRoot.appendingPathComponent(".retired-completed-abc123", isDirectory: true)
     try fm.createDirectory(at: retiredDone, withIntermediateDirectories: true)
     try Data("old".utf8).write(to: retiredDone.appendingPathComponent("old.txt"))
@@ -501,7 +643,7 @@ func promote_entry_sweep_cleans_stale_litter_and_restores_orphaned_retired() asy
     let engine = makeEngine(root: root)
     _ = try await engine.promote(proposalId: "tool_sweeper")
 
-    #expect(!fm.fileExists(atPath: staleStaging.path))
+    #expect(fm.fileExists(atPath: staleStaging.path))
     #expect(!fm.fileExists(atPath: retiredDone.path))
     #expect(fm.fileExists(atPath: activeCompleted.appendingPathComponent("KEEP").path))
     #expect(!fm.fileExists(atPath: retiredOrphan.path))
@@ -589,7 +731,7 @@ func promote_reserved_prefix_id_rejected() async throws {
     let root = try makeTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
     let engine = makeEngine(root: root)
-    for evil in [".staging-evil-1", ".retired-evil-1"] {
+    for evil in [".staging-evil-1", ".retired-evil-1", ".recovery-evil-1"] {
         do {
             _ = try await engine.promote(proposalId: evil)
             Issue.record("expected validationFailed for \(evil)")

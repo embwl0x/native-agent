@@ -89,7 +89,13 @@ struct DetachedChatPanelView: View {
     // item. What lands here is strictly "same scrolls, at most ~6 Hz instead of
     // ~14 Hz" — the 0.16 s non-animated floor in `scrollToBottom`.
     @State private var scrollCoordinator = ChatScrollCoordinator()
+    /// D2 review fix: the routing decision must know the dynamically
+    /// registered slash tools too, or a dynamic command typed here falls
+    /// through as chat text while the built-ins toast. Same store the main
+    /// window uses; refreshed once per panel.
+    @State private var capabilitiesStore = CapabilitiesStore.shared
     @State private var isCapturing = false
+    @State private var isRetryingLoad = false
     @State private var toastMessage: String?
     @State private var voiceInput = VoiceInputController()
     @State private var voiceDraftBeforeListening = ""
@@ -216,6 +222,7 @@ struct DetachedChatPanelView: View {
             // task(id:) re-fires if the panel is somehow rebound to a new
             // session, but in practice sessionId is immutable per panel.
             guard !didInitialLoad else { return }
+            await capabilitiesStore.refresh()
             didInitialLoad = true
             // H5: adopt whatever draft this session had (typed in the main
             // window or a previous panel) into the view-local state.
@@ -484,7 +491,19 @@ struct DetachedChatPanelView: View {
                         .textSelection(.enabled)
                         .help(technical)
                 }
+                Button {
+                    retryDetachedHistoryLoad()
+                } label: {
+                    if isRetryingLoad {
+                        Label("Trying again…", systemImage: "arrow.clockwise")
+                    } else {
+                        Label("Try Again", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(isRetryingLoad)
+                .accessibilityHint("Reloads this conversation without changing your draft")
             }
+            .accessibilityElement(children: .contain)
         } else if loadPresentation == .loading {
             VStack(spacing: 8) {
                 ProgressView().controlSize(.small)
@@ -494,6 +513,15 @@ struct DetachedChatPanelView: View {
             }
         } else {
             emptyState
+        }
+    }
+
+    private func retryDetachedHistoryLoad() {
+        guard !isRetryingLoad else { return }
+        isRetryingLoad = true
+        Task { @MainActor in
+            await appModel.loadDetachedSessionMessages(sessionId)
+            isRetryingLoad = false
         }
     }
 
@@ -582,6 +610,8 @@ struct DetachedChatPanelView: View {
                 screenCaptureDisabled: !sessionIsAvailable || isBusy || isCapturing || !screenCaptureAllowed,
                 pendingAttachmentCount: pendingAttachments.count,
                 isRunning: isBusy,
+                hasQueuedTurns: !appModel.queuedChatTurns(for: sessionId).isEmpty,
+                isQueuePaused: appModel.isChatQueuePaused(sessionId),
                 canSend: canSend,
                 onToggleVoice: toggleVoice,
                 onCaptureScreen: captureScreen,
@@ -603,7 +633,7 @@ struct DetachedChatPanelView: View {
                 .italic(voiceInput.isListening)
                 .onSubmit(send)
                 .onChange(of: voiceInput.transcript) { _, newVal in
-                    if !newVal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if ChatTranscriptPresentation.hasVisibleText(newVal) {
                         draft = composeVoiceDraft(newVal)
                     }
                 }
@@ -625,7 +655,7 @@ struct DetachedChatPanelView: View {
     private var canSend: Bool {
         sessionIsAvailable
             && !isCapturing
-            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingAttachments.isEmpty)
+            && (ChatTranscriptPresentation.hasVisibleText(draft) || !pendingAttachments.isEmpty)
     }
 
     private func send() {
@@ -633,6 +663,22 @@ struct DetachedChatPanelView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = pendingAttachments
         guard !isCapturing, (!text.isEmpty || !attachments.isEmpty) else { return }
+        // D2 (2026-08-28): this panel has no slash-command dispatcher, so a
+        // typed `/model gpt-5.5` used to be sent to the agent as ordinary text
+        // and echoed straight back. Same prefix check the main window makes;
+        // a recognized command says where it works instead of dead-ending.
+        // Non-command slash text (`/tmp/foo`) still reaches the agent.
+        switch ChatSlashCommandRouting.decide(
+            text: text,
+            dynamicToolNames: capabilitiesStore.slashCommandNames,
+            supportsDispatch: false
+        ) {
+        case .unsupportedHere(let command):
+            showToast(ChatSlashCommandRouting.unsupportedMessage(command: command))
+            return
+        case .dispatch, .sendAsMessage:
+            break
+        }
         Task { @MainActor in
             let acceptance = await appModel.startChatTurnForSession(
                 text,

@@ -214,6 +214,82 @@ private final class WorkflowUncooperativeAttemptProbe: @unchecked Sendable {
 
 // MARK: - Empty registry -> just defaults (sorted)
 
+@Test(arguments: ["{broken", "{}", "null", "\"saved-workflows\""], [false, true])
+func workflowRegistryDamageSurvivesListAndCreate(bytes: String, create: Bool) async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let path = root.appendingPathComponent("workflows/registry.json")
+    try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let original = Data(bytes.utf8)
+    try original.write(to: path)
+    let client = SwiftNativeWorkflowOrchestrationClient(root: root)
+    do {
+        if create { _ = try await client.createWorkflow(.object(["name": .string("New workflow")])) }
+        else { _ = try await client.listWorkflows() }
+        Issue.record("Damaged workflow registry must not be replaced with defaults")
+    } catch {}
+    #expect(try Data(contentsOf: path) == original)
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("activity/events.jsonl").path))
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("traces/events.jsonl").path))
+}
+
+@Test(arguments: ["unreadable", "directory", "dangling_symlink"], [false, true])
+func workflowRegistryUnavailableEntryIsNotMissing(kind: String, create: Bool) async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let fm = FileManager.default
+    let path = root.appendingPathComponent("workflows/registry.json")
+    try fm.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let original = Data("[{\"id\":\"preserved\",\"status\":\"disabled\"}]".utf8)
+    if kind == "unreadable" {
+        try original.write(to: path)
+        try fm.setAttributes([.posixPermissions: 0], ofItemAtPath: path.path)
+    } else if kind == "directory" {
+        try fm.createDirectory(at: path, withIntermediateDirectories: false)
+        try original.write(to: path.appendingPathComponent("preserved.json"))
+    } else {
+        try fm.createSymbolicLink(atPath: path.path, withDestinationPath: "missing-registry.json")
+    }
+    defer {
+        if kind == "unreadable" { try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path) }
+    }
+    let client = SwiftNativeWorkflowOrchestrationClient(root: root)
+    do {
+        if create { _ = try await client.createWorkflow(.object(["name": .string("New workflow")])) }
+        else { _ = try await client.listWorkflows() }
+        Issue.record("An unavailable saved entry must not bootstrap defaults")
+    } catch {}
+    if kind == "unreadable" {
+        #expect(try fm.attributesOfItem(atPath: path.path)[.posixPermissions] as? Int == 0)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+        #expect(try Data(contentsOf: path) == original)
+    } else if kind == "directory" {
+        #expect(try Data(contentsOf: path.appendingPathComponent("preserved.json")) == original)
+    } else {
+        #expect(try fm.destinationOfSymbolicLink(atPath: path.path) == "missing-registry.json")
+        #expect(!fm.fileExists(atPath: path.deletingLastPathComponent().appendingPathComponent("missing-registry.json").path))
+    }
+    #expect(!fm.fileExists(atPath: root.appendingPathComponent("activity/events.jsonl").path))
+}
+
+@Test func workflowRegistryCheckedReadPreservesCustomAndDisabledRowsDuringCreate() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try writeRegistry(root, [
+        .object(["id": .string("memory-capture"), "status": .string("disabled"), "custom": .string("preserve")]),
+        .object(["id": .string("custom-work"), "status": .string("active"), "name": .string("Saved custom")]),
+    ])
+    let client = SwiftNativeWorkflowOrchestrationClient(root: root)
+    let created = try await client.createWorkflow(.object(["name": .string("New workflow")]))
+    let rows = try await client.listWorkflows()
+    #expect(rows.contains { idOf($0) == idOf(created) })
+    #expect(rows.contains { idOf($0) == "custom-work" && stringField($0, "name") == "Saved custom" })
+    let disabled = try #require(rows.first { idOf($0) == "memory-capture" })
+    #expect(stringField(disabled, "status") == "disabled")
+    #expect(stringField(disabled, "custom") == "preserve")
+    #expect(stringField(disabled, "trigger") == "remember this")
+}
+
 @Test func listWorkflowsEmptyRegistryReturnsDefaults() async throws {
     let root = tempRoot()
     let client = SwiftNativeWorkflowOrchestrationClient(
@@ -466,6 +542,22 @@ private final class WorkflowUncooperativeAttemptProbe: @unchecked Sendable {
     let result = try await client.listWorkflows()
     #expect(result.count == 3)
     #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("workflows/registry.json").path))
+}
+
+@Test func listWorkflowsUnchangedMergePreservesRegistryBytesAndModificationDate() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let initial = SwiftNativeWorkflowOrchestrationClient(root: root, now: { "2026-06-01T00:00:00+00:00" })
+    let originalRows = try await initial.listWorkflows()
+    let path = root.appendingPathComponent("workflows/registry.json")
+    let originalBytes = try Data(contentsOf: path)
+    let oldModificationDate = Date(timeIntervalSince1970: 1_700_000_000)
+    try FileManager.default.setAttributes([.modificationDate: oldModificationDate], ofItemAtPath: path.path)
+
+    let later = SwiftNativeWorkflowOrchestrationClient(root: root, now: { "2026-06-02T00:00:00+00:00" })
+    #expect(try await later.listWorkflows() == originalRows)
+    #expect(try Data(contentsOf: path) == originalBytes)
+    #expect(try FileManager.default.attributesOfItem(atPath: path.path)[.modificationDate] as? Date == oldModificationDate)
 }
 
 // MARK: - cancel / rollback helpers
@@ -1157,6 +1249,101 @@ private func makeIDFactory(_ ids: [String]) -> @Sendable () -> String {
     let runs = try await client.listWorkflowRuns()
     #expect(runs.count == 1)
     #expect(stringField(runs[0], "id") == "run-v1")
+}
+
+@Test(arguments: ["default", "2", "v2", "2.0"], [false, true])
+func workflowV2PreviewNeverDispatchesWhileLiveExecutionStillDoes(engine: String, execute: Bool) async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    var definition: [String: JSONValue] = [
+        "id": .string("preview-boundary"), "name": .string("Preview Boundary"),
+        "status": .string("active"),
+        "steps": .array([
+            .object(["id": .string("effect"), "title": .string("Trace effect"), "kind": .string("trace")]),
+            .object(["id": .string("gate"), "title": .string("Gate"), "kind": .string("approval"), "requiresApproval": .bool(true)]),
+        ]),
+    ]
+    if engine != "default" { definition["engineVersion"] = .string(engine) }
+    try writeRegistry(root, [.object(definition)])
+    let dispatches = WorkflowCancellationReadCounter()
+    let client = SwiftNativeWorkflowOrchestrationClient(
+        root: root, useFileLock: false,
+        afterStepAttemptPersisted: { _, _ in dispatches.record() }
+    )
+    let run = try await client.runWorkflow(
+        id: "preview-boundary", objective: "preview requested work",
+        execute: execute, engineVersion: nil, variables: nil
+    )
+    let runID = try #require(stringField(run, "id"))
+    #expect(stringField(run, "mode") == (execute ? "execute" : "dry_run"))
+    #expect(stringField(run, "status") == (execute ? "waiting_approval" : "dry_run"))
+    #expect(dispatches.value() == (execute ? 1 : 0))
+    let effects = try allTraces(root).filter { stringField($0, "kind") == "workflow.step" }
+    #expect(effects.count == (execute ? 1 : 0))
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("workflows/run_state/\(runID).json").path) == execute)
+    let approvals = try await SwiftNativeApprovalInbox(root: root).list(filter: ApprovalFilter())
+    #expect(approvals.count == (execute ? 1 : 0))
+    let reloaded = try await client.listWorkflowRuns()
+    #expect(reloaded.count == 1)
+    #expect(reloaded.first == run)
+    if !execute {
+        #expect((arrayField(run, "steps") ?? []).allSatisfy { stringField($0, "status") == "not_executed" })
+        let controls = WorkflowRunControlPreflight.evaluate(status: stringField(run, "status"))
+        #expect(!controls.resume.isEligible && !controls.cancel.isEligible && !controls.rollback.isEligible)
+        let model = try #require(try await client.motorActionReadModel(actionId: runID))
+        #expect(model.phase == .proposed)
+        #expect(model.verification == .notRequired)
+        await #expect(throws: WorkflowOrchestrationError.self) {
+            _ = try await client.resumeWorkflowRun(id: runID)
+        }
+        #expect(dispatches.value() == 0)
+    }
+}
+
+@Test func workflowV2PreviewRetainsPlanStructureAndRedactsInputsWithoutInventingResults() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let secret = "xoxb-" + "1234567890-abcdefghijklmnop"
+    let step: JSONValue = .object([
+        "id": .string("future-effect"), "title": .string("Future effect"), "kind": .string("trace"),
+        "condition": .string("outputs.prior.ready"), "dependsOn": .array([.string("prior")]),
+        "input": .object(["message": .string("${variables.message}"), "token": .string(secret)]),
+        "retry": .object(["maxAttempts": .int(3)]), "timeoutSeconds": .int(30),
+        "outputKey": .string("future"),
+    ])
+    try writeRegistry(root, [.object([
+        "id": .string("v2-structure"), "name": .string("V2 Structure"),
+        "engineVersion": .string("1"), "steps": .array([step]),
+        "variables": .object(["message": .string("saved"), "retained": .int(42), "token": .string(secret)]),
+    ])])
+    let client = SwiftNativeWorkflowOrchestrationClient(root: root, useFileLock: false)
+    let run = try await client.runWorkflow(
+        id: "v2-structure", objective: "static preview", execute: false, engineVersion: "2",
+        variables: .object(["message": .string("requested"), "added": .bool(true)])
+    )
+    guard case .object(let fields) = run,
+          case .object(let previewStep)? = arrayField(run, "steps")?.first,
+          case .object(let original) = step,
+          case .object(let variables)? = fields["variables"] else {
+        Issue.record("Expected structured preview")
+        return
+    }
+    for key in ["condition", "dependsOn", "retry", "timeoutSeconds", "outputKey"] {
+        #expect(previewStep[key] == original[key])
+    }
+    #expect(variables["message"] == .string("requested"))
+    #expect(variables["retained"] == .int(42))
+    #expect(variables["added"] == .bool(true))
+    #expect(previewStep["input"] == WorkflowRedaction.redactValue(original["input"]!))
+    #expect(previewStep["attempts"] == .array([]))
+    #expect(fields["outputs"] == .object([:]))
+    #expect(previewStep["output"] == .object([:]))
+    #expect(stringField(run, "detail")?.contains("conditions/dependencies not evaluated") == true)
+    #expect(stringField(run, "detail")?.contains("no outputs generated") == true)
+    #expect(!((try run.serialize(pretty: false)).contains(secret)))
+    let ledger = try String(contentsOf: root.appendingPathComponent("workflows/runs.jsonl"), encoding: .utf8)
+    #expect(!ledger.contains(secret))
+    #expect(try await client.listWorkflowRuns() == [run])
 }
 
 @Test func legacyV1LiveApprovalRunHealsOntoResumableV2() async throws {

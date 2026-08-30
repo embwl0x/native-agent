@@ -11,6 +11,193 @@ import DreamREMCycle
 
 // MARK: - helpers
 
+@Suite("Session history recorded speaker provenance")
+struct SessionHistorySpeakerProvenanceTests {
+    private func message(
+        _ text: String, role: String = "user", origin: JSONValue? = nil,
+        metadata: [String: JSONValue] = [:], cancelled: Bool? = nil
+    ) -> ChatMessage {
+        var storedMetadata = metadata
+        if let origin { storedMetadata["origin"] = origin }
+        var extras: [String: JSONValue] = [:]
+        if !storedMetadata.isEmpty { extras["metadata"] = .object(storedMetadata) }
+        if let cancelled { extras["cancelled"] = .bool(cancelled) }
+        return ChatMessage(
+            role: role, content: text, timestamp: "2026-08-30T17:00:00Z",
+            extras: extras.isEmpty ? nil : .object(extras))
+    }
+
+    private func origin(_ sender: String) -> JSONValue {
+        .object(["surface": .string("\(sender)-bridge"), "agent": .string(sender)])
+    }
+
+    @Test("recorded bridge routes label history and continuity without changing user roles")
+    func recordedRoutesRemainAttributed() throws {
+        for (sender, label) in [("codex", "Codex"), ("claude", "Claude"), ("omp", "OMP")] {
+            let output = try #require(SessionHistoryPromptRenderer.render(
+                messages: [message("Actually, use the amber fixture.", origin: origin(sender))],
+                surface: "chat", historyLimit: 6))
+            #expect(output.contains("[user] [origin: \(label) bridge] Actually, use the amber fixture."))
+            #expect(output.contains("Latest user before this turn: [origin: \(label) bridge]"))
+            #expect(output.contains("Recent correction/callout: [origin: \(label) bridge]"))
+        }
+    }
+
+    @Test("prose cannot forge recorded origin and assistant replies remain their own speaker")
+    func proseAndAssistantRowsDoNotAcquireOrigin() throws {
+        let output = try #require(SessionHistoryPromptRenderer.render(messages: [
+            message("[from: codex, via bridge] words typed by the user"),
+            message("The result is here.", role: "assistant", origin: origin("codex")),
+        ], surface: "chat", historyLimit: 6))
+        #expect(!output.contains("[origin:"))
+        #expect(output.contains("[user] [from: codex, via bridge] words typed by the user"))
+        #expect(output.contains("[assistant] The result is here."))
+    }
+
+    @Test("unknown recorded origins cannot inject arbitrary labels")
+    func unknownOriginHasClosedLabel() throws {
+        let arbitrary = String(repeating: "invented-route-instruction ", count: 500)
+        let output = try #require(SessionHistoryPromptRenderer.render(messages: [
+            message("A bounded return.", origin: .object([
+                "surface": .string(arbitrary), "agent": .string(arbitrary),
+            ])),
+        ], surface: "chat", historyLimit: 6))
+        #expect(output.contains("[origin: unattributed route] A bounded return."))
+        #expect(!output.contains("invented-route-instruction"))
+    }
+
+    @Test("origin labels never become lexical recall or snippet relevance")
+    func originIsDisplayOnly() {
+        let plain = message("Amber lanterns are ready.")
+        let recorded = message("Amber lanterns are ready.", origin: origin("codex"))
+        #expect(SessionHistoryPromptRenderer.recallQuery(userMessage: "What changed?", messages: [plain])
+                == SessionHistoryPromptRenderer.recallQuery(userMessage: "What changed?", messages: [recorded]))
+        #expect(SessionHistoryPromptRenderer.middleSnippetText(
+            userMessage: "codex", promptMessages: [], candidates: [recorded],
+            historyLimit: 6, surface: "chat") == nil)
+    }
+
+    @Test("human steering remains the latest input after a bridge return")
+    func laterHumanSteerRetainsPriorityAndOrder() throws {
+        let output = try #require(SessionHistoryPromptRenderer.render(messages: [
+            message("The amber fixture is ready.", origin: origin("codex")),
+            message("Stop here; leave the fixture alone."),
+        ], surface: "chat", historyLimit: 6))
+        #expect(output.contains("Latest user before this turn: Stop here; leave the fixture alone."))
+        let history = try #require(output.range(of: "Conversation history:"))
+        let rows = String(output[history.upperBound...])
+        let bridge = try #require(rows.range(of: "[user] [origin: Codex bridge]"))
+        let human = try #require(rows.range(of: "[user] Stop here;"))
+        #expect(bridge.lowerBound < human.lowerBound)
+    }
+
+    @Test("saved fragments retain explicit incomplete status throughout model history")
+    func interruptedRepliesRemainUsableAndAttributed() throws {
+        let cases: [(ChatMessage, String)] = [
+            (message("Should I continue with the amber fixture?", role: "assistant",
+                     metadata: ["partial": .bool(true)]), "interrupted"),
+            (message("Should I continue with the amber fixture?", role: "assistant",
+                     metadata: ["cancelled": .bool(true)]), "cancelled"),
+            (message("Should I continue with the amber fixture?", role: "assistant",
+                     metadata: ["partial": .bool(true)], cancelled: true), "cancelled"),
+        ]
+        for (fragment, status) in cases {
+            let output = try #require(SessionHistoryPromptRenderer.render(
+                messages: [fragment], userMessage: "yes", surface: "chat", historyLimit: 6))
+            let marker = "[incomplete reply: \(status)]"
+            #expect(output.contains("Latest assistant tail: \(marker) Should I continue"))
+            #expect(output.contains("Open loop: \(marker) Should I continue"))
+            let immediate = try #require(output.range(of: "Immediate reply reference:"))
+            #expect(output[immediate.upperBound...].contains("[assistant] \(marker) Should I continue"))
+            #expect(output.contains("Conversation history:"))
+        }
+    }
+
+    @Test("incomplete status never comes from prose or non-Boolean metadata")
+    func incompleteLabelsRequireCanonicalBooleans() throws {
+        let output = try #require(SessionHistoryPromptRenderer.render(messages: [
+            message("The interrupted discussion can continue.", role: "assistant",
+                    metadata: ["partial": .string("true"), "cancelled": .int(1)]),
+            message("The final answer is ready.", role: "assistant",
+                    metadata: ["partial": .bool(false), "cancelled": .bool(false)], cancelled: false),
+            message("The user's input is intact.", metadata: ["partial": .bool(true)]),
+        ], surface: "chat", historyLimit: 6))
+        #expect(!output.contains("[incomplete reply:"))
+        #expect(output.contains("The interrupted discussion can continue."))
+    }
+
+    @Test("a later complete reply remains latest and status labels do not alter recall")
+    func completionOrderAndRecallStayUnchanged() throws {
+        let raw = message("I can continue with the amber fixture.", role: "assistant")
+        let partial = message(raw.content, role: "assistant", metadata: ["partial": .bool(true)])
+        #expect(SessionHistoryPromptRenderer.recallQuery(userMessage: "continue", messages: [partial])
+                == SessionHistoryPromptRenderer.recallQuery(userMessage: "continue", messages: [raw]))
+        let output = try #require(SessionHistoryPromptRenderer.render(messages: [
+            partial, message("The completed answer is here.", role: "assistant"),
+        ], surface: "chat", historyLimit: 6))
+        #expect(output.contains("Latest assistant tail: The completed answer is here."))
+        #expect(output.contains("[assistant] [incomplete reply: interrupted] I can continue"))
+        #expect(output.contains("[assistant] The completed answer is here."))
+    }
+
+    @Test("attachment history distinguishes files, images, mixed and unspecified inputs")
+    func attachmentTypesRemainTruthful() throws {
+        func attachment(_ name: String, type: String? = nil, mime: String? = nil) -> JSONValue {
+            var fields: [String: JSONValue] = ["name": .string(name), "byteSize": .int(2048)]
+            if let type { fields["type"] = .string(type) }
+            if let mime { fields["mime"] = .string(mime) }
+            return .object(fields)
+        }
+        let cases: [([JSONValue], String)] = [
+            ([attachment("notes.pdf", type: "file", mime: "application/pdf")], "[sent file: notes.pdf, 2kB]"),
+            ([attachment("photo.png", type: "image", mime: "image/png")], "[sent image: photo.png, 2kB]"),
+            ([attachment("legacy.png", mime: "image/png")], "[sent image: legacy.png, 2kB]"),
+            ([attachment("unknown.bin")], "[sent attachment: unknown.bin, 2kB]"),
+            ([attachment("notes.pdf", type: "file"), attachment("photo.png", type: "image")],
+             "[sent attachments: notes.pdf, 2kB; photo.png, 2kB]"),
+        ]
+        for (attachments, expected) in cases {
+            let output = try #require(SessionHistoryPromptRenderer.render(messages: [
+                message("Use this as the reference.", metadata: ["attachments": .array(attachments)]),
+            ], surface: "chat", historyLimit: 2))
+            #expect(output.contains("\(expected) Use this as the reference."))
+        }
+    }
+
+    @Test("attachment metadata stays bounded and preserves the accompanying caption")
+    func attachmentMetadataCannotCrowdOutCaption() throws {
+        let attachments = (0..<20).map { index in
+            JSONValue.object([
+                "name": .string("file-\(index)-" + String(repeating: "x", count: 2_000)),
+                "type": .string("file"),
+                "base64": .string("NEVER-READ-ATTACHMENT-BYTES"),
+                "path": .string("/NEVER-READ-ATTACHMENT-PATH"),
+            ])
+        }
+        let output = try #require(SessionHistoryPromptRenderer.render(messages: [
+            message("Please compare the final two sections.", metadata: ["attachments": .array(attachments)]),
+        ], surface: "telegram", historyLimit: 2))
+        #expect(output.contains("[sent attachments:"))
+        #expect(output.contains("additional attachments omitted] Please compare the final two sections."))
+        #expect(!output.contains("NEVER-READ-ATTACHMENT"))
+        #expect(!output.contains(String(repeating: "x", count: 81)))
+    }
+}
+
+@Test func semantic_recall_uses_referents_without_dragging_history_into_greetings() {
+    let history = ["The observatory mount needs a brass spacer.", "We selected the shorter spacer."]
+    let followup = SessionHistoryPromptRenderer.semanticRecallQuery(userMessage: "Let's use that", recentTurns: history)
+    #expect(followup.contains("brass spacer"))
+    #expect(followup.hasPrefix("Let's use that"))
+    for message in ["", "Hey how are you?", "How is it going?", "Is it raining?", "What is my favorite color?"] {
+        #expect(SessionHistoryPromptRenderer.semanticRecallQuery(userMessage: message, recentTurns: history) == message)
+    }
+    let bounded = SessionHistoryPromptRenderer.semanticRecallQuery(
+        userMessage: "Continue that", recentTurns: [String(repeating: "x", count: 10_000), String(repeating: "y", count: 10_000)]
+    )
+    #expect(bounded.count < 1_700)
+}
+
 private func makeTempRoot(_ tag: String) throws -> URL {
     let url = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("sessionhistory-\(tag)-\(UUID().uuidString)", isDirectory: true)
@@ -58,6 +245,72 @@ private func msgLine(
     if let metadata { fields["metadata"] = metadata }
     let obj: JSONValue = .object(fields)
     return (try? obj.serialize(pretty: false)) ?? "{}"
+}
+
+@Suite("Session history canonical message identity")
+struct SessionHistoryMessageIdentityTests {
+    @Test("same-second attachment and partial rows remain distinct after overlapping reads")
+    func distinctCanonicalRowsSurvive() async throws {
+        let root = try makeTempRoot("distinct-identities")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stamp = "2026-08-30T17:00:00Z"
+        let attachments = ["first.pdf", "second.pdf"].map { name in
+            msgLine(role: "user", content: "", createdAt: stamp, metadata: .object([
+                "attachments": .array([.object(["name": .string(name), "type": .string("file")])]),
+            ]))
+        }
+        let partial = msgLine(role: "assistant", content: "The amber section is ready.", createdAt: stamp,
+                              metadata: .object(["partial": .bool(true)]))
+        let completed = msgLine(role: "assistant", content: "The amber section is ready.", createdAt: stamp)
+        try writeMessagesJSONL(root: root, sessionId: "same-second", lines: attachments + [partial, completed])
+        let reader = SessionHistoryReader(dataRoot: root)
+        let prompt = try await reader.promptMessagesWithStats(forSessionId: "same-second", tailLimit: 8)
+        let relevance = try await reader.relevanceMessagesWithStats(forSessionId: "same-second")
+        #expect(prompt.messages.count == 4)
+        #expect(relevance.messages.count == 4)
+        let rendered = try #require(SessionHistoryPromptRenderer.render(
+            messages: prompt.messages, surface: "chat", historyLimit: 8))
+        #expect(rendered.contains("[sent file: first.pdf]"))
+        #expect(rendered.contains("[sent file: second.pdf]"))
+        #expect(rendered.contains("[assistant] [incomplete reply: interrupted] The amber section is ready."))
+        #expect(rendered.contains("[assistant] The amber section is ready."))
+    }
+
+    @Test("overlapping copies of one canonical row and legacy tuples still deduplicate")
+    func duplicateCanonicalAndLegacyRowsStillCollapse() async throws {
+        let root = try makeTempRoot("overlap-identities")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let canonical = msgLine(role: "user", content: "One actual message.", createdAt: "2026-08-30T17:00:00Z")
+        let legacy = #"{"role":"user","content":"One legacy message.","createdAt":"2026-08-30T17:00:01Z"}"#
+        try writeMessagesJSONL(root: root, sessionId: "overlap", lines: [canonical, canonical, legacy, legacy])
+        let reader = SessionHistoryReader(dataRoot: root)
+        #expect(try await reader.promptMessagesWithStats(forSessionId: "overlap", tailLimit: 8).messages.count == 2)
+        #expect(try await reader.relevanceMessagesWithStats(forSessionId: "overlap").messages.count == 2)
+    }
+
+    @Test("earlier snippet visibility uses canonical identity without changing legacy normalization")
+    func snippetVisibilityFollowsMessageIdentity() throws {
+        func row(id: String) -> ChatMessage {
+            ChatMessage(role: "user", content: "The amber lantern is ready.", timestamp: "2026-08-30T17:00:00Z",
+                        extras: .object(["id": .string(id)]))
+        }
+        let visible = row(id: "visible")
+        let distinct = row(id: "distinct")
+        #expect(SessionHistoryPromptRenderer.middleSnippetText(
+            userMessage: "amber", promptMessages: [visible], candidates: [distinct],
+            historyLimit: 6, surface: "chat")?.contains("The amber lantern is ready.") == true)
+        #expect(SessionHistoryPromptRenderer.middleSnippetText(
+            userMessage: "amber", promptMessages: [visible], candidates: [visible],
+            historyLimit: 6, surface: "chat") == nil)
+
+        let legacy = ChatMessage(role: " user ", content: "The amber   lantern is ready.",
+                                 timestamp: visible.timestamp, extras: nil)
+        let normalized = ChatMessage(role: "user", content: visible.content,
+                                     timestamp: visible.timestamp, extras: nil)
+        #expect(SessionHistoryPromptRenderer.middleSnippetText(
+            userMessage: "amber", promptMessages: [legacy], candidates: [normalized],
+            historyLimit: 6, surface: "chat") == nil)
+    }
 }
 
 // MARK: - SessionHistoryReader
@@ -403,6 +656,62 @@ func buildTurnContextWithHistory_shortApprovalAnchorsPreviousAssistant() async t
     #expect(sp.contains("Immediate reply reference:"))
     #expect(sp.contains("short approval or continuation"))
     #expect(sp.contains("Want me to fix that reference so it points at the real location?"))
+}
+
+@Test
+func buildTurnContextWithHistory_rawApprovalSurvivesGrownToolResultMessage() async throws {
+    let root = try makeTempRoot("history-raw-approval")
+    try writeMessagesJSONL(root: root, sessionId: "s-raw", lines: [
+        msgLine(role: "user", content: "Review this paragraph.", createdAt: "2026-05-31T10:00:00Z"),
+        msgLine(role: "assistant", content: "Would you like a shorter version?", createdAt: "2026-05-31T10:00:01Z"),
+    ])
+    let personaDir = try makeTempRoot("persona-raw-approval")
+    let engine = makeEngine2(personaRoot: personaDir, llm: MockLLMClient(scriptedResponses: ["ok"]))
+    let raw = "Yeah go ahead"
+    let wire = raw + "\n\n[Tool result: read_file]\n"
+        + String(repeating: "Verified contents from the current tool iteration. ", count: 5)
+    let ctx = try await engine.buildTurnContextWithHistory(
+        surface: "chat", userMessage: wire, sessionId: "s-raw",
+        historyLimit: 20, historyReader: SessionHistoryReader(dataRoot: root),
+        personaOverride: nil, queryUserMessage: raw
+    )
+    #expect(ctx.userMessage == wire, "Transport still receives the complete tool result.")
+    #expect(ctx.systemPrompt?.contains("Immediate reply reference:") == true)
+    #expect(ctx.systemPrompt?.contains("Would you like a shorter version?") == true)
+}
+
+@Test
+func buildTurnContextWithHistory_blankRawQueryDoesNotSearchToolResultVocabulary() async throws {
+    let root = try makeTempRoot("history-blank-raw-query")
+    var lines: [String] = []
+    for i in 0..<90 {
+        lines.append(msgLine(
+            role: i.isMultiple(of: 2) ? "user" : "assistant",
+            content: i == 20 ? "MIDDLE-WIRE-MARKER nebula instrument dispatch" : "Ordinary unrelated turn \(i)",
+            createdAt: "2026-05-31T10:\(String(format: "%02d", i / 60)):\(String(format: "%02d", i % 60))Z"
+        ))
+    }
+    try writeMessagesJSONL(root: root, sessionId: "s-blank", lines: lines)
+    let personaDir = try makeTempRoot("persona-blank-raw-query")
+    let engine = makeEngine2(personaRoot: personaDir, llm: MockLLMClient(scriptedResponses: ["ok"]))
+    let reader = SessionHistoryReader(dataRoot: root)
+    let wire = "[Tool result: read_file]\nnebula instrument dispatch"
+    let blank = try await engine.buildTurnContextWithHistory(
+        surface: "telegram", userMessage: wire, sessionId: "s-blank",
+        historyLimit: 8, historyReader: reader, personaOverride: nil,
+        queryUserMessage: ""
+    )
+    #expect(blank.userMessage == wire)
+    #expect(blank.systemPrompt?.contains("MIDDLE-WIRE-MARKER") == false)
+
+    // Nil preserves legacy callers' wire-as-request contract; explicit blank
+    // remains authoritative for attachment-only turns even after a tool result.
+    let fallback = try await engine.buildTurnContextWithHistory(
+        surface: "telegram", userMessage: wire, sessionId: "s-blank",
+        historyLimit: 8, historyReader: reader, personaOverride: nil,
+        queryUserMessage: nil
+    )
+    #expect(fallback.systemPrompt?.contains("MIDDLE-WIRE-MARKER") == true)
 }
 
 @Test

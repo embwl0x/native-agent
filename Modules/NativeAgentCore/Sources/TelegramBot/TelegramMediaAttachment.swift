@@ -52,7 +52,8 @@ public protocol TelegramMediaDownloading: Sendable {
 ///   2. GET  https://api.telegram.org/file/bot<token>/<file_path>  → raw bytes
 ///
 /// Honors a max-size cap: if getFile reports file_size > maxBytes the download is
-/// refused with `.oversized` before any byte transfer occurs.
+/// refused with `.oversized` before any byte transfer occurs. The actual body is
+/// also bounded while downloading, even when the reported size is absent/wrong.
 public actor TelegramMediaDownloader {
     private let session: URLSession
 
@@ -112,9 +113,27 @@ public actor TelegramMediaDownloader {
             throw TelegramMediaDownloadError.malformedResponse
         }
 
-        let (bytes, resp2) = try await session.data(for: URLRequest(url: fileURL))
+        let (body, resp2) = try await session.bytes(for: URLRequest(url: fileURL))
+        defer { body.task.cancel() }
+        try Task.checkCancellation()
         if let http = resp2 as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw TelegramMediaDownloadError.httpError(status: http.statusCode)
+        }
+        let bytes = try await withTaskCancellationHandler {
+            var downloaded = Data()
+            for try await byte in body {
+                try Task.checkCancellation()
+                guard downloaded.count < maxBytes else {
+                    throw TelegramMediaDownloadError.oversized(
+                        reportedBytes: downloaded.count + 1, capBytes: maxBytes
+                    )
+                }
+                downloaded.append(byte)
+            }
+            try Task.checkCancellation()
+            return downloaded
+        } onCancel: {
+            body.task.cancel()
         }
 
         let filename = URL(fileURLWithPath: filePath).lastPathComponent
