@@ -177,17 +177,26 @@ struct SlackConversationDiscoveryTests {
         _ = try await harness.loop.cachedPollableConversations(now: now)
         try SlackDiscoveryProtocol.reset([discoveryPage([joinedChannel("Cpartial")], cursor: "held")], holdAt: 1)
         let task = Task { try await harness.loop.cachedPollableConversations(now: now.addingTimeInterval(601)) }
-        let deadline = Date().addingTimeInterval(2)
-        while SlackDiscoveryProtocol.requests.count < 2 && Date() < deadline {
+        defer { task.cancel() }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while SlackDiscoveryProtocol.requests.count < 2 && clock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
-        #expect(SlackDiscoveryProtocol.requests.count == 2)
+        try #require(SlackDiscoveryProtocol.requests.count == 2)
         task.cancel()
         do {
             _ = try await task.value
             Issue.record("Cancellation must not fall back to the old cache")
         } catch { #expect(error is CancellationError) }
-        #expect(SlackDiscoveryProtocol.stops == 1)
+        // URLSession can resume the cancelled data(for:) continuation before
+        // URLProtocol receives stopLoading. Await that independent receipt
+        // before asserting or resetting the shared mock for recovery.
+        let stopDeadline = clock.now.advanced(by: .seconds(2))
+        while SlackDiscoveryProtocol.stops == 0 && clock.now < stopDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(SlackDiscoveryProtocol.stops == 1)
         try SlackDiscoveryProtocol.reset([discoveryPage([joinedChannel("Cnew")])])
         #expect(try await harness.loop.cachedPollableConversations(now: now.addingTimeInterval(602)) == [.init(id: "Cnew", channelType: "channel")])
     }
