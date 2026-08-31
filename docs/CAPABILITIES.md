@@ -1,6 +1,8 @@
 # NativeAgent capabilities
 
-*Verified against the repository and release baseline on 2026-07-31.*
+*Product map, with computer-control and repository navigation reviewed against
+source on 2026-08-30. Release and installed-behavior receipts remain separately
+dated in Project Status and the Changelog.*
 
 This document is the readable product map. It describes what NativeAgent
 currently does without requiring a tour through every Swift target. Exact
@@ -219,17 +221,28 @@ and live account proof.
 
 ### Mac computer control
 
-- A read-only accessibility perception organ walks the frontmost window's
-  AX tree as structured data under hard node/depth/length bounds and reports
-  truncation honestly (`ax_status`, `ax_tree`, `ax_find`).
-- `mac_view` fuses one screenshot with the AX walk into a numbered scene:
-  the agent acts by mark reference (`mac_click{mark}`, `mac_ax_act{mark}`),
-  never by model-guessed coordinates. Marks expire; a stale view is refused
-  rather than reinterpreted.
-- Keyboard, mouse, scroll, and semantic AX actions require three gates: the
-  accessibility category, an active Full Mac trust window, and a one-time
-  capability bound by digest to the exact approved body — non-forgeable,
-  non-replayable, durable across crashes.
+- The ordinary agent-facing vocabulary is `screen`, `act`, `read`, and `open`.
+  A bounded accessibility walk and native pixel perception feed the same named
+  scene. Lower-level AX/mark tools remain diagnostic/compatibility mechanisms,
+  not a requirement to manufacture coordinates or learn another screen API.
+- `screen(part:)` can narrow to a canvas/viewport, observed HUD/readout, or
+  controls while preserving uncertainty and source omissions. Pixel objects
+  can carry measured colour, silhouette, relative location, and motion; unknown
+  semantics or unobserved values remain unknown.
+- `act` resolves the named target from fresh evidence. The existing hand
+  supports explicit left/right mouse input, paced drag travel, simultaneous
+  movement keys, held modifiers, and fine four-direction wheel input. A request
+  for a covered point or obstructed drag path is refused before input; input
+  is released on completion, cancellation, or user takeover.
+- TrustCenter and the shared origin-aware chat policy determine authority.
+  Full Mac YOLO preserves ordinary native-tool access for admitted local and
+  authenticated remote conversations; approval-bound modes retain exact
+  capability/replay checks. Screen Recording and Accessibility remain separate
+  macOS grants, and the selected mode cannot override a locked screen.
+- Pointer placement, emitted input, visible application effect, and task
+  completion are separate evidence. Recent local motion/navigation fixtures
+  demonstrate bounded behaviors, not perfect tracking, semantic understanding
+  of arbitrary pixels, or general game play.
 - Displayed secrets are redacted at the source by SHAPE (one-time codes,
   high-entropy tokens, card numbers with Luhn, recovery phrases, secret-labeled
   captions in all three geometries) before any model, trace, or synced sink
@@ -238,6 +251,27 @@ and live account proof.
 - `mac_wake` and `mac_nudge` dismiss a non-locked screensaver or wake a
   sleeping display; any readable lock evidence refuses, fail-closed, and a
   refusal carries no image or text.
+
+### Chrome and the built-in browser
+
+Chrome control is an optional, default-off extension path. The Manifest V3
+extension keeps bounded, renewable tab leases and yields them on user input or
+tab activation. It can operate inactive agent tabs without stealing focus.
+Structured snapshots include permitted frames and open shadow roots, with
+unavailable frames and closed roots explicit. Click, fill/type, select,
+keypress, checked-state, double-click, wait, and scroll use the current
+snapshot's advertised node actions; password nodes are not actionable.
+
+`ChromeControlRuntime` in the Mac app owns the authority and effect-time Trust
+Center check. The Swift `NativeAgentChromeRelay` only carries framed messages
+between Chrome and the app-owned Unix socket. A lost post-dispatch response is
+`outcome_unknown`, not a reason to repeat an effect automatically. See the
+[extension guide](../Extensions/NativeAgentChrome/README.md) for setup.
+
+The built-in Browser remains an app-owned visible WKWebView with Core Browser
+lifecycle/receipt ownership. Native screen control remains the visible desktop
+path. These are three purpose-built surfaces, not interchangeable permissions
+or a second runtime.
 
 ### Ambient activity watcher
 

@@ -583,7 +583,7 @@ release_personal_identity_hit_files() {
 release_assert_no_identity_strings() {
   local bundle="$1"
   local exe fatal_hits exact_hits section_hits raw_hits identity_regex
-  local section_tmp raw_tmp scan_rc
+  local section_tmp raw_tmp scan_copy scan_rc
   local failed=false
 
   identity_regex="$(release_identity_leak_regex)" || {
@@ -618,14 +618,24 @@ release_assert_no_identity_strings() {
     # rc >= 2 = the scanner itself failed, which is NOT a clean binary.
     section_tmp="$(mktemp "${TMPDIR:-/tmp}/nativeagent-gate-sections.XXXXXX")" || return 1
     raw_tmp="$(mktemp "${TMPDIR:-/tmp}/nativeagent-gate-raw.XXXXXX")" || { rm -f "$section_tmp"; return 1; }
-    if ! strings -n 3 "$exe" > "$section_tmp"; then
-      rm -f "$section_tmp" "$raw_tmp"
+    scan_copy="$(mktemp "${TMPDIR:-/tmp}/nativeagent-gate-copy.XXXXXX")" || { rm -f "$section_tmp" "$raw_tmp"; return 1; }
+    # strings recognizes Swift typeref sections but mistakes pointer payloads
+    # inside them for text. Mask only ABI-defined numeric reference bytes in a
+    # disposable scan copy. The shipped executable is never modified here.
+    if ! swift "$(dirname "${BASH_SOURCE[0]}")/../macho_identity_scan_copy.swift" "$exe" > "$scan_copy"; then
+      rm -f "$section_tmp" "$raw_tmp" "$scan_copy"
+      echo "ERROR: A1.1 leak gate could not decode Mach-O metadata in $exe." >&2
+      failed=true
+      continue
+    fi
+    if ! strings -n 3 "$scan_copy" > "$section_tmp"; then
+      rm -f "$section_tmp" "$raw_tmp" "$scan_copy"
       echo "ERROR: A1.1 leak gate could not read the string table of $exe." >&2
       failed=true
       continue
     fi
-    if ! LC_ALL=C tr -c '[:print:]' '\n' < "$exe" | awk 'length($0) >= 4' > "$raw_tmp"; then
-      rm -f "$section_tmp" "$raw_tmp"
+    if ! LC_ALL=C tr -c '[:print:]' '\n' < "$scan_copy" | awk 'length($0) >= 4' > "$raw_tmp"; then
+      rm -f "$section_tmp" "$raw_tmp" "$scan_copy"
       echo "ERROR: A1.1 leak gate could not extract printable byte runs from $exe." >&2
       failed=true
       continue
@@ -633,14 +643,14 @@ release_assert_no_identity_strings() {
     scan_rc=0
     section_hits="$(grep -E -e "$identity_regex" -- "$section_tmp")" || scan_rc=$?
     if [[ "$scan_rc" -gt 1 ]]; then
-      rm -f "$section_tmp" "$raw_tmp"
+      rm -f "$section_tmp" "$raw_tmp" "$scan_copy"
       echo "ERROR: A1.1 leak gate section scan FAILED on $exe — grep exited $scan_rc." >&2
       failed=true
       continue
     fi
     scan_rc=0
     raw_hits="$(grep -E -e "$identity_regex" -- "$raw_tmp")" || scan_rc=$?
-    rm -f "$section_tmp" "$raw_tmp"
+    rm -f "$section_tmp" "$raw_tmp" "$scan_copy"
     if [[ "$scan_rc" -gt 1 ]]; then
       echo "ERROR: A1.1 leak gate raw-byte scan FAILED on $exe — grep exited $scan_rc." >&2
       failed=true

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/script/lib/release_bundle_gates.sh"
+swift "$ROOT/script/macho_identity_scan_copy.swift" --self-test
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-release-gates.XXXXXX")"
 # Some cases below chmod a fixture directory to 000 to model a find that fails
@@ -102,6 +103,18 @@ printf '\000private_fixture_identity\000' >> "$SHORT_BIN"
 if PATH="$FAKE_BIN:$PATH" NATIVEAGENT_PRIVACY_DENYLIST_FILE="$DENYLIST" \
   release_assert_no_identity_strings "$SHORT_BUNDLE" >/dev/null 2>&1; then
   echo "FAIL: substantial raw identity data outside string sections was accepted" >&2
+  exit 1
+fi
+
+# A real three-character C string must still be rejected after masking numeric
+# Swift references. Check the verdict, not merely a nonzero scanner exit.
+printf 'int main(void) { const char *name = "Qzx"; return name[0]; }\n' > "$TMP/short-literal.c"
+xcrun clang -O0 "$TMP/short-literal.c" -o "$SHORT_BIN"
+short_literal_rc=0
+short_literal_output="$(NATIVEAGENT_PRIVACY_DENYLIST_FILE="$TMP/short_denylist.regex" \
+  release_assert_no_identity_strings "$SHORT_BUNDLE" 2>&1)" || short_literal_rc=$?
+if [[ "$short_literal_rc" -ne 1 || "$short_literal_output" != *'private instance identity compiled into'* ]]; then
+  echo "FAIL: real three-byte Mach-O literal was not rejected as an identity leak" >&2
   exit 1
 fi
 

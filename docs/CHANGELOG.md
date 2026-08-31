@@ -1,6 +1,13 @@
 # Changelog
 
-Public releases of NativeAgent. Download: the latest notarized DMG is on
+Retained early release notes for NativeAgent; the notes below stop at 0.3.8.
+The [root Changelog](../CHANGELOG.md) is the canonical current change ledger,
+with version-specific detail under `docs/release-notes/`. See
+[Project Status](../PROJECT_STATUS.md#summary) for source/candidate status and
+the GitHub releases page for published artifacts. A candidate entry in the
+Changelog or version in `VERSION` is not proof that its DMG has been published.
+
+Download: the latest notarized DMG is on
 the [releases page](https://github.com/embwl0x/native-agent/releases);
 installed apps update in place via Sparkle (Check for Updates…).
 

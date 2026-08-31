@@ -671,17 +671,20 @@ private func makeConsentJSON(
 // MARK: - defaultDataRoot / libraryAppSupportFallback
 
 @Test func defaultDataRootHonorsEnvVar() async throws {
-    let prior = ProcessInfo.processInfo.environment["NATIVE_AGENT_DATA_ROOT"]
-    setenv("NATIVE_AGENT_DATA_ROOT", "/tmp/mcp-test-root-xyz", 1)
-    defer {
-        if let prior {
-            setenv("NATIVE_AGENT_DATA_ROOT", prior, 1)
-        } else {
-            unsetenv("NATIVE_AGENT_DATA_ROOT")
-        }
-    }
+    // The canonical runner pins this before process launch. Mutating it here
+    // races every parallel suite using a default owner; suite serialization
+    // cannot isolate a process-wide environment variable.
+    let environment = ProcessInfo.processInfo.environment
     let root = SwiftNativeMCPDispatcher.defaultDataRoot()
-    #expect(root.path == "/tmp/mcp-test-root-xyz")
+    #expect(root == PersistenceCore.defaultDataRoot(environment: environment))
+    if let pinned = environment["NATIVE_AGENT_DATA_ROOT"], !pinned.isEmpty {
+        #expect(root.path == pinned)
+    }
+    // Alternate-value precedence is injected at the canonical resolver; the
+    // argument-free wrapper above still executes in both pinned and bare runs.
+    let alternate = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mcp-root-precedence-\(UUID().uuidString)")
+    #expect(PersistenceCore.defaultDataRoot(environment: ["NATIVE_AGENT_DATA_ROOT": alternate.path]).path == alternate.path)
 }
 
 @Test func libraryAppSupportFallbackHasNoDataSuffix() async throws {

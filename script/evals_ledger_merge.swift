@@ -828,9 +828,10 @@ var tot = PyCounter()
 for s in rows { tot.add(pyStr(s["status"])) }
 
 var L: [String] = ["# Eval coverage — NativeAgent", "",
-                   "_generated deterministically from phase-1 fragments; \(rows.count) surfaces across \(byFence.count) fences._", "",
+                   "_generated deterministically from phase-1 fragments, overrides, and campaigns; \(rows.count) surfaces across \(byFence.count) fences._", "",
                    "**COVERED \(tot["COVERED"]) · REPORTS-ONLY \(tot["REPORTS-ONLY"]) · UNCOVERED \(tot["UNCOVERED"])**", "",
-                   "**Behaviorally open: \(tot["REPORTS-ONLY"] + tot["UNCOVERED"])** (mapped/structural evidence is useful, but only `COVERED` means an asserting evaluator executed.)", "",
+                   "**Behaviorally open in the inventory: \(tot["REPORTS-ONLY"] + tot["UNCOVERED"])**. `COVERED` means a recorded coverage reference has `strength: asserts`; rendering this report does not execute that evaluator or verify its current result.", "",
+                   "This is an inventory, not a current test receipt. Run notes, line references, failure hypotheses, and proposed evals preserve their original audit context; later coverage mappings do not rewrite those historical observations. Use current source and a revision-specific execution log for present behavior and pass/fail claims. See [the eval guide](README.md).", "",
                    "## Uncovered by silent-failure class (keyword-classified; refine in phase 2)", ""]
 var cls = PyCounter()
 for s in rows {
@@ -847,7 +848,7 @@ for f in byFence.keys.sorted(by: pyLess) {
     var cc = PyCounter()
     for s in ss { cc.add(pyStr(s["status"])) }
     L += ["## \(f)  — COVERED \(cc["COVERED"]) · REPORTS-ONLY \(cc["REPORTS-ONLY"]) · UNCOVERED \(cc["UNCOVERED"])", "",
-          "_ran: \(pyTruthy(ran[f]) ? pyStr(ran[f]) : "—")_", "",
+          "_recorded audit run (historical): \(pyTruthy(ran[f]) ? pyStr(ran[f]) : "—")_", "",
           "| surface | kind | status | coverage | silent failure | proposed eval |", "|---|---|---|---|---|---|"]
     let sortedSS = ss.enumerated().sorted { l, r in
         let ls = pyStr(l.element["status"]), rs = pyStr(r.element["status"])

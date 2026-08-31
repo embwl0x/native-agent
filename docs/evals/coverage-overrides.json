@@ -7616,7 +7616,7 @@
     "id": "scripts.test.nodeSuiteGlob",
     "coverage": [
       {
-        "ref": "tests/NativeAgentAppTests/ScriptGateWiringEvalTests.swift \u2014 everyScriptTestsSuiteHasARunner + scriptTestsRunnerDetectorDoesNotCreditTheWrongGlob",
+        "ref": "tests/scripts/canonical_test_wiring_guards_test.sh \u2014 bridge and Chrome Node families require executable loops; omitted directories and echo-only loops fail. tests/NativeAgentAppTests/ScriptGateWiringEvalTests.swift \u2014 everyScriptTestsSuiteHasARunner + scriptTestsRunnerDetectorDoesNotCreditTheWrongGlob",
         "strength": "asserts",
         "tier": "smoke"
       }
@@ -7671,7 +7671,7 @@
     "id": "scripts.guardSuites.orphaned",
     "coverage": [
       {
-        "ref": "tests/NativeAgentAppTests/ScriptGateWiringEvalTests.swift \u2014 everyScriptTestsSuiteHasARunner (both known orphans named, a third fails)",
+        "ref": "tests/NativeAgentAppTests/ScriptGateWiringEvalTests.swift \u2014 everyScriptTestsSuiteHasARunner (only the historical pipe mechanism demonstration remains diagnostic-only); tests/scripts/canonical_test_wiring_guards_test.sh rejects unwired auxiliary shell suites and production Node families",
         "strength": "asserts",
         "tier": "smoke"
       }
@@ -18405,6 +18405,27 @@
       "liveOrClone": "hermetic",
       "reads": "the production screen bodies for the complete enumerated Mac-snapshot surface set",
       "tier": "test"
+    }
+  },
+  {
+    "fence": "scripts",
+    "id": "scripts.macho_identity_scan_copy",
+    "kind": "cli",
+    "where": "script/macho_identity_scan_copy.swift:scanCopy, selfTest; script/lib/release_bundle_gates.sh invokes the scan-only normalization before executable identity checks",
+    "coverage": [
+      {
+        "ref": "tests/scripts/release_bundle_gates_test.sh invokes script/macho_identity_scan_copy.swift --self-test (relative/absolute symbolic references, preserved short literals and nonmetadata bytes, truncated-reference refusal) and compiles a real three-byte C string literal into Mach-O, requiring the identity-leak verdict rather than an arbitrary scanner failure; script/test.sh invokes this suite",
+        "strength": "asserts",
+        "tier": "smoke"
+      }
+    ],
+    "silentFailureMode": "False private-identity alarms from numeric Swift symbolic references, or false clean results if scan-only normalization masks actual literals outside validated typeref metadata. The signed executable must not be modified.",
+    "proposedEval": {
+      "asserts": "Only validated Swift typeref pointer payloads are normalized in a scan copy; real short literals remain visible, truncated references fail closed, and a compiled three-byte identity literal receives the explicit identity-leak rejection",
+      "costSeconds": 10,
+      "liveOrClone": "hermetic",
+      "reads": "Synthetic Mach-O data through scanCopy and a temporary C-built Mach-O executable through release_assert_no_identity_strings",
+      "tier": "smoke"
     }
   }
 ]

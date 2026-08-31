@@ -1,6 +1,11 @@
 # keeper-baseline.json
-Known surfaces WITHOUT a ledger row as of 2026-08-23 (101 entries) — tolerated by
-`EvalCoverageLedgerTests` so the keeper fails only on NEW gaps. Burn this list down: each
-entry gets a ledger row + an eval (wave B: a by-name worker for the built-in tools), then
-is removed here. Never add to this file to make the keeper pass for a new surface without a
-dated reason in the commit message.
+Known enumerable surfaces without a ledger row, tolerated by
+`EvalCoverageLedgerTests` so the keeper fails on new gaps. The inventory began
+with 101 entries on 2026-08-23; six remain in the checked-in file on 2026-08-30.
+Those counts describe the baseline, not executed behavior or a current pass.
+
+When a surface receives its canonical ledger row and evaluator, remove its
+baseline entry. Update `coverage-overrides.json` and regenerate the ledger;
+do not hand-edit the generated output. Never add an exemption just to make the
+keeper pass without a dated reason in the commit message. The keeper checks
+enumerable presence, not the completeness or freshness of every assertion.

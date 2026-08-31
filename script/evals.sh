@@ -141,7 +141,7 @@ full_source_digest() {
     printf '%s\0' "$file"
     shasum -a 256 "$ROOT/$file" | awk '{printf "%s\0", $1}'
   done < <(git -C "$ROOT" ls-files -co --exclude-standard -z -- \
-    Sources Modules tests iOS script Shared Package.swift Package.resolved docs/evals) \
+    Sources Modules tests iOS script Shared Extensions Package.swift Package.resolved docs/evals) \
     | shasum -a 256 | awk '{print $1}'
 }
 full_install_and_verify() {

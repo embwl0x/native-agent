@@ -71,10 +71,8 @@ struct ScriptGateWiringEvalTests {
 
     // MARK: - scripts.test.nodeSuiteGlob / scripts.guardSuites.orphaned
 
-    /// script/test.sh:143-146 loops `script/tests/*.test.js`. There is no
-    /// equivalent loop for `.test.sh` or `.test.swift`, and the orphan guard
-    /// above is aimed at tests/scripts, not script/tests — so a suite in this
-    /// directory with any other extension is invoked by nothing at all.
+    /// Node suites use a glob; deterministic shell suites have exact commands.
+    /// Standalone mechanism demonstrations are not product regression proof.
     static func unrunnableScriptTestsSuites(listing: [String], testShellSource: String) -> [String] {
         listing.filter { name in
             guard let dot = name.range(of: ".", options: .backwards) else { return true }
@@ -86,12 +84,12 @@ struct ScriptGateWiringEvalTests {
         }.sorted()
     }
 
-    /// Dated known gap (2026-08-23): both of these are invoked by nothing in
-    /// the repo (verified by grep). Wiring them is a production edit to
-    /// script/test.sh. A THIRD unrunnable suite fails this eval.
+    /// Explicit diagnostic-only exception: this standalone script compares a
+    /// historical broken pipe mechanism with a replacement, not shipped code.
+    /// The canonical Node suites pin the shipped SystemProcessAdapter wiring.
+    /// ios_release.test.sh joined the canonical gate on 2026-08-30.
     static let knownUnrunnableScriptTests: Set<String> = [
         "codex_wakeup_helper_pipe.test.swift",
-        "ios_release.test.sh",
     ]
 
     @Test func everyScriptTestsSuiteHasARunner() throws {

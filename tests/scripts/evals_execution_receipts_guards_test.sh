@@ -67,6 +67,9 @@ STUB
 cat > "$TMP/repo/script/verify_installed_runtime_ready.sh" <<'STUB'
 #!/usr/bin/env bash
 echo verify >> "$FULL_INSTALL_CALLS"
+if [[ -n "${FULL_MUTATE_EXTENSION:-}" ]]; then
+  printf 'changed extension source\n' >> "$FULL_MUTATE_EXTENSION"
+fi
 STUB
 chmod +x "$TMP/repo/script/"*.sh
 git -C "$TMP/repo" init -q
@@ -101,4 +104,16 @@ run_full_case full-smoke-failed 7 0 1
 run_full_case full-canonical-failed 0 65 1
 run_full_case full-canonical-interrupted 0 143 1
 run_full_case full-both-failed 7 65 2
+
+# Chrome participates in the canonical gate, so a full-mode source receipt
+# must bind its source too, including edits after its Node tests completed.
+mkdir -p "$TMP/repo/Extensions/NativeAgentChrome"
+extension="$TMP/repo/Extensions/NativeAgentChrome/background.js"
+printf 'fixture extension source\n' > "$extension"
+rc=0
+PATH="$TMP/bin:$PATH" TMPDIR="$TMP/runs" FULL_INSTALL_CALLS="$TMP/install.calls" \
+  FULL_MUTATE_EXTENSION="$extension" \
+  bash "$TMP/repo/script/evals.sh" --full > "$TMP/full-extension-drift.log" 2>&1 || rc=$?
+[[ "$rc" != 0 ]] && grep -q 'source changed during gate' "$TMP/full-extension-drift.log" \
+  || { echo 'FAIL: full-mode receipt accepted extension source drift' >&2; exit 1; }
 echo 'evals_execution_receipts_guards_test.sh: all assertions passed'

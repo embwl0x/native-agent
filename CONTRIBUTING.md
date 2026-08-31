@@ -8,7 +8,7 @@ lazy context and tools, shared surface policy, and fail-closed trust boundaries.
 
 ```bash
 git clone https://github.com/embwl0x/native-agent.git
-cd NativeAgent
+cd native-agent
 
 # Hooks are not cloned. Install the staged privacy/secret guard once.
 bash script/hooks/install.sh
@@ -23,11 +23,13 @@ artifacts, and local signing material are intentionally ignored.
 
 ## Read before changing architecture
 
-1. [docs/NORTHSTAR.md](docs/NORTHSTAR.md)
-2. [docs/ARCHITECTURE_BLUEPRINT.md](docs/ARCHITECTURE_BLUEPRINT.md)
-3. [docs/PROJECT_DIRECTION.md](docs/PROJECT_DIRECTION.md)
-4. [PROJECT_STATUS.md](PROJECT_STATUS.md)
-5. The task-specific as-built map under `docs/build_plans/`
+Start with the [Documentation and Repository Guide](docs/README.md), then read
+the relevant owner section in the [Architecture Blueprint](docs/ARCHITECTURE_BLUEPRINT.md).
+[North Star](docs/NORTHSTAR.md) and [Project Direction](docs/PROJECT_DIRECTION.md)
+explain intent; the [capability snapshot](PROJECT_STATUS.md#capability-snapshot)
+records implementation boundaries. Maintainer checkouts additionally have
+task-specific as-built maps under `docs/build_plans/`; public exports omit
+private plans and handoffs.
 
 Code and Git are authoritative when an old plan is stale. Update the active
 docs when changing ownership, state roots, policy, or a cross-surface contract.
@@ -73,15 +75,23 @@ checked.
 
 ## Build and tests
 
-Start with the narrowest relevant test, then broaden with risk:
+Assemble the coherent change, build the integrated target, then run one
+proportionate validation of the finished workflow. The
+[validation map](docs/README.md#validation-boundaries) explains the different
+gates; these commands are alternatives selected by scope, not a sequence of
+per-file checks.
 
 ```bash
+swift build --jobs 4 --force-resolved-versions --skip-update
+
+# Select the relevant finished-workflow/package check.
 swift test --filter '<suite-or-test>'
-swift test --package-path Modules/NativeAgentCore --filter '<suite-or-test>'
-swift build --jobs 4
+swift test --package-path Modules/NativeAgentCore --no-parallel
+swift test --package-path Modules/NativeAgentShared
 
 # Canonical whole-repository gate before publication.
 ./script/test.sh
+./script/test.sh --require-ios
 
 # Optional installed-runtime sweeps.
 ./script/smoke_all.sh
@@ -90,6 +100,12 @@ swift build --jobs 4
 
 For iOS changes, build or test against an actually installed simulator and
 verify signing-sensitive behavior on a properly entitled device when needed.
+The canonical gate covers script/inventory/iOS-release guards, Node builder and
+Chrome extension tests, Core
+XCTest and Swift Testing shards, Shared, the root Mac package, and an iOS test
+handoff. An ordinary unavailable-simulator skip is not iOS proof; release
+receipts require that lane. Chrome extension tests also have a focused
+[entry point](Extensions/NativeAgentChrome/README.md).
 
 For Mac runtime or UI changes, install canonically with
 `./script/install_app.sh`. Do not execute the repository `dist` GUI executable

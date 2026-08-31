@@ -2,12 +2,27 @@
 
 Last updated: 2026-08-30
 
+Navigation: [documentation and repository guide](docs/README.md),
+[capability snapshot](#capability-snapshot),
+[Living Fabric evidence](#living-fabric-convergence),
+[public-source guardrails](#current-public-source-guardrails), and
+[verification commands](#verification-commands).
+
+The Summary retains a running change narrative. Its older counts and installed
+receipts apply to the revision/date they describe, not automatically to HEAD.
+The capability table is the compact implementation map; the
+[root Changelog](CHANGELOG.md) is the current change ledger, including candidate
+entries that are not yet published. Updating these docs does not
+certify a new source build or publish an artifact.
+
 ## Summary
 
-Public release 0.4.3 is live. Version 0.4.4 is the current release candidate,
-bringing the subsequent computer-use, relevant recall, conversation continuity,
-delegation, evaluation, and reliability work together on one integrated source.
-Release validation and publication are pending; this is not a release receipt.
+Version 0.4.4 brings the post-0.4.3 computer-use, relevant recall, conversation
+continuity, delegation, evaluation, and reliability work together on one
+integrated source. The [public Releases page](https://github.com/embwl0x/native-agent/releases)
+is authoritative for available installers; a version in this checkout is not
+publication proof. Published artifacts carry their exact-source test receipt
+and release attestation; this status document is not a release receipt.
 Source and live behavior remain authoritative over older release prose below.
 
 The post-0.4.3 integration audit is complete. It repaired a vision-region
@@ -1777,14 +1792,19 @@ document are verified gaps, not shipped capability claims.
 
 ## Verification Commands
 
-Use the smallest useful check first, then broaden before commit:
+Assemble the coherent change, build the integrated target, then select the
+proportionate final check. The [validation map](docs/README.md#validation-boundaries)
+explains which evidence each entry point supplies; these are not all required
+for a documentation-only change.
 
 ```bash
-swift build --package-path Modules/NativeAgentShared
-swift test --package-path Modules/NativeAgentCore
-swift build
+swift build --jobs 4 --force-resolved-versions --skip-update
+swift test --package-path Modules/NativeAgentShared
+swift test --package-path Modules/NativeAgentCore --no-parallel
+swift test --no-parallel
 ./script/check_architecture_blueprint.swift --repo .
 ./script/test.sh
+./script/test.sh --require-ios
 ./script/release.sh --dry-run
 ./script/verify_release_artifact.sh --bundle dist/NativeAgent.app
 git diff --check

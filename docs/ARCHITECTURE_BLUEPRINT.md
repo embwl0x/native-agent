@@ -1,5 +1,19 @@
 # NativeAgent Architecture Blueprint
 
+Last navigation/ownership review: 2026-08-30.
+
+Use the [documentation and repository guide](README.md) for a short reading
+path. This catalog preserves detailed contracts; jump directly to the owner
+you need rather than treating every dated note as a current task.
+
+- [Runtime shape](#runtime-shape) and [high-level flow](#high-level-flow)
+- [Mac app owners](#app-source-map), [iOS](#ios-companion-map), and [Core](#core-runtime-map)
+- [Desk work](#desk-work-ownership) and [tool dispatcher](#tool-dispatcher-map)
+- [State](#state-ownership), [policy](#policy-chokepoints), and [chat context](#chat-context-rules)
+- [Background loops](#background-loops), [connectors](#connector-rules), and [build/test](#build-and-test-baseline)
+
+## Recent contract notes
+
 Bounded discovery contract (2026-08-30): `MacFourVerbs.zoom` owns on-demand
 HUD/readout and controls/actions scopes. Whole-section expansion retains
 source omissions and original addresses; observed caps and unobserved values
@@ -73,10 +87,6 @@ work/reminders are not newly surfaced without the user's request. See
 `docs/build_plans/fluid-context-as-built-map.md` for current telemetry and eval
 boundaries.
 
-Last updated: 2026-08-29
-
-This is the fast architecture map for any LLM or human collaborator working on NativeAgent. Read this before making structural changes.
-
 ## First Principle
 
 NativeAgent is a Swift-native Mac + iPhone agent runtime. `NativeAgent.app` owns the live runtime in-process.
@@ -93,10 +103,10 @@ Historical daemon/Python-era words may still appear in old audit notes, compatib
 
 ## Read Order
 
-1. `docs/ARCHITECTURE_BLUEPRINT.md` for the system map and ownership rules.
-2. `docs/PROJECT_DIRECTION.md` for durable product and safety guardrails.
-3. `docs/HANDOFF_CURRENT.md` for the current known-good baseline and recent changes.
-4. `PROJECT_STATUS.md` for capability status and open gaps.
+1. [Documentation guide](README.md) for the repository layout and task-specific reading path.
+2. The relevant section of this blueprint for exact ownership.
+3. [Project Direction](PROJECT_DIRECTION.md) for durable intent and [Project Status](../PROJECT_STATUS.md#capability-snapshot) for implementation boundaries.
+4. In a maintainer checkout, the newest relevant section of `docs/HANDOFF_CURRENT.md` and the applicable current as-built map. Public exports omit those private handoffs/plans.
 
 If docs and code disagree, trust code/git, then update the stale doc.
 
@@ -1286,7 +1296,10 @@ acceptance contract first prove it belongs in the resident agent's living path.
 
 ## Build And Test Baseline
 
-Use the narrowest relevant check during iteration, then broaden before committing.
+Assemble the coherent change, build the integrated target, then run the
+proportionate finished-workflow validation. The
+[validation map](README.md#validation-boundaries) distinguishes package tests,
+whole-repository coverage, installed behavior, and exact-source release proof.
 
 `script/lib/development_bundle_signing.sh` is the single mechanical owner for
 development build/install signing: identity discovery, stale-override refusal,
@@ -1319,17 +1332,27 @@ distribution artifacts, quarantine, or receipts. Non-WMO compilation remains
 unadopted until the benchmark and separate runtime proof meet their thresholds.
 
 ```bash
-swift build --package-path Modules/NativeAgentShared
-swift build --package-path Modules/NativeAgentCore
+swift build --jobs 4 --force-resolved-versions --skip-update
+# Select final checks by the changed boundary, not all of these per edit.
 swift test --package-path Modules/NativeAgentCore --no-parallel
-swift build
-swift test --filter NativeAgentAppTests
+swift test --package-path Modules/NativeAgentShared
+swift test --no-parallel
 ./script/test.sh
+./script/test.sh --require-ios
 ./script/smoke_all.sh
 ./script/install_app.sh
 ```
 
 For Mac runtime behavior changes, install with `./script/install_app.sh`. For iOS changes, build the iOS project with an installed simulator destination.
+
+`script/test.sh` includes script/inventory/iOS-release guards, Node builder and
+Chrome extension tests, Core
+XCTest and serial Swift Testing shards, Shared, root Mac tests, and the iOS
+runner. Its ordinary iOS lane can report unavailable/skipped; release receipt
+mode cannot. The Chrome extension's Node suite also has a focused entry point
+in its [guide](../Extensions/NativeAgentChrome/README.md); relay tests live in the
+root package. No package gate alone proves installed perception, provider
+behavior, locked-phone delivery, or a fresh-machine launch.
 
 ## Refactor Rules
 

@@ -112,6 +112,8 @@ echo "[test] agent instrument eval suite"
 echo "[test] merge candidate integration helper"
 bash "$ROOT/script/tests/merge_candidate.test.sh"
 
+echo "[test] iOS release deterministic fixtures (no signing or upload)"
+bash "$ROOT/script/tests/ios_release.test.sh"
 
 echo "[test] tool execution inventory states"
 "$ROOT/tests/scripts/tool_execution_inventory_test.sh"
@@ -184,6 +186,11 @@ echo "[test] tracked privacy"
 # them all so a new suite can never sit orphaned outside the gate.
 echo "[test] bridge wakeup helpers (node)"
 for suite in "$ROOT"/script/tests/*.test.js; do
+  node --test "$suite"
+done
+
+echo "[test] Chrome extension (mock browser, node)"
+for suite in "$ROOT"/Extensions/NativeAgentChrome/tests/*.test.js; do
   node --test "$suite"
 done
 

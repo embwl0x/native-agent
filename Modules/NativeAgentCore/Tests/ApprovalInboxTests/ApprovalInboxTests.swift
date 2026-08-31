@@ -322,17 +322,17 @@ private func writeSeed(
 // MARK: - Fix 1: defaultDataRoot priority order
 
 @Test func defaultDataRootHonorsEnvVar() async throws {
-    let prior = ProcessInfo.processInfo.environment["NATIVE_AGENT_DATA_ROOT"]
-    setenv("NATIVE_AGENT_DATA_ROOT", "/tmp/test-root-abc", 1)
-    defer {
-        if let prior {
-            setenv("NATIVE_AGENT_DATA_ROOT", prior, 1)
-        } else {
-            unsetenv("NATIVE_AGENT_DATA_ROOT")
-        }
-    }
+    // Read the runner's process-start pin, never mutate a shared root while
+    // other Swift Testing suites may be constructing their own stores.
+    let environment = ProcessInfo.processInfo.environment
     let root = SwiftNativeApprovalInbox.defaultDataRoot()
-    #expect(root.path == "/tmp/test-root-abc")
+    #expect(root == PersistenceCore.defaultDataRoot(environment: environment))
+    if let pinned = environment["NATIVE_AGENT_DATA_ROOT"], !pinned.isEmpty {
+        #expect(root.path == pinned)
+    }
+    let alternate = FileManager.default.temporaryDirectory
+        .appendingPathComponent("approval-root-precedence-\(UUID().uuidString)")
+    #expect(PersistenceCore.defaultDataRoot(environment: ["NATIVE_AGENT_DATA_ROOT": alternate.path]).path == alternate.path)
 }
 
 @Test func libraryAppSupportFallbackHasNoDataSuffix() async throws {

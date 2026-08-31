@@ -44,4 +44,15 @@ printf '%s\n' \
   > "$TMP/ran-run-wrong-type.json"
 expect_rejected ran-run-wrong-type 'fragment.ranRun must be a non-empty string'
 
+printf '%s\n' \
+  '[{"fence":"core.fixture","fragment":{"ranRun":"dated fixture observation","uncertain":[],"surfaces":[{"id":"surface.one","kind":"public-api","where":"Sources/One.swift:1","coverage":[{"tier":"test","ref":"Tests/OneTests.swift:1","strength":"asserts"}]}]},"critic":{"missed":[],"disputed":[]}}]' \
+  > "$TMP/inventory-not-receipt.json"
+"$MERGER" "$TMP/inventory-not-receipt.json" --out "$TMP/inventory-not-receipt-out" >/dev/null
+report="$TMP/inventory-not-receipt-out/COVERAGE.md"
+grep -Fq 'COVERED 1' "$report" || fail "asserting coverage lost its inventory classification"
+grep -Fq 'rendering this report does not execute that evaluator or verify its current result' "$report" \
+  || fail "inventory rendering implies a fresh passing run"
+grep -Fq 'recorded audit run (historical): dated fixture observation' "$report" \
+  || fail "historical observations are presented as current execution"
+
 echo "evals_ledger_schema_guards_test.sh: all assertions passed"

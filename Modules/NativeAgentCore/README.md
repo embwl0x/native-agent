@@ -1,13 +1,15 @@
 # NativeAgentCore
 
-Swift package for NativeAgent's native runtime. Every subsystem listed in the
-design doc lives here as a Swift module.
+Swift package for NativeAgent's core runtime owners. Mac UI, app composition,
+and platform effect adapters live in `Sources/NativeAgentApp` at the repository
+root; shared transport and the iOS app are separate packages/targets.
 
 Architecture doc: [`../../docs/ARCHITECTURE_BLUEPRINT.md`](../../docs/ARCHITECTURE_BLUEPRINT.md).
 
 ## Runtime ownership
 
-NativeAgentCore is the only live runtime behind `NativeAgent.app`. Shipped
+NativeAgentCore runs inside `NativeAgent.app`, alongside app-owned composition
+and platform adapters. Shipped
 subsystems are unconditionally Swift-native; unsupported edges fail closed with
 an explicit Swift error rather than selecting another process or backend.
 
@@ -23,18 +25,23 @@ execution, persona, doctor checks, chat orchestration, memory, dreams/REM,
 self-improvement, trust, provider routing, background cognition, connectors,
 Workshop, workflows, and the cognition/organism runtime.
 
-Subsystem #17 (HTTP server deprecation) is a removal, not a new module.
+`Sources/` groups implementations by module, `Tests/` groups their test targets,
+and `Package.swift` defines the actual products and dependency graph. In
+particular, `NativeAgentEvaluation` is evaluation support linked by ChatDrive
+and tests, not a second production cognition owner or a Mac app dependency.
 
 ## Runtime status
 
 NativeAgentCore is the live Swift runtime for `NativeAgent.app`. There is no
-runtime HTTP server, process-owned daemon, fallback backend, or runtime-selection
-attachment in the app lifecycle.
+general-purpose agent daemon or runtime-selection attachment in the app
+lifecycle. The app's authenticated loopback bridge is a live adapter for local
+clients, not a fallback runtime; external coding CLI/MCP child processes remain
+distinct from the Mac-owned agent.
 
 Key ownership boundaries:
 
 - **PersistenceCore** owns atomic JSON / JSONL file IO and file-lock helpers.
-- **ChatOrchestration**, **ProviderRouting**, **MemoryV2**, **TrustCenter**, and
+- **ChatOrchestration**, **ProviderRouting**, **MemoryV2**, **Context**, **TrustCenter**, and
   **ToolExecution** own chat turns, model routing, recall/writeback, policy, and
   tool dispatch in process.
 - **BackgroundLoops**, **TriggerScheduler**, **DreamREMCycle**, and
@@ -52,24 +59,27 @@ fail closed with an explicit Swift error.
 
 ## Validation runbook
 
-Run the narrowest package check for the changed module, then broaden when the
-change crosses module or app boundaries:
+From the repository root, assemble the complete change, build the integrated
+target, then choose the relevant final check. The
+[repository validation map](../../docs/README.md#validation-boundaries)
+describes the canonical gate, including Core XCTest/Swift Testing, Shared, Mac,
+script/bridge guards, and iOS. A Core-only test is not full-system proof.
 
 ```bash
-cd ~/Projects/NativeAgent
-
-# Shared model changes
-swift build --package-path Modules/NativeAgentShared
+# Integrated Mac build
+swift build --jobs 4 --force-resolved-versions --skip-update
 
 # Core runtime changes
-swift test --package-path Modules/NativeAgentCore --filter <Subsystem>Tests
-swift test --package-path Modules/NativeAgentCore
+swift test --package-path Modules/NativeAgentCore --no-parallel
 
-# Mac app changes
-swift build
+# Shared models or root Mac/relay tests
+swift test --package-path Modules/NativeAgentShared
+swift test --no-parallel
 
 # Full repo sweep when the surface is broad
 ./script/test.sh
+# Require the iOS lane; an ordinary simulator skip is not proof.
+./script/test.sh --require-ios
 ```
 
 For app-runtime behavior changes, rebuild/install with `./script/install_app.sh`

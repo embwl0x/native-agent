@@ -59,10 +59,20 @@ write canonical user facts, approve actions, or bypass TrustCenter.
 ## Turn on Mac computer control and the activity watcher
 
 - Computer control (see, click, type): grant macOS **Accessibility** (and
-  **Screen Recording** for `mac_view`'s picture) to NativeAgent, then open an
-  active Full Mac window in Trust Center. Each injected action still requires
-  its own one-time approval unless you enable full autonomy. Displayed
-  secrets are redacted before the model sees the screen either way.
+  **Screen Recording** for pixel perception) to NativeAgent, then select the
+  intended Full Mac mode in Trust Center. The ordinary agent-facing tools are
+  `screen`, `act`, `read`, and `open`: named controls and observed visual regions
+  are resolved again before input. Full Mac YOLO removes routine approval
+  friction for the admitted operator, including authenticated remote chat;
+  other modes retain their applicable approvals. Redaction, takeover,
+  locked-screen refusal, and truthful effect receipts remain either way.
+- Chrome control is separate: enable **Chrome control** in Trust Center and
+  install/load the [NativeAgent Chrome extension](../Extensions/NativeAgentChrome/README.md).
+  It can create an inactive agent tab or claim an exact existing tab, read a
+  bounded structured snapshot, and act on that snapshot's nodes. Touching or
+  activating the tab yields its lease. Native screen control still operates
+  the visible desktop; NativeAgent's built-in Browser is a third, WebKit-based
+  surface. Enabling one does not silently enable the others.
 - Activity watcher: Trust Center -> capture tab -> enable. It records app and
   redacted window-title spans locally, nothing else, and only while enabled.
   Ask the agent "what was I working on yesterday" to use it. Disabling stops

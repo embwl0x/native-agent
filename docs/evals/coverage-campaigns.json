@@ -17,7 +17,7 @@
    {
     "tier": "smoke",
     "strength": "incidental",
-    "ref": "script/evals.sh --full \u2014 complete Swift suites, live read-only instrument, required iOS simulator suite, and strict installed-app accessibility walk through one command; generic gate participation is not row-specific proof"
+    "ref": "script/evals.sh --full \u2014 complete canonical suites, live read-only instrument, required iOS simulator suite, and verified app installation; strict installed-app accessibility walk additionally requires --ui. Generic gate participation is not row-specific proof"
    }
   ]
  },

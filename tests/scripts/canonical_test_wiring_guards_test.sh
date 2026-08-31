@@ -30,4 +30,34 @@ RUNNER
 "$CHECKER" "$FIXTURE" "$FIXTURE/script/test.sh" >/dev/null \
   || fail "a direct canonical suite invocation was rejected"
 
-echo "PASS: comments cannot masquerade as canonical script-suite wiring"
+mkdir -p "$FIXTURE/script/tests" "$FIXTURE/Extensions/NativeAgentChrome/tests"
+printf '#!/usr/bin/env bash\n' > "$FIXTURE/script/tests/release.test.sh"
+printf 'fixture\n' > "$FIXTURE/script/tests/bridge.test.js"
+printf 'fixture\n' > "$FIXTURE/Extensions/NativeAgentChrome/tests/browser.test.js"
+if "$CHECKER" "$FIXTURE" "$FIXTURE/script/test.sh" >"$FIXTURE/missing-families.log" 2>&1; then
+  fail "auxiliary shell and Chrome/bridge Node suites were silently omitted"
+fi
+grep -q 'orphaned script suite: script/tests/release.test.sh' "$FIXTURE/missing-families.log"
+grep -Fq 'orphaned Node suite family: script/tests/*.test.js' "$FIXTURE/missing-families.log"
+grep -Fq 'orphaned Node suite family: Extensions/NativeAgentChrome/tests/*.test.js' "$FIXTURE/missing-families.log"
+
+cat >> "$FIXTURE/script/test.sh" <<'RUNNER'
+bash "$ROOT/script/tests/release.test.sh"
+for suite in "$ROOT"/script/tests/*.test.js; do
+  node --test "$suite"
+done
+for suite in "$ROOT"/Extensions/NativeAgentChrome/tests/*.test.js; do
+  echo "$suite"
+done
+RUNNER
+if "$CHECKER" "$FIXTURE" "$FIXTURE/script/test.sh" >"$FIXTURE/echo-loop.log" 2>&1; then
+  fail "a Chrome loop that only prints paths was accepted as executed coverage"
+fi
+grep -Fq 'orphaned Node suite family: Extensions/NativeAgentChrome/tests/*.test.js' "$FIXTURE/echo-loop.log"
+sed 's/  echo "\$suite"/  node --test "$suite"/' "$FIXTURE/script/test.sh" > "$FIXTURE/script/complete.sh"
+"$CHECKER" "$FIXTURE" "$FIXTURE/script/complete.sh" >/dev/null \
+  || fail "complete shell, bridge, and Chrome wiring was rejected"
+
+"$CHECKER" "$ROOT" "$ROOT/script/test.sh" >/dev/null \
+  || fail "the real canonical runner has orphaned suites"
+echo "PASS: canonical shell, bridge, and Chrome suite wiring rejects comments, omissions, and nonexecuting loops"
