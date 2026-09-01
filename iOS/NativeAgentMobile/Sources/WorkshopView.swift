@@ -253,10 +253,12 @@ final class WorkshopCompletionNotificationTracker {
 
     private var hasBaseline = false
     private var knownCompletedIDs = Set<String>()
-    private let notify: (WorkshopTaskRecord) -> Void
+    private let notify: @MainActor (WorkshopTaskRecord) -> Void
 
-    init(notify: @escaping (WorkshopTaskRecord) -> Void = WorkshopCompletionNotificationTracker.post) {
-        self.notify = notify
+    init(notify: (@MainActor (WorkshopTaskRecord) -> Void)? = nil) {
+        self.notify = notify ?? { task in
+            WorkshopCompletionNotificationTracker.post(task)
+        }
     }
 
     func apply(_ next: [WorkshopTaskRecord]) {

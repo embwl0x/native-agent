@@ -122,16 +122,22 @@ private actor TelegramQueuedTurnOrderCapture {
 
 private actor TelegramSteerGenerationCapture {
     private var firstRelease: CheckedContinuation<Void, Never>?
+    private var firstReleased = false
     private(set) var secondStarted = false
     private(set) var secondCanceled = false
 
     func runFirst() async {
+        // Under parallel test execution the turn task can be scheduled AFTER
+        // the test's releaseFirst() call; a bare continuation then waits on a
+        // resume that already happened, and waitForSecond() spins forever.
+        guard !firstReleased else { return }
         await withCheckedContinuation { continuation in
             firstRelease = continuation
         }
     }
 
     func releaseFirst() {
+        firstReleased = true
         firstRelease?.resume()
         firstRelease = nil
     }
@@ -398,6 +404,36 @@ struct TelegramTurnControlsTests {
         await capture.waitForStarts(3)
         await coordinator.waitUntilAllIdle()
         #expect(await capture.starts == ["first", "second", "third"])
+    }
+
+    @Test func approvalContinuationWaitsForActiveTurnThenRunsBeforeOrdinaryQueue() async {
+        let coordinator = TelegramTurnCoordinator()
+        let capture = TelegramQueuedTurnOrderCapture()
+
+        _ = await coordinator.startTrackedTurn(chatId: 77, text: "active") { _ in
+            await capture.run("active", waitsForRelease: true)
+        }
+        await capture.waitForStarts(1)
+        #expect(await coordinator.enqueueTrackedTurn(
+            updateId: 2,
+            chatId: 77,
+            text: "ordinary queued message",
+            acknowledgementMessageId: 501,
+            operation: { _ in await capture.run("ordinary", waitsForRelease: false) },
+            onStart: { _ in }
+        ) == 1)
+
+        #expect(await coordinator.enqueueApprovalContinuation(
+            chatId: 77,
+            text: "verified approval continuation",
+            operation: { _ in await capture.run("approval", waitsForRelease: false) }
+        ) == 1)
+        #expect(await capture.starts == ["active"])
+
+        await capture.releaseFirst()
+        await capture.waitForStarts(3)
+        await coordinator.waitUntilAllIdle()
+        #expect(await capture.starts == ["active", "approval", "ordinary"])
     }
 
     @Test func callbacksAndStatusStayResponsiveWhileOrdinaryTurnsRemainSerialized() async throws {

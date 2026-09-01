@@ -75,6 +75,45 @@ extension CognitiveSubstrate {
     /// Where a neutral read lands. Deliberately wide — the envelope's job is to
     /// notice the EXTREMES (a one-word ping, an exhausted 4am turn), not to
     /// second-guess ordinary replies.
+    ///
+    /// DO NOT TUNE THIS FOR IN-BAND ADHERENCE. 6acbbdf4 moved it to 350 because
+    /// only 18.6% of 727 live paired rows landed inside the band and a sweep of
+    /// this constant took that to 52.3%. Both numbers are real and the inference
+    /// from them was wrong; this reverts it. Kept as a comment rather than a
+    /// clean revert because the next person to read the 18.6% will otherwise
+    /// make the same move.
+    ///
+    /// WHY ADHERENCE IS NOT AN OBJECTIVE HERE. Widening a band raises adherence
+    /// whether or not the band tracks anything. Shuffling `sizePrior` across the
+    /// 727 rows — destroying every association between an envelope and the reply
+    /// it was computed for — and re-fitting still reaches 91.5% adherence,
+    /// against 93.5% with the true pairing. Two points of the ninety-three come
+    /// from the mechanism. The rest is width.
+    ///
+    /// WHAT THE STAGED QUESTION ACTUALLY GOT ANSWERED. "Enable after the
+    /// distribution is understood" — the distribution is now understood and it
+    /// says the prior barely predicts the quantity it exists to size:
+    /// Spearman(sizePrior, replyCharacters) = 0.230, log-linear R² = 0.089,
+    /// residual sd of log reply 0.753 against an unconditional 0.789 (4.6%
+    /// narrowing). Reply length at a FIXED prior spreads p90/p10 = 4.0…8.4×
+    /// across prior bins, while the disjointness invariant documented at the
+    /// band construction below caps the band's own width at 2.82×. A 2.6×-wide
+    /// window is being sled along a 6×-wide distribution, which is why moving
+    /// this constant can only trade one tail for the other and never fits.
+    ///
+    /// THE ONE CRITERION THAT SURVIVES is the file's own non-negotiable: a
+    /// mis-sized envelope must not truncate real work. That is asymmetric —
+    /// below-band costs nothing (no actuator pads a reply), above-band is the
+    /// failure the risk note names. Measured over the same rows, above-band
+    /// exposure by center: 900 → 18 rows / 9,303 characters; 350 → 145 rows /
+    /// 57,363 characters. The tuned value was eight times worse on the only
+    /// axis that matters, because at 350 the reachable ceiling is 1,243 and the
+    /// 4,000 hard bound below stops binding at all (observed replies reach
+    /// 6,448; p95 = 1,088, p99 = 2,033).
+    ///
+    /// So: 900, on the safety criterion, not the adherence one. Anyone enabling
+    /// the actuator should first move the PREDICTOR — a prior with R² = 0.089
+    /// has no business sizing replies — and not this number.
     static let envelopeNeutralCharacters = 900
 
     /// Compute the envelope from felt state + the size of what the user sent.
@@ -97,6 +136,17 @@ extension CognitiveSubstrate {
         serveCharacters: Int,
         dynamics: PersonalityDynamicsConfiguration
     ) -> DeliveryEnvelope {
+        // MEASURED, 727 live paired rows, 2026-08-31 — against log(replyChars):
+        //   raw log1p(serveCharacters)  R² = 0.1022
+        //   the composed `prior` below  R² = 0.0894
+        //   the `oneBeat` flag alone    R² = 0.0695
+        // Bootstrap (2,000 resamples) on R²(serve) − R²(prior): +0.0126,
+        // 95% CI [−0.0021, +0.0283], serve ahead in 95.5% of resamples. The CI
+        // crosses zero, so the honest claim is NOT that the elaboration hurts —
+        // it is that terms 2 and 3 add nothing measurable over term 1 alone.
+        // Do not read that as license to delete them on this sample; read it as
+        // the reason a future enable has to beat raw serve length first.
+
         // 1. Serve size → 0…1, saturating around a paragraph. `log1p` rather than
         // a linear ramp because the difference between 10 and 60 characters is a
         // different KIND of turn, while 900 vs 1200 is not.

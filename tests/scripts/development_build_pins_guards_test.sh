@@ -126,6 +126,9 @@ case "$1" in
     ;;
   */agent_instrument.swift) ;; # Interpreter calls must not receive SwiftPM options.
   */evals_ledger_merge.swift)
+    if [[ "$2" == validate-overrides ]]; then
+      exit 0
+    fi
     [[ "$2" == changed-plan ]] || exit 70
     shift 2
     while [[ $# -gt 0 ]]; do

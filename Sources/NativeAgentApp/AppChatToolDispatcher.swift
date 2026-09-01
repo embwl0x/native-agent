@@ -545,6 +545,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         var discoveryNames = Self.jsonStringArray(obj["discovery_only_tools"])
         Self.mergeStrings(loadedAppTools, into: &loadedNames)
         Self.mergeStrings(discoveryAppTools, into: &discoveryNames)
+        loadedNames = SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(loadedNames)).sorted()
+        discoveryNames = SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(discoveryNames)).sorted()
         let loadedSet = Set(loadedNames)
 
         if fullDetail {
@@ -619,7 +621,16 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         obj["organism_tools"] = .array(Self.organismToolNames.map { .string($0) })
         obj["currently_loaded"] = .array(loadedNames.sorted().map { .string($0) })
         obj["turn_active_tools"] = .array(modelVisibleTurnScoped.sorted().map { .string($0) })
-        for key in ["mac_app_available_tools", "mac_app_policy_locked_tools"] {
+        // Treat every Core capability summary as model-facing discovery. The
+        // inner dispatcher already filters these, but the app boundary owns
+        // the final cross-surface catalog and must not re-advertise a retired
+        // implementation tool from an older/custom inner client.
+        for key in [
+            "mac_app_available_tools", "mac_app_policy_locked_tools",
+            "mac_accessibility_read_available_tools", "mac_accessibility_read_policy_locked_tools",
+            "mac_nudge_available_tools", "mac_nudge_policy_locked_tools",
+            "mac_accessibility_act_available_tools", "mac_accessibility_act_policy_locked_tools",
+        ] {
             let filtered = SwiftToolDispatcher.modelVisibleCatalogToolNames(
                 Set(Self.jsonStringArray(obj[key]))
             )
@@ -2022,14 +2033,17 @@ private enum AppNotificationToolError: LocalizedError {
 /// `includeEvolutionBridge` (2026-06-11, U4 Wave D): the self-evolution chat
 /// tools (evolution_propose / evolution_status / self_install) reach their
 /// backend only when this is true. FULLY-AUTONOMOUS turns with no human anywhere
-/// in the loop — the reflection/dream/REM background loops, Slack, Telegram,
-/// and iOS — pass `false`, so those clients return a `bridge_not_wired`
+/// in the loop — the reflection/dream/REM background loops, Slack, and iOS —
+/// pass `false`, so those clients return a `bridge_not_wired`
 /// envelope rather than reaching the store/stager. The claude/codex bridge
 /// `/claude/message` path
 /// keeps the default `true` as of the user's 2026-06-13 "open the bridges" call: it
 /// IS Claude/codex collaborating as a team, and self_install there still only
 /// STAGES a local-only confirm card the user resolves (never auto-installs). Genuine
-/// local Mac desktop chat also keeps the default `true`.
+/// local Mac desktop chat also keeps the default `true`. Telegram keeps the
+/// bridge so authenticated Full Mac YOLO turns can use read-only
+/// `evolution_status`; mutation tools still cross the ordinary TrustCenter and
+/// approval floors before this backend can run.
 ///
 /// `denyExternalMcp` (2026-06-13): on human-OUT-of-the-loop bridge clients the
 /// external MCP namespace (`mcp__*` — third-party connectors, including a wired

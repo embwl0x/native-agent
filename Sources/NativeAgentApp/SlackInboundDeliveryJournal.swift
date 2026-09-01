@@ -134,7 +134,12 @@ actor SlackInboundDeliveryJournal {
         let pendingCount: Int
         let unknownCount: Int
         let pendingLimit: Int
+        /// Damaged journals renamed aside (`…json.stale-<ts>`) rather than
+        /// deleted. Non-zero means accepted-but-undelivered rows may have been
+        /// lost from the live journal and are only readable in those files.
+        var quarantinedCount: Int = 0
         var isAtCapacity: Bool { pendingCount >= pendingLimit }
+        var hasQuarantinedEvidence: Bool { quarantinedCount > 0 }
     }
 
     private struct File: Codable {
@@ -168,14 +173,33 @@ actor SlackInboundDeliveryJournal {
     /// fresh socket hello cannot hide a queue requiring human recovery.
     nonisolated static func recoverySummary(dataRoot: URL) throws -> RecoverySummary? {
         let path = path(dataRoot: dataRoot)
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        let file = try loadFile(path: path)
+        let existed = FileManager.default.fileExists(atPath: path.path)
+        // loadFile may quarantine, so count the evidence files afterwards.
+        let file = existed ? try loadFile(path: path) : File()
+        let quarantined = quarantinedEvidencePaths(dataRoot: dataRoot).count
+        guard existed || quarantined > 0 else { return nil }
         return RecoverySummary(
             pendingCount: file.records.filter { $0.phase != .delivered }.count,
             unknownCount: file.records.filter { $0.phase == .outcomeUnknown }.count,
-            pendingLimit: max(1, file.pendingLimit ?? 100)
+            pendingLimit: max(1, file.pendingLimit ?? 100),
+            quarantinedCount: quarantined
         )
     }
+
+    /// Damaged journals this actor renamed aside, newest last. Never deleted:
+    /// they hold accepted message bodies whose delivery is unproven.
+    nonisolated static func quarantinedEvidencePaths(dataRoot: URL) -> [URL] {
+        let journal = path(dataRoot: dataRoot)
+        let directory = journal.deletingLastPathComponent()
+        let prefix = journal.lastPathComponent + quarantineSuffixPrefix
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return entries
+            .filter { $0.hasPrefix(prefix) }
+            .sorted()
+            .map { directory.appendingPathComponent($0) }
+    }
+
+    private static let quarantineSuffixPrefix = ".stale-"
 
     func claim(_ inbound: SlackInboundMessage, now: Date = Date()) throws -> SlackInboundClaimOutcome {
         var file = try load()
@@ -287,10 +311,13 @@ actor SlackInboundDeliveryJournal {
 
     nonisolated private static func loadFile(path: URL) throws -> File {
         guard FileManager.default.fileExists(atPath: path.path) else { return File() }
+        // A read failure (permissions, I/O) says nothing about the CONTENT and
+        // must never quarantine a healthy journal; it stays a hard error.
+        let data = try Data(contentsOf: path)
         do {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            let file = try decoder.decode(File.self, from: Data(contentsOf: path))
+            let file = try decoder.decode(File.self, from: data)
             guard file.version == 1,
                   Set(file.records.map { $0.inbound.eventId }).count == file.records.count,
                   file.records.allSatisfy({
@@ -299,10 +326,40 @@ actor SlackInboundDeliveryJournal {
                             || $0.phase == .outcomeUnknown || $0.prepared != nil)
                   }) else { throw SlackInboundJournalError.malformed }
             return file
-        } catch let error as SlackInboundJournalError {
-            throw error
         } catch {
-            throw SlackInboundJournalError.malformed
+            // Damaged bytes used to be terminal: every later load threw
+            // `.malformed`, so inbound admission AND recovery stayed dead until
+            // a human deleted the file. The bytes are evidence and are kept —
+            // renamed aside, never deleted — but they no longer hold the
+            // connector down. If the rename fails the old refusal stands,
+            // because starting fresh would then overwrite that evidence.
+            guard quarantine(path: path) else {
+                throw SlackInboundJournalError.malformed
+            }
+            return File()
+        }
+    }
+
+    @discardableResult
+    nonisolated private static func quarantine(path: URL) -> Bool {
+        let directory = path.deletingLastPathComponent()
+        let stamp = Int(Date().timeIntervalSince1970)
+        var destination = directory
+            .appendingPathComponent(path.lastPathComponent + "\(quarantineSuffixPrefix)\(stamp)")
+        var attempt = 1
+        while FileManager.default.fileExists(atPath: destination.path), attempt < 100 {
+            destination = directory
+                .appendingPathComponent(path.lastPathComponent + "\(quarantineSuffixPrefix)\(stamp)-\(attempt)")
+            attempt += 1
+        }
+        guard !FileManager.default.fileExists(atPath: destination.path) else { return false }
+        do {
+            try FileManager.default.moveItem(at: path, to: destination)
+            return true
+        } catch {
+            // A concurrent owner may already have moved it aside; that is a
+            // healed journal, not a failure. Anything else keeps the refusal.
+            return !FileManager.default.fileExists(atPath: path.path)
         }
     }
 

@@ -11,6 +11,17 @@ import DreamREMCycle
 // emitter derives from. The legacy file is imported once and renamed to
 // `.migrated` by `importLegacyHarnessFileIfNeeded`.
 
+// NOT REGISTERED IN PRODUCTION since 2026-08-31. The app-side factory
+// (`BackgroundLoopsAssembly.makeREMCycleLoop`) and the `rem_cycle` entries in
+// `assembleAllLoops` / `AppDelegate.bgTaskIdentifiers` were deleted: weekly REM
+// has exactly one owner, the `nativeagent-weekly-rem` TriggerScheduler job (Sun
+// 04:30 America/Chicago → NativeClient.runRem → SwiftNativeDreamREMCycle). This
+// type survives only as the driver its own test suite (REMCycleLoopTests) uses
+// to exercise REMProposalStore's canonical-path / schema / flock contracts,
+// which the live path also depends on. `rem_cycle` is tombstoned in
+// `SwiftNativeLoopScheduler.retiredLoopIds` — re-registering this loop means
+// removing it from that set too, or its due clock restarts from scratch.
+
 /// Weekly REM consolidation loop. Once per ~7d, runs SwiftNativeREMConsolidator
 /// over the last week of dream-diary entries, filters out tombstoned proposals,
 /// triggers GROWTH.md eviction if the doc is near cap, and appends surviving

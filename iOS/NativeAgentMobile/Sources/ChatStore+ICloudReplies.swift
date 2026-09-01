@@ -26,6 +26,10 @@ extension ChatStore {
            incomingSessionID != selectedSessionID {
             return
         }
+        // Any signed Mac event carrying the new session id proves the locally
+        // created identity has crossed the bridge and is safe to reconcile
+        // against published snapshots from here forward.
+        acknowledgePublishedSession(msg.sessionID)
         if msg.metadata?["kind"] == "progress" {
             receiveICloudProgress(msg)
             return
@@ -481,53 +485,32 @@ extension ChatStore {
     /// active-send polling — not for user-driven or scenePhase refreshes.
     /// Updates `lastRefreshAt` so throttled callers are debounced afterwards.
     func forceRefresh(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) async {
+        await forceRefresh(
+            loadHistory: { await client.refreshChatHistory(sessionID: $0) },
+            fallbackMessages: fallbackMessages
+        )
+    }
+
+    func forceRefresh(
+        loadHistory: (String?) async -> [ChatMessage]?,
+        fallbackMessages: [ChatMessage]?
+    ) async {
         lastRefreshAt = Date()
-        guard let macMessages = await client.refreshChatHistory(sessionID: selectedSessionID) else {
+        let sessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
+        let generation = sessionSwitchGeneration
+        let macMessages = await loadHistory(sessionID)
+        guard !Task.isCancelled,
+              generation == sessionSwitchGeneration,
+              sessionID == Self.cleanSessionID(selectedSessionID ?? mainSessionID) else { return }
+        guard let macMessages else {
             if messages.isEmpty, let fallbackMessages, !fallbackMessages.isEmpty {
                 messages = fallbackMessages
             }
             return
         }
-        guard !macMessages.isEmpty else { return }
-
-        let replyArrived = macAssistantReplyArrived(macMessages)
-        if replyArrived, resolvePendingReplyFromMac(macMessages) {
-            return
-        }
-
-        // Capture the pending placeholder's tool events before the merge swaps
-        // it for the Mac-id reply, so the collapsed box survives the swap.
-        let carriedEvents: [ToolEvent] = pendingICloudPlaceholders.values.first
-            .flatMap { id in messages.first(where: { $0.id == id })?.toolEvents } ?? []
-        let merged = mergedMacMessagesPreservingPending(macMessages, replyArrived: replyArrived)
-        let hasPendingReply = replyArrived && !pendingICloudPlaceholders.isEmpty
-        guard merged.map(\.id) != messages.map(\.id) || hasPendingReply else { return }
-
-        if merged.map(\.id) != messages.map(\.id) {
-            messages = merged
-            persistMessages()
-        }
-
-        if replyArrived, let pendingId = pendingICloudPlaceholders.keys.first {
-            // The iCloud snapshot found a reply the file listener missed.
-            // Resolve the placeholder; the merge above already kept local pending sends.
-            let placeholderId = pendingICloudPlaceholders[pendingId]
-            markICloudReplyResolved(pendingId)
-            pendingICloudPlaceholders.removeValue(forKey: pendingId)
-            cancelReplyWaits(for: pendingId)
-            if let placeholderId {
-                streamingHintsByMessageId.removeValue(forKey: placeholderId)
-            }
-            isPollingFallback = false
-            if pendingICloudPlaceholders.isEmpty {
-                isLoading = false
-            }
-            // Speak the reply if TTS is wired up.
-            if let lastAssistant = newestMacAssistantReply(macMessages) {
-                stampToolEvents(carriedEvents, onMessageWithId: lastAssistant.id)
-                onReply?(lastAssistant.text)
-            }
-        }
+        // Push, foreground refresh, and missed-reply recovery share one merge
+        // owner, including same-ID text updates and timed-out reply recovery.
+        applyMacTranscriptSnapshot(macMessages, sessionID: sessionID)
     }
 
     private func fireTimeout(pendingId: String, placeholderId: UUID) {

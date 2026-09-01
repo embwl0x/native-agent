@@ -1,4 +1,5 @@
 import Foundation
+import NotificationInbox
 import PersistenceCore
 import TriggerScheduler
 
@@ -70,28 +71,23 @@ enum TriggerNotifierBinding {
         }
         let normalizedObj = cardObj
         let normalized: JSONValue = .object(normalizedObj)
-        let persistence = SwiftNativePersistenceCore()
         do {
-            // 2026-07-21 audit (MED): route through the shared capped append —
-            // notifications/inbox.jsonl is the LIVE inbox the UI and iOS read.
-            // A5.2 (2026-07-24): dedup-check + append run under ONE file lock
-            // (appendJSONLCapped with takeLock:false inside our lock) so two
-            // concurrent fires can't both pass the check and double-card.
-            return try await persistence.withFileLock(inboxPath) { () async throws -> MirrorOutcome in
-                if let existingId = ProactiveInboxStore.activeDuplicateId(
-                    for: normalizedObj,
-                    notificationsInboxPath: inboxPath
-                ) {
-                    return .duplicate(existingId: existingId)
+            // A5.2 (2026-07-24): dedup-check + append run under ONE file lock so
+            // two concurrent fires can't both pass the check and double-card.
+            // 2026-08-31: that lock is now taken by the feed's owner rather than
+            // by hand around a raw capped append — the shared cap trims by
+            // keeping a suffix and hard-deletes the oldest cards once the file
+            // crosses its budget, while `LiveNotificationInbox` shelves what it
+            // evicts to `notifications/inbox_archive.jsonl` first.
+            let existingId = try await LiveNotificationInbox(path: inboxPath)
+                .appendUnlessDuplicate(normalized) {
+                    ProactiveInboxStore.activeDuplicateId(
+                        for: normalizedObj,
+                        notificationsInboxPath: inboxPath
+                    )
                 }
-                try await appendJSONLCapped(
-                    normalized, to: inboxPath, using: persistence,
-                    maxLines: JSONLLineCaps.notificationInbox,
-                    logLabel: "TriggerNotifierBinding.inbox",
-                    takeLock: false
-                )
-                return .appended
-            }
+            if let existingId { return .duplicate(existingId: existingId) }
+            return .appended
         } catch {
             NSLog("trigger_mirror: REAL-inbox card write FAILED for %@: %@",
                   triggerName, String(describing: error))

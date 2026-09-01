@@ -64,6 +64,22 @@ func iCloudReplacementIntentFailsClosedWithoutBothSignedFields() {
     ]) == nil)
 }
 
+@Test
+func terminalICloudTurnIsConsumedWhenReplyPublicationFails() {
+    #expect(ICloudIncomingTurnConsumptionPolicy.shouldConsume(
+        turnReachedTerminalState: true,
+        replyPublished: false
+    ))
+    #expect(!ICloudIncomingTurnConsumptionPolicy.shouldConsume(
+        turnReachedTerminalState: false,
+        replyPublished: false
+    ))
+    #expect(ICloudIncomingTurnConsumptionPolicy.shouldConsume(
+        turnReachedTerminalState: false,
+        replyPublished: true
+    ))
+}
+
 @MainActor
 @Test
 func startupSendRejectionPreservesDraftAndAttachments() async {

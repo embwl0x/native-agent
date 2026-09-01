@@ -104,7 +104,9 @@ final class ApprovalsStore: ObservableObject {
     @Published var isLoading = false
     @Published var bannerError: String? = nil
     @Published var bannerWarning: String? = nil
-    @Published var decidingApprovalID: String? = nil
+    /// Distinct approval decisions may be sent together. The former single id
+    /// made every other card look tappable while silently discarding its tap.
+    @Published private(set) var decidingApprovalIDs = Set<String>()
     var isVisible = false
     private var hasLoadedApprovals = false
     private var notifiedPendingIDs = Set<String>()
@@ -152,14 +154,12 @@ final class ApprovalsStore: ObservableObject {
     // MARK: - Decide
 
     func decide(id: String, decision: String, client: MacBridgeClient, pairingStore: PairingStore) async {
-        if decidingApprovalID != nil { return }
-        decidingApprovalID = id
-        defer { decidingApprovalID = nil }
+        guard beginDecision(id: id) else { return }
+        defer { finishDecision(id: id) }
         guard pairingStore.usesICloudTransport else {
             bannerError = "Pair to view"
             return
         }
-        let previousApprovals = approvals
         do {
             guard let route = ApprovalDecisionRoute.resolve(decision) else {
                 bannerError = "Unsupported approval decision."
@@ -181,12 +181,28 @@ final class ApprovalsStore: ObservableObject {
                 bannerError = nil
             } else {
                 locallyFinalizedApprovals.removeValue(forKey: id)
-                withAnimation(AppMotion.snappy) { approvals = previousApprovals }
-                iCloudSyncEngine.shared.approvals = previousApprovals
+                // Rebuild from transport truth while preserving any other
+                // concurrently submitted local decisions. Restoring the whole
+                // pre-call array would resurrect sibling cards that succeeded.
+                let merged = mergeLocalFinalDecisions(iCloudSyncEngine.shared.approvals)
+                withAnimation(AppMotion.snappy) { approvals = merged }
+                iCloudSyncEngine.shared.approvals = merged
                 bannerWarning = nil
                 bannerError = "Failed to record decision: \(error.localizedDescription)"
             }
         }
+    }
+
+    @discardableResult
+    func beginDecision(id: String) -> Bool {
+        let clean = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, !decidingApprovalIDs.contains(clean) else { return false }
+        decidingApprovalIDs.insert(clean)
+        return true
+    }
+
+    func finishDecision(id: String) {
+        decidingApprovalIDs.remove(id.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// Hold a confirmed local final decision until the Mac snapshot reflects
@@ -380,7 +396,7 @@ struct ApprovalsView: View {
                         ForEach(pending) { approval in
                             ApprovalCard(
                                 approval: approval,
-                                isDeciding: store.decidingApprovalID == approval.id
+                                isDeciding: store.decidingApprovalIDs.contains(approval.id)
                             ) { decision in
                                 Task {
                                     await store.decide(

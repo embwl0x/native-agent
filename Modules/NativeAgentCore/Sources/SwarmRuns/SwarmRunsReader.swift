@@ -80,10 +80,18 @@ public struct SwiftNativeSwarmRunsReader: SwarmRunsReader {
     /// Exact, read-only inspection of retained evidence. Unlike the historical
     /// list API, corruption must not masquerade as an empty or missing result.
     public func inspectSwarm(runID: String, reportID: String? = nil, offset: Int = 0, limit: Int = 2_000) -> JSONValue {
+        // Rows the strict shape check rejected. Counted, never silently dropped:
+        // a skipped row is unreadable evidence, and the caller must see that a
+        // run's absence here might be corruption rather than "never ran".
+        var skippedMalformedRows = 0
         func envelope(_ status: String, _ reason: String) -> JSONValue {
-            .object(["status": .string(status), "reason": .string(reason), "run_id": .string(runID),
-                     "store": .string("swarms/runs.json"),
-                     "note": .string("Read-only retained receipts. Missing evidence does not prove work never ran; receipts may be disabled, not yet settled, or no longer retained.")])
+            var object: [String: JSONValue] = [
+                "status": .string(status), "reason": .string(reason), "run_id": .string(runID),
+                "store": .string("swarms/runs.json"),
+                "note": .string("Read-only retained receipts. Missing evidence does not prove work never ran; receipts may be disabled, not yet settled, or no longer retained."),
+            ]
+            if skippedMalformedRows > 0 { object["skipped_malformed_rows"] = .int(Int64(skippedMalformedRows)) }
+            return .object(object)
         }
         let cap = 64 * 1_024 * 1_024
         let data: Data
@@ -112,13 +120,29 @@ public struct SwiftNativeSwarmRunsReader: SwarmRunsReader {
             return envelope("unavailable", "receipt_store_malformed")
         }
         var matching: [(receipt: [String: JSONValue], reports: [RetainedSwarmReport])] = []
+        var validRows = 0
         for row in rows {
             guard case .object(let object) = row, case .string(let id)? = object["id"], !id.isEmpty,
                   case .string(_)? = object["status"],
                   let validated = Self.retainedReports(object) else {
-                return envelope("unavailable", "receipt_store_malformed")
+                // The Python daemon also writes this store, so a single legacy- or
+                // partially-shaped row must not black out inspection of every other
+                // run. Skip it per row instead of failing the whole store — but the
+                // REQUESTED run's own corrupt row still fails loud, since reporting
+                // it as not-retained would misread corruption as absence.
+                if case .object(let object) = row, case .string(let id)? = object["id"], id == runID {
+                    return envelope("unavailable", "receipt_store_malformed")
+                }
+                skippedMalformedRows += 1
+                continue
             }
+            validRows += 1
             if id == runID { matching.append((object, validated)) }
+        }
+        // Nothing in the store survived the shape check: that is a malformed store,
+        // not an empty one. (A genuinely empty array skips no rows and reads clean.)
+        guard validRows > 0 || skippedMalformedRows == 0 else {
+            return envelope("unavailable", "receipt_store_malformed")
         }
         guard matching.count <= 1 else { return envelope("unavailable", "receipt_id_ambiguous") }
         guard let selected = matching.first else { return envelope("not_found", "receipt_not_retained") }
@@ -133,6 +157,7 @@ public struct SwiftNativeSwarmRunsReader: SwarmRunsReader {
             "worker_count": .int(Int64(reports.filter { $0.kind == "worker" }.count)), "reports": .array(reports.map(\.metadata)),
             "note": .string("These are retained worker/synthesis reports, not verified effects. Original text discarded by output or digest caps is not recoverable here. Select a report_id and follow next_offset to inspect retained text; this read never reruns work."),
         ]
+        if skippedMalformedRows > 0 { result["skipped_malformed_rows"] = .int(Int64(skippedMalformedRows)) }
         for key in ["createdAt", "completedAt"] {
             if case .string(let value)? = receipt[key] { result[key] = .string(String(value.prefix(80))) }
         }

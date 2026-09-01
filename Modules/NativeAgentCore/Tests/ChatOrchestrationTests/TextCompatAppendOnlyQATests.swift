@@ -308,6 +308,7 @@ private func runCompatScenario(
     suppressUserAppend: Bool = false,
     wedgeToolTranscriptDirectory: Bool = false,
     turnTraceBus: TurnTraceBus = .shared,
+    turnWallClockSeconds: TimeInterval? = nil,
     onProviderCall: @escaping @Sendable () -> Void = {}
 ) async throws -> CompatObservation {
     let root = try makeTempRoot(tag)
@@ -341,7 +342,8 @@ private func runCompatScenario(
         history: SessionHistoryReader(dataRoot: root),
         dataRoot: root,
         turnTraceBus: turnTraceBus,
-        trust: SwiftNativeTrustCenter(dataRoot: root)
+        trust: SwiftNativeTrustCenter(dataRoot: root),
+        turnWallClockSeconds: turnWallClockSeconds
     )
     let sessionId = "s-\(tag)"
 
@@ -399,7 +401,15 @@ func textCompatWholeTurnBudget_usesExistingExhaustionTerminalWithoutSleeping() a
         try await runCompatScenario(
             tag: "whole-turn-budget",
             scripts: [[marker], ["must not start"]],
-            tools: MockToolDispatchClient(scripted: ["read_file": .string("probe")]),
+            // FAILED dispatch (2026-08-31): the budget is progress-aware now,
+            // so a round that lands a real result re-earns its window. This
+            // test is the STUCK case — an error envelope extends nothing, and
+            // the ceiling applies exactly as before.
+            tools: MockToolDispatchClient(
+                scripted: ["read_file": .object([
+                    "status": .string("failed"), "error": .string("nope"),
+                ])]
+            ),
             grownPromptCompat: false,
             // 601 > the 600s interactive ceiling (was 181 vs the old 180s;
             // 57c5703a raised the ceiling without touching this advance, so
@@ -421,6 +431,61 @@ func textCompatWholeTurnBudget_usesExistingExhaustionTerminalWithoutSleeping() a
             wallClockElapsedSeconds: 601
         )
     )
+}
+
+/// The bridge profile raises turnWallClockSeconds to 3900 for marathon turns.
+/// The structured loops honour that override; this lane silently dropped it and
+/// cut Anthropic-model bridge turns at chat's 600s default. Same clock, same
+/// 601s advance as the test above — with the override the second round runs.
+@Test
+func textCompatWholeTurnBudget_honoursTheClientTurnWallClockOverride() async throws {
+    let clock = TextCompatManualMonotonicClock()
+    let marker = #"<tool_use id="budget-2" name="read_file">{"path":"probe.txt"}</tool_use>"#
+    let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
+
+    let observation = try await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
+        try await runCompatScenario(
+            tag: "whole-turn-budget-override",
+            scripts: [[marker], ["finished on the second round"]],
+            tools: MockToolDispatchClient(scripted: ["read_file": .string("probe")]),
+            grownPromptCompat: false,
+            turnWallClockSeconds: 3_900,
+            onProviderCall: { clock.advance(seconds: 601) }
+        )
+    }
+
+    #expect(observation.errors.isEmpty)
+    #expect(observation.llm.messagesCalls.count == 2)
+    #expect(observation.finalProviderCallCount == 2)
+    #expect(observation.toolUses == ["read_file"])
+    #expect(observation.finalReply == "finished on the second round")
+}
+
+/// Progress extension on the text-compat lane (2026-08-31), same rule as both
+/// structured loops: each round that lands a real tool result re-grants the
+/// surface window. Three rounds at 400s = 1200s of turn on a 600s budget —
+/// without the extension the third round could never start.
+@Test
+func textCompatWholeTurnBudget_productiveRoundsExtendTheDeadline() async throws {
+    let clock = TextCompatManualMonotonicClock()
+    let marker = #"<tool_use id="budget-3" name="read_file">{"path":"probe.txt"}</tool_use>"#
+    let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
+
+    let observation = try await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
+        try await runCompatScenario(
+            tag: "whole-turn-budget-progress",
+            scripts: [[marker], [marker], ["finished on the third round"]],
+            tools: MockToolDispatchClient(scripted: ["read_file": .string("probe")]),
+            grownPromptCompat: false,
+            onProviderCall: { clock.advance(seconds: 400) }
+        )
+    }
+
+    #expect(observation.errors.isEmpty)
+    #expect(observation.llm.messagesCalls.count == 3)
+    #expect(observation.finalProviderCallCount == 3)
+    #expect(observation.toolUses == ["read_file", "read_file"])
+    #expect(observation.finalReply == "finished on the third round")
 }
 
 @Test

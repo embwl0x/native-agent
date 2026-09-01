@@ -38,7 +38,8 @@ extension SwiftToolDispatcher {
     func impl_mcp_tool(
         serverId: String,
         toolName: String,
-        input: [String: JSONValue]
+        input: [String: JSONValue],
+        surface: String
     ) async throws -> JSONValue {
         let dispatcher = SwiftNativeMCPDispatcher(root: dataRoot)
         let servers = try await dispatcher.listServers()
@@ -58,17 +59,21 @@ extension SwiftToolDispatcher {
                 && MCPToolBridge.consent($0, matchesCurrentEffectiveRisk: effectiveRisk)
         }
         if !hasConsent {
-            if MCPToolBridge.riskRequiresApproval(effectiveRisk) {
+            let bridgedTool = "mcp__\(serverId)__\(toolName)"
+            let yoloAdmitted = await fullMacYoloAdmitted(tool: bridgedTool, surface: surface)
+            if MCPToolBridge.riskRequiresApproval(effectiveRisk), !yoloAdmitted {
                 throw AutonomyGateError.toolDenied(
                     reason: "MCP tool '\(serverId)/\(toolName)' requires approval before Swift execution (risk=\(effectiveRisk))"
                 )
             }
-            _ = try await dispatcher.grantConsent(MCPConsentGrant(
-                serverId: serverId,
-                toolName: toolName,
-                risk: effectiveRisk,
-                argumentSummary: "Auto-granted low-risk Swift chat MCP call."
-            ))
+            if !MCPToolBridge.riskRequiresApproval(effectiveRisk) {
+                _ = try await dispatcher.grantConsent(MCPConsentGrant(
+                    serverId: serverId,
+                    toolName: toolName,
+                    risk: effectiveRisk,
+                    argumentSummary: "Auto-granted low-risk Swift chat MCP call."
+                ))
+            }
         }
         // Strip the chat-surface session marker before forwarding: it's
         // injected into EVERY tool input for the lazy-load gate, and remote
@@ -80,6 +85,27 @@ extension SwiftToolDispatcher {
             toolName: toolName,
             arguments: .object(forwarded)
         )
+    }
+
+    func fullMacYoloAdmitted(tool: String, surface: String) async -> Bool {
+        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let remoteSurfaces: Set<String> = [
+            "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile", "watch", "remote",
+        ]
+        let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
+            tool: tool,
+            origin: SecurityOriginContext(
+                surface: surface,
+                sessionId: ChatToolSessionContext.verifiedSessionId,
+                userId: ChatToolSessionContext.verifiedUserId,
+                chatId: ChatToolSessionContext.verifiedChatId,
+                deviceId: nil,
+                source: "swift_tool_dispatcher",
+                isRemote: remoteSurfaces.contains(normalized),
+                commandSignatureVerified: ChatToolSessionContext.commandSignatureVerified
+            )
+        )
+        return authority.admitted
     }
 
 }

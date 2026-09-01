@@ -80,7 +80,8 @@ func macAXReadTools_areVisibleToTheModel_whenAccessibilityCategoryOn() async thr
 
     let tools = SwiftToolDispatcher(dataRoot: root)
 
-    // 1. name catalog (what tool_catalog / listAvailableTools advertises)
+    // 1. The eager diagnostic name inventory retains every implementation
+    // organ. Conversational discovery is checked separately below.
     let names = try await tools.listAvailableTools()
     for tool in axToolNames {
         #expect(names.contains(tool), "\(tool) must appear in listAvailableTools() under Full Mac + accessibility")
@@ -93,21 +94,49 @@ func macAXReadTools_areVisibleToTheModel_whenAccessibilityCategoryOn() async thr
         #expect(schemaNames.contains(tool), "\(tool) must have a model-visible schema under Full Mac + accessibility")
     }
 
-    // 3. tool_catalog discovery block names them as READS, not app control.
+    // 3. tool_catalog is the conversational discovery surface. The direct
+    // diagnostic organs remain in the eager schema/name inventory above, but
+    // only their four-verb replacements may be advertised to tool_load.
     let catalog = try await tools.dispatch(tool: "tool_catalog", input: [:], surface: "chat")
     guard case .object(let catalogObj) = catalog,
           case .array(let axAvailable)? = catalogObj["mac_accessibility_read_available_tools"] else {
         Issue.record("expected mac_accessibility_read_available_tools array in tool_catalog")
         return
     }
-    for tool in axToolNames {
-        #expect(axAvailable.contains(.string(tool)), "tool_catalog must list \(tool) as an available accessibility READ tool")
+    let modelVisibleReads = SwiftToolDispatcher.modelVisibleCatalogToolNames(Set(axToolNames))
+    #expect(Set(axAvailable.compactMap {
+        if case .string(let name) = $0 { return name }
+        return nil
+    }) == modelVisibleReads)
+    for tool in SwiftToolDispatcher.legacyMacModelToolNames {
+        #expect(!axAvailable.contains(.string(tool)), "tool_catalog must not advertise retired model tool \(tool)")
     }
     if case .array(let appTools)? = catalogObj["mac_app_available_tools"] {
         for tool in axToolNames {
             #expect(!appTools.contains(.string(tool)), "\(tool) is perception, not app control — it must not be listed under mac_app_available_tools")
         }
     }
+
+    guard case .array(let advertised)? = catalogObj["available_tools"] else {
+        Issue.record("expected available_tools array in tool_catalog")
+        return
+    }
+    let advertisedNames = Set(advertised.compactMap {
+        if case .string(let name) = $0 { return name }
+        return nil
+    })
+    #expect(modelVisibleReads.isSubset(of: advertisedNames))
+
+    let load = try await tools.impl_tool_load(input: [
+        "session_id": .string(UUID().uuidString),
+        "names": .array(modelVisibleReads.sorted().map(JSONValue.string)),
+    ])
+    guard case .object(let loadObject) = load else {
+        Issue.record("expected tool_load object")
+        return
+    }
+    #expect(loadObject["not_in_catalog"] == .array([]))
+    #expect(loadObject["loaded"] == .array(modelVisibleReads.sorted().map(JSONValue.string)))
 }
 
 @Test

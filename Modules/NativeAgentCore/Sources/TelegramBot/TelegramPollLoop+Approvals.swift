@@ -223,10 +223,7 @@ extension TelegramPollLoop {
             try? await sendMessage(token, chatId, acknowledgement)
             return
         }
-        guard await turnCoordinator.startTrackedTurn(
-            chatId: chatId,
-            text: prompt,
-            operation: { turnId in
+        let operation: @Sendable (UUID) async -> Void = { turnId in
                 let card = makeTurnProgressCard(
                     chatId: chatId,
                     turnId: turnId,
@@ -294,13 +291,16 @@ extension TelegramPollLoop {
                     }
                 }
             }
-        ) != nil else {
-            try? await sendMessage(
-                token,
-                chatId,
-                "\(acknowledgement) A different turn is running; the verified result is saved for the next turn."
+        if await turnCoordinator.startTrackedTurn(
+            chatId: chatId,
+            text: prompt,
+            operation: operation
+        ) == nil {
+            await turnCoordinator.enqueueApprovalContinuation(
+                chatId: chatId,
+                text: prompt,
+                operation: operation
             )
-            return
         }
     }
 }

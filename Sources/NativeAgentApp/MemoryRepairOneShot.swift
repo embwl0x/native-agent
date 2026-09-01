@@ -22,6 +22,7 @@
 
 import Foundation
 import ApprovalInbox
+import TrustCenter
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
@@ -153,6 +154,49 @@ enum MemoryRepairOneShot {
         title: String, reason: String, payload: JSONValue,
         cardSummary: String, cardDetail: String, relatedPath: String
     ) async -> String? {
+        let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+            .fullMacYoloAuthority(
+                tool: action,
+                origin: SecurityOriginContext(
+                    surface: "desk",
+                    source: "memory_repair_one_shot",
+                    isRemote: false
+                )
+            )
+        if yolo.admitted {
+            let timestamp = ISO8601DateFormatter().string(from: Date())
+            let admitted = ApprovalRecord(
+                id: "full-mac-yolo-\(UUID().uuidString.lowercased())",
+                title: title,
+                action: action,
+                risk: "medium",
+                reason: "Admitted by active Full Mac authority",
+                status: "resolved",
+                payload: payload,
+                payloadPreview: "",
+                createdAt: timestamp,
+                resolvedAt: timestamp,
+                decision: "approved",
+                decidedBy: "full_mac_yolo",
+                remoteResolvable: false,
+                localOnly: true
+            )
+            await NativeClient.applyResolvedMemoryRepair(from: admitted, dataRoot: dataRoot)
+            writeFullMacOutcome(
+                kind: kind, status: "admitted",
+                detail: "Executed through the canonical memory repair executor without an approval prompt.",
+                dataRoot: dataRoot
+            )
+            return nil
+        }
+        if yolo.state == .explicitlyBlocked {
+            writeFullMacOutcome(
+                kind: kind, status: "refused",
+                detail: "memory.repair is explicitly blocked; no approval was staged.",
+                dataRoot: dataRoot
+            )
+            return nil
+        }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         // Crash-retry dedupe: a prior launch may have created the approval
         // but died before the stamp write. Reuse the pending record. Fails
@@ -196,6 +240,30 @@ enum MemoryRepairOneShot {
         } catch {
             NSLog("[memoryRepair] stage failed for \(kind): \(String(describing: error))")
             return nil
+        }
+    }
+
+    private static func writeFullMacOutcome(
+        kind: String,
+        status: String,
+        detail: String,
+        dataRoot: URL
+    ) {
+        let path = dataRoot
+            .appendingPathComponent("memory/repairs", isDirectory: true)
+            .appendingPathComponent("\(kind).full_mac_outcome.json")
+        try? FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let value: JSONValue = .object([
+            "kind": .string(kind),
+            "status": .string(status),
+            "detail": .string(detail),
+            "at": .string(ISO8601DateFormatter().string(from: Date())),
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(value) {
+            try? data.write(to: path, options: .atomic)
         }
     }
 

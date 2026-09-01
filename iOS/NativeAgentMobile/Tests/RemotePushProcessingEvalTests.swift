@@ -70,9 +70,35 @@ final class RemotePushProcessingEvalTests: XCTestCase {
         }
     }
 
+    func test_visibleChatReplyPushDrainsReplyTransportAndReportsDeliveredData() async {
+        let result = await process(
+            payload: [
+                "source": "icloud_chat_reply",
+                "screen": "chat",
+                "correlationId": "reply-1",
+            ],
+            cloudKitDelivered: false,
+            chatReplyLoaded: true,
+            inboxLoaded: false
+        )
+
+        XCTAssertEqual(result.outcome, .newData)
+        XCTAssertEqual(result.steps, ["record", "drain", "chat", "inbox", "activity"])
+
+        let unrelated = await process(
+            payload: ["source": "other", "screen": "chat"],
+            cloudKitDelivered: false,
+            chatReplyLoaded: true,
+            inboxLoaded: false
+        )
+        XCTAssertEqual(unrelated.outcome, .noData)
+        XCTAssertFalse(unrelated.steps.contains("chat"))
+    }
+
     private func process(
         payload: [String: String],
         cloudKitDelivered: Bool,
+        chatReplyLoaded: Bool = false,
         inboxLoaded: Bool
     ) async -> ProcessResult {
         var steps: [String] = []
@@ -105,6 +131,10 @@ final class RemotePushProcessingEvalTests: XCTestCase {
                 steps.append("drain")
                 drainedKinds.append(info["kind"] as? String ?? "")
                 return cloudKitDelivered
+            },
+            refreshChatReply: {
+                steps.append("chat")
+                return chatReplyLoaded
             },
             refreshInbox: {
                 steps.append("inbox")

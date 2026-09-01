@@ -4,6 +4,13 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.4.5 — cross-surface repair and Full Mac continuity (2026-09-01)
+
+Repairs iPhone chat/session continuity, approval handling, tool and memory
+schema compatibility, and Full Mac YOLO authority across every surface. The
+developer installer now preserves macOS Accessibility/TCC attribution through
+bundle replacement. Full notes: `docs/release-notes/0.4.5.md`.
+
 ## 0.4.4 — integrated computer use, recall, and delegation (2026-08-30)
 
 Natural visual navigation and coordinated input, bounded relevant recall,

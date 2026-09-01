@@ -18,6 +18,8 @@ let typeDispatchCount = 0;
 let nextTypeResult = null;
 let nextFillOrSelectError = null;
 let fillOrSelectDispatchCount = 0;
+const rejectedMutationReplies = new Set();
+const mutationDispatchCounts = new Map();
 const invalidatedLeases = [];
 let nextSnapshotNodes = null;
 let lastClickedLocalNode = null;
@@ -108,6 +110,10 @@ globalThis.chrome = {
           frame: { name: options.frameId === 0 ? "Fixture" : "Child", url: webFrames.find((frame) => frame.frameId === (options.frameId ?? 0))?.url },
           nodes,
         } };
+      }
+      if (["nativeagent.page.click", "nativeagent.page.scroll"].includes(message.type)) {
+        mutationDispatchCounts.set(message.type, (mutationDispatchCounts.get(message.type) ?? 0) + 1);
+        if (rejectedMutationReplies.delete(message.type)) throw new Error("frame navigated after dispatch");
       }
       if (message.type === "nativeagent.page.click") {
         lastClickedLocalNode = message.nodeId;
@@ -474,6 +480,32 @@ test("lost type reply returns one outcome_unknown receipt and never retries", as
   assert.equal(typed.result.receipt.verification, "outcome_unknown");
   assert.equal(typed.result.receipt.retry, "never_automatic");
   assert.equal(typeDispatchCount, before + 1);
+});
+
+test("lost click and scroll replies return one outcome_unknown receipt without retrying", async () => {
+  for (const [action, messageType, fields] of [
+    ["page.element.click", "nativeagent.page.click", { nodeId: "n1" }],
+    ["page.scroll", "nativeagent.page.scroll", { deltaX: 0, deltaY: 240 }],
+  ]) {
+    const suffix = action.replaceAll(".", "-");
+    const acquire = await sendRequest(`acquire-${suffix}-unknown`, "lease.acquire", { mode: "create" });
+    const snapshot = await sendRequest(`snapshot-${suffix}-unknown`, "page.snapshot.read", {
+      leaseId: acquire.result.leaseId,
+    });
+    const before = mutationDispatchCounts.get(messageType) ?? 0;
+    rejectedMutationReplies.add(messageType);
+    const response = await sendRequest(`${suffix}-unknown`, action, {
+      leaseId: acquire.result.leaseId,
+      expectedUserSequence: 0,
+      snapshotId: snapshot.result.snapshotId,
+      ...fields,
+    });
+    assert.equal(response.ok, true);
+    assert.equal(response.result.outcome, "outcome_unknown");
+    assert.equal(response.result.receipt.verification, "outcome_unknown");
+    assert.equal(response.result.receipt.retry, "never_automatic");
+    assert.equal(mutationDispatchCounts.get(messageType), before + 1);
+  }
 });
 
 test("partial type progress stays partial and lease release reaches in-flight page actions", async () => {

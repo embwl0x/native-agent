@@ -172,6 +172,28 @@ private actor ApprovalHandlerCapture: TelegramApprovalHandling {
     func snapshot() -> [Call] { calls }
 }
 
+private actor ApprovalContinuationTurnGate {
+    private var started = false
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func run() async {
+        started = true
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        while !started { await Task.yield() }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private actor TelegramModelRoutingCapture: ProviderRoutingRef {
     private let menu: TelegramModelMenu
     private var savedSelections: [(surface: String, provider: String?, model: String)] = []
@@ -680,6 +702,84 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(object["offset"] == .int(702))
     }
 
+    @Test func telegramPollLoop_settlesRehydratedQueuedClaimThatNeverReEnqueues() async throws {
+        // A `.queued` claim rehydrated after restart skips pending→processing.
+        // If its handling exits without re-enqueueing (here: the chat is no
+        // longer allowlisted), the tail settlement must still retire it —
+        // otherwise the claim stays queued, every later tick sees recovered
+        // work, skips getUpdates entirely, and replays the same failure.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_durable_queued_wedge_\(UUID().uuidString)", isDirectory: true)
+        let offset = root.appendingPathComponent("telegram", isDirectory: true)
+            .appendingPathComponent("last_offset.json")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let update = TelegramUpdate(
+            updateId: 705,
+            message: TelegramMessage(
+                messageId: 12,
+                chatId: 88,
+                chatType: "private",
+                fromUserId: 11,
+                text: "wedged queue",
+                date: 1
+            )
+        )
+        let inbox = TelegramUpdateInbox(offsetURL: offset)
+        _ = try await inbox.ensurePending(update)
+        _ = try await inbox.transition(updateId: 705, from: [.pending], to: .processing)
+        _ = try await inbox.transition(updateId: 705, from: [.processing], to: .queued)
+        try await SwiftNativePersistenceCore().writeJSON(
+            .object(["offset": .int(706)]),
+            to: offset
+        )
+
+        nonisolated(unsafe) var pollCount = 0
+        let session = mockSession { request in
+            pollCount += 1
+            return (makeResponse(request.url!, 200), Data(#"{"ok":true,"result":[]}"#.utf8))
+        }
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            // 88 is NOT allowlisted: the rehydrated turn drops instead of
+            // re-enqueueing.
+            allowedChatIds: [77],
+            bot: SwiftNativeTelegramBot(dataRoot: root),
+            session: session,
+            dataRoot: root,
+            offsetURL: offset,
+            sendMessage: { _, _, _ in },
+            sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
+            chatHandler: { _, _ in "unreachable" },
+            typingRefreshNanoseconds: 0,
+            // Fresh coordinator = post-restart: nothing mirrors the durable
+            // queued claim in memory.
+            turnCoordinator: TelegramTurnCoordinator()
+        )
+
+        let recovery = await loop.tickOutcome()
+        guard case .completed = recovery else {
+            Issue.record("expected the rehydrated queued claim to settle, got \(recovery)")
+            return
+        }
+        #expect(try await inbox.snapshots().first?.phase == .completed)
+        // Recovery tick uses the durable inbox as its transport, not the network.
+        #expect(pollCount == 0)
+
+        let next = await loop.tickOutcome()
+        guard case .completed = next else {
+            Issue.record("expected the next tick to complete, got \(next)")
+            return
+        }
+        // The wedge: without settlement this stayed 0 forever.
+        #expect(pollCount == 1)
+    }
+
     @Test func telegramUpdateInbox_preservesMalformedClaimAndFailsClosed() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("telegram_durable_corrupt_\(UUID().uuidString)", isDirectory: true)
@@ -1073,6 +1173,70 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(chatCalls.first?.2 == true)
         #expect(chatCalls.first?.3 == 11)
         #expect(await capture.sentSnapshot().map(\.1) == ["continued answer"])
+    }
+
+    @Test func telegramPollLoop_approvedCallbackQueuesContinuationWhileOriginalTurnIsActive() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("telegram_approval_queued_resume_\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let raw = #"""
+        {"ok":true,"result":[{"update_id":9,"callback_query":{"id":"cb-queued","from":{"id":11},"message":{"message_id":5,"chat":{"id":77}},"data":"na_approval:approve:appr-queued"}}]}
+        """#
+        let session = mockSession { req in
+            (makeResponse(req.url!, 200), Data(raw.utf8))
+        }
+        actor Capture {
+            var chatCalls: [(String, Bool)] = []
+            func chat(_ text: String, _ suppressUserAppend: Bool) {
+                chatCalls.append((text, suppressUserAppend))
+            }
+            func snapshot() -> [(String, Bool)] { chatCalls }
+        }
+        let capture = Capture()
+        let gate = ApprovalContinuationTurnGate()
+        let coordinator = TelegramTurnCoordinator()
+        _ = await coordinator.startTrackedTurn(chatId: 77, text: "original active turn") { _ in
+            await gate.run()
+        }
+        await gate.waitUntilStarted()
+
+        let loop = TelegramPollLoop(
+            interval: 60,
+            token: tokenStr,
+            allowedChatIds: [77],
+            bot: SwiftNativeTelegramBot(dataRoot: hermeticTelegramDataRoot()),
+            session: session,
+            offsetURL: tmp,
+            sendMessage: { _, _, _ in },
+            sendChatAction: { _, _, _ in },
+            sendMessageReturningId: discardTurnCardSend,
+            editMessageText: discardTurnCardEdit,
+            turnCardMinimumEditIntervalSeconds: 0,
+            turnCardHeartbeatNanoseconds: 0,
+            approvalHandler: ApprovalHandlerCapture(
+                reply: "approved and replayed",
+                continuationPrompt: "[queued verified continuation]"
+            ),
+            progressChatHandler: { _, text, _, context in
+                await capture.chat(text, context.suppressUserAppend)
+                return "continued answer"
+            },
+            typingRefreshNanoseconds: 0,
+            turnCoordinator: coordinator
+        )
+
+        await loop.tick()
+        #expect(await capture.snapshot().isEmpty,
+                "continuation must not overlap the original active turn")
+        #expect(await coordinator.snapshot(chatId: 77).promptPreview == "original active turn")
+
+        await gate.release()
+        await coordinator.waitUntilAllIdle()
+        let calls = await capture.snapshot()
+        #expect(calls.count == 1)
+        #expect(calls.first?.0 == "[queued verified continuation]")
+        #expect(calls.first?.1 == true)
     }
 
     @Test func telegramPollLoop_model_slash_sends_provider_buttons() async throws {

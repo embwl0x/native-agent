@@ -47,6 +47,7 @@ extension NativeClient {
         dryRun: Bool,
         input: [String: JSONValue] = [:],
         externalSendIdempotencyKey: String? = nil,
+        surface: String = "connector_action",
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -61,6 +62,7 @@ extension NativeClient {
             dryRun: dryRun,
             input: input,
             externalSendIdempotencyKey: externalSendIdempotencyKey,
+            surface: surface,
             dataRoot: dataRoot
         )
     }
@@ -71,10 +73,15 @@ extension NativeClient {
         input: [String: JSONValue] = [:],
         externalSendIdempotencyKey: String? = nil,
         approvedReplayApprovalID: String? = nil,
+        surface: String = "connector_action",
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
+        let yoloAdmitted = !dryRun && approvedReplayApprovalID == nil
+            ? await Self.fullMacYoloAdmitted(tool: descriptor.id, surface: surface, dataRoot: dataRoot)
+            : false
         if !dryRun,
-           ExternalSendApprovalRequest.canonicalActionID(for: descriptor.id) != nil {
+           ExternalSendApprovalRequest.canonicalActionID(for: descriptor.id) != nil,
+           !yoloAdmitted {
             let staged = try await ExternalSendApprovalLifecycle.stage(
                 invokedAs: descriptor.id,
                 input: input,
@@ -92,7 +99,7 @@ extension NativeClient {
             )
         }
 
-        if descriptor.requiresApproval, !dryRun, approvedReplayApprovalID == nil {
+        if descriptor.requiresApproval, !dryRun, approvedReplayApprovalID == nil, !yoloAdmitted {
             let approval = try await Self.createConnectorActionApproval(
                 descriptor,
                 input: input,
@@ -250,9 +257,18 @@ extension NativeClient {
                 output = try await SlackConnectorActions.listUnreads(input: input)
                 receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "slack.post_message", "agentmail.send":
-                throw NSError(domain: "NativeAgentSwiftOnly", code: -403, userInfo: [
-                    NSLocalizedDescriptionKey: "External send escaped mandatory approval staging."
-                ])
+                guard yoloAdmitted else {
+                    throw NSError(domain: "NativeAgentSwiftOnly", code: -403, userInfo: [
+                        NSLocalizedDescriptionKey: "External send escaped mandatory approval staging."
+                    ])
+                }
+                output = await ExternalSendApprovalLifecycle.executeAdmittedYoloToolResult(
+                    invokedAs: descriptor.id,
+                    input: input,
+                    idempotencyKey: externalSendIdempotencyKey,
+                    dataRoot: dataRoot
+                )
+                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             default:
                 guard descriptor.id.hasSuffix(".status") else {
                     throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
@@ -284,6 +300,39 @@ extension NativeClient {
             approvalId: nil,
             output: output,
             dataRoot: dataRoot
+        )
+    }
+
+    static func fullMacYoloAdmitted(
+        tool: String,
+        surface: String,
+        dataRoot: URL
+    ) async -> Bool {
+        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let remoteSurfaces: Set<String> = [
+            "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile", "watch", "remote",
+        ]
+        let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
+            tool: tool,
+            origin: SecurityOriginContext(
+                surface: surface,
+                sessionId: ChatToolSessionContext.verifiedSessionId,
+                userId: ChatToolSessionContext.verifiedUserId,
+                chatId: ChatToolSessionContext.verifiedChatId,
+                deviceId: nil,
+                source: "native_client_direct_action",
+                isRemote: remoteSurfaces.contains(normalized),
+                commandSignatureVerified: ChatToolSessionContext.commandSignatureVerified
+            )
+        )
+        return authority.admitted
+    }
+
+    func fullMacYoloAuthorityAdmitted(tool: String, surface: String) async -> Bool {
+        await Self.fullMacYoloAdmitted(
+            tool: tool,
+            surface: surface,
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         )
     }
 

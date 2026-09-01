@@ -128,17 +128,26 @@ extension NativeClient {
         let requestDigest = SwiftNativeBrowserClient.browserRequestDigest(for: start)
         _ = try await browser.executeBrowserOperation(.start(start))
 
-        let captureTask = Task { @MainActor in
-            try await navigateVisibleBrowser(
-                parsed.url,
-                runID: runID,
-                captureSource: captureSource,
-                captureScreenshot: captureScreenshot
-            )
-        }
+        let cancellationLatch = BrowserRunCancellationLatch()
         let activeToken = await BrowserActiveRunRegistry.shared.register(runID: runID) {
-            captureTask.cancel()
-            _ = BrowserWindowController.shared.cancelNavigation(runID: runID)
+            cancellationLatch.cancel()
+        }
+        let captureTask = await MainActor.run {
+            let task = Task { @MainActor in
+                try await navigateVisibleBrowser(
+                    parsed.url,
+                    runID: runID,
+                    captureSource: captureSource,
+                    captureScreenshot: captureScreenshot
+                )
+            }
+            // Creating and attaching are one non-suspending MainActor turn, so
+            // WebKit cannot begin between task creation and cancellation hookup.
+            cancellationLatch.install {
+                task.cancel()
+                _ = BrowserWindowController.shared.cancelNavigation(runID: runID)
+            }
+            return task
         }
         defer {
             Task { @MainActor in

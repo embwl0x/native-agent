@@ -71,6 +71,18 @@ private struct MCPConsentEvalRoot {
     func consents() async -> [MCPConsent] {
         (try? await SwiftNativeMCPDispatcher(root: dataRoot).listConsents()) ?? []
     }
+
+    func enableFullMacYolo() throws {
+        let trustRoot = dataRoot.appendingPathComponent("trust", isDirectory: true)
+        try FileManager.default.createDirectory(at: trustRoot, withIntermediateDirectories: true)
+        let policy: JSONValue = .object([
+            "permissionLevel": .string("full_mac_os"),
+            "fullMacNeverExpires": .bool(true),
+            "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+        ])
+        try policy.serializedData(pretty: true)
+            .write(to: trustRoot.appendingPathComponent("policy.json"))
+    }
 }
 
 /// Approval-gated risk classes must refuse AND leave no consent behind. This is
@@ -90,7 +102,7 @@ private struct MCPConsentEvalRoot {
     ] {
         await #expect(throws: (any Error).self, "\(server)/\(tool): \(why)") {
             _ = try await dispatcher.impl_mcp_tool(
-                serverId: server, toolName: tool, input: ["q": .string("x")]
+                serverId: server, toolName: tool, input: ["q": .string("x")], surface: "chat"
             )
         }
         let rows = await root.consents()
@@ -120,7 +132,7 @@ private struct MCPConsentEvalRoot {
     let dispatcher = SwiftToolDispatcher(dataRoot: root.dataRoot)
 
     _ = try? await dispatcher.impl_mcp_tool(
-        serverId: "readserver", toolName: "peek", input: ["q": .string("x")]
+        serverId: "readserver", toolName: "peek", input: ["q": .string("x")], surface: "chat"
     )
 
     let rows = await root.consents()
@@ -141,4 +153,28 @@ private struct MCPConsentEvalRoot {
             "a read-tier consent must not satisfy a write-tier call — that would be silent escalation"
         )
     }
+}
+
+@Test func mcpDispatch_fullMacYoloRunsApprovalRiskWithoutPersistingStandingConsent() async throws {
+    let root = try MCPConsentEvalRoot.make()
+    defer { root.cleanup() }
+    try root.enableFullMacYolo()
+    let dispatcher = SwiftToolDispatcher(dataRoot: root.dataRoot)
+
+    do {
+        _ = try await dispatcher.impl_mcp_tool(
+            serverId: "writeserver",
+            toolName: "poke",
+            input: ["q": .string("x")],
+            surface: "chat"
+        )
+        Issue.record("the unreachable MCP fixture should fail at transport")
+    } catch is AutonomyGateError {
+        Issue.record("admitted Full Mac YOLO must reach MCP transport instead of asking for approval")
+    } catch {
+        // Expected: the fixture endpoint is deliberately unreachable. Reaching
+        // that boundary proves the approval prompt was bypassed.
+    }
+
+    #expect(await root.consents().isEmpty, "YOLO is per-call authority, not a standing MCP consent grant")
 }

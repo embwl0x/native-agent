@@ -97,8 +97,14 @@ enum NativePrivateFile {
             }
             return true
         }
+        // temp+rename is only atomic against a CRASH. Against power loss the
+        // rename can reach the directory while the temp file's data is still
+        // in the page cache, publishing a torn/empty file at the destination —
+        // exactly the input that makes a durable journal unreadable. fsync the
+        // bytes before they are published; a failed fsync is a failed write.
+        let synced = wroteAll && Darwin.fsync(descriptor) == 0
         Darwin.close(descriptor)
-        guard wroteAll else {
+        guard synced else {
             _ = temporaryPath.withCString { Darwin.unlink($0) }
             return false
         }

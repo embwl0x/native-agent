@@ -20,13 +20,18 @@ func wave5FullMacYoloLocalSurfacesAcceptLegacySpellings() {
     for spelling in ["workshop", "missions", "mission"] {
         #expect(SwiftNativeSecurityCenter.fullMacYoloLocalSurfaces.contains(spelling))
     }
-    // The non-Workshop members of the set are untouched.
-    for other in ["chat", "codex-bridge", "claude-bridge"] {
+    // Every app-owned local operator surface is explicit. New action surfaces
+    // must join this set rather than infer authority from a caller string.
+    for other in [
+        "chat", "desk", "codex-bridge", "claude-bridge",
+        "connector_action", "nextgen_action", "mcp_ui", "native_actions",
+    ] {
         #expect(SwiftNativeSecurityCenter.fullMacYoloLocalSurfaces.contains(other))
     }
-    #expect(SwiftNativeSecurityCenter.fullMacYoloLocalSurfaces.count == 6)
+    #expect(SwiftNativeSecurityCenter.fullMacYoloLocalSurfaces.count == 11)
     // Negative controls: remote surfaces must NOT leak into the LOCAL set —
-    // that would let a phone or a Telegram message auto-fire builder shell.
+    // they require concrete authenticated origin evidence through the remote
+    // authority path instead.
     for remote in ["telegram", "slack", "ios", "icloud", "remote"] {
         #expect(!SwiftNativeSecurityCenter.fullMacYoloLocalSurfaces.contains(remote))
     }

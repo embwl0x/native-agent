@@ -71,6 +71,7 @@ struct SlackDurableInboundDeliveryTests {
         recorder: DurableSlackRecorder,
         history: Bool = false,
         lifecycleSignal: DurableSlackLifecycleSignal? = nil,
+        closeReason: String? = nil,
         chatHandler: SlackSocketModeChatHandler? = nil
     ) -> SlackSocketModeLoop {
         let configuration = URLSessionConfiguration.ephemeral
@@ -85,6 +86,16 @@ struct SlackDurableInboundDeliveryTests {
                         if !lifecycleSignal.contains("hello_received") {
                             lifecycleSignal.mark("hello_received")
                             return .string("{\"type\":\"hello\"}")
+                        }
+                        if let closeReason {
+                            // End the session only once a chat turn is really
+                            // in flight, so the teardown race is deterministic.
+                            var waited = 0
+                            while !lifecycleSignal.contains("generation_started"), waited < 500 {
+                                try await Task.sleep(nanoseconds: 10_000_000)
+                                waited += 1
+                            }
+                            return .string("{\"type\":\"disconnect\",\"reason\":\"\(closeReason)\"}")
                         }
                         lifecycleSignal.mark("receive_waiting")
                         while !Task.isCancelled { try await Task.sleep(nanoseconds: 10_000_000) }
@@ -138,7 +149,11 @@ struct SlackDurableInboundDeliveryTests {
         #expect(await recorder.posts.count == 1)
     }
 
-    @Test func malformedJournalNeverAcknowledgesOrOverwritesEvidence() async throws {
+    /// Damaged bytes used to be terminal: every later load threw `.malformed`,
+    /// so inbound admission AND recovery stayed dead until a human deleted the
+    /// file. The evidence must still survive untouched — it is now preserved in
+    /// a quarantine file beside the journal, and the journal itself heals.
+    @Test func malformedJournalQuarantinesEvidenceInsteadOfRefusingIntakeForever() async throws {
         let root = try root()
         defer { try? FileManager.default.removeItem(at: root) }
         let directory = root.appendingPathComponent("slack", isDirectory: true)
@@ -147,14 +162,49 @@ struct SlackDurableInboundDeliveryTests {
         let bytes = Data("not-json".utf8)
         try bytes.write(to: path)
         let recorder = DurableSlackRecorder()
+        let message = inbound()
+        let claim = try await loop(root: root, recorder: recorder).claimInboundBeforeAcknowledging(message) {
+            await recorder.acknowledge()
+        }
+        guard case .claimed = claim else {
+            Issue.record("A quarantined journal must admit the envelope")
+            return
+        }
+        #expect(await recorder.acknowledgements == 1)
+        // Evidence: renamed aside, byte-identical, never deleted or overwritten.
+        let quarantined = SlackInboundDeliveryJournal.quarantinedEvidencePaths(dataRoot: root)
+        #expect(quarantined.count == 1)
+        #expect(try Data(contentsOf: #require(quarantined.first)) == bytes)
+        // Journal: healed, durable, and holding the freshly accepted claim.
+        let journal = SlackInboundDeliveryJournal(dataRoot: root)
+        #expect(try await journal.record(eventId: message.eventId)?.phase == .claimed)
+        let read = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root)
+        let summary = try #require(read)
+        #expect(summary.quarantinedCount == 1)
+        #expect(summary.hasQuarantinedEvidence)
+        #expect(summary.pendingCount == 1)
+    }
+
+    /// A read failure says nothing about the CONTENT. Quarantining on it would
+    /// rename a healthy journal aside on a transient I/O or permission error.
+    @Test func unreadableJournalStillRefusesIntakeWithoutQuarantining() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("slack", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // A directory at the journal path reads as "exists" but cannot be read.
+        let path = directory.appendingPathComponent("inbound_delivery_journal.json")
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        let recorder = DurableSlackRecorder()
         do {
             _ = try await loop(root: root, recorder: recorder).claimInboundBeforeAcknowledging(inbound()) {
                 await recorder.acknowledge()
             }
-            Issue.record("Malformed journal unexpectedly admitted an envelope")
+            Issue.record("An unreadable journal must not admit an envelope")
         } catch {}
         #expect(await recorder.acknowledgements == 0)
-        #expect(try Data(contentsOf: path) == bytes)
+        #expect(SlackInboundDeliveryJournal.quarantinedEvidencePaths(dataRoot: root).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: path.path))
     }
 
     @Test func journalPublicationIsPrivateInsideAnExistingPublicDirectory() async throws {
@@ -361,5 +411,57 @@ struct SlackDurableInboundDeliveryTests {
         #expect(await recorder.posts.count == 2)
         #expect(!SlackSocketModeLoop.isProvenSlackRejection(.object(["ok": .bool(false), "error": .string("internal_error")])))
         #expect(!SlackSocketModeLoop.isProvenSlackRejection(.object(["ok": .bool(false), "error": .string("fatal_error")])))
+    }
+
+    /// A session that ends ON PURPOSE must not guillotine a chat turn: the row
+    /// would stay `.generating`, recovery would park it `outcome_unknown`, and
+    /// nothing auto-retries it — the user's message silently never gets a reply.
+    @Test func plannedTeardownLetsAnInFlightGenerationFinishInsteadOfParkingItUnanswered() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let journal = SlackInboundDeliveryJournal(dataRoot: root)
+        let message = inbound()
+        _ = try await journal.claim(message)
+        DurableSlackHistoryProtocol.response = ["ok": .bool(true), "url": .string("wss://slack.invalid/test")]
+        DurableSlackHistoryProtocol.requests = []
+        let signal = DurableSlackLifecycleSignal()
+        let recorder = DurableSlackRecorder()
+        let loop = loop(
+            root: root,
+            recorder: recorder,
+            lifecycleSignal: signal,
+            closeReason: "refresh_requested"
+        ) { _ in
+            signal.mark("generation_started")
+            try await Task.sleep(nanoseconds: 300_000_000)
+            signal.mark("generation_finished")
+            return await recorder.generate()
+        }
+        _ = await loop.tickOutcome()
+        #expect(signal.contains("generation_started"))
+        #expect(signal.contains("generation_finished"))
+        #expect(await recorder.generations == 1)
+        #expect(await recorder.posts.count == 1)
+        #expect(try await journal.record(eventId: message.eventId)?.phase == .delivered)
+    }
+
+    @Test func teardownGraceCoversPlannedTeardownOnlyAndNeverDelaysABrokenSocket() {
+        let planned = SlackSocketModeLoop.inFlightCompletionGrace
+        #expect(SlackSocketModeLoop.teardownGrace(closing: nil, recyclePlanned: true) == planned)
+        #expect(SlackSocketModeLoop.teardownGrace(closing: nil, recyclePlanned: false) == 0)
+        // The recycle timer cancels the socket, which surfaces as a transport
+        // error rather than a Slack `disconnect` frame.
+        #expect(SlackSocketModeLoop.teardownGrace(
+            closing: SlackSocketModeError.api("socket cancelled"), recyclePlanned: true) == planned)
+        #expect(SlackSocketModeLoop.teardownGrace(
+            closing: SlackSocketModeError.api("socket died"), recyclePlanned: false) == 0)
+        #expect(SlackSocketModeLoop.teardownGrace(
+            closing: SlackSocketSessionClosure.disconnect(reason: "refresh_requested"),
+            recyclePlanned: false) == planned)
+        for fatal in ["link_disabled", "too_many_connections"] {
+            #expect(SlackSocketModeLoop.teardownGrace(
+                closing: SlackSocketSessionClosure.disconnect(reason: fatal),
+                recyclePlanned: true) == 0)
+        }
     }
 }

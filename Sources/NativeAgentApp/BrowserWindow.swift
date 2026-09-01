@@ -124,6 +124,30 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Senda
 
 // MARK: - Active browser run ownership
 
+/// Closes the short interval between canonical `running` persistence and the
+/// WebKit task becoming cancellable. A cancel that arrives before attachment
+/// is remembered and applied immediately when the exact task is installed.
+@MainActor
+final class BrowserRunCancellationLatch {
+    private var cancellationRequested = false
+    private var cancelAction: (@MainActor () -> Void)?
+
+    func install(_ action: @escaping @MainActor () -> Void) {
+        guard !cancellationRequested else {
+            action()
+            return
+        }
+        cancelAction = action
+    }
+
+    func cancel() {
+        cancellationRequested = true
+        let action = cancelAction
+        cancelAction = nil
+        action?()
+    }
+}
+
 /// Process-local owner for live visible-browser work. Canonical lifecycle still
 /// lives in Browser/runs.json; this registry exists only so a persisted cancel
 /// can target the exact in-flight Task and WebKit navigation before a late

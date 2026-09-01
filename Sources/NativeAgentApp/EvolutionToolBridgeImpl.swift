@@ -4,6 +4,7 @@ import ChatOrchestration
 import PersistenceCore
 import SelfImprovement
 import ApprovalInbox
+import TrustCenter
 
 // MARK: - EvolutionToolBridgeImpl (2026-06-11, U2b)
 //
@@ -141,6 +142,25 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
         // SHOULD-FIX — the chat trigger named one id; don't silently stage
         // unrelated green candidates). Reuses the single card-staging path.
         await BackgroundLoopsAssembly.stageEvolutionApprovals(dataRoot: dataRoot, onlyProposalId: id)
+
+        let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+            .fullMacYoloAuthority(
+                tool: NativeClient.selfEvolutionAction,
+                origin: SecurityOriginContext(
+                    surface: "chat",
+                    source: "evolution_tool_bridge",
+                    isRemote: false
+                )
+            )
+        if yolo.admitted {
+            let updated = try? await store.get(id: id)
+            return .object([
+                "status": .string("admitted"),
+                "id": .string(id),
+                "proposal_status": .string(updated?.status.rawValue ?? proposal.status.rawValue),
+                "note": .string("Active Full Mac authority admitted the validated candidate through the canonical evolution executor; no approval prompt was created."),
+            ])
+        }
 
         // Report the staged self_evolution.apply card for THIS proposal.
         let card = await latestEvolutionApproval(proposalId: id)

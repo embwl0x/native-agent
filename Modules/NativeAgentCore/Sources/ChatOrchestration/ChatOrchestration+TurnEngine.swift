@@ -835,10 +835,10 @@ public actor SwiftNativeTurnEngine {
         trace.record(.contextFlowAttention, since: attentionStartNs)
         // M9 (2026-07-11): on the Workshop surface, ContextFlow reuses
         // `activeTask` as the execution prewarm-cache id (ContextFlowCoordinator
-        // prewarmScopes). Her pursuit intent now populates activeTask/goal, so
-        // it would collide there — suppress it on that ONE surface. Every other
-        // surface (chat/telegram/bridge) keeps the pursuit intent, which is the
-        // whole point: her active pursuit colors her context.
+        // prewarmScopes), so intent must never collide there. Resident Desk
+        // pursuit is also withheld from ordinary turns: work context remains
+        // query-selectable through its adaptive projection, but does not color
+        // unrelated conversation merely because a pursuit exists.
         //
         // P2-3: `missions` and `workshop` were two DISTINCT ContextSurfaces
         // until 2026-08-05, so the same surface suppressed or kept pursuit
@@ -846,7 +846,8 @@ public actor SwiftNativeTurnEngine {
         // collision was live for anyone who wrote `workshop`. They are one
         // surface now, and the suppression follows the surface, not the
         // spelling.
-        let suppressPursuitIntent = ContextSurface(rawValue: surface) == .workshop
+        let suppressActiveIntent = ContextSurface(rawValue: surface) == .workshop
+            || attention.residentWorkIntent
         // Sweep R4 A5: this used to be a bare `valueIfReady` — a pure sample,
         // never awaited. On the FIRST message after launch MiniLM is still
         // warming, so the sample came back nil and the 1.2-weighted semantic
@@ -880,9 +881,9 @@ public actor SwiftNativeTurnEngine {
             personaIDHint: personaOverride,
             sessionID: sessionID,
             recentTurns: recentTurns,
-            activeTask: suppressPursuitIntent ? nil : attention.activeTask,
+            activeTask: suppressActiveIntent ? nil : attention.activeTask,
             unresolvedQuestion: attention.unresolvedQuestion,
-            goal: suppressPursuitIntent ? nil : attention.goal,
+            goal: suppressActiveIntent ? nil : attention.goal,
             predictedToolGroups: attention.predictedToolGroups,
             contextualTerms: attention.contextualTerms,
             cognitiveActivation: attention.cognitiveActivation,
@@ -1342,6 +1343,7 @@ public actor SwiftNativeTurnEngine {
         var unresolvedQuestion: String?
         var activeTask: String?
         var goal: String?
+        var residentWorkIntent = false
         var predictedToolGroups: Set<String> = []
         var cognitiveActivation: [ContextAtomID: Double] = [:]
         var workingAtomIDs: Set<ContextAtomID> = []
@@ -1431,6 +1433,7 @@ public actor SwiftNativeTurnEngine {
         inputs.unresolvedQuestion = Self.nonEmpty(signals.unresolvedQuestion)
         inputs.activeTask = Self.nonEmpty(signals.activeTask)
         inputs.goal = Self.nonEmpty(signals.goal)
+        inputs.residentWorkIntent = signals.residentWorkIntent
 
         // Memory RECORD ids → ContextAtomID is app-owned (owner string lives
         // app-side). Without a translator, memory-keyed activation is dropped;

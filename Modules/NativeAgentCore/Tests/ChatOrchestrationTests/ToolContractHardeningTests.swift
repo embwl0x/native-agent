@@ -89,8 +89,8 @@ func builderConversationModeFailsClosed() async throws {
     #expect(newObject["reason"] == nil)
 }
 
-@Test("builder and Desk schemas make optional contract boundaries explicit")
-func toolSchemasExposeConversationModeAndNonEmptyMetadata() async throws {
+@Test("builder, Desk, and GitHub schemas make optional contract boundaries explicit")
+func toolSchemasExposeNeutralPlaceholdersAndExplicitClears() async throws {
     let root = try contractTempRoot("schemas")
     defer { try? FileManager.default.removeItem(at: root) }
     let schemas = try await SwiftToolDispatcher(dataRoot: root).listAvailableToolSchemas()
@@ -122,20 +122,40 @@ func toolSchemasExposeConversationModeAndNonEmptyMetadata() async throws {
     guard case .object(let statusObject) = parsedStatus,
           case .object(let statusProperties)? = statusObject["properties"],
           case .object(let assignee)? = statusProperties["assignee"],
-          case .object(let laneOf)? = statusProperties["lane_of"] else {
+          case .object(let laneOf)? = statusProperties["lane_of"],
+          case .object(let progress)? = statusProperties["progress"] else {
         Issue.record("desk_set_status metadata schema is malformed")
         return
     }
     // Optional blank metadata is an omission, not a clear/unassign request.
     // The schema must agree with deskMetadataString's preserved-value contract.
     for metadata in [assignee, laneOf] {
-        #expect(metadata["type"] == .string("string"))
+        #expect(metadata["type"] == .array([.string("string"), .string("null")]))
         #expect(metadata["minLength"] == nil)
         guard case .string(let description)? = metadata["description"] else {
             Issue.record("desk_set_status metadata needs preservation guidance")
             continue
         }
-        #expect(description.contains("Omitted or blank values preserve the current value"))
+        #expect(description.contains("Omitted, null, or blank values preserve the current value"))
         #expect(description.contains("cannot clear"))
+    }
+    #expect(progress["type"] == .array([.string("object"), .string("null")]))
+
+    let github = try #require(schemas.first { $0.name == "github_mutate" })
+    let parsedGitHub = try JSONValue.parse(github.parametersJSON)
+    guard case .object(let githubObject) = parsedGitHub,
+          case .object(let githubProperties)? = githubObject["properties"] else {
+        Issue.record("github_mutate schema is malformed")
+        return
+    }
+    for (flag, collection) in [("clear_labels", "labels"), ("clear_assignees", "assignees")] {
+        guard case .object(let clearSchema)? = githubProperties[flag],
+              case .string(let description)? = clearSchema["description"] else {
+            Issue.record("missing explicit GitHub clear contract: \(flag)")
+            continue
+        }
+        #expect(clearSchema["type"] == .string("boolean"))
+        #expect(description.contains("Explicitly clear"))
+        #expect(description.contains("Empty \(collection) alone preserve"))
     }
 }

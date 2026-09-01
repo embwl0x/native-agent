@@ -1,4 +1,5 @@
 import Foundation
+import NotificationInbox
 import PersistenceCore
 import ApprovalInbox
 import SelfImprovement
@@ -64,8 +65,9 @@ extension NativeClient {
         /// Post-restart quick health read for the verify decision.
         var doctorState: @Sendable () async -> EvolutionDoctorState
 
-        static func production() -> SelfEvolutionDeps {
-            let dataRoot = PersistenceCore.defaultDataRoot()
+        static func production(
+            dataRoot: URL = PersistenceCore.defaultDataRoot()
+        ) -> SelfEvolutionDeps {
             let repoRoot = NativeClient.evolutionRepoRoot(dataRoot: dataRoot)
             return SelfEvolutionDeps(
                 dataRoot: dataRoot,
@@ -242,6 +244,34 @@ extension NativeClient {
                     root: deps.dataRoot)
             }
         }
+    }
+
+    /// Full Mac admission enters the exact approved executor without first
+    /// creating a pending ApprovalInbox row. The synthetic record is only an
+    /// in-memory adapter for the established CAS/backup/rollback/idempotency
+    /// implementation; canonical proposal/install receipts remain authoritative.
+    static func applyFullMacAdmittedSelfEvolution(
+        payload: JSONValue,
+        deps: SelfEvolutionDeps
+    ) async {
+        let timestamp = SwiftNativeManifestSigner.isoTimestamp(Date())
+        let record = ApprovalRecord(
+            id: "full-mac-yolo-\(UUID().uuidString.lowercased())",
+            title: "Full Mac admitted self-evolution",
+            action: selfEvolutionAction,
+            risk: EvolutionProposal.pinnedRisk,
+            reason: "Admitted by active Full Mac authority",
+            status: "resolved",
+            payload: payload,
+            payloadPreview: "",
+            createdAt: timestamp,
+            resolvedAt: timestamp,
+            decision: "approved",
+            decidedBy: "full_mac_yolo",
+            remoteResolvable: false,
+            localOnly: true
+        )
+        await applyResolvedSelfEvolution(from: record, deps: deps)
     }
 
     /// The approved lane. Order (plan wave-2 spec, gpt-5.5 fix-round):
@@ -687,16 +717,14 @@ extension NativeClient {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        let persistence = SwiftNativePersistenceCore()
         do {
-            // 2026-07-21 audit (MED): same shared capped append as the other
-            // notifications/inbox.jsonl writers — the LIVE inbox must not
-            // grow unbounded.
-            try await appendJSONLCapped(
-                card, to: inboxPath, using: persistence,
-                maxLines: JSONLLineCaps.notificationInbox,
-                logLabel: "SelfEvolution.inbox"
-            )
+            // 2026-08-31: through the feed's owner, like every other
+            // notifications/inbox.jsonl writer. The shared capped append trims
+            // by keeping a suffix and hard-deletes the oldest cards once the
+            // file crosses its budget; `LiveNotificationInbox` shelves what it
+            // evicts to `notifications/inbox_archive.jsonl` first.
+            try await LiveNotificationInbox(path: inboxPath)
+                .appendUnique(card, id: itemId)
             await InboxPushNotifier.notifyIfAttentionWorthy(
                 dataRoot: dataRoot,
                 itemId: itemId,

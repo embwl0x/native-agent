@@ -5,7 +5,9 @@
 //   app.background.loop.evolution_proposal_retention
 //   app.background.loop.self_improvement_sweep
 //   app.background.setting.selfImprovementEnabled
-//   app.background.loop.rem_cycle
+//   app.background.loop.rem_cycle  (lane RETIRED 2026-08-31 — the row is now
+//     closed by the persona-resolver guard plus the retirement pin in
+//     BackgroundLifecycleWiringContractTests)
 //   app.background.heartbeat.intervalEnv
 //
 // Every one of these is a SILENT-failure surface: the loops report `.completed`
@@ -286,16 +288,21 @@ struct BackgroundMaintenanceLoopContractTests {
                 "a failed pass must not leave a committed weekly stamp behind")
     }
 
-    // MARK: - rem_cycle persona root
+    // MARK: - REM persona root (the `rem_cycle` loop was retired 2026-08-31)
 
     @Test("REM binds the resolved persona root, never a <dataRoot>/persona hardcode")
-    func remCycleUsesTheCanonicalPersonaResolver() throws {
+    func remUsesTheCanonicalPersonaResolver() throws {
         // The documented bug (NativeAgentPaths.swift) is REM mutating a phantom
-        // persona dir the reader never reads. The loop keeps `personaRoot`
-        // private, so the durable guard is: (1) the resolver really diverges
-        // from <dataRoot>/persona when the env pins it elsewhere, and (2) the
-        // factory feeds BOTH the GrowthDocManager and the loop from the
-        // resolver, not from a path literal.
+        // persona dir the reader never reads. The durable guard is that the
+        // resolver really diverges from <dataRoot>/persona when the env pins it
+        // elsewhere, and that the REM owner feeds itself from the resolver.
+        //
+        // The app-side `makeREMCycleLoop` factory this used to scrape is GONE:
+        // weekly REM has one owner now, the `nativeagent-weekly-rem`
+        // TriggerScheduler job → NativeClient.runRem → SwiftNativeDreamREMCycle,
+        // which resolves the persona root itself (DreamREMCycle.swift:486).
+        // The app half that remains scrapable is that runRem never introduces a
+        // persona path literal of its own.
         let dataRoot = try maintenanceTempRoot("rem-data")
         defer { try? FileManager.default.removeItem(at: dataRoot) }
         let personaRoot = try maintenanceTempRoot("rem-persona")
@@ -310,12 +317,12 @@ struct BackgroundMaintenanceLoopContractTests {
         #expect(NativeAgentPaths.resolvePersonaRoot(dataRoot: dataRoot, env: env).standardizedFileURL.path
                 == resolved.standardizedFileURL.path)
 
-        let source = try AppSourceScraping.appSource("BackgroundLoopsAssembly+DreamsMemory.swift")
-        let factory = try AppSourceScraping.functionBody(named: "makeREMCycleLoop", in: source)
-        #expect(factory.contains("PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)"))
-        #expect(factory.contains("GrowthDocManager(personaRoot: personaRoot)"))
-        #expect(factory.contains("personaRoot: personaRoot"))
-        #expect(!factory.contains("appendingPathComponent(\"persona\")"),
+        let assembly = try AppSourceScraping.appSource("BackgroundLoopsAssembly+DreamsMemory.swift")
+        #expect(!assembly.contains("static func makeREMCycleLoop"),
+                "the duplicate rem_cycle lane is retired — reinstating it needs a fresh decision")
+        let dream = try AppSourceScraping.appSource("NativeClient+DreamActions.swift")
+        let runRem = try AppSourceScraping.functionBody(named: "runRem", in: dream)
+        #expect(!runRem.contains("appendingPathComponent(\"persona\")"),
                 "REM must never hardcode <dataRoot>/persona — that is the phantom-write bug")
     }
 

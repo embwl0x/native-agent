@@ -805,6 +805,18 @@ struct CloudKitCrashGuardTests {
         #expect(visibleInfo.alertLocalizationKey != nil)
     }
 
+    @Test func incrementalPullUsesOnlyTheDeployedQueryableDirectionField() {
+        let predicate = CloudKitDeviceTransport.makePullPredicate(
+            inboundDirection: NAChatDirection.mac2ios.rawValue
+        )
+
+        #expect(predicate.predicateFormat.contains("direction"))
+        #expect(predicate.predicateFormat.contains(NAChatDirection.mac2ios.rawValue))
+        #expect(!predicate.predicateFormat.contains("createdAt >"))
+        #expect(!predicate.predicateFormat.contains("modificationDate"))
+        #expect(!predicate.predicateFormat.contains("___modTime"))
+    }
+
     @Test func staleSameIDSubscriptionCannotMasqueradeAsVisibleAlert() {
         let expected = CloudKitDeviceTransport.makeVisibleNotificationSubscription()
         #expect(CloudKitDeviceTransport.subscription(expected, matches: expected))

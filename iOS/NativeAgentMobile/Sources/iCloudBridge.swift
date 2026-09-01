@@ -700,11 +700,15 @@ final class iCloudBridge: ObservableObject {
     /// Exact active-transport catch-up used only while a chat reply is
     /// outstanding or the user explicitly refreshes. CloudKit must drain its
     /// records; checking the retired Drive outbox cannot observe a public build.
-    func pollIncomingNow() async {
+    @discardableResult
+    func pollIncomingNow() async -> Bool {
         if deviceTransport != nil {
-            _ = await drainDeviceTransport()
+            return await drainDeviceTransport()
         } else {
             await checkMacOutbox()
+            // The retired Drive lane has no exact dispatched-count receipt.
+            // Preserve that uncertainty instead of claiming new data.
+            return false
         }
     }
 

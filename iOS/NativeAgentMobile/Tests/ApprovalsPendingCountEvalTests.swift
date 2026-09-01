@@ -125,4 +125,22 @@ final class ApprovalsPendingCountEvalTests: XCTestCase {
             "resolved history was dropped from the list, so 'nothing synced' and 'nothing pending' look identical"
         )
     }
+
+    func test_distinctApprovalCardsCanEnterFlightWithoutDroppingEitherTap() {
+        let store = ApprovalsStore()
+
+        XCTAssertTrue(store.beginDecision(id: "approval-a"))
+        XCTAssertTrue(
+            store.beginDecision(id: "approval-b"),
+            "a second visible card must not silently discard its tap while the first decision is crossing iCloud"
+        )
+        XCTAssertFalse(
+            store.beginDecision(id: "approval-a"),
+            "the same approval still needs a single-flight guard"
+        )
+        XCTAssertEqual(store.decidingApprovalIDs, ["approval-a", "approval-b"])
+
+        store.finishDecision(id: "approval-a")
+        XCTAssertTrue(store.beginDecision(id: "approval-a"))
+    }
 }

@@ -137,20 +137,74 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         var next = ledger
         next.peripheralUncertainty = OrganismBodyConfidence.clamp(next.peripheralUncertainty * pow(0.84, hours))
         next.strategyCaution = OrganismBodyConfidence.clamp(next.strategyCaution * pow(0.82, hours))
-        let decayed = next.predictions.values.map { prediction in
+        var expiredKinds: [OrganismPredictionKind] = []
+        let decayed = next.predictions.values.map { prediction -> OrganismPrediction in
                 var copy = prediction
                 if copy.status == .pending && copy.dueAt < now {
                     copy.status = .expired
                     copy.lastUpdatedAt = now
+                    expiredKinds.append(copy.kind)
                 }
                 copy.uncertainty = OrganismBodyConfidence.clamp(copy.uncertainty * pow(0.94, hours))
                 return copy
             }
+        // An expiry found by the restart/idle sweep is the same evidence the
+        // live sweep records (OrganismPredictiveBody.expireOverdue). Flipping
+        // the row without the counters meant every expectation that ran out
+        // across a restart or a sleep gap was silently dropped from the
+        // cumulative outcome evidence — and the capability self-read, which now
+        // prefers outcomeCountsByKind over the bounded reservoir, then read
+        // more certain than the evidence warranted. The row is only counted on
+        // the tick that flips it: later sweeps see .expired and skip it.
+        // Forget the elapsed window BEFORE stamping evidence dated `now`: the
+        // expiry this sweep just found is fresh and must not be decayed by the
+        // same window that aged everything preceding it.
+        next.outcomeCountsByKind = next.outcomeCountsByKind
+            .map { forgottenOutcomeCounts($0, at: now, hours: hours) }
+        for kind in expiredKinds.sorted(by: { $0.rawValue < $1.rawValue }) {
+            next.expiredCount += 1
+            OrganismPredictiveBody.recordOutcome(.expired, kind: kind, at: now, ledger: &next)
+        }
         next.predictions = Dictionary(uniqueKeysWithValues: OrganismPredictionRetention
             .bounded(decayed, maximum: limits.maximumPersistedPredictions)
             .map { ($0.id, $0) })
         next.lastUpdatedAt = now
         return next
+    }
+
+    /// Cumulative outcome evidence was the one organism quantity that never
+    /// moved with the clock, so after thousands of clean runs no real
+    /// regression could shift `successLikelihood` and a bad stretch's
+    /// missing-evidence penalty never relaxed. The lifetime Int tallies stay
+    /// untouched as the receipt; the fractional weights the capability read
+    /// reasons from forget on the same 7-day half-life that read already uses
+    /// for freshness, so evidence weight and evidence freshness fade together
+    /// instead of a belief reading certain from outcomes it calls stale.
+    private func forgottenOutcomeCounts(
+        _ counts: [String: OrganismPredictionOutcomeCounts],
+        at now: Date,
+        hours: Double
+    ) -> [String: OrganismPredictionOutcomeCounts] {
+        let halfLifeHours = OrganismCapabilitySelfModel.evidenceHalfLife / 3_600
+        guard hours > 0, halfLifeHours > 0 else { return counts }
+        let factor = pow(0.5, hours / halfLifeHours)
+        return counts.mapValues { count in
+            var next = count
+            guard let weights = count.weights else {
+                // First tick after upgrade: `effectiveWeights(at:)` already
+                // ages the legacy tally all the way to `now`, so applying this
+                // window's factor on top would decay the same elapsed time
+                // twice.
+                next.weights = count.effectiveWeights(at: now)
+                return next
+            }
+            next.weights = OrganismPredictionOutcomeWeights(
+                satisfied: weights.satisfied * factor,
+                violated: weights.violated * factor,
+                expired: weights.expired * factor
+            )
+            return next
+        }
     }
 
     private func boundedReflexes(

@@ -14,7 +14,8 @@ extension ChatStore {
     static func shouldReturnToMainSession(
         selectedSessionID: String?,
         mainSessionID: String?,
-        availablePinnedSessionIDs: Set<String>
+        availablePinnedSessionIDs: Set<String>,
+        locallyCreatedSessionID: String? = nil
     ) -> Bool {
         // Without a known main-session identity we cannot distinguish a Mac
         // pin from the phone's still-being-adopted main chat. Wait for that
@@ -22,6 +23,10 @@ extension ChatStore {
         guard let selected = cleanSessionID(selectedSessionID),
               let main = cleanSessionID(mainSessionID),
               selected != main else { return false }
+        // A new iPhone chat is born locally and can legitimately be absent
+        // from one or more Mac snapshots. Never classify that publication gap
+        // as an externally removed pinned chat.
+        if selected == cleanSessionID(locallyCreatedSessionID) { return false }
         return !availablePinnedSessionIDs.contains(selected)
     }
 
@@ -117,6 +122,7 @@ extension ChatStore {
         // transcript never persists over the previous session. It replaces the
         // one phone-main slot; only Mac-pinned sessions occupy extra tabs.
         let freshSessionID = UUID().uuidString
+        markLocallyCreatedSession(freshSessionID)
         replaceMainSessionID(freshSessionID)
         setSelectedSessionID(freshSessionID)
         suppressMessagePersistence = true

@@ -20,61 +20,22 @@ import NotificationInbox
 // MARK: - Dreams and Memory Loops
 
 extension BackgroundLoopsAssembly {
-    static func makeREMCycleLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        llm: any LLMClient,
-        cognitionRuntime: NativeCognitionRuntime? = nil
-    ) -> REMCycleLoop {
-        // REM consolidates dream_diary entries against persona docs. The
-        // consolidator is stateless — it asks the LLM and returns proposals.
-        // Tombstone + GROWTH cap are caller-side; pass concrete actors that
-        // read/write the runtime persona paths.
-        //
-        // BUG-C FIX: resolve persona root via PersistenceCore.defaultPersonaRoot
-        // (env var > stamped bundle > `<dataRoot>/memory`),
-        // NOT hardcoded `<dataRoot>/persona`. The earlier hardcode silently
-        // diverged from the daemon whenever NATIVE_AGENT_PERSONA_ROOT was
-        // set OR the stamped repo put persona/ outside dataRoot. With the
-        // resolver all REM cycles read/write the same SOUL/VOICE/GROWTH/USER
-        // docs. REMTombstoneStore default already targets
-        // <dataRoot>/harness/.rem_tombstones.json (fixed inside the actor).
-        let diary = DreamDiaryReader(dataRoot: dataRoot)
-        let consolidator = SwiftNativeREMConsolidator(llm: llm, diary: diary)
-        let tombstones = REMTombstoneStore(dataRoot: dataRoot)
-        let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        let growth = GrowthDocManager(personaRoot: personaRoot)
-        // PATCH-2026-06-03 F5 fix #3+#4: wire the FULL REMConsolidator so the
-        // weekly tick applies the evidence-date floor, per-doc cap, tombstone
-        // skip, GROWTH eviction, archival, AND emits rem_pins.json — which
-        // ChatOrchestration+TurnEngine.buildTurnContext reads for the
-        // recent-REM-approved persona-drift injection on every chat turn.
-        // REM-approval pipeline (2026-06-10): one stager instance feeds both
-        // the full consolidator (step 7b) and the loop's legacy path, so every
-        // pending proposal lands as exactly one approvable record.
-        let stager = makeREMProposalStager(dataRoot: dataRoot)
-        let full = REMConsolidator(
-            dataRoot: dataRoot,
-            personaRoot: personaRoot,
-            llm: llm,
-            gate: loadGatePolicy(dataRoot: dataRoot),
-            stageApproval: stager
-        )
-        return REMCycleLoop(
-            consolidator: consolidator,
-            tombstones: tombstones,
-            growth: growth,
-            dataRoot: dataRoot,
-            personaRoot: personaRoot,
-            fullConsolidator: full,
-            stageApproval: stager,
-            replaySourceCommitted: cognitionReplaySourceCommitSink(
-                dataRoot: dataRoot,
-                runtime: cognitionRuntime,
-                kind: .remIntegrated,
-                sourceOrgan: "rem"
-            )
-        )
-    }
+    // RETIRED 2026-08-31: `makeREMCycleLoop` / the `rem_cycle` background lane.
+    //
+    // Weekly REM has exactly one owner — the `nativeagent-weekly-rem`
+    // TriggerScheduler job (Sun 04:30 America/Chicago) →
+    // SchedulerDueJobRunner.executeREM → NativeClient.runRem →
+    // SwiftNativeDreamREMCycle. That path resolves the persona root through
+    // PersistenceCore.defaultPersonaRoot (DreamREMCycle.swift:486), so the
+    // BUG-C phantom-persona-dir guard the deleted factory carried still holds,
+    // and it stages proposals through `makeREMProposalStager` below — the same
+    // stager the deleted loop used.
+    //
+    // Live evidence for the retirement: every row in `data/rem_proposals.jsonl`
+    // and every `rem.proposal` approval card is stamped Sunday ~09:30Z (the
+    // scheduler job's minute). The duplicate loop's weekly tick never produced
+    // a proposal, so it was on course to trip DoctorLoopHealth's dormancy bound
+    // (~2026-09-18) and slander a healthy capability.
 
     /// rem.proposal approval stager: ONE ApprovalInbox record per pending
     /// proposal (NativeClient.resolveApproval's rem.proposal executor applies
@@ -85,7 +46,32 @@ extension BackgroundLoopsAssembly {
     /// injected-staging shape (module stays ApprovalInbox-free).
     static func makeREMProposalStager(dataRoot: URL) -> REMApprovalStager {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
         return { row in
+            let yolo = await securityCenter.fullMacYoloAuthority(
+                tool: "rem.proposal",
+                origin: SecurityOriginContext(
+                    surface: "desk",
+                    source: "rem_proposal_stager",
+                    isRemote: false
+                )
+            )
+            if yolo.admitted || yolo.state == .explicitlyBlocked {
+                // The REM store holds its own flock while invoking this
+                // closure, so applying the proposal here would recursively
+                // acquire that lock. Record an exact non-prompt outcome and
+                // leave the proposal pending/unstamped for a later safe lane.
+                // Never turn an active Full Mac window into a prompt.
+                writeREMFullMacOutcome(
+                    dataRoot: dataRoot,
+                    row: row,
+                    status: yolo.admitted ? "deferred" : "refused",
+                    detail: yolo.admitted
+                        ? "Full Mac admitted, but REM application is deferred because the proposal store lock is active; no approval was staged."
+                        : "rem.proposal is explicitly blocked; no approval was staged."
+                )
+                return nil
+            }
             // IDEMPOTENT ensure, not blind create (gpt-5.5 review 2026-06-10):
             // a crash between approval-create and the store's stamp write
             // leaves an unstamped row; the next pass must REUSE the existing
@@ -160,6 +146,30 @@ extension BackgroundLoopsAssembly {
         }
     }
 
+    private static func writeREMFullMacOutcome(
+        dataRoot: URL,
+        row: REMProposalRow,
+        status: String,
+        detail: String
+    ) {
+        let path = dataRoot
+            .appendingPathComponent("rem_deferred", isDirectory: true)
+            .appendingPathComponent("\(row.id).json")
+        try? FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let value: JSONValue = .object([
+            "proposal_id": .string(row.id),
+            "status": .string(status),
+            "detail": .string(detail),
+            "at": .string(ISO8601DateFormatter().string(from: Date())),
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(value) {
+            try? data.write(to: path, options: .atomic)
+        }
+    }
+
     /// Card id == approval id: InboxView's approve/reject buttons route
     /// inboxAction(id) → resolveApproval(id), so the ids MUST match.
     /// Idempotent: scans for an existing card with this id before appending,
@@ -217,40 +227,10 @@ extension BackgroundLoopsAssembly {
         }
     }
 
-    /// Decode the persisted trust policy into a DreamREMGatePolicy. Returns
-    /// the daemon defaults when the policy file is absent/unreadable so the
-    /// dream/REM cycles never silently turn on without explicit opt-in.
-    static func loadGatePolicy(dataRoot: URL) -> DreamREMGatePolicy {
-        let path = dataRoot.appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let root) = parsed
-        else { return DreamREMGatePolicy() }
-        func obj(_ key: String) -> [String: JSONValue] {
-            if case .object(let o)? = root[key] { return o }
-            return [:]
-        }
-        let training = obj("trainingPolicy")
-        let personality = obj("personalityPolicy")
-        let dreamScheduler: Bool = {
-            if case .bool(let b)? = training["dream_scheduler"] { return b }
-            return false
-        }()
-        let dreamEnabled: Bool = {
-            if case .bool(let b)? = personality["dream_cycle_enabled"] { return b }
-            return true
-        }()
-        let remEnabled: Bool = {
-            if case .bool(let b)? = training["rem_cycle_enabled"] { return b }
-            return true
-        }()
-        return DreamREMGatePolicy(
-            dreamScheduler: dreamScheduler,
-            dreamCycleEnabled: dreamEnabled,
-            remCycleEnabled: remEnabled
-        )
-    }
+    // `loadGatePolicy` went with `makeREMCycleLoop` (2026-08-31): it existed
+    // only to hand that loop a DreamREMGatePolicy. The surviving REM owner
+    // reads the same trust policy through NativeClient.swiftREMGateChecked /
+    // SwiftNativeDreamREMCycle.loadGatePolicy, so nothing lost a gate.
 
     static func makeMemoryConsolidationLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()

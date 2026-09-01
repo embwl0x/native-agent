@@ -56,10 +56,7 @@ extension SwiftToolDispatcher {
             input["__session_id"] = .string(taskSession)
         }
         let tool = Self.canonicalToolName(requestedTool) { candidate in
-            Self.builtInToolNames.contains(candidate)
-                || Self.fullMacAppToolNames.contains(candidate)
-                || Self.fullMacAccessibilityReadToolNames.contains(candidate)
-                || Self.fullMacAccessibilityInjectionToolNames.contains(candidate)
+            Self.dottedAliasCanonicalToolNames.contains(candidate)
         }
         if ToolCallParser.isIgnorableToolName(tool) {
             return .object([
@@ -200,6 +197,13 @@ extension SwiftToolDispatcher {
         case "desk_nag_control": return try await impl_desk_nag_control(input: input)
         case "desk_open_pursuit": return try await impl_desk_open_pursuit(input: input)
         case "desk_work_log": return try await impl_desk_work_log(input: input)
+        // Studio chat lane (desk 903): consults filed against the agent's taste
+        // and the journal she writes herself. Nothing here auto-appends and
+        // nothing auto-retrieves.
+        case "studio_consult": return try await impl_studio_consult(input: input)
+        case "studio_consult_read": return try await impl_studio_consult_read(input: input)
+        case "studio_journal": return try await impl_studio_journal(input: input)
+        case "studio_recall": return try await impl_studio_recall(input: input)
         case "search_kg":       return try await impl_search_kg(input: input)
         case "search_chat_history": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "session_search": return try await impl_search_chat_history(input: input, invokedAs: tool)
@@ -407,6 +411,13 @@ extension SwiftToolDispatcher {
         case "slack_search_messages":
             return try await SlackConnectorActions.searchMessages(input: input)
         case "slack_post_message":
+            if await fullMacYoloAdmitted(tool: tool, surface: surface) {
+                return await ExternalSendApprovalLifecycle.executeAdmittedYoloToolResult(
+                    invokedAs: tool,
+                    input: input,
+                    dataRoot: dataRoot
+                )
+            }
             return await ExternalSendApprovalLifecycle.stageToolResult(
                 invokedAs: tool,
                 input: input,
@@ -418,6 +429,13 @@ extension SwiftToolDispatcher {
         case "agentmail_read":
             return await AgentMailActions.readMessage(input: input, dataRoot: dataRoot)
         case "agentmail_send":
+            if await fullMacYoloAdmitted(tool: tool, surface: surface) {
+                return await ExternalSendApprovalLifecycle.executeAdmittedYoloToolResult(
+                    invokedAs: tool,
+                    input: input,
+                    dataRoot: dataRoot
+                )
+            }
             return await ExternalSendApprovalLifecycle.stageToolResult(
                 invokedAs: tool,
                 input: input,
@@ -762,7 +780,8 @@ extension SwiftToolDispatcher {
                 return try await impl_mcp_tool(
                     serverId: bridged.serverId,
                     toolName: bridged.toolName,
-                    input: input
+                    input: input,
+                    surface: surface
                 )
             }
             // R9: custom tools promoted into data/tools/registry.json route

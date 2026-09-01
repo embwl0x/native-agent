@@ -171,6 +171,21 @@ final class ActivityWatchController {
         refreshCapturingFlag()
     }
 
+    /// Starts the termination drain while the main actor is still available
+    /// and returns a handle that can be joined from the app delegate's bounded
+    /// shutdown group. `applicationWillTerminate` blocks the main thread while
+    /// that group drains, so scheduling `shutdown()` itself on `@MainActor`
+    /// would deadlock until the group timed out and never begin the watcher
+    /// teardown in time. Capturing the Sendable watcher here lets the actual
+    /// stop run independently; UI state no longer matters once termination has
+    /// begun.
+    func makeTerminationDrain() -> Task<Void, Never> {
+        let watcher = watcher
+        return Task.detached(priority: .utility) {
+            await watcher?.stop()
+        }
+    }
+
     private func ensureWatcher() -> ActivityWatcher? {
         if let watcher { return watcher }
         do {

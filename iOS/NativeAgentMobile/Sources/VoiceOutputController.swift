@@ -44,7 +44,6 @@ final class VoiceOutputController: NSObject, ObservableObject {
     /// with `.notifyOthersOnDeactivation` hands the route back.
     private let deactivateAudioSession: () throws -> Void
     private var playbackState: VoiceOutputPlaybackState = .idle
-    private var interruptionObserver: NSObjectProtocol?
 
     init(
         configureAudioSession: @escaping () throws -> Void = {
@@ -68,21 +67,18 @@ final class VoiceOutputController: NSObject, ObservableObject {
         self.activateAudioSession = activateAudioSession
         self.deactivateAudioSession = deactivateAudioSession
         super.init()
-        interruptionObserver = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: AVAudioSession.sharedInstance(),
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handleAudioSessionInterruption()
-            }
-        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(audioSessionInterrupted(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance()
+        )
         // Intentionally NO synth init or AVAudioSession setup here — see comment above.
     }
 
-    deinit {
-        if let interruptionObserver {
-            NotificationCenter.default.removeObserver(interruptionObserver)
+    @objc nonisolated private func audioSessionInterrupted(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            self?.handleAudioSessionInterruption()
         }
     }
 

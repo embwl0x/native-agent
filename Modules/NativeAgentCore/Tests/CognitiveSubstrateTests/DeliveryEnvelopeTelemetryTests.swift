@@ -126,6 +126,36 @@ struct DeliveryEnvelopeTelemetryTests {
         #expect(!tense.oneBeat)
     }
 
+    /// The ONE criterion the live distribution left standing.
+    ///
+    /// 6acbbdf4 tuned `envelopeNeutralCharacters` down to 350 to raise in-band
+    /// adherence, and in doing so pulled the most expansive reachable ceiling
+    /// from 3,197 characters to 1,243 — below the 99th percentile of replies
+    /// this agent actually writes (2,033 over 727 live paired rows; p95 1,088,
+    /// max 6,448). Above-band exposure went from 18 rows / 9,303 characters to
+    /// 145 rows / 57,363. Adherence is not an objective here — reshuffling
+    /// `sizePrior` and re-fitting still reaches 91.5% against the true
+    /// pairing's 93.5% — but "a mis-sized envelope truncates real work" is, and
+    /// it is the asymmetric one: nothing pads a short reply, while a low
+    /// ceiling cuts a long one.
+    ///
+    /// So this pins the ceiling, not the fit. Any future move of the center has
+    /// to keep the expansive end above the replies the agent really produces.
+    @Test("the most expansive band still clears the replies the agent writes")
+    func expansiveBandClearsTheObservedReplyTail() {
+        let expansive = CognitiveSubstrate.deliveryEnvelope(
+            signals: signals(valence: 0.9, arousal: 0.9, tension: 0.1,
+                             pressure: 0.0, fatigue: 0.0, curiosity: 1.0),
+            serveCharacters: 4_000,
+            dynamics: .derived(from: PersonalityTraitDials(brevity: 0)))
+        let observedReplyP99 = 2_033
+        #expect(expansive.maximumCharacters >= observedReplyP99)
+        // And the declared hard ceiling must still be capable of binding: a
+        // reachable maximum far under `envelopeCeilingCharacters` means the
+        // stated "cannot truncate real work" bound is decorative.
+        #expect(expansive.maximumCharacters * 2 >= CognitiveSubstrate.envelopeCeilingCharacters)
+    }
+
     /// P1's `brevity` dial, finally driving something. Neutral dials must be a
     /// no-op, exactly as the P1 contract promises.
     @Test("the brevity trait leans the band and neutral dials are a no-op")

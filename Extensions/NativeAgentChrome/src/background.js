@@ -118,7 +118,7 @@ async function dispatch(request) {
     case "page.snapshot.read":
       return readStructuredSnapshot(request.payload);
     case "page.element.click":
-      return clickSnapshotNode(request.payload);
+      return clickSnapshotNode(request.payload, request.id);
     case "page.element.fill":
       return fillSnapshotNode(request.payload, request.id);
     case "page.element.type":
@@ -134,7 +134,7 @@ async function dispatch(request) {
     case "page.wait":
       return waitForPage(request.payload, request.id);
     case "page.scroll":
-      return scrollPage(request.payload);
+      return scrollPage(request.payload, request.id);
     default:
       throw new ProtocolError("unknown_action", `Unknown action '${request.action}'.`);
   }
@@ -392,19 +392,21 @@ function boundSnapshotForTransport(snapshot, routes) {
   return snapshot;
 }
 
-async function clickSnapshotNode(payload) {
+async function clickSnapshotNode(payload, actionId) {
   const lease = leaseManager.requireForPageAction(payload);
   if (payload.button !== undefined && payload.button !== "left") {
     throw new ProtocolError("button_not_supported", "Structured page clicks currently support the left button only.");
   }
   const route = requireSnapshotRoute(lease, payload);
-  const result = await sendPageMessage(lease.tabId, {
-    type: "nativeagent.page.click",
-    snapshotId: route.localSnapshotId,
-    nodeId: route.localNodeId,
-    button: payload.button ?? "left",
-  }, { frameId: route.frameId });
-  return { ...result, snapshotId: payload.snapshotId, nodeId: payload.nodeId, frameId: route.frameId };
+  return performSnapshotMutation({
+    lease, route, payload, actionId, action: "click",
+    pageMessage: {
+      type: "nativeagent.page.click",
+      snapshotId: route.localSnapshotId,
+      nodeId: route.localNodeId,
+      button: payload.button ?? "left",
+    },
+  });
 }
 
 async function fillSnapshotNode(payload, actionId) {
@@ -590,7 +592,13 @@ async function performSnapshotMutation({ lease, route, payload, actionId, action
       : "succeeded",
     verification: action === "type" && response.result?.characterCount === 0 && response.result?.completed === false
       ? "not_verified" : "page_acknowledged",
-    detail: { ...response.result, snapshotId: payload.snapshotId, nodeId: payload.nodeId, frameId: route.frameId },
+    detail: {
+      ...response.result,
+      snapshotId: payload.snapshotId ?? null,
+      ...(payload.nodeId !== undefined ? { nodeId: payload.nodeId } : {}),
+      ...(payload.targetNodeId !== undefined ? { targetNodeId: payload.targetNodeId } : {}),
+      frameId: route.frameId,
+    },
   });
 }
 
@@ -601,7 +609,7 @@ function pageActionResult({ actionId, action, lease, payload, startedAt, outcome
     leaseId: lease.leaseId,
     userSequence: lease.userSequence,
     snapshotId: payload.snapshotId ?? null,
-    nodeId: payload.nodeId ?? null,
+    nodeId: payload.nodeId ?? payload.targetNodeId ?? null,
     outcome,
     verification,
     retry: outcome === "outcome_unknown" ? "never_automatic"
@@ -619,20 +627,22 @@ function normalizedPageError(response) {
   };
 }
 
-async function scrollPage(payload) {
+async function scrollPage(payload, actionId) {
   const lease = leaseManager.requireForPageAction(payload);
   const route = payload.targetNodeId ? requireSnapshotRoute(lease, {
     ...payload,
     nodeId: payload.targetNodeId,
   }) : { frameId: 0, localSnapshotId: payload.snapshotId, localNodeId: undefined };
-  const result = await sendPageMessage(lease.tabId, {
-    type: "nativeagent.page.scroll",
-    snapshotId: route.localSnapshotId,
-    targetNodeId: route.localNodeId,
-    deltaX: payload.deltaX,
-    deltaY: payload.deltaY,
-  }, { frameId: route.frameId });
-  return { ...result, snapshotId: payload.snapshotId ?? null, targetNodeId: payload.targetNodeId ?? null, frameId: route.frameId };
+  return performSnapshotMutation({
+    lease, route, payload, actionId, action: "scroll",
+    pageMessage: {
+      type: "nativeagent.page.scroll",
+      snapshotId: route.localSnapshotId,
+      targetNodeId: route.localNodeId,
+      deltaX: payload.deltaX,
+      deltaY: payload.deltaY,
+    },
+  });
 }
 
 async function sendPageMessage(tabId, message, options = undefined) {

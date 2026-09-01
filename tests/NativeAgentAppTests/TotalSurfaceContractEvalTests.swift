@@ -9,7 +9,8 @@ import Testing
 ///
 /// This is deliberately not the only proof. `script/evals.sh --full` pairs it
 /// with the complete Swift suites, required iOS simulator tests, the live
-/// instrument, and the strict installed-app Accessibility walk.
+/// instrument, and an exact verified install. The separate `--ui` flag adds
+/// the strict installed-app Accessibility walk.
 @Suite("Total surface contract")
 struct TotalSurfaceContractEvalTests {
     static let repo = EvalCoverageLedgerTests.repo

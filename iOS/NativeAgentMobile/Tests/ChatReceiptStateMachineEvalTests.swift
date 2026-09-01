@@ -109,6 +109,75 @@ final class ChatReceiptStateMachineEvalTests: XCTestCase {
         assertNoReplyWaits(store)
     }
 
+    func test_historyRefreshReadsNewSnapshotEvenWithCachedTranscript() async throws {
+        let engine = iCloudSyncEngine.shared
+        let oldDirectory = engine.snapshotDir
+        let oldTranscripts = engine.chatTranscripts
+        let oldSyncAt = engine.lastSyncAt
+        let oldError = engine.syncError
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            engine.snapshotDir = oldDirectory
+            engine.chatTranscripts = oldTranscripts
+            engine.lastSyncAt = oldSyncAt
+            engine.syncError = oldError
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let sid = "phone-session"
+        let user = ChatMessageRecord(id: UUID().uuidString, sessionId: sid, role: "user", content: "Hello")
+        let reply = ChatMessageRecord(id: UUID().uuidString, sessionId: sid, role: "assistant", content: "Reply saved on Mac")
+        engine.snapshotDir = directory
+        engine.chatTranscripts = [sid: [user]]
+        let snapshot = [ChatTranscriptSnapshot(sessionId: sid, messages: [user, reply])]
+        try JSONEncoder().encode(snapshot).write(to: directory.appendingPathComponent("chat_transcripts.json"))
+
+        let client = MacBridgeClient()
+        let refreshed = await client.refreshChatHistory(sessionID: sid)
+        XCTAssertEqual(refreshed?.map(\.text), ["Hello", "Reply saved on Mac"])
+
+        // An unavailable refresh retains last-good history, not a blank chat.
+        engine.snapshotDir = nil
+        let retained = await client.refreshChatHistory(sessionID: sid)
+        XCTAssertEqual(retained, refreshed)
+    }
+
+    func test_forceRefreshUpdatesTextUnderTheSameMessageID() async {
+        let store = makeStore()
+        store.setSelectedSessionID("phone-session")
+        let old = ChatMessage(role: .assistant, text: "")
+        store.messages = [old]
+        var completed = old
+        completed.text = "Now visible"
+        await store.forceRefresh(loadHistory: { _ in [completed] }, fallbackMessages: nil)
+        XCTAssertEqual(store.messages, [completed])
+    }
+
+    func test_forceRefreshCannotReplaceAChatSelectedDuringItsRead() async {
+        for returnsSnapshot in [true, false] {
+            let store = makeStore()
+            store.setSelectedSessionID("old-chat")
+            let oldReply = ChatMessage(role: .assistant, text: "Old chat reply")
+            await store.forceRefresh(loadHistory: { requested in
+                XCTAssertEqual(requested, "old-chat")
+                store.startNewSession()
+                return returnsSnapshot ? [oldReply] : nil
+            }, fallbackMessages: [oldReply])
+            XCTAssertTrue(store.messages.isEmpty)
+        }
+    }
+
+    func test_forceRefreshRecoversPendingReplyAndRetiresItsReceipt() async {
+        let (store, _) = pendingStore()
+        let user = store.messages[0]
+        let reply = ChatMessage(role: .assistant, text: "Recovered reply")
+        await store.forceRefresh(loadHistory: { _ in [user, reply] }, fallbackMessages: nil)
+        XCTAssertEqual(store.messages.map(\.text), [user.text, reply.text])
+        XCTAssertFalse(store.isLoading)
+        XCTAssertTrue(store.pendingICloudPlaceholders.isEmpty)
+        XCTAssertTrue(store.resolvedICloudReplyIds.contains("turn-1"))
+    }
+
     func test_everyReplyTerminalRetiresItsTimeoutAndPollTogether() async {
         let errorID = "turn-error"
         let (errorStore, _) = pendingStore(correlationID: errorID)

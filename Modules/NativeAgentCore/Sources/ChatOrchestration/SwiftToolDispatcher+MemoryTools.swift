@@ -343,22 +343,31 @@ extension SwiftToolDispatcher {
             meta["tags"] = .array(tags.map { .string($0) })
         }
         if let rawTopics = input["context_topics"] {
-            guard kind.lowercased() == "correction", case .array(let values) = rawTopics,
-                  !values.isEmpty, values.count <= 8 else {
+            guard case .array(let values) = rawTopics else {
+                throw AutonomyGateError.toolDenied(reason: "context_topics must be an array")
+            }
+            // Strict provider schemas can materialize every optional array as
+            // `[]`. That is the wire-equivalent of omission, not an attempt to
+            // scope an ordinary fact as a correction.
+            if values.isEmpty {
+                // Leave the metadata absent so recall cannot mistake an empty
+                // strict-schema placeholder for a real contextual boundary.
+            } else if kind.lowercased() != "correction" || values.count > 8 {
                 throw AutonomyGateError.toolDenied(reason: "context_topics requires a correction and 1–8 topic phrases")
-            }
-            var topics: [JSONValue] = []
-            for value in values {
-                guard case .string(let raw) = value else {
-                    throw AutonomyGateError.toolDenied(reason: "context_topics must contain strings")
+            } else {
+                var topics: [JSONValue] = []
+                for value in values {
+                    guard case .string(let raw) = value else {
+                        throw AutonomyGateError.toolDenied(reason: "context_topics must contain strings")
+                    }
+                    let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !topic.isEmpty, topic.count <= 120 else {
+                        throw AutonomyGateError.toolDenied(reason: "context_topics must contain nonempty phrases of at most 120 characters")
+                    }
+                    topics.append(.string(topic))
                 }
-                let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !topic.isEmpty, topic.count <= 120 else {
-                    throw AutonomyGateError.toolDenied(reason: "context_topics must contain nonempty phrases of at most 120 characters")
-                }
-                topics.append(.string(topic))
+                meta["context_topics"] = .array(topics)
             }
-            meta["context_topics"] = .array(topics)
         }
 
         let record: MemoryRecord

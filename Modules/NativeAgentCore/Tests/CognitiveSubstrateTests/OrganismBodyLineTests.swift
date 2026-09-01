@@ -39,6 +39,47 @@ struct OrganismBodyLineTests {
         #expect(p.bodyLine == "- Body: provider or tool path feels brittle; be careful before claiming completion.")
     }
 
+    @Test func unknownProviderEvidenceDoesNotClaimABrittlePath() {
+        // The compatibility Bool maps unknown provider evidence to false. The
+        // chemistry already declines to treat that as a failure; the prompt
+        // line must agree, or sparse evidence writes "brittle" into the turn.
+        let now = Date(timeIntervalSince1970: 0)
+        let uncertain = ProviderPathBeliefProjection(
+            generatedAt: now,
+            estimate: 0.5,
+            freshness: 0.8,
+            uncertainty: 0.7,
+            evidenceCount: 2,
+            newestEvidenceAt: now,
+            state: .uncertain,
+            bodySchemaProvidersHealthy: nil
+        )
+        #expect(uncertain.bodySchemaProvidersHealthy == nil)
+        let body = BodySchema(providersHealthy: false, providerPathBelief: uncertain)
+        let p = OrganismChemistry.projection(at: now, chemicalState: .neutral, bodySchema: body)
+        #expect(p.bodyLine != "- Body: provider or tool path feels brittle; be careful before claiming completion.")
+    }
+
+    @Test func observedBrittleProviderStillWarns() {
+        // Regression guard: a belief that actually reads brittle must keep the
+        // warning. Only unknown was ever the bug.
+        let now = Date(timeIntervalSince1970: 0)
+        let brittle = ProviderPathBeliefProjection(
+            generatedAt: now,
+            estimate: 0.1,
+            freshness: 0.8,
+            uncertainty: 0.2,
+            evidenceCount: 6,
+            newestEvidenceAt: now,
+            state: .brittle,
+            bodySchemaProvidersHealthy: false
+        )
+        #expect(brittle.bodySchemaProvidersHealthy == false)
+        let body = BodySchema(providersHealthy: false, providerPathBelief: brittle)
+        let p = OrganismChemistry.projection(at: now, chemicalState: .neutral, bodySchema: body)
+        #expect(p.bodyLine == "- Body: provider or tool path feels brittle; be careful before claiming completion.")
+    }
+
     @Test func coherenceAndConfidenceGradeWithinHighBand() {
         // The gate is coherence>=0.65 && confidence>=0.62, so it only ever fires in
         // the high range; grade within it: 0.62–0.8 → "settled and clear", >=0.8 →

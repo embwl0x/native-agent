@@ -1122,6 +1122,39 @@ struct WorkshopExecutorApprovalSuite {
         #expect(toolCount == 1)  // ran unattended
     }
 
+    @Test func yoloWorkshopExecutionDoesNotPromptForExplicitTrustRequired() async throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "yolo-explicit-trust"
+        try await seedWorkshopExecution(
+            root: root, id: id, title: "y", objective: "y",
+            planJSON: """
+            [{"id": "step-1", "description": "write", "tool_or_action": "file.write", "args": {}, "autonomy": "needs_approval"}]
+            """,
+            trustRequired: "send_approval"
+        )
+        let staged = Counter()
+        let toolRuns = Counter()
+        let executor = WorkshopExecutorLoop(
+            root: root,
+            toolDispatch: { _, _ in
+                await toolRuns.bump()
+                return .object(["status": .string("succeeded")])
+            },
+            stageApproval: { _ in
+                await staged.bump()
+                return "should-not-stage"
+            },
+            cancellationPollInterval: 0.02,
+            stepApprovalEnforced: { false }
+        )
+        await executor.drainOnce()
+        let final = await readWorkshopExecution(root: root, id: id)
+        #expect(final?.status == "completed")
+        #expect(await staged.snapshot().0 == 0)
+        #expect(await toolRuns.snapshot().0 == 1)
+    }
+
     @Test func resumeApprovedExecutesStepThenContinuesToCompletion() async throws {
         let root = try makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

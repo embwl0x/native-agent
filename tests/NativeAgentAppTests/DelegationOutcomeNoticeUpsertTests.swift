@@ -38,6 +38,17 @@ private func inboxRows(_ root: URL) throws -> [[String: JSONValue]] {
     }
 }
 
+/// A stamp the live inbox's 30-day retention will always read as recent.
+/// `LiveNotificationInbox` prunes terminal rows by wall-clock age, so a
+/// hard-coded date in a seeded `archived`/`dismissed` fixture is a scheduled
+/// failure: the row is fine until the calendar crosses the cutoff, then the
+/// write under test shelves it and the assertion that it survived breaks.
+private func recentInboxStamp(daysAgo: Double = 3) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: Date().addingTimeInterval(-daysAgo * 24 * 60 * 60))
+}
+
 private func codexJob(id: String = "cx-1", undelivered: Bool) -> DelegationJobSnapshot {
     DelegationJobSnapshot(
         id: id, source: "codex", agent: "codex", topicSlug: "mac-chat-658-16",
@@ -171,7 +182,7 @@ struct DelegationOutcomeNoticeUpsertTests {
         let preserved = try #require(DelegationOutcomeCard.make(from: codexJob(undelivered: true), now: now))
         // Legacy "Codex finished" info row the user had dismissed.
         let legacy = """
-        {"id":"\(preserved.cardId)","source":"delegation_outcome","severity":"info","title":"Codex finished","error_signature":"\(preserved.jobKey)","status":"dismissed","read_at":"2026-08-20T12:00:00Z"}
+        {"id":"\(preserved.cardId)","source":"delegation_outcome","severity":"info","title":"Codex finished","error_signature":"\(preserved.jobKey)","status":"dismissed","read_at":"\(recentInboxStamp())"}
         """
         try Data((legacy + "\n").utf8).write(to: root.appendingPathComponent("notifications/inbox.jsonl"))
         #expect(await BackgroundLoopsAssembly.fileDelegationOutcomeNotice(dataRoot: root, card: preserved))

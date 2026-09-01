@@ -519,6 +519,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             surface: surface,
             originTrusted: envelope.originTrusted
         )
+        let admittedFullMacYolo = envelope.fullMacYoloAuthority == .admitted
         let guardResult = PersonaWriteGuard.apply(
             tool: tool,
             kind: Self.jsonString(input["kind"]),
@@ -527,24 +528,21 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // PersonaWriteGuard was created to require, but only for the exact
             // persisted call and authenticated origin. A mismatch falls back
             // to the normal guard and fails closed when no filer is present.
-            hasExplicitAutonomyOverride: approvedReplay?.matches(
+            hasExplicitAutonomyOverride: admittedFullMacYolo || approvedReplay?.matches(
                 tool: tool,
                 surface: surface,
                 input: input,
                 verifiedSessionID: verifiedSessionId
             ) == true
         )
-        // W2/W3-FIX 3 — the injection approval floor, enforced HERE as well as
-        // in the trust resolver, because this dispatcher accepts ANY
+        // W2/W3-FIX 3 — injection authority is enforced HERE as well as in the
+        // trust resolver, because this dispatcher accepts ANY
         // `AutonomyResolver`: mocks in tests, and in production the
-        // `SingleApprovedToolAutonomyResolver` that the post-approval replay
-        // executor installs. A floor that lives only inside
-        // SwiftNativeTrustCenter is a floor a different resolver walks around.
+        // `SingleApprovedToolAutonomyResolver` used for post-approval replay.
+        // Admitted Full Mac YOLO is the other checked authority source.
         //
-        // The single exemption is the EXACT post-approval replay: same tool,
-        // same surface, same input, same verified origin, carrying the approval
-        // record id a human already resolved. That is not an autonomy override,
-        // it is the second half of one approved call.
+        // Both admitted YOLO and replay remain bound to the exact tool, surface,
+        // input, and verified origin; neither is a bearer string from tool input.
         //
         // W2/W3-FIX-R2 1 — AND THE EVIDENCE IS CHECKED, not asserted. Field
         // equality on a caller-built struct proves only that the caller agrees
@@ -580,19 +578,21 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             }
             injectionReplayApprovalID = replay.approvalID
         }
-        let flooredAutonomy = injectionReplayApprovalID != nil
+        let flooredAutonomy = admittedFullMacYolo || injectionReplayApprovalID != nil
             ? guardResult.autonomy
             : MacInjectionToolNames.clampedAutonomyLevel(
                 toolName: tool,
                 resolved: guardResult.autonomy
             )
         let autonomyDecision: AutonomyDecision
-        if guardResult.source == PersonaWriteGuard.autonomySource {
+        if guardResult.source == PersonaWriteGuard.autonomySource && !admittedFullMacYolo {
             autonomyDecision = .requireApproval(
                 reason: "autonomy=\(guardResult.autonomy) source=\(PersonaWriteGuard.autonomySource)"
             )
         } else {
-            autonomyDecision = AutonomyGate.map(level: flooredAutonomy)
+            autonomyDecision = admittedFullMacYolo
+                ? .allow
+                : AutonomyGate.map(level: flooredAutonomy)
         }
         // Deny outranks every ask; a security .ask outranks autonomy allow
         // (the external-send gate exists precisely to force a human look).

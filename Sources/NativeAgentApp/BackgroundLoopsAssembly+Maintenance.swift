@@ -72,10 +72,28 @@ extension BackgroundLoopsAssembly {
         llm: any LLMClient
     ) -> WeeklySelfImprovementLoop {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+        let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
         return WeeklySelfImprovementLoop(
             llm: llm,
             dataRoot: dataRoot,
-            isEnabled: { UserDefaults.standard.bool(forKey: "selfImprovementEnabled") },
+            isEnabled: {
+                guard UserDefaults.standard.bool(forKey: "selfImprovementEnabled") else {
+                    return false
+                }
+                // Full Mac already supplies temporary runtime authority. A
+                // background suggestion is not a validated action executor,
+                // so suppress its approval producer instead of prompting or
+                // permanently changing policy while YOLO is active.
+                let yolo = await securityCenter.fullMacYoloAuthority(
+                    tool: "self_improvement.apply",
+                    origin: SecurityOriginContext(
+                        surface: "desk",
+                        source: "weekly_self_improvement",
+                        isRemote: false
+                    )
+                )
+                return !yolo.admitted
+            },
             stageProposal: { proposal in
                 let body: JSONValue = .object([
                     "title": .string(proposal.title),

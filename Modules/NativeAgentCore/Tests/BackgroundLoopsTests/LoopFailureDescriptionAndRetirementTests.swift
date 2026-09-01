@@ -135,9 +135,17 @@ private struct EmptyErrorLoop: LoopRunner {
     #expect(loops["stale_artifact_sweep"] == nil)
 }
 
-@Test func retiredIdsAreExactlyTheDeRegisteredPair() {
+@Test func retiredIdsAreExactlyTheDeRegisteredSet() {
     // mission_executor is a LIVE wire id (de-mission rename fence) and must
     // never appear here; if this set grows, the assembly comment for the
     // newly retired loop is the place that justifies it.
-    #expect(SwiftNativeLoopScheduler.retiredLoopIds == ["golden_eval", "stale_artifact_sweep"])
+    //
+    // `rem_cycle` joined 2026-08-31: the duplicate weekly REM lane, retired in
+    // favour of the `nativeagent-weekly-rem` TriggerScheduler job.
+    // `memory_consolidation` and `self_improvement_sweep` are NOT here — both
+    // are live weekly lanes with no other owner.
+    #expect(SwiftNativeLoopScheduler.retiredLoopIds
+            == ["golden_eval", "stale_artifact_sweep", "rem_cycle"])
+    #expect(!SwiftNativeLoopScheduler.retiredLoopIds.contains("memory_consolidation"))
+    #expect(!SwiftNativeLoopScheduler.retiredLoopIds.contains("self_improvement_sweep"))
 }

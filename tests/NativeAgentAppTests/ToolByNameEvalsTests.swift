@@ -1,4 +1,4 @@
-import ChatOrchestration
+@testable import ChatOrchestration
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -10,8 +10,9 @@ import Testing
 // Every test drives the REAL SwiftToolDispatcher.dispatch through the same
 // switch the chat turn uses, against a hermetic data root, and asserts the
 // envelope/throw that actually reaches the caller. The pinned shapes were
-// captured from a live probe run of all 95 keeper-baseline `tool:` entries
-// (not assumed from source), so these tests bite when:
+// captured from live probes and continuously reconciled against the current
+// runtime catalog (not assumed from a stale hand-maintained count), so these
+// tests bite when:
 //   - a fail-closed gate (canonical-body, lazy catalog, permission store,
 //     bridge wiring) silently opens or its refusal envelope drifts into
 //     something a model would read as success;
@@ -597,6 +598,39 @@ struct ToolByNameSendPathEvals {
                 "\(tool) must name the missing config, got \(result)"
             )
         }
+    }
+}
+
+@Suite("ToolByName: every installed native tool reaches a real dispatch boundary")
+struct ToolByNameExhaustiveDispatchEvals {
+    @Test func everyCataloguedToolDispatchesWithoutUnknownOrLazyGateDrift() async throws {
+        let root = try makeHermeticRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dispatcher = makeDispatcher(root: root)
+        let tools = Array(SwiftToolDispatcher.reservedBuiltInNames)
+
+        #expect(tools.count >= 150, "the canonical Core catalog unexpectedly shrank to \(tools.count) tools")
+        #expect(Set(tools).count == tools.count, "the native catalog contains duplicate tool names")
+
+        var visited = Set<String>()
+        for tool in tools.sorted() {
+            visited.insert(tool)
+            do {
+                let result = try await dispatcher.dispatch(tool: tool, input: [:], surface: "chat")
+                let rendered = String(describing: result).lowercased()
+                #expect(!rendered.contains("unknown tool"), "\(tool) fell out of the dispatch switch")
+                #expect(!rendered.contains("unknown_tool"), "\(tool) returned an unknown-tool envelope")
+                #expect(!rendered.contains("not_loaded"), "\(tool) did not honor its exact active-tool load")
+                #expect(!rendered.contains("missing_session_id"), "\(tool) lost the canonical chat session")
+            } catch {
+                let rendered = String(describing: error).lowercased()
+                #expect(!rendered.contains("unknown tool"), "\(tool) fell out of the dispatch switch: \(error)")
+                #expect(!rendered.contains("not loaded"), "\(tool) did not honor its exact active-tool load: \(error)")
+                #expect(!rendered.contains("session_id is required"), "\(tool) lost the canonical chat session: \(error)")
+            }
+        }
+
+        #expect(visited == Set(tools), "the exhaustive pass skipped a catalogued native tool")
     }
 }
 

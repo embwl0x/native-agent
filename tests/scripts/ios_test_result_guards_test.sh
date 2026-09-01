@@ -20,6 +20,9 @@ STUB
 cat > "$TMP/bin/xcodebuild" <<'STUB'
 #!/usr/bin/env bash
 [[ " $* " == *" -resultBundlePath "*"/tests.xcresult "* ]] || exit 93
+if [[ -n "${EXPECTED_ONLY_TESTING:-}" ]]; then
+  [[ " $* " == *" -only-testing:NativeAgentMobileTests/$EXPECTED_ONLY_TESTING "* ]] || exit 94
+fi
 exit "${BUILD_EXIT:-0}"
 STUB
 chmod +x "$TMP/bin/xcrun" "$TMP/bin/xcodebuild"
@@ -40,6 +43,13 @@ run_case() {
 }
 valid='{"result":"Passed","totalTestCount":3,"passedTests":2,"failedTests":0,"skippedTests":1,"expectedFailures":0}'
 run_case executed pass "$valid"
+EXPECTED_ONLY_TESTING=FocusedIOSFixtureTests RESULT_SUMMARY="$TMP/summary.json" \
+  BUILD_EXIT=0 RESULT_TOOL_EXIT=0 NATIVE_AGENT_SWIFTPM_DISABLE_SANDBOX=0 PATH="$TMP/bin:$PATH" \
+  bash "$TMP/repo/script/test_ios.sh" --require --only-testing FocusedIOSFixtureTests \
+  > "$TMP/only-testing.log" 2>&1 \
+  || { echo "FAIL: focused iOS selector did not reach xcodebuild" >&2; exit 1; }
+grep -q '\[test-ios\] passed: 2 passed, 1 skipped' "$TMP/only-testing.log" \
+  || { echo "FAIL: focused iOS selector did not retain execution proof" >&2; exit 1; }
 run_case command-failure fail "$valid" 65
 run_case timeout fail "$valid" 124
 run_case unreadable-result fail "$valid" 0 1

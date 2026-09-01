@@ -160,6 +160,10 @@ extension AppModel {
         try await client.getTrustPolicy()
     }
 
+    func fullMacYoloAuthorityAdmitted(tool: String, surface: String) async -> Bool {
+        await client.fullMacYoloAuthorityAdmitted(tool: tool, surface: surface)
+    }
+
     func saveMacControlPolicy(_ policy: TrustMacControlPolicy) async throws -> TrustPolicy {
         try await client.saveMacControlPolicy(policy)
     }

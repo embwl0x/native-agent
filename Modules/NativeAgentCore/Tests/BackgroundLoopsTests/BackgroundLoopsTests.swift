@@ -142,7 +142,7 @@ private actor RecordingSchedulerJobWriter: SchedulerJobWriter {
     )
     let w = try await sn.getWatchdog()
     #expect(w.daemon == "swift")
-    #expect(w.uptimeSeconds == 60)
+    #expect(w.uptimeSeconds == 0)
     #expect(w.daemonLifecycleStatus == "stopped")
     #expect(w.launchAgentStatus == "not_applicable")
     #expect(w.repairAvailable == false)
@@ -937,16 +937,15 @@ private actor RecoverySpy {
 // `uptimeSeconds(now:)` is rendered as "Uptime" by Sources/NativeAgentApp/
 // StatusView.swift and iOS/NativeAgentMobile/Sources/SettingsViewFull.swift,
 // and had no direct test: the `uptimeSeconds` hits elsewhere in this file are
-// on WatchdogStatus's DECODED field, which is a DIFFERENT number computed from
-// SwiftNativeBackgroundLoops' own `startedAt`.
+// on WatchdogStatus's decoded field. The watchdog and manager must now share
+// this one lifecycle-owned value.
 //
 // Two silent modes pinned here:
 //   1. SILENT ZERO — a manager that never started (or whose start() bailed on
 //      the generation guard) reports 0s, which is exactly what a healthy,
 //      just-launched app shows. Only the isRunning() pair disambiguates.
-//   2. LIFECYCLE RESIDUE — stop() clears `started` but NOT `startedAt`, so the
-//      number keeps climbing after the loops are gone. Asserted, so the
-//      meaning of the rendered figure is a decision rather than an accident.
+//   2. STOPPED TRUTH — a stopped manager reports zero rather than letting an
+//      old start timestamp continue to look like live uptime.
 
 private final class SteppableClock: @unchecked Sendable {
     private let lock = NSLock()
@@ -982,7 +981,7 @@ private final class SteppableClock: @unchecked Sendable {
     await manager.stop()
 }
 
-@Test func managerUptime_keepsClimbingAfterStop_soIsRunningIsTheLivenessSignal() async {
+@Test func managerUptime_isZeroAfterStop_andRebasesOnRestart() async {
     let clock = SteppableClock(Date(timeIntervalSince1970: 2_000))
     let manager = BackgroundLoopsManager(clock: { clock.now })
     _ = await manager.start(loops: [])
@@ -993,10 +992,7 @@ private final class SteppableClock: @unchecked Sendable {
     await manager.stop()
     clock.advance(60)
     #expect(await manager.isRunning() == false)
-    #expect(
-        await manager.uptimeSeconds(now: clock.now) == 90,
-        "stop() clears `started` but not `startedAt` — the rendered Uptime keeps climbing for a manager with no running loops; isRunning() is the only liveness signal"
-    )
+    #expect(await manager.uptimeSeconds(now: clock.now) == 0)
 
     // Restart rebases the clock rather than accumulating the stopped gap.
     _ = await manager.start(loops: [])
@@ -1006,12 +1002,7 @@ private final class SteppableClock: @unchecked Sendable {
     await manager.stop()
 }
 
-@Test func watchdogUptimeAndManagerUptimeAreTwoIndependentNumbers() async throws {
-    // SwiftNativeBackgroundLoops stamps its OWN startedAt at CONSTRUCTION;
-    // BackgroundLoopsManager stamps its own at start(). Nothing reconciles the
-    // two, so the watchdog can report a healthy-looking uptime for a manager
-    // that never started. Pin the divergence AND the field that does track the
-    // manager, so a UI reading the wrong one is a caught mistake.
+@Test func watchdogUptimeComesFromTheManagerLifecycleOwner() async throws {
     let clock = SteppableClock(Date(timeIntervalSince1970: 5_000))
     let manager = BackgroundLoopsManager(clock: { clock.now })
     let sn = SwiftNativeBackgroundLoops(
@@ -1022,7 +1013,7 @@ private final class SteppableClock: @unchecked Sendable {
     )
 
     let stopped = try await sn.getWatchdog()
-    #expect(stopped.uptimeSeconds == 1_000, "the watchdog's uptime is its own construction clock")
+    #expect(stopped.uptimeSeconds == 0)
     #expect(await manager.uptimeSeconds(now: clock.now) == 0, "the manager never started")
     #expect(stopped.daemonLifecycleStatus == "stopped",
             "lifecycle status — not uptimeSeconds — is what tracks the manager")
@@ -1031,10 +1022,9 @@ private final class SteppableClock: @unchecked Sendable {
     clock.advance(10)
     let running = try await sn.getWatchdog()
     let managerUptime = await manager.uptimeSeconds(now: clock.now)
-    #expect(running.uptimeSeconds == 1_010)
+    #expect(running.uptimeSeconds == 10)
     #expect(managerUptime == 10)
-    #expect(running.uptimeSeconds != managerUptime,
-            "two independent uptimes; nothing in production compares them")
+    #expect(running.uptimeSeconds == managerUptime)
     #expect(running.daemonLifecycleStatus == "ok")
     await manager.stop()
 }

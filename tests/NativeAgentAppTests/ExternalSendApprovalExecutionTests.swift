@@ -55,6 +55,21 @@ private func writeExternalSendAgentMailConfig(_ root: URL) throws {
     ]).serializedData(pretty: true).write(to: path)
 }
 
+private func enableExternalSendFullMacYolo(_ root: URL) throws {
+    let path = root
+        .appendingPathComponent("trust", isDirectory: true)
+        .appendingPathComponent("policy.json")
+    try FileManager.default.createDirectory(
+        at: path.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try JSONValue.object([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacNeverExpires": .bool(true),
+        "filePolicy": .object(["outsideWorkspaceDefault": .string("allow")]),
+    ]).serializedData(pretty: true).write(to: path)
+}
+
 private func resolvedSlackApproval(
     root: URL,
     decision: ApprovalDecision
@@ -149,6 +164,28 @@ private func writeLegacyTerminalReceiptBeyondFormerTailWindow(
     #expect(replay.actionID == "slack.post_message")
     #expect(replay.surface == "connector_action")
     #expect(replay.input["text"] == .string("connector dispatch private body"))
+}
+
+@Test func connectorDispatchFullMacYoloNeverCreatesExternalSendApproval() async throws {
+    let root = try externalSendRoot("connector-yolo-no-prompt")
+    defer { try? FileManager.default.removeItem(at: root) }
+    try enableExternalSendFullMacYolo(root)
+
+    let receipt = try await NativeClient(baseURL: "").runConnectorAction(
+        id: "slack.post_message",
+        dryRun: false,
+        input: [
+            "channel": .string("C123"),
+            "text": .string("Full Mac YOLO direct send"),
+        ],
+        externalSendIdempotencyKey: "yolo-direct-send-1",
+        dataRoot: root
+    )
+
+    #expect(receipt.status != "pending_approval")
+    #expect(receipt.approvalId == nil)
+    let approvals = try await SwiftNativeApprovalInbox(root: root).list(filter: .all)
+    #expect(approvals.isEmpty, "admitted Full Mac YOLO must not create a pending approval row")
 }
 
 @Test func genericConnectorApprovalCarriesAndRevalidatesExactBoundedInput() async throws {

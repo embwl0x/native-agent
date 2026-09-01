@@ -130,6 +130,36 @@ final class ChatStoreMergeTests: XCTestCase {
             mainSessionID: nil,
             availablePinnedSessionIDs: []
         ))
+        XCTAssertFalse(ChatStore.shouldReturnToMainSession(
+            selectedSessionID: "new-phone-chat",
+            mainSessionID: "old-phone-chat",
+            availablePinnedSessionIDs: [],
+            locallyCreatedSessionID: "new-phone-chat"
+        ), "a lagging session snapshot must not roll a new phone chat back to the old main")
+    }
+
+    func test_newPhoneChatIdentitySurvivesRelaunchUntilMacPublishesIt() throws {
+        let defaults = isolatedDefaults()
+        let first = ChatStore(defaults: defaults, restoreQueuedSends: false)
+
+        first.startNewSession()
+        let newSessionID = try XCTUnwrap(first.selectedSessionID)
+        XCTAssertEqual(first.mainSessionID, newSessionID)
+        XCTAssertEqual(first.locallyCreatedSessionID, newSessionID)
+
+        let relaunched = ChatStore(defaults: defaults, restoreQueuedSends: false)
+        XCTAssertEqual(relaunched.selectedSessionID, newSessionID)
+        XCTAssertEqual(relaunched.mainSessionID, newSessionID)
+        XCTAssertEqual(relaunched.locallyCreatedSessionID, newSessionID)
+
+        relaunched.acknowledgePublishedSessions(["old-phone-chat"])
+        XCTAssertEqual(relaunched.locallyCreatedSessionID, newSessionID)
+        relaunched.acknowledgePublishedSessions(["old-phone-chat", newSessionID])
+        XCTAssertNil(relaunched.locallyCreatedSessionID)
+
+        let acknowledgedRelaunch = ChatStore(defaults: defaults, restoreQueuedSends: false)
+        XCTAssertEqual(acknowledgedRelaunch.selectedSessionID, newSessionID)
+        XCTAssertNil(acknowledgedRelaunch.locallyCreatedSessionID)
     }
 
     func test_timedOutRetryResumesOriginalSignedEventWithoutNewCorrelation() throws {
@@ -397,6 +427,33 @@ final class ChatStoreMergeTests: XCTestCase {
             Set([.activity])
         )
         XCTAssertNil(iCloudSyncEngine.snapshotSignalGroups("2026-08-16T01:02:03Z"))
+    }
+
+    /// A Mac newer than this app can name a group this build's enum does not
+    /// have (a renamed or added group). Dropping that token and refreshing only
+    /// the recognised ones leaves the unrecognised group's data stale behind a
+    /// signal that claimed to describe the whole publication — the phantom
+    /// STALE badge that survives a healthy Mac write. An incompletely understood
+    /// signal must route to the same complete read the legacy timestamp-only
+    /// publishers already use.
+    func test_snapshotSignalGroupsRejectsPartiallyUnknownPublication() {
+        XCTAssertNil(
+            iCloudSyncEngine.snapshotSignalGroups("2026-08-16T01:02:03Z|groups=desk,missions")
+        )
+        XCTAssertNil(
+            iCloudSyncEngine.snapshotSignalGroups("2026-08-16T01:02:03Z|groups=workshop_tasks")
+        )
+        // Whitespace around a known name is still a fully understood signal.
+        XCTAssertEqual(
+            iCloudSyncEngine.snapshotSignalGroups("2026-08-16T01:02:03Z|groups=chat, core"),
+            Set([.chat, .core])
+        )
+        // An empty group list stays an empty set: the caller already treats that
+        // as "nothing named" and performs the complete read.
+        XCTAssertEqual(
+            iCloudSyncEngine.snapshotSignalGroups("2026-08-16T01:02:03Z|groups="),
+            Set()
+        )
     }
 
     // The vanish repro: snapshot is a strict prefix of local resolved state.

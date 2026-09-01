@@ -41,7 +41,11 @@ import Connectors
 import Browser
 
 extension NativeClient {
-    func runNextGenAction(id: String, dryRun: Bool) async throws -> NextGenActionResponse {
+    func runNextGenAction(
+        id: String,
+        dryRun: Bool,
+        surface: String = "nextgen_action"
+    ) async throws -> NextGenActionResponse {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw NSError(domain: "NativeAgentNextGen", code: 400, userInfo: [
@@ -59,7 +63,14 @@ extension NativeClient {
             ])
         }
         let resolved = try await resolveNextGenAction(id: trimmed)
-        if resolved.action?.requiresApproval == true, !dryRun {
+        let yoloAdmitted = !dryRun
+            ? await Self.fullMacYoloAdmitted(
+                tool: "nextgen.action.\(trimmed)",
+                surface: surface,
+                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            )
+            : false
+        if resolved.action?.requiresApproval == true, !dryRun, !yoloAdmitted {
             let approval = try await Self.createNextGenActionApproval(id: trimmed, resolved: resolved)
             return try await Self.appendNextGenActionReceipt(
                 actionId: trimmed,

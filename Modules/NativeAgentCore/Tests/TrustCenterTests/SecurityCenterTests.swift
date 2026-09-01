@@ -10,6 +10,133 @@ private func makeSecurityTempRoot() throws -> URL {
     return dir
 }
 
+private func seedAdmittedFullMacAuthority(
+    at root: URL,
+    blockedTool: String? = nil
+) throws {
+    let trust = root.appendingPathComponent("trust", isDirectory: true)
+    try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+    var autonomy: [String: JSONValue] = ["default": .string("send_approval")]
+    if let blockedTool { autonomy[blockedTool] = .string("blocked") }
+    let policy: JSONValue = .object([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacNeverExpires": .bool(true),
+        "fullMacExpiresAt": .string("never"),
+        "toolAutonomy": .object(autonomy),
+        "iosRemotePolicy": .object(["remote_from_ios_allowed": .bool(true)]),
+        "connectorPolicy": .object(["sendExternalMessagesRequiresApproval": .bool(true)]),
+    ])
+    try policy.serializedData(pretty: false)
+        .write(to: trust.appendingPathComponent("policy.json"))
+
+    let telegram = root.appendingPathComponent("telegram", isDirectory: true)
+    try FileManager.default.createDirectory(at: telegram, withIntermediateDirectories: true)
+    try JSONValue.object(["allowed_chat_ids": .array([.string("tg-user")])])
+        .serializedData(pretty: false)
+        .write(to: telegram.appendingPathComponent("config.json"))
+
+    let slack = root.appendingPathComponent("connectors/slack", isDirectory: true)
+    try FileManager.default.createDirectory(at: slack, withIntermediateDirectories: true)
+    try JSONValue.object(["allowed_channel_ids": .array([.string("slack-user")])])
+        .serializedData(pretty: false)
+        .write(to: slack.appendingPathComponent("auth.json"))
+}
+
+@Test func SecurityCenter_fullMacYoloAuthority_admitsEveryAuthenticatedOperatorSurface() async throws {
+    let root = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try seedAdmittedFullMacAuthority(at: root)
+    let center = SwiftNativeSecurityCenter(dataRoot: root)
+    let cases: [(String, SecurityOriginContext)] = [
+        ("local chat", .init(surface: "chat")),
+        ("Codex bridge", .init(surface: "codex-bridge")),
+        ("mission", .init(surface: "mission")),
+        ("Telegram", .init(surface: "telegram", chatId: "tg-user", isRemote: true)),
+        ("Slack", .init(surface: "slack", chatId: "slack-user", isRemote: true)),
+        ("iOS", .init(surface: "ios", deviceId: "paired-phone", isRemote: true)),
+    ]
+    for (label, origin) in cases {
+        let authority = await center.fullMacYoloAuthority(
+            tool: "approval_shaped_tool",
+            origin: origin
+        )
+        #expect(authority.state == .admitted, "\(label): \(authority.reason)")
+    }
+}
+
+@Test func SecurityCenter_fullMacYoloAuthority_failsClosedForExplicitBlockOutsiderExpiryAndCorruption() async throws {
+    let blockedRoot = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: blockedRoot) }
+    try seedAdmittedFullMacAuthority(at: blockedRoot, blockedTool: "never_run")
+    let blockedCenter = SwiftNativeSecurityCenter(dataRoot: blockedRoot)
+    #expect(await blockedCenter.fullMacYoloAuthority(
+        tool: "never_run", origin: .init(surface: "chat")
+    ).state == .explicitlyBlocked)
+    let explicitlyBlockedEnvelope = await blockedCenter.evaluateTool(
+        tool: "never_run",
+        input: [:],
+        origin: .init(surface: "chat"),
+        enforceAutonomy: false
+    )
+    #expect(explicitlyBlockedEnvelope.decision == .block)
+    #expect(!explicitlyBlockedEnvelope.requiresApproval)
+    #expect(await blockedCenter.fullMacYoloAuthority(
+        tool: "shell",
+        origin: .init(surface: "telegram", chatId: "outsider", isRemote: true)
+    ).state == .untrustedOrigin)
+
+    let expiredRoot = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: expiredRoot) }
+    let trust = expiredRoot.appendingPathComponent("trust", isDirectory: true)
+    try FileManager.default.createDirectory(at: trust, withIntermediateDirectories: true)
+    try JSONValue.object([
+        "permissionLevel": .string("full_mac_os"),
+        "fullMacExpiresAt": .string("2020-01-01T00:00:00Z"),
+    ]).serializedData(pretty: false).write(to: trust.appendingPathComponent("policy.json"))
+    #expect(await SwiftNativeSecurityCenter(dataRoot: expiredRoot).fullMacYoloAuthority(
+        tool: "shell", origin: .init(surface: "chat")
+    ).state == .inactive)
+
+    let corruptRoot = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: corruptRoot) }
+    let corruptPolicy = corruptRoot.appendingPathComponent("trust/policy.json")
+    try FileManager.default.createDirectory(
+        at: corruptPolicy.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+    try Data("{bad".utf8).write(to: corruptPolicy)
+    #expect(await SwiftNativeSecurityCenter(dataRoot: corruptRoot).fullMacYoloAuthority(
+        tool: "shell", origin: .init(surface: "chat")
+    ).state == .unavailable)
+}
+
+@Test func SecurityCenter_directClientsNeverReceiveAskUnderAdmittedFullMacYolo() async throws {
+    let root = try makeSecurityTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try seedAdmittedFullMacAuthority(at: root)
+    let center = SwiftNativeSecurityCenter(dataRoot: root)
+    for tool in [
+        "self_install", "evolution_propose", "remote_node_execute",
+        "gmail.send", "slack.post_message", "mac_keystroke",
+    ] {
+        let envelope = await center.evaluateTool(
+            tool: tool,
+            input: [:],
+            origin: .init(surface: "chat")
+        )
+        #expect(envelope.decision == .allow, "\(tool): \(envelope.reasons)")
+        #expect(!envelope.requiresApproval, "\(tool) must not return ask")
+        #expect(envelope.fullMacYoloAuthority == .admitted)
+    }
+
+    let permissionReset = await center.evaluateTool(
+        tool: "bash",
+        input: ["cmd": .string("tccutil reset Accessibility")],
+        origin: .init(surface: "chat")
+    )
+    #expect(permissionReset.decision == .block)
+    #expect(!permissionReset.requiresApproval)
+}
+
 /// Delegates every read to the real persistence backend but rejects audit
 /// appends, modeling disk-full/permission failure at SecurityCenter.record's
 /// actual write seam.
@@ -724,7 +851,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     #expect(envelope.originTrusted)
     #expect(envelope.allowed)
     #expect(envelope.decision == .allow)
-    #expect(envelope.autonomyLevel == "send_approval")
+    #expect(envelope.autonomyLevel == "auto")
     #expect(!envelope.requiresApproval)
     #expect(!envelope.reasons.contains { $0.contains("tool autonomy requires approval") })
 }
@@ -1520,10 +1647,10 @@ private func makeTrustedTelegramRoot(
 }
 
 /// Full Mac keeps ordinary autonomous builder work, but changing the host's
-/// permission authority is a distinct effect. The exact command is classified
-/// at dispatch time and must ask even when the saved shell override is `auto`
-/// and the outer chat gate owns normal autonomy resolution.
-@Test func SecurityCenter_systemPermissionResetHasApprovalFloorUnderTrustedYolo() async throws {
+/// permission authority is a distinct hard effect. YOLO never turns it into an
+/// approval prompt or an allow; it remains blocked while ordinary diagnostics
+/// and builder work run autonomously.
+@Test func SecurityCenter_systemPermissionResetRemainsBlockedUnderTrustedYolo() async throws {
     let (root, persistence) = try await makeTrustedTelegramRoot(
         toolAutonomy: ["bash": .string("auto")]
     )
@@ -1546,8 +1673,8 @@ private func makeTrustedTelegramRoot(
             enforceAutonomy: false
         )
         #expect(envelope.originTrusted)
-        #expect(envelope.decision == .ask, "\(command)")
-        #expect(envelope.requiresApproval)
+        #expect(envelope.decision == .block, "\(command)")
+        #expect(!envelope.requiresApproval)
         #expect(!envelope.allowed)
         #expect(envelope.rollbackRequired)
         #expect(envelope.capabilities.contains("system_permission_reset"))
@@ -1593,7 +1720,8 @@ private func makeTrustedTelegramRoot(
         origin: origin,
         enforceAutonomy: false
     )
-    #expect(directMutation.decision == .ask)
+    #expect(directMutation.decision == .block)
+    #expect(!directMutation.requiresApproval)
     #expect(directMutation.capabilities.contains("system_permission_reset"))
 }
 
@@ -2015,7 +2143,7 @@ private func makeTrustedTelegramRoot(
     }
 }
 
-@Test func SecurityCenter_localYoloStillRequiresApprovalForExternalSends() async throws {
+@Test func SecurityCenter_localYoloSuppressesExternalSendApproval() async throws {
     let root = try makeSecurityTempRoot()
     let persistence = SwiftNativePersistenceCore()
     try await persistence.writeJSON(
@@ -2036,16 +2164,16 @@ private func makeTrustedTelegramRoot(
         origin: SecurityOriginContext(surface: "chat", sessionId: "local", isRemote: false)
     )
 
-    #expect(envelope.allowed == false)
-    #expect(envelope.decision == .ask)
+    #expect(envelope.allowed)
+    #expect(envelope.decision == .allow)
+    #expect(!envelope.requiresApproval)
     #expect(envelope.reasons.contains { $0.contains("external send requires approval") })
+    #expect(envelope.reasons.contains { $0.contains("suppresses per-call approval") })
 }
 
-/// Self-modification (self_install / evolution_propose) keeps MAXIMUM defense:
-/// a local yolo window does NOT satisfy their Developer-Mode requirement, so the
-/// dev-mode block still fires even locally. Yolo never rides the self-evolution
-/// surface (rampancy firewall).
-@Test func SecurityCenter_selfModification_stillRequiresDeveloperMode_evenInLocalYolo() async throws {
+/// Saved confirm defaults remain visible policy data, but admitted YOLO is the
+/// effect-time operator authority and resolves them without a per-call prompt.
+@Test func SecurityCenter_selfModificationHasNoPerCallPromptInLocalYolo() async throws {
     let root = try makeSecurityTempRoot()
     let persistence = SwiftNativePersistenceCore()
     try await persistence.writeJSON(
@@ -2064,15 +2192,9 @@ private func makeTrustedTelegramRoot(
             input: [:],
             origin: SecurityOriginContext(surface: "chat", sessionId: "local", isRemote: false)
         )
-        // YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
-        // execution ungated. OLD CONTRACT: the dev-mode block fired here — yolo
-        // did not cover self-modification, and SecurityCenter said so.
-        // NEW CONTRACT: `criticalRequiresDeveloperMode` defaults false, so
-        // SecurityCenter raises no Developer Mode reason for ANY tool,
-        // self-modification included. The self-modification floor that SURVIVES
-        // lives one layer up, in the Trust Center autonomy table
-        // (self_install / evolution_* stay `confirm` and are excluded from YOLO
-        // elevation) — asserted below so this row still pins a real floor.
+        #expect(envelope.decision == .allow)
+        #expect(envelope.autonomyLevel == "auto")
+        #expect(!envelope.requiresApproval)
         #expect(
             !envelope.reasons.contains { $0.contains("Developer Mode") },
             "\(tool): SecurityCenter no longer raises a Developer Mode block"
@@ -2082,7 +2204,7 @@ private func makeTrustedTelegramRoot(
             Issue.record("expected toolAutonomy in the merged policy"); continue
         }
         #expect(ta[tool] == .string("confirm"),
-                "\(tool) keeps its autonomy floor in the Trust Center table (got \(String(describing: ta[tool])))")
+                "saved preset remains confirm; admitted authority owns the runtime override")
     }
 }
 

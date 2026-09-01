@@ -14,14 +14,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="$ROOT/iOS/NativeAgentMobile/NativeAgentMobile.xcodeproj"
 SCHEME="NativeAgentMobile"
 REQUIRE=0
+ONLY_TESTING=""
 
 usage() {
-  echo "usage: $0 [--require]" >&2
+  echo "usage: $0 [--require] [--only-testing TEST_CLASS]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --require) REQUIRE=1 ;;
+    --only-testing)
+      [[ $# -ge 2 && "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { usage; exit 2; }
+      ONLY_TESTING="$2"
+      shift
+      ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -84,13 +90,15 @@ mkdir -p "$ROOT/.runtime/test-ios-results"
 RESULT_DIR="$(mktemp -d "$ROOT/.runtime/test-ios-results/run.XXXXXX")"
 RESULT_BUNDLE="$RESULT_DIR/tests.xcresult"
 echo "[test-ios] result bundle: $RESULT_BUNDLE"
-xcodebuild test \
+set -- xcodebuild test \
   -project "$PROJECT" \
   -scheme "$SCHEME" \
   -destination "platform=iOS Simulator,name=$SIM_NAME" \
   -derivedDataPath "$ROOT/iOS/NativeAgentMobile/build/DerivedData" \
   -resultBundlePath "$RESULT_BUNDLE" \
   CODE_SIGNING_ALLOWED=NO
+[[ -n "$ONLY_TESTING" ]] && set -- "$@" "-only-testing:NativeAgentMobileTests/$ONLY_TESTING"
+"$@"
 # Exit zero alone does not prove discovery or execution. Read Xcode's typed
 # summary from this exact, fresh run; never borrow an older successful bundle.
 xcrun xcresulttool get test-results summary --path "$RESULT_BUNDLE" --compact > "$RESULT_DIR/summary.json"

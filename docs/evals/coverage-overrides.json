@@ -2778,7 +2778,18 @@
     "id": "loops.manager.uptimeSeconds",
     "coverage": [
       {
-        "ref": "Modules/NativeAgentCore/Tests/BackgroundLoopsTests/BackgroundLoopsTests.swift:904 managerUptime_isZeroBeforeStart_andOnlyIsRunningDisambiguatesIt, :928 managerUptime_keepsClimbingAfterStop_soIsRunningIsTheLivenessSignal, :952 watchdogUptimeAndManagerUptimeAreTwoIndependentNumbers \u2014 injected clock; pre-start 0 is proven indistinguishable from just-started 0 (isRunning() is the disambiguator); the post-stop climb (startedAt never cleared) is asserted as a lifecycle residue; and the two independent uptimes (manager vs SwiftNativeBackgroundLoops) are shown to disagree with daemonLifecycleStatus named as the field that tracks the manager",
+        "ref": "Modules/NativeAgentCore/Tests/BackgroundLoopsTests/BackgroundLoopsTests.swift::managerUptime_isZeroBeforeStart_andOnlyIsRunningDisambiguatesIt, ::managerUptime_isZeroAfterStop_andRebasesOnRestart, ::watchdogUptimeComesFromTheManagerLifecycleOwner \u2014 injected clock proves pre-start/stopped zero, live advancement, restart rebasing, and exact agreement between the watchdog projection and Core's lifecycle owner",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ]
+  },
+  {
+    "fence": "core.loops",
+    "id": "loops.manager.restartLoop",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/BackgroundLoopsTests/BackgroundLoopsManagerTests.swift::telegramReplacementIsTargeted, ::cancelledReplacementStillDrainsOldGate \u2014 replacement preserves unrelated registrations/counters and caller cancellation cannot install a fresh gate until the retired effecting body has authoritatively exited",
         "strength": "asserts",
         "tier": "test"
       }
@@ -3100,7 +3111,7 @@
     "id": "github.action.mutate",
     "coverage": [
       {
-        "ref": "mutateRefusesMalformedWritesBeforeIssuingARequest \u2014 GitHubConnectorWriteAndEvidenceTests.swift:192 (9 adversarial write inputs, all refused pre-call)",
+        "ref": "Modules/NativeAgentCore/Tests/GitHubConnectorTests/GitHubConnectorWriteAndEvidenceTests.swift \u2014 mutateRefusesMalformedWritesBeforeIssuingARequest and strictEmptyIssueCollectionsPreserveUnlessExplicitlyCleared prove malformed writes are refused before a request, [] placeholders preserve remote collections, explicit clears emit empty collections, and set+clear conflicts fail [swift-filter: GitHubWritePreflightTests]",
         "strength": "asserts",
         "tier": "test"
       }
@@ -4681,11 +4692,6 @@
     "id": "ui.cognitionObservatory.copy.masterSwitchClaim",
     "coverage": [
       {
-        "ref": "tests/NativeAgentAppTests/OperationalSettingsPresentationTests.swift:147 subconsciousMasterOwnsEveryResidentLaneAndFluidContextHasOneProductionControl \u2014 asserts ownership of the controls, not that the master actually resets all six",
-        "strength": "reports-only",
-        "tier": "test"
-      },
-      {
         "ref": "tests/NativeAgentAppTests/MindObservatoryControlSeamTests.swift :: MindObservatorySwitchTests.theMasterSwitchReallyMovesEveryToggleTogether",
         "strength": "asserts",
         "tier": "test"
@@ -5956,7 +5962,7 @@
     "id": "app.background.lifecycle.terminationDrain",
     "coverage": [
       {
-        "ref": "tests/NativeAgentAppTests/BackgroundLifecycleWiringContractTests.swift::terminationDrainEntriesArePairedAndBounded",
+        "ref": "tests/NativeAgentAppTests/BackgroundLifecycleWiringContractTests.swift::terminationDrainEntriesArePairedAndBounded \u2014 every drain is paired and bounded, and Activity Watch begins through makeTerminationDrain before the main-thread group wait rather than queueing its teardown onto the blocked MainActor",
         "strength": "asserts",
         "tier": "test"
       }
@@ -7992,14 +7998,19 @@
         "ref": "tests/NativeAgentAppTests/ToolByNameEvalsTests.swift \u2014 ToolByNameDeskEvals/deskAddReadMutateRoundtrip",
         "strength": "asserts",
         "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/DeskChatToolDispatchTests.swift \u2014 blankStatusMetadataPreservesAssignedAndUnassignedItems proves strict-schema null and blank placeholders preserve assignee/lane/progress while malformed non-null values still fail [swift-filter: DeskChatToolDispatchTests]",
+        "strength": "asserts",
+        "tier": "test"
       }
     ],
     "fence": "tools.byname",
     "id": "tool.desk_set_status",
     "kind": "tool",
-    "silentFailureMode": "desk_set_status throws AutonomyGateError on bad input and returns confirmation envelopes on success; a swallowed throw or a confirmation emitted without the store write would fabricate desk state the model then trusts and repeats back to the user.",
+    "silentFailureMode": "strict-provider compatibility regression \u2014 optional assignee, lane_of, and progress fields may be materialized even when unchanged. Null and blank placeholders must preserve existing metadata, while an invented self-lane or malformed non-null progress must still fail before a Desk op is appended.",
     "source": "inventory",
-    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+DeskTools.swift:228"
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+DeskTools.swift impl_desk_set_status, deskProgress, and deskMetadataString; SwiftToolDispatcher+SchemaBuilders.swift desk_set_status schema"
   },
   {
     "coverage": [
@@ -8177,14 +8188,19 @@
         "ref": "tests/NativeAgentAppTests/ToolByNameEvalsTests.swift \u2014 ToolByNameGitHubEvals/githubToolsThrowOnHermeticUnconfiguredCalls",
         "strength": "asserts",
         "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/GitHubConnectorTests/GitHubConnectorWriteAndEvidenceTests.swift \u2014 strictEmptyIssueCollectionsPreserveUnlessExplicitlyCleared proves [] placeholders omit labels/assignees, explicit clear flags emit empty collections, and set+clear conflicts fail [swift-filter: GitHubWritePreflightTests]",
+        "strength": "asserts",
+        "tier": "test"
       }
     ],
     "fence": "tools.byname",
     "id": "tool.github_mutate",
     "kind": "tool",
-    "silentFailureMode": "github_mutate throws typed GitHubConnectorError; if the dispatch case ever swallowed the throw into an empty-success envelope, the model would treat 'no repos/issues/PRs/notifications' as ground truth with nobody noticing the connector is broken.",
+    "silentFailureMode": "destructive strict-provider regression \u2014 optional labels or assignees materialized as [] can silently clear the remote issue collections. Empty placeholders must preserve remote state; clearing requires the explicit clear_labels or clear_assignees signal, and set+clear conflicts must fail before any request.",
     "source": "inventory",
-    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+Dispatch.swift:380"
+    "where": "Modules/NativeAgentCore/Sources/GitHubConnector/GitHubProjectTracking.swift issueBody; Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SchemaBuilders.swift github_mutate schema; SwiftToolDispatcher+Dispatch.swift github_mutate route"
   },
   {
     "coverage": [
@@ -13297,11 +13313,6 @@
     "id": "ui.observatory.organismToggle",
     "coverage": [
       {
-        "ref": "tests/NativeAgentAppTests/OperationalSettingsPresentationTests.swift:160 (#expect(observatory.contains(\"Toggle(\\\"Organism body kernel\\\"\")) \u2014 source-string scrape only)",
-        "strength": "reports-only",
-        "tier": "test"
-      },
-      {
         "ref": "tests/NativeAgentAppTests/OrganismObservatoryMountedEvalTests.swift:16 organismToggleReachesRuntimeAndPreference",
         "strength": "asserts",
         "tier": "test"
@@ -14994,11 +15005,6 @@
     "id": "ui.Tools.chatToolCatalogBucketing",
     "coverage": [
       {
-        "ref": "OperationalSettingsPresentationTests.visibleToolsCatalogRequestsDetailWithoutChangingChatDefault \u2014 tests/NativeAgentAppTests/OperationalSettingsPresentationTests.swift:167 (only #expect(tools.contains(\"DisclosureGroup(isExpanded: bucketExpandedBinding(bucket.id))\")) \u2014 pins that buckets exist, nothing about assignment)",
-        "strength": "incidental",
-        "tier": "test"
-      },
-      {
         "ref": "route \"tools\" \u2014 script/user_mode_eval.swift:100 (asserts \"Chat Tool Catalog\" renders)",
         "strength": "incidental",
         "tier": "ui-walk"
@@ -15830,11 +15836,6 @@
     "fence": "app.runtimes",
     "id": "voice.pushToTalk",
     "coverage": [
-      {
-        "ref": "tests/NativeAgentAppTests/OperationalSettingsPresentationTests.swift:223 globalHotkeyRegistrationTransitionsAreIdempotent \u2014 covers only the register/unregister transition table (:37), not the press/hold path",
-        "strength": "incidental",
-        "tier": "test"
-      },
       {
         "ref": "tests/NativeAgentAppTests/AppRuntimesBehaviorWave2EvalTests.swift:403 pushToTalkRelease",
         "strength": "asserts",
@@ -18427,5 +18428,972 @@
       "reads": "Synthetic Mach-O data through scanCopy and a temporary C-built Mach-O executable through release_assert_no_identity_strings",
       "tier": "smoke"
     }
+  },
+  {
+    "fence": "core.chat.tools",
+    "id": "chat.tools.commit_memory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/CommitMemoryDispatchTests.swift — strictSchemaPlaceholderPersistsAcrossSharedDispatcherSurfaces sends the exact strict-provider placeholder shape through public dispatch for chat, Telegram, Slack, iOS, bridge, and background; malformedTopicScopeIsRejectedBeforeMemoryWrite retains the nonempty misuse/type negatives; catalogAdvertisesCommitMemoryInAlwaysOnBlock and commitMemoryIsAlwaysOnAndBuiltIn pin availability [swift-filter: CommitMemoryDispatchTests]",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+MemoryTools.swift impl_commit_memory; SwiftToolDispatcher+Dispatch.swift public commit_memory route",
+    "silentFailureMode": "strict-provider compatibility regression — optional arrays and strings may arrive as [] and empty strings on an ordinary memory. Treating placeholder presence as correction intent rejects a valid durable write on every shared chat surface. Empty placeholders must persist the fact without correction metadata; malformed or nonempty correction scope on an ordinary memory must still fail closed.",
+    "proposedEval": {
+      "asserts": "the exact strict-provider ordinary-memory payload persists through the public dispatcher on every shared surface and stores no false correction scope, while malformed and nonempty misuse remains rejected",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the public SwiftToolDispatcher commit_memory route and a temporary injected MemoryV2 store",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.studio_consult",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioChatToolDispatchTests.swift — registration, schemasWellFormed, consultRoundTrips, consultWithoutRefsMustBeFlagged, and descriptionOnlyConsultIsNotAnEncounter exercise the catalog, schema, durable write/read path, and fail-closed description-only boundary [swift-filter: StudioChatToolDispatchTests]",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioTools.swift:168 impl_studio_consult; SwiftToolDispatcher+Dispatch.swift:206 public route",
+    "silentFailureMode": "A consult could appear filed while no durable envelope exists, or description-only material could silently cross into the encounter journal. The production round trip and refusal tests keep both boundaries observable.",
+    "proposedEval": {
+      "asserts": "a valid consult persists and reads back verbatim, missing description-only acknowledgement fails closed, and catalog/schema/trust registration stays intact",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the public Studio dispatcher contract and a temporary SwiftNativeStudioStore",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.studio_consult_read",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioChatToolDispatchTests.swift — registration and consultRoundTrips prove the read tool is cataloged as a lazy local read and returns the exact envelope written by studio_consult [swift-filter: StudioChatToolDispatchTests]",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioTools.swift:205 impl_studio_consult_read; SwiftToolDispatcher+Dispatch.swift:207 public route",
+    "silentFailureMode": "A missing or misrouted read could make a successfully filed consult look lost, causing the agent to answer without the original artifacts and question.",
+    "proposedEval": {
+      "asserts": "the stable consult id resolves through the production read implementation and returns the filed envelope verbatim",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the Studio dispatcher read path and a temporary SwiftNativeStudioStore",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.studio_journal",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioChatToolDispatchTests.swift — journalEntryRoundTrips, journalIsAppendOnly, descriptionOnlyCannotBeLaunderedByOriginKind, scoreShapedFieldsAreRefused, nestedUnknownFieldsAreRefused, and archiverIsWiredIntoTheProductionAppendPath pin the full durable journal contract [swift-filter: StudioChatToolDispatchTests]",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioTools.swift:227 impl_studio_journal; SwiftToolDispatcher+Dispatch.swift:208 public route",
+    "silentFailureMode": "A journal write could drop unknown fields, mutate an earlier encounter, admit description-only material, or trim history without archiving it. Each case would silently corrupt Agent's developed taste record.",
+    "proposedEval": {
+      "asserts": "valid entries round-trip append-only, forbidden nested fields and laundered description-only origins fail closed, and archival precedes retention trim",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic",
+      "reads": "the production Studio journal dispatcher and temporary append/archive stores",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.studio_recall",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioChatToolDispatchTests.swift — schemasWellFormed, emptyRelationKindIsOmittedNotRefused, and recallFindsAndReturnsVerbatim cover strict-provider neutral placeholders plus creator, tag, relation, and verbatim-response retrieval [swift-filter: StudioChatToolDispatchTests]",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioTools.swift:341 impl_studio_recall; SwiftToolDispatcher+Dispatch.swift:209 public route",
+    "silentFailureMode": "Strict providers can send empty optional filters; treating them as real filters makes existing encounters disappear, while altered response text would rewrite the agent's earlier judgment during recall.",
+    "proposedEval": {
+      "asserts": "empty optional filters are omission, real creator/tag/relation filters find the intended entry, and recalled response text remains verbatim",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the production Studio recall dispatcher and a temporary journal",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_acquire",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_acquire and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_acquire while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_click",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_click and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_click while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_double_click",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_double_click and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_double_click while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_fill",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_fill and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_fill while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_keypress",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_keypress and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_keypress while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_navigate",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_navigate and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_navigate while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_release",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_release and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_release while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_scroll",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_scroll and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_scroll while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_select",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_select and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_select while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_set_checked",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_set_checked and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_set_checked while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_snapshot",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_snapshot and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_snapshot while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_type",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_type and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_type while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_wait",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.chrome_wait and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.chrome_wait while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.navigate",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.navigate and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.navigate while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.open_url",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.open_url and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.open_url while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.read_links",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.read_links and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.read_links while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.read_text",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.read_text and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.read_text while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.screenshot",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift — everyRegisteredBrowserToolMapsValidInputToTheAppRunner exhaustively submits schema-valid input for browser.screenshot and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift — app-owned browser catalog, schema, and dispatch routes",
+    "silentFailureMode": "The app could advertise browser.screenshot while delegating it to Core or dropping it as unknown, leaving Agent with a visible browser command that cannot execute.",
+    "proposedEval": {
+      "asserts": "the registered app-owned tool reaches AppChatToolDispatcher without unknown-tool or Core fallthrough drift",
+      "costSeconds": 1,
+      "liveOrClone": "hermetic",
+      "reads": "the production AppChatToolDispatcher with injected browser and notification boundaries",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.activity_query",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/ToolCatalogGateEvalTests.swift — pins catalog visibility and surface refusal behavior; tests/NativeAgentAppTests/ToolByNameEvalsTests.swift — everyCataloguedToolDispatchesWithoutUnknownOrLazyGateDrift pins the real dispatch boundary",
+        "strength": "reports-only",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved activity_query command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.evolution_propose",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/EvolutionChatToolsWiringTests.swift — pins evolution tool autonomy and app wiring; tests/NativeAgentAppTests/ToolByNameEvalsTests.swift — everyCataloguedToolDispatchesWithoutUnknownOrLazyGateDrift pins the real dispatch boundary",
+        "strength": "reports-only",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved evolution_propose command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.evolution_status",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/EvolutionChatToolsWiringTests.swift — pins evolution tool autonomy and app wiring; tests/NativeAgentAppTests/ToolByNameEvalsTests.swift — everyCataloguedToolDispatchesWithoutUnknownOrLazyGateDrift pins the real dispatch boundary",
+        "strength": "reports-only",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved evolution_status command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_attention",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests and tests/NativeAgentAppTests/ToolByNameEvalsTests.swift — production Mac-control behavior plus exhaustive dispatch-boundary coverage",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_attention command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_ax_act",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MacInjectionCapabilityFenceTests.swift and Modules/NativeAgentCore/Tests/MacControlTests — capability, redaction, and production Mac-control behavior; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_ax_act command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_ax_find",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacAxTreeRedactionTests.swift and tests/NativeAgentAppTests/ToolByNameEvalsTests.swift — tree/find redaction plus exhaustive dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_ax_find command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_ax_status",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MacNudgeToolTests.swift and tests/NativeAgentAppTests/ToolByNameEvalsTests.swift — accessibility gate parity plus exhaustive dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_ax_status command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_ax_tree",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacAxTreeRedactionTests.swift and Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MacInjectionCapabilityFenceTests.swift — read-path redaction and capability behavior; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_ax_tree command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_click",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MacInjectionCapabilityFenceTests.swift and Modules/NativeAgentCore/Tests/MacControlTests/MacScreenViewTests.swift — capability, replay, and mark behavior; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_click command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_focus_app",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift and tests/NativeAgentAppTests/ToolByNameEvalsTests.swift — app-tool composition plus exhaustive Core dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_focus_app command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_keystroke",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MacInjectionCapabilityFenceTests.swift and Modules/NativeAgentCore/Tests/MacControlTests/MacControlCoverageWaveATests.swift — capability and secret redaction; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_keystroke command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_look",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacPerceptionCompilerTests.swift and Modules/NativeAgentCore/Tests/MacControlTests/MacFourVerbsTests.swift — perception envelope and four-verb behavior; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_look command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_nudge",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MacNudgeToolTests.swift — gate, catalog, schema, and handler behavior; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_nudge command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_quit_app",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift and tests/NativeAgentAppTests/ToolByNameEvalsTests.swift — app-tool composition plus exhaustive Core dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_quit_app command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_scroll",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MacInjectionCapabilityFenceTests.swift — capability and replay behavior; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_scroll command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_view",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacScreenViewTests.swift — screen-view, redaction, and mark behavior; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_view command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.mac_wake",
+    "kind": "tool",
+    "source": "inventory",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacWakeTests.swift and MacWakeRefusalCopyTests.swift — wake, recapture, gate, and refusal behavior; ToolByNameExhaustiveDispatchEvals pins dispatch",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration — reserved built-in catalog and production dispatch routes",
+    "silentFailureMode": "The reserved mac_wake command could remain callable in one path while disappearing from the catalog, dispatch switch, or eval inventory.",
+    "proposedEval": {
+      "asserts": "the reserved command reaches a known production dispatch boundary and its specialized policy or behavior suite stays green",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic",
+      "reads": "the real SwiftToolDispatcher and the specialized production boundary",
+      "tier": "test"
+    }
+  },
+  {
+    "fence": "ios.sync",
+    "id": "ios.chatStore.sessionSwitching",
+    "where": "iOS/NativeAgentMobile/Sources/ChatStore+Sessions.swift:14 shouldReturnToMainSession / :32 switchSession / :59 switchToMainSession / startNewSession (+ ChatStore.swift selectedSessionID/mainSessionID/locallyCreatedSessionID)",
+    "coverage": [
+      {
+        "ref": "iOS/NativeAgentMobile/Tests/ChatStoreMergeTests.swift:95 test_tabProjectionContainsOnlyPhoneMainAndOrderedMacPins / :112 test_externalUnpinRequiresSelectedPinnedSessionToReturnToMain / :141 test_newPhoneChatIdentitySurvivesRelaunchUntilMacPublishesIt / :267 test_regenerateDuringSessionSwitchLeavesCanonicalLocalTurnUntouched",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "an iPhone-created chat is mistaken for an externally unpinned Mac session before the Mac publishes it, so launch or refresh silently jumps back to an older chat"
+  },
+  {
+    "fence": "ios.sync",
+    "id": "shared.cloudkit.incrementalPullPredicate",
+    "kind": "public-api",
+    "source": "override",
+    "where": "Modules/NativeAgentShared/Sources/NativeAgentShared/CloudKitDeviceTransport.swift:960 makePullPredicate",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentShared/Tests/NativeAgentSharedTests/DeviceSyncTransportTests.swift:808 incrementalPullUsesOnlyTheDeployedQueryableDirectionField [swift-filter: CloudKitDeviceTransportPullCursorTests]",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "the iPhone pull query uses a non-queryable production CloudKit field, so new replies exist but never enter the visible chat"
+  },
+  {
+    "fence": "ios.screens",
+    "id": "ios.chat.runtime.processingModePill",
+    "kind": "ui-control",
+    "source": "override",
+    "where": "iOS/NativeAgentMobile/Sources/ChatView.swift:950 processing-mode pill / :1698 processingModeTitle",
+    "coverage": [
+      {
+        "ref": "iOS/NativeAgentMobile/Tests/IOSBehaviorWave3EvalTests.swift:959 test_processingModePillNamesTheActualRequestTier [xcode-filter: IOSChatBehaviorWave2EvalTests]",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "the chat claims Fast when the actual request is Normal, leaving the user unable to tell or correct the active processing tier"
+  },
+  {
+    "fence": "app.bridges",
+    "id": "icloud.forwardToSwiftRuntime",
+    "where": "Sources/NativeAgentApp/AppDelegate+ICloudRuntimeForwarding.swift:23 ICloudIncomingTurnConsumptionPolicy and forwardToSwiftRuntime drain paths",
+    "coverage": [
+      {
+        "ref": "Tests/NativeAgentAppTests/TransactionalChatTests.swift:51 ICloudChatReplacementIntent fail-closed decoding / :68 terminalICloudTurnIsConsumedWhenReplyPublicationFails",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "a terminal turn whose reply publication failed is left unconsumed, so every drain tick reruns the same user message and duplicates the reply"
+  },
+  {
+    "fence": "ios.screens",
+    "id": "ios.approvals.decide",
+    "where": "iOS/NativeAgentMobile/Sources/ApprovalsView.swift:156 decide / :197 beginDecision",
+    "coverage": [
+      {
+        "ref": "iOS/NativeAgentMobile/Tests/ApprovalsPendingCountEvalTests.swift:129 test_distinctApprovalCardsCanEnterFlightWithoutDroppingEitherTap",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "iOS/NativeAgentMobile/Tests/ActionChannelTests.swift:479 test_isMacResponseTimeout_classification",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "a global decision latch silently discards a second visible approval tap, or a failed sibling restores the whole old array and resurrects a successful decision"
+  },
+  {
+    "fence": "ios.screens",
+    "id": "ios.shared.macStatusChip.singleLine",
+    "kind": "ui-control",
+    "source": "override",
+    "where": "iOS/NativeAgentMobile/Sources/SystemToastBar.swift:260 MacStatusChip",
+    "coverage": [
+      {
+        "ref": "iOS/NativeAgentMobile/Tests/MacStatusChipEvalTests.swift:46 test_statusChipLabelCannotWrapWhenTheNavigationBarCompressesIt",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "the Live label wraps vertically under navigation-bar compression and collapses the connection control below its usable hit target"
   }
 ]

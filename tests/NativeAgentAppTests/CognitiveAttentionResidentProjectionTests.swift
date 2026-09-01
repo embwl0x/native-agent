@@ -82,6 +82,7 @@ struct CognitiveAttentionResidentProjectionTests {
         let withPursuit = projection.read(at: now)
         #expect(withPursuit?.activeTask == "close the eval fence")
         #expect(withPursuit?.goal == "ship wave A")
+        #expect(withPursuit?.residentWorkIntent == true)
 
         // A half-empty pursuit is NOT a pursuit: publishing one must clear the
         // overlay, not strand the previous intent as resident state.
@@ -89,6 +90,7 @@ struct CognitiveAttentionResidentProjectionTests {
         let cleared = projection.read(at: now)
         #expect(cleared?.activeTask == "substrate task")
         #expect(cleared?.goal == "substrate goal")
+        #expect(cleared?.residentWorkIntent == false)
     }
 
     @Test("predicted tool groups are bounded and deterministic")

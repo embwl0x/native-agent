@@ -3291,7 +3291,8 @@ public actor SwiftNativeMacControl: MacControlClient {
     // MARK: accessibility injection (W2 — physical, W3 — semantic)
     //
     // Every handler below has already passed the three-gate pre-flight
-    // (accessibility category + active Full Mac window + approval attestation).
+    // (accessibility category + active Full Mac window + body-bound injection
+    // capability, supplied by admitted YOLO or an exact approved replay).
     // They still re-check the macOS Accessibility TCC grant, because a policy
     // gate is not a system grant: without the grant CGEventPost is silently
     // swallowed by the window server and the caller would be told "typed" when

@@ -37,14 +37,13 @@ private final class ToolLoopBudgetRouting: ProviderRoutingProtocol, @unchecked S
     func getModelPreferences() async throws -> ModelPreferences { ModelPreferences() }
     func saveModelConfig(_ body: JSONValue) async throws -> ModelPreferences { ModelPreferences() }
     func computeModelPreferences() async throws -> [String: SurfacePreference] {
-        [
-            "chat": SurfacePreference(
-                surface: "chat", model: "test-model", reasoningEffort: "high"
-            ),
-            "telegram": SurfacePreference(
-                surface: "telegram", model: "test-model", reasoningEffort: "high"
-            ),
-        ]
+        // Every surface the budget tests drive: the progress extension is
+        // surface-UNIFORM, so the tests exercise more than chat/telegram.
+        Dictionary(
+            uniqueKeysWithValues: ["chat", "telegram", "ios", "mac"].map {
+                ($0, SurfacePreference(surface: $0, model: "test-model", reasoningEffort: "high"))
+            }
+        )
     }
 }
 
@@ -152,8 +151,11 @@ func wholeTurnWallClockBudget_hasSurfaceScopedPolicyAndCanonicalWorkshopAliases(
     #expect(WholeTurnWallClockBudget.defaultSeconds(for: "mac") == 600)
     #expect(WholeTurnWallClockBudget.defaultSeconds(for: "slack") == 600)
     #expect(WholeTurnWallClockBudget.defaultSeconds(for: "ios") == 600)
-    #expect(WholeTurnWallClockBudget.defaultSeconds(for: "telegram") == 300)
-    #expect(WholeTurnWallClockBudget.defaultSeconds(for: " TELEGRAM ") == 300)
+    // 2026-08-31: telegram was the SHORTEST budget in the app (300) on the
+    // surface where the agent does real remote research — a live multi-tool
+    // turn got clipped. Same interactive floor as chat now.
+    #expect(WholeTurnWallClockBudget.defaultSeconds(for: "telegram") == 600)
+    #expect(WholeTurnWallClockBudget.defaultSeconds(for: " TELEGRAM ") == 600)
 
     for surface in [
         "workshop", "mission", "missions", " WORKSHOP ",
@@ -181,34 +183,51 @@ func wholeTurnWallClockBudget_expiresAtTheMonotonicBoundaryWithoutSleeping() asy
     }
 }
 
-@Test
-func structuredWholeTurnBudget_isolatesTelegramAndUsesExistingExhaustionTerminal() async throws {
-    let call = #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{}"}}]}"#
+private let budgetToolCall =
+    #"{"tool_calls":[{"id":"c1","type":"function","function":{"name":"echo","arguments":"{}"}}]}"#
 
-    func run(surface: String) async throws -> (TurnEngineResult, Int) {
-        let clock = ToolLoopManualMonotonicClock()
-        let llm = AdvancingToolLoopLLM(
-            responses: [call, "finished on the second round"],
-            advance: { clock.advance(seconds: 400) }
+/// Every structured-loop budget scenario in this file: N tool-calling rounds
+/// then a final reply, on a manual clock that advances by `advanceSeconds` per
+/// provider call. `toolResult` decides whether each round is PRODUCTIVE (a real
+/// result → the budget re-earns its window) or stuck (an error envelope → no
+/// extension), which is the whole progress-aware contract.
+private func runStructuredBudgetTurn(
+    surface: String,
+    tag: String,
+    responses: [String],
+    advanceSeconds: TimeInterval,
+    toolResult: JSONValue
+) async throws -> (result: TurnEngineResult, providerCalls: Int) {
+    let clock = ToolLoopManualMonotonicClock()
+    let llm = AdvancingToolLoopLLM(
+        responses: responses,
+        advance: { clock.advance(seconds: advanceSeconds) }
+    )
+    let tools = MockToolDispatchClient(scripted: ["echo": toolResult])
+    let engine = try makeToolLoopBudgetEngine(tag: tag, llm: llm, tools: tools)
+    let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
+    let result = try await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
+        try await engine.executeTurnWithToolLoop(
+            surface: surface,
+            userMessage: "use echo",
+            llm: llm,
+            tools: tools
         )
-        let tools = MockToolDispatchClient(scripted: ["echo": .string("ok")])
-        let engine = try makeToolLoopBudgetEngine(tag: surface, llm: llm, tools: tools)
-        let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
-        let result = try await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
-            try await engine.executeTurnWithToolLoop(
-                surface: surface,
-                userMessage: "use echo",
-                llm: llm,
-                tools: tools
-            )
-        }
-        return (result, llm.callCount)
     }
+    return (result, llm.callCount)
+}
 
-    // Interactive moved 180 → 600 (2026-08-27: 180 sat below the measured
-    // p95 of real chat turns), so the tier contrast runs the other way now:
-    // telegram (300s) exhausts on the round-1 advance, chat (600s) finishes.
-    let (telegram, telegramCalls) = try await run(surface: "telegram")
+@Test
+func structuredWholeTurnBudget_stopsAStuckTurnThroughTheExistingExhaustionTerminal() async throws {
+    // A turn whose dispatches all FAIL earns no extension: it is exactly the
+    // runaway the brake exists for, so telegram's 600s floor still kills it.
+    let (telegram, telegramCalls) = try await runStructuredBudgetTurn(
+        surface: "telegram",
+        tag: "stuck-telegram",
+        responses: [budgetToolCall, "must not start"],
+        advanceSeconds: 700,
+        toolResult: .object(["status": .string("failed"), "error": .string("nope")])
+    )
     #expect(telegramCalls == 1)
     #expect(telegram.providerCallCount == 1)
     #expect(telegram.toolDispatches.map(\.name) == ["echo"])
@@ -217,35 +236,154 @@ func structuredWholeTurnBudget_isolatesTelegramAndUsesExistingExhaustionTerminal
             iterationLimit: ToolLoopBudget.defaultIterations(for: "telegram"),
             dispatchCount: 1,
             providerRounds: 1,
-            wallClockElapsedSeconds: 400
+            wallClockElapsedSeconds: 700
         )
     )
     // Literal pin: a wall-clock stop must NAME the wall clock and the actual
     // rounds — never the iteration limit (the 2026-08-27 misdiagnosis was a
-    // 188s budget cut reported as "exhausted after 180 iterations").
-    #expect(telegram.reply.contains("turn stopped by wall-clock budget after 400s / 1 provider rounds"))
+    // 188s budget cut reported as "exhausted after 180 iterations"). The
+    // elapsed value stays truthful for an extended turn too: it is measured
+    // from turn start, never from the last extension.
+    #expect(telegram.reply.contains("turn stopped by wall-clock budget after 700s / 1 provider rounds"))
 
-    let (chat, chatCalls) = try await run(surface: "chat")
+    let (chat, chatCalls) = try await runStructuredBudgetTurn(
+        surface: "chat",
+        tag: "stuck-chat",
+        responses: [budgetToolCall, "finished on the second round"],
+        advanceSeconds: 400,
+        toolResult: .object(["status": .string("failed"), "error": .string("nope")])
+    )
     #expect(chatCalls == 2)
     #expect(chat.providerCallCount == 2)
     #expect(chat.reply == "finished on the second round")
 }
 
+/// The live motivation (2026-08-31): the resident agent was doing real
+/// multi-tool research and got clipped mid-work. A turn that keeps landing
+/// tool results must run WELL past the surface floor. Uniform across surfaces
+/// — the extension is a property of the budget, never of the lane.
 @Test
-func streamingWholeTurnBudget_expiresThroughTheSameExhaustionTerminal() async throws {
-    let clock = ToolLoopManualMonotonicClock()
-    let llm = AdvancingStreamingToolLoopLLM(
-        iterations: [[
-            .toolCall(LLMStreamToolCall(
-                id: "stream-1", name: "echo", inputJSON: Data("{}".utf8)
-            )),
-        ]],
-        advance: { clock.advance(seconds: 601) }
+func structuredWholeTurnBudget_productiveTurnRunsPastTheSurfaceFloorOnEverySurface() async throws {
+    for surface in ["telegram", "chat", "ios", "mac"] {
+        let (result, providerCalls) = try await runStructuredBudgetTurn(
+            surface: surface,
+            tag: "productive-\(surface)",
+            responses: [
+                budgetToolCall, budgetToolCall, budgetToolCall, "finished after four rounds",
+            ],
+            advanceSeconds: 400,
+            toolResult: .string("ok")
+        )
+        // Four provider calls = 1600s of turn on a 600s surface budget. Every
+        // one of those rounds landed a result, so the deadline kept sliding.
+        #expect(providerCalls == 4, "\(surface): productive rounds must extend the budget")
+        #expect(result.providerCallCount == 4, "\(surface)")
+        #expect(result.toolDispatches.count == 3, "\(surface)")
+        #expect(result.reply == "finished after four rounds", "\(surface)")
+    }
+}
+
+/// The other half of the contract: a SPIN loop (every dispatch erroring) gets
+/// no extension and still dies at the surface budget.
+@Test
+func structuredWholeTurnBudget_spinningTurnNeverExtendsPastTheSurfaceBudget() async throws {
+    let (result, providerCalls) = try await runStructuredBudgetTurn(
+        surface: "telegram",
+        tag: "spin",
+        responses: [budgetToolCall],
+        advanceSeconds: 400,
+        toolResult: .object(["status": .string("failed"), "error": .string("still stuck")])
     )
-    let tools = MockToolDispatchClient(scripted: ["echo": .string("ok")])
-    let engine = try makeToolLoopBudgetEngine(tag: "stream", llm: llm, tools: tools)
+    // Rounds land at 400s and 800s; the third boundary check is past the 600s
+    // floor. A productive turn with this shape would have kept going.
+    #expect(providerCalls == 2)
+    #expect(result.providerCallCount == 2)
+    #expect(result.toolDispatches.count == 2)
+    #expect(result.reply.contains("turn stopped by wall-clock budget after 800s / 2 provider rounds"))
+}
+
+/// An iteration that dispatches NOTHING is not progress, however much text the
+/// model produced. Protocol-violation bounces run the loop without a single
+/// dispatch, so the budget must expire on schedule.
+@Test
+func structuredWholeTurnBudget_iterationsWithoutDispatchesDoNotExtend() async throws {
+    let malformed = "\nool_use name=\"echo\">{}</tool_use>"
+    let (result, providerCalls) = try await runStructuredBudgetTurn(
+        surface: "telegram",
+        tag: "no-dispatch",
+        responses: [malformed],
+        advanceSeconds: 300,
+        toolResult: .string("ok")
+    )
+    // Bounces at 300s and 600s; the third boundary check is at the floor.
+    #expect(providerCalls == 2)
+    #expect(result.providerCallCount == 2)
+    #expect(result.toolDispatches.isEmpty)
+}
+
+@Test
+func wholeTurnWallClockBudget_progressSlidesTheDeadlineAndStopsAtTheAbsoluteCeiling() async {
+    let clock = ToolLoopManualMonotonicClock()
     let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
 
+    await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
+        var budget = WholeTurnWallClockBudget.start(surface: "telegram")
+        clock.advance(seconds: 500)
+        #expect(!budget.isExhausted)
+        budget.recordProgress()
+        clock.advance(seconds: 500)
+        // 1000s in on a 600s surface budget, still alive: the round at 500s
+        // re-granted the window.
+        #expect(!budget.isExhausted)
+
+        // Keep producing all the way to the ceiling.
+        for _ in 0..<5 {
+            budget.recordProgress()
+            clock.advance(seconds: 500)
+        }
+        #expect(!budget.isExhausted)  // 3500s
+        // This round's extension is CLAMPED to the ceiling: 3500 + 600 would
+        // be 4100, the deadline lands on 3900.
+        budget.recordProgress()
+        clock.advance(seconds: 399)
+        #expect(!budget.isExhausted)  // 3899s
+        clock.advance(seconds: 1)
+        budget.recordProgress()  // productive, and it CANNOT help any more
+        #expect(budget.isExhausted)
+        #expect(budget.elapsedSeconds == 3_900)
+    }
+}
+
+@Test
+func wholeTurnWallClockBudget_unattendedSurfacesAreAlreadyAtTheCeilingSoProgressAddsNothing() async {
+    let clock = ToolLoopManualMonotonicClock()
+    let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
+
+    await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
+        var budget = WholeTurnWallClockBudget.start(surface: "autonomy")
+        clock.advance(seconds: 1_000)
+        budget.recordProgress()
+        clock.advance(seconds: 2_899)
+        #expect(!budget.isExhausted)
+        clock.advance(seconds: 1)
+        #expect(budget.isExhausted)  // 3900s, extension or not
+    }
+}
+
+private func runStreamingBudgetTurn(
+    tag: String,
+    iterations: [[LLMMessageStreamEvent]],
+    advanceSeconds: TimeInterval,
+    toolResult: JSONValue
+) async throws -> (result: TurnEngineResult, providerCalls: Int) {
+    let clock = ToolLoopManualMonotonicClock()
+    let llm = AdvancingStreamingToolLoopLLM(
+        iterations: iterations,
+        advance: { clock.advance(seconds: advanceSeconds) }
+    )
+    let tools = MockToolDispatchClient(scripted: ["echo": toolResult])
+    let engine = try makeToolLoopBudgetEngine(tag: tag, llm: llm, tools: tools)
+    let now: WholeTurnWallClockBudget.MonotonicClock = { clock.now() }
     let result = try await WholeTurnWallClockBudget.$nowNanoseconds.withValue(now) {
         try await engine.executeTurnWithStreamingToolLoop(
             surface: "chat",
@@ -254,8 +392,24 @@ func streamingWholeTurnBudget_expiresThroughTheSameExhaustionTerminal() async th
             tools: tools
         )
     }
+    return (result, llm.callCount)
+}
 
-    #expect(llm.callCount == 1)
+private let budgetStreamedCall: [LLMMessageStreamEvent] = [
+    .toolCall(LLMStreamToolCall(id: "stream-1", name: "echo", inputJSON: Data("{}".utf8))),
+]
+
+@Test
+func streamingWholeTurnBudget_expiresThroughTheSameExhaustionTerminal() async throws {
+    // Failing dispatch → no extension → the 600s ceiling still applies.
+    let (result, providerCalls) = try await runStreamingBudgetTurn(
+        tag: "stream",
+        iterations: [budgetStreamedCall],
+        advanceSeconds: 601,
+        toolResult: .object(["status": .string("failed"), "error": .string("nope")])
+    )
+
+    #expect(providerCalls == 1)
     #expect(result.providerCallCount == 1)
     #expect(result.toolDispatches.map(\.name) == ["echo"])
     #expect(
@@ -266,4 +420,24 @@ func streamingWholeTurnBudget_expiresThroughTheSameExhaustionTerminal() async th
             wallClockElapsedSeconds: 601
         )
     )
+}
+
+@Test
+func streamingWholeTurnBudget_productiveRoundsExtendTheSameWay() async throws {
+    let (result, providerCalls) = try await runStreamingBudgetTurn(
+        tag: "stream-productive",
+        iterations: [
+            budgetStreamedCall,
+            budgetStreamedCall,
+            budgetStreamedCall,
+            [.textDelta("finished after four rounds")],
+        ],
+        advanceSeconds: 400,
+        toolResult: .string("ok")
+    )
+
+    #expect(providerCalls == 4)
+    #expect(result.providerCallCount == 4)
+    #expect(result.toolDispatches.count == 3)
+    #expect(result.reply.contains("finished after four rounds"))
 }

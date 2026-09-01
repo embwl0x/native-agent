@@ -507,6 +507,7 @@ extension AppDelegate {
 
     // runtime integration + background loops: drain Swift-native subsystems
     // before process exit.
+    @MainActor
     func applicationWillTerminate(_ notification: Notification) {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         // Stop the loopback bridges first, synchronously: once the listeners are
@@ -583,8 +584,13 @@ extension AppDelegate {
             group.leave()
         }
         group.enter()
-        Task { @MainActor in
-            await ActivityWatchController.shared.shutdown()
+        // Create the Activity Watch drain ON the main actor before blocking it
+        // in `group.wait`. Dispatching `shutdown()` back to MainActor here used
+        // to guarantee that teardown could not even begin until the 3s wait had
+        // already expired.
+        let activityWatchDrain = ActivityWatchController.shared.makeTerminationDrain()
+        Task.detached {
+            await activityWatchDrain.value
             group.leave()
         }
         _ = group.wait(timeout: .now() + 3.0)

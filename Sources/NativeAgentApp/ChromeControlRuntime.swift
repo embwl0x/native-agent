@@ -10,6 +10,7 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
     case disconnected
     case invalidResponse
     case requestTimedOut
+    case extensionRejected(code: String, message: String)
     case outcomeUnknown(action: String, reason: String)
     case socketFailure(Int32)
     case socketPathTooLong
@@ -23,6 +24,8 @@ enum ChromeControlRuntimeError: Error, LocalizedError, Sendable, Equatable {
         case .disconnected: return "Chrome is not connected to NativeAgent."
         case .invalidResponse: return "Chrome returned an invalid control response."
         case .requestTimedOut: return "Chrome did not answer before the control deadline."
+        case .extensionRejected(let code, let message):
+            return "Chrome refused the control request (\(code)): \(message)"
         case .outcomeUnknown(let action, let reason):
             return "Chrome did not confirm \(action) after dispatch. \(reason) The action may have completed; do not automatically repeat it. Observe the page before retrying."
         case .socketFailure(let code): return "Chrome control socket failed (errno \(code))."
@@ -165,7 +168,11 @@ actor ChromeControlChannel {
                 } catch {
                     if let row = pending.removeValue(forKey: id) {
                         row.timeout.cancel()
-                        row.continuation.resume(throwing: error)
+                        // FileHandle may report a write failure after a frame
+                        // prefix or payload reached the relay. For an effect,
+                        // transport failure is therefore not proof that Chrome
+                        // did nothing and must not invite a blind retry.
+                        row.continuation.resume(throwing: row.unconfirmedFailure(error))
                     }
                 }
             }
@@ -229,17 +236,23 @@ actor ChromeControlChannel {
             }
             row.continuation.resume(returning: value)
         } else {
+            let code: String
             let message: String
             if case .object(let errorObject)? = object["error"],
                case .string(let detail)? = errorObject["message"] {
                 message = detail
+                if case .string(let value)? = errorObject["code"] {
+                    code = value
+                } else {
+                    code = "extension_rejected"
+                }
             } else {
+                code = "extension_rejected"
                 message = "Chrome control action failed."
             }
-            row.continuation.resume(throwing: NSError(
-                domain: "NativeAgentChromeControl",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: message]
+            row.continuation.resume(throwing: ChromeControlRuntimeError.extensionRejected(
+                code: code,
+                message: message
             ))
         }
     }

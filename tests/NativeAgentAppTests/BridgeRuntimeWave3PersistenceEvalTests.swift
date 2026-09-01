@@ -376,6 +376,85 @@ struct BridgeRuntimeWave3PersistenceEvalTests {
     }
 
     // app.bridges / icloud.chatDeliveryReceipts
+    @Test("one torn receipt line self-heals instead of blocking every later write")
+    func tornReceiptLineSelfHealsAndPreservesTheDamagedStore() async throws {
+        // The store was appended non-atomically for most of its life, so a torn
+        // last line can already be on disk at upgrade time. A strict full-file
+        // parse threw on it, every append swallowed the throw with `try?`, and
+        // `confirmChatDeliveryReceipt` then answered false forever — the phone's
+        // recordNotificationReceipt failed `receipt_persistence_failed` with no
+        // way back. Skipping the bad line must not silently eat the bytes.
+        let root = try wave3Root("receipt-torn-line")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let secret = Data(repeating: 7, count: 32)
+        let eventID = String(repeating: "c", count: 64)
+        let receiptsURL = root.appendingPathComponent("icloud/chat_delivery_receipts.jsonl")
+
+        // A good row that must survive, followed by a torn trailing write.
+        let survivor = try BridgeMessage.make(
+            id: "pre-tear-1",
+            sender: "mac",
+            text: "Earlier reply",
+            metadata: ["kind": "notification", "userInfo.eventId": eventID]
+        ).signed(with: secret)
+        await iCloudBridge.appendChatDeliveryReceipt(
+            survivor,
+            direction: "mac_to_ios",
+            transport: "cloudkit",
+            status: .acceptedByTransport,
+            secret: secret,
+            dataRoot: root
+        )
+        let intact = try Data(contentsOf: receiptsURL)
+        var torn = intact
+        torn.append(Data("{\"at\":\"2026-08-31T00:00:00Z\",\"messageId\":\"tor".utf8))
+        try torn.write(to: receiptsURL)
+
+        // A later append still lands, and the pre-existing row is still
+        // confirmable — both were permanently dead before this fix.
+        let follower = try BridgeMessage.make(
+            id: "post-tear-1",
+            sender: "mac",
+            text: "Later reply",
+            metadata: ["kind": "reply"]
+        ).signed(with: secret)
+        await iCloudBridge.appendChatDeliveryReceipt(
+            follower,
+            direction: "mac_to_ios",
+            transport: "cloudkit",
+            status: .acceptedByTransport,
+            secret: secret,
+            dataRoot: root
+        )
+        let confirmed = await iCloudBridge.confirmChatDeliveryReceipt(
+            direction: "mac_to_ios",
+            eventID: eventID,
+            channel: "ios",
+            dataRoot: root
+        )
+
+        let rows = try readJSONLRows(at: receiptsURL)
+        #expect(confirmed)
+        #expect(rows.count == 2)
+        #expect(rows.contains { ($0["messageId"] as? String) == "pre-tear-1" })
+        #expect(rows.contains { ($0["messageId"] as? String) == "post-tear-1" })
+        #expect(rows.contains {
+            ($0["messageId"] as? String) == "pre-tear-1"
+                && ($0["status"] as? String) == "confirmed_by_peer"
+        })
+
+        // The damaged original is renamed aside, never deleted.
+        let icloudDir = root.appendingPathComponent("icloud", isDirectory: true)
+        let asides = try FileManager.default
+            .contentsOfDirectory(atPath: icloudDir.path)
+            .filter { $0.hasPrefix("chat_delivery_receipts.jsonl.stale-") }
+        #expect(asides.count == 1)
+        let preserved = try #require(asides.first)
+        let preservedBytes = try Data(contentsOf: icloudDir.appendingPathComponent(preserved))
+        #expect(preservedBytes == torn)
+    }
+
+    // app.bridges / icloud.chatDeliveryReceipts
     @Test("peer notification confirmation rejects missing or invalid explicit direction")
     func peerNotificationConfirmationRequiresExplicitDirection() async throws {
         let root = try wave3Root("receipt-confirmation-invalid")

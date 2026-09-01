@@ -462,7 +462,50 @@ func autonomyGatedDispatcher_fullMacYoloTrustedTelegramMemoryWriteBypassesApprov
 }
 
 @Test
-func trustCenter_fullMacYoloDoesNotTrustRemoteSurfaceLabelAloneOrRemoveHardFloors() async throws {
+func autonomyGatedDispatcher_fullMacYoloBypassesPersonaWriteGuardWithZeroFilerCalls() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("full_mac_persona_zero_filer_\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let persistence = SwiftNativePersistenceCore()
+    try await persistence.writeJSON(
+        .object([
+            "permissionLevel": .string("full_mac_os"),
+            "fullMacNeverExpires": .bool(true),
+            "toolAutonomy": .object([
+                "default": .string("send_approval"),
+                "persona_write": .string("confirm"),
+            ]),
+        ]),
+        to: root.appendingPathComponent("trust", isDirectory: true)
+            .appendingPathComponent("policy.json")
+    )
+    let tools = MockToolDispatchClient(scripted: [
+        "persona_write": .object(["status": .string("written")]),
+    ])
+    let filer = MockNonBlockingApprovalFiler()
+    let trust = SwiftNativeTrustCenter(dataRoot: root, persistence: persistence)
+    let dispatcher = AutonomyGatedDispatcher(
+        inner: tools,
+        gate: AutonomyGate(trust: trust, approvalFiler: filer),
+        approvalFiler: filer,
+        securityCenter: SwiftNativeSecurityCenter(dataRoot: root, persistence: persistence),
+        hasFiler: true,
+        verifiedSessionId: "local-chat"
+    )
+
+    let result = try await dispatcher.dispatch(
+        tool: "persona_write",
+        input: ["kind": .string("profile"), "text": .string("bounded update")],
+        surface: "chat"
+    )
+
+    #expect(result == .object(["status": .string("written")]))
+    #expect(tools.dispatches.map(\.tool) == ["persona_write"])
+    #expect(await filer.filedCount() == 0)
+}
+
+@Test
+func trustCenter_fullMacYoloDoesNotTrustRemoteSurfaceLabelButFlattensTrustedConfirm() async throws {
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("telegram_full_mac_origin_boundary_\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -496,7 +539,7 @@ func trustCenter_fullMacYoloDoesNotTrustRemoteSurfaceLabelAloneOrRemoveHardFloor
 
     #expect(untrustedMemory == "send_approval")
     #expect(untrustedFileWrite != "auto")
-    #expect(trustedExternalWrite == "confirm")
+    #expect(trustedExternalWrite == "auto")
 }
 
 // MARK: - Throwaway protocol stubs for SwiftNativeTurnEngine construction

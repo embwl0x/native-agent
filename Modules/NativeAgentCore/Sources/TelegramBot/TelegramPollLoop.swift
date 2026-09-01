@@ -1097,9 +1097,17 @@ public struct TelegramPollLoop: LoopRunner {
             }
             guard shouldCompleteClaim else { continue }
             do {
+                // `.queued` belongs in the from-set: a claim rehydrated as
+                // queued after restart never re-enters `.processing`, and if
+                // its handling exits WITHOUT re-enqueueing (the re-enqueue
+                // paths set shouldCompleteClaim = false) it is finished. With
+                // `[.processing]` alone the transition silently no-op'd, the
+                // tick returned .failed, and the still-queued claim made every
+                // later tick skip getUpdates and replay the same failure
+                // forever.
                 let completed = try await updateInbox.transition(
                     updateId: update.updateId,
-                    from: [.processing],
+                    from: [.processing, .queued],
                     to: .completed
                 )
                 guard completed.phase == .completed else {

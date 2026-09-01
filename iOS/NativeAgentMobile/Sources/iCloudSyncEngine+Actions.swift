@@ -712,8 +712,19 @@ extension iCloudSyncEngine {
             }
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 { break }
-            // Wakes early on a push; otherwise ticks the cheap local read.
-            _ = await waiters.wait(msgId, timeout: min(interval, remaining))
+            let tick = min(interval, remaining)
+            if waiters.hasArrived(msgId) {
+                // The response is durable locally but the poll above still
+                // rejected it (signature mismatch after a secret rotation, an
+                // undecodable body, a receipt that would not persist). `wait`
+                // returns immediately once an arrival is recorded, so this
+                // pass has to pay the interval itself — otherwise the retry
+                // busy-spins the main actor for the whole timeout.
+                try? await Task.sleep(nanoseconds: UInt64(max(0, tick) * 1_000_000_000))
+            } else {
+                // Wakes early on a push; otherwise ticks the cheap local read.
+                _ = await waiters.wait(msgId, timeout: tick)
+            }
             if Task.isCancelled { return nil }
         }
         return nil

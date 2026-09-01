@@ -184,6 +184,34 @@ struct GitHubReviewThreadEvidenceTests {
 
 @Suite("GitHub write pre-flight")
 struct GitHubWritePreflightTests {
+    @Test
+    func strictEmptyIssueCollectionsPreserveUnlessExplicitlyCleared() throws {
+        let ordinary = try GitHubConnectorActions.testIssueBody([
+            "title": .string("Keep existing assignments"),
+            "labels": .array([]),
+            "assignees": .array([]),
+            "clear_labels": .bool(false),
+            "clear_assignees": .bool(false),
+        ], requireTitle: false)
+        #expect(ordinary["title"] as? String == "Keep existing assignments")
+        #expect(ordinary["labels"] == nil)
+        #expect(ordinary["assignees"] == nil)
+
+        let explicit = try GitHubConnectorActions.testIssueBody([
+            "clear_labels": .bool(true),
+            "clear_assignees": .bool(true),
+        ], requireTitle: false)
+        #expect((explicit["labels"] as? [String]) == [])
+        #expect((explicit["assignees"] as? [String]) == [])
+
+        #expect(throws: GitHubConnectorError.self) {
+            _ = try GitHubConnectorActions.testIssueBody([
+                "labels": .array([.string("bug")]),
+                "clear_labels": .bool(true),
+            ], requireTitle: false)
+        }
+    }
+
     // GitHubProjectTracking.swift:127 — the connector's entire write fan-out
     // (issue/PR create, comment, close/merge). Every refusal below happens
     // before `call(...)`, which is the only thing standing between a body

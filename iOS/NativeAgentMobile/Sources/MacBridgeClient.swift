@@ -204,7 +204,20 @@ final class MacBridgeClient: ObservableObject {
     private let pathObserver: NetworkPathObserver = .shared
     /// E8: fired when the device's network path comes back, so the chat store
     /// can auto-resume its durable queued sends.
-    var onNetworkPathRestored: (() -> Void)?
+    ///
+    /// The path observer starts in this init, so its one-shot nil -> online
+    /// fire routinely lands before `ContentView.onAppear` installs this
+    /// callback — always so when onboarding is on screen first. A missed fire
+    /// is latched and replayed on install, or the cold-launch-online resume is
+    /// silently lost for the session.
+    var onNetworkPathRestored: (() -> Void)? {
+        didSet {
+            guard missedPathRestore, let onNetworkPathRestored else { return }
+            missedPathRestore = false
+            onNetworkPathRestored()
+        }
+    }
+    private var missedPathRestore = false
     /// nil until NWPathMonitor reports; nil never paints an outage. Republished
     /// here so views observing the client see the transition.
     @Published private(set) var deviceIsOffline: Bool?
@@ -239,7 +252,12 @@ final class MacBridgeClient: ObservableObject {
                 }
             }
         pathObserver.onPathRestored = { [weak self] in
-            self?.onNetworkPathRestored?()
+            guard let self else { return }
+            if let handler = onNetworkPathRestored {
+                handler()
+            } else {
+                missedPathRestore = true
+            }
         }
         pathObserver.start()
         refreshBridgeStatus()
@@ -372,9 +390,11 @@ final class MacBridgeClient: ObservableObject {
         bridge.removeRejectedObserver(id)
     }
 
-    func pollICloudRepliesNow() async {
-        await bridge.pollIncomingNow()
+    @discardableResult
+    func pollICloudRepliesNow() async -> Bool {
+        let delivered = await bridge.pollIncomingNow()
         refreshBridgeStatus()
+        return delivered
     }
 
     /// Only Mac-originated activity or a confirmed Mac action may refresh the
@@ -504,9 +524,9 @@ final class MacBridgeClient: ObservableObject {
         } else {
             return nil
         }
-        if let cached = engine.transcriptRecords(for: sid) {
-            return Self.projectChatRecords(cached)
-        }
+        // A refresh is also the missed-reply recovery path. Existing in-memory
+        // rows do not prove that the latest Mac snapshot has been adopted.
+        // The snapshot reader retains last-good rows if the read is unavailable.
         await engine.refreshChatTranscriptsSnapshot()
         guard let records = engine.transcriptRecords(for: sid) else { return nil }
         return Self.projectChatRecords(records)
@@ -543,6 +563,4 @@ final class MacBridgeClient: ObservableObject {
             return ChatMessage(id: uuid, role: role, text: rec.content, attachments: attachments)
         }
     }
-
-    static let shared = MacBridgeClient()
 }

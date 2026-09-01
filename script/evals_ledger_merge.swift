@@ -8,6 +8,8 @@
 //        swift script/evals_ledger_merge.swift changed-plan --repo ROOT
 //        --ledger FILE --sha SHA --selections FILE --mappings FILE
 //        --unmapped FILE --changed-files FILE
+//        swift script/evals_ledger_merge.swift validate-overrides --repo ROOT
+//        --overrides FILE
 // fragments.json = the phase-1 workflow return: [{fence, fragment, critic}, ...]
 // Critic 'missed' surfaces are merged in (tagged source=critic); 'disputed' ids are
 // annotated, never dropped — the ledger shows the dispute.
@@ -140,11 +142,10 @@ private func changedWriteLines(_ lines: [String], to path: String) {
 
 // The lookbehind anchors the match at a path-token boundary: without it,
 // `iOS/NativeAgentMobile/Tests/Foo.swift` substring-matched at `Tests/` and
-// got planned into the root package, where zero tests match and the
-// vacuous-evidence guard fails the gate (2026-08-28). iOS test refs are not
-// swift-test-executable here; the --full iOS simulator lane owns them.
+// got planned into the root package. iOS evidence is a first-class changed
+// selection now and runs through the simulator runner, never SwiftPM.
 private let changedExecutableTestPathPattern = try! NSRegularExpression(
-    pattern: #"(?<![\w/-])(?:Modules/NativeAgentCore/Tests|Modules/NativeAgentShared/Tests|tests|Tests)/[^\s:()—]+\.swift"#
+    pattern: #"(?<![\w/-])(?:iOS/NativeAgentMobile/Tests|Modules/NativeAgentCore/Tests|Modules/NativeAgentShared/Tests|tests|Tests)/[^\s:()—]+\.swift"#
 )
 
 private let changedExecutableSmokePathPattern = try! NSRegularExpression(
@@ -185,7 +186,8 @@ private func changedExpandTestGlob(_ path: String, repo: String) -> [String] {
 
 private func changedPotentialTestPaths(for path: String, repo: String) -> [String] {
     let hasGlob = path.contains("*") || path.contains("?") || path.contains("[")
-    if path.hasPrefix("Modules/NativeAgentCore/Tests/")
+    if path.hasPrefix("iOS/NativeAgentMobile/Tests/")
+        || path.hasPrefix("Modules/NativeAgentCore/Tests/")
         || path.hasPrefix("Modules/NativeAgentShared/Tests/")
         || path.hasPrefix("tests/") {
         // An explicit package path is unambiguous even after deletion. Keep it
@@ -235,6 +237,9 @@ private func changedSelection(forCanonicalPath path: String) -> ChangedSelection
     } else if path.hasPrefix("tests/") || path.hasPrefix("Tests/") {
         packageLabel = "root"
         packagePath = "."
+    } else if path.hasPrefix("iOS/NativeAgentMobile/Tests/") {
+        packageLabel = "ios"
+        packagePath = "iOS/NativeAgentMobile"
     } else {
         return nil
     }
@@ -249,6 +254,19 @@ private func changedSelections(for path: String, repo: String) -> [ChangedSelect
 
 private func changedCoverageSelections(for ref: String, repo: String) -> [ChangedSelectionKey] {
     let paths = changedExecutableTestPaths(in: ref)
+    if ref.contains("[xcode-filter:") {
+        let pattern = try! NSRegularExpression(pattern: #"\[xcode-filter: ([A-Za-z_][A-Za-z0-9_]*)\]"#)
+        let matches = pattern.matches(in: ref, range: NSRange(ref.startIndex..., in: ref))
+        guard paths.count == 1, matches.count == 1,
+              ref.components(separatedBy: "[xcode-filter:").count == 2,
+              paths[0].hasPrefix("iOS/NativeAgentMobile/Tests/"),
+              let suiteRange = Range(matches[0].range(at: 1), in: ref),
+              let source = try? String(contentsOf: URL(fileURLWithPath: repo).appendingPathComponent(paths[0]), encoding: .utf8) else { return [] }
+        let suite = String(ref[suiteRange])
+        let declaration = #"\b(?:struct|class|enum)\s+"# + NSRegularExpression.escapedPattern(for: suite) + #"\b"#
+        guard source.range(of: declaration, options: .regularExpression) != nil else { return [] }
+        return [ChangedSelectionKey(packageLabel: "ios", packagePath: "iOS/NativeAgentMobile", filter: suite)]
+    }
     guard ref.contains("[swift-filter:") else {
         return paths.flatMap { changedSelections(for: $0, repo: repo) }
     }
@@ -292,6 +310,66 @@ private func changedTestReference(_ path: String, matches changedPath: String) -
         patterns = [path]
     }
     return patterns.contains { fnmatch($0, changedPath, FNM_PATHNAME) == 0 }
+}
+
+private func validateOverrideReferences(_ rawArguments: [String]) {
+    var values: [String: String] = [:]
+    var index = 0
+    while index < rawArguments.count {
+        guard rawArguments[index].hasPrefix("--"), index + 1 < rawArguments.count else {
+            changedFail("validate-overrides expects --repo ROOT --overrides FILE")
+        }
+        values[rawArguments[index]] = rawArguments[index + 1]
+        index += 2
+    }
+    guard let repo = values["--repo"], !repo.isEmpty,
+          let path = values["--overrides"], !path.isEmpty,
+          let data = FileManager.default.contents(atPath: path),
+          let patches = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+        changedFail("validate-overrides could not read its repo/overrides inputs")
+    }
+
+    var failures: [String] = []
+    for patch in patches {
+        let identity = "\(patch["fence"] as? String ?? "?").\(patch["id"] as? String ?? "?")"
+        for case let coverage as [String: Any] in patch["coverage"] as? [Any] ?? [] {
+            guard coverage["tier"] as? String == "test",
+                  let ref = coverage["ref"] as? String else { continue }
+            for testPath in changedExecutableTestPaths(in: ref) {
+                let resolved = changedResolvedTestPaths(for: testPath, repo: repo)
+                if resolved.isEmpty {
+                    failures.append("\(identity): unresolved test path \(testPath)")
+                    continue
+                }
+                let escaped = NSRegularExpression.escapedPattern(for: testPath)
+                let linePattern = try! NSRegularExpression(pattern: escaped + #":([0-9]+)"#)
+                let refRange = NSRange(ref.startIndex..<ref.endIndex, in: ref)
+                let lineNumbers = linePattern.matches(in: ref, range: refRange).compactMap { match -> Int? in
+                    guard let range = Range(match.range(at: 1), in: ref) else { return nil }
+                    return Int(ref[range])
+                }
+                for resolvedPath in resolved {
+                    let url = URL(fileURLWithPath: repo).appendingPathComponent(resolvedPath)
+                    guard let source = try? String(contentsOf: url, encoding: .utf8) else {
+                        failures.append("\(identity): unreadable test path \(resolvedPath)")
+                        continue
+                    }
+                    let lineCount = source.split(separator: "\n", omittingEmptySubsequences: false).count
+                    for line in lineNumbers where line > lineCount {
+                        failures.append("\(identity): stale line \(testPath):\(line) (file has \(lineCount))")
+                    }
+                }
+            }
+            if (ref.contains("[swift-filter:") || ref.contains("[xcode-filter:")),
+               changedCoverageSelections(for: ref, repo: repo).isEmpty {
+                failures.append("\(identity): stale or ambiguous swift-filter reference")
+            }
+        }
+    }
+    guard failures.isEmpty else {
+        changedFail("override reference integrity failed:\n  " + failures.sorted().joined(separator: "\n  "))
+    }
+    print("eval override references resolve")
 }
 
 
@@ -425,6 +503,11 @@ private func runChangedPlan(_ rawArguments: [String]) {
          changedSanitizeTSV($0.fence)].joined(separator: "\t")
     }
     changedWriteLines(unresolvedLines, to: arguments.unmapped)
+}
+
+if CommandLine.arguments.count > 1, CommandLine.arguments[1] == "validate-overrides" {
+    validateOverrideReferences(Array(CommandLine.arguments.dropFirst(2)))
+    exit(0)
 }
 
 if CommandLine.arguments.count > 1, CommandLine.arguments[1] == "changed-plan" {
@@ -628,6 +711,18 @@ func validateSurface(_ surface: [String: Any], fence: String?) {
         guard let ref = str(coverage["ref"]), !ref.isEmpty else { fail("\(fence).\(id): coverage ref is empty") }
         if let strength = str(coverage["strength"]), !["asserts", "reports-only", "incidental"].contains(strength) {
             fail("\(fence).\(id): invalid coverage strength '\(strength)'")
+        }
+        // These exhaustive probes prove only that a registered name reaches a
+        // known dispatch boundary. Empty arguments may still be rejected, or
+        // the implementation behind that boundary may be behaviorally broken.
+        // Never let route reachability alone certify a tool as COVERED.
+        let routeOnlyProofs = [
+            "everyRegisteredAppToolReachesItsAppOwnedDispatchBoundary",
+            "everyCataloguedToolDispatchesWithoutUnknownOrLazyGateDrift",
+        ]
+        if str(coverage["strength"]) == "asserts",
+           routeOnlyProofs.contains(where: ref.contains) {
+            fail("\(fence).\(id): route-only coverage must be reports-only, not asserts")
         }
     }
 }

@@ -155,7 +155,10 @@ full_install_and_verify() {
   touch "$OUT/full-install-ready"
 }
 echo "evals — $(git -C "$ROOT" rev-parse --short HEAD) — $(date '+%Y-%m-%d %H:%M')   (logs: $OUT)"
+step eval-reference-integrity swift "$ROOT/script/evals_ledger_merge.swift" validate-overrides \
+  --repo "$ROOT" --overrides "$ROOT/docs/evals/coverage-overrides.json"
 if [ -n "$CHANGED_SHA" ]; then
+  [ "$fails" -eq 0 ] || changed_exit_code=1
   CHANGED_SWIFT="${NATIVEAGENT_EVALS_CHANGED_SWIFT:-swift}"
   if ! "$CHANGED_SWIFT" "$ROOT/script/evals_ledger_merge.swift" changed-plan \
       --repo "$ROOT" --ledger "$ROOT/docs/evals/ledger.json" --sha "$CHANGED_SHA" \
@@ -197,6 +200,10 @@ if [ -n "$CHANGED_SHA" ]; then
     if [ "$package_label" = "script" ]; then
       printf '  SELECTED: executable %s\n' "$filter"
       changed_script_step "$name" "$filter" "$ROOT/$filter" || true
+    elif [ "$package_label" = "ios" ]; then
+      printf '  SELECTED: iOS simulator --only-testing %s\n' "$filter"
+      changed_test_step "$name" "$package_label" "$filter" \
+        "$ROOT/script/test_ios.sh" --require --only-testing "$filter" || true
     else
       printf '  SELECTED: %s --filter %s\n' "$package_label" "$filter"
       changed_test_step "$name" "$package_label" "$filter" \

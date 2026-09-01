@@ -90,10 +90,19 @@ extension SwiftToolDispatcher {
         let lockedAppTools = Self.fullMacAppToolNames.sorted().filter {
             modelNameSet.contains($0) && !names.contains($0)
         }
-        let axReadTools = Self.fullMacAccessibilityReadToolNames.sorted()
+        // These summary arrays are model-facing discovery just like
+        // `available_tools`. Keep them on the same four-verb cutover boundary:
+        // the underlying mac_* organs remain callable by direct diagnostics,
+        // but a conversational catalog must never advertise one that
+        // `tool_load` intentionally rejects as internal-only.
+        let axReadTools = Self.fullMacAccessibilityReadToolNames
+            .filter { modelNameSet.contains($0) }
+            .sorted()
         let availableAXReadTools = axReadTools.filter { names.contains($0) }
         let lockedAXReadTools = axReadTools.filter { !names.contains($0) }
-        let nudgeTools = Self.fullMacNudgeToolNames.sorted()
+        let nudgeTools = Self.fullMacNudgeToolNames
+            .filter { modelNameSet.contains($0) }
+            .sorted()
         let availableNudgeTools = nudgeTools.filter { names.contains($0) }
         let lockedNudgeTools = nudgeTools.filter { !names.contains($0) }
         // W7 — activity_query. Reported in the discovery surface like every
@@ -103,7 +112,9 @@ extension SwiftToolDispatcher {
         let activityTools = Self.activityQueryToolNames.sorted()
         let availableActivityTools = activityTools.filter { names.contains($0) }
         let lockedActivityTools = activityTools.filter { !names.contains($0) }
-        let axActTools = Self.fullMacAccessibilityInjectionToolNames.sorted()
+        let axActTools = Self.fullMacAccessibilityInjectionToolNames
+            .filter { modelNameSet.contains($0) }
+            .sorted()
         let availableAXActTools = axActTools.filter { names.contains($0) }
         let lockedAXActTools = axActTools.filter { !names.contains($0) }
         let groupIndex = ToolPreloadHeuristics.groupIndex(

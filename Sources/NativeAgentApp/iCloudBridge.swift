@@ -911,7 +911,7 @@ final class iCloudBridge: ObservableObject {
         let path = chatDeliveryReceiptsURL(dataRoot: dataRoot)
         let persistence = SwiftNativePersistenceCore()
         return try await persistence.withFileLock(path) {
-            let existing = try loadChatDeliveryReceiptRows(path: path)
+            let existing = loadChatDeliveryReceiptRows(path: path)
             var rows = existing
             var matchedIndex: Int?
             if let match {
@@ -939,19 +939,69 @@ final class iCloudBridge: ObservableObject {
         }
     }
 
-    nonisolated private static func loadChatDeliveryReceiptRows(path: URL) throws -> [[String: JSONValue]] {
+    /// Tolerant, self-healing load. This store was appended non-atomically for
+    /// most of its life, so a torn last line can already exist on disk at
+    /// upgrade time. Throwing on it made `upsertChatDeliveryReceipt` fail
+    /// forever — every append swallows the error with `try?`, and
+    /// `confirmChatDeliveryReceipt` then answers false permanently, so the
+    /// phone's `recordNotificationReceipt` fails with
+    /// `receipt_persistence_failed` and never recovers. Skip the unparseable
+    /// lines instead, but never drop the bytes silently: the damaged original
+    /// is renamed aside as `.stale-<ts>` before the rebuilt store is written.
+    nonisolated private static func loadChatDeliveryReceiptRows(path: URL) -> [[String: JSONValue]] {
         guard let data = try? Data(contentsOf: path) else { return [] }
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
-        return try text
-            .split(whereSeparator: \.isNewline)
-            .map { line in
-                guard case .object(let object) = try JSONValue.parse(Data(String(line).utf8)) else {
-                    throw NSError(domain: "iCloudBridge.chatDelivery", code: 1, userInfo: [
-                        NSLocalizedDescriptionKey: "Invalid chat delivery receipt row"
-                    ])
-                }
-                return object
+        guard let text = String(data: data, encoding: .utf8) else {
+            // Not even UTF-8 — the whole file is unreadable. Preserve it aside
+            // rather than letting the atomic rewrite overwrite the evidence.
+            quarantineDamagedChatDeliveryReceipts(path: path, reason: "file is not valid UTF-8")
+            return []
+        }
+        var rows: [[String: JSONValue]] = []
+        var damagedLines = 0
+        for line in text.split(whereSeparator: \.isNewline) {
+            let raw = String(line)
+            if raw.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+            guard
+                let parsed = try? JSONValue.parse(Data(raw.utf8)),
+                case .object(let object) = parsed
+            else {
+                damagedLines += 1
+                continue
             }
+            rows.append(object)
+        }
+        if damagedLines > 0 {
+            quarantineDamagedChatDeliveryReceipts(
+                path: path,
+                reason: "\(damagedLines) unparseable row(s)"
+            )
+        }
+        return rows
+    }
+
+    /// Rename the damaged store aside instead of deleting it. The caller
+    /// rewrites `path` from the rows it could parse, so the quarantined copy is
+    /// the only remaining record of the bytes that were dropped.
+    nonisolated private static func quarantineDamagedChatDeliveryReceipts(path: URL, reason: String) {
+        let fm = FileManager.default
+        var destination = path.appendingPathExtension("stale-\(Int(Date().timeIntervalSince1970))")
+        if fm.fileExists(atPath: destination.path) {
+            destination = destination.appendingPathExtension(UUID().uuidString.prefix(8).lowercased())
+        }
+        do {
+            try fm.moveItem(at: path, to: destination)
+            NSLog(
+                "[iCloudBridge] chat delivery receipts self-healed (%@); damaged store preserved at %@",
+                reason,
+                destination.lastPathComponent
+            )
+        } catch {
+            NSLog(
+                "[iCloudBridge] chat delivery receipts damaged (%@) but could not be preserved aside: %@",
+                reason,
+                error.localizedDescription
+            )
+        }
     }
 
     nonisolated private static func saveChatDeliveryReceiptRows(_ rows: [[String: JSONValue]], path: URL) throws {

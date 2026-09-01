@@ -3,6 +3,7 @@ import PersistenceCore
 import ApprovalInbox
 import MemoryV2
 import ProviderRouting
+import TrustCenter
 
 extension NativeClient {
     /// Applies a resolved memory.repair record (U3 wave-1 item 3 — mirror of
@@ -273,6 +274,23 @@ extension NativeClient {
     static func stageKindBackfillIfNeeded(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async {
+        let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+            .fullMacYoloAuthority(
+                tool: MemoryKindBackfill.action,
+                origin: SecurityOriginContext(
+                    surface: "desk",
+                    source: "memory_kind_backfill_stager",
+                    isRemote: false
+                )
+            )
+        if yolo.state == .explicitlyBlocked {
+            writeKindBackfillFullMacOutcome(
+                dataRoot: dataRoot,
+                status: "refused",
+                detail: "memory kind backfill is explicitly blocked; no approval was staged."
+            )
+            return
+        }
         let storage: MemoryStorage
         do {
             storage = try await Self.kindBackfillStorage(dataRoot: dataRoot)
@@ -340,12 +358,68 @@ extension NativeClient {
             storage: storage,
             classifier: classifier,
             createApproval: { body in
-                try await inbox.create(body).id
+                if yolo.admitted {
+                    guard case .object(let object) = body,
+                          let payload = object["payload"] else {
+                        throw NSError(domain: "MemoryKindBackfill", code: 422, userInfo: [
+                            NSLocalizedDescriptionKey: "kind-backfill staging body carries no payload"
+                        ])
+                    }
+                    let timestamp = ISO8601DateFormatter().string(from: Date())
+                    let id = "full-mac-yolo-\(UUID().uuidString.lowercased())"
+                    let admitted = ApprovalRecord(
+                        id: id,
+                        title: "Full Mac admitted memory kind backfill",
+                        action: MemoryKindBackfill.action,
+                        risk: "medium",
+                        reason: "Admitted by active Full Mac authority",
+                        status: "resolved",
+                        payload: payload,
+                        payloadPreview: "",
+                        createdAt: timestamp,
+                        resolvedAt: timestamp,
+                        decision: "approved",
+                        decidedBy: "full_mac_yolo",
+                        remoteResolvable: false,
+                        localOnly: true
+                    )
+                    await applyResolvedKindBackfill(from: admitted, dataRoot: dataRoot)
+                    writeKindBackfillFullMacOutcome(
+                        dataRoot: dataRoot,
+                        status: "admitted",
+                        detail: "Executed through the canonical kind-backfill executor without an approval prompt."
+                    )
+                    return id
+                }
+                return try await inbox.create(body).id
             },
             listPendingBackfills: {
-                try await inbox.list(
+                if yolo.admitted { return [] }
+                return try await inbox.list(
                     filter: ApprovalFilter(status: "pending", action: MemoryKindBackfill.action)
                 ).map { (id: $0.id, payload: $0.payload) }
             })
+    }
+
+    private static func writeKindBackfillFullMacOutcome(
+        dataRoot: URL,
+        status: String,
+        detail: String
+    ) {
+        let path = dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("kind_backfill.full_mac_outcome.json")
+        try? FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let value: JSONValue = .object([
+            "status": .string(status),
+            "detail": .string(detail),
+            "at": .string(ISO8601DateFormatter().string(from: Date())),
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(value) {
+            try? data.write(to: path, options: .atomic)
+        }
     }
 }

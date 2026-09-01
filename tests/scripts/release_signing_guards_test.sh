@@ -132,6 +132,13 @@ grep -Fq 'buildIdentity.sourceRevision' "$READINESS" \
   || fail "readiness verifier no longer proves exact source revision"
 grep -Fq 'buildIdentity.sourceDirty' "$READINESS" \
   || fail "readiness verifier no longer proves exact source dirty state"
+grep -Fq '/usr/bin/open -n "$APP_DEST"' "$INSTALLER" \
+  || fail "installer no longer retries a stale LaunchServices registration through the app bundle"
+grep -Fq 'refusing a direct executable launch because it can lose macOS TCC attribution' "$INSTALLER" \
+  || fail "installer no longer fails closed when only a TCC-breaking direct executable launch remains"
+if grep -Fq '( "$APP_DEST/Contents/MacOS/NativeAgentApp"' "$INSTALLER"; then
+  fail "installer can still bypass the app bundle and silently lose Accessibility/TCC attribution"
+fi
 
 # Exercise the shared pure plist contract without requiring a maintainer's
 # signed provisioning profiles in the repository.

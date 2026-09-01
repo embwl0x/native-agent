@@ -9,6 +9,7 @@ import PersistenceCore
 import Research
 import SystemOps
 import ToolExecution
+import TrustCenter
 
 private enum WorkflowOrchestrationProcessIdentity {
     /// One identity for the lifetime of this process. All clients in the live
@@ -70,6 +71,20 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
     private var runsPath: URL { root.appendingPathComponent("workflows/runs.jsonl") }
     private var tracesPath: URL { root.appendingPathComponent("traces/events.jsonl") }
     private var activityPath: URL { root.appendingPathComponent("activity/events.jsonl") }
+
+    /// Checked local authority for unattended workflow execution. This only
+    /// answers approval posture; downstream domain executors retain every hard
+    /// block, CAS, backup, rollback, consent, and idempotency boundary.
+    private func fullMacYoloAuthority(tool: String) async -> FullMacYoloAuthorityAssessment {
+        await SwiftNativeSecurityCenter(dataRoot: root).fullMacYoloAuthority(
+            tool: tool,
+            origin: SecurityOriginContext(
+                surface: "desk",
+                source: "workflow_orchestration",
+                isRemote: false
+            )
+        )
+    }
 
     /// Mirror of Runtime.workflow_state_path(run_id):
     ///   workflow_run_state_dir / f"{slugify(run_id)}.json"
@@ -1130,6 +1145,12 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
             dataRoot: root
         )
         if MCPToolBridge.riskRequiresApproval(effectiveRisk) {
+            let yolo = await fullMacYoloAuthority(tool: toolName)
+            if yolo.state == .explicitlyBlocked {
+                throw NSError(domain: "WorkflowOrchestration", code: -403, userInfo: [
+                    NSLocalizedDescriptionKey: "MCP tool is explicitly blocked by the user"
+                ])
+            }
             let gateSatisfied = resolvedApprovalSatisfiesMCPGate(
                 resolvedApproval,
                 workflowId: objectString(workflow, "id"),
@@ -1138,7 +1159,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 serverId: serverId,
                 toolName: toolName
             )
-            if !gateSatisfied {
+            if !gateSatisfied && !yolo.admitted {
                 let inbox = SwiftNativeApprovalInbox(root: root)
                 let approval = try await inbox.create(.object([
                     "title": .string(title),
@@ -1260,6 +1281,22 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
         ]
 
         if !approvalAlreadyResolved, objectBool(step, "requiresApproval") || kind == "approval" {
+            let action = truthyString(
+                objectField(step, "action") ?? objectField(step, "toolName")
+                    ?? objectField(step, "toolId") ?? objectField(step, "kind"),
+                fallback: "workflow_step"
+            )
+            let yolo = await fullMacYoloAuthority(tool: action)
+            if yolo.state == .explicitlyBlocked {
+                receipt["status"] = .string("failed")
+                receipt["detail"] = .string("Workflow action is explicitly blocked by the user.")
+                receipt["error"] = .string("explicitly_blocked")
+                return .object(receipt)
+            }
+            if yolo.admitted {
+                // Continue through the ordinary step executor. No approval
+                // row is created, and the same domain owner performs the work.
+            } else {
             do {
                 let approval = try await createWorkflowApproval(
                     workflow: workflow,
@@ -1279,6 +1316,7 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 receipt["error"] = .string(error.localizedDescription)
             }
             return .object(receipt)
+            }
         }
 
         do {
@@ -1852,6 +1890,46 @@ public final class SwiftNativeWorkflowOrchestrationClient: WorkflowOrchestration
                 if !terminal.isEmpty {
                     state = setField(state, "status", .string(terminal))
                     return try await workflowTerminalTakeover(state)
+                }
+                let approvalTool = truthyString(
+                    objectField(step, "action") ?? objectField(step, "toolName")
+                        ?? objectField(step, "toolId") ?? objectField(step, "kind"),
+                    fallback: "workflow_step"
+                )
+                let yolo = await fullMacYoloAuthority(tool: approvalTool)
+                if yolo.state == .explicitlyBlocked {
+                    receipts.append(.object([
+                        "id": .string(stepId),
+                        "title": .string(title),
+                        "kind": .string(kind.isEmpty ? "approval" : kind),
+                        "status": .string("failed"),
+                        "requiresApproval": .bool(true),
+                        "detail": .string("Workflow action is explicitly blocked by the user."),
+                        "attempts": .array([]),
+                    ]))
+                    state = setField(state, "status", .string("failed"))
+                    state = setField(state, "steps", .array(receipts))
+                    state = setField(state, "updatedAt", .string(now()))
+                    if try await !saveWorkflowState(state) {
+                        return try await workflowTerminalTakeover(state)
+                    }
+                    return WorkflowRunState.publicRun(state)
+                }
+                if yolo.admitted {
+                    receipts.append(.object([
+                        "id": .string(stepId),
+                        "title": .string(title),
+                        "kind": .string(kind.isEmpty ? "approval" : kind),
+                        "status": .string("succeeded"),
+                        "requiresApproval": .bool(true),
+                        "detail": .string("Approval gate admitted by active Full Mac authority."),
+                        "attempts": .array([]),
+                    ]))
+                    index += 1
+                    state = setField(state, "steps", .array(receipts))
+                    state = setField(state, "currentStepIndex", .int(Int64(index)))
+                    state = setField(state, "updatedAt", .string(now()))
+                    continue
                 }
                 let approval = try await createWorkflowApproval(
                     workflow: workflow,

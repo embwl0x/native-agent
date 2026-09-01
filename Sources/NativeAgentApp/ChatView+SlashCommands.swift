@@ -146,8 +146,8 @@ extension ChatView {
                 await MainActor.run { showToast(result.userMessage) }
             }
         case .note:
-            // PATCH-Phase1a-dispatcher: /note <text> — POST /v1/notes → Dispatcher.run(commit_memory)
-            // Both /note and the agent's commit_memory tool call go through the same Dispatcher.run() path.
+            // Manual /note is an intentional direct MemoryV2 lane. Provider
+            // tool calls use commit_memory through the shared chat dispatcher.
             guard !arg.isEmpty else { showToast("/note requires some text"); return }
             Task {
                 let result = await appModel.addNote(arg)

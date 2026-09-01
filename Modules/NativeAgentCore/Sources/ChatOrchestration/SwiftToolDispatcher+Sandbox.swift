@@ -453,10 +453,11 @@ extension SwiftToolDispatcher {
         /// HONEST NOTE: like the read tier this is today the same boolean as
         /// `appControlAllowed`, because there is one `accessibility_allowed`
         /// key. It is named apart because the CONSEQUENCES differ by an order
-        /// of magnitude, and because this tier carries two gates the others do
-        /// not: an approval floor that survives an active Full Mac YOLO window,
-        /// and MacControl's own injection attestation. Catalog visibility from
-        /// this flag is not authority — it only decides what the model can SEE.
+        /// of magnitude, and because this tier carries MacControl's body-bound
+        /// injection capability. Standard modes obtain it through approved
+        /// replay; admitted Full Mac YOLO obtains it directly for the checked
+        /// call. Catalog visibility from this flag is not authority — it only
+        /// decides what the model can SEE.
         var accessibilityInjectionAllowed: Bool
         var permissionLevel: String
         var outsideWorkspaceDefault: String

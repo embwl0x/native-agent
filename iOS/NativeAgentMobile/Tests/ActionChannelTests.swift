@@ -525,6 +525,53 @@ final class ActionChannelTests: XCTestCase {
         XCTAssertTrue(engine.syncError?.contains("msgId mismatch") == true)
     }
 
+    /// A durably-arrived response that `pollResponse` keeps REJECTING (bad
+    /// signature, undecodable body, unpersistable receipt) used to busy-spin
+    /// the main actor for the entire timeout — up to 300s on a decision
+    /// action — because `wait` returns immediately once an arrival is
+    /// recorded, so the loop paid no interval between retries.
+    func test_pollWithTimeout_rejectedArrivalPacesRetriesInsteadOfSpinning() async throws {
+        let msgId = UUID().uuidString
+        try writeResponse(
+            ["msgId": msgId, "action": "approveApproval", "status": "ok"],
+            as: "\(msgId).json"
+        )
+        // Verifies, then fails to persist its receipt on every pass: each poll
+        // returns nil, and the hook counts the passes.
+        let passes = _PassCounter()
+        engine.transactionWriteTestHook = { _ in
+            passes.increment()
+            throw SyncError.persistence("receipt write refused by test")
+        }
+
+        async let polled = engine.pollWithTimeout(
+            msgId: msgId,
+            timeout: 1,
+            interval: 0.25,
+            expectedAction: "approveApproval"
+        )
+        // Let the poll arm its waiter, then play the push that says the
+        // response is durable locally.
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        ActionResponseWaiters.shared.signal(msgId)
+        let result = await polled
+
+        XCTAssertNil(result, "a response whose receipt cannot persist is not a verified response")
+        XCTAssertGreaterThanOrEqual(passes.value, 1, "the response must actually have been polled")
+        XCTAssertLessThanOrEqual(
+            passes.value, 8,
+            "a rejected arrival must still pay the poll interval, not spin the main actor"
+        )
+    }
+
+    private final class _PassCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func increment() { lock.lock(); count += 1; lock.unlock() }
+        var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+    }
+
     func test_pollResponse_actionMismatch_rejectedAsStale() async throws {
         let msgId = UUID().uuidString
         try writeResponse(

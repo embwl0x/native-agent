@@ -194,7 +194,7 @@ that function disagree, the function wins — update this table.
 | loopId | cadence | what / why |
 |---|---|---|
 | `memory_consolidation` | weekly | real MemoryV2 consolidator over `memory.sqlite` (union-find near-dup clusters ≥0.95 cosine, keep newest). Advances `data/memory/hygiene_last_run.json`. |
-| `rem_cycle` | weekly | REMConsolidator: dream_diary → persona growth lessons, staged through the approval inbox (REMApprovalStager dedupes; a re-run can't double-stage). |
+| ~~`rem_cycle`~~ | RETIRED 2026-08-31 | Duplicate weekly REM lane. Weekly REM has one owner: the `nativeagent-weekly-rem` TriggerScheduler job (Sun 04:30 America/Chicago) → `NativeClient.runRem`, which still stages through `REMApprovalStager`. Every row in `rem_proposals.jsonl` and every `rem.proposal` card carried that job's Sunday ~09:30Z stamp; the loop's own weekly tick never produced one, so it was on course to trip Doctor's dormancy bound on a healthy capability. |
 | `self_improvement_sweep` | weekly | weekly self-improvement pass. Gated on the Self-Improvement tab's `selfImprovementEnabled` switch. |
 | `cognition_maintenance` / `cognition_replay` / `cognition_reflection` | daily-ish | CognitiveSubstrate upkeep: decay/maintenance, episodic replay, LLM reflection. All route through the one `NativeCognitionRuntime` owner. |
 
@@ -438,8 +438,10 @@ the gate is reading a dead file — flag it.
 
 **What/why:** nightly dream = TriggerScheduler job `Agent Nightly Dream`
 (03:30 America/Chicago) — the ONLY unattended dream owner; no periodic
-loop wrapper exists. Weekly REM (`Agent Weekly REM` job + `rem_cycle` loop)
-consolidates diary → persona growth lessons through the approval inbox.
+loop wrapper exists. Weekly REM = TriggerScheduler job `Agent Weekly REM`
+(`nativeagent-weekly-rem`, Sun 04:30 America/Chicago) — likewise the ONLY
+owner since 2026-08-31, when the duplicate `rem_cycle` loop was retired.
+It consolidates diary → persona growth lessons through the approval inbox.
 
 **The trap:** `data/dream_diary/<date>.md` is named for the day being
 DREAMED ABOUT, written at ~01:30 the NEXT morning. "No file for today" at

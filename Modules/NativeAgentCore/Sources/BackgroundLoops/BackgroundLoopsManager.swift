@@ -194,6 +194,21 @@ private actor LoopExecutionGate {
         await waitForIdle()
     }
 
+    /// Administrative drain used while replacing a registration. Unlike an
+    /// ordinary coalesced caller, replacement must not abandon this wait when
+    /// its caller is cancelled: the old effecting body may still be running,
+    /// and installing a fresh gate at that point would permit overlapping
+    /// effects under the same loop id. The lifecycle operation therefore
+    /// reaches the safe idle boundary before it observes completion.
+    func waitUntilIdleForReplacement() async {
+        guard active else { return }
+        let wait = IdleWait()
+        await withCheckedContinuation { continuation in
+            wait.continuation = continuation
+            idleWaiters.append(wait)
+        }
+    }
+
     /// Drops a parked waiter whose Task was cancelled. 2026-07-21 audit (MED):
     /// a loop wedged ignoring cancellation used to leak the joining Task and
     /// its continuation in `idleWaiters` forever — one per interval.
@@ -636,7 +651,9 @@ public actor BackgroundLoopsManager {
     public func registered() -> [String] { registeredIds }
 
     public func uptimeSeconds(now: Date = Date()) -> Double {
-        guard let startedAt else { return 0 }
+        // Uptime describes the CURRENT manager lifecycle, not process age or a
+        // historical start. A stopped manager has no running-loop uptime.
+        guard started, let startedAt else { return 0 }
         return max(0, now.timeIntervalSince(startedAt))
     }
 
@@ -811,7 +828,11 @@ public actor BackgroundLoopsManager {
         let previous = registrations.removeValue(forKey: id)
         registeredIds.removeAll { $0 == id }
         await scheduler.unregister(loopId: id)
-        await previous?.gate.waitUntilIdle()
+        // Cancellation cannot turn replacement into an overlap. An ordinary
+        // gate join is cancellation-responsive, but this administrative drain
+        // must wait for authoritative proof that the retired effecting body is
+        // gone before a new registration receives a fresh gate.
+        await previous?.gate.waitUntilIdleForReplacement()
 
         if let newLoop {
             await register(newLoop)

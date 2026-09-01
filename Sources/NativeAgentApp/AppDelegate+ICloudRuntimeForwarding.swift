@@ -16,6 +16,19 @@ struct ICloudChatReplacementIntent: Equatable, Sendable {
     }
 }
 
+/// The incoming CloudKit record acknowledges a user turn, not successful
+/// delivery of the reply back to the phone. Once the runtime has reached a
+/// terminal outcome, a transient reply-write failure must consume the input:
+/// replaying it would run the same user message again on every drain tick.
+enum ICloudIncomingTurnConsumptionPolicy {
+    static func shouldConsume(
+        turnReachedTerminalState: Bool,
+        replyPublished: Bool
+    ) -> Bool {
+        turnReachedTerminalState || replyPublished
+    }
+}
+
 private final class ICloudGeneratedAttachmentBox: @unchecked Sendable {
     private let lock = NSLock()
     private var attachments: [NativeAgentShared.MultimodalAttachment] = []
@@ -94,7 +107,11 @@ extension AppDelegate {
         let remoteMetadata = msg.metadata ?? [:]
         let sourceKey = remoteMetadata["sourceKey"] ?? "app"
         let routeKey = remoteMetadata["routeKey"] ?? remoteMetadata["deviceSourceKey"] ?? sourceKey
-        func writeErrorReply(_ text: String, sessionID: String?) async -> Bool {
+        func writeErrorReply(
+            _ text: String,
+            sessionID: String?,
+            turnReachedTerminalState: Bool = false
+        ) async -> Bool {
             do {
                 _ = try await iCloudBridge.shared.sendChatMessage(
                     text: text,
@@ -119,7 +136,13 @@ extension AppDelegate {
                 return true
             } catch {
                 NSLog("[iCloudBridge] failed to write error reply for msg %@: %@", msg.id, "\(error)")
-                return false
+                if turnReachedTerminalState {
+                    NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
+                }
+                return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
+                    turnReachedTerminalState: turnReachedTerminalState,
+                    replyPublished: false
+                )
             }
         }
         func writeProgress(_ text: String, stage: String, sessionID: String) async {
@@ -430,7 +453,11 @@ extension AppDelegate {
                 return true
             } catch {
                 NSLog("[iCloudBridge] failed to write cancel reply for msg %@: %@", msg.id, "\(error)")
-                return false
+                NotificationCenter.default.post(name: .chatTurnCompleted, object: resolvedSessionID)
+                return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
+                    turnReachedTerminalState: true,
+                    replyPublished: false
+                )
             }
         }
 
@@ -462,14 +489,22 @@ extension AppDelegate {
                 return true
             } catch {
                 NSLog("[iCloudBridge] failed to write error reply for msg %@: %@", msg.id, "\(error)")
-                return false
+                NotificationCenter.default.post(name: .chatTurnCompleted, object: resolvedSessionID)
+                return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
+                    turnReachedTerminalState: true,
+                    replyPublished: false
+                )
             }
         }
 
         let replyText = outcome.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !replyText.isEmpty || !outcomeAttachments.isEmpty else {
             NSLog("[iCloudBridge] forwardToSwiftRuntime: empty reply for msg %@", msg.id)
-            return await writeErrorReply("NativeAgent returned an empty reply. Check NativeAgent logs for that run.", sessionID: resolvedSessionID)
+            return await writeErrorReply(
+                "NativeAgent returned an empty reply. Check NativeAgent logs for that run.",
+                sessionID: resolvedSessionID,
+                turnReachedTerminalState: true
+            )
         }
 
         do {
@@ -497,7 +532,15 @@ extension AppDelegate {
             return true
         } catch {
             NSLog("[iCloudBridge] failed to write reply to Drive for msg %@: %@", msg.id, "\(error)")
-            return false
+            // The assistant turn is already durable in the Mac transcript.
+            // Publish the snapshot and consume the one signed input; iOS's
+            // transcript backstop can recover the reply without asking Agent
+            // to execute the same turn again.
+            NotificationCenter.default.post(name: .chatTurnCompleted, object: resolvedSessionID)
+            return ICloudIncomingTurnConsumptionPolicy.shouldConsume(
+                turnReachedTerminalState: true,
+                replyPublished: false
+            )
         }
     }
 

@@ -40,6 +40,7 @@ extension BackgroundLoopsAssembly {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let policyPath = trustPolicyPath(dataRoot: dataRoot)
         let trustCenter = SwiftNativeTrustCenter(dataRoot: dataRoot)
+        let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
         let loop = AutonomyPromotionLoop(
             // Daily is now the missed-event integrity cadence. Approval/policy
             // mutations and the persisted proposal cooldown drive normal work.
@@ -48,8 +49,21 @@ extension BackgroundLoopsAssembly {
             // the same enableAutonomy flag the Workshop execution gate uses.
             isEnabled: {
                 let policy = await trustCenter.loadTrustPolicy()
-                if case .bool(true) = policy["enableAutonomy"] ?? .null { return true }
-                return false
+                guard case .bool(true) = policy["enableAutonomy"] ?? .null else {
+                    return false
+                }
+                // Full Mac already supplies temporary runtime authority. Do
+                // not mint promotion prompts or permanently loosen saved
+                // per-tool authority while that checked grant is admitted.
+                let yolo = await securityCenter.fullMacYoloAuthority(
+                    tool: "autonomy.promote",
+                    origin: SecurityOriginContext(
+                        surface: "desk",
+                        source: "background_autonomy_promotion",
+                        isRemote: false
+                    )
+                )
+                return !yolo.admitted
             },
             port: AutonomyPromotionInboxAdapter(inbox: inbox, dataRoot: dataRoot),
             // RAW saved toolAutonomy[tool]; nil if absent (absent ⇒ default/auto

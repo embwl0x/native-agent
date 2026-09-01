@@ -63,6 +63,7 @@ rg -q '^unmapped-production:Modules/NativeAgentCore/Sources/NewTarget/NewTarget.
 mkdir -p "$TMP/repo/script" "$TMP/repo/docs/evals" "$TMP/bin"
 cp "$ROOT/script/evals.sh" "$TMP/repo/script/evals.sh"
 cp "$TMP/ledger.json" "$TMP/repo/docs/evals/ledger.json"
+printf '[]\n' > "$TMP/repo/docs/evals/coverage-overrides.json"
 cat > "$TMP/bin/swift" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$1" == */evals_ledger_merge.swift ]]; then
@@ -238,5 +239,41 @@ for scenario in valid stale missing relative wildcard unsafe multiple; do
   fi
 done
 [[ ! -e selector-injected ]] || fail "suite metadata was evaluated as shell code"
+
+# iOS evidence is executable in changed mode too. A differently named XCTest
+# class must be explicitly bound to its source file and emitted for the
+# simulator runner instead of being misrouted into the root Swift package.
+mkdir -p "$TMP/repo/iOS/NativeAgentMobile/Sources" "$TMP/repo/iOS/NativeAgentMobile/Tests"
+printf 'struct IOSFixture { let baseline = true }\n' \
+  > "$TMP/repo/iOS/NativeAgentMobile/Sources/IOSFixture.swift"
+printf 'final class ActualIOSFixtureTests {}\n' \
+  > "$TMP/repo/iOS/NativeAgentMobile/Tests/FileNamedDifferently.swift"
+git -C "$TMP/repo" add .
+git -C "$TMP/repo" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm ios-baseline
+printf 'struct IOSFixture { let changed = true }\n' \
+  > "$TMP/repo/iOS/NativeAgentMobile/Sources/IOSFixture.swift"
+git -C "$TMP/repo" add .
+git -C "$TMP/repo" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm ios-source-change
+ios_sha="$(git -C "$TMP/repo" rev-parse HEAD)"
+printf '%s\n' \
+  '{"surfaces":[{"fence":"ios.fixture","id":"ios.fixture","kind":"public-api","where":"iOS/NativeAgentMobile/Sources/IOSFixture.swift:1","coverage":[{"tier":"test","ref":"iOS/NativeAgentMobile/Tests/FileNamedDifferently.swift:1 [xcode-filter: ActualIOSFixtureTests]","strength":"asserts"}],"status":"COVERED"}]}' \
+  > "$TMP/ledger-ios.json"
+"$MERGER" changed-plan \
+  --repo "$TMP/repo" --ledger "$TMP/ledger-ios.json" --sha "$ios_sha" \
+  --selections "$TMP/ios-selections.tsv" --mappings "$TMP/ios-mappings.tsv" \
+  --unmapped "$TMP/ios-unmapped.tsv" --changed-files "$TMP/ios-files.txt"
+[[ "$(tr -d '\n' < "$TMP/ios-selections.tsv")" == $'ios\tiOS/NativeAgentMobile\tActualIOSFixtureTests' ]] \
+  || fail "iOS changed evidence was not bound to the declared XCTest class"
+[[ ! -s "$TMP/ios-unmapped.tsv" ]] || fail "valid iOS changed evidence remained unresolved"
+
+jq '.surfaces[0].coverage[0].ref = "iOS/NativeAgentMobile/Tests/FileNamedDifferently.swift:1 [xcode-filter: StaleIOSFixtureTests]"' \
+  "$TMP/ledger-ios.json" > "$TMP/ledger-ios-stale.json"
+"$MERGER" changed-plan \
+  --repo "$TMP/repo" --ledger "$TMP/ledger-ios-stale.json" --sha "$ios_sha" \
+  --selections "$TMP/ios-stale-selections.tsv" --mappings "$TMP/ios-stale-mappings.tsv" \
+  --unmapped "$TMP/ios-stale-unmapped.tsv" --changed-files "$TMP/ios-stale-files.txt"
+[[ ! -s "$TMP/ios-stale-selections.tsv" ]] || fail "stale iOS suite metadata guessed a selection"
+rg -q $'^ios.fixture\t' "$TMP/ios-stale-unmapped.tsv" \
+  || fail "stale iOS suite metadata did not fail closed"
 
 echo "evals_changed_plan_guards_test.sh: all assertions passed"

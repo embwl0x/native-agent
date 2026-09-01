@@ -174,7 +174,13 @@ extension BackgroundLoopsAssembly {
                     .appendOrRollUpInformational(
                         .object(rollupRow),
                         id: rollupID,
-                        rollupKey: rollupKey
+                        rollupKey: rollupKey,
+                        // `rollupID` is ONE stable id shared by every write to
+                        // this card, so it cannot tell a new job from a retry of
+                        // the last one. The per-job card id is the occurrence
+                        // identity: a job counted once is never counted twice,
+                        // and a genuinely new job still bumps the rollup.
+                        occurrenceID: card.cardId
                     )
                 return true
             } catch {

@@ -12,8 +12,8 @@ enum NativeAgentAppChatSurfaceProfile: String, CaseIterable, Sendable {
 
     var includesEvolutionBridge: Bool {
         switch self {
-        case .mac, .bridge: true
-        case .slack, .telegram, .ios, .background: false
+        case .mac, .telegram, .bridge: true
+        case .slack, .ios, .background: false
         }
     }
 

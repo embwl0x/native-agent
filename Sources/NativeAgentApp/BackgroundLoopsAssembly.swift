@@ -259,15 +259,22 @@ private enum BackgroundPersonaContextError: Error, Sendable, CustomStringConvert
 // manager registers real work through the canonical Core owner.
 //
 // Core periodic loops:
-//   - rem_cycle              (REMCycleLoop, weekly) → REMConsolidator over
-//                              DreamDiaryReader + REMTombstoneStore +
-//                              GrowthDocManager on persona/
 //   - memory_consolidation   (MemoryConsolidationHygieneRunner, weekly) →
 //                              the REAL MemoryV2 MemoryConsolidator over
 //                              memory.sqlite (U3 wave-1 item 6 retired the
 //                              dead memory_embeddings.jsonl adapter wiring)
 // No periodic dream wrapper is registered in production;
 // TriggerScheduler owns unattended dreams.
+//
+// RETIRED 2026-08-31: `rem_cycle` (REMCycleLoop). Weekly REM has exactly one
+// owner, the `nativeagent-weekly-rem` TriggerScheduler job at 04:30
+// America/Chicago on Sundays (SchedulerDueJobRunner.executeREM →
+// NativeClient.runRem → SwiftNativeDreamREMCycle, which resolves the persona
+// root through PersistenceCore.defaultPersonaRoot the same way the deleted
+// factory did). Every row in `data/rem_proposals.jsonl` and every
+// `rem.proposal` approval card carries that job's Sunday ~09:30Z stamp; the
+// duplicate loop's own weekly tick never produced one, so it was on course to
+// trip DoctorLoopHealth's dormancy bound while the real lane stayed healthy.
 //
 // BackgroundLoopsManager owns execution in the Swift-only runtime. The wiring
 // helpers below are safe to call eagerly because disk-touching work happens
@@ -324,10 +331,12 @@ enum BackgroundLoopsAssembly {
         )
     }
     /// Full loop manifest for BackgroundLoopsManager: doctor,
-    /// memory, self-improvement, REM, Workshop execution executor, heartbeat, and hooks.
+    /// memory, self-improvement, Workshop execution executor, heartbeat, and hooks.
     /// A periodic dream wrapper is intentionally absent from this manifest:
     /// unattended dreams have exactly one owner, the `nativeagent-nightly-dream`
-    /// TriggerScheduler job at 03:30 America/Chicago.
+    /// TriggerScheduler job at 03:30 America/Chicago. A periodic REM wrapper is
+    /// absent for the same reason: `nativeagent-weekly-rem` at 04:30
+    /// America/Chicago on Sundays owns weekly REM.
     static func assembleAllLoops(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [any LoopRunner] {
@@ -346,7 +355,8 @@ enum BackgroundLoopsAssembly {
             makeDataRootDiskHygieneLoop(dataRoot: dataRoot),
             makeMemoryConsolidationLoop(dataRoot: dataRoot),
             makeWeeklySelfImprovementLoop(dataRoot: dataRoot, llm: llm),
-            makeREMCycleLoop(dataRoot: dataRoot, llm: llm, cognitionRuntime: cognition),
+            // No `rem_cycle` entry: the `nativeagent-weekly-rem` TriggerScheduler
+            // job is the sole owner of weekly REM (see the manifest note above).
             // User-authored scheduler jobs and time/idle triggers use exact
             // persisted deadlines plus config/activity invalidations. Core owns
             // the only lifecycle; the six-hour cadence is missed-event repair.

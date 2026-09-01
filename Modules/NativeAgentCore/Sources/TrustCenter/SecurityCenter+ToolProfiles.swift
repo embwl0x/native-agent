@@ -101,6 +101,22 @@ extension SwiftNativeSecurityCenter {
         // now set-diffs all five sites so a 4-of-5 registration fails the
         // build instead of waiting for an audit.
         "desk_open_pursuit", "desk_work_log",
+        // studio chat lane (desk 903): the agent's aesthetic journal and the
+        // consults filed against it. studio_consult / studio_journal are medium
+        // ledger-class WRITES under <dataRoot>/studio/ — a local file write, NOT
+        // a Mac filesystem op, NOT a process spawn, and with no third-party side
+        // effect of any kind. studio_consult_read / studio_recall are pure local
+        // reads. Registered explicitly because "consult"/"journal" trip NO
+        // keyword catcher below (they would resolve to {tool_call}/.low with
+        // rollbackRequired false — the 4-of-5 failure the desk lane already
+        // shipped once), and because "read"/"recall" would otherwise give the
+        // two reads only the generic safe_read catcher via the unsigned path.
+        // Checked against every sieve below: none of the four names contains
+        // send/post/message/reply/tweet, so external_send does NOT misfire and
+        // they must NOT be added to notificationToolNames (that set is a
+        // carve-out FROM external_send; adding a tool that never trips it would
+        // instead ADD the external_send capability at medium risk).
+        "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
         // evolution chat tools (2026-06-11, U2b): the three privileged
         // self-evolution chat tools. evolution_propose is a critical-risk
         // evolution-store WRITE, self_install is a critical-risk install-card
@@ -426,9 +442,9 @@ extension SwiftNativeSecurityCenter {
             add("process_spawn", .critical)
             // A shell is broad by design, but mutating macOS's permission
             // authority is not ordinary builder work. Classify the concrete
-            // effect from the command body so SecurityCenter can apply a hard
-            // approval floor even while Full Mac/YOLO remains available for
-            // normal autonomous builds and repairs.
+            // effect from the command body so SecurityCenter can hard-block it
+            // without producing a contradictory approval prompt while Full
+            // Mac/YOLO remains available for normal builds and repairs.
             if tool == "apply_patch" || tool == "git" || tool == "swift_build" || tool == "swift_test" {
                 add("filesystem_write", .high)
             }
@@ -523,6 +539,19 @@ extension SwiftNativeSecurityCenter {
             "desk_open_pursuit", "desk_work_log",
         ]
         if deskWriteTools.contains(tool) {
+            add("ledger_write", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // studio (desk 903): the same shape as the desk lane. The two writes
+        // append/write one local record under <dataRoot>/studio/ and reach
+        // nothing outside it; the two reads touch only those same files. Exact
+        // sets rather than a `studio_` prefix, so a later studio tool cannot
+        // inherit either profile before it has been classified on its own.
+        if tool == "studio_consult_read" || tool == "studio_recall" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "studio_consult" || tool == "studio_journal" {
             add("ledger_write", .medium)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }

@@ -102,11 +102,17 @@ final class ChatStore: ObservableObject {
     var maxDeltaSeqByCorrelation: [String: Int] = [:]
     @Published private(set) var selectedSessionID: String?
     @Published private(set) var mainSessionID: String?
+    /// A phone-created main session remains locally authoritative until the
+    /// Mac publishes that exact identity. Session-list snapshots can lag the
+    /// first send, so treating absence as removal can otherwise roll the UI
+    /// back to the previous main chat and stamp the send with the wrong id.
+    private(set) var locallyCreatedSessionID: String?
 
     // PATCH-2026-05-11: unified-session-v1 — drop stale iOS-only session ID on first launch
     // so the Mac app resolves to the shared mobile session via sourceKey.
     private static let selectedSessionIDKey = "NativeAgentMobile.chatSessionID"
     private static let mainSessionIDKey = "NativeAgentMobile.mainChatSessionID"
+    private static let locallyCreatedSessionIDKey = "NativeAgentMobile.locallyCreatedChatSessionID"
     let transcriptKey = "NativeAgentMobile.chatMessages"
     let transcriptPrefix = "NativeAgentMobile.chatMessages.session."
     var suppressMessagePersistence = false
@@ -129,8 +135,15 @@ final class ChatStore: ObservableObject {
         }
         let savedSelected = Self.cleanSessionID(defaults.string(forKey: Self.selectedSessionIDKey))
         let savedMain = Self.cleanSessionID(defaults.string(forKey: Self.mainSessionIDKey)) ?? savedSelected
+        let savedLocal = Self.cleanSessionID(defaults.string(forKey: Self.locallyCreatedSessionIDKey))
         selectedSessionID = savedSelected
         mainSessionID = savedMain
+        if savedLocal == savedSelected, savedLocal == savedMain {
+            locallyCreatedSessionID = savedLocal
+        } else {
+            locallyCreatedSessionID = nil
+            defaults.removeObject(forKey: Self.locallyCreatedSessionIDKey)
+        }
         // 2026-07-21 audit fix: restore persisted queued sends (were in-memory
         // only; a relaunch silently discarded user-composed messages). ChatStore
         // is owned once at the App boundary, so no process-global restore latch
@@ -169,6 +182,23 @@ final class ChatStore: ObservableObject {
         } else {
             defaults.removeObject(forKey: Self.mainSessionIDKey)
         }
+    }
+
+    func markLocallyCreatedSession(_ value: String) {
+        guard let clean = Self.cleanSessionID(value) else { return }
+        locallyCreatedSessionID = clean
+        defaults.set(clean, forKey: Self.locallyCreatedSessionIDKey)
+    }
+
+    func acknowledgePublishedSession(_ value: String?) {
+        guard let clean = Self.cleanSessionID(value), clean == locallyCreatedSessionID else { return }
+        locallyCreatedSessionID = nil
+        defaults.removeObject(forKey: Self.locallyCreatedSessionIDKey)
+    }
+
+    func acknowledgePublishedSessions(_ sessionIDs: Set<String>) {
+        guard let local = locallyCreatedSessionID, sessionIDs.contains(local) else { return }
+        acknowledgePublishedSession(local)
     }
 
     func rememberMainSessionIDIfNeeded(_ value: String?) {
@@ -297,7 +327,18 @@ final class ChatStore: ObservableObject {
 
     /// Held weakly so receiveICloudRejection can replay a send without the
     /// caller threading the client through the rejection observer.
-    weak var pendingRetryClient: MacBridgeClient?
+    ///
+    /// It is also the last precondition `scheduleQueuedSendDrain` waits on, and
+    /// it only arrives from `ChatView.onAppear` — which does not run on a
+    /// launch that lands on another tab. A resume that happened first (network
+    /// restore, rejection replay) would otherwise schedule nothing and be lost,
+    /// so installing the client picks up whatever the queue is already owed.
+    weak var pendingRetryClient: MacBridgeClient? {
+        didSet {
+            guard pendingRetryClient !== oldValue, pendingRetryClient != nil else { return }
+            scheduleQueuedSendDrain()
+        }
+    }
     /// Held weakly so the rejection-retry path can call refreshFromKVS() without
     /// the caller threading PairingStore through every observer signature.
     weak var pairingStoreRef: PairingStore?

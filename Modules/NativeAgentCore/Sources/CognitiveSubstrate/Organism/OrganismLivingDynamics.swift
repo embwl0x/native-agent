@@ -1003,6 +1003,14 @@ public struct OrganismCapabilityBelief: Sendable, Equatable, Identifiable {
 /// the read has no prose, prompt, action, or identity authority.
 public enum OrganismCapabilitySelfModel {
     public static let freshnessHalfLife: TimeInterval = 7 * 24 * 60 * 60
+    /// Half-life of the outcome evidence itself, applied on the organism clock
+    /// in `OrganismPersistentState.decayed(at:)`. Matched to
+    /// `freshnessHalfLife` so weight and freshness fade together: a week of
+    /// silence halves what the body still counts as known. The neighbouring
+    /// prediction horizons (`predictionHalfLife` 6h, typed body beliefs 2-3h)
+    /// govern single in-flight expectations and are far too fast for lifetime
+    /// capability evidence.
+    public static let evidenceHalfLife: TimeInterval = freshnessHalfLife
 
     public static func beliefs(
         ledger: OrganismPredictionLedger,
@@ -1014,21 +1022,33 @@ public enum OrganismCapabilitySelfModel {
             let expired = evidence.filter { $0.status == .expired }
             let cumulative = ledger.outcomeCountsByKind?[kind.rawValue]
             let bodyPrior = bodyConfidence(for: kind, in: ledger.bodyConfidence)
-            let expiredCount = cumulative?.expired ?? expired.count
+            // Prefer the forgotten weights over the lifetime tally: the belief
+            // is about what this capability does now, not about everything it
+            // ever did. `effectiveWeights(at:)` seeds from the tally for states
+            // written before forgetting existed — aged to now, so an upgrade
+            // cannot make stale history read fresh — and nothing is lost.
+            let weights = cumulative?.effectiveWeights(at: now)
+            let expiredWeight = weights?.expired ?? Double(expired.count)
             // Eight pseudo-observations preserve the pre-counter body model as
             // a bounded prior while real per-kind outcomes take over.
             let priorStrength = 8.0
-            let posterior = cumulative.map {
-                (Double($0.satisfied) + bodyPrior * priorStrength)
-                    / (Double($0.satisfied + $0.violated) + priorStrength)
+            let posterior = weights.map {
+                ($0.satisfied + bodyPrior * priorStrength)
+                    / ($0.satisfied + $0.violated + priorStrength)
             } ?? bodyPrior
-            let resolvedCount = cumulative.map { $0.satisfied + $0.violated } ?? resolved.count
-            let evidenceCount = cumulative.map { $0.satisfied + $0.violated + $0.expired }
-                ?? evidence.count
-            let resolutionUncertainty = 1 / sqrt(Double(resolvedCount + 1))
-            let missingEvidencePenalty = evidenceCount == 0
+            let resolvedWeight = weights.map { $0.satisfied + $0.violated }
+                ?? Double(resolved.count)
+            let evidenceWeight = weights.map { $0.satisfied + $0.violated + $0.expired }
+                ?? Double(evidence.count)
+            let resolutionUncertainty = 1 / sqrt(resolvedWeight + 1)
+            // Smoothed by the SAME prior the posterior uses. As a bare ratio
+            // this penalty is scale-free, so forgetting shrinks numerator and
+            // denominator together and a bad stretch could never relax however
+            // long ago it was; measured against a fixed prior it decays as the
+            // evidence behind it does.
+            let missingEvidencePenalty = evidenceWeight <= 0
                 ? 0
-                : Double(expiredCount) / Double(evidenceCount)
+                : expiredWeight / (evidenceWeight + priorStrength)
             let uncertainty = max(
                 cumulative == nil ? 0.5 : 0,
                 max(resolutionUncertainty, missingEvidencePenalty)
@@ -1045,9 +1065,9 @@ public enum OrganismCapabilitySelfModel {
                 kind: kind,
                 successLikelihood: (posterior).clamped01(),
                 uncertainty: (uncertainty).clamped01(),
-                evidenceCount: evidenceCount,
-                resolvedEvidenceCount: resolvedCount,
-                expiredEvidenceCount: expiredCount,
+                evidenceCount: Int(evidenceWeight.rounded()),
+                resolvedEvidenceCount: Int(resolvedWeight.rounded()),
+                expiredEvidenceCount: Int(expiredWeight.rounded()),
                 freshness: (freshness).clamped01(),
                 lastEvidenceAt: last,
                 evidenceBasis: cumulative == nil ? .legacyBodyConfidence : .cumulativeOutcomes

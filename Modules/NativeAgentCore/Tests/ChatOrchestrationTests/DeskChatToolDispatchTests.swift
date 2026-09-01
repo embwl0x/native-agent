@@ -70,6 +70,7 @@ struct DeskChatToolDispatchTests {
             Issue.record("desk_set_status progress schema malformed"); return
         }
         #expect(progressRequired == [.string("done"), .string("total")])
+        #expect(progress["type"] == .array([.string("object"), .string("null")]))
         #expect(progress["additionalProperties"] == .bool(false))
         #expect(statusProperties["assignee"] != nil)
         #expect(statusProperties["lane_of"] != nil)
@@ -77,7 +78,7 @@ struct DeskChatToolDispatchTests {
             guard case .object(let metadata)? = statusProperties[key] else {
                 Issue.record("missing optional metadata schema: \(key)"); return
             }
-            #expect(metadata["type"] == .string("string"))
+            #expect(metadata["type"] == .array([.string("string"), .string("null")]))
             #expect(metadata["minLength"] == nil, "blank optional metadata preserves current values")
         }
 
@@ -315,9 +316,10 @@ struct DeskChatToolDispatchTests {
             let before = try await SwiftNativePersistenceCore().readJSONL(store.opsPath).count
             let result = try await d.impl_desk_set_status(input: [
                 "handle": .string(handle), "status": .string("now"),
-                "assignee": .string(blank), "lane_of": .string(blank),
+                "assignee": assigned ? .null : .string(blank),
+                "lane_of": assigned ? .null : .string(blank),
                 "blocked_reason": .string(""), "waiting_on": .string(""),
-                "progress": .object(["done": .int(1), "total": .int(3)]),
+                "progress": assigned ? .null : .object(["done": .int(1), "total": .int(3)]),
             ])
             guard case .object(let resultObject) = result else {
                 Issue.record("status update malformed"); return
@@ -329,10 +331,10 @@ struct DeskChatToolDispatchTests {
             #expect(row.assignee == (assigned ? "codex" : nil))
             #expect(row.laneOf == (assigned ? parentHandle : nil))
             #expect(row.parent == nil)
-            #expect(row.progress == DeskProgress(done: 1, total: 3))
+            #expect(row.progress == (assigned ? nil : DeskProgress(done: 1, total: 3)))
 
             for key in ["assignee", "lane_of"] {
-                for malformed: JSONValue in [.null, .int(0), .bool(false), .object([:]), .array([])] {
+                for malformed: JSONValue in [.int(0), .bool(false), .object([:]), .array([])] {
                     await #expect(throws: AutonomyGateError.self) {
                         _ = try await d.impl_desk_set_status(input: [
                             "handle": .string(handle), "status": .string("next"), key: malformed,

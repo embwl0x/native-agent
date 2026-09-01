@@ -652,6 +652,11 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     /// event settled. Injectable for tests.
     let dispatchedEventKeysTailCap: Int
 
+    /// The `liveState()` replay memo this store consults. Defaults to the
+    /// process-wide one; injectable so a test can own an isolated memo rather
+    /// than racing every other suite for its 8 entries.
+    let liveStateMemo: GitHubCommandLiveStateMemo
+
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         changeBus: StoreChangeBus = .shared,
@@ -659,11 +664,30 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         terminalItemRetentionSeconds: TimeInterval = 30 * 24 * 60 * 60,
         dispatchedEventKeysTailCap: Int = 512
     ) {
+        self.init(
+            dataRoot: dataRoot,
+            changeBus: changeBus,
+            opsCompactionThreshold: opsCompactionThreshold,
+            terminalItemRetentionSeconds: terminalItemRetentionSeconds,
+            dispatchedEventKeysTailCap: dispatchedEventKeysTailCap,
+            liveStateMemo: Self.sharedLiveStateMemo
+        )
+    }
+
+    init(
+        dataRoot: URL,
+        changeBus: StoreChangeBus = .shared,
+        opsCompactionThreshold: Int = 2_048,
+        terminalItemRetentionSeconds: TimeInterval = 30 * 24 * 60 * 60,
+        dispatchedEventKeysTailCap: Int = 512,
+        liveStateMemo: GitHubCommandLiveStateMemo
+    ) {
         self.dataRoot = dataRoot
         self.changeBus = changeBus
         self.opsCompactionThreshold = max(2, opsCompactionThreshold)
         self.terminalItemRetentionSeconds = terminalItemRetentionSeconds
         self.dispatchedEventKeysTailCap = max(0, dispatchedEventKeysTailCap)
+        self.liveStateMemo = liveStateMemo
         let directory = dataRoot.appendingPathComponent("workshop/github_command", isDirectory: true)
         self.opsPath = directory.appendingPathComponent("ops.jsonl")
         self.statePath = directory.appendingPathComponent("github_command_state.json")
@@ -673,7 +697,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
     public func liveState() async throws -> GitHubCommandState {
         let key = Self.memoKey(opsPath)
         let stamp = Self.feedStamp(opsPath: opsPath, basePath: basePath)
-        return try await Self.sharedLiveStateMemo.value(key: key, stamp: stamp) {
+        return try await liveStateMemo.value(key: key, stamp: stamp) {
             let feed = try await readFeedUnlocked()
             let state = try replay(base: feed.base, feed.ops)
             try Self.validate(state)
@@ -992,7 +1016,7 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         // The writer already owns the exact reduced state for the final feed
         // stamp. Publish it before waking readers so the physiology/runtime
         // reaction does not immediately decode and replay the same ~1 MB feed.
-        await Self.sharedLiveStateMemo.prime(
+        await liveStateMemo.prime(
             key: Self.memoKey(opsPath), stamp: committed.stamp, state: committed.state
         )
         changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))

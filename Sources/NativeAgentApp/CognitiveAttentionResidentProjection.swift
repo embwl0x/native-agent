@@ -65,6 +65,7 @@ final class CognitiveAttentionResidentProjection: @unchecked Sendable {
             unresolvedQuestion: unresolvedQuestion,
             activeTask: snapshot.pursuit?.activeTask ?? base?.activeTask,
             goal: snapshot.pursuit?.goal ?? base?.goal,
+            residentWorkIntent: snapshot.pursuit != nil,
             predictedToolGroups: snapshot.predictedToolGroups,
             memoryActivation: base?.memoryActivation ?? [:],
             workingMemoryRecordIDs: base?.workingMemoryRecordIDs ?? []

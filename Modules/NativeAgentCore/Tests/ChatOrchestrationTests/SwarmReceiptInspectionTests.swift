@@ -173,18 +173,23 @@ struct SwarmReceiptInspectionTests {
         #expect(report["text"] == .string("Error:\nprovider failed before output was retained"))
         #expect(try Data(contentsOf: fixture.file) == original)
 
+        var malformedRows: [[String: JSONValue]] = []
         for replacement in [JSONValue.null, .bool(false), .int(0)] {
             var malformed = oldWorker
             malformed["output"] = replacement
-            try fixture.write(.array([oldReceipt(malformed), fixture.receipt]))
-            let response = try await fixture.inspect()
-            #expect(response["reason"] == .string("receipt_store_malformed"))
+            malformedRows.append(malformed)
         }
         let invalidEvidence: [[String: JSONValue]] = [["status": .string("completed")], ["error": .string(" ")], ["error": .null]]
-        for changes in invalidEvidence {
-            try fixture.write(.array([oldReceipt(oldWorker.merging(changes) { _, new in new }), fixture.receipt]))
-            let response = try await fixture.inspect()
-            #expect(response["reason"] == .string("receipt_store_malformed"))
+        malformedRows += invalidEvidence.map { oldWorker.merging($0) { _, new in new } }
+        for worker in malformedRows {
+            try fixture.write(.array([oldReceipt(worker), fixture.receipt]))
+            // The corrupt row's OWN run still fails loud...
+            let corrupt = try await fixture.inspect(["run_id": .string("old-run")])
+            #expect(corrupt["reason"] == .string("receipt_store_malformed"))
+            // ...while every other run stays inspectable, with the skip counted.
+            let intact = try await fixture.inspect()
+            #expect(intact["status"] == .string("ok"))
+            #expect(intact["skipped_malformed_rows"] == .int(1))
         }
     }
 
@@ -263,10 +268,10 @@ struct SwarmReceiptInspectionTests {
         let malformed: [Data] = [
             Data("{invalid".utf8),
             try JSONValue.object(["runs": .array([])]).serializedData(pretty: false),
-            try JSONValue.array([fixture.receipt, .string("malformed unrelated row")]).serializedData(pretty: false),
-            try JSONValue.array([fixture.receipt, .object(["id": .string("other"), "status": .string("completed")])]).serializedData(pretty: false),
             try JSONValue.array([fixture.receipt, fixture.receipt]).serializedData(pretty: false),
+            // Every row unreadable is still a malformed STORE, not an empty one.
             try JSONValue.array([.object(collision)]).serializedData(pretty: false),
+            try JSONValue.array([.string("malformed unrelated row"), .object(collision)]).serializedData(pretty: false),
         ]
         for bytes in malformed {
             try bytes.write(to: fixture.file)
@@ -278,6 +283,58 @@ struct SwarmReceiptInspectionTests {
         try FileManager.default.createDirectory(at: fixture.file, withIntermediateDirectories: true)
         let unreadable = try await fixture.inspect()
         #expect(unreadable["reason"] == .string("receipt_store_unreadable"))
+    }
+
+    @Test func oneMalformedRowSkipsItselfInsteadOfBlackingOutEveryOtherRun() async throws {
+        let fixture = try SwarmInspectionFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        // A legacy-shaped worker: no `output`, and status != "failed".
+        let legacyRow = JSONValue.object([
+            "id": .string("legacy-run"), "status": .string("completed"),
+            "workers": .array([.object(["id": .string("w"), "status": .string("completed")])]),
+        ])
+        let unrelated = JSONValue.object([
+            "id": .string("other-run"), "status": .string("completed"),
+            "workers": .array([.object(["id": .string("w"), "status": .string("completed"), "output": .string("kept")])]),
+        ])
+        try fixture.write(.array([legacyRow, fixture.receipt, unrelated]))
+        let original = try Data(contentsOf: fixture.file)
+
+        let intact = try await fixture.inspect()
+        #expect(intact["status"] == .string("ok"))
+        #expect(intact["run_status"] == .string("cancelled"))
+        #expect(intact["skipped_malformed_rows"] == .int(1))
+        let other = try await fixture.inspect(["run_id": .string("other-run")])
+        #expect(other["status"] == .string("ok"))
+        #expect(other["skipped_malformed_rows"] == .int(1))
+        // The corrupt row's own run is never reported as merely not-retained.
+        let corrupt = try await fixture.inspect(["run_id": .string("legacy-run")])
+        #expect(corrupt["status"] == .string("unavailable"))
+        #expect(corrupt["reason"] == .string("receipt_store_malformed"))
+        // An unknown run is still not_found, but carries the skip count so the
+        // caller can tell "absent" from "possibly hidden by corruption".
+        let unknown = try await fixture.inspect(["run_id": .string("never-ran")])
+        #expect(unknown["status"] == .string("not_found"))
+        #expect(unknown["reason"] == .string("receipt_not_retained"))
+        #expect(unknown["skipped_malformed_rows"] == .int(1))
+
+        // Clean rows only: no skip count is emitted at all.
+        try fixture.write(.array([fixture.receipt, unrelated]))
+        #expect(try await fixture.inspect()["skipped_malformed_rows"] == nil)
+
+        // All rows malformed and none of them the requested run: the store as a
+        // whole is malformed, never an empty not_found.
+        try fixture.write(.array([legacyRow, legacyRow]))
+        let allBad = try await fixture.inspect(["run_id": .string("never-ran")])
+        #expect(allBad["status"] == .string("unavailable"))
+        #expect(allBad["reason"] == .string("receipt_store_malformed"))
+
+        // An empty store is empty, not malformed.
+        try fixture.write(.array([]))
+        #expect(try await fixture.inspect()["reason"] == .string("receipt_not_retained"))
+
+        try original.write(to: fixture.file)
+        #expect(try Data(contentsOf: fixture.file) == original)
     }
 
     @Test func oversizedStoreIsRejectedBeforeLoadingItsBody() async throws {

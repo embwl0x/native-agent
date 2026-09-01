@@ -77,7 +77,10 @@ private func predictionSignal(
             satisfied: 1,
             violated: 0,
             expired: 0,
-            lastEvidenceAt: date.addingTimeInterval(2)
+            lastEvidenceAt: date.addingTimeInterval(2),
+            // The lifetime tally and its forgettable weight are stamped
+            // together; the weight is undecayed until the clock moves.
+            weights: OrganismPredictionOutcomeWeights(satisfied: 1)
         ))
 }
 

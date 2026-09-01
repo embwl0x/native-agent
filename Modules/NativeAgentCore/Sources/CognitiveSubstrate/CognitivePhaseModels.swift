@@ -65,6 +65,11 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
     public let unresolvedQuestion: String?
     public let activeTask: String?
     public let goal: String?
+    /// Provenance bit for an activeTask/goal supplied by the resident Desk
+    /// pursuit overlay. The turn engine keeps this intent out of ordinary
+    /// conversation relevance; the Desk context projection remains available
+    /// for explicit, query-selected work recall.
+    public let residentWorkIntent: Bool
     public let predictedToolGroups: Set<String>
     public let memoryActivation: [String: Double]
     public let workingMemoryRecordIDs: Set<String>
@@ -80,6 +85,7 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
         unresolvedQuestion: String? = nil,
         activeTask: String? = nil,
         goal: String? = nil,
+        residentWorkIntent: Bool = false,
         predictedToolGroups: Set<String> = [],
         memoryActivation: [String: Double] = [:],
         workingMemoryRecordIDs: Set<String> = []
@@ -110,6 +116,7 @@ public struct CognitiveAttentionSignals: Sendable, Equatable {
         self.unresolvedQuestion = unresolvedQuestion.map { bounded($0, to: 200) }
         self.activeTask = activeTask.map { bounded($0, to: 200) }
         self.goal = goal.map { bounded($0, to: 200) }
+        self.residentWorkIntent = residentWorkIntent
         self.predictedToolGroups = Set(predictedToolGroups.sorted().prefix(8).map { bounded($0, to: 64) })
         self.memoryActivation = cappedByWeight(memoryActivation, cap: 32, keyLimit: 128)
         self.workingMemoryRecordIDs = Set(workingMemoryRecordIDs.sorted().prefix(16).map { bounded($0, to: 128) })

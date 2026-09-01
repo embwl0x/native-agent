@@ -150,17 +150,63 @@ struct BuilderInboxRecoveryTests {
         #expect(try Data(contentsOf: fixture.inbox) == before)
     }
 
+    /// A malformed inbox used to fail EVERY later send to that agent until a
+    /// human repaired the file, so one torn line kept the bridge dark forever.
+    /// It now self-heals: the damaged bytes are renamed aside (never deleted),
+    /// a fresh inbox carries this send, and the receipt names the quarantine so
+    /// a possible earlier admission is reported rather than hidden.
     @Test(arguments: ["claude", "omp"])
-    func malformedInboxCannotHideAnEarlierAdmission(agent: String) async throws {
+    func malformedInboxIsQuarantinedAsideAndReportedInsteadOfWedgingTheBridge(agent: String) async throws {
         let fixture = try InboxRecoveryFixture(agent: agent)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        try FileManager.default.createDirectory(at: fixture.inbox.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let directory = fixture.inbox.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let corrupt = Data("{unreadable admission}\n".utf8)
         try corrupt.write(to: fixture.inbox)
+
         let result = try await fixture.send()
-        #expect(result["status"] == .string("failed"))
-        #expect(await fixture.recorder.payloads.isEmpty)
-        #expect(try Data(contentsOf: fixture.inbox) == corrupt)
+
+        #expect(result["status"] == .string("queued"))
+        #expect(await fixture.recorder.payloads.count == 1)
+
+        // The receipt must NAME the quarantine — a recovered send that looks
+        // like an ordinary first admission is the silent-drop this replaced.
+        guard case .object(let quarantine)? = result["inboxQuarantined"],
+              case .string(let asidePath)? = quarantine["quarantinedPath"] else {
+            Issue.record("expected an inboxQuarantined receipt naming the preserved bytes")
+            return
+        }
+        #expect(asidePath.hasPrefix(fixture.inbox.path + ".quarantined-"))
+        // Original bytes preserved verbatim, and never at the live path.
+        #expect(try Data(contentsOf: URL(fileURLWithPath: asidePath)) == corrupt)
+
+        // The live inbox is fresh and carries exactly this send.
+        let rows = try await SwiftNativePersistenceCore().readJSONL(fixture.inbox)
+        #expect(rows.count == 1)
+        guard case .object(let row)? = rows.first else {
+            Issue.record("expected the fresh inbox to hold the recovered row")
+            return
+        }
+        #expect(row["messageId"] == .string("same-operation"))
+
+        // A durable error receipt lands beside the inbox for the operator.
+        let receipts = try await SwiftNativePersistenceCore()
+            .readJSONL(directory.appendingPathComponent("bridge-inbox-quarantine.jsonl"))
+        #expect(receipts.count == 1)
+        guard case .object(let receipt)? = receipts.first else {
+            Issue.record("expected a quarantine receipt row")
+            return
+        }
+        #expect(receipt["event"] == .string("builder_inbox_quarantined"))
+        #expect(receipt["quarantinedPath"] == .string(asidePath))
+        #expect(receipt["inboxPath"] == .string(fixture.inbox.path))
+
+        // And the bridge stays healthy afterwards: the next send dedupes off
+        // the fresh inbox instead of tripping the malformed guard again.
+        let second = try await fixture.send()
+        #expect(second["status"] == .string("queued"))
+        #expect(second["deduplicated"] == .bool(true))
+        #expect(second["inboxQuarantined"] == nil)
     }
 
     @Test(arguments: ["claude", "omp"])

@@ -154,6 +154,12 @@ public enum ToolLoopBudget {
 /// existing exhausted-turn terminal path; it never manufactures a new error,
 /// fallback, receipt, cancellation, or provider-failure shape.
 ///
+/// It is also PROGRESS-AWARE (2026-08-31): a round that lands at least one
+/// successful tool dispatch re-grants the surface window via `recordProgress()`,
+/// capped at start + the unattended ceiling. So the ceiling a turn actually
+/// feels is "how long since it last got somewhere", not "how long has it run" —
+/// stuck turns still die on schedule, working turns keep working.
+///
 /// The `nowNanoseconds` TaskLocal is the shared injection seam for the
 /// structured and text-compatible loops. Production uses uptime nanoseconds;
 /// deterministic tests bind a manual monotonic clock without sleeping.
@@ -165,7 +171,12 @@ struct WholeTurnWallClockBudget: Sendable {
     /// was clipping legitimate deep turns the day it shipped. A runaway loop
     /// still dies; a real deliberate turn cannot be touched (>3x worst case).
     static let defaultInteractiveSeconds: TimeInterval = 600
-    static let defaultTelegramSeconds: TimeInterval = 300
+    /// 600, not 300: Telegram is the surface the agent works User's real
+    /// research on REMOTELY, and it carried the shortest budget in the app —
+    /// half the interactive one the same p95 evidence justified. A live
+    /// multi-tool research turn was cut at 300s (2026-08-31). Same floor as
+    /// interactive now; progress extension does the rest.
+    static let defaultTelegramSeconds: TimeInterval = 600
     static let defaultUnattendedSeconds: TimeInterval = 3_900
 
     @TaskLocal static var nowNanoseconds: MonotonicClock = {
@@ -173,7 +184,13 @@ struct WholeTurnWallClockBudget: Sendable {
     }
 
     private let startedAtNanoseconds: UInt64
-    private let deadlineNanoseconds: UInt64
+    /// Slides forward on `recordProgress()`, never past `ceilingNanoseconds`.
+    private var deadlineNanoseconds: UInt64
+    /// The surface (or override) window, re-granted by each productive round.
+    private let windowNanoseconds: UInt64
+    /// start + defaultUnattendedSeconds: an extended interactive turn can
+    /// never outlive what an unattended lane gets, no matter how productive.
+    private let ceilingNanoseconds: UInt64
     private let clock: MonotonicClock
 
     static func defaultSeconds(for surface: String) -> TimeInterval {
@@ -201,10 +218,35 @@ struct WholeTurnWallClockBudget: Sendable {
         // wins over the surface default, clamped to the unattended ceiling.
         let seconds = min(requestedSeconds ?? defaultSeconds(for: surface), defaultUnattendedSeconds)
         let duration = UInt64(seconds * 1_000_000_000)
-        let deadline = startedAt > UInt64.max - duration
-            ? UInt64.max
-            : startedAt + duration
-        return Self(startedAtNanoseconds: startedAt, deadlineNanoseconds: deadline, clock: clock)
+        let deadline = Self.offset(startedAt, by: duration)
+        return Self(
+            startedAtNanoseconds: startedAt,
+            deadlineNanoseconds: deadline,
+            windowNanoseconds: duration,
+            ceilingNanoseconds: Self.offset(
+                startedAt, by: UInt64(defaultUnattendedSeconds * 1_000_000_000)
+            ),
+            clock: clock
+        )
+    }
+
+    private static func offset(_ base: UInt64, by duration: UInt64) -> UInt64 {
+        base > UInt64.max - duration ? UInt64.max : base + duration
+    }
+
+    /// A turn that is GETTING SOMEWHERE re-earns its window: at least one tool
+    /// dispatch in the round just finished came back a real result, so the
+    /// deadline slides to now + the surface budget. The brake is for turns that
+    /// spin, not for turns that take a while — a real research turn on Telegram
+    /// was dying at the floor while it was still producing (2026-08-31).
+    ///
+    /// Two invariants keep this from becoming "no budget at all": the deadline
+    /// only ever moves FORWARD, and it is hard-capped at start + the unattended
+    /// window, so a productive interactive turn can still never outlive a
+    /// background one. Surfaces already at that ceiling extend by zero.
+    mutating func recordProgress() {
+        let extended = Self.offset(clock(), by: windowNanoseconds)
+        deadlineNanoseconds = min(max(deadlineNanoseconds, extended), ceilingNanoseconds)
     }
 
     var isExhausted: Bool {
@@ -1704,7 +1746,13 @@ extension SwiftNativeTurnEngine {
     /// Result of a shared post-dispatch round: `.stopLoop` when the no-progress
     /// guard tripped (caller breaks BEFORE the next-iteration prep, exactly as
     /// the inlined code did), `.continueLoop` otherwise.
-    enum ToolDispatchRoundOutcome { case continueLoop, stopLoop }
+    ///
+    /// `madeProgress` is the whole-turn wall-clock budget's extension signal:
+    /// true when at least ONE dispatch in the round returned a real result
+    /// (`ChatToolOutcome.outputLooksSuccessful` — the same classification that
+    /// sets the provider's tool_result `is_error` bit). An all-errored round is
+    /// exactly the stuck case the budget exists to kill, so it extends nothing.
+    enum ToolDispatchRoundOutcome { case continueLoop(madeProgress: Bool), stopLoop }
 
     /// Shared post-provider-call round for both structured loops: mint the
     /// assistant message (prose + tool_use blocks, synthesizing collision-free
@@ -1775,6 +1823,10 @@ extension SwiftNativeTurnEngine {
             progress: progress
         )
         dispatches.append(contentsOf: iterationRecords)
+        // Whole-turn budget extension signal (see ToolDispatchRoundOutcome).
+        let madeProgress = iterationRecords.contains {
+            ChatToolOutcome.outputLooksSuccessful($0.result)
+        }
         switch noProgressGuard.observe(iterationRecords) {
         case .none:
             break
@@ -1809,7 +1861,7 @@ extension SwiftNativeTurnEngine {
         if AnthropicOAuthDirectAdapter.GrownPromptCompat.effective {
             IntraTurnToolResultClearing.sweep(&conversation)
         }
-        return .continueLoop
+        return .continueLoop(madeProgress: madeProgress)
     }
 
     /// Shared exhaustion tail for a loop that ran out of iterations without a
@@ -1921,7 +1973,7 @@ extension SwiftNativeTurnEngine {
                 Task { await ProviderToolResultRecoveryStore.shared.remove(scope: recoveryScope) }
             }
         }
-        let wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface, requestedSeconds: turnWallClockSecondsOverride)
+        var wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface, requestedSeconds: turnWallClockSecondsOverride)
         let startNs = DispatchTime.now().uptimeNanoseconds
         // Shared pre-loop context resolution (C2): prefer preBuiltContext, else
         // build + lazy-filter through the session's active tools, then fire the
@@ -2111,6 +2163,11 @@ extension SwiftNativeTurnEngine {
                 noProgressGuard: &noProgressGuard,
                 loopRecoveryReply: &loopRecoveryReply
             )
+            // A6 progress extension: a round that actually landed a tool result
+            // re-earns the surface window (capped at the unattended ceiling).
+            if case .continueLoop(let madeProgress) = outcome, madeProgress {
+                wholeTurnBudget.recordProgress()
+            }
             if case .stopLoop = outcome { break }
         }
         // Loop exhausted. Shared exhaustion tail (C2): best-effort final reply
@@ -2164,7 +2221,7 @@ extension SwiftNativeTurnEngine {
                 Task { await ProviderToolResultRecoveryStore.shared.remove(scope: recoveryScope) }
             }
         }
-        let wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface, requestedSeconds: turnWallClockSecondsOverride)
+        var wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface, requestedSeconds: turnWallClockSecondsOverride)
         let startNs = DispatchTime.now().uptimeNanoseconds
         // Shared pre-loop context resolution (C2): same build + lazy-filter +
         // snapshot as the non-streaming path so the streaming surface doesn't
@@ -2561,6 +2618,11 @@ extension SwiftNativeTurnEngine {
                 noProgressGuard: &noProgressGuard,
                 loopRecoveryReply: &loopRecoveryReply
             )
+            // A6 progress extension (same rule as the non-streaming sibling —
+            // streamed TEXT is never progress; a landed tool result is).
+            if case .continueLoop(let madeProgress) = outcome, madeProgress {
+                wholeTurnBudget.recordProgress()
+            }
             if case .stopLoop = outcome { break }
         }
 

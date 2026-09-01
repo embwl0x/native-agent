@@ -216,10 +216,9 @@ public actor WorkshopExecutorLoop {
     private let approvalTimeoutNanos: UInt64
     /// Whether the per-STEP autonomy approval gate is enforced (default true =
     /// prior behavior). Wired FALSE under wide-open trust (full-mac yolo) so
-    /// Workshop execution tool steps the planner marked `needs_approval` run UNATTENDED —
-    /// the "she does everything" posture. An EXPLICIT per-Workshop execution
-    /// trustRequired != "none" still gates regardless (a Workshop execution deliberately
-    /// asking for approval is honored even under yolo).
+    /// Workshop execution approval-only posture runs unattended. This includes
+    /// explicit trustRequired: it is an ask/confirm policy request, not a hard
+    /// domain block, and an admitted Full Mac grant has already answered it.
     private let stepApprovalEnforced: @Sendable () async -> Bool
     private let terminalEventSink: WorkshopTerminalEventSink?
     /// Resolves the execution→memory recorder LAZILY, on the first terminal event.
@@ -1225,10 +1224,9 @@ public actor WorkshopExecutorLoop {
         // Approval gate (v1 reduced rule per the build plan): the execution's
         // trustRequired escalates every step; a step may also mark itself.
         // YOLO: under wide-open trust stepApprovalEnforced() is false, so the
-        // planner's per-tool `needs_approval` default does NOT gate (executions
-        // run unattended). An EXPLICIT per-execution trustRequired != "none" is
-        // still honored regardless — an execution deliberately asking for approval
-        // gates even under yolo.
+        // planner, intrinsic tool tier, and explicit per-execution
+        // trustRequired do NOT gate. Hard domain/tool refusals still happen in
+        // the injected dispatcher at effect time.
         let enforceStepAutonomy = await stepApprovalEnforced()
         // Non-yolo: the planner's per-step autonomy_hint must NOT be able to
         // downgrade a tool that intrinsically needs approval. A sloppy/compromised
@@ -1247,9 +1245,9 @@ public actor WorkshopExecutorLoop {
             return DefaultToolAutonomy.needsApproval(
                 DefaultToolAutonomy.resolve(toolId: step.toolOrAction))
         }()
-        let needsApproval = !bypassApproval
+        let needsApproval = !bypassApproval && enforceStepAutonomy
             && (execution.trustRequired != "none"
-                || (step.autonomy == "needs_approval" && enforceStepAutonomy)
+                || step.autonomy == "needs_approval"
                 || toolIntrinsicGate)
         if needsApproval {
             guard let stageApproval else {

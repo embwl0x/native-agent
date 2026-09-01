@@ -105,7 +105,7 @@ iOS/NativeAgentMobile/Sources/ProviderSettingsView.swift	*	1	visible_ui	MobilePr
 iOS/NativeAgentMobile/Sources/SystemToastBar.swift	*	1	visible_ui	MobileToastUI
 iOS/NativeAgentMobile/Sources/VoiceInputController.swift	*	1	visible_ui	MobileVoiceInputUI
 iOS/NativeAgentMobile/Sources/iCloudBridge.swift	*	1	external_protocol_poll	MobileICloudBridgeTimeout
-iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift	*	3	external_protocol_poll	MobileICloudActionTransport
+iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift	*	4	external_protocol_poll	MobileICloudActionTransport; rejected-arrival signature retry pays its bounded interval instead of busy-spinning the main actor
 iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Snapshots.swift	*	1	external_protocol_poll	MobileICloudSnapshotFetch
 Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+SchemaBuilders.swift	try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))	1	timeout_retry_deadline	MCPToolCacheWarmDeadline
 Modules/NativeAgentCore/Sources/NativeAgentCore/LifecyclePrimitives.swift	try await Task.sleep(nanoseconds: BoundedWait.nanoseconds(deadline))	1	timeout_retry_deadline	BoundedWait.deadline

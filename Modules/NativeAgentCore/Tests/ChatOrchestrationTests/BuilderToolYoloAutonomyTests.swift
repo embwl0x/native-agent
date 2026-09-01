@@ -14,8 +14,8 @@ import TrustCenter
 // spawn processes. Authenticated remote origins share the selected YOLO posture
 // only after SecurityCenter proves their allowlist/pairing; an untrusted remote
 // surface label never elevates. Outside yolo they stay confirm-class.
-// Self-modification tools (self_install/evolution_*) and external account sends
-// are deliberately excluded from yolo autonomy.
+// Every ask/confirm tool shares the admitted YOLO posture. Explicit user
+// `blocked` overrides and hard SecurityCenter/domain blocks remain closed.
 //
 // These tests drive the REAL SwiftNativeTrustCenter.autonomyLevel(forTool:
 // surface:) resolution (the full-mac bypass in ChatOrchestration+AutonomyGate),
@@ -235,19 +235,27 @@ struct BuilderToolYoloAutonomyTests {
         #expect(evo == "confirm", "self_install keeps its floor on any surface (got \(evo))")
     }
 
-    // MARK: the firewall — self-modification tools never elevate
+    // MARK: admitted YOLO flattens every per-call confirm
 
-    @Test func evolutionTools_stayNonAuto_evenInYolo() async throws {
+    @Test func evolutionMutationAndStatusAreAutoInYolo() async throws {
         let root = tempRoot("evo")
         try seedYoloActive_shellFlagOff(root)
         let tc = SwiftNativeTrustCenter(dataRoot: root)
-        for tool in ["self_install", "evolution_propose", "evolution_status"] {
+        for tool in ["self_install", "evolution_propose"] {
             let level = try await tc.autonomyLevel(forTool: tool, surface: "chat")
-            #expect(level != "auto", "\(tool) must NEVER elevate to auto via the yolo window (got \(level))")
+            #expect(level == "auto", "\(tool) must not prompt in admitted yolo (got \(level))")
+        }
+        for surface in ["chat", "telegram", "ios"] {
+            let level = try await tc.autonomyLevel(
+                forTool: "evolution_status",
+                surface: surface,
+                originTrusted: true
+            )
+            #expect(level == "auto", "read-only evolution_status must not ask in yolo on \(surface) (got \(level))")
         }
     }
 
-    @Test func remoteNodeExecutionKeepsApprovalFloorEvenInYolo() async throws {
+    @Test func remoteNodeExecutionHasNoPerCallApprovalInYolo() async throws {
         let root = tempRoot("remote-node")
         try seedYoloActive_shellFlagOff(root)
         let tc = SwiftNativeTrustCenter(dataRoot: root)
@@ -257,11 +265,11 @@ struct BuilderToolYoloAutonomyTests {
                 surface: surface,
                 originTrusted: true
             )
-            #expect(level == "confirm", "remote effects must retain an approval floor on \(surface) (got \(level))")
+            #expect(level == "auto", "remote effects must not prompt on admitted \(surface) (got \(level))")
         }
     }
 
-    @Test func approvalGatedExternalSendTools_stayNonAuto_evenInYolo() async throws {
+    @Test func approvalGatedExternalSendTools_areAutoInYolo() async throws {
         let root = tempRoot("send")
         try seedYoloActive_shellFlagOff(root)
         let tc = SwiftNativeTrustCenter(dataRoot: root)
@@ -271,7 +279,7 @@ struct BuilderToolYoloAutonomyTests {
             "agentmail.send", "agentmail_send",
         ] {
             let level = try await tc.autonomyLevel(forTool: tool, surface: "chat")
-            #expect(level != "auto", "\(tool) must not become an automatic external send in yolo (got \(level))")
+            #expect(level == "auto", "\(tool) must not prompt in admitted yolo (got \(level))")
         }
     }
 

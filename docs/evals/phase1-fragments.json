@@ -64596,10 +64596,6 @@
      "why": "Cites ChatStoreMergeTests.swift:249 test_unmatchedLateCancellationCannotStopANewerTurn as \"asserts\". That test is real and does pin correlation matching on cancellation \u2014 but the surface's stated failure mode is a VISIBILITY one (\"stop only renders while store.isLoading; if isLoading goes false while the Mac turn is still live the user has no cancel\"). No test covers the render gate. The coverage is for a different property than the one at risk; strength should be incidental."
     },
     {
-     "id": "ios.approvals.decide",
-     "why": "Cites ActionChannelTests.swift:479 test_isMacResponseTimeout_classification as \"asserts\". Both refs verified present, but the named failure mode is the single-slot mutex \u2014 decidingApprovalID != nil returning early at ApprovalsView.swift:71-72, which blocks every other approval on screen with no visible reason. Neither cited test touches decidingApprovalID. The timeout-classification test covers error labelling, not the mutex. Strength should be incidental and the mutex needs its own eval."
-    },
-    {
      "id": "ios.content.activityBadge",
      "why": "Not a coverage dispute \u2014 a factual correction. The silentFailureMode says the badge is \"a max() of five independent sources\". Read at ContentView.swift:41-58 it is a SUM of five buckets, two of which are internally max()'d pairs (approvalsStore.pendingCount vs the sync.approvals filter; inboxStore.activeCount vs the sync.inboxItems filter). The proposedEval (\"the badge equals the sum across all five buckets\") is correct and should be kept; the description would mislead whoever implements it into asserting the wrong operator."
     },

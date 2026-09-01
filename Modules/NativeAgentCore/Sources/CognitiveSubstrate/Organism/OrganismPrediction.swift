@@ -90,6 +90,27 @@ public struct OrganismPredictionLimits: Sendable, Equatable {
     public static let defaults = OrganismPredictionLimits()
 }
 
+/// Time-forgotten counterpart of the lifetime outcome tallies. Fractional
+/// because the organism clock ticks at second granularity: integer counters
+/// cannot carry an exponential decay without either starving (a one-second
+/// tick never removes half a unit) or bleeding at a rate set by signal
+/// frequency instead of wall time.
+public struct OrganismPredictionOutcomeWeights: Codable, Sendable, Equatable {
+    public var satisfied: Double
+    public var violated: Double
+    public var expired: Double
+
+    public init(satisfied: Double = 0, violated: Double = 0, expired: Double = 0) {
+        self.satisfied = Self.clamp(satisfied)
+        self.violated = Self.clamp(violated)
+        self.expired = Self.clamp(expired)
+    }
+
+    private static func clamp(_ value: Double) -> Double {
+        value.isFinite ? max(0, value) : 0
+    }
+}
+
 /// Cumulative, per-capability outcome evidence. Unlike the bounded prediction
 /// reservoir, these counters are not a display sample and therefore remain a
 /// valid basis for Agent's capability self-read after old rows are evicted.
@@ -98,17 +119,48 @@ public struct OrganismPredictionOutcomeCounts: Codable, Sendable, Equatable {
     public var violated: Int
     public var expired: Int
     public var lastEvidenceAt: Date?
+    /// Added after the lifetime counters shipped. The Ints stay a monotone
+    /// receipt of everything that ever happened; these weights are the same
+    /// evidence forgotten on the organism clock, and are what the capability
+    /// self-read reasons from. `nil` means a state written before forgetting
+    /// existed; readers seed from the lifetime tally rather than discard it
+    /// (additive wire — old files decode as nil, old builds ignore the key).
+    public var weights: OrganismPredictionOutcomeWeights?
 
     public init(
         satisfied: Int = 0,
         violated: Int = 0,
         expired: Int = 0,
-        lastEvidenceAt: Date? = nil
+        lastEvidenceAt: Date? = nil,
+        weights: OrganismPredictionOutcomeWeights? = nil
     ) {
         self.satisfied = max(0, satisfied)
         self.violated = max(0, violated)
         self.expired = max(0, expired)
         self.lastEvidenceAt = lastEvidenceAt
+        self.weights = weights
+    }
+
+    /// Recorded weights, or the lifetime tally seeded for a state written
+    /// before forgetting existed. The seed is discounted by the age of
+    /// `lastEvidenceAt`, because decay only ever runs forward from the upgrade:
+    /// an undiscounted seed would let months-old evidence read as if all of it
+    /// had landed at restore, contradicting the staleness the same record
+    /// reports. Full strength only when the state carries no evidence date to
+    /// age it against.
+    public func effectiveWeights(at date: Date) -> OrganismPredictionOutcomeWeights {
+        if let weights { return weights }
+        var factor: Double = 1
+        if let lastEvidenceAt {
+            let elapsed: Double = max(0, date.timeIntervalSince(lastEvidenceAt))
+            let halfLife: Double = OrganismCapabilitySelfModel.evidenceHalfLife
+            factor = pow(0.5, elapsed / halfLife)
+        }
+        return OrganismPredictionOutcomeWeights(
+            satisfied: Double(satisfied) * factor,
+            violated: Double(violated) * factor,
+            expired: Double(expired) * factor
+        )
     }
 }
 
@@ -612,7 +664,10 @@ public enum OrganismPredictiveBody {
         return next
     }
 
-    private static func recordOutcome(
+    /// Internal rather than private: the restart/idle sweep in
+    /// `OrganismPersistentState.decayed(at:)` finds expiries the live sweep
+    /// never sees, and both paths must stamp identical evidence.
+    static func recordOutcome(
         _ status: OrganismPredictionStatus,
         kind: OrganismPredictionKind,
         at date: Date,
@@ -620,12 +675,20 @@ public enum OrganismPredictiveBody {
     ) {
         var all = ledger.outcomeCountsByKind ?? [:]
         var count = all[kind.rawValue] ?? OrganismPredictionOutcomeCounts()
+        var weights = count.effectiveWeights(at: date)
         switch status {
-        case .satisfied: count.satisfied += 1
-        case .violated: count.violated += 1
-        case .expired: count.expired += 1
+        case .satisfied:
+            count.satisfied += 1
+            weights.satisfied += 1
+        case .violated:
+            count.violated += 1
+            weights.violated += 1
+        case .expired:
+            count.expired += 1
+            weights.expired += 1
         case .pending: return
         }
+        count.weights = weights
         count.lastEvidenceAt = max(count.lastEvidenceAt ?? .distantPast, date)
         all[kind.rawValue] = count
         ledger.outcomeCountsByKind = all

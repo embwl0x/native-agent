@@ -164,9 +164,10 @@ extension BackgroundLoopsAssembly {
             // bot's growing draft wants accumulated text-so-far. One
             // accumulator per turn (this closure runs once per turn).
             let deltaAccumulator = TelegramDeltaAccumulator()
-            // U4 Wave D (gpt-5.5 review BLOCKER): Telegram is a REMOTE surface —
-            // the self-evolution tools must not be reachable from it.
-            // includeEvolutionBridge:false → they return `bridge_not_wired`.
+            // Telegram uses the canonical surface profile. Its evolution
+            // backend is present so trusted Full Mac YOLO can read
+            // `evolution_status`; propose/install retain their ordinary
+            // TrustCenter and approval floors.
             let sessionId = try await telegramSessions.activeSessionId(chatId: chatId)
             let persona = (try? await telegramSessions.persona(chatId: chatId))
                 ?? NativeAgentNotificationDefaults.agentDisplayName(dataRoot: dataRoot)

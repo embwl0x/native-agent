@@ -149,4 +149,65 @@ final class ReplyNudgeAndStatusCadenceEvalTests: XCTestCase {
         observer.apply(isOffline: false)   // no edge
         XCTAssertEqual(restored, 2)
     }
+
+    func test_aRestoreThatLandsBeforeTheCallbackIsInstalledIsReplayedNotLost() {
+        // MacBridgeClient hooks the observer in its init, but the chat-store
+        // callback behind it is installed from ContentView.onAppear — which
+        // never runs while onboarding is on screen. The restore must be
+        // latched and replayed, or the cold-launch-online queued-send resume
+        // is lost for the whole session.
+        let client = MacBridgeClient()
+        let observer = NetworkPathObserver.shared
+        observer.apply(isOffline: true)
+        observer.apply(isOffline: false)   // restore with nothing downstream
+        var resumed = 0
+        client.onNetworkPathRestored = { resumed += 1 }
+        XCTAssertEqual(resumed, 1, "the missed restore must replay on install")
+        client.onNetworkPathRestored = { resumed += 1 }
+        XCTAssertEqual(resumed, 1, "the latch is one-shot, not a replay on every install")
+    }
+
+    func test_aRestoreReplayedBeforeTheChatTabOpensStillSendsWhenTheClientArrives() async {
+        // The whole chain on a launch that lands on a NON-CHAT tab: the path
+        // observer fires, MacBridgeClient latches it, ContentView.onAppear
+        // replays it into resumeQueuedSends — but `scheduleQueuedSendDrain`
+        // also needs `pendingRetryClient`, which only ChatView.onAppear
+        // installs. Consuming the one-shot latch with no client installed must
+        // not lose the resume.
+        let suiteName = "NativeAgentMobileTests.restoreOrdering.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = ChatStore(defaults: defaults, restoreQueuedSends: false)
+        store.setSelectedSessionID("session-a")
+        store.queuedSends = [
+            QueuedChatSend(
+                id: UUID(),
+                sessionID: "session-a",
+                text: "queued before the network came back",
+                controls: .defaults,
+                attachments: [],
+                createdAt: Date()
+            )
+        ]
+        store.pausedQueueSessionKeys.insert(store.queueSessionKey("session-a"))
+
+        let client = MacBridgeClient()   // held strong — pendingRetryClient is weak
+        let observer = NetworkPathObserver.shared
+        observer.apply(isOffline: true)
+        observer.apply(isOffline: false)   // restore, latched
+        client.onNetworkPathRestored = { [weak store] in store?.resumeQueuedSends() }
+
+        XCTAssertFalse(store.isSelectedQueuePaused, "the replayed restore must un-pause the queue")
+        XCTAssertNil(store.sendTask, "nothing can send before the chat tab installs the client")
+
+        store.pendingRetryClient = client   // ChatView.onAppear, one tab later
+        for _ in 0..<50 {
+            if store.sendTask != nil { break }
+            await Task.yield()
+        }
+        XCTAssertNotNil(
+            store.sendTask,
+            "the queued send never resumed — the restore was consumed while no client was installed"
+        )
+    }
 }

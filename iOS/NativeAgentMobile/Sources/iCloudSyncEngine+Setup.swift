@@ -210,16 +210,29 @@ extension iCloudSyncEngine {
         }
     }
 
+    /// A snapshot signal names the groups whose files the Mac just published.
+    /// It is only a complete description of that publication when this build
+    /// understands every name in it. A Mac newer than this app can name a group
+    /// this enum does not have — a rename or an addition — and silently
+    /// dropping that name while refreshing the recognised siblings leaves the
+    /// unrecognised group's data stale behind a signal that claimed to cover
+    /// the whole write. That is how a phantom STALE badge survives a healthy
+    /// Mac publication. An incompletely understood signal is therefore no
+    /// signal: return nil so the caller performs the same complete read the
+    /// legacy timestamp-only publishers already get.
     nonisolated static func snapshotSignalGroups(
         _ value: String?
     ) -> Set<NAMobileSnapshotGroup>? {
         guard let value,
               let marker = value.range(of: "|groups=") else { return nil }
-        let rawGroups = value[marker.upperBound...]
-        return Set(
-            rawGroups
-                .split(separator: ",")
-                .compactMap { NAMobileSnapshotGroup(rawValue: String($0)) }
-        )
+        var groups: Set<NAMobileSnapshotGroup> = []
+        for token in value[marker.upperBound...].split(separator: ",") {
+            let name = token.trimmingCharacters(in: .whitespaces)
+            // An empty slot names nothing; it does not make the signal unknown.
+            guard !name.isEmpty else { continue }
+            guard let group = NAMobileSnapshotGroup(rawValue: name) else { return nil }
+            groups.insert(group)
+        }
+        return groups
     }
 }

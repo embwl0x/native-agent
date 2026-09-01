@@ -64,6 +64,15 @@ struct NativeMacPowerPanelBehaviorEvalTests {
         #expect(!approvalRequired.canRun)
         #expect(approvalRequired.blockedDetail == "Approval is required before this action can run.")
 
+        let admittedYolo = NativeMacPowerPanelPresentation.action(
+            requiresApproval: true,
+            dryRunAvailable: true,
+            fullMacYoloAdmitted: true
+        )
+        #expect(admittedYolo.canDryRun)
+        #expect(admittedYolo.canRun)
+        #expect(admittedYolo.blockedDetail == nil)
+
         let noDryRun = NativeMacPowerPanelPresentation.action(
             requiresApproval: false,
             dryRunAvailable: false

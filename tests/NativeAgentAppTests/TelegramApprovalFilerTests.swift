@@ -384,16 +384,13 @@ struct TelegramApprovalFilerTests {
             "kind": .string("soul"),
             "title": .string("User-approved identity note"),
             "content": .string("Carry this bounded note forward."),
-            // Persona writes are lazy tools. The approved replay must carry
-            // the exact source session and that session's active loadout,
-            // rather than relying on a detached SwiftUI host or bypassing the
-            // dispatch gate during recovery.
+            // Persona writes are lazy tools. Approved replay must bind this
+            // exact approved tool turn-locally even when the source session no
+            // longer has a persisted loadout.
             "session_id": .string("telegram-session"),
         ]
-        try await ActiveToolsStore(dataRoot: root).addLoaded(
-            sessionId: "telegram-session",
-            names: ["persona_append_section"]
-        )
+        #expect(await ActiveToolsStore(dataRoot: root)
+            .load(sessionId: "telegram-session").activeTools.isEmpty)
         let inbox = SwiftNativeApprovalInbox(root: root)
         let approval = try await inbox.create(.object([
             "title": .string("Approve persona update"),
@@ -453,6 +450,9 @@ struct TelegramApprovalFilerTests {
         #expect(body.components(separatedBy: "## User-approved identity note").count == 2)
         #expect(body.contains("Carry this bounded note forward."))
         #expect(executed["status"] == .string("succeeded"))
+        #expect(await ActiveToolsStore(dataRoot: root)
+            .load(sessionId: "telegram-session").activeTools.isEmpty,
+            "approved replay must not persist or broaden the source session loadout")
 
         let transcript = try await persistence.readJSONL(
             root

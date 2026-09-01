@@ -303,7 +303,14 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     }
 
     public func listAvailableTools() async throws -> [String] {
-        var names = readRegistryNames()
+        // Registry discovery may never advertise a spelling that dispatch
+        // resolves to a native/MCP route. Otherwise a disabled built-in such
+        // as `shell`, or a dotted alias such as `desk.read`, can leak back
+        // into the catalog from registry.json even though its custom manifest
+        // can never own the call.
+        var names = readRegistryNames().filter {
+            !Self.registryReservedNames.contains($0) && !$0.hasPrefix("mcp__")
+        }
         // Built-in Swift dispatch-table names always surface, even if
         // data/tools/registry.json is missing or empty (fresh installs).
         let existing0 = Set(names)
@@ -343,8 +350,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         }
         // W2/W3 — INJECTION. Same category, act tier. Catalog visibility here
         // is not authority: dispatch re-checks the category and MacControl
-        // still requires the active Full Mac window AND the approval
-        // attestation before a single event is emitted.
+        // still requires the active Full Mac window AND a body-bound injection
+        // capability before a single event is emitted. Standard modes obtain
+        // it through approved replay; admitted YOLO obtains it directly for
+        // the exact checked call without a per-call prompt.
         if access.accessibilityInjectionAllowed {
             let existing = Set(names)
             names.append(contentsOf: Self.fullMacAccessibilityInjectionToolNames.filter { !existing.contains($0) })
@@ -408,6 +417,17 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
     /// registry schema under a built-in name would advertise behavior
     /// dispatch can't deliver (e.g. a custom "shell" schema while Full Mac
     /// is off).
+    /// Canonical native names whose dotted twins are accepted at dispatch.
+    /// Keep this as the one source for both alias routing and registry-name
+    /// reservation: publishing a custom schema under `desk.read` while the
+    /// dispatcher executes `desk_read` would be a lying tool contract.
+    static let dottedAliasCanonicalToolNames: Set<String> = Set(builtInToolNames)
+        .union(fullMacAppToolNames)
+        .union(fullMacAccessibilityReadToolNames)
+        .union(fullMacNudgeToolNames)
+        .union(activityQueryToolNames)
+        .union(fullMacAccessibilityInjectionToolNames)
+
     static let reservedBuiltInNames: Set<String> = Set(builtInToolNames)
         .union(alwaysOnCoreNames)
         .union(fullMacFileToolNames)
@@ -420,6 +440,17 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         .union(fullMacBuilderToolNames)
         .union(fullMacRestartToolNames)
         .union(fullMacEvolutionToolNames)
+
+    /// Registry ownership must also reserve accepted alias spellings, but the
+    /// public built-in inventory remains canonical so catalogs and eval-ledger
+    /// enumeration do not advertise every compatibility spelling as a second
+    /// tool surface.
+    static let registryReservedNames: Set<String> = {
+        let dottedAliases = Set(dottedAliasCanonicalToolNames
+            .filter { $0.contains("_") }
+            .map { $0.replacingOccurrences(of: "_", with: ".") })
+        return reservedBuiltInNames.union(dottedAliases)
+    }()
 
     /// R9 (review finding 3): the chat lane requires a signed tool. Returns
     /// the codeFingerprint from the registry record, falling back to the
@@ -463,7 +494,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         // that prefix as an MCP bridge name BEFORE consulting the registry, so
         // a registry schema under it would advertise a route that never fires.
         for id in Set(activeIds).sorted()
-        where !Self.reservedBuiltInNames.contains(id) && !id.hasPrefix("mcp__") {
+        where !Self.registryReservedNames.contains(id) && !id.hasPrefix("mcp__") {
             let manifestURL = activeRoot
                 .appendingPathComponent(id, isDirectory: true)
                 .appendingPathComponent("manifest.json")

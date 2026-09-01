@@ -186,6 +186,8 @@ final class ICloudSyncVisibleLifecycleEvalTests: XCTestCase {
 
         XCTAssertTrue(push.contains("PushReceiptLedger.record"))
         XCTAssertTrue(push.contains("drainIfDeviceSyncPush"))
+        XCTAssertTrue(push.contains("pollIncomingNow"))
+        XCTAssertTrue(push.contains("refreshChatTranscriptsSnapshot"))
         XCTAssertTrue(push.contains("refreshInboxSnapshot"))
         XCTAssertTrue(push.contains("refreshActivitySnapshot"))
         XCTAssertTrue(push.contains("NativeAgentRemotePushProcessor.process"))

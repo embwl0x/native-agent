@@ -154,9 +154,10 @@ extension BackgroundLoopsAssembly {
             toolDispatch: toolStep,
             stageApproval: makeWorkshopStepApprovalStager(dataRoot: dataRoot),
             isEnabled: { await workshopExecutorGate(dataRoot: dataRoot) },
-            // YOLO: under wide-open trust, don't gate the planner's per-tool
-            // needs_approval default — Workshop executions run unattended. An explicit
-            // per-Workshop execution trustRequired still gates inside the executor.
+            // An admitted, active Full Mac grant flattens all Workshop
+            // approval-only posture (planner hints, intrinsic confirm tiers,
+            // and explicit trustRequired). Domain/tool dispatch still owns
+            // hard blocks and effect-time validation.
             stepApprovalEnforced: { await !isWideOpenTrust(dataRoot: dataRoot) },
             terminalEventSink: { record, reason in
                 await WorkshopDeskReceiptBridge.recordTerminal(
@@ -171,15 +172,20 @@ extension BackgroundLoopsAssembly {
         )
     }
 
-    /// True when the Trust policy is a wide-open / full-mac "yolo" posture, in
-    /// which Workshop execution tool steps should run unattended (no per-step approval).
+    /// True only for the canonical checked, active and unexpired Full Mac
+    /// authority grant on the local Workshop surface. A permission label by
+    /// itself is not authority, and corrupt/unavailable policy fails closed.
     static func isWideOpenTrust(dataRoot: URL) async -> Bool {
-        let trust = SwiftNativeTrustCenter(dataRoot: dataRoot)
-        let policy = await trust.loadTrustPolicy()
-        if case .string(let level) = policy["permissionLevel"] ?? .null {
-            return level == "full_mac_os" || level == "wide_open_receipts"
-        }
-        return false
+        let assessment = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+            .fullMacYoloAuthority(
+                tool: "workshop.execution",
+                origin: SecurityOriginContext(
+                    surface: WorkshopSurfaceVocabulary.canonical,
+                    source: "background_workshop_executor",
+                    isRemote: false
+                )
+            )
+        return assessment.admitted
     }
 
     /// enableAutonomy + missionPolicy gate, mirroring the daemon's posture:

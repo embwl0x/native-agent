@@ -259,6 +259,24 @@ private func capturedRequest(
     #expect(request.workingAtomIDs.isEmpty)
 }
 
+@Test func residentWorkIntentDoesNotColorAnUnrelatedChatTurn() async throws {
+    let signals = CognitiveAttentionSignals(
+        terms: ["continuity": 0.7],
+        unresolvedQuestion: "did that land?",
+        activeTask: "finish the release checklist",
+        goal: "ship the build",
+        residentWorkIntent: true,
+        predictedToolGroups: ["memory"]
+    )
+    let request = try await capturedRequest(provider: AttentionProviderStub(signals: signals))
+
+    #expect(request.activeTask == nil)
+    #expect(request.goal == nil)
+    #expect(request.contextualTerms == ["continuity"])
+    #expect(request.unresolvedQuestion == "did that land?")
+    #expect(request.predictedToolGroups == ["memory"])
+}
+
 // MARK: - (b) nil provider / nil signals → baseline request
 
 @Test func nilProviderYieldsBaselineRequest() async throws {

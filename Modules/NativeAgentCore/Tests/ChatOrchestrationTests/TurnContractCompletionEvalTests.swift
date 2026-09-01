@@ -124,6 +124,14 @@ struct TurnContractCompletionEvalTests {
         let canonical = try await contractRequest(surface: "workshop", signals: signals)
         let legacy = try await contractRequest(surface: " MISSIONS ", signals: signals)
         let chat = try await contractRequest(surface: "chat", signals: signals)
+        let residentWork = try await contractRequest(
+            surface: "chat",
+            signals: CognitiveAttentionSignals(
+                activeTask: "finish release evidence",
+                goal: "ship the reliable build",
+                residentWorkIntent: true
+            )
+        )
 
         #expect(canonical.surface == .workshop)
         #expect(legacy.surface == .workshop)
@@ -133,6 +141,8 @@ struct TurnContractCompletionEvalTests {
         #expect(legacy.goal == nil)
         #expect(chat.activeTask == signals.activeTask)
         #expect(chat.goal == signals.goal)
+        #expect(residentWork.activeTask == nil)
+        #expect(residentWork.goal == nil)
     }
 
     // Ledger: turn.contract.surfaceSpellingFold

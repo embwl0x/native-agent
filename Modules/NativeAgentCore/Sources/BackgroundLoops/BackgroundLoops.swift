@@ -323,24 +323,26 @@ public protocol BackgroundLoopsProtocol: Sendable {
 public actor SwiftNativeBackgroundLoops: BackgroundLoopsProtocol {
     private let jobWriter: any SchedulerJobWriter
     private let manager: BackgroundLoopsManager
-    private let startedAt: Date
     private let now: @Sendable () -> Date
 
     public init(
         jobWriter: (any SchedulerJobWriter)? = nil,
         manager: BackgroundLoopsManager = BackgroundLoopsManager.shared,
-        startedAt: Date = Date(),
+        // Retained as a source-compatible label for callers compiled against
+        // the prior facade-owned uptime. Runtime uptime is now read from the
+        // lifecycle owner below; construction time is not liveness evidence.
+        startedAt _: Date = Date(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.jobWriter = jobWriter ?? makeSchedulerJobWriter()
         self.manager = manager
-        self.startedAt = startedAt
         self.now = now
     }
 
     public func getWatchdog() async throws -> WatchdogStatus {
         let running = await manager.isRunning()
         let statuses = await manager.status()
+        let uptime = await manager.uptimeSeconds(now: now())
         let newest = statuses.compactMap(\.lastRun).max()
         let lastActivity: JSONValue? = newest.map { lastRun in
             .object([
@@ -364,7 +366,7 @@ public actor SwiftNativeBackgroundLoops: BackgroundLoopsProtocol {
         })
         return WatchdogStatus(
             daemon: "swift",
-            uptimeSeconds: max(0, now().timeIntervalSince(startedAt)),
+            uptimeSeconds: uptime,
             daemonLifecycleStatus: running ? "ok" : "stopped",
             daemonLifecycleDetail: running
                 ? "Swift background loops are running in NativeAgent.app."
@@ -1347,7 +1349,15 @@ public actor SwiftNativeLoopScheduler {
     /// NOT listed: `mission_executor` — that is a live wire id (kept through
     /// the de-mission rename fence), still registered by
     /// BackgroundLoopsAssembly+WorkshopExecution.
-    static let retiredLoopIds: Set<String> = ["golden_eval", "stale_artifact_sweep"]
+    static let retiredLoopIds: Set<String> = [
+        "golden_eval",
+        "stale_artifact_sweep",
+        // Retired 2026-08-31: the duplicate weekly REM lane. Weekly REM has one
+        // owner, the `nativeagent-weekly-rem` TriggerScheduler job. Tombstoned
+        // here so the loop's stale `loops`/`completions`/`firstSeen` stamps do
+        // not survive into the next flush.
+        "rem_cycle",
+    ]
 
     /// A missing/corrupt file simply yields no persisted history, which
     /// degrades to the pre-LOOPS-4 behavior rather than blocking startup.

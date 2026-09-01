@@ -323,24 +323,49 @@ _rotate_log "$DATA/logs/daemon.out.log"
 # fall back to direct exec if it did not.
 INSTALL_VERIFY_STARTED="$(date +%s)"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
-/usr/bin/open "$APP_DEST" 2>&1 || true
+
+# Launching the Mach-O directly is not equivalent to launching its app bundle.
+# In particular, macOS can attribute Accessibility/TCC checks differently for
+# that process even when the on-disk bundle has the same valid designated
+# requirement. A 2026-09-01 install took the old direct-exec fallback, passed
+# bridge readiness, and then returned accessibility_not_trusted until the same
+# bundle was relaunched through LaunchServices. Keep every successful install
+# on the bundle launch path: retry once with `open -n` after re-registration,
+# then fail into the ordinary rollback instead of reporting a crippled app as
+# ready.
+_wait_for_nativeagent_launch() { # $1 = bounded seconds
+  local deadline=$((SECONDS + $1))
+  while ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
+      && (( SECONDS < deadline )); do
+    sleep 0.25
+  done
+  pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1
+}
+
+_launch_nativeagent_bundle() {
+  [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
+  /usr/bin/open "$APP_DEST" 2>&1 || true
+  if _wait_for_nativeagent_launch 10; then
+    return 0
+  fi
+
+  echo "[install_app.sh] no NativeAgentApp process 10s after the first bundle launch; retrying through LaunchServices"
+  [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
+  /usr/bin/open -n "$APP_DEST" 2>&1 || true
+  _wait_for_nativeagent_launch 20
+}
+
 echo
 echo "Installed $APP_DEST"
-launch_deadline=$((SECONDS + 10))
-while ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
-    && (( SECONDS < launch_deadline )); do
-  sleep 0.25
-done
-if ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1; then
-  echo "[install_app.sh] no NativeAgentApp process 10s after /usr/bin/open"
-  echo "[install_app.sh] (launchd-163 or stale LaunchServices unit — bundle IS in"
-  echo "[install_app.sh] place + valid); falling back to direct exec."
-  # Direct binary spawn — bypasses launchd's bundle-ID cache entirely.
-  ( "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 & ) || true
+INSTALL_LAUNCH_OK=0
+if _launch_nativeagent_bundle; then
+  INSTALL_LAUNCH_OK=1
+else
+  echo "[install_app.sh] LaunchServices could not start the replacement bundle; refusing a direct executable launch because it can lose macOS TCC attribution." >&2
 fi
 echo "Swift runtime install — verifying authenticated readiness and source identity..."
-if "$ROOT/script/verify_installed_runtime_ready.sh" \
+if [[ "$INSTALL_LAUNCH_OK" == "1" ]] \
+  && "$ROOT/script/verify_installed_runtime_ready.sh" \
     "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 45; then
   APP_PID="$(pgrep -fxn "$APP_DEST/Contents/MacOS/NativeAgentApp" || true)"
   echo "OK — NativeAgentApp ready (pid=$APP_PID)."
@@ -361,19 +386,11 @@ if [[ -d "$APP_OLD" ]]; then
   FAILED_APP="${APP_DEST}.failed.$(date +%Y%m%d-%H%M%S)"
   mv "$APP_DEST" "$FAILED_APP"
   mv "$APP_OLD" "$APP_DEST"
-  # Same stale-LaunchServices-unit hazard as the install launch above: this mv
-  # invalidates the unit too, and `open` can exit 0 having launched nothing.
-  # Prove a process appeared rather than trusting the exit status — a rollback
-  # that silently leaves User with no running app is the worst outcome here.
-  [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
-  /usr/bin/open "$APP_DEST" 2>/dev/null || true
-  restore_deadline=$((SECONDS + 10))
-  while ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
-      && (( SECONDS < restore_deadline )); do
-    sleep 0.25
-  done
-  if ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1; then
-    ( "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 & ) || true
+  # The restored bundle follows the same TCC-preserving LaunchServices path.
+  # If that cannot launch, report it honestly; do not revive the app with the
+  # same direct-exec path that caused the failed replacement's permission loss.
+  if ! _launch_nativeagent_bundle; then
+    echo "[install_app.sh] WARNING: restored the previous bundle, but LaunchServices could not start it." >&2
   fi
   echo "[install_app.sh] restored the previous bundle; failed replacement retained at:" >&2
   echo "  $FAILED_APP" >&2

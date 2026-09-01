@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NotificationInbox
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
@@ -184,15 +185,13 @@ extension SchedulerDueJobRunner {
             "read_at": .null,
             "schedulerJobId": .string(jobId),
         ])
-        // 2026-07-21 audit (MED): route through the shared capped append —
-        // notifications/inbox.jsonl is the LIVE inbox the UI and iOS read and
-        // grew with no rotation. Same 1000-line budget as the legacy
-        // items.jsonl cap; the trim runs under the same flock as the append.
-        try await appendJSONLCapped(
-            row, to: notificationInboxPath, using: persistence,
-            maxLines: JSONLLineCaps.notificationInbox,
-            logLabel: "SchedulerDueJobRunner.inbox"
-        )
+        // 2026-08-31: through the feed's owner, not a raw capped append. The
+        // shared cap trims by keeping a suffix, which HARD-DELETES the oldest
+        // cards once the file crosses its budget; `LiveNotificationInbox` shelves
+        // every row it evicts to `notifications/inbox_archive.jsonl` first and
+        // ages finished history out on its own schedule.
+        try await LiveNotificationInbox(path: notificationInboxPath)
+            .appendUnique(row, id: itemId)
         if notifyPhone {
             await InboxPushNotifier.notifyIfAttentionWorthy(
                 dataRoot: root,

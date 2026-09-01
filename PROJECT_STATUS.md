@@ -1,6 +1,6 @@
 # NativeAgent Project Status
 
-Last updated: 2026-08-30
+Last updated: 2026-09-01
 
 Navigation: [documentation and repository guide](docs/README.md),
 [capability snapshot](#capability-snapshot),
@@ -17,13 +17,63 @@ certify a new source build or publish an artifact.
 
 ## Summary
 
-Version 0.4.4 brings the post-0.4.3 computer-use, relevant recall, conversation
-continuity, delegation, evaluation, and reliability work together on one
-integrated source. The [public Releases page](https://github.com/embwl0x/native-agent/releases)
+Version 0.4.5 is the current release candidate. It keeps the 0.4.4 computer-use,
+recall, conversation, delegation, and reliability work while repairing the
+cross-surface regressions found in the post-release live audit. The
+[public Releases page](https://github.com/embwl0x/native-agent/releases)
 is authoritative for available installers; a version in this checkout is not
 publication proof. Published artifacts carry their exact-source test receipt
 and release attestation; this status document is not a release receipt.
 Source and live behavior remain authoritative over older release prose below.
+
+The 0.4.5 candidate keeps new iPhone chats bound to their own session, restores
+reply projection and Normal/Fast mode controls, serializes concurrent approval
+decisions, and keeps the compact live-status label on one line. Full Mac YOLO
+now bypasses NativeAgent approval prompts consistently for admitted actions on
+Mac, Telegram, iOS, Slack, bridge, lifecycle, and workflow paths without
+weakening external-input or macOS privacy boundaries. Tool discovery, strict
+schema placeholders, memory dispatch, and changed-eval ownership were aligned
+with the runtime catalog. A live Agent bridge audit exercised all 180 catalogued
+tools with temporary mutations cleaned up and no NativeAgent approval prompts;
+the developer installer was then hardened so a stale LaunchServices recovery
+cannot direct-execute the app and silently lose its existing Accessibility/TCC
+grant.
+
+Full Mac YOLO now has one effect-time authority contract across every surface.
+When the saved grant is active and unexpired and the concrete local or remote
+origin is admitted, no per-tool ask/confirm or pending approval row is created.
+This includes Mac input, external sends, connectors, MCP, workflows, Workshop,
+evolution/self-install, native actions, and background memory/REM paths. The
+same calls retain their normal approval behavior outside YOLO. Explicit user
+blocks, untrusted callers, corrupt or expired authority, secret egress,
+protected roots, unavailable integrations, and missing macOS permissions stay
+hard refusals; YOLO never turns those boundaries into approval prompts.
+
+The latest private deep-debug pass repaired six cross-owner defects and the
+eval gaps that hid them. Ordinary APNS chat-reply notifications now drain the
+signed iPhone reply lane and refresh the transcript backstop, rather than
+showing a banner while an open chat stays stale. Resident Desk pursuit no
+longer colors unrelated Mac, Telegram, Slack, iOS, or bridge conversation;
+explicit work queries can still select its adaptive Context projection. Chrome
+click/scroll effects now settle lost replies as outcome-unknown, typed extension
+refusals survive the relay, and visible Browser cancellation is armed before
+WebKit begins. Core loop replacement cannot overlap a cancelled retired body,
+Activity Watch teardown starts before the main-thread quit join, and watchdog
+uptime comes from the actual Core lifecycle. Dotted native aliases and custom
+registry shadowing now share one reserved-name contract. Eval overrides validate
+paths, line anchors, and suite selectors on every run, and route-only probes can
+no longer certify functional behavior without a schema-valid owner test. A live
+Telegram audit also found a Full Mac YOLO regression around `evolution_status`:
+the safe status read asked for approval, approved replay lost its lazy-tool
+activation, and the verified continuation collided with the still-active turn.
+Trusted Full Mac YOLO status now runs without that prompt; Telegram carries the
+status backend; replay grants only the exact approved tool for that detached
+dispatch; and verified continuations run serially before ordinary queued turns.
+The later end-to-end authority repair supersedes that narrow status-only fix:
+admitted YOLO no longer prompts for mutation/install either, while standard
+modes retain their gates. The earlier canonical gate passed the complete
+Core/app/extension/release graph plus 541 required iOS simulator tests with zero
+skips or failures.
 
 The post-0.4.3 integration audit is complete. It repaired a vision-region
 regression that fragmented connected controls, made Telegram `/retry` obey the
@@ -1065,6 +1115,9 @@ switch tables cannot drift. Workshop planning captures one root-exact tool
 dispatcher and reuses its existing policy-keyed schema cache instead of
 rebuilding the MemoryV2/KG/tool graph for every plan. The obsolete reduced
 background-loop manifest is gone; production has one assembly manifest.
+Mac capability summaries, loaded names, and discovery-only names also pass
+through the same four-verb model-visible boundary, so retired diagnostic
+organs such as `mac_look` and `mac_view` cannot be advertised to `tool_load`.
 
 The installed skill lifecycle now has one conversational contract and one
 storage owner. Every provider sees the compact `list_skills` manifest plus the
@@ -1101,7 +1154,10 @@ is no longer mislabeled as pinned merely because of provenance. The phone's
 close control sends a signed, receipt-checked `unpinChatSession` action back to
 the Mac and never deletes or archives the transcript. Starting a new iPhone
 chat replaces the phone-main slot, preserving a selected tab without inventing
-a second pin owner.
+a second pin owner. The phone now retains that fresh session identity as a
+durable provisional main until the Mac acknowledges the exact id through a
+signed event or session publication, so a lagging snapshot cannot erase the
+new chat or route its first message and reply into the previous iPhone chat.
 
 There is no live external interpreter backend, launchd-owned runtime, bundled interpreter, fallback path, or per-subsystem runtime-selection switchboard outside the Swift app. Shipped subsystems are unconditionally Swift-native; unsupported edges fail closed and real product gates remain with their canonical owners.
 

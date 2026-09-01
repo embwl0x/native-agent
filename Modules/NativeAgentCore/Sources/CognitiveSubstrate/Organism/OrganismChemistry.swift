@@ -237,7 +237,13 @@ public enum OrganismChemistry {
         if chemicalState.fatigue >= 0.24 {
             return "- Body: internal workload fatigue is high; keep the next move lightweight."
         }
-        if !bodySchema.providersHealthy || !bodySchema.toolHandsAvailable || chemicalState.vigilance >= 0.22 {
+        // Same unknown-is-not-failure rule the chemistry above applies: the
+        // compatibility Bool reads false for sparse/aged provider evidence, so
+        // reading it raw put "provider path feels brittle" into the prompt on
+        // evidence the body itself declined to treat as a failure.
+        if observedProviderHealth(bodySchema) == false
+            || !bodySchema.toolHandsAvailable
+            || chemicalState.vigilance >= 0.22 {
             return "- Body: provider or tool path feels brittle; be careful before claiming completion."
         }
         if !bodySchema.approvalChannelsOpen {

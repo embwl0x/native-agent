@@ -2,6 +2,7 @@ import Foundation
 import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
+import SlackConnector
 
 public struct ExternalSendApprovalRequest: Sendable, Equatable {
     public static let approvalAction = "connector.external_send"
@@ -109,6 +110,54 @@ struct ExternalSendPreparedInput: Sendable {
 }
 
 public enum ExternalSendApprovalLifecycle {
+    /// Executes an external send only after the caller has established the
+    /// canonical checked Full Mac YOLO authority. This preserves the exact
+    /// provider validation and idempotency lanes while deliberately creating
+    /// no ApprovalInbox row. Provider authentication and transport failures
+    /// remain ordinary hard failures; YOLO removes only the confirmation.
+    public static func executeAdmittedYoloToolResult(
+        invokedAs: String,
+        input: [String: JSONValue],
+        idempotencyKey suppliedIdempotencyKey: String? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> JSONValue {
+        do {
+            guard let actionID = ExternalSendApprovalRequest.canonicalActionID(for: invokedAs) else {
+                throw ExternalSendApprovalError.unsupportedAction(invokedAs)
+            }
+            let idempotencyKey = try resolvedIdempotencyKey(suppliedIdempotencyKey)
+            switch actionID {
+            case "slack.post_message":
+                let prepared = try prepareSlackInput(input)
+                return try await SlackConnectorActions.postMessage(
+                    input: prepared.input,
+                    idempotencyKey: idempotencyKey,
+                    dataRoot: dataRoot
+                )
+            case "agentmail.send":
+                let prepared = try AgentMailActions.prepareSendApprovalInput(input, dataRoot: dataRoot)
+                return await AgentMailActions.sendNow(
+                    input: prepared.input,
+                    approvalId: nil,
+                    idempotencyKey: idempotencyKey,
+                    dataRoot: dataRoot
+                )
+            default:
+                throw ExternalSendApprovalError.unsupportedAction(invokedAs)
+            }
+        } catch {
+            let errorCode = (error as? AgentMailError)?.message ?? "external_send_failed"
+            return .object([
+                "status": .string("failed"),
+                "actionId": .string(
+                    ExternalSendApprovalRequest.canonicalActionID(for: invokedAs) ?? invokedAs
+                ),
+                "error": .string(errorCode),
+                "detail": .string(error.localizedDescription),
+            ])
+        }
+    }
+
     public static func stage(
         invokedAs: String,
         input: [String: JSONValue],
@@ -138,16 +187,7 @@ public enum ExternalSendApprovalLifecycle {
             )
         }
 
-        let idempotencyKey: String
-        if let suppliedIdempotencyKey {
-            let trimmed = suppliedIdempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, trimmed.utf8.count <= 128 else {
-                throw ExternalSendApprovalError.invalidIdempotencyKey
-            }
-            idempotencyKey = trimmed
-        } else {
-            idempotencyKey = UUID().uuidString.lowercased()
-        }
+        let idempotencyKey = try resolvedIdempotencyKey(suppliedIdempotencyKey)
 
         let sessionID = nonEmpty(ChatToolSessionContext.verifiedSessionId)
         let chatID = nonEmpty(ChatToolSessionContext.verifiedChatId)
@@ -254,6 +294,15 @@ public enum ExternalSendApprovalLifecycle {
             destinationCount: 1,
             contentByteCount: text.utf8.count
         )
+    }
+
+    private static func resolvedIdempotencyKey(_ supplied: String?) throws -> String {
+        guard let supplied else { return UUID().uuidString.lowercased() }
+        let trimmed = supplied.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 128 else {
+            throw ExternalSendApprovalError.invalidIdempotencyKey
+        }
+        return trimmed
     }
 
     private static func string(_ value: JSONValue?) -> String? {

@@ -28,6 +28,17 @@ private func wave10DeskRoot(_ label: String) throws -> URL {
     return root
 }
 
+/// A stamp the live inbox's 30-day retention will always read as recent.
+/// `LiveNotificationInbox` prunes terminal rows by wall-clock age, so a
+/// hard-coded date in a seeded `archived`/`dismissed` fixture is a scheduled
+/// failure: fine until the calendar crosses the cutoff, then the next write
+/// shelves the row the assertions still expect to find.
+private func recentInboxStamp(daysAgo: Double = 3) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: Date().addingTimeInterval(-daysAgo * 24 * 60 * 60))
+}
+
 private func wave10InboxRows(_ inbox: LiveNotificationInbox) async throws -> [InboxItemRecord] {
     let decoder = JSONDecoder()
     return try await inbox.rows().map { row in
@@ -156,7 +167,7 @@ struct DeskReportsOnlyWave10EvalTests {
             ("system-archived", "heartbeat", "archived"),
         ] {
             try await inbox.appendUnique(.object([
-                "id": .string(id), "created_at": .string("2026-08-24T12:00:00Z"),
+                "id": .string(id), "created_at": .string(recentInboxStamp()),
                 "source": .string(source), "severity": .string("info"),
                 "title": .string(id), "summary": .string("stored card"),
                 "status": .string(status), "actions": .array([]),
@@ -178,7 +189,7 @@ struct DeskReportsOnlyWave10EvalTests {
         let path = NativeClient.visibleNotificationInboxPath(dataRoot: root)
         let inbox = LiveNotificationInbox(path: path)
         try await inbox.appendUnique(.object([
-            "id": .string("system-card"), "created_at": .string("2026-08-24T12:00:00Z"),
+            "id": .string("system-card"), "created_at": .string(recentInboxStamp()),
             "source": .string("heartbeat"), "severity": .string("info"),
             "title": .string("System card"), "summary": .string("must settle"),
             "status": .string("unread"), "actions": .array([]),
@@ -208,7 +219,7 @@ struct DeskReportsOnlyWave10EvalTests {
         let path = NativeClient.visibleNotificationInboxPath(dataRoot: root)
         let inbox = LiveNotificationInbox(path: path)
         try await inbox.appendUnique(.object([
-            "id": .string("proactive-unresolved"), "created_at": .string("2026-08-24T12:00:00Z"),
+            "id": .string("proactive-unresolved"), "created_at": .string(recentInboxStamp()),
             "source": .string("proactive_autonomy:unmapped"), "severity": .string("actionable"),
             "title": .string("Opportunity"), "summary": .string("Needs a real route."),
             "status": .string("unread"), "actions": .array([]),

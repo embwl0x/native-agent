@@ -1667,14 +1667,14 @@ public enum MacInjectionToolNames {
         "mac_scroll": "scroll",
         "mac_ax_act": "ax_act",
         // native-look item 3 — the closed-loop verb. In this vocabulary
-        // because it IS injection: one entry here gives it the Full-Mac-YOLO
-        // exclusion hook, the redaction sinks and the capability mint, with no
+        // because it IS injection: one entry here gives it the redaction sinks
+        // and the body-bound capability path, with no
         // act-shaped special case anywhere in the gate.
         "mac_act": "act",
         // W6 — mac_wake posts a HID nudge, so it belongs to the SAME
-        // vocabulary: one entry here is what gives it the approval floor, the
-        // Full-Mac-YOLO exclusion, the replay verification and the capability
-        // mint, with no wake-shaped special case anywhere in the gate.
+        // vocabulary: one entry here gives it replay verification, redaction,
+        // and the body-bound capability path, with no wake-shaped special case
+        // anywhere in the gate.
         "mac_wake": "wake",
         "mac.keystroke": "keystroke",
         "mac.click": "click",

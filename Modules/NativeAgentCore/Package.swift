@@ -135,6 +135,7 @@ let extraDeps: [String: [String]] = [
     "WorkflowOrchestration": [
         "PersistenceCore",
         "ApprovalInbox",
+        "TrustCenter",
         "MCPDispatcher",
         "MemoryV2",
         "Research",

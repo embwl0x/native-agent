@@ -425,6 +425,16 @@ extension SwiftToolDispatcher {
             if let desc { props.append(("description", .string(desc))) }
             return obj(props)
         }
+        /// An enum field that may also be null: `type` admits null AND `null`
+        /// is a member of `enum`, because a JSON Schema `enum` is exhaustive —
+        /// widening `type` alone would still reject null.
+        func nullableEnumStringSchema(_ values: [String], _ desc: String) -> JSONValue {
+            obj([
+                ("type", .array([.string("string"), .string("null")])),
+                ("enum", .array(values.map(JSONValue.string) + [.null])),
+                ("description", .string(desc)),
+            ])
+        }
         func intSchema(
             _ desc: String? = nil,
             minimum: Int? = nil,
@@ -1235,6 +1245,8 @@ extension SwiftToolDispatcher {
                     ("head", strSchema("PR head branch.")), ("base", strSchema("PR base branch.")), ("draft", boolSchema("Create PR as draft.")),
                     ("labels", .object(["type": .array([.string("string"), .string("array")])])),
                     ("assignees", .object(["type": .array([.string("string"), .string("array")])])),
+                    ("clear_labels", boolSchema("Explicitly clear every issue label. Empty labels alone preserve the current labels; do not combine this with nonempty labels.")),
+                    ("clear_assignees", boolSchema("Explicitly clear every issue assignee. Empty assignees alone preserve the current assignees; do not combine this with nonempty assignees.")),
                     ("reviewers", .object(["type": .array([.string("string"), .string("array")])])),
                     ("team_reviewers", .object(["type": .array([.string("string"), .string("array")])])),
                     ("event", strSchema("Review event: COMMENT, APPROVE, or REQUEST_CHANGES.")),
@@ -1907,7 +1919,7 @@ extension SwiftToolDispatcher {
                         // R13: first-class correction lineage.
                         ("corrects", strSchema("Optional id of an existing memory this new fact CORRECTS (e.g. from recall_memory). The old memory is marked lifecycle=corrected with a lineage link to this one and drops out of recall.")),
                         ("correction_reason", strSchema("Optional one-line reason the old memory was wrong (stored on the corrected row's lineage).")),
-                        ("context_topics", stringArraySchema("For kind=correction only: 1–8 explicit topic/project phrases, at most 120 characters each. Use only when the user's correction is limited to those topics. Omit for global instructions/boundaries; never invent a scope to weaken them. This limits automatic injection, not explicit recall.")),
+                        ("context_topics", stringArraySchema("For kind=correction only: 1–8 explicit topic/project phrases, at most 120 characters each. Use only when the user's correction is limited to those topics. Omit or send [] for ordinary memories and global instructions/boundaries; never invent a scope to weaken them. This limits automatic injection, not explicit recall.")),
                     ],
                     required: ["text"]
                 )
@@ -2057,11 +2069,17 @@ extension SwiftToolDispatcher {
                         ("status", strSchema("New status: watch | flag | now | next | todo | done | blocked | canceled.")),
                         ("blocked_reason", strSchema("Why it's blocked (when status=blocked).")),
                         ("waiting_on", strSchema("What/who it's waiting on (when status=blocked).")),
-                        ("assignee", strSchema("Optional assignee update for this existing item. Omitted or blank values preserve the current value; this field cannot clear an assignment.")),
-                        ("lane_of", strSchema("Optional live parent program handle (or visible alias) update for this existing lane. Omitted or blank values preserve the current value; this field cannot clear a lane link. Never use the item's own handle.")),
+                        ("assignee", obj([
+                            ("type", .array([.string("string"), .string("null")])),
+                            ("description", .string("Optional assignee update for this existing item. Omitted, null, or blank values preserve the current value; this field cannot clear an assignment.")),
+                        ])),
+                        ("lane_of", obj([
+                            ("type", .array([.string("string"), .string("null")])),
+                            ("description", .string("Optional live parent program handle (or visible alias) update for this existing lane. Omitted, null, or blank values preserve the current value; this field cannot clear a lane link. Send null when unchanged; never copy the item's own handle.")),
+                        ])),
                         ("progress", obj([
-                            ("type", .string("object")),
-                            ("description", .string("Optional explicit progress. Requires 0 <= done <= total and total > 0; omit when unknown.")),
+                            ("type", .array([.string("object"), .string("null")])),
+                            ("description", .string("Optional explicit progress. Requires 0 <= done <= total and total > 0; omit or send null when unknown.")),
                             ("properties", obj([
                                 ("done", intSchema("Completed units.")),
                                 ("total", intSchema("Total units; must be greater than zero.")),
@@ -2254,6 +2272,120 @@ extension SwiftToolDispatcher {
                     required: ["handle", "receipt"]
                 )
             ),
+            // Studio chat lane (desk 903). Same wiring canon as the desk tools:
+            // catalog-visible, LAZY-LOADED, no preload group. studio_consult
+            // files an envelope and NOTHING else — it never touches the journal
+            // and never carries a suggested verdict.
+            requestedSchema(
+                name: "studio_consult",
+                description: "File a consult against your developed taste: real work, a real question, no suggested answer. Give artifact_refs (file paths or URLs to the actual thing — images, a page, a build, a cut) and/or a description, say what portion is available, and ask the question. Add project_context, stage, constraints, and prior_discussion when they matter; leave them out when they don't. If you pass NO artifact_refs this is a description-only consult and description_only MUST be true — a concept or brief can be critiqued but can never enter the journal as an encounter. This writes ONE consult envelope: it does not add a journal entry, does not retrieve journal entries, and does not decide anything. Returns a stable consult_id to answer against (studio_consult_read) and, if it turns out to be worth keeping, to journal deliberately later.",
+                parametersJSON: params(
+                    properties: [
+                        ("artifact_refs", stringArraySchema("File paths or URLs to the actual work being asked about. Omit or leave empty ONLY for a description-only consult.")),
+                        ("description", strSchema("What the work is, in words. Required when there are no artifact_refs.")),
+                        ("portion_available", strSchema("What portion is actually available — the whole thing, one spread, a rough cut, a single screen.")),
+                        ("question", strSchema("The real question being asked. Required.")),
+                        ("project_context", strSchema("What the work is for and who it is for.")),
+                        ("stage", strSchema("Where the work is — sketch, draft, near-final, shipped.")),
+                        ("constraints", strSchema("Real constraints: budget, format, deadline, brand, technical limits.")),
+                        ("prior_discussion", strSchema("What has already been argued about this, if anything.")),
+                        ("description_only", boolSchema("True when no actual work is attached — a concept or brief only. MUST be true when artifact_refs is empty; such a consult can never become a journal encounter.")),
+                    ],
+                    required: ["question"]
+                )
+            ),
+            requestedSchema(
+                name: "studio_consult_read",
+                description: "Read one filed consult back, verbatim — the artifact refs, the question, the context, and whether it was description-only. Use this to pull the whole bundle in front of you before you answer. Read-only.",
+                parametersJSON: params(
+                    properties: [
+                        ("consult_id", strSchema("The exact consult_id returned by studio_consult.")),
+                    ],
+                    required: ["consult_id"]
+                )
+            ),
+            requestedSchema(
+                name: "studio_journal",
+                description: "Write ONE journal entry: one encounter, one honest judgment in your own words. `response` is the heart of it — everything else says what you met and how you met it. Entries are ADDITIVE: nothing here can edit or delete an earlier entry, and there is no tool that can. When your judgment changes, write a NEW entry and link it with relations (revises / contradicts / deepens / echoes) — the change is the point, so both stay. An encounter does not owe a verdict: stance.kind=abstained is fully valid and is the one case where `response` may be omitted (say why in stance.reason if you want to). origin.kind=consult requires origin.ref, and a consult that was description_only is REFUSED as an encounter — a description is not a work you met. There is no rating, score, confidence, or sentiment field, and passing one is an error rather than a silent drop. The server stamps id and recorded_at.",
+                parametersJSON: params(
+                    properties: [
+                        ("encountered_at", strSchema("When you actually encountered it (ISO-8601). Omit to use now — the server always stamps recorded_at separately.")),
+                        ("work", obj([
+                            ("type", .string("object")),
+                            ("description", .string("What you encountered. Only title is required; fill the rest only with what you actually know.")),
+                            ("properties", obj([
+                                ("title", strSchema("The work's title.")),
+                                ("creator", strSchema("Who made it.")),
+                                ("medium", strSchema("Painting, film, building, typeface, garment, game, photograph, interior …")),
+                                ("date", strSchema("When it was made.")),
+                                ("version", strSchema("Which version/cut/build, when that matters.")),
+                                ("edition", strSchema("Which edition/printing/pressing, when that matters.")),
+                            ])),
+                            ("required", .array([.string("title")])),
+                        ])),
+                        ("reception", obj([
+                            ("type", .string("object")),
+                            ("description", .string("How you received it — this is what makes the encounter honest.")),
+                            ("properties", obj([
+                                ("how", strSchema("Original, reproduction, screening, playthrough, excerpt — or whatever it actually was.")),
+                                ("whole_or_part", strSchema("The whole thing, or which part.")),
+                            ])),
+                        ])),
+                        ("artifact_refs", stringArraySchema("What you actually saw / heard / read / played — paths or URLs.")),
+                        ("origin", obj([
+                            ("type", .string("object")),
+                            ("description", .string("Where this encounter came from. ref is required when kind=consult.")),
+                            ("properties", obj([
+                                ("kind", enumStringSchema(["wandering", "consult", "project"], "wandering (you went looking), consult (it came in through studio_consult), project (it came out of work).")),
+                                ("ref", strSchema("The consult_id when kind=consult; otherwise whatever identifies the source.")),
+                            ])),
+                            ("required", .array([.string("kind")])),
+                        ])),
+                        ("response", strSchema("Your judgment, in your own words, at whatever length it takes. Required unless stance.kind=abstained.")),
+                        ("stance", obj([
+                            ("type", .string("object")),
+                            ("description", .string("Where the judgment stands. abstained is a real outcome, not a failure.")),
+                            ("properties", obj([
+                                ("kind", enumStringSchema(["open", "formed", "abstained"], "open (still working on it), formed (you know what you think), abstained (not enough to judge, or you chose not to).")),
+                                ("reason", strSchema("Optional — why you abstained, or what is still open.")),
+                            ])),
+                            ("required", .array([.string("kind")])),
+                        ])),
+                        ("relations", looseObjectArraySchema("Typed links to earlier entries. Each: {kind: deepens|contradicts|revises|echoes, entry_id}. This is the ONLY way to revise — the earlier entry is never rewritten.")),
+                        ("tags", stringArraySchema("Your own tags, if you want them. Nothing tags an entry for you.")),
+                    ],
+                    required: ["work", "origin", "stance"]
+                )
+            ),
+            requestedSchema(
+                name: "studio_recall",
+                description: "Search your own journal — your pull, when you decide it matters. Filter by work title, creator, medium, tag, relation, or free text across the entry (the response included); supplied filters combine with AND. Returns matching entries VERBATIM, newest first, capped by limit, with matched and has_more so you know what was left out. There is no relevance score and no ranking: the writing is the point. Read-only, and nothing calls this on your behalf.",
+                parametersJSON: params(
+                    properties: [
+                        ("query", nullableRecallField(strSchema("Free text matched across the whole entry, response text included. Omit, or send null, for no text filter."))),
+                        ("title", nullableRecallField(strSchema("Substring of the work's title. Omit or null for no title filter."))),
+                        ("creator", nullableRecallField(strSchema("Substring of the creator. Omit or null for no creator filter."))),
+                        ("medium", nullableRecallField(strSchema("Substring of the medium. Omit or null for no medium filter."))),
+                        ("tag", nullableRecallField(strSchema("Exact tag (case-insensitive). Omit or null for no tag filter."))),
+                        // NULLABLE ON PURPOSE, with the null inside `enum` too.
+                        // A strict provider schema sends every property on the
+                        // wire, and an enum of four relation kinds admits no
+                        // way to say "no relation filter" — not even "",
+                        // because an enum is exhaustive. The model must then
+                        // pick a kind, and an entry with no relations can never
+                        // be recalled (live 2026-08-31: every recall carried
+                        // relation_kind "echoes" and matched 0). Widening the
+                        // type alone would not do it; null must be a member.
+                        ("relation_kind", nullableEnumStringSchema(
+                            ["deepens", "contradicts", "revises", "echoes"],
+                            "Only entries carrying a relation of this kind. Every filter here is optional — send null (or omit this) unless you truly want to restrict to related entries; entries with no relations are only findable without it."
+                        )),
+                        ("related_to", nullableRecallField(strSchema("Only entries whose relations point at this entry_id. Omit or null for no relation filter."))),
+                        ("limit", nullableRecallField(intSchema("Entries to return: default 10, max 50. Omit or null for the default.", minimum: 1, maximum: 50))),
+                    ],
+                    required: []
+                )
+            ),
         ]
         if includeFullMacFileTools {
             schemas.append(contentsOf: [
@@ -2431,7 +2563,7 @@ extension SwiftToolDispatcher {
                 ),
                 requestedSchema(
                     name: "remote_node_execute",
-                    description: "Run one argv-shaped command on an explicitly enabled trusted remote node. The node is re-read at effect time, the executable must exactly match its allowlist, SSH host identity is pinned, output is bounded, and a durable receipt is written. This remains behind Trust Center Full Mac and the normal autonomy/approval gate.",
+                    description: "Run one argv-shaped command on an explicitly enabled trusted remote node. The node is re-read at effect time, the executable must exactly match its allowlist, SSH host identity is pinned, output is bounded, and a durable receipt is written. This remains behind Trust Center Full Mac; standard modes follow their normal autonomy gate, while admitted Full Mac YOLO runs without a per-call prompt.",
                     parametersJSON: params(
                         properties: [
                             ("node_id", strSchema("Required node id from remote_node_list.")),
@@ -2472,13 +2604,13 @@ extension SwiftToolDispatcher {
                     )
                 ),
                 // self-evolution chat tools (2026-06-11, U2b). Privileged: they
-                // mutate the EvolutionProposalStore and stage a self-install
-                // approval card. Live in the Full-Mac-GATED block on purpose
+                // mutate the EvolutionProposalStore and can stage a self-install
+                // approval card in standard modes. Live in the Full-Mac-GATED block on purpose
                 // (catalogued only when file_ops_allowed is on), all default
                 // autonomy `confirm`. Reachable on the claude/codex bridge as of
-                // the user's 2026-06-13 "open the bridges" call — but still safe: none
-                // spawns a Process, and self_install only STAGES a card a human
-                // still approves; it never installs.
+                // the user's 2026-06-13 "open the bridges" call. Admitted Full
+                // Mac YOLO uses the same candidate/CAS/backup/rollback executor
+                // without a per-call card; standard modes retain approval.
                 requestedSchema(
                     name: "evolution_propose",
                     description: "File a self-evolution proposal into the evolution store (data/evolution/proposals.json). Use when you have identified a concrete improvement to your own codebase. With a diff it lands as 'proposed' (eligible to build+test in an isolated worktree); without one it lands as 'needs_diff'. This NEVER edits the live repo; it only records a proposal for the build/approve pipeline. Requires Trust Center Full Mac file_ops_allowed; queues an approval unless toolAutonomy=auto for 'evolution_propose'.",
@@ -2504,7 +2636,7 @@ extension SwiftToolDispatcher {
                 ),
                 requestedSchema(
                     name: "self_install",
-                    description: "Stage the self-install approval card for a self-evolution proposal that has already built+tested GREEN (status candidate_green). This does NOT install anything; it only stages a self_evolution.apply card that the user must still approve, and the install itself only fires once Trust Center systemRebuild is enabled. Returns an honest 'not installable yet' envelope if the proposal is not candidate_green. Requires Trust Center Full Mac file_ops_allowed; queues an approval unless toolAutonomy=auto for 'self_install'.",
+                    description: "Advance a self-evolution proposal that has already built+tested GREEN (status candidate_green). Standard modes stage a self_evolution.apply approval card. Admitted Full Mac YOLO enters the same candidate/CAS/backup/rollback executor directly without a per-call prompt; installation still requires Trust Center systemRebuild to be enabled. Returns an honest 'not installable yet' envelope if the proposal is not candidate_green. Requires Trust Center Full Mac file_ops_allowed.",
                     parametersJSON: params(
                         properties: [
                             ("proposal_id", strSchema("Required. The evolution proposal id (evo_…) to stage for install. Must be status candidate_green.")),

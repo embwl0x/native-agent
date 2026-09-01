@@ -309,7 +309,14 @@ extension SwiftNativeChatOrchestrationClient {
         // turn.terminal carried 9.7 s for a 23-tool turn that ran 204 s
         // (2026-08-23 instrument lead).
         let turnStartNs = DispatchTime.now().uptimeNanoseconds
-        let wholeTurnBudget = WholeTurnWallClockBudget.start(surface: surface)
+        // Same caller-scoped override the structured loops thread through
+        // (StructuredChat 378/757 → ToolLoop 1924/2167). Without it the bridge
+        // profile's marathon budget (turnWallClockSeconds=3900) was dropped on
+        // this lane and Anthropic-model bridge turns died at chat's 600s.
+        var wholeTurnBudget = WholeTurnWallClockBudget.start(
+            surface: surface,
+            requestedSeconds: turnWallClockSecondsOverride
+        )
         let resolvedSession: String
         do {
             resolvedSession = try Self.resolveSessionId(sessionId)
@@ -1311,6 +1318,16 @@ extension SwiftNativeChatOrchestrationClient {
             // next provider call — the write is off the dispatch critical
             // path, not off the turn.
             await receiptWriter.value
+
+            // A6 progress extension (same rule as both structured loops): a
+            // round that landed at least one real tool result re-earns the
+            // surface window, capped at the unattended ceiling. `slot.isError`
+            // is the SAME classification the structured lane reads through
+            // ChatToolOutcome.outputLooksSuccessful — an all-errored round is
+            // the stuck case the budget exists to kill and extends nothing.
+            if slots.contains(where: { !$0.isError }) {
+                wholeTurnBudget.recordProgress()
+            }
 
             var stopForNoProgress = false
             let iterationRecords = Array(dispatches[iterationDispatchStart...])

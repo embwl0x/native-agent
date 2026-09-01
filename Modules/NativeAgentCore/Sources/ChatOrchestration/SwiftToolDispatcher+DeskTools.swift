@@ -56,6 +56,7 @@ extension SwiftToolDispatcher {
     /// malformed or impossible values fail before any Desk op is appended.
     private func deskProgress(_ input: [String: JSONValue]) throws -> DeskProgress? {
         guard let raw = input["progress"] else { return nil }
+        if case .null = raw { return nil }
         guard case .object(let object) = raw,
               case .int(let doneRaw)? = object["done"],
               case .int(let totalRaw)? = object["total"],
@@ -85,6 +86,7 @@ extension SwiftToolDispatcher {
     /// preserve the prior value, never clear it or invent a lane reference.
     private func deskMetadataString(_ input: [String: JSONValue], _ key: String) throws -> String? {
         guard let raw = input[key] else { return nil }
+        if case .null = raw { return nil }
         guard case .string(let value) = raw else {
             throw AutonomyGateError.toolDenied(reason: "desk_set_status: \(key) must be a string")
         }

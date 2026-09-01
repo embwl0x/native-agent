@@ -1,7 +1,7 @@
 // PATCH-2026-05-07: mac-control-ui-1 iOS Mac Tools — remote Mac Control from iPhone/iPad
 import SwiftUI
 
-enum MacSystemQuickAction: String, CaseIterable {
+enum MacSystemQuickAction: String, CaseIterable, Sendable {
     case lockScreen = "lock_screen"
     case sleepDisplay = "sleep_display"
 }
@@ -9,6 +9,7 @@ enum MacSystemQuickAction: String, CaseIterable {
 /// A system action may only claim completion after the matching Mac call has
 /// been issued successfully. Unknown strings are a failed completion and do
 /// not invoke the send closure.
+@MainActor
 enum MacSystemQuickActionExecution {
     struct Completion: Equatable {
         let state: RemoteActionState
@@ -23,7 +24,7 @@ enum MacSystemQuickActionExecution {
 
     static func execute(
         named action: String,
-        send: (MacSystemQuickAction) async throws -> Void
+        send: @MainActor @Sendable (MacSystemQuickAction) async throws -> Void
     ) async -> Completion {
         guard let quickAction = MacSystemQuickAction(rawValue: action) else {
             return unsupported(named: action)
@@ -33,7 +34,7 @@ enum MacSystemQuickActionExecution {
 
     static func execute(
         _ action: MacSystemQuickAction,
-        send: (MacSystemQuickAction) async throws -> Void
+        send: @MainActor @Sendable (MacSystemQuickAction) async throws -> Void
     ) async -> Completion {
         do {
             try await send(action)

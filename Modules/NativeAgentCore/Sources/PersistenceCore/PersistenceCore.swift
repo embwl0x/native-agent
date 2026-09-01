@@ -1175,17 +1175,34 @@ public enum JSONLLineCaps {
     /// display/idempotency feed, so they take the standard receipt budget.
     public static let deskArchive = 5000
 
-    /// `<dataRoot>/notifications/inbox.jsonl` — the LIVE inbox card feed the
-    /// Mac UI and the iOS snapshot read (distinct from the already-capped
-    /// legacy `inbox/items.jsonl` silo). 2026-07-21 audit (MED): every writer
-    /// appended with no rotation; same budget as the daemon's items.jsonl
-    /// surface cap. Status/read_at live per-line here (no index.json overlay),
-    /// so the trim needs no index-prune pairing.
-    public static let notificationInbox = 1000
+    /// `<dataRoot>/notifications/inbox.jsonl` — the LIVE inbox card feed the Mac
+    /// UI and the iOS snapshot read — deliberately has NO budget here.
+    ///
+    /// It had one (1000 lines, added by the 2026-07-21 audit) and three writers
+    /// passed it to `appendJSONLCapped`. That was a latent data-loss bug, not
+    /// retention: `enforceJSONLLineCap` keeps a `suffix(maxLines)`, so the first
+    /// append past 1,000 lines would have HARD-DELETED the oldest cards — an
+    /// unread one included — with nothing kept anywhere.
+    ///
+    /// Retention for this feed is owned by `LiveNotificationInbox` (2026-08-31):
+    /// a 500-row cap plus a 30-day cutoff on finished cards, and every evicted
+    /// row is moved to `notifications/inbox_archive.jsonl` before it leaves. All
+    /// three writers now append through that actor. The constant is gone rather
+    /// than merely unused so a future writer cannot reach the destructive route
+    /// by reaching for a symbol that looks like the feed's policy.
     /// `<dataRoot>/harness/benchmark/runs.jsonl` — bounded recent benchmark
     /// trend history. This is a receipt-class feed; older benchmark runs are
     /// not the source of truth for any live state.
     public static let harnessBenchmarkRuns = 5000
+
+    /// `<dataRoot>/studio/journal/journal.jsonl` — the agent's aesthetic
+    /// journal. DELIBERATELY 20x the receipt-class budget: this is a curated
+    /// life record, not telemetry. Entries are written a handful of times a
+    /// WEEK by hand, so 100k lines is centuries of a saturated cadence, and the
+    /// cap exists only as a runaway-writer backstop — never as retention. The
+    /// journal's own contract is additive-only, and nothing in the product may
+    /// rely on this trim to bound it.
+    public static let studioJournal = 100_000
 
     /// Byte threshold below which the turn-trace feed skips its line count
     /// entirely (see `enforceJSONLLineCap(trimWhenBytesExceed:)`). Sized so the
@@ -1465,6 +1482,11 @@ public func appendJSONLCapped(
     maxBytes: Int? = nil,
     trimToBytes: Int? = nil,
     capCheckStride: Int = JSONLLineCaps.capCheckStride,
+    // When the feed is a RECORD rather than telemetry, the append has to be on
+    // the platter before this call returns. `appendBytes` refuses a raw durable
+    // append to a path-owned feed, so the durable route has to run here, inside
+    // the permit — a caller cannot get both guarantees any other way.
+    durable: Bool = false,
     beforePotentialLineCap: (@Sendable () async throws -> Void)? = nil
 ) async throws {
     // F2 (2026-08-28): when the FILE owns its retention, the table wins over
@@ -1504,7 +1526,11 @@ public func appendJSONLCapped(
             }
         }
         try await JSONLPathOwnedAppendPermit.$isInsideCappedAppend.withValue(true) {
-            try await persistence.appendJSONL(event, to: path)
+            if durable {
+                try await persistence.appendJSONLDurable(event, to: path)
+            } else {
+                try await persistence.appendJSONL(event, to: path)
+            }
         }
         // F2 note above applies to WHICH cap; this decides WHEN it is counted.
         // On a stride append the byte trigger is dropped so the line budget is
@@ -1627,6 +1653,13 @@ public func jsonlPathOwnedCapPolicy(for path: URL) -> JSONLPathOwnedCapPolicy? {
        path.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "harness" {
         return JSONLPathOwnedCapPolicy(maxLines: JSONLLineCaps.harnessBenchmarkRuns)
     }
+    if file == "journal.jsonl",
+       parent == "journal",
+       path.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "studio" {
+        // No byte trigger: the line budget is the ONLY constraint, and the feed
+        // is small enough that evaluating it costs nothing.
+        return JSONLPathOwnedCapPolicy(maxLines: JSONLLineCaps.studioJournal)
+    }
     return nil
 }
 
@@ -1638,7 +1671,11 @@ public func appendPathOwnedJSONL(
     to path: URL,
     using persistence: any PersistenceCoreProtocol,
     logLabel: String,
-    takeLock: Bool = true
+    takeLock: Bool = true,
+    durable: Bool = false,
+    // Passthrough to `appendJSONLCapped`'s pre-trim hook, for the owners whose
+    // feed must not lose a row to a trim. It throws to STOP the append.
+    beforePotentialLineCap: (@Sendable () async throws -> Void)? = nil
 ) async throws {
     guard let policy = jsonlPathOwnedCapPolicy(for: path) else {
         throw JSONLPathOwnedAppendError.unregisteredPath(path.standardizedFileURL.path)
@@ -1650,7 +1687,9 @@ public func appendPathOwnedJSONL(
         maxLines: policy.maxLines,
         logLabel: logLabel,
         takeLock: takeLock,
-        trimWhenBytesExceed: policy.trimWhenBytesExceed
+        trimWhenBytesExceed: policy.trimWhenBytesExceed,
+        durable: durable,
+        beforePotentialLineCap: beforePotentialLineCap
     )
 }
 

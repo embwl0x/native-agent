@@ -211,6 +211,14 @@ extension SwiftToolDispatcher {
         // (NOT in alwaysOnCoreNames). No tool exposes reserveWorkSession — the
         // pump's reservation seam is internal API (H5 groundwork).
         "desk_open_pursuit", "desk_work_log",
+        // Studio chat lane (desk 903, phases 1–2). Catalog-visible and
+        // LAZY-LOADED (NOT in alwaysOnCoreNames, and deliberately in no preload
+        // group either): consulting the agent's taste and journaling an
+        // encounter are things she or a caller ASKS for, never something the
+        // runtime arranges in the background. studio_consult / studio_journal
+        // are ledger-class writes into <dataRoot>/studio/; studio_consult_read
+        // and studio_recall are pure local reads.
+        "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
     ]
 
     /// Swift-implemented builder/file tools exposed only when Trust Center's
@@ -286,10 +294,11 @@ extension SwiftToolDispatcher {
 
     /// INJECTION tools (W2/W3). Same `accessibility` gate category again, but
     /// the far end of it: these synthesize keyboard/mouse input and drive other
-    /// apps' UI. Their own list because all three of the following differ from
-    /// both lists above — they route to `impl_mac_injection_tool`, they carry an
-    /// approval floor that survives an active Full Mac YOLO window, and they are
-    /// blocked under `fileAccess=read_only`.
+    /// apps' UI. Their own list because they route to
+    /// `impl_mac_injection_tool`, require a body-bound injection capability,
+    /// and are blocked under `fileAccess=read_only`. Standard modes obtain the
+    /// capability through approved replay; admitted Full Mac YOLO obtains it
+    /// directly for the checked call without a per-call prompt.
     /// `mac_wake` (W6) is in this list rather than the read list even though
     /// most of what it RETURNS is a `mac_view` result: it posts a HID mouse
     /// move first, and the tier is decided by what a tool does, not by what it
@@ -471,6 +480,7 @@ extension SwiftToolDispatcher {
         "desk_set_notify", "desk_close", "desk_archive", "desk_blocked_on",
         "desk_defer", "desk_breakdown", "desk_nag_control", "desk_open_pursuit",
         "desk_work_log",
+        "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
     ]
 
 }

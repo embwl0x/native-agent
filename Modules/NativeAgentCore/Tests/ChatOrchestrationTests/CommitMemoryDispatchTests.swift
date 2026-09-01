@@ -13,10 +13,9 @@ import MemoryV2
 // empty-text rejection (which fires BEFORE the .shared store, so it's
 // hermetic), and the SecurityCenter risk profile.
 //
-// The store round-trip + kind threading + dedup-for-free are asserted
-// hermetically in MemoryV2Tests/CommitMemoryStoreTests.swift (the impl routes
-// to the process-wide SwiftNativeMemoryV2.shared, which cannot be redirected
-// to a tmp root from inside one test without racing the global `let`).
+// Store round-trips use an injected, temporary MemoryV2 owner so public
+// dispatcher behavior can be proven without touching the installed app's
+// memory root.
 
 @Suite("CommitMemoryDispatch")
 struct CommitMemoryDispatchTests {
@@ -94,7 +93,7 @@ struct CommitMemoryDispatchTests {
 
     @Test func malformedTopicScopeIsRejectedBeforeMemoryWrite() async throws {
         let dispatcher = hermeticDispatcher()
-        for value in [JSONValue.array([]), .array([.int(1)]), .array([.string(" ")]), .string("project")] {
+        for value in [JSONValue.array([.int(1)]), .array([.string(" ")]), .string("project")] {
             await #expect(throws: (any Error).self) {
                 _ = try await dispatcher.impl_commit_memory(input: [
                     "text": .string("The greenhouse schedule is dusk."), "kind": .string("correction"),
@@ -102,6 +101,43 @@ struct CommitMemoryDispatchTests {
                 ])
             }
         }
+    }
+
+    @Test(arguments: ["chat", "telegram", "slack", "ios", "bridge", "background"])
+    func strictSchemaPlaceholderPersistsAcrossSharedDispatcherSurfaces(surface: String) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("commit-empty-topics-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = try MemoryStorage(dataRoot: root)
+        let memory = SwiftNativeMemoryV2(
+            embedder: MockEmbeddingProvider(),
+            storage: MemoryStorageBridge(storage: storage)
+        )
+        let dispatcher = SwiftToolDispatcher(
+            dataRoot: root, memoryV2: memory, allowProcessGlobalTools: false
+        )
+
+        let result = try await dispatcher.dispatch(tool: "commit_memory", input: [
+            "text": .string("Strict-schema memory from the \(surface) surface."),
+            "kind": .string("preference"),
+            "tags": .array([]),
+            "confidence": .double(0.98),
+            "importance": .double(0.82),
+            "context_topics": .array([]),
+            "corrects": .string(""),
+            "correction_reason": .string(""),
+        ], surface: surface)
+        guard case .object(let payload) = result,
+              case .string(let id)? = payload["id"],
+              let stored = try await storage.memory(id: id),
+              case .object(let metadata) = stored.metadata else {
+            Issue.record("ordinary memory was not saved through the strict-schema shape")
+            return
+        }
+        #expect(payload["status"] == .string("ok"))
+        #expect(metadata["kind"] == .string("preference"))
+        #expect(metadata["context_topics"] == nil)
+        #expect(metadata["corrected_by"] == nil)
     }
 
     @Test(arguments: [false, true])

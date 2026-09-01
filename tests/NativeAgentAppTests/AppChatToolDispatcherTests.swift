@@ -81,6 +81,10 @@ private struct LegacyMacCatalogStub: ToolDispatchClient {
             "turn_active_tools": .array([.string("mac_quit_app"), .string("go")]),
             "mac_app_available_tools": .array([.string("mac_focus_app"), .string("mac_quit_app")]),
             "mac_app_policy_locked_tools": .array([.string("mac_focus_app")]),
+            "mac_accessibility_read_available_tools": .array([.string("mac_look"), .string("mac_view"), .string("screen")]),
+            "mac_accessibility_read_policy_locked_tools": .array([.string("mac_ax_find"), .string("wait")]),
+            "mac_accessibility_act_available_tools": .array([.string("mac_act"), .string("act")]),
+            "mac_accessibility_act_policy_locked_tools": .array([.string("mac_click"), .string("go")]),
             "available_tools": .array([.string("mac_focus_app"), .string("act"), .string("tool_catalog")]),
             "tools": .array([]),
         ])
@@ -146,6 +150,59 @@ private actor ContextPrewarmCapture {
 
     func record(_ kind: ContextPrewarmHintKind, id: String, terms: [String]) {
         hints.append((kind, id, terms))
+    }
+}
+
+@Test
+func everyRegisteredAppToolReachesItsAppOwnedDispatchBoundary() async throws {
+    let dispatcher = AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(),
+        enforceAutonomySecurity: false,
+        mobileNotificationSender: { _, _, _ in
+            MobileNotificationDeliveryReceipt(
+                bridgeMessageID: "app-tool-gauntlet",
+                bridgeError: nil,
+                apnsReceipts: [],
+                apnsErrors: []
+            )
+        },
+        macNotificationSender: { _, _ in
+            NativeAgentNotificationPostResult(
+                identifier: "app-tool-gauntlet",
+                status: "completed",
+                delivery: "test",
+                posted: true,
+                visibleAlertsEnabled: true,
+                authorizationStatus: "authorized",
+                alertSetting: "enabled",
+                soundSetting: "enabled",
+                badgeSetting: "enabled",
+                error: nil
+            )
+        },
+        browserActionRunner: { actionID, dryRun, _ in
+            .object([
+                "status": .string("ok"),
+                "actionId": .string(actionID),
+                "dryRun": .bool(dryRun),
+            ])
+        },
+        doctorStatusProvider: { .object(["status": .string("ok")]) },
+        telegramStatusProvider: { .object(["status": .string("ok")]) },
+        organismPostureProvider: { nil }
+    )
+
+    let names = AppChatToolDispatcher.catalogRegisteredToolNames
+    #expect(names.count >= 20)
+    for name in names.sorted() {
+        do {
+            let result = try await dispatcher.dispatch(tool: name, input: [:], surface: "chat")
+            guard case .object(let object) = result else { continue }
+            #expect(object["delegated"] != .bool(true), "\(name) fell through to the Core dispatcher")
+        } catch {
+            let rendered = String(describing: error).lowercased()
+            #expect(!rendered.contains("unknown tool"), "\(name) is registered but not dispatched: \(error)")
+        }
     }
 }
 
@@ -363,8 +420,16 @@ func appChatToolCatalog_doesNotReadvertiseRetiredMacImplementationTools() async 
     #expect(!available.contains("mac_quit_app"))
     let turnActive = Set(jsonStringArray(result, key: "turn_active_tools"))
     #expect(turnActive.isEmpty)
+    #expect(Set(jsonStringArray(result, key: "currently_loaded")) == ["act"])
+    let discoveryOnly = Set(jsonStringArray(result, key: "discovery_only_tools"))
+    #expect(!discoveryOnly.contains("mac_look"))
+    #expect(!discoveryOnly.contains("mac_view"))
     #expect(jsonStringArray(result, key: "mac_app_available_tools").isEmpty)
     #expect(jsonStringArray(result, key: "mac_app_policy_locked_tools").isEmpty)
+    #expect(jsonStringArray(result, key: "mac_accessibility_read_available_tools") == ["screen"])
+    #expect(jsonStringArray(result, key: "mac_accessibility_read_policy_locked_tools") == ["wait"])
+    #expect(jsonStringArray(result, key: "mac_accessibility_act_available_tools") == ["act"])
+    #expect(jsonStringArray(result, key: "mac_accessibility_act_policy_locked_tools") == ["go"])
     guard case .object(let object) = result,
           case .object(let groups)? = object["tool_groups"] else {
         Issue.record("expected compact tool group index")
@@ -1152,10 +1217,18 @@ func mobileNotificationReceiptNeverClaimsLockScreenDisplayFromAPNSAcceptance() {
 /// Records every tool name it is asked to dispatch, so a test can prove the
 /// app shim intercepts notify BEFORE delegating to core.
 private actor RecordingInnerToolDispatcher: ToolDispatchClient {
+    struct Call: Sendable {
+        let tool: String
+        let input: [String: JSONValue]
+        let surface: String
+    }
+
     private(set) var dispatchedTools: [String] = []
+    private(set) var calls: [Call] = []
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         dispatchedTools.append(tool)
+        calls.append(Call(tool: tool, input: input, surface: surface))
         return .object([
             "tool": .string(tool),
             "surface": .string(surface),
@@ -1165,6 +1238,47 @@ private actor RecordingInnerToolDispatcher: ToolDispatchClient {
 
     func listAvailableTools() async throws -> [String] { [] }
     func listAvailableToolSchemas() async throws -> [LLMToolSchema] { [] }
+}
+
+/// The app shell must not reinterpret provider-materialized optional fields.
+/// Mac, Telegram, Slack, and iOS all reach the same core memory dispatcher;
+/// this pins the wrapper seam that sits between every surface and that owner.
+@Test
+func appChatToolDispatcher_preservesStrictCommitMemoryPayloadAcrossSurfaces() async throws {
+    let inner = RecordingInnerToolDispatcher()
+    let dispatcher = AppChatToolDispatcher(
+        inner: inner,
+        enforceAutonomySecurity: false,
+        organismPostureProvider: { nil },
+        contextPrewarm: { _, _, _ in }
+    )
+    let strictPayload: [String: JSONValue] = [
+        "text": .string("User prefers a warm conversational tone."),
+        "kind": .string("preference"),
+        "tags": .array([]),
+        "confidence": .double(0.8),
+        "importance": .double(0.5),
+        "corrects": .string(""),
+        "correction_reason": .string(""),
+        "context_topics": .array([]),
+    ]
+    let surfaces = ["chat", "telegram", "slack", "ios"]
+
+    for surface in surfaces {
+        _ = try await dispatcher.dispatch(
+            tool: "commit_memory",
+            input: strictPayload,
+            surface: surface
+        )
+    }
+
+    let calls = await inner.calls
+    #expect(calls.count == surfaces.count)
+    #expect(calls.map(\.tool) == Array(repeating: "commit_memory", count: surfaces.count))
+    #expect(calls.map(\.surface) == surfaces)
+    for call in calls {
+        #expect(call.input == strictPayload)
+    }
 }
 
 /// B5 (tightness-sweep 2026-07-17): the app shim is the SINGLE owner of
@@ -1332,6 +1446,67 @@ func appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias() 
     #expect(calls.count == 1)
     #expect(calls.first?.actionId == "browser.status")
     #expect(calls.first?.dryRun == false)
+}
+
+@Test
+func everyRegisteredBrowserToolMapsValidInputToTheAppRunner() async throws {
+    let capture = BrowserToolCapture()
+    let dispatcher = AppChatToolDispatcher(
+        inner: StubInnerToolDispatcher(),
+        enforceAutonomySecurity: false,
+        browserActionRunner: { actionId, dryRun, input in
+            await capture.record(actionId: actionId, dryRun: dryRun, input: input)
+            return .object([
+                "status": .string("fixture"),
+                "runner_action": .string(actionId),
+            ])
+        },
+        organismPostureProvider: { nil }
+    )
+    let stable: [String: JSONValue] = [
+        "lease_id": .string("lease-fixture"),
+        "expected_user_sequence": .int(0),
+        "snapshot_id": .string("snapshot-fixture"),
+        "node_id": .string("node-fixture"),
+    ]
+    let cases: [(String, [String: JSONValue])] = [
+        ("browser.status", [:]),
+        ("browser.open_url", ["url": .string("https://example.com/"), "dry_run": .bool(true)]),
+        ("browser.navigate", ["url": .string("https://example.com/next"), "dry_run": .bool(true)]),
+        ("browser.read_text", ["dry_run": .bool(true)]),
+        ("browser.read_links", ["dry_run": .bool(true)]),
+        ("browser.screenshot", ["dry_run": .bool(true)]),
+        ("browser.chrome_acquire", ["mode": .string("create"), "initial_url": .string("https://example.com/")]),
+        ("browser.chrome_navigate", stable.merging(["url": .string("https://example.com/next")]) { _, new in new }),
+        ("browser.chrome_snapshot", ["lease_id": .string("lease-fixture"), "max_nodes": .int(20)]),
+        ("browser.chrome_click", stable),
+        ("browser.chrome_fill", stable.merging(["value": .string("replacement")]) { _, new in new }),
+        ("browser.chrome_type", stable.merging(["text": .string(" appended"), "delay_ms": .int(0)]) { _, new in new }),
+        ("browser.chrome_select", stable.merging(["values": .array([.string("pro")])]) { _, new in new }),
+        ("browser.chrome_keypress", stable.merging(["key": .string("Enter")]) { _, new in new }),
+        ("browser.chrome_set_checked", stable.merging(["checked": .bool(true)]) { _, new in new }),
+        ("browser.chrome_double_click", stable),
+        ("browser.chrome_wait", stable.merging([
+            "condition": .string("element_state"),
+            "state": .string("visible"),
+            "timeout_ms": .int(100),
+        ]) { _, new in new }),
+        ("browser.chrome_scroll", stable.merging(["delta_x": .int(0), "delta_y": .int(240)]) { _, new in new }),
+        ("browser.chrome_release", ["lease_id": .string("lease-fixture"), "close_created_tab": .bool(false)]),
+    ]
+
+    #expect(Set(cases.map(\.0)) == Set(
+        AppChatToolDispatcher.catalogRegisteredToolNames.filter { $0.hasPrefix("browser.") }
+    ))
+    for (tool, input) in cases {
+        let result = try await dispatcher.dispatch(tool: tool, input: input, surface: "chat")
+        #expect(jsonString(result, key: "tool") == tool)
+        #expect(jsonString(result, key: "runner_action") == tool)
+        #expect(jsonString(result, key: "surface") == "chat")
+    }
+    let calls = await capture.calls
+    #expect(calls.map(\.actionId) == cases.map(\.0))
+    #expect(calls.map(\.input) == cases.map(\.1))
 }
 
 @Test

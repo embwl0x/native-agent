@@ -233,7 +233,12 @@ extension NativeClient {
                 && MCPToolBridge.consent($0, matchesCurrentEffectiveRisk: effectiveRisk)
         }
         if !hasConsent {
-            if MCPToolBridge.riskRequiresApproval(effectiveRisk) {
+            let yoloAdmitted = await Self.fullMacYoloAdmitted(
+                tool: "mcp__\(serverId)__\(toolName)",
+                surface: "mcp_ui",
+                dataRoot: dataRoot
+            )
+            if MCPToolBridge.riskRequiresApproval(effectiveRisk), !yoloAdmitted {
                 return MCPCallResult(
                     id: callID,
                     serverId: serverId,
@@ -245,12 +250,14 @@ extension NativeClient {
                     evidenceStatus: "not_required"
                 )
             }
-            _ = try await dispatcher.grantConsent(MCPConsentGrant(
-                serverId: serverId,
-                toolName: toolName,
-                risk: effectiveRisk,
-                argumentSummary: "Auto-granted low-risk local Swift MCP call."
-            ))
+            if !MCPToolBridge.riskRequiresApproval(effectiveRisk) {
+                _ = try await dispatcher.grantConsent(MCPConsentGrant(
+                    serverId: serverId,
+                    toolName: toolName,
+                    risk: effectiveRisk,
+                    argumentSummary: "Auto-granted low-risk local Swift MCP call."
+                ))
+            }
         }
 
         let args = try Self.jsonValueBody(input)

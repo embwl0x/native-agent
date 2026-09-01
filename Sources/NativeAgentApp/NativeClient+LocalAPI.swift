@@ -612,7 +612,11 @@ extension NativeClient {
         }
         do {
             if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
-               recovery.pendingCount > 0 {
+               recovery.hasQuarantinedEvidence {
+                row["runtimeStatus"] = .string("recovery_quarantined")
+                row["runtimeDetail"] = .string("A damaged Slack delivery journal was moved aside (.stale-<ts>) and a fresh one started; intake is running again. Accepted-but-undelivered replies may only exist in that file — ask Agent to inspect it before any manual retry.")
+            } else if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
+                      recovery.pendingCount > 0 {
                 if recovery.isAtCapacity {
                     row["runtimeStatus"] = .string("intake_paused")
                     row["runtimeDetail"] = .string("\(recovery.pendingCount) pending replies; new message intake is paused. \(recovery.unknownCount) need recovery. Ask Agent to inspect Slack delivery recovery before any manual retry; nothing is automatically discarded or resent.")

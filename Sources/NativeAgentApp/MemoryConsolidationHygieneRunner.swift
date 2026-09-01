@@ -40,6 +40,7 @@ import KnowledgeGraph
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
+import TrustCenter
 
 // MARK: - Shared hygiene implementation
 
@@ -240,7 +241,7 @@ enum MemoryConsolidationHygiene {
         }
     }
 
-    private static func write(_ report: MemoryHygieneReport, dataRoot: URL) throws {
+    static func write(_ report: MemoryHygieneReport, dataRoot: URL) throws {
         let path = lastRunPath(dataRoot: dataRoot)
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -300,6 +301,43 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
     }
 
     func tickOutcome() async -> LoopTickOutcome {
+        let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+            .fullMacYoloAuthority(
+                tool: Self.approvalAction,
+                origin: SecurityOriginContext(
+                    surface: "desk",
+                    source: "memory_consolidation_background",
+                    isRemote: false
+                )
+            )
+        if yolo.admitted || yolo.state == .explicitlyBlocked {
+            // Candidate construction and the canonical swap share a locked,
+            // approval-backed protocol. This background tick cannot safely
+            // auto-swap without changing that authority contract, so record a
+            // non-prompt deferred/refused result and leave live memory intact.
+            let now = Date()
+            let report = MemoryHygieneReport(
+                id: "hygiene-\(UUID().uuidString.lowercased())",
+                status: yolo.admitted ? "deferred" : "refused",
+                reason: yolo.admitted
+                    ? "Active Full Mac authority suppresses approval prompts; background consolidation was deferred without changing live memory."
+                    : "Memory consolidation is explicitly blocked; no approval was staged.",
+                version: "swift-memory-v2-consolidator",
+                createdAt: ISO8601DateFormatter().string(from: now),
+                beforeCount: nil,
+                afterCount: nil,
+                normalized: nil,
+                archivedDuplicates: nil,
+                archivedReflections: nil,
+                distilledFactsAdded: nil,
+                decayedMemories: nil,
+                proposalHygiene: nil,
+                consolidationRunId: nil,
+                nextScheduled: nil
+            )
+            try? MemoryConsolidationHygiene.write(report, dataRoot: dataRoot)
+            return .skipped(reason: report.reason ?? "memory hygiene deferred")
+        }
         guard let approvalID = await Self.stageHygieneApprovalIfNeeded(dataRoot: dataRoot) else {
             return .failed(error: "memory hygiene approval scan or staging failed")
         }

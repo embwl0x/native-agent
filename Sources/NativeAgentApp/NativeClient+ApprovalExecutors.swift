@@ -480,6 +480,14 @@ extension NativeClient {
         ConversationSurfaceProfile(surface).isRemote
     }
 
+    private static func evolutionBridgeEnabledForApprovalReplay(surface: String) -> Bool {
+        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized == NativeAgentAppChatSurfaceProfile.telegram.rawValue {
+            return NativeAgentAppChatSurfaceProfile.telegram.includesEvolutionBridge
+        }
+        return !isRemoteChatApprovalSurface(surface)
+    }
+
     static func reconcileUnappliedChatToolApprovalExecutions(
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async {
@@ -751,7 +759,9 @@ extension NativeClient {
 
         do {
             let tools = makeNativeAgentAppToolDispatchClient(
-                includeEvolutionBridge: !isRemoteChatApprovalSurface(replay.surface),
+                includeEvolutionBridge: evolutionBridgeEnabledForApprovalReplay(
+                    surface: replay.surface
+                ),
                 denyExternalMcp: false,
                 enforceAppAutonomy: false,
                 dataRoot: dataRoot
@@ -778,16 +788,22 @@ extension NativeClient {
                     verifiedUserID: replay.verifiedUserId
                 )
             )
-            let result = try await ChatToolSessionContext.$commandSignatureVerified.withValue(true) {
-                try await ChatToolSessionContext.$verifiedChatId.withValue(replay.telegramChatId) {
-                    try await ChatToolSessionContext.$verifiedUserId.withValue(replay.verifiedUserId) {
-                        try await ChatToolSessionContext.$replyRoute.withValue(replay.replyRoute) {
-                            try await ChatToolSessionContext.$verifiedSessionId.withValue(replay.sessionId) {
-                                try await gated.dispatch(
-                                    tool: replay.toolName,
-                                    input: replay.input,
-                                    surface: replay.surface
-                                )
+            // Approval replay is a fresh detached dispatch, not the original
+            // provider turn. Rehydrate only the approved lazy tool for this
+            // dispatch so the lazy gate cannot answer `not_loaded`, while no
+            // sibling tool receives an accidental capability grant.
+            let result = try await LLMCallContext.$turnActiveTools.withValue([replay.toolName]) {
+                try await ChatToolSessionContext.$commandSignatureVerified.withValue(true) {
+                    try await ChatToolSessionContext.$verifiedChatId.withValue(replay.telegramChatId) {
+                        try await ChatToolSessionContext.$verifiedUserId.withValue(replay.verifiedUserId) {
+                            try await ChatToolSessionContext.$replyRoute.withValue(replay.replyRoute) {
+                                try await ChatToolSessionContext.$verifiedSessionId.withValue(replay.sessionId) {
+                                    try await gated.dispatch(
+                                        tool: replay.toolName,
+                                        input: replay.input,
+                                        surface: replay.surface
+                                    )
+                                }
                             }
                         }
                     }

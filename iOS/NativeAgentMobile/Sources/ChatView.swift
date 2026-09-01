@@ -936,54 +936,21 @@ struct ChatView: View {
                     controlPill(icon: "brain", title: reasoningLabel(selectedReasoningEffort))
                 }
 
-                if selectedModelSupportsFast {
-                    Toggle(isOn: Binding(
-                        get: { selectedFastMode },
-                        set: { enabled in
-                            let previousModel = selectedModel
-                            let previousEffort = selectedReasoningEffort
-                            let previous = selectedFastMode
-                            let previousProvider = selectedProviderId
-                            selectedFastMode = enabled
-                            let requestedModel = selectedModel
-                            let requestedEffort = selectedReasoningEffort
-                            let requestedProvider = selectedProviderId
-                            let myGeneration = beginSurfaceSelectionUpdate()
-                            Task {
-                                do {
-                                    let receipt = try await sync.configureSurfaceSelection(
-                                        surface: "ios",
-                                        providerId: requestedProvider,
-                                        model: requestedModel,
-                                        reasoningEffort: requestedEffort,
-                                        serviceTier: enabled ? "priority" : "default"
-                                    )
-                                    adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
-                                } catch {
-                                    finishSurfaceSelectionFailure(requestGeneration: myGeneration)
-                                    if let restored = ChatRuntimeControlPresentation.rollback(
-                                        currentGeneration: surfaceSelectionGeneration,
-                                        requestGeneration: myGeneration,
-                                        previous: .init(providerID: previousProvider, model: previousModel, reasoningEffort: previousEffort, fastMode: previous)
-                                    ) {
-                                        selectedModel = restored.model
-                                        selectedReasoningEffort = restored.reasoningEffort
-                                        selectedFastMode = restored.fastMode
-                                        selectedProviderId = restored.providerID
-                                    }
-                                    iOSSystemToastCenter.shared.push(
-                                        error: "Couldn't change Fast mode: \(error.localizedDescription)"
-                                    )
-                                }
-                            }
-                        }
-                    )) {
-                        Label("Fast", systemImage: "bolt.fill")
-                            .font(AppFont.tag)
+                Menu {
+                    Button { setFastMode(false) } label: {
+                        Label("Normal", systemImage: selectedFastMode ? "circle" : "checkmark")
                     }
-                    .toggleStyle(.button)
-                    .accessibilityLabel("Fast mode")
+                    Button { setFastMode(true) } label: {
+                        Label("Fast", systemImage: selectedFastMode ? "checkmark" : "bolt.fill")
+                    }
+                    .disabled(!selectedModelSupportsFast)
+                } label: {
+                    controlPill(
+                        icon: selectedFastMode ? "bolt.fill" : "gauge.with.dots.needle.33percent",
+                        title: ChatRuntimeControlPresentation.processingModeTitle(fastMode: selectedFastMode)
+                    )
                 }
+                .accessibilityLabel("Processing mode: \(selectedFastMode ? "Fast" : "Normal")")
 
                 Menu {
                     ForEach(fileAccessOptions, id: \.id) { option in
@@ -1109,6 +1076,55 @@ struct ChatView: View {
                 finishSurfaceSelectionFailure(requestGeneration: myGeneration)
                 iOSSystemToastCenter.shared.push(
                     error: "Couldn't switch provider: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func setFastMode(_ enabled: Bool) {
+        guard enabled != selectedFastMode else { return }
+        guard !enabled || selectedModelSupportsFast else {
+            iOSSystemToastCenter.shared.push(error: "Fast mode is not available for \(modelLabel(selectedModel)).")
+            return
+        }
+        let previous = ChatRuntimeControlPresentation.Selection(
+            providerID: selectedProviderId,
+            model: selectedModel,
+            reasoningEffort: selectedReasoningEffort,
+            fastMode: selectedFastMode
+        )
+        selectedFastMode = enabled
+        let requested = ChatRuntimeControlPresentation.Selection(
+            providerID: selectedProviderId,
+            model: selectedModel,
+            reasoningEffort: selectedReasoningEffort,
+            fastMode: enabled
+        )
+        let myGeneration = beginSurfaceSelectionUpdate()
+        Task {
+            do {
+                let receipt = try await sync.configureSurfaceSelection(
+                    surface: "ios",
+                    providerId: requested.providerID,
+                    model: requested.model,
+                    reasoningEffort: requested.reasoningEffort,
+                    serviceTier: requested.fastMode ? "priority" : "default"
+                )
+                adoptCanonicalSurfaceSelection(receipt, requestGeneration: myGeneration)
+            } catch {
+                finishSurfaceSelectionFailure(requestGeneration: myGeneration)
+                if let restored = ChatRuntimeControlPresentation.rollback(
+                    currentGeneration: surfaceSelectionGeneration,
+                    requestGeneration: myGeneration,
+                    previous: previous
+                ) {
+                    selectedProviderId = restored.providerID
+                    selectedModel = restored.model
+                    selectedReasoningEffort = restored.reasoningEffort
+                    selectedFastMode = restored.fastMode
+                }
+                iOSSystemToastCenter.shared.push(
+                    error: "Couldn't change processing mode: \(error.localizedDescription)"
                 )
             }
         }
@@ -1302,6 +1318,7 @@ struct ChatView: View {
     }
 
     private func reconcilePublishedChatSessions() {
+        store.acknowledgePublishedSessions(Set(sync.sessions.map(\.id)))
         adoptMainSessionFromSnapshots()
         reconcileExternallyRemovedPinnedSession(
             afterPinnedIDs: Set(sync.pinnedChatSessions.map(\.id))
@@ -1318,7 +1335,8 @@ struct ChatView: View {
         guard ChatStore.shouldReturnToMainSession(
             selectedSessionID: store.selectedSessionID,
             mainSessionID: effectiveMainSessionID,
-            availablePinnedSessionIDs: afterPinnedIDs
+            availablePinnedSessionIDs: afterPinnedIDs,
+            locallyCreatedSessionID: store.locallyCreatedSessionID
         ) else { return }
         store.switchToMainSession(
             using: bridgeClient,
@@ -1676,6 +1694,10 @@ private struct MobileChatIssueBanner: View {
 /// sent to the signed Mac route.
 enum ChatRuntimeControlPresentation {
     static let fileAccessIDs = ICloudChatFileAccessPolicy.acceptedIDs
+
+    static func processingModeTitle(fastMode: Bool) -> String {
+        fastMode ? "Fast" : "Normal"
+    }
 
     /// Runs the model-menu refresh and surfaces every unsuccessful outcome to
     /// the person who explicitly asked for it. Background refresh callers can

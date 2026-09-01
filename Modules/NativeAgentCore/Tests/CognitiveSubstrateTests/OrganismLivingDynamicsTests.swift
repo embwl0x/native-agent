@@ -356,6 +356,111 @@ struct OrganismLivingDynamicsTests {
         #expect(candidate.trustClass == .highRisk)
         #expect(!candidate.autoActivationAllowed)
     }
+
+    @Test func forgettingLetsASustainedRegressionMoveTheBelief() throws {
+        // A thousand clean tool completions used to make the belief immovable:
+        // the counters were a lifetime tally, so a fortnight of real failures
+        // barely dented successLikelihood. Evidence now forgets on the clock.
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        var ledger = OrganismPredictionLedger()
+        for index in 0..<1_000 {
+            ledger = recordingOutcome(.toolSucceeded, run: "ok-\(index)", at: start, into: ledger)
+        }
+        let before = try #require(OrganismCapabilitySelfModel.beliefs(ledger: ledger, at: start)
+            .first { $0.kind == .toolCompletion })
+        #expect(before.successLikelihood > 0.99)
+
+        // Two half-lives of sustained failure: 30 a day for a fortnight, with
+        // the organism clock settling each day the way the kernel settles it.
+        let unforgotten = ledger
+        var day = start
+        var run = 0
+        for _ in 0..<14 {
+            let next = day.addingTimeInterval(24 * 3_600)
+            ledger = OrganismPersistentState(savedAt: day, predictionLedger: ledger)
+                .decayed(at: next)
+                .predictionLedger
+            for _ in 0..<30 {
+                run += 1
+                ledger = recordingOutcome(.toolFailed, run: "bad-\(run)", at: next, into: ledger)
+            }
+            day = next
+        }
+        let after = try #require(OrganismCapabilitySelfModel.beliefs(ledger: ledger, at: day)
+            .first { $0.kind == .toolCompletion })
+
+        // The same 420 failures against a clock that never moved — the old
+        // behaviour, kept as the control the fix has to beat.
+        var stalled = unforgotten
+        for index in 0..<420 {
+            stalled = recordingOutcome(.toolFailed, run: "stalled-\(index)", at: start, into: stalled)
+        }
+        let control = try #require(OrganismCapabilitySelfModel.beliefs(ledger: stalled, at: start)
+            .first { $0.kind == .toolCompletion })
+
+        #expect(after.successLikelihood < 0.55)
+        #expect(control.successLikelihood > 0.65)
+        #expect(after.successLikelihood < control.successLikelihood - 0.15)
+    }
+
+    @Test func quietPeriodHealsTheMissingEvidencePenalty() throws {
+        // A stretch of timeouts pinned uncertainty to expired/total forever:
+        // the ratio is scale-free, so nothing could ever relax it. Measured
+        // against the same prior the posterior uses, it decays with the
+        // evidence behind it — and what replaces it is honest low-evidence
+        // uncertainty, not confidence.
+        let start = Date(timeIntervalSince1970: 2_000_000)
+        let badStretch = OrganismPredictionLedger(
+            bodyConfidence: OrganismBodyConfidence(toolPath: 0.8),
+            outcomeCountsByKind: [
+                OrganismPredictionKind.toolCompletion.rawValue:
+                    OrganismPredictionOutcomeCounts(
+                        satisfied: 40, violated: 4, expired: 20, lastEvidenceAt: start
+                    ),
+            ]
+        )
+        // How much of the belief's uncertainty the expiries are responsible for.
+        func expiryPressure(_ ledger: OrganismPredictionLedger, at date: Date) throws -> Double {
+            var withoutExpiries = ledger
+            let key = OrganismPredictionKind.toolCompletion.rawValue
+            var counts = try #require(withoutExpiries.outcomeCountsByKind?[key])
+            var weights = counts.effectiveWeights(at: date)
+            weights.expired = 0
+            counts.weights = weights
+            counts.expired = 0
+            withoutExpiries.outcomeCountsByKind?[key] = counts
+            let full = try #require(OrganismCapabilitySelfModel.beliefs(ledger: ledger, at: date)
+                .first { $0.kind == .toolCompletion })
+            let stripped = try #require(
+                OrganismCapabilitySelfModel.beliefs(ledger: withoutExpiries, at: date)
+                    .first { $0.kind == .toolCompletion }
+            )
+            return full.uncertainty - stripped.uncertainty
+        }
+
+        // Four half-lives of silence, settled daily like the kernel settles it.
+        var quiet = badStretch
+        var day = start
+        for _ in 0..<28 {
+            let next = day.addingTimeInterval(24 * 3_600)
+            quiet = OrganismPersistentState(savedAt: day, predictionLedger: quiet)
+                .decayed(at: next)
+                .predictionLedger
+            day = next
+        }
+
+        let before = try #require(OrganismCapabilitySelfModel.beliefs(ledger: badStretch, at: start)
+            .first { $0.kind == .toolCompletion })
+        let after = try #require(OrganismCapabilitySelfModel.beliefs(ledger: quiet, at: day)
+            .first { $0.kind == .toolCompletion })
+
+        #expect(try expiryPressure(badStretch, at: start) > 0.1)
+        #expect(try expiryPressure(quiet, at: day) < 0.000_001)
+        // Healed does not mean reassured: with the evidence gone the belief
+        // reads less certain overall, not more.
+        #expect(after.uncertainty > before.uncertainty)
+        #expect(after.freshness < 0.1)
+    }
 }
 
 private final class LivingDynamicsClock: @unchecked Sendable {
@@ -395,4 +500,32 @@ private func livingSignal(
         intensity: 1,
         metadata: metadata
     )
+}
+
+/// One correlated tool lifecycle: a start the body can hold as a pending
+/// expectation, then its resolution. Distinct `run` ids matter — a bare
+/// terminal signal collapses onto one synthetic row per timestamp and only
+/// the first would count.
+private func recordingOutcome(
+    _ resolution: SomaticSignalKind,
+    run: String,
+    at date: Date,
+    into ledger: OrganismPredictionLedger
+) -> OrganismPredictionLedger {
+    func apply(_ kind: SomaticSignalKind, to current: OrganismPredictionLedger) -> OrganismPredictionLedger {
+        OrganismPredictiveBody.applying(
+            signal: SomaticSignal(
+                id: UUID(),
+                kind: kind,
+                sourceOrgan: "tool",
+                occurredAt: date,
+                intensity: 1,
+                metadata: ["predictionCorrelationId": .string(run)]
+            ),
+            to: current,
+            chemicalState: .neutral,
+            bodySchema: .neutral
+        ).ledger
+    }
+    return apply(resolution, to: apply(.toolStarted, to: ledger))
 }

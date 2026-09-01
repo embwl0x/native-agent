@@ -169,7 +169,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "x.post_tweet", connectorId: "x", connector: "x",
             name: "X Post Tweet",
-            description: "Post to X. Requires approval.",
+            description: "Post to X. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "external_send", dryRunAvailable: true, requiresApproval: true,
             inputSchema: schema([
                 ("text", prop("string")),
@@ -379,7 +379,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "gmail.send", connectorId: "email", connector: "email",
             name: "Gmail Send Draft",
-            description: "Send a previously created Gmail draft. Requires approval.",
+            description: "Send a previously created Gmail draft. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "external_send", dryRunAvailable: false, requiresApproval: true,
             inputSchema: schema([
                 ("draftId", prop("string", description: "Draft ID from gmail.draft.")),
@@ -446,7 +446,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "agentmail.send", connectorId: "agentmail", connector: "agentmail",
             name: "AgentMail Send",
-            description: "Stage an approval to send email from the configured AgentMail inbox.",
+            description: "Send email from the configured AgentMail inbox. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "external_send", dryRunAvailable: true, requiresApproval: true,
             inputSchema: schema([
                 ("to", .object(["type": .array([.string("string"), .string("array")])])),
@@ -478,7 +478,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "calendar.create_event", connectorId: "calendar", connector: "calendar",
             name: "Calendar Create Event",
-            description: "Create a calendar event. Requires approval.",
+            description: "Create a calendar event. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "external_write", dryRunAvailable: false, requiresApproval: true,
             inputSchema: schema([
                 ("title", prop("string")),
@@ -505,7 +505,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "calendar.cancel_event", connectorId: "calendar", connector: "calendar",
             name: "Calendar Cancel Event",
-            description: "Cancel/delete a calendar event. Requires approval.",
+            description: "Cancel/delete a calendar event. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "external_write", dryRunAvailable: false, requiresApproval: true,
             inputSchema: schema([
                 ("eventId", prop("string")),
@@ -838,7 +838,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.write_file", connectorId: "mac", connector: "mac",
             name: "Mac Write File",
-            description: "Write or append to a file on the Mac filesystem. Requires approval.",
+            description: "Write or append to a file on the Mac filesystem. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "file_ops",
             inputSchema: schema([
@@ -860,7 +860,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.applescript", connectorId: "mac", connector: "mac",
             name: "Mac AppleScript",
-            description: "Run an AppleScript. Requires approval.",
+            description: "Run an AppleScript. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: true, requiresApproval: true,
             category: "applescript",
             inputSchema: schema([
@@ -871,7 +871,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.jxa", connectorId: "mac", connector: "mac",
             name: "Mac JXA",
-            description: "Run JavaScript for Automation. Requires approval.",
+            description: "Run JavaScript for Automation. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: true, requiresApproval: true,
             category: "jxa",
             inputSchema: schema([
@@ -882,7 +882,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.focus_app", connectorId: "mac", connector: "mac",
             name: "Mac Focus App",
-            description: "Bring an app to front by bundle ID. Requires approval.",
+            description: "Bring an app to front by bundle ID. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "medium", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
@@ -892,7 +892,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.quit_app", connectorId: "mac", connector: "mac",
             name: "Mac Quit App",
-            description: "Quit an app by bundle ID. Requires approval.",
+            description: "Quit an app by bundle ID. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
@@ -911,7 +911,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.set_volume", connectorId: "mac", connector: "mac",
             name: "Mac Set Volume",
-            description: "Set Mac output volume (0–100). Requires approval.",
+            description: "Set Mac output volume (0–100). Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "medium", dryRunAvailable: false, requiresApproval: true,
             category: "system",
             inputSchema: schema([
@@ -921,7 +921,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.sleep_display", connectorId: "mac", connector: "mac",
             name: "Mac Sleep Display",
-            description: "Sleep the Mac display. Requires approval.",
+            description: "Sleep the Mac display. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "medium", dryRunAvailable: false, requiresApproval: true,
             category: "system",
             inputSchema: emptySchema()
@@ -929,7 +929,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.lock_screen", connectorId: "mac", connector: "mac",
             name: "Mac Lock Screen",
-            description: "Lock the Mac screen. Requires approval.",
+            description: "Lock the Mac screen. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "medium", dryRunAvailable: false, requiresApproval: true,
             category: "system",
             inputSchema: emptySchema()
@@ -937,7 +937,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.shell", connectorId: "mac", connector: "mac",
             name: "Mac Shell Command",
-            description: "Run a shell command on Mac. Requires approval. Most dangerous gate.",
+            description: "Run a shell command on Mac. Standard modes prompt; admitted Full Mac YOLO runs directly. Hard safety boundaries still refuse.",
             risk: "critical", dryRunAvailable: false, requiresApproval: true,
             category: "shell",
             inputSchema: schema([
@@ -950,7 +950,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.keystroke", connectorId: "mac", connector: "mac",
             name: "Mac Keystroke",
-            description: "Type text and/or press key combinations on this Mac, as if from the physical keyboard. The keystrokes go to whatever app is frontmost. Requires approval.",
+            description: "Type text and/or press key combinations on this Mac, as if from the physical keyboard. The keystrokes go to whatever app is frontmost. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
@@ -963,7 +963,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.click", connectorId: "mac", connector: "mac",
             name: "Mac Click",
-            description: "Click, double-click, right-click or drag at screen coordinates, as if from the physical mouse. Requires approval.",
+            description: "Click, double-click, right-click or drag at screen coordinates, as if from the physical mouse. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
@@ -989,7 +989,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.scroll", connectorId: "mac", connector: "mac",
             name: "Mac Scroll",
-            description: "Scroll the view under the pointer, as if from the physical mouse wheel or trackpad. Requires approval.",
+            description: "Scroll the view under the pointer, as if from the physical mouse wheel or trackpad. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
@@ -1007,7 +1007,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.wake", connectorId: "mac", connector: "mac",
             name: "Mac Wake Screen",
-            description: "Dismiss a screensaver or wake a sleeping display with a one-point mouse nudge, then return a fresh view of the real screen. Refuses when the Mac is password-locked — it never bypasses a lock. Requires approval.",
+            description: "Dismiss a screensaver or wake a sleeping display with a one-point mouse nudge, then return a fresh view of the real screen. Refuses when the Mac is password-locked — it never bypasses a lock. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: false, requiresApproval: true,
             category: "accessibility",
             inputSchema: schema([
@@ -1223,7 +1223,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.move_file", connectorId: "mac", connector: "mac",
             name: "Mac Move File",
-            description: "Move a file. Requires approval.",
+            description: "Move a file. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: true, requiresApproval: true,
             category: "file_ops",
             inputSchema: schema([
@@ -1234,7 +1234,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.trash_file", connectorId: "mac", connector: "mac",
             name: "Mac Trash File",
-            description: "Move a file to the macOS Trash. Requires approval.",
+            description: "Move a file to the macOS Trash. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "high", dryRunAvailable: true, requiresApproval: true,
             category: "file_ops",
             inputSchema: schema([
@@ -1244,7 +1244,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.set_brightness", connectorId: "mac", connector: "mac",
             name: "Mac Set Brightness",
-            description: "Set Mac display brightness (0–100). Requires approval.",
+            description: "Set Mac display brightness (0–100). Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "medium", dryRunAvailable: false, requiresApproval: true,
             category: "system",
             inputSchema: schema([
@@ -1254,7 +1254,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.set_focus_mode", connectorId: "mac", connector: "mac",
             name: "Mac Set Focus Mode",
-            description: "Set macOS Focus mode by name. Requires approval.",
+            description: "Set macOS Focus mode by name. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "medium", dryRunAvailable: false, requiresApproval: true,
             category: "system",
             inputSchema: schema([
@@ -1300,7 +1300,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "slack.post_message", connectorId: "slack", connector: "slack",
             name: "Slack Post Message",
-            description: "Stage an approval to post a message to a Slack channel.",
+            description: "Post a message to a Slack channel. Standard modes prompt; admitted Full Mac YOLO runs directly.",
             risk: "external_send", dryRunAvailable: false, requiresApproval: true,
             inputSchema: schema([
                 ("channel", prop("string", description: "Channel ID or name.")),

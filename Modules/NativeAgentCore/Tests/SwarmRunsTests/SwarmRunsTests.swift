@@ -733,7 +733,11 @@ private actor RecordingSwarmWorkerRunner: AgentSwarmWorkerRunning {
         input: ["objective": .string("append next receipt"), "agentCount": .int(1), "synthesize": .bool(false)],
         policy: AgentSwarmPolicy(storeReceipts: true)
     )
-    #expect(SwarmRunsStore.load(path: runsPath).runs == [second, out])
+    // Round-trip the expected receipts through the same JSON encoding the store
+    // uses on disk — the measured durationSeconds Double can lose its last bit
+    // in serialization, so exact equality against the in-memory value flakes.
+    let expected = try JSONValue.parse(JSONValue.array([second, out]).serializedData(pretty: false))
+    #expect(JSONValue.array(SwarmRunsStore.load(path: runsPath).runs) == expected)
 }
 
 @Test func swiftAgentSwarmExecutor_preservesUnavailableReceiptStoreAfterWorkersSettle() async throws {

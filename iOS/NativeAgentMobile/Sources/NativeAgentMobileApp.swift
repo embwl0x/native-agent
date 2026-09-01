@@ -608,7 +608,8 @@ enum NativeAgentRemotePushProcessor {
         userInfo: [AnyHashable: Any],
         recordReceipt: ([AnyHashable: Any]) -> PushReceiptEntry,
         sendReceipt: (String) async throws -> Void,
-        drainDeviceSyncPush: ([AnyHashable: Any]) async throws -> Bool,
+        drainDeviceSyncPush: @MainActor @Sendable ([AnyHashable: Any]) async throws -> Bool,
+        refreshChatReply: () async throws -> Bool = { false },
         refreshInbox: () async throws -> Bool,
         refreshActivity: () async throws -> Void
     ) async -> FetchOutcome {
@@ -622,9 +623,21 @@ enum NativeAgentRemotePushProcessor {
         // Each lane is independently best-effort. A failed CloudKit drain
         // must not suppress the inbox/activity refreshes (and vice versa).
         let cloudKitDelivered = (try? await drainDeviceSyncPush(userInfo)) ?? false
+        // The Mac's visible reply notification is an ordinary APNS payload,
+        // not the CloudKit subscription push recognized above. Treat its exact
+        // source as a bounded transport nudge so an open Chat view receives the
+        // signed reply record immediately instead of showing only the banner.
+        let chatReplyLoaded = isChatReplyNudge(userInfo)
+            ? ((try? await refreshChatReply()) ?? false)
+            : false
         let inboxLoaded = (try? await refreshInbox()) ?? false
         try? await refreshActivity()
-        return (inboxLoaded || cloudKitDelivered) ? .newData : .noData
+        return (inboxLoaded || cloudKitDelivered || chatReplyLoaded) ? .newData : .noData
+    }
+
+    static func isChatReplyNudge(_ userInfo: [AnyHashable: Any]) -> Bool {
+        (userInfo["source"] as? String) == "icloud_chat_reply"
+            && (userInfo["screen"] as? String) == "chat"
     }
 }
 
@@ -743,6 +756,14 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
                 },
                 drainDeviceSyncPush: { userInfo in
                     await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo)
+                },
+                refreshChatReply: {
+                    let delivered = await iCloudBridge.shared.pollIncomingNow()
+                    // The transport record is primary. The transcript snapshot
+                    // is the independent missed-record backstop and publishes
+                    // through ChatView's existing snapshot merge owner.
+                    await iCloudSyncEngine.shared.refreshChatTranscriptsSnapshot()
+                    return delivered
                 },
                 refreshInbox: {
                     await iCloudSyncEngine.shared.refreshInboxSnapshot()

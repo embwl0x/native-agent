@@ -86,8 +86,8 @@ struct BackgroundLifecycleWiringContractTests {
     @Test("every background-activity identifier maps to a real loop id and a real interval")
     func backgroundActivityTablesAgreeAndCoverRealLoops() throws {
         let ids = AppDelegate.bgTaskIdentifiers
-        #expect(ids.count == 3)
-        #expect(Set(ids).count == 3, "duplicate identifiers silently overwrite each other's schedule")
+        #expect(ids.count == 2)
+        #expect(Set(ids).count == 2, "duplicate identifiers silently overwrite each other's schedule")
 
         // The registration loop `continue`s when EITHER lookup misses — a
         // silent "this weekly job never runs again". The three tables must
@@ -116,14 +116,24 @@ struct BackgroundLifecycleWiringContractTests {
         let declared = try suffixes(inVarNamed: "bgTaskIdentifiers")
         let loops = try suffixes(inVarNamed: "backgroundLoopIDsByTaskIdentifier")
         let intervals = try suffixes(inVarNamed: "backgroundTaskIntervalsByIdentifier")
-        #expect(declared == ["rem_cycle", "memory_consolidation", "self_improvement_sweep"])
+        #expect(declared == ["memory_consolidation", "self_improvement_sweep"])
         #expect(loops == declared, "a scheduled identifier with no loop mapping silently never ticks")
         #expect(intervals == declared, "a scheduled identifier with no interval silently never ticks")
 
-        // The retired dream activity must be invalidated, never registered —
-        // it could otherwise wake independently of the 03:30 scheduler job.
-        #expect(!declared.contains("dream_cycle"))
-        #expect(source.contains("NSBackgroundActivityScheduler(identifier: retiredDreamTaskIdentifier).invalidate()"))
+        // Retired activities must be INVALIDATED, never registered. Dropping a
+        // row from `bgTaskIdentifiers` is not enough — NSBackgroundActivityScheduler
+        // persists an older build's `repeats = true` registration per bundle, so
+        // the OS keeps waking the retired identifier until something cancels it.
+        //   dream_cycle — the 03:30 Central scheduler job owns unattended dreams.
+        //   rem_cycle   — `nativeagent-weekly-rem` (Sun 04:30 Central) owns weekly REM.
+        for retired in ["dream_cycle", "rem_cycle"] {
+            #expect(!declared.contains(retired))
+            #expect(source.contains("backgroundTaskIdentifier(\"\(retired)\")"),
+                    Comment(rawValue: "\(retired) fell out of retiredTaskIdentifiers — an "
+                            + "older build's persisted activity would keep waking with no handler"))
+        }
+        #expect(source.contains(
+            "NSBackgroundActivityScheduler(identifier: retired).invalidate()"))
 
         // And the mapped loop ids are the ids the real loops actually publish.
         let tmp = FileManager.default.temporaryDirectory
@@ -131,12 +141,53 @@ struct BackgroundLifecycleWiringContractTests {
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
         let published: Set<String> = [
-            BackgroundLoopsAssembly.makeREMCycleLoop(dataRoot: tmp, llm: WiringStubLLM()).loopId,
             BackgroundLoopsAssembly.makeMemoryConsolidationLoop(dataRoot: tmp).loopId,
             BackgroundLoopsAssembly.makeWeeklySelfImprovementLoop(dataRoot: tmp, llm: WiringStubLLM()).loopId,
         ]
         #expect(published == loops,
                 "the OS-scheduled ids drifted from the ids the loops publish: \(published) vs \(loops)")
+    }
+
+    // MARK: - retired rem_cycle lane
+
+    /// The retirement is only real if BOTH drivers are gone AND the surviving
+    /// owner is still wired. A half-retirement (loop gone, OS activity left
+    /// behind) silently wakes a handler that no longer exists; a full
+    /// retirement with no surviving owner silently stops weekly REM.
+    @Test("rem_cycle is retired from every driver and the weekly-REM owner survives")
+    func remCycleLaneIsRetiredAndTheSchedulerOwnerSurvives() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RemRetired-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        // 1. Not in the in-app loop manifest.
+        let manifest = Set(BackgroundLoopsAssembly.assembleAllLoops(dataRoot: tmp).map(\.loopId))
+        #expect(!manifest.contains("rem_cycle"))
+        // 2. Not on the OS scheduler.
+        #expect(!AppDelegate.bgTaskIdentifiers.contains {
+            $0.hasSuffix("rem_cycle")
+        })
+        // 3. The durable-state tombstone (so the retired lane's stale
+        //    loops/completions/firstSeen stamps are dropped at load instead of
+        //    haunting background_loop_state.json) is pinned Core-side, in
+        //    BackgroundLoopsTests::retiredIdsAreExactlyTheDeRegisteredSet —
+        //    `retiredLoopIds` is internal to the BackgroundLoops module.
+        // 4. The app-side factory is gone, not merely unregistered.
+        let assembly = try AppSourceScraping.appSource("BackgroundLoopsAssembly+DreamsMemory.swift")
+        #expect(!assembly.contains("static func makeREMCycleLoop"))
+
+        // 5. …and the surviving owner is still wired end to end: the scheduler
+        //    job kind `rem` reaches NativeClient.runRem, which stages through
+        //    the SAME approval stager the retired loop used.
+        #expect(manifest.contains("trigger_scheduler_due_work"))
+        let execution = try AppSourceScraping.appSource("SchedulerDueJobRunner+Execution.swift")
+        #expect(execution.contains("case .rem:"))
+        #expect(execution.contains("executeREM(job: job)"))
+        let dream = try AppSourceScraping.appSource("NativeClient+DreamActions.swift")
+        #expect(dream.contains("func runRem()"))
+        #expect(dream.contains("BackgroundLoopsAssembly.makeREMProposalStager(dataRoot: root)"),
+                "the surviving REM owner must keep staging proposals as approvals")
     }
 
     // MARK: - login item
@@ -275,6 +326,15 @@ struct BackgroundLifecycleWiringContractTests {
         // The one drain that can wedge on SQLite/embedder work is bounded BELOW
         // the budget so it cannot consume the whole quit window.
         #expect(body.contains("waitForExecutionMemoryWrites(timeout: 2.5)"))
+
+        // `applicationWillTerminate` runs on the main thread and then blocks it
+        // in the bounded DispatchGroup wait. A drain enqueued as
+        // `Task { @MainActor ... }` cannot start until after that wait expires.
+        // Activity Watch must capture its Sendable watcher and begin teardown
+        // before the main-thread wait.
+        #expect(body.contains("ActivityWatchController.shared.makeTerminationDrain()"))
+        #expect(!body.contains("Task { @MainActor"))
+        #expect(!body.contains("ActivityWatchController.shared.shutdown()"))
     }
 
     @Test("sleep/wake observers are registered in pairs and removed at termination")

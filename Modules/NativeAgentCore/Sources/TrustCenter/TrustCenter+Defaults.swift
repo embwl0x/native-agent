@@ -322,9 +322,9 @@ extension SwiftNativeTrustCenter {
         // speak the action id (`mac.keystroke`). One spelling alone would leave
         // the other resolving through `autonomyDefault` instead of this floor.
         //
-        // These four are also on `isFullMacYoloAutonomyExcludedTool`, so an
-        // active Full Mac YOLO window cannot flatten them to auto the way it
-        // does for mac.focus_app / mac.quit_app.
+        // The checked admitted-Full-Mac authority now owns the runtime
+        // zero-prompt decision for these and every other confirm-shaped tool;
+        // this table keeps the non-YOLO default explicit.
         "mac.keystroke": .string("auto"),
         "mac.click": .string("auto"),
         "mac.scroll": .string("auto"),

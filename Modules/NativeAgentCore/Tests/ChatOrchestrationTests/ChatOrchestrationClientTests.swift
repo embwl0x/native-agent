@@ -3920,10 +3920,10 @@ func swiftToolDispatcher_iOSFullMacRequiresRemoteIOSPolicy() async throws {
     let gate = AutonomyGate(trust: SwiftNativeTrustCenter(dataRoot: dataRoot))
     #expect(try await gate.decide(toolName: "write_file", surface: "ios") == .allow)
     #expect(try await gate.decide(toolName: "write_file", surface: "chat") == .allow)
-    // TEETH: the gate is not blanket-allow — a surviving floor still requires
-    // approval on the same root.
+    // TEETH: a remote surface without authenticated origin evidence does not
+    // inherit admitted YOLO authority for a self-install action.
     if case .allow = try await gate.decide(toolName: "self_install", surface: "ios") {
-        Issue.record("self_install kept its floor — it must not map to allow")
+        Issue.record("untrusted iOS origin must not inherit Full Mac YOLO")
     }
 }
 

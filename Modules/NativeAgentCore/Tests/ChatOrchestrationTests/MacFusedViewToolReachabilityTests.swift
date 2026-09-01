@@ -186,16 +186,16 @@ func macView_isReadTier_autoNoMotorOwnerAllowedUnderReadOnly() async throws {
     // YOLO cutover 2026-08-12 (9023d24d, 84fb8201): perimeter gates entry,
     // execution ungated. OLD CONTRACT: mac_keystroke was pinned to
     // send_approval here as the control-tier neighbour. NEW CONTRACT: it
-    // resolves auto like the reads; the contrast row moves to a floor that
-    // SURVIVED the cutover, so "auto everywhere" still cannot pass by accident.
+    // resolves auto like the reads; the contrast row is now an untrusted remote
+    // origin, so "auto everywhere" still cannot pass by accident.
     let injectionLevel = try await gate.autonomyLevel(
         toolName: "mac_keystroke", surface: "chat", originTrusted: true
     )
     #expect(injectionLevel == "auto", "mac_keystroke resolves auto post-cutover (got \(injectionLevel))")
-    let flooredLevel = try await gate.autonomyLevel(
-        toolName: "self_install", surface: "chat", originTrusted: true
+    let outsiderLevel = try await gate.autonomyLevel(
+        toolName: "self_install", surface: "telegram", originTrusted: false
     )
-    #expect(flooredLevel != "auto", "self_install kept its floor — teeth for the auto rows above")
+    #expect(outsiderLevel != "auto", "untrusted Telegram cannot inherit YOLO")
 
     // 2. It sets no external effect, so it claims no motor owner.
     #expect(!ToolCausalBoundary.hasCanonicalMotorOwner(tool: "mac_view"))

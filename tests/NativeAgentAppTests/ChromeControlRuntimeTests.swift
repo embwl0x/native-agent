@@ -167,6 +167,42 @@ struct ChromeControlRuntimeTests {
         try await disconnect.value
     }
 
+    @Test("Extension refusals preserve their protocol code and explanation")
+    func extensionRefusalKeepsTypedEvidence() async throws {
+        var descriptors: [Int32] = [0, 0]
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0)
+        let channel = ChromeControlChannel(descriptor: descriptors[0])
+        await channel.start()
+        let peer = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
+        let framer = NativeMessagingFramer()
+
+        let fixture = Task.detached {
+            let data = try #require(try framer.readMessage(from: peer))
+            guard case .object(let request) = try JSONValue.parse(data),
+                  case .string(let requestID)? = request["id"] else {
+                throw ChromeControlRuntimeError.invalidResponse
+            }
+            let response = JSONValue.object([
+                "version": .int(1), "type": .string("response"), "id": .string(requestID),
+                "action": .string("page.snapshot.read"), "ok": .bool(false),
+                "error": .object([
+                    "code": .string("snapshot_stale"),
+                    "message": .string("The page changed after capture."),
+                ]),
+            ])
+            try framer.writeMessage(response.serializedData(pretty: false), to: peer)
+        }
+
+        await #expect(throws: ChromeControlRuntimeError.extensionRejected(
+            code: "snapshot_stale",
+            message: "The page changed after capture."
+        )) {
+            _ = try await channel.request(action: .snapshot, payload: ["leaseId": .string("lease-fixture")])
+        }
+        try await fixture.value
+        await channel.shutdown(releaseLeases: false)
+    }
+
     @Test("Cancelling delayed Chrome typing revokes its lease without closing the tab")
     func cancelledTypingReleasesItsLeaseWithoutClosingTheTab() async throws {
         var descriptors: [Int32] = [0, 0]

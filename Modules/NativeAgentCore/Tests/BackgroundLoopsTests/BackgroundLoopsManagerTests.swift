@@ -683,6 +683,48 @@ struct BackgroundLoopsManagerTests {
         await manager.stop()
     }
 
+    @Test("cancelling replacement cannot overlap the retired effecting tick")
+    func cancelledReplacementStillDrainsOldGate() async throws {
+        let oldProbe = SuspendedTickProbe()
+        let newCounter = TickCounter()
+        let id = "cancelled_replacement"
+        let manager = BackgroundLoopsManager()
+        await manager.start(loops: [AsyncStubLoop(id) { await oldProbe.tick() }])
+
+        let oldTick = Task { await manager.runTickOnce(loopId: id) }
+        await oldProbe.waitUntilStarted()
+
+        let replacement = Task {
+            await manager.restartLoop(
+                id: id,
+                newLoop: AsyncStubLoop(id) { await newCounter.bump() }
+            )
+        }
+        // Let restart remove the old scheduler registration and enter its
+        // execution-gate drain, then cancel the requesting task. Before the
+        // fix that cancellation resumed the ordinary idle waiter and installed
+        // a fresh gate while `oldProbe` was still effecting.
+        for _ in 0..<20 {
+            if !(await manager.registered().contains(id)) { break }
+            await Task.yield()
+        }
+        replacement.cancel()
+        try await Task.sleep(for: .milliseconds(30))
+
+        #expect(!(await manager.registered().contains(id)))
+        #expect(await oldProbe.value == 1)
+        #expect(await newCounter.value == 0)
+
+        await oldProbe.release()
+        _ = await oldTick.value
+        await replacement.value
+
+        #expect(await manager.registered().contains(id))
+        #expect(await manager.runTickOnce(loopId: id) == .completed(result: nil))
+        #expect(await newCounter.value == 1)
+        await manager.stop()
+    }
+
     @Test("event physiology coalesces bursts and stays idle without signals")
     func physiologyBurstAndIdle() async throws {
         let source = PhysiologyEventSource()

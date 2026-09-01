@@ -55,7 +55,12 @@ func liveInboxRetentionPrioritizesActiveCards() async throws {
     }
     try payload.write(to: path)
 
-    let owner = LiveNotificationInbox(path: path)
+    // Pinned clock: every fixture row is stamped 2026-08-16, so a wall-clock
+    // `now` would start age-pruning this file 30 days after that date and turn
+    // a cap assertion into a calendar-dependent flake.
+    let owner = LiveNotificationInbox(
+        path: path, clock: { Date(timeIntervalSince1970: 1_788_000_000) }
+    )
     #expect(try await owner.appendUnique(liveInboxFixture("new"), id: "new"))
     let rows = try await owner.rows()
     #expect(rows.count == LiveNotificationInbox.rowLimit)

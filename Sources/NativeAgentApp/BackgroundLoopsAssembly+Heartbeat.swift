@@ -1160,7 +1160,9 @@ extension BackgroundLoopsAssembly {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         var stageable: [EvolutionProposal]
         do {
-            stageable = try await store.list(statuses: [.candidateGreen, .staged])
+            // `.approved` is the non-prompt Full Mac deferred-install resume
+            // state: promotion succeeded, but the rebuild gate was closed.
+            stageable = try await store.list(statuses: [.candidateGreen, .staged, .approved])
         } catch {
             FileHandle.standardError.write(Data(
                 "EvolutionStager: proposal scan failed: \(error)\n".utf8))
@@ -1182,6 +1184,46 @@ extension BackgroundLoopsAssembly {
         for proposal in stageable {
             guard let runId = proposal.candidateRunId,
                   let diffSha = proposal.diffSHA256 else { continue }
+            let payload: JSONValue = .object([
+                "kind": .string("self_evolution"),
+                "proposalId": .string(proposal.id),
+                "runId": .string(runId),
+                "diffSHA256": .string(diffSha),
+                "expectedHead": .string(proposal.expectedHead ?? ""),
+                "evidence": .string(await candidateEvidenceSummary(
+                    dataRoot: dataRoot, runId: runId)),
+                "source": .string(proposal.source.rawValue),
+            ])
+            let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
+                .fullMacYoloAuthority(
+                    tool: NativeClient.selfEvolutionAction,
+                    origin: SecurityOriginContext(
+                        surface: "desk",
+                        source: "background_evolution_stager",
+                        isRemote: false
+                    )
+                )
+            if yolo.admitted {
+                await NativeClient.applyFullMacAdmittedSelfEvolution(
+                    payload: payload,
+                    deps: .production(dataRoot: dataRoot)
+                )
+                continue
+            }
+            if yolo.state == .explicitlyBlocked {
+                try? await store.appendReceipt(
+                    id: proposal.id,
+                    kind: "full_mac_refused",
+                    detail: "self_evolution.apply is explicitly blocked; no approval was staged"
+                )
+                continue
+            }
+            if proposal.status == .approved {
+                // Only the Full Mac admitted lane creates this approval-free
+                // deferred state. Outside that grant, leave it deferred and
+                // never translate it back into a prompt.
+                continue
+            }
             let matching = approvals
                 .filter { rec in
                     guard case .object(let p) = rec.payload,
@@ -1217,15 +1259,7 @@ extension BackgroundLoopsAssembly {
                     + "Approving commits the change to the live repo"
                     + " and stages a self-install (which only fires once systemRebuild.enabled is on). "
                     + "Denying retires it permanently."),
-                "payload": .object([
-                    "kind": .string("self_evolution"),
-                    "proposalId": .string(proposal.id),
-                    "runId": .string(runId),
-                    "diffSHA256": .string(diffSha),
-                    "expectedHead": .string(proposal.expectedHead ?? ""),
-                    "evidence": .string(evidence),
-                    "source": .string(proposal.source.rawValue),
-                ]),
+                "payload": payload,
                 "payloadPreview": .string(
                     "[evolution: \(runId)] \(String(proposal.title.prefix(140))) — \(evidence)"),
             ])

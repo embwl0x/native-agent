@@ -956,6 +956,11 @@ final class IOSChatBehaviorWave2EvalTests: XCTestCase {
         XCTAssertFalse(state.fastMode)
     }
 
+    func test_processingModePillNamesTheActualRequestTier() {
+        XCTAssertEqual(ChatRuntimeControlPresentation.processingModeTitle(fastMode: false), "Normal")
+        XCTAssertEqual(ChatRuntimeControlPresentation.processingModeTitle(fastMode: true), "Fast")
+    }
+
     func test_fileAccessPillAndOutboundEnvelopeUseExactlyTheMacRouterIDs() {
         let acceptedByMacRouter = ICloudChatFileAccessPolicy.acceptedIDs
         XCTAssertEqual(acceptedByMacRouter, ["auto", "read_only", "workspace", "full"])

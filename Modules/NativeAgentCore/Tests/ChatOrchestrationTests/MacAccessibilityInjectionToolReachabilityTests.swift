@@ -12,9 +12,9 @@ import TrustCenter
 /// The executor itself is proven by MacControlTests/MacAccessibilityActuatorTests
 /// and the three-gate refusals by SwiftNativeMacControlTests. These prove the
 /// SURFACE: the model can see and call them when it should, cannot when it
-/// shouldn't, they keep an approval floor that an active Full Mac YOLO window
-/// does NOT flatten, they are blocked in restricted file-access modes, and they
-/// carry a motor owner (unlike the reads).
+/// shouldn't, admitted Full Mac YOLO supplies their checked body-bound
+/// capability without a per-call prompt, they are blocked in restricted
+/// file-access modes, and they carry a motor owner (unlike the reads).
 ///
 /// HERMETICITY: every dispatcher/trust type is constructed with a temp
 /// dataRoot. Nothing touches the live app data root, and no test here can reach
@@ -60,8 +60,8 @@ private func injFullMacPolicy(accessibilityAllowed: Bool) -> JSONValue {
 /// most of its result is a `mac_view`: it posts a HID mouse move, so it must
 /// clear every gate the other four do. Everything below runs over it unchanged
 /// — catalog visibility, schema honesty, the category and Full-Mac denials, the
-/// approval floor a YOLO window cannot flatten, the read_only block and the
-/// motor owner. It is deliberately absent from the one loop that EXECUTES
+/// admitted-YOLO capability path, the read_only block and the motor owner. It
+/// is deliberately absent from the one loop that EXECUTES
 /// (`macInjectionTools_dispatchToTheMatchingMacControlAction`), which builds a
 /// production MacControl with the live CGEvent sink; wake's execution path is
 /// proven hermetically in MacControlTests/MacWakeTests.swift instead.
@@ -91,17 +91,25 @@ func macInjectionTools_areVisibleToTheModel_whenAccessibilityCategoryOn() async 
         #expect(schemaNames.contains(tool), "\(tool) must have a model-visible schema — a name without one is unreachable")
     }
 
-    // The discovery block names them as ACTS, not as reads and not as app
-    // control. A surface that mislabels injection is how a user ends up
-    // approving something they think is a read.
+    // The conversational discovery block names the model-facing four-verb
+    // controls as ACTS, not as reads and not as app control. The legacy
+    // implementation tools remain available to the internal dispatcher and
+    // Tools UI, but `tool_catalog` deliberately hides them from the model so
+    // Agent sees one coherent motor vocabulary instead of two overlapping
+    // surfaces.
     let catalog = try await tools.dispatch(tool: "tool_catalog", input: [:], surface: "chat")
     guard case .object(let obj) = catalog,
           case .array(let acts)? = obj["mac_accessibility_act_available_tools"] else {
         Issue.record("expected mac_accessibility_act_available_tools in tool_catalog")
         return
     }
-    for tool in injToolNames {
+    let modelVisibleActs = injToolNames.filter { SwiftToolDispatcher.fourVerbToolNames.contains($0) }
+    let legacyImplementationActs = injToolNames.filter { !SwiftToolDispatcher.fourVerbToolNames.contains($0) }
+    for tool in modelVisibleActs {
         #expect(acts.contains(.string(tool)), "tool_catalog must list \(tool) as an accessibility ACT tool")
+    }
+    for tool in legacyImplementationActs {
+        #expect(!acts.contains(.string(tool)), "tool_catalog must hide legacy implementation tool \(tool) from the model")
     }
     if case .array(let reads)? = obj["mac_accessibility_read_available_tools"] {
         for tool in injToolNames {
@@ -381,10 +389,12 @@ func macInjectionTools_resolveAutoUnderFullMac_approvalFloorRetired() async thro
         #expect(level == "auto", "\(tool) resolves auto post-cutover (got \(level))")
     }
 
-    // TEETH: this is not a blanket-auto resolver — a floor that SURVIVED the
-    // cutover still comes back non-auto in the same fixture.
-    let floored = try await gate.autonomyLevel(toolName: "self_install", surface: "chat", originTrusted: true)
-    #expect(floored == "confirm", "self_install kept its floor (got \(floored))")
+    // TEETH: the grant belongs only to an admitted origin. A remote surface
+    // without concrete origin proof does not inherit local YOLO.
+    let outsider = try await gate.autonomyLevel(
+        toolName: "self_install", surface: "telegram", originTrusted: false
+    )
+    #expect(outsider != "auto", "untrusted Telegram must not inherit YOLO (got \(outsider))")
 
     // The read tools and the app-control pair resolve to auto in the SAME
     // fixture, as they always did.

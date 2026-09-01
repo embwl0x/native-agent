@@ -341,6 +341,13 @@ public extension GitHubConnectorActions {
 extension GitHubConnectorActions {
     // Internal pure seams used by focused connector tests; production callers
     // use the bounded action envelopes above.
+    static func testIssueBody(
+        _ input: [String: JSONValue],
+        requireTitle: Bool
+    ) throws -> [String: Any] {
+        try issueBody(input, requireTitle: requireTitle)
+    }
+
     static func testBoundFilePatches(_ raw: Any, maxCharacters: Int) -> JSONValue {
         let value = boundFilePatches(raw, maxCharacters: maxCharacters)
         return .object([
@@ -2037,7 +2044,21 @@ private extension GitHubConnectorActions {
     static func issueBody(_ input: [String: JSONValue], requireTitle: Bool) throws -> [String: Any] {
         var body: [String: Any] = [:]
         for key in ["title", "body", "state", "state_reason"] { if let value = normalized(input[key]) { body[key] = value } }
-        for key in ["labels", "assignees"] where input[key] != nil { body[key] = stringArray(input[key]) }
+        for (key, clearKey) in [("labels", "clear_labels"), ("assignees", "clear_assignees")] {
+            let values = stringArray(input[key])
+            let clear = bool(input[clearKey]) == true
+            if clear && !values.isEmpty {
+                throw GitHubConnectorError.invalidInput("GitHub issue update cannot both set and clear \(key).")
+            }
+            // Strict tool schemas may materialize an unused optional array as
+            // `[]`. Omission must preserve the remote collection; clearing is
+            // destructive and therefore requires the explicit clear flag.
+            if clear {
+                body[key] = [String]()
+            } else if !values.isEmpty {
+                body[key] = values
+            }
+        }
         let milestone = int(input["milestone"], default: 0); if milestone > 0 { body["milestone"] = milestone }
         if requireTitle && body["title"] == nil { throw GitHubConnectorError.invalidInput("Creating an issue requires title.") }
         return body

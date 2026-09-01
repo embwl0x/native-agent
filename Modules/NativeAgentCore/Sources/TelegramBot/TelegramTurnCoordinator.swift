@@ -71,6 +71,7 @@ public actor TelegramTurnCoordinator {
     private var claimedCallbackIds: Set<String> = []
     private var callbackClaimOrder: [String] = []
     private let callbackClaimLimit = 512
+    private var nextInternalUpdateID = Int.min
 
     public init() {}
 
@@ -185,6 +186,34 @@ public actor TelegramTurnCoordinator {
             return 0
         }
         return queuedTurns[chatId]?.firstIndex(where: { $0.updateId == updateId }).map { $0 + 1 }
+    }
+
+    /// Schedules a verified internal continuation behind the active turn.
+    /// Approval continuations are not Telegram updates and therefore have no
+    /// durable update id or queue card. They take the next serial slot so the
+    /// result of an interrupted request cannot be dropped behind later user
+    /// messages merely because the original provider turn is still unwinding.
+    @discardableResult
+    func enqueueApprovalContinuation(
+        chatId: Int,
+        text: String,
+        operation: @escaping @Sendable (_ turnId: UUID) async -> Void
+    ) -> Int {
+        let updateId = nextInternalUpdateID
+        nextInternalUpdateID &+= 1
+        let queued = QueuedTurn(
+            updateId: updateId,
+            text: text,
+            acknowledgementMessageId: nil,
+            operation: operation,
+            onStart: { _ in }
+        )
+        queuedTurns[chatId, default: []].insert(queued, at: 0)
+        if activeTurns[chatId] == nil {
+            startNextQueuedTurn(chatId: chatId)
+            return 0
+        }
+        return 1
     }
 
     func queuedTurn(

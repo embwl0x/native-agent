@@ -7,6 +7,35 @@ public enum SecurityToolDecision: String, Codable, Sendable, Equatable {
     case block
 }
 
+/// Result of the one checked Full Mac YOLO authority read.
+///
+/// `.admitted` is deliberately narrow: the saved Full Mac grant is active,
+/// the concrete conversation origin is local or has been authenticated by its
+/// canonical remote surface, and the user has not explicitly blocked this
+/// tool. Callers may use that state to flatten per-call ask/confirm policy into
+/// allow. It never authorizes a SecurityCenter `.block` or a domain-owned
+/// boundary such as protected roots, disabled integrations, secret egress, or
+/// macOS TCC.
+public enum FullMacYoloAuthorityState: String, Codable, Sendable, Equatable {
+    case admitted
+    case inactive
+    case explicitlyBlocked = "explicitly_blocked"
+    case untrustedOrigin = "untrusted_origin"
+    case unavailable
+}
+
+public struct FullMacYoloAuthorityAssessment: Codable, Sendable, Equatable {
+    public var state: FullMacYoloAuthorityState
+    public var reason: String
+
+    public init(state: FullMacYoloAuthorityState, reason: String) {
+        self.state = state
+        self.reason = reason
+    }
+
+    public var admitted: Bool { state == .admitted }
+}
+
 public struct SecurityOriginContext: Codable, Sendable, Equatable {
     public var surface: String
     public var sessionId: String?
@@ -49,6 +78,7 @@ public struct SecurityToolEnvelope: Codable, Sendable, Equatable, Identifiable {
     public var capabilities: [String]
     public var risk: String
     public var autonomyLevel: String
+    public var fullMacYoloAuthority: FullMacYoloAuthorityState
     public var signedToolKnown: Bool
     public var rollbackRequired: Bool
     public var decision: SecurityToolDecision

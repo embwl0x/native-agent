@@ -66,8 +66,8 @@ struct TelegramSecurityAllowlist: Sendable {
 public actor SwiftNativeSecurityCenter {
     private let dataRoot: URL
     private let persistence: any PersistenceCoreProtocol
-    private let clock: @Sendable () -> Date
-    private let trustCenter: SwiftNativeTrustCenter
+    let clock: @Sendable () -> Date
+    let trustCenter: SwiftNativeTrustCenter
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -277,6 +277,13 @@ public actor SwiftNativeSecurityCenter {
         // existed. Connector-owned Telegram/Slack allowlists remain live reads
         // from their own authority domains.
         let originAssessment = await assessOrigin(origin, policy: policy)
+        let fullMacYoloAuthority = Self.fullMacYoloAuthority(
+            tool: canonicalTool,
+            surface: origin.surface,
+            originAssessment: originAssessment,
+            snapshot: snapshot,
+            now: evaluatedAt
+        )
         let trustedLocalAgentBridge =
             Self.localAgentBridgeToolNames.contains(canonicalTool)
             && (!originAssessment.isRemote || originAssessment.trusted)
@@ -297,7 +304,7 @@ public actor SwiftNativeSecurityCenter {
             origin: origin,
             originAssessment: originAssessment,
             profile: profile,
-            fullMac: fullMac
+            fullMacYoloAuthority: fullMacYoloAuthority
         )
         let promptInjectionKeys = Self.promptInjectionKeys(in: .object(input))
         let secretKeys = Self.secretKeys(in: .object(input))
@@ -365,9 +372,19 @@ public actor SwiftNativeSecurityCenter {
             }
         }
 
-        // Permission-authority mutation has an unconditional approval floor.
+        // A raw user `blocked` override is a hard authority decision, not an
+        // autonomy ask. Keep it effective even when a composed caller asks
+        // SecurityCenter to leave ordinary autonomy resolution to an outer
+        // gate (`enforceAutonomy == false`).
+        if decision != .block,
+           fullMacYoloAuthority.state == .explicitlyBlocked {
+            decision = .block
+            reasons.append("tool is explicitly blocked by the user")
+        }
+
+        // Permission-authority mutation is an unconditional hard boundary.
         // Full Mac keeps ordinary shell/build work autonomous, but neither
-        // YOLO nor a saved per-tool `auto` override may silently reset TCC and
+        // YOLO nor a saved per-tool `auto` override may reset TCC and
         // remove microphone, speech, camera, Accessibility, or other grants.
         // This runs even for callers that resolve autonomy in the outer chat
         // gate (`enforceAutonomy == false`), so every dispatch surface sees
@@ -440,13 +457,7 @@ public actor SwiftNativeSecurityCenter {
         //      stages a card the user resolves.
         // The self-evolution / training-promotion developerMode gates in
         // SelfImprovement read the raw policy flag and are likewise untouched.
-        let yoloSatisfiesDevMode = Self.fullMacYoloAllowsAutonomy(
-            tool: canonicalTool,
-            origin: origin,
-            originAssessment: originAssessment,
-            profile: profile,
-            fullMac: fullMac
-        )
+        let yoloSatisfiesDevMode = fullMacYoloAuthority.admitted
         if decision != .block,
            profile.risk == .critical,
            // USER 2026-08-12 YOLO: critical actions no longer require Developer
@@ -527,6 +538,25 @@ public actor SwiftNativeSecurityCenter {
             reasons.append("app notification tool is allowed by security policy")
         }
 
+        // An admitted Full Mac YOLO grant is the operator's answer to every
+        // per-call ask/confirm policy. Flatten asks here, after every security
+        // rule has had a chance to produce a hard `.block`, so direct/raw
+        // SecurityCenter clients and composed chat clients see the same
+        // zero-prompt result. This never upgrades a block.
+        //
+        // Resetting macOS permission authority is a hard boundary, not a
+        // prompt in disguise: during YOLO it remains blocked rather than
+        // returning an approval request that contradicts the selected mode.
+        if decision == .ask, fullMacYoloAuthority.admitted {
+            if profile.capabilities.contains("system_permission_reset") {
+                decision = .block
+                reasons.append("Full Mac cannot reset macOS permission authority")
+            } else {
+                decision = .allow
+                reasons.append("admitted Full Mac YOLO suppresses per-call approval")
+            }
+        }
+
         let now = Self.isoTimestamp(evaluatedAt)
         return SecurityToolEnvelope(
             id: UUID().uuidString,
@@ -539,6 +569,7 @@ public actor SwiftNativeSecurityCenter {
             capabilities: Array(profile.capabilities).sorted(),
             risk: profile.risk.rawValue,
             autonomyLevel: autonomyLevel,
+            fullMacYoloAuthority: fullMacYoloAuthority.state,
             signedToolKnown: signedToolKnown,
             rollbackRequired: rollbackRequired,
             decision: decision,
@@ -614,6 +645,7 @@ public actor SwiftNativeSecurityCenter {
             capabilities: [],
             risk: SecurityRisk.critical.rawValue,
             autonomyLevel: "blocked",
+            fullMacYoloAuthority: .unavailable,
             signedToolKnown: false,
             rollbackRequired: true,
             decision: .block,
@@ -807,21 +839,14 @@ public actor SwiftNativeSecurityCenter {
         origin: SecurityOriginContext,
         originAssessment: OriginAssessment,
         profile: ToolProfile,
-        fullMac: Bool
+        fullMacYoloAuthority: FullMacYoloAuthorityAssessment
     ) -> String {
         // 2026-07-21 audit fix: an explicit USER-SET "blocked" entry
         // outranks the yolo posture (mirror of the SwiftNativeTrustCenter
         // resolver fix — confirm/send_approval stay flattened by yolo;
         // consult the raw user file so merged code defaults can't
         // masquerade as explicit entries).
-        if !SwiftNativeTrustCenter.hasExplicitBlockOverride(tool, overrides: userOverrides),
-           Self.fullMacYoloAllowsAutonomy(
-            tool: tool,
-            origin: origin,
-            originAssessment: originAssessment,
-            profile: profile,
-            fullMac: fullMac
-        ) {
+        if fullMacYoloAuthority.admitted {
             return "auto"
         }
         let overrides = Self.object(policy["toolAutonomy"])
@@ -835,7 +860,7 @@ public actor SwiftNativeSecurityCenter {
         )
     }
 
-    private func assessOrigin(
+    func assessOrigin(
         _ origin: SecurityOriginContext,
         policy: [String: JSONValue]
     ) async -> OriginAssessment {

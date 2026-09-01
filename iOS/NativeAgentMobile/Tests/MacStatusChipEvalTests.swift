@@ -43,6 +43,17 @@ final class MacStatusChipEvalTests: XCTestCase {
         XCTAssertEqual(MacStatusChipPresentation.shortLabel(for: .connecting), "Connecting")
     }
 
+    func test_statusChipLabelCannotWrapWhenTheNavigationBarCompressesIt() throws {
+        let chrome = try MobileEvalSources.mobileSource("SystemToastBar.swift")
+        let chip = try XCTUnwrap(
+            MobileEvalSources.blockBody(named: "MacStatusChip", keyword: "struct", in: chrome)
+        )
+
+        XCTAssertTrue(chip.contains(".lineLimit(1)"))
+        XCTAssertTrue(chip.contains(".fixedSize(horizontal: true, vertical: false)"))
+        XCTAssertTrue(chip.contains(".frame(minWidth: 44, minHeight: 44)"))
+    }
+
     func test_unreachableCopyDoesNotInventSleepOrHealthyICloud() {
         let explanation = MacStatusChipPresentation.explanation(for: .macUnreachable)
         XCTAssertFalse(explanation.contains("iCloud is fine"))

@@ -105,6 +105,23 @@ func browserActiveRunRegistryTargetsExactRunAndProtectsReplacement() {
     #expect(!registry.contains(runID: "run-a"))
 }
 
+@Test @MainActor
+func browserRunCancellationLatchAppliesCancelBeforeAndAfterTaskAttachment() {
+    let early = BrowserRunCancellationLatch()
+    var earlyCalls = 0
+    early.cancel()
+    early.install { earlyCalls += 1 }
+    early.cancel()
+    #expect(earlyCalls == 1)
+
+    let late = BrowserRunCancellationLatch()
+    var lateCalls = 0
+    late.install { lateCalls += 1 }
+    late.cancel()
+    late.cancel()
+    #expect(lateCalls == 1)
+}
+
 @Test
 func browserRunningStatePersistsBeforeTerminalReceipts() async throws {
     let root = try makeU5TempRoot()

@@ -497,10 +497,11 @@ extension SwiftToolDispatcher {
         // and route the append through the shared line cap so the inbox
         // cannot grow unbounded.
         let persistence = SwiftNativePersistenceCore()
+        let quarantineNote = Self.BuilderInboxQuarantineNote()
         let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
             appendResult = try await persistence.withFileLock(inboxURL) {
-                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence)
+                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantineNote)
                 if case .object(let object)? = existing {
                     guard object["text"] == .string(text),
                           object["topic"] == inboxEntry["topic"],
@@ -555,6 +556,7 @@ extension SwiftToolDispatcher {
             "priority": .string(priority),
             "queuedAt": .string(appendResult.queuedAt),
         ]
+        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
@@ -605,15 +607,41 @@ extension SwiftToolDispatcher {
         return state + " For a contextual follow-up, use claude_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id."
     }
 
+    /// Carries a quarantine out of the flock'd read-dedup-append closure, which
+    /// is `@Sendable` and so cannot write to a captured local. Only the send
+    /// that actually quarantined stamps it, so the receipt names THIS call's
+    /// damage — never an older `.quarantined-<ts>` sibling still on disk.
+    final class BuilderInboxQuarantineNote: @unchecked Sendable {
+        private let lock = NSLock()
+        private var quarantinedPath: String?
+        var path: String? { lock.withLock { quarantinedPath } }
+        func record(_ path: String) { lock.withLock { quarantinedPath = path } }
+    }
+
     private static func checkedBuilderInboxMessage(
         _ messageId: String,
         inboxURL: URL,
-        persistence: SwiftNativePersistenceCore
+        persistence: SwiftNativePersistenceCore,
+        quarantine: BuilderInboxQuarantineNote
     ) async throws -> JSONValue? {
         let scan = try await persistence.readJSONLReporting(inboxURL)
         guard scan.report.isClean,
               scan.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else {
-            throw PersistenceCoreError.ioFailure("builder inbox is malformed; original bytes preserved")
+            // Self-heal instead of wedging the bridge. This used to throw, so a
+            // SINGLE torn line failed EVERY later send to that agent until a
+            // human repaired the file by hand — the bridge went dark and stayed
+            // dark. Move the damaged bytes aside (never delete), then return nil
+            // so the caller appends into a fresh inbox. A quarantine failure
+            // still throws: appending onto bytes we could not preserve would be
+            // the silent-drop this path exists to prevent.
+            let aside = try await quarantineBuilderInbox(
+                inboxURL,
+                report: scan.report,
+                parsedRowCount: scan.rows.count,
+                persistence: persistence
+            )
+            quarantine.record(aside.path)
+            return nil
         }
         let matching = scan.rows.filter { row in
             guard case .object(let object) = row else { return false }
@@ -627,6 +655,64 @@ extension SwiftToolDispatcher {
             throw PersistenceCoreError.ioFailure("builder inbox message identity conflicts; original bytes preserved")
         }
         return matching.first
+    }
+
+    /// A quarantined inbox may have held an admission of THIS very message that
+    /// no longer parses, so the send that recovers the bridge has to say so out
+    /// loud. The old behaviour failed every send forever; the new one must not
+    /// trade that for a silent second admission.
+    static func stampBuilderInboxQuarantine(
+        _ note: BuilderInboxQuarantineNote,
+        on response: inout [String: JSONValue]
+    ) {
+        guard let aside = note.path else { return }
+        response["inboxQuarantined"] = .object([
+            "quarantinedPath": .string(aside),
+            "note": .string("The previous inbox was malformed. Its bytes were moved aside, NOT deleted, and a fresh inbox was started so this send could land. An earlier admission of this same message may sit inside the preserved file — reconcile against it before assuming this was the first."),
+        ])
+    }
+
+    /// Rename aside, NEVER delete — the same contract the claude session
+    /// pointer takeover uses for `.stale-<ts>` (script/claude_thread_wakeup.js
+    /// `renameSessionPointerAside`): a file that turns out to be recoverable is
+    /// still on disk, and a human can read `<name>.quarantined-<ts>` to see
+    /// exactly which messages were set aside. An error receipt lands in a
+    /// sibling `bridge-inbox-quarantine.jsonl` so the loss is recorded rather
+    /// than silent. Throws if the bytes could NOT be preserved.
+    private static func quarantineBuilderInbox(
+        _ inboxURL: URL,
+        report: JSONLReadReport,
+        parsedRowCount: Int,
+        persistence: SwiftNativePersistenceCore
+    ) async throws -> URL {
+        let fileManager = FileManager.default
+        let stamp = String(Int(Date().timeIntervalSince1970))
+        var aside = inboxURL.appendingPathExtension("quarantined-\(stamp)")
+        var collision = 1
+        while fileManager.fileExists(atPath: aside.path) {
+            aside = inboxURL.appendingPathExtension("quarantined-\(stamp)-\(collision)")
+            collision += 1
+        }
+        try fileManager.moveItem(at: inboxURL, to: aside)
+        let receipt: [String: JSONValue] = [
+            "event": .string("builder_inbox_quarantined"),
+            "quarantinedAt": .string(ISO8601DateFormatter().string(from: Date())),
+            "inboxPath": .string(inboxURL.path),
+            "quarantinedPath": .string(aside.path),
+            "reason": .string("builder inbox is malformed; original bytes preserved"),
+            "malformedLineCount": .int(Int64(report.malformedLineCount)),
+            "trailingPartialLine": .bool(report.trailingPartialLine),
+            "physicalLineCount": .int(Int64(report.physicalLineCount)),
+            "parsedRowCount": .int(Int64(parsedRowCount)),
+        ]
+        // Best effort: the bytes are already safe, and a receipt write failure
+        // must not turn a recovered send back into a dark bridge.
+        try? await persistence.appendJSONLDurable(
+            .object(receipt),
+            to: inboxURL.deletingLastPathComponent()
+                .appendingPathComponent("bridge-inbox-quarantine.jsonl")
+        )
+        return aside
     }
 
     private static func builderInboxAllowsExplicitWakeRetry(
@@ -895,10 +981,11 @@ extension SwiftToolDispatcher {
         let inboxEntry = row
 
         let persistence = SwiftNativePersistenceCore()
+        let quarantineNote = Self.BuilderInboxQuarantineNote()
         let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
             appendResult = try await persistence.withFileLock(inboxURL) {
-                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence)
+                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantineNote)
                 if case .object(let object)? = existing {
                     guard object["text"] == .string(text),
                           object["topic"] == inboxEntry["topic"],
@@ -953,6 +1040,7 @@ extension SwiftToolDispatcher {
             "timeoutSeconds": .int(Int64(timeoutSeconds)),
             "note": .string("OMP's final reply returns as a separate bridge event. For a contextual follow-up, call omp_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id."),
         ]
+        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let topic { response["topic"] = .string(topic) }
         if let conversationId = conversation.conversationId {
             response["conversationId"] = .string(conversationId)
@@ -1550,10 +1638,11 @@ extension SwiftToolDispatcher {
         let inboxEntry = entry
 
         let persistence = SwiftNativePersistenceCore()
+        let quarantineNote = Self.BuilderInboxQuarantineNote()
         let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
             appendResult = try await persistence.withFileLock(inboxURL) {
-                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence)
+                let existing = try await Self.checkedBuilderInboxMessage(messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantineNote)
                 if case .object(let object)? = existing {
                     // Inbox persistence precedes helper admission. An explicit
                     // retry must keep that exact work order, including its
@@ -1607,6 +1696,7 @@ extension SwiftToolDispatcher {
                 ? "NativeAgent queues the note and records Codex's terminal receipt without creating another Agent chat turn. Failures still return visibly."
                 : "NativeAgent queues the inbox row, attempts a Mac notification, wakes Codex, and watches for the final answer. For a contextual follow-up, call codex_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id. If Codex is busy, the wake remains queued until that thread is idle."),
         ]
+        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }

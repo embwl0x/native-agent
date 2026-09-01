@@ -276,6 +276,12 @@ struct MacStatusChip: View {
                 Text(shortLabel)
                     .font(AppFont.tag)
                     .foregroundStyle(status.color)
+                    // Navigation bars aggressively compress leading items when
+                    // adjacent controls are present. A two-line status chip is
+                    // never useful ("Live" became "Liv" / "e" on iPhone), so
+                    // preserve the compact label's intrinsic width.
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             .padding(.horizontal, isHealthy ? 2 : 7)
             .padding(.vertical, isHealthy ? 2 : 3)
@@ -287,7 +293,7 @@ struct MacStatusChip: View {
             // A bare 8pt dot is far under the 44pt minimum target, so pad the
             // hit area without padding the visual.
             .contentShape(Rectangle())
-            .frame(minWidth: 32, minHeight: 32)
+            .frame(minWidth: 44, minHeight: 44)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Mac connection: \(status.displayName)")

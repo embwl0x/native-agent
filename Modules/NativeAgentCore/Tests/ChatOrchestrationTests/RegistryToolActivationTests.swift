@@ -305,13 +305,24 @@ import PersistenceCore
     @Test func registryToolMayNeverShadowReservedBuiltInName() async throws {
         let root = try makeRoot()
         // A malicious/confused registry entry named "shell" with its own
-        // manifest must never publish a schema — the dispatch switch matches
-        // the built-in case first, so the schema would lie.
+        // manifest, or a dotted alias that dispatch canonicalizes to a native
+        // name, must never publish a name/schema — the native route wins.
         _ = try seedActiveTool(root, id: "shell", entrypointBody: nil)
-        try writeRegistry(root, records: [["id": "shell", "name": "shell", "status": "active", "createdAt": "2026-07-01T00:00:00Z"]])
-        let schemas = try await SwiftToolDispatcher(dataRoot: root).listAvailableToolSchemas()
+        _ = try seedActiveTool(root, id: "desk.read", entrypointBody: nil)
+        try writeRegistry(root, records: [
+            ["id": "shell", "name": "shell", "status": "active", "createdAt": "2026-07-01T00:00:00Z"],
+            ["id": "desk.read", "name": "desk.read", "status": "active", "createdAt": "2026-07-01T00:00:00Z"],
+        ])
+        let dispatcher = SwiftToolDispatcher(dataRoot: root)
+        let names = try await dispatcher.listAvailableTools()
+        let schemas = try await dispatcher.listAvailableToolSchemas()
         // Full Mac is off in this root, so no built-in shell schema either —
         // and the registry copy must not sneak in as a stand-in.
+        #expect(!names.contains("shell"))
+        #expect(!names.contains("desk.read"))
         #expect(!schemas.contains { $0.name == "shell" })
+        #expect(!schemas.contains { $0.name == "desk.read" })
+        // The real native spelling remains available under its own contract.
+        #expect(names.contains("desk_read"))
     }
 }

@@ -173,7 +173,12 @@ func codexMessageRetryKeepsExactOperation() async throws {
     #expect(await wakeups.count == 2)
 }
 
-@Test("codex_message does not append or wake through a malformed inbox")
+// Retargeted 2026-08-31 with the quarantine contract (the claude/omp twin is
+// malformedInboxIsQuarantinedAsideAndReportedInsteadOfWedgingTheBridge): a
+// malformed inbox used to fail every later send until a human repaired the
+// file; it now self-heals, preserving the damaged bytes aside and naming the
+// quarantine in the receipt.
+@Test("codex_message quarantines a malformed inbox aside and proceeds")
 func codexMessageRetryPreservesMalformedInbox() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("codex-malformed-retry-\(UUID().uuidString)")
     let inbox = root.appendingPathComponent("codex-nativeagent-bridge/codex-inbox.jsonl")
@@ -193,9 +198,20 @@ func codexMessageRetryPreservesMalformedInbox() async throws {
     let result = try await dispatcher.dispatch(tool: "codex_message", input: [
         "text": .string("same uncertain operation"), "message_id": .string("uncertain")
     ], surface: "chat")
-    #expect(codexInboxObject(result)?["reason"] == .string("inbox_write_failed"))
-    #expect(await wakeups.count == 0)
-    #expect(try Data(contentsOf: inbox) == bytes)
+    let envelope = try #require(codexInboxObject(result))
+    #expect(envelope["reason"] != .string("inbox_write_failed"))
+    #expect(await wakeups.count == 1)
+    // Damaged bytes preserved aside verbatim, receipt naming the quarantine.
+    guard case .object(let quarantine)? = envelope["inboxQuarantined"],
+          case .string(let asidePath)? = quarantine["quarantinedPath"] else {
+        Issue.record("expected an inboxQuarantined receipt naming the preserved bytes: \(result)")
+        return
+    }
+    #expect(asidePath.hasPrefix(inbox.path + ".quarantined-"))
+    #expect(try Data(contentsOf: URL(fileURLWithPath: asidePath)) == bytes)
+    // The fresh inbox carries exactly this send.
+    let rows = try await SwiftNativePersistenceCore().readJSONL(inbox)
+    #expect(rows.count == 1)
 }
 
 @Test("codex_message preserves uncertain consumption markers", arguments: ["missingRead", "invalidRead", "invalidConsumedAt"])

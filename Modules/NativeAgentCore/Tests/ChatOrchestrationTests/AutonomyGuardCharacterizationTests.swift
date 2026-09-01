@@ -488,7 +488,7 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
     #expect(await dispatched(chain, "persona_append_section", input: input))
 }
 
-@Test func AutonomyGuardCharacterization_COMPOSED_changedPersonaReplay_failsClosed() async throws {
+@Test func AutonomyGuardCharacterization_COMPOSED_changedPersonaReplay_failsClosedOutsideYolo() async throws {
     let approvedInput: [String: JSONValue] = [
         "kind": .string("soul"),
         "title": .string("Bounded note"),
@@ -504,7 +504,7 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
         verifiedUserID: nil
     )
     let chain = try await composedChain(
-        policy: personalPolicy(),
+        policy: personalShellConfirmPolicy(),
         verifiedSessionId: "session-mismatch",
         approvedReplay: replay
     )
@@ -547,22 +547,22 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
     #expect(!(await dispatched(chain, "persona_append_section", input: input)))
 }
 
-@Test func AutonomyGuardCharacterization_GitHub_mutation_fails_closed_without_filer_even_in_yolo() async throws {
+@Test func AutonomyGuardCharacterization_GitHub_mutation_runs_without_filer_in_admittedYolo() async throws {
     let chain = try await composedChain(policy: yoloInstallConfirmPolicy(developerMode: true))
     #expect(await dispatched(chain, "github_status"), "GitHub safe read should reach the native connector")
     #expect(
-        !(await dispatched(
+        await dispatched(
             chain,
             "github_mutate",
             input: [
                 "operation": .string("comment_issue"),
                 "repo": .string("owner/repo"),
                 "number": .int(1),
-                "body": .string("must never reach inner without approval"),
+                "body": .string("admitted operator requested this mutation"),
             ],
             surface: "codex-bridge"
-        )),
-        "GitHub external writes must fail closed when the bridge has no approval filer"
+        ),
+        "admitted Full Mac YOLO must not depend on an approval filer"
     )
 }
 

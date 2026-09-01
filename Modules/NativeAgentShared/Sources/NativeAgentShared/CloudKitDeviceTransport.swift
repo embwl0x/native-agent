@@ -444,12 +444,14 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         do {
             var records = try await pull(
                 recordType: NADeviceSyncRecordType.chatMessage,
-                since: since
+                since: since,
+                inboundDirection: inbound
             )
             if role == .ios {
                 records += try await pull(
                     recordType: NADeviceSyncRecordType.notification,
-                    since: since
+                    since: since,
+                    inboundDirection: inbound
                 )
             }
             fetched = records
@@ -950,20 +952,28 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     // MARK: pull (cursor-paginated)
 
+    /// The deployed container does not permit range predicates on either the
+    /// private `___modTime` field or our ISO-string `createdAt` field. Filter by
+    /// the indexed direction, sort newest-first by `createdAt`, and page until
+    /// a page crosses the durable server-date watermark. This keeps quiet polls
+    /// to one bounded page while still draining bursts larger than one page.
+    static func makePullPredicate(inboundDirection: String) -> NSPredicate {
+        NSPredicate(format: "direction == %@", inboundDirection)
+    }
+
     private func pull(
         recordType: String,
-        since: Date?
+        since: Date?,
+        inboundDirection: String
     ) async throws -> [(fields: NAChatMessageFields, modDate: Date?)] {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
         do {
             return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull") {
-                let predicate: NSPredicate
-                if let ts = since {
-                    predicate = NSPredicate(format: "modificationDate > %@", ts as NSDate)
-                } else {
-                    predicate = NSPredicate(value: true)
-                }
-                let query = CKQuery(recordType: recordType, predicate: predicate)
+                let query = CKQuery(
+                    recordType: recordType,
+                    predicate: Self.makePullPredicate(inboundDirection: inboundDirection)
+                )
+                query.sortDescriptors = [NSSortDescriptor(key: "createdAt", ascending: false)]
 
                 var combined: [(fields: NAChatMessageFields, modDate: Date?)] = []
                 var nextCursor: CKQueryOperation.Cursor? = nil
@@ -979,6 +989,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                         break
                     }
                     op.qualityOfService = .userInitiated
+                    op.resultsLimit = 200
 
                     let holder = DeviceCKPullPageHolder()
                     let modHolder = DeviceCKModDateHolder()
@@ -1021,7 +1032,13 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                     for f in page.records {
                         combined.append((f, modHolder.get(f.recordName)))
                     }
-                    nextCursor = page.cursor
+                    let crossedWatermark = since.map { watermark in
+                        page.records.contains { fields in
+                            guard let modDate = modHolder.get(fields.recordName) else { return false }
+                            return modDate <= watermark
+                        }
+                    } ?? false
+                    nextCursor = crossedWatermark ? nil : page.cursor
                 } while nextCursor != nil
 
                 return combined

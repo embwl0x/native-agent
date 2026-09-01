@@ -26,7 +26,7 @@ struct FeedAndBackgroundWave1ContractTests {
         let unconditional: Set<String> = [
             "doctor_auto_run", "full_mac_expiry", "turn_trace_retention",
             "evolution_proposal_retention", "data_root_disk_hygiene", "memory_consolidation",
-            "self_improvement_sweep", "rem_cycle", "trigger_scheduler_due_work",
+            "self_improvement_sweep", "trigger_scheduler_due_work",
             "mission_executor", "workshop_pump", "cognition_maintenance", "cognition_replay",
             "cognition_reflection", "heartbeat", "self_healing", "autonomy_promotion_proposals",
             "desk_notify", "delegation_outcome", "github_tracking",
@@ -45,6 +45,19 @@ struct FeedAndBackgroundWave1ContractTests {
         #expect(ids.count == expected.count, "a duplicate id overwrites a loop inside the manager")
         #expect(Set(ids) == expected, "a missing manifest id silently deletes its owner from production")
         #expect(!ids.contains("dream_cycle"), "the TriggerScheduler owns the nightly dream deadline")
+        // Retired 2026-08-31. `nativeagent-weekly-rem` (Sun 04:30 America/Chicago)
+        // is the sole owner of weekly REM; a duplicate loop here ticks, produces
+        // nothing, and eventually trips Doctor's dormancy bound on a healthy lane.
+        #expect(!ids.contains("rem_cycle"), "the TriggerScheduler owns the weekly REM deadline")
+        // Negative control for the retirement: the surviving weekly lanes that
+        // share rem_cycle's cadence and its stale-looking 2026-08-28 tick stamp
+        // are NOT duplicates and must stay registered — memory_consolidation is
+        // the only producer of the weekly memory-hygiene approval card, and
+        // self_improvement_sweep the only producer of the weekly digest.
+        #expect(ids.contains("memory_consolidation"))
+        #expect(ids.contains("self_improvement_sweep"))
+        #expect(ids.contains("trigger_scheduler_due_work"),
+                "the nightly-dream / weekly-REM owner must stay registered")
 
         for remoteId in ["telegram_poll", "slack_socket_mode"] {
             let runner = try #require(loops.first { $0.loopId == remoteId })

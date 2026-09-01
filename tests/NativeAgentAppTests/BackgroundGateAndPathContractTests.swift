@@ -39,15 +39,24 @@ struct BackgroundGateAndPathContractTests {
 
     // MARK: - isWideOpenTrust
 
-    @Test("wide-open trust is exactly two literals and nothing else")
-    func isWideOpenTrustAcceptsExactlyTheTwoWideOpenLevels() async throws {
-        // Accepted.
-        for level in ["full_mac_os", "wide_open_receipts"] {
+    @Test("wide-open trust requires a checked active Full Mac grant")
+    func isWideOpenTrustAcceptsOnlyActiveFullMacAuthority() async throws {
+        // Both supported persisted spellings normalize to active Full Mac only
+        // with their complete authority shape.
+        for (level, outside) in [
+            ("full_mac_os", "deny"),
+            ("wide_open_receipts", "allow"),
+        ] {
             let root = try gateTempRoot("wideopen-\(level)")
             defer { try? FileManager.default.removeItem(at: root) }
-            try seedTrustPolicy(.object(["permissionLevel": .string(level)]), at: root)
+            try seedTrustPolicy(.object([
+                "permissionLevel": .string(level),
+                "fullMacNeverExpires": .bool(true),
+                "fullMacExpiresAt": .string("never"),
+                "filePolicy": .object(["outsideWorkspaceDefault": .string(outside)]),
+            ]), at: root)
             let allowed = await BackgroundLoopsAssembly.isWideOpenTrust(dataRoot: root)
-            #expect(allowed, "\(level) is a wide-open posture")
+            #expect(allowed, "\(level) is an active wide-open posture")
         }
 
         // Refused — including near-misses that a sloppy contains/case-insensitive
@@ -61,6 +70,10 @@ struct BackgroundGateAndPathContractTests {
             ("bool", .object(["permissionLevel": .bool(true)])),
             ("null", .object(["permissionLevel": .null])),
             ("absent", .object(["enableAutonomy": .bool(true)])),
+            ("expired", .object([
+                "permissionLevel": .string("full_mac_os"),
+                "fullMacExpiresAt": .string("2020-01-01T00:00:00Z"),
+            ])),
         ]
         for (label, policy) in refusals {
             let root = try gateTempRoot("wideopen-deny-\(label)")
@@ -88,22 +101,14 @@ struct BackgroundGateAndPathContractTests {
         #expect(!corrupt, "an unreadable policy must never read as wide-open")
     }
 
-    @Test("the wide-open literals match the Trust Center's own permission vocabulary")
-    func wideOpenLiteralsAreTheTrustCenterVocabulary() throws {
-        // A rename on either side is silent: the gate would simply stop matching
-        // and unattended execution would go quiet forever. Pin both spellings
-        // against the app sources that render/write them.
+    @Test("the background gate delegates to checked SecurityCenter authority")
+    func wideOpenGateUsesCanonicalCheckedAuthority() throws {
+        // This gate must never return to raw permission-label matching: that
+        // ignores expiry, corruption, explicit blocks, and origin admission.
         let gate = try AppSourceScraping.appSource("BackgroundLoopsAssembly+WorkshopExecution.swift")
-        #expect(gate.contains("\"full_mac_os\""))
-        #expect(gate.contains("\"wide_open_receipts\""))
-
-        let appRoot = try AppSourceScraping.appSourcesRoot()
-        let all = try AppSourceScraping.swiftSourceContents(under: appRoot)
-        for literal in ["\"full_mac_os\"", "\"wide_open_receipts\""] {
-            let users = all.filter { $0.source.contains(literal) }.map(\.file)
-            #expect(users.count >= 2,
-                    "\(literal) is only referenced by the gate itself — the vocabulary it gates on is gone")
-        }
+        #expect(gate.contains(".fullMacYoloAuthority("))
+        #expect(gate.contains("return assessment.admitted"))
+        #expect(!gate.contains("policy[\"permissionLevel\"]"))
     }
 
     // MARK: - workshopEnabledGate

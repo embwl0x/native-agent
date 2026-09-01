@@ -260,8 +260,12 @@ enum NativeMacPowerPanelPresentation {
         )
     }
 
-    static func action(requiresApproval: Bool?, dryRunAvailable: Bool?) -> Action {
-        if requiresApproval != false {
+    static func action(
+        requiresApproval: Bool?,
+        dryRunAvailable: Bool?,
+        fullMacYoloAdmitted: Bool = false
+    ) -> Action {
+        if requiresApproval != false, !fullMacYoloAdmitted {
             return Action(
                 canDryRun: dryRunAvailable != false,
                 canRun: false,
@@ -473,6 +477,10 @@ struct CapabilitiesView: View {
     @State private var catalogSourceName = "Local NativeAgent Catalog"
     @State private var catalogSourceURL = ""
     @State private var catalogSourceOutcome: AppModel.CapabilityCatalogSourceSaveOutcome?
+    /// Per-action result from the checked SecurityCenter authority owner.
+    /// Missing stays conservative: the Run button remains disabled until a
+    /// current policy/origin read proves admitted Full Mac YOLO.
+    @State private var nativeActionYoloAdmission: [String: Bool] = [:]
     private let loadsOnAppear: Bool
     // 2026-07-22 page-tighten: the two heaviest always-expanded blocks
     // (Next-Gen Runtime migration cockpit in Overview, MCP Builder in Build —
@@ -521,12 +529,14 @@ struct CapabilitiesView: View {
         .task {
             guard loadsOnAppear else { return }
             await appModel.refreshForSidebarItem(.capabilities)
+            await refreshNativeActionYoloAdmission()
             await refreshResearchLabRuns()
         }
         .toolbar {
             Button("Refresh", systemImage: "arrow.clockwise") {
                 Task {
                     await appModel.refreshForSidebarItem(.capabilities)
+                    await refreshNativeActionYoloAdmission()
                     await refreshResearchLabRuns()
                 }
             }
@@ -1418,7 +1428,8 @@ struct CapabilitiesView: View {
                         ForEach(appModel.nativeActions.prefix(6)) { action in
                             let actionPresentation = NativeMacPowerPanelPresentation.action(
                                 requiresApproval: action.requiresApproval,
-                                dryRunAvailable: action.dryRunAvailable
+                                dryRunAvailable: action.dryRunAvailable,
+                                fullMacYoloAdmitted: nativeActionYoloAdmission[action.id] == true
                             )
                             HStack(alignment: .top, spacing: 10) {
                                 CapabilityDetailRow(
@@ -1492,6 +1503,21 @@ struct CapabilitiesView: View {
 
             CapabilityProductionHardeningPanel()
         }
+    }
+
+    @MainActor
+    private func refreshNativeActionYoloAdmission() async {
+        let actionIDs = appModel.nativeActions
+            .filter { $0.requiresApproval != false }
+            .map(\.id)
+        var checked: [String: Bool] = [:]
+        for actionID in actionIDs {
+            checked[actionID] = await appModel.fullMacYoloAuthorityAdmitted(
+                tool: actionID,
+                surface: "native_actions"
+            )
+        }
+        nativeActionYoloAdmission = checked
     }
 }
 

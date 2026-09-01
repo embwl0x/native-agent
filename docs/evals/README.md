@@ -17,7 +17,7 @@ after every gate succeeds. A historical receipt never certifies later edits.
 | Command | Scope and effects |
 |---|---|
 | `./script/evals.sh` | Smoke, read-only instrument over the checkout's `data/`, synthetic turn/range tests, ledger keeper and surface-contract checks. Not the full regression gate; duration varies. |
-| `./script/evals.sh --changed <sha>` | Ledger-mapped checks for one commit plus keeper/contract checks. Fails on unmapped executable coverage or zero selected tests; not proof of unselected behavior. |
+| `./script/evals.sh --changed <sha>` | Ledger-mapped checks for one commit plus keeper/contract checks, including focused iOS simulator classes referenced by changed surfaces. Fails on unmapped executable coverage or zero selected tests; not proof of unselected behavior. |
 | `./script/evals.sh --ios` | Adds required iOS simulator execution. |
 | `./script/evals.sh --ui` | Adds a strict Accessibility walk of the installed app; it interacts with UI. |
 | `./script/evals.sh --full` | Adds feed observations, the canonical gate with required iOS, then installs and verifies the built app if prerequisites pass. **Mutates the installed app.** Does not imply `--ui`. |
@@ -37,6 +37,15 @@ It is not a statement that the evaluator ran on HEAD, or that every failure
 hypothesis/proposed eval in the original row has been resolved. Recorded audit
 run notes and dated campaign lists remain historical evidence. The keeper and
 structural contracts check inventory consistency, not all runtime behavior.
+Catalog membership or reaching a known dispatch boundary is only reachability
+evidence: the merge refuses to label the exhaustive route probes as asserting
+functional tool coverage. A tool needs a valid-input behavior test at its
+owning implementation before that route can be marked covered.
+
+Every eval entry point also validates current `coverage-overrides.json` test
+paths, path-qualified line anchors, and `[swift-filter: ...]` selectors. Historical
+phase-1 prose remains dated evidence, but a post-inventory override cannot keep
+certifying a deleted test, an out-of-range line, or a vanished suite.
 
 Update canonical inputs, then regenerate both outputs:
 

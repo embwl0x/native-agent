@@ -829,6 +829,10 @@ struct SlackSocketModeLoop: LoopRunner {
         max(config.historyPollInterval * 10, 900)
     }
     static let shortLivedSessionFloor: TimeInterval = 30
+    /// Bounded window in which already-accepted work may finish before the
+    /// tick cancels it. Used after a socket-open failure and after a PLANNED
+    /// session teardown; see `teardownGrace`.
+    static let inFlightCompletionGrace: TimeInterval = 30
 
     /// Base reconnect spacing between socket sessions. A tick IS one session,
     /// so `interval` is the reconnect delay after a session that ended without
@@ -887,7 +891,7 @@ struct SlackSocketModeLoop: LoopRunner {
         // Socket-open failure must still give bot-token/prepared recovery a
         // bounded opportunity to finish. A held chat turn cannot postpone the
         // next connection attempt forever, and cancellation skips this grace.
-        _ = await inFlight.waitForCompletion(timeout: 30)
+        _ = await inFlight.waitForCompletion(timeout: Self.inFlightCompletionGrace)
         await inFlight.cancelAndWaitAll()
         return outcome
     }
@@ -920,7 +924,7 @@ struct SlackSocketModeLoop: LoopRunner {
             }
             defer { recycleTask.cancel() }
             do {
-                try await receiveLoop(socket: socket)
+                try await receiveLoop(socket: socket, recycleFlag: recycleFlag)
                 socket.cancel()
                 if Task.isCancelled {
                     await writeState([
@@ -1052,7 +1056,10 @@ struct SlackSocketModeLoop: LoopRunner {
         return url
     }
 
-    private func receiveLoop(socket: SlackSocketConnection) async throws {
+    private func receiveLoop(
+        socket: SlackSocketConnection,
+        recycleFlag: SlackSessionRecycleFlag
+    ) async throws {
         let pingTask = Task {
             await pingUntilCancelled(socket: socket)
         }
@@ -1067,21 +1074,52 @@ struct SlackSocketModeLoop: LoopRunner {
         do {
             try await receiveLoopBody(socket: socket)
         } catch {
-            await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
+            await drainSessionWork(
+                pingTask: pingTask,
+                historyPollTask: historyPollTask,
+                grace: Self.teardownGrace(closing: error, recyclePlanned: recycleFlag.didFire)
+            )
             throw error
         }
-        await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
+        await drainSessionWork(
+            pingTask: pingTask,
+            historyPollTask: historyPollTask,
+            grace: Self.teardownGrace(closing: nil, recyclePlanned: recycleFlag.didFire)
+        )
+    }
+
+    /// A session that ends ON PURPOSE — the hourly recycle, or Slack's routine
+    /// `refresh_requested`/`warning` rotation — used to cancel in-flight chat
+    /// generation the instant the socket closed. That leaves the journal row in
+    /// `.generating`, which recovery parks as `outcome_unknown` and never
+    /// auto-retries (guarding against duplicated tool effects), so the user's
+    /// message silently never gets a reply. Give planned teardown a bounded
+    /// grace to finish the turn first. Unplanned failure keeps the prompt
+    /// cancel: reconnection must not wait on a session that is already broken,
+    /// and the crash/fatal-disconnect semantics stay exactly as they were.
+    static func teardownGrace(closing error: Error?, recyclePlanned: Bool) -> TimeInterval {
+        // Same precedence as `classifySessionClosure`: a fatal disconnect racing
+        // the recycle timer is a broken socket, not a planned teardown.
+        if let error, let closure = error as? SlackSocketSessionClosure,
+           case .disconnect(let reason) = closure {
+            return disconnectDisposition(forReason: reason) == .routine ? inFlightCompletionGrace : 0
+        }
+        return recyclePlanned ? inFlightCompletionGrace : 0
     }
 
     private func drainSessionWork(
         pingTask: Task<Void, Never>,
-        historyPollTask: Task<Void, Never>
+        historyPollTask: Task<Void, Never>,
+        grace: TimeInterval = 0
     ) async {
         pingTask.cancel()
         historyPollTask.cancel()
         await socketHealth.markDisconnected()
         await historyPollTask.value
         await pingTask.value
+        // Canonical loop cancellation short-circuits this wait, so stopping the
+        // loop stays prompt.
+        if grace > 0 { _ = await inFlight.waitForCompletion(timeout: grace) }
         await inFlight.cancelAndWaitAll()
     }
 

@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import ChatOrchestration
+@testable import NativeAgentApp
 
 // THE KEEPER. docs/evals/ledger.json is the eval-of-the-evals: one row per
 // observable surface. This test enumerates what can be enumerated MECHANICALLY
@@ -51,8 +52,9 @@ struct EvalCoverageLedgerTests {
         // 2. Mac screens + 3. iOS screens
         for f in Self.files(under: "Sources/NativeAgentApp", suffix: "View.swift") { expected.append("screen:\(f.split(separator: "/").last!)") }
         for f in Self.files(under: "iOS/NativeAgentMobile", suffix: "View.swift") where !f.contains("Tests") { expected.append("screen:\(f.split(separator: "/").last!)") }
-        // 4. built-in tool names
-        for t in SwiftToolDispatcher.builtInToolNames { expected.append("tool:\(t)") }
+        // 4. Core and app-owned native tool names
+        for t in SwiftToolDispatcher.reservedBuiltInNames { expected.append("tool:\(t)") }
+        for t in AppChatToolDispatcher.catalogRegisteredToolNames { expected.append("tool:\(t)") }
         // 5. @AppStorage keys in the Mac app
         for f in Self.files(under: "Sources/NativeAgentApp", suffix: ".swift") {
             let text = (try? String(contentsOf: Self.repo.appendingPathComponent("Sources/NativeAgentApp/\(f)"), encoding: .utf8)) ?? ""

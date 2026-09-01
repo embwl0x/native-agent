@@ -240,13 +240,12 @@ func macNudge_andMacClick_bothDispatchWithNoApprovalFiler() async throws {
     #expect(clicked == .object(["reached_inner": .bool(true), "tool": .string("mac_click")]),
             "mac_click reaches the inner dispatcher on a filer-less chain post-cutover")
 
-    // TEETH: the chain still gates SOMETHING on this exact fixture — a tool
-    // that kept its deliberate confirm floor (self_install) still cannot run
-    // with no filer wired. Without this, the two assertions above could pass on
-    // a dispatcher that had stopped gating entirely.
+    // TEETH: a claimed remote surface without authenticated origin evidence
+    // still cannot inherit the local grant. Without this, the two assertions
+    // above could pass on a dispatcher that had stopped checking admission.
     await #expect(throws: (any Error).self,
-                  "self_install kept its floor — a filer-less chain must still refuse it") {
-        _ = try await gated.dispatch(tool: "self_install", input: [:], surface: "chat")
+                  "untrusted Telegram must be refused without creating a prompt") {
+        _ = try await gated.dispatch(tool: "self_install", input: [:], surface: "telegram")
     }
 }
 
@@ -265,11 +264,13 @@ func macNudge_resolvesToAutoLikeMacAXStatus() async throws {
     // execution ungated. OLD CONTRACT: mac_click was pinned to send_approval
     // here, as the approval-tier neighbour that proved this test was not just
     // reading "auto everywhere". NEW CONTRACT: the whole motor family resolves
-    // auto, so the contrast row moves to a floor that SURVIVED the cutover.
+    // auto, so the contrast row is an untrusted remote origin.
     let clickLevel = try await gate.autonomyLevel(toolName: "mac_click", surface: "chat", originTrusted: true)
     #expect(clickLevel == "auto", "mac_click resolves auto post-cutover (got \(clickLevel))")
-    let floored = try await gate.autonomyLevel(toolName: "self_install", surface: "chat", originTrusted: true)
-    #expect(floored != "auto", "self_install kept its floor — teeth for the auto assertions above")
+    let outsider = try await gate.autonomyLevel(
+        toolName: "self_install", surface: "telegram", originTrusted: false
+    )
+    #expect(outsider != "auto", "untrusted Telegram cannot inherit YOLO")
 
     // The store-level tier is EXPLICIT in the defaults, under both spellings.
     let policyObj = await SwiftNativeTrustCenter(dataRoot: root).loadTrustPolicy()
