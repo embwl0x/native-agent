@@ -265,6 +265,28 @@ private actor EphemeralWorkshopCognitionProbe: CognitiveRuntimeProviding {
 
 @Suite("Workshop ephemeral tool turn")
 struct WorkshopExecutionEphemeralToolTurnTests {
+    @Test func revokedAdmissionAfterPreparationNeverCallsProvider() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ephemeral-admission-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let adapter = EphemeralWorkshopToolCallingAdapter()
+        let router = EphemeralWorkshopExecutionRouter()
+        let llm = SwiftNativeLLMClient(router: router, codex: adapter, anthropic: adapter, openAI: adapter,
+                                       moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot())
+        let tools = EphemeralWorkshopToolIdentityProbe()
+        let trust = SwiftNativeTrustCenter(dataRoot: root)
+        let engine = SwiftNativeTurnEngine(persona: hermeticPersona(root: root), memory: nil, router: router,
+                                          trust: trust, llm: llm, tools: tools, memoryPromoter: nil)
+        let client = SwiftNativeChatOrchestrationClient(engine: engine, tools: tools, llm: llm,
+                                                       dataRoot: root, trust: trust, promoter: nil)
+        await #expect(throws: CancellationError.self) {
+            try await client.runEphemeralToolTurn(message: "Prepare a background turn.", surface: "workshop",
+                providerAdmission: { throw CancellationError() })
+        }
+        #expect(adapter.sessions().isEmpty)
+        #expect(await tools.captured().isEmpty)
+    }
+
     @Test(arguments: [false, true])
     func exhaustedEphemeralTurnRequiresTypedCompletionOnlyWhenRequested(requireCompleted: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ephemeral-incomplete-\(UUID().uuidString)")

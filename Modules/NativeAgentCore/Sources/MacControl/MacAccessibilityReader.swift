@@ -467,6 +467,9 @@ public protocol MacAXElementSource: Sendable {
     func frontmostApp() -> MacAXAppInfo?
     /// Frontmost (focused, else main, else first) window of the frontmost app.
     func frontmostWindowRoot() -> MacAXElementRef?
+    /// Whether global wheel input at this point still lands in the captured
+    /// container. Live AX handles are reminted, so compare underlying elements.
+    func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool
     /// The same window choice inside a NAMED process, or nil when that process
     /// has no readable window. `mac_act`'s identity guard (gpt-5.5 round-2 B3)
     /// re-compiles the window it is about to act in, and that window belongs to
@@ -491,6 +494,41 @@ public protocol MacAXElementSource: Sendable {
     /// pid, and nil otherwise — absence over a wrong answer, like every other
     /// member here.
     func appInfo(pid: Int32) -> MacAXAppInfo?
+    /// fable51 item 32a — every app with a user interface that is running RIGHT
+    /// NOW, so a caller can name one and have its window read without
+    /// activating it. Enumeration only: nothing here focuses, launches or quits
+    /// anything.
+    ///
+    /// Default: whatever is frontmost, which is the truthful answer for a
+    /// single-tree synthetic source — it knows of exactly one app, and claiming
+    /// to know of others would make background sight testable against a
+    /// fiction.
+    func runningApps() -> [MacAXAppInfo]
+    /// fable51 item 29 — the app's `AXMenuBar` element, or nil when it has
+    /// none. Its own member rather than a role the ordinary walk may reach:
+    /// every window walk in this module DELIBERATELY refuses to descend into a
+    /// menu bar (400 items would eat the node budget on every look), and this
+    /// keeps that refusal intact while giving the menu organ its one door.
+    ///
+    /// Default nil — a synthetic source has no menu bar unless it says it does,
+    /// and "no menu bar" is a truthful answer that the organ reports in words.
+    func menuBarRoot(pid: Int32) -> MacAXElementRef?
+    /// fable51 item 33 — the FILE the app's front window is showing, as a
+    /// filesystem path, when the app names one (`AXDocument`). This is the one
+    /// question that decides whether `read` can go to the source instead of
+    /// scraping the screen: a PDF viewer that names its file is a document to
+    /// be extracted, and a window that names nothing is a surface to be
+    /// accumulated.
+    ///
+    /// Its own member rather than a field on `MacAXAttributes` because it is
+    /// ONE attribute on ONE element (the window root) and every other walk in
+    /// this module reads attributes for hundreds of nodes per frame — putting
+    /// it there would buy a per-node AX round trip for an answer only this
+    /// organ asks for.
+    ///
+    /// Default nil — a synthetic source names no file unless it says it does,
+    /// and "no document" is a truthful answer the organ reports in words.
+    func frontmostDocumentPath(pid: Int32) -> String?
     /// Currently open native menus belonging to this frontmost app. They can
     /// be application siblings, not descendants of its document window.
     /// These roots are never window-relative action addresses.
@@ -523,6 +561,10 @@ public protocol MacAXElementSource: Sendable {
 }
 
 public extension MacAXElementSource {
+    func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool {
+        frontmostApp()?.processIdentifier == pid && frontmostWindowRoot() == window
+            && attributes(of: container)?.frame == frame
+    }
     func transientMenuRoots(pid: Int32) -> [MacAXElementRef] { [] }
     func childCount(of ref: MacAXElementRef) -> Int { children(of: ref).count }
     func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef] {
@@ -550,6 +592,9 @@ public extension MacAXElementSource {
         guard let app = frontmostApp(), app.processIdentifier == pid else { return nil }
         return app
     }
+    func runningApps() -> [MacAXAppInfo] { [frontmostApp()].compactMap { $0 } }
+    func menuBarRoot(pid: Int32) -> MacAXElementRef? { nil }
+    func frontmostDocumentPath(pid: Int32) -> String? { nil }
 }
 
 // MARK: - Pure reader
@@ -860,6 +905,26 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         AXIsProcessTrusted()
     }
 
+    public func documentScrollTargetIsCurrent(window: MacAXElementRef, container: MacAXElementRef, frame: MacAXFrame, pid: Int32) -> Bool {
+        guard frontmostApp()?.processIdentifier == pid,
+              let current = frontmostWindowRoot(), let currentElement = element(current),
+              let original = element(window), CFEqual(currentElement, original),
+              let target = element(container), attributes(of: container)?.frame == frame else { return false }
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(
+            AXUIElementCreateSystemWide(), Float(frame.x + frame.w / 2),
+            Float(frame.y + frame.h / 2), &hit
+        ) == .success else { return false }
+        // A sheet, popup, overlapping window, or sibling scroll area is not
+        // the document, even when the foreground PID has not changed.
+        for _ in 0..<64 {
+            guard let node = hit else { return false }
+            if CFEqual(node, target) { return true }
+            hit = copyElement(node, kAXParentAttribute)
+        }
+        return false
+    }
+
     public func frontmostApp() -> MacAXAppInfo? {
         #if canImport(AppKit)
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
@@ -880,6 +945,57 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         #else
         return nil
         #endif
+    }
+
+    /// fable51 item 32a. `.regular` only: accessory and prohibited-policy
+    /// processes are menu-bar items and daemons with no window to read, and
+    /// listing them would fill an "app not running" refusal with names that can
+    /// never be answers.
+    public func runningApps() -> [MacAXAppInfo] {
+        #if canImport(AppKit)
+        return NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && !$0.isTerminated }
+            .map { app in
+                MacAXAppInfo(
+                    name: app.localizedName ?? app.bundleIdentifier ?? "unknown",
+                    bundleIdentifier: app.bundleIdentifier,
+                    processIdentifier: app.processIdentifier
+                )
+            }
+        #else
+        return []
+        #endif
+    }
+
+    /// fable51 item 29. One attribute read on the application element; no walk
+    /// happens here — `MacMenuBar.read` owns the bounded descent.
+    public func menuBarRoot(pid: Int32) -> MacAXElementRef? {
+        #if canImport(AppKit)
+        guard pid != getpid(), isTrusted() else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        guard let bar = copyElement(app, kAXMenuBarAttribute) else { return nil }
+        return mint(bar)
+        #else
+        return nil
+        #endif
+    }
+
+    /// fable51 item 33. ONE attribute read on the front window; no walk. The
+    /// `AXDocument` attribute is a file URL string when the app is showing a
+    /// file and absent otherwise — absence is the honest "this is not a
+    /// document window", never a guess from the window title.
+    public func frontmostDocumentPath(pid: Int32) -> String? {
+        guard pid != getpid(), isTrusted() else { return nil }
+        guard let window = windowRoot(pid: pid), let element = element(window) else { return nil }
+        guard let raw = copyString(element, kAXDocumentAttribute)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        // Apps publish this as a file URL. Percent-decode through URL rather
+        // than by hand: a path with a space arrives as %20 and a hand-rolled
+        // decode is how "My Contract.pdf" becomes a file-not-found.
+        if raw.hasPrefix("file://") {
+            return URL(string: raw)?.path
+        }
+        return raw.hasPrefix("/") ? raw : nil
     }
 
     public func transientMenuRoots(pid: Int32) -> [MacAXElementRef] {

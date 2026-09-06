@@ -74,7 +74,10 @@ public enum OpenRouterModelCatalog {
         endpoint: endpoint,
         readCache: { readCache(dataRoot: $0) },
         cacheUpdatedAt: { cacheUpdatedAt(dataRoot: $0) },
-        fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1) },
+        // Both doors are the same fetch; `fetchLiveComplete` is the one that
+        // carries the completeness verdict (User, 2026-09-06).
+        fetchLive: { try await fetchLiveModels(dataRoot: $0, session: $1).models },
+        fetchLiveComplete: { try await fetchLiveModels(dataRoot: $0, session: $1) },
         fallback: { fallbackModels() }
     )
 
@@ -84,6 +87,15 @@ public enum OpenRouterModelCatalog {
         refresh: Bool = false
     ) async -> [ProviderModelDescriptor] {
         await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
+    }
+
+    /// The same read, saying whether it reached OpenRouter (User, 2026-09-06).
+    public static func modelsWithFreshness(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        session: URLSession = .shared,
+        refresh: Bool = false
+    ) async -> ModelCatalogRead {
+        await ttlCache.modelsWithFreshness(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
     /// True when the cache is missing its `updated_at` stamp or that stamp is
@@ -98,14 +110,25 @@ public enum OpenRouterModelCatalog {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         now: Date = Date()
     ) -> CachedModelAvailability {
+        // User, 2026-09-06: membership and completeness used to come from two
+        // separate reads of this file, so a refresh landing between them could
+        // convict a model against a generation that never listed it. Both
+        // facts now come from ONE decode of one set of bytes.
         guard !cacheIsStale(dataRoot: dataRoot, now: now),
-              let cached = readCache(dataRoot: dataRoot),
-              !cached.isEmpty else {
+              let cached = readDecodedCache(dataRoot: dataRoot),
+              !cached.models.isEmpty else {
             return .unknown
         }
         let wanted = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !wanted.isEmpty else { return .unavailable }
-        return cached.contains(where: { $0.id == wanted }) ? .available : .unavailable
+        if cached.models.contains(where: { $0.id == wanted }) { return .available }
+        // A cache written from a TRUNCATED page lists only part of the
+        // catalogue, so a missing id there is no evidence of absence — it reads
+        // as `.unknown` and the pin stands. Only a cache whose source response
+        // carried the whole list may say `.unavailable`. User, 2026-09-06: a
+        // cache carrying NO completeness stamp is unknown for the same reason —
+        // absence of the stamp is not authority to convict.
+        return cached.isComplete == true ? .unavailable : .unknown
     }
 
     private static func cacheUpdatedAt(dataRoot: URL) -> Date? {
@@ -183,10 +206,61 @@ public enum OpenRouterModelCatalog {
         return sortModels(Array(byId.values))
     }
 
+    /// Envelope keys whose non-empty value NAMES a further page. A cursor or a
+    /// next link that is present but null/empty/false says the opposite: this
+    /// is the last page.
+    private static let continuationKeys = ["next", "next_page", "next_cursor", "cursor"]
+
+    /// Envelope keys that may nest those continuation markers.
+    private static let continuationContainerKeys = ["pagination", "links", "meta"]
+
+    /// User, 2026-09-06: only a complete list may prune rows a caller no longer
+    /// sees. Complete means the envelope carries no marker that says MORE —
+    /// `has_more == true`, or a non-null continuation cursor/link. The mere
+    /// PRESENCE of `page`, `links` or `has_more: false` is a paginated API
+    /// describing its LAST page, not evidence of truncation. The old
+    /// count-against-the-disk-cache comparison is gone entirely: it wedged a
+    /// legitimately shrunk catalogue as permanently incomplete (the shrunk list
+    /// was never persisted, so every later fetch met the same tall baseline),
+    /// and it never caught a marker-free truncation anyway.
+    static func responseIsComplete(_ data: Data) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return true
+        }
+        if envelopeSaysMore(root) { return false }
+        for key in continuationContainerKeys {
+            if let nested = root[key] as? [String: Any], envelopeSaysMore(nested) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func envelopeSaysMore(_ object: [String: Any]) -> Bool {
+        if truthy(object["has_more"]) { return true }
+        for key in continuationKeys where truthy(object[key]) { return true }
+        return false
+    }
+
+    /// A marker "says more" only when it carries an actual value: null, false,
+    /// 0 and the empty string are all a provider saying there is nothing after
+    /// this page.
+    private static func truthy(_ value: Any?) -> Bool {
+        guard let value, !(value is NSNull) else { return false }
+        if let number = value as? NSNumber { return number.doubleValue != 0 }
+        if let text = value as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !trimmed.isEmpty && trimmed != "false" && trimmed != "0" && trimmed != "null"
+        }
+        if let array = value as? [Any] { return !array.isEmpty }
+        if let object = value as? [String: Any] { return !object.isEmpty }
+        return true
+    }
+
     private static func fetchLiveModels(
         dataRoot: URL,
         session: URLSession
-    ) async throws -> [ProviderModelDescriptor] {
+    ) async throws -> ModelCatalogFetch {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
         request.timeoutInterval = 10
@@ -207,7 +281,10 @@ public enum OpenRouterModelCatalog {
         guard (200..<300).contains(code) else {
             throw ProviderRoutingError.invalidResponse(status: code)
         }
-        return try parseModelsResponse(data)
+        return ModelCatalogFetch(
+            models: try parseModelsResponse(data),
+            isComplete: responseIsComplete(data)
+        )
     }
 
     private static func parseModel(_ row: [String: Any]) -> ProviderModelDescriptor? {
@@ -299,6 +376,12 @@ public enum OpenRouterModelCatalog {
     /// file is visible on the very next read — while the unchanged case costs
     /// one stat.
     private static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
+        readDecodedCache(dataRoot: dataRoot)?.models
+    }
+
+    /// The whole decoded cache — rows AND the completeness stamp they were
+    /// written under — from a single decode of a single set of bytes.
+    private static func readDecodedCache(dataRoot: URL) -> DecodedOpenRouterCatalog? {
         OpenRouterCacheDecodeCache.shared.read(url: cachePath(dataRoot: dataRoot)) {
             decodeCache(data: $0)
         }
@@ -318,11 +401,17 @@ public enum OpenRouterModelCatalog {
         let hits: Int
     }
 
-    private static func decodeCache(data: Data) -> [ProviderModelDescriptor]? {
+    private static func decodeCache(data: Data) -> DecodedOpenRouterCatalog? {
         guard let root = try? JSONValue.parse(data),
               case .object(let obj) = root,
               case .array(let rows)? = obj["models"] else {
             return nil
+        }
+        let isComplete: Bool?
+        if case .bool(let complete)? = obj["complete"] {
+            isComplete = complete
+        } else {
+            isComplete = nil
         }
         let models = rows.compactMap { value -> ProviderModelDescriptor? in
             guard case .object(let row) = value,
@@ -342,7 +431,8 @@ public enum OpenRouterModelCatalog {
                 costPer1KOut: double(row["cost_per_1k_out"])
             )
         }
-        return models.isEmpty ? nil : sortModels(models)
+        guard !models.isEmpty else { return nil }
+        return DecodedOpenRouterCatalog(models: sortModels(models), isComplete: isComplete)
     }
 
     private static func stringSet(_ value: Any?) -> Set<String> {
@@ -401,6 +491,14 @@ public enum OpenRouterModelCatalog {
     }
 }
 
+/// One decode of the on-disk catalogue: the rows AND the completeness verdict
+/// the bytes were written under. `isComplete` is nil when the file carries no
+/// `complete` stamp — unknown, never a claim either way (User, 2026-09-06).
+private struct DecodedOpenRouterCatalog: Sendable {
+    let models: [ProviderModelDescriptor]
+    let isComplete: Bool?
+}
+
 /// Process-local decoded cache keyed by canonical path and file mtime.
 ///
 /// Every read still stats the exact file, so removal and atomic replacement are
@@ -413,7 +511,7 @@ private final class OpenRouterCacheDecodeCache: @unchecked Sendable {
 
     private struct Entry {
         let modifiedAt: Date
-        let models: [ProviderModelDescriptor]?
+        let catalog: DecodedOpenRouterCatalog?
     }
 
     private let lock = NSLock()
@@ -423,8 +521,8 @@ private final class OpenRouterCacheDecodeCache: @unchecked Sendable {
 
     func read(
         url: URL,
-        decode: (Data) -> [ProviderModelDescriptor]?
-    ) -> [ProviderModelDescriptor]? {
+        decode: (Data) -> DecodedOpenRouterCatalog?
+    ) -> DecodedOpenRouterCatalog? {
         // `attributesOfItem` does NOT follow symlinks, but `Data(contentsOf:)`
         // does. Resolve first so a symlinked cache path stats as the regular
         // file it points at instead of silently reading as "no catalog".
@@ -442,7 +540,7 @@ private final class OpenRouterCacheDecodeCache: @unchecked Sendable {
             }
             if let entry = entries[key], entry.modifiedAt == modifiedAt {
                 hits[key, default: 0] += 1
-                return entry.models
+                return entry.catalog
             }
 
             decodeAttempts[key, default: 0] += 1
@@ -452,7 +550,7 @@ private final class OpenRouterCacheDecodeCache: @unchecked Sendable {
             if entries[key] == nil, entries.count >= 64 {
                 entries.remove(at: entries.startIndex)
             }
-            entries[key] = Entry(modifiedAt: modifiedAt, models: decoded)
+            entries[key] = Entry(modifiedAt: modifiedAt, catalog: decoded)
             return decoded
         }
 

@@ -97,37 +97,52 @@ struct NativeSecurityCenterPanel: View {
     }
 
     var body: some View {
-        NativePanel(title: "Security Center", systemImage: "shield.lefthalf.filled", tint: panelTint) {
+        NativePanel(title: "Security Center", systemImage: "shield.lefthalf.filled") {
             if let status = refreshModel.status {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 10)], spacing: 10) {
-                    TrustPolicyTile(title: "Mode", value: status.mode, systemImage: "switch.2")
-                    TrustPolicyTile(title: "Full Mac", value: status.fullMac ? "active" : "limited", systemImage: "macbook")
-                    TrustPolicyTile(title: "Developer", value: status.developerMode ? "on" : "off", systemImage: "terminal")
-                    TrustPolicyTile(title: "Receipts", value: status.recentReceipts.isEmpty ? "ready" : "\(status.recentReceipts.count) recent", systemImage: "doc.text.magnifyingglass")
+                // The four counts were tinted tiles in a grid — a plate each,
+                // inside the card. They are bare stat rows now.
+                HStack(alignment: .top, spacing: NativeAgentSpacing.xl) {
+                    AdvancedStat(title: "Mode", value: AdvancedStatusWords.label(status.mode))
+                    AdvancedStat(
+                        title: "Full Mac",
+                        value: status.fullMac ? "Active" : "Limited",
+                        status: status.fullMac ? "warn" : "ok"
+                    )
+                    AdvancedStat(
+                        title: "Developer",
+                        value: status.developerMode ? "On" : "Off",
+                        status: status.developerMode ? "warn" : "ok"
+                    )
+                    AdvancedStat(
+                        title: "Receipts",
+                        value: status.recentReceipts.isEmpty ? "None yet" : "\(status.recentReceipts.count)",
+                        detail: status.recentReceipts.isEmpty ? "" : "Recent"
+                    )
                 }
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 230), spacing: 10)], spacing: 10) {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                     ForEach(status.flags) { flag in
                         SecurityFlagRow(flag: flag)
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                     // ui-taste-sweep 2026-06-07: was exposing the full
                     // /Users/<home>/Library/... path. Tildify it and use the
                     // tooltip for the full path power users may want to copy.
                     Text(UserDisplayFormatters.tildifyPath(status.auditReceiptsPath))
-                        .font(NativeAgentFont.mono)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.code)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
                         .help(status.auditReceiptsPath)
 
                     if status.recentReceipts.isEmpty {
-                        Text("No security receipts yet.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text("No security receipts yet. Every approval and block the agent handles is written here.")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     } else {
                         ForEach(status.recentReceipts.prefix(5)) { receipt in
                             SecurityReceiptRow(receipt: receipt)
@@ -137,59 +152,53 @@ struct NativeSecurityCenterPanel: View {
             } else {
                 switch refreshState {
                 case .unavailable(let detail):
-                    Label(
-                        SecurityCenterRefreshPresentation.message(for: .unavailable(detail: detail)) ?? "Security status unavailable.",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    Text(SecurityCenterRefreshPresentation.message(for: .unavailable(detail: detail)) ?? "Security status unavailable.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                         .accessibilityIdentifier("security.center.refresh.unavailable")
                 case .loading, .refreshing, .current, .stale:
-                    HStack(spacing: 10) {
+                    HStack(spacing: NativeAgentSpacing.sm) {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Loading security status...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text("Reading security status…")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
                 }
             }
 
             switch refreshState {
             case .refreshing:
-                Label(
-                    SecurityCenterRefreshPresentation.message(for: refreshState) ?? "Refreshing security status…",
-                    systemImage: "arrow.triangle.2.circlepath"
-                )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(SecurityCenterRefreshPresentation.message(for: refreshState) ?? "Refreshing security status…")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .accessibilityIdentifier("security.center.refresh.inflight")
             case .stale(let detail):
-                Label(
-                    SecurityCenterRefreshPresentation.message(for: .stale(detail: detail))
-                        ?? "Showing the last security status; refresh failed.",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Text(SecurityCenterRefreshPresentation.message(for: .stale(detail: detail))
+                    ?? "Showing the last security status; refresh failed.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                     .accessibilityIdentifier("security.center.refresh.stale")
             case .loading, .current, .unavailable:
                 EmptyView()
             }
 
-            HStack {
-                Button(refreshModel.isRefreshing ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise") {
+            HStack(spacing: NativeAgentSpacing.sm) {
+                Button(refreshModel.isRefreshing ? "Refreshing…" : "Refresh") {
                     Task { await refreshModel.refresh() }
                 }
+                .buttonStyle(.bordered)
                 .disabled(refreshModel.isRefreshing)
                 .accessibilityIdentifier("security.center.refresh")
-                Spacer()
                 if refreshModel.isRefreshing {
                     ProgressView()
                         .controlSize(.small)
                 }
+                Spacer()
             }
         }
         .task {
@@ -198,44 +207,35 @@ struct NativeSecurityCenterPanel: View {
         }
     }
 
-    private var panelTint: Color {
-        guard let status = refreshModel.status else {
-            if case .unavailable = refreshState { return .orange }
-            return .blue
-        }
-        if status.killSwitchEnabled { return .red }
-        if status.developerMode { return .orange }
-        return .green
-    }
-
     private static func liveStatus(limit: Int) async throws -> SecurityCenterStatus {
         await SwiftNativeSecurityCenter().status(limit: limit)
     }
 }
 
+/// One switch and where it stands. Was a grey plate with a dot AND a capsule
+/// saying the same thing twice; the state is one word at the end of the row.
 private struct SecurityFlagRow: View {
     var flag: SecurityStatusFlag
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            InlineStatusDot(status: flag.status)
-                .padding(.top, 5)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(flag.title)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                    StatusBadge(text: flag.enabled ? flag.status : "off", status: flag.enabled ? flag.status : "disabled")
-                }
-                Text(flag.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.md) {
+                Text(flag.title)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                Spacer(minLength: NativeAgentSpacing.sm)
+                StatusBadge(
+                    text: flag.enabled ? flag.status : "off",
+                    status: flag.enabled ? flag.status : "disabled"
+                )
             }
-            Spacer(minLength: 0)
+            Text(flag.detail)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .lineLimit(2)
         }
-        .padding(10)
-        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
     }
 }
@@ -244,30 +244,32 @@ private struct SecurityReceiptRow: View {
     var receipt: SecurityReceiptSummary
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            StatusBadge(text: receipt.decision, status: receipt.decision)
-            VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.md) {
                 Text("\(receipt.tool) · \(receipt.surface) · \(receipt.risk)")
-                    .font(.caption.weight(.semibold))
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
-                if !receipt.reason.isEmpty {
-                    Text(receipt.reason)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-                // ui-taste-sweep 2026-06-07: receipt.at is raw ISO with
-                // fractional seconds + timezone offset. Show relative phrase
-                // (uses the shared formatter that landed in batch 2), keep
-                // raw ISO in the tooltip for power users.
-                Text(UserDisplayFormatters.humanizeISOTimestamp(receipt.at))
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .help(receipt.at)
+                Spacer(minLength: NativeAgentSpacing.sm)
+                StatusBadge(text: receipt.decision, status: receipt.decision)
             }
-            Spacer(minLength: 0)
+            if !receipt.reason.isEmpty {
+                Text(receipt.reason)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(2)
+            }
+            // ui-taste-sweep 2026-06-07: receipt.at is raw ISO with
+            // fractional seconds + timezone offset. Show relative phrase
+            // (uses the shared formatter that landed in batch 2), keep
+            // raw ISO in the tooltip for power users.
+            Text(UserDisplayFormatters.humanizeISOTimestamp(receipt.at))
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.tertiary)
+                .lineLimit(1)
+                .help(receipt.at)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
     }
 }

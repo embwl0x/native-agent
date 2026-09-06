@@ -10,12 +10,17 @@ import NativeAgentShared
 
 extension ChatStore {
     typealias SessionHistoryLoader = (String?) async throws -> [ChatMessage]?
+    /// 2026-09-06: a session load reads the same two-state transcript the
+    /// refresh lane does — no row published, or a row that may legitimately be
+    /// empty because the chat was cleared on the Mac.
+    typealias SessionTranscriptLoader = (String?) async throws -> MacTranscriptRead
 
     static func shouldReturnToMainSession(
         selectedSessionID: String?,
         mainSessionID: String?,
         availablePinnedSessionIDs: Set<String>,
-        locallyCreatedSessionID: String? = nil
+        locallyCreatedSessionID: String? = nil,
+        explicitlySelectedSessionID: String? = nil
     ) -> Bool {
         // Without a known main-session identity we cannot distinguish a Mac
         // pin from the phone's still-being-adopted main chat. Wait for that
@@ -27,6 +32,11 @@ extension ChatStore {
         // from one or more Mac snapshots. Never classify that publication gap
         // as an externally removed pinned chat.
         if selected == cleanSessionID(locallyCreatedSessionID) { return false }
+        // 2026-09-06: a conversation the human opened by tapping its reply
+        // notification was never a pinned tab, so its absence from the pinned
+        // snapshot is not evidence of a removed pin. Bouncing it back to the
+        // main chat threw away the conversation they asked to see.
+        if selected == cleanSessionID(explicitlySelectedSessionID) { return false }
         return !availablePinnedSessionIDs.contains(selected)
     }
 
@@ -38,7 +48,7 @@ extension ChatStore {
         }
         setSelectedSessionID(clean)
         loadSelectedSession(
-            loadHistory: { sessionID in await client.refreshChatHistory(sessionID: sessionID) },
+            loadTranscript: { sessionID in await client.readChatTranscript(sessionID: sessionID) },
             fallbackMessages: fallbackMessages
         )
     }
@@ -55,7 +65,13 @@ extension ChatStore {
         guard !isSwitchingSession, let clean = Self.cleanSessionID(sessionID) else { return }
         guard clean != selectedSessionID else { return }
         setSelectedSessionID(clean)
-        loadSelectedSession(loadHistory: loadHistory, fallbackMessages: fallbackMessages)
+        loadSelectedSession(
+            loadTranscript: { sessionID in
+                guard let messages = try await loadHistory(sessionID) else { return .unavailable }
+                return .published(messages, generation: nil)
+            },
+            fallbackMessages: fallbackMessages
+        )
     }
 
     func switchToMainSession(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) {
@@ -70,7 +86,7 @@ extension ChatStore {
         }
         setSelectedSessionID(nil)
         loadSelectedSession(
-            loadHistory: { sessionID in await client.refreshChatHistory(sessionID: sessionID) },
+            loadTranscript: { sessionID in await client.readChatTranscript(sessionID: sessionID) },
             fallbackMessages: fallbackMessages
         )
     }
@@ -81,6 +97,13 @@ extension ChatStore {
     /// the exact Mac-owned pinned snapshot. Mirrors loadSelectedSession's
     /// in-flight reset so no stale stream/poll bleeds into the new session.
     func startNewSession() {
+        // A new chat is the human's own choice of session: the chat stops
+        // defaulting to the conversation anchor for the rest of this launch.
+        // "New chat" is otherwise untouched — a real new session, no merge.
+        MobileChatSelectionIntent.noteUserChoice()
+        // 2026-09-06: a new chat is a session change like any other; the
+        // dictation started in the chat being left ends here too.
+        onSessionChange?()
         // Escape hatch: usable even while a turn is still "working" — that is
         // exactly when the user reaches for it (a hung iCloud round-trip leaves
         // isLoading stuck true). A session history read is cancellable, so a
@@ -110,6 +133,9 @@ extension ChatStore {
         canceledPendingIds.removeAll()
         streamingHintsByMessageId.removeAll()
         maxDeltaSeqByCorrelation.removeAll()
+        // 2026-09-06: both sets name rows of the session being left.
+        macPublishedMessageIDs.removeAll()
+        regeneratedAwayAssistantIDs.removeAll()
         cancelAllTypewriters()
         isPollingFallback = false
         errorBanner = nil
@@ -139,9 +165,13 @@ extension ChatStore {
     }
 
     private func loadSelectedSession(
-        loadHistory: @escaping SessionHistoryLoader,
+        loadTranscript: @escaping SessionTranscriptLoader,
         fallbackMessages: [ChatMessage]?
     ) {
+        // 2026-09-06: every switch that actually changes conversation lands
+        // here (switchSession, switchToMainSession, the evaluation variant);
+        // startNewSession is the only other one and calls this hook itself.
+        onSessionChange?()
         sendTask?.cancel()
         sendTask = nil
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
@@ -164,11 +194,21 @@ extension ChatStore {
         streamingHintsByMessageId.removeAll()
         // PATCH-2026-05-30: session switch — clear text_delta seq tracking too.
         maxDeltaSeqByCorrelation.removeAll()
+        // 2026-09-06: both sets name rows of the session being left.
+        macPublishedMessageIDs.removeAll()
+        regeneratedAwayAssistantIDs.removeAll()
         cancelAllTypewriters()
         isPollingFallback = false
         isSwitchingSession = true
         sessionSwitchGeneration &+= 1
         let switchGeneration = sessionSwitchGeneration
+        // 2026-09-06: the turn that owned `isLoading` was just cancelled and
+        // its pending maps emptied above; only `isSwitchingSession` was ever
+        // cleared at the end. Loading is a property of the turn, not of the
+        // app, so a switch made during a reply left the destination chat
+        // showing a spinner and a disabled composer forever. Ordered after
+        // `isSwitchingSession = true` so the didSet's queue drain stays gated.
+        isLoading = false
         errorBanner = nil
         let loadingSessionID = selectedSessionID
         let cachedMessages = fallbackMessages ?? loadCachedMessages(for: loadingSessionID)
@@ -184,16 +224,22 @@ extension ChatStore {
             guard let self else { return }
             defer { self.finishSessionSwitch(generation: switchGeneration) }
             do {
-                let macMessages = try await loadHistory(loadingSessionID)
+                let read = try await loadTranscript(loadingSessionID)
                 guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
-                if let macMessages, !macMessages.isEmpty {
+                let macMessages = read.messages
+                if case .published(_, let generation) = read, !macMessages.isEmpty {
+                    self.noteAppliedTranscriptGeneration(
+                        generation, for: Self.cleanSessionID(loadingSessionID))
+                    self.noteMacPublishedMessageIDs(macMessages)
                     // Stale-snapshot guard (ff7b6657): merge instead of replace so a
                     // snapshot built before the newest turns synced can't vanish the
-                    // locally-cached transcript on a session (re)load. An EMPTY
-                    // snapshot is treated like nil — likely an iOS-created session
-                    // the Mac hasn't written back yet, never grounds to clear cache.
-                    // Only the session's OWN cache earns the merge; an explicit
-                    // fallbackMessages payload (legacy/global cache) must not leak
+                    // locally-cached transcript on a session (re)load. An
+                    // UNAVAILABLE read still clears nothing — likely an
+                    // iOS-created session the Mac hasn't written back yet; only
+                    // an explicitly published empty transcript does, in the
+                    // branch below. Only the session's OWN cache earns the
+                    // merge; an explicit fallbackMessages payload
+                    // (legacy/global cache) must not leak
                     // into this session — snapshot replaces it like before.
                     if fallbackMessages == nil {
                         self.messages = self.mergedMacMessagesPreservingPending(
@@ -202,6 +248,16 @@ extension ChatStore {
                         self.messages = macMessages
                     }
                     self.persistMessages()
+                } else if case .published(_, let generation) = read,
+                          macMessages.isEmpty,
+                          self.applyAuthoritativeEmptyTranscript(
+                              generation: generation,
+                              sessionID: Self.cleanSessionID(loadingSessionID)) {
+                    // 2026-09-06: the Mac published an empty transcript for this
+                    // chat and proved it newer than anything shown — the cached
+                    // rows loaded above are the ones that were cleared. Falling
+                    // through to the cache here is what kept a cleared chat
+                    // alive on the phone across every reopen.
                 } else if self.messages.isEmpty, let fallbackMessages {
                     self.messages = fallbackMessages
                     self.persistMessages()

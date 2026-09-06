@@ -184,6 +184,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         let kernelSourceFingerprint: String
         let stableIncludedDocumentIDs: [String]
         let allowedPrivacy: [String]
+        /// Part of the key because it changes the DERIVED value: it decides
+        /// whether every persona source is precovered or only the kernel's.
+        let stableSegmentCarriesRequiredDocuments: Bool
 
         init(
             generationID: Int64,
@@ -195,7 +198,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             kernelSurface: String,
             kernelSourceFingerprint: String,
             stableIncludedDocumentIDs: [String],
-            allowedPrivacy: [String]
+            allowedPrivacy: [String],
+            stableSegmentCarriesRequiredDocuments: Bool = false
         ) {
             self.generationID = generationID
             self.generationSourceFingerprint = generationSourceFingerprint
@@ -207,6 +211,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             self.kernelSourceFingerprint = kernelSourceFingerprint
             self.stableIncludedDocumentIDs = stableIncludedDocumentIDs
             self.allowedPrivacy = allowedPrivacy
+            self.stableSegmentCarriesRequiredDocuments = stableSegmentCarriesRequiredDocuments
         }
 
         init(
@@ -225,7 +230,9 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 kernelSurface: kernel.key.surfaceVariant.rawValue,
                 kernelSourceFingerprint: kernel.key.sourceFingerprint,
                 stableIncludedDocumentIDs: kernel.includedDocumentIDs.map(\.rawValue),
-                allowedPrivacy: request.allowedPrivacy.map(\.rawValue).sorted()
+                allowedPrivacy: request.allowedPrivacy.map(\.rawValue).sorted(),
+                stableSegmentCarriesRequiredDocuments:
+                    request.stableSegmentCarriesRequiredDocuments
             )
         }
     }
@@ -467,7 +474,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
 
         generationDerivedComputationCount += 1
-        let personaPrefix = "persona/\(mirror.personaID.rawValue)/"
+        let personaPrefix = ContextPersonaSourceNaming.locatorPrefix(for: mirror.personaID)
         let normalizedPersonaID = mirror.personaID.rawValue
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -482,7 +489,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             }
             if source.descriptor.permittedSurfaces.contains(request.surface),
                request.allowedPrivacy.contains(source.descriptor.privacy),
-               source.descriptor.owner != "nativeagent.persona"
+               source.descriptor.owner != ContextPersonaSourceNaming.owner
                     || source.descriptor.canonicalLocator.hasPrefix(personaPrefix) {
                 // Appending in generation order preserves the exact input order
                 // used by the precoverage derivation before this cache existed.
@@ -495,8 +502,28 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             String($0.rawValue.dropLast(3))
         })
         let surfaceSuffix = "/surfaces/\(request.surface.rawValue).md"
+        // When the caller's STABLE segment carries the persona's required
+        // documents verbatim, EVERY persona-owned source it is allowed to carry
+        // is already in the cached prefix — not just the kernel's own
+        // SOUL/VOICE. Precovering them is how the packet stops mirroring 22 KB
+        // of identity into the volatile block on every turn. `false` (the
+        // default) keeps the kernel-only precoverage that shipped before this
+        // flag.
+        //
+        // SURFACE PERMISSION IS THE GATE, IN BOTH DIRECTIONS. A source that
+        // does not permit THIS turn's surface is not in the stable prefix, so
+        // precovering it would delete it from the turn outright — the packet
+        // must keep answering for it under its own surface rules (where
+        // `ContextSelection.eligibilityReason` denies it as `.surfaceDenied`
+        // anyway). `selectedSources` is already surface-filtered above; the
+        // guard is restated here because "the caller happened to filter it for
+        // me" is not a permission check, and `stablePrefixRequiredDocuments`
+        // applies this identical predicate on the rendering side.
         var precoveredSourceIDs = Set(selectedSources.lazy.filter { source in
-            guard source.descriptor.owner == "nativeagent.persona" else { return false }
+            guard source.descriptor.owner == ContextPersonaSourceNaming.owner,
+                  source.descriptor.permittedSurfaces.contains(request.surface)
+            else { return false }
+            if request.stableSegmentCarriesRequiredDocuments { return true }
             let locator = source.descriptor.canonicalLocator
             if locator.hasSuffix(surfaceSuffix) { return true }
             let documentName = locator.split(separator: "/").last.map(String.init)?
@@ -706,9 +733,12 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                             )
                     }.map(\.draft.id)),
                     queryEmbedding: request.queryEmbedding,
+                    alternateQueryEmbedding: request.alternateQueryEmbedding,
                     queryEmbeddingModelFingerprint: request.queryEmbeddingModelFingerprint,
                     availableGenerationID: generation.generation.id,
                     characterBudget: characterBudget,
+                    packetAtomExpandThresholdChars: request.packetAtomExpandThresholdChars,
+                    memoryAtomRowLimit: request.memoryAtomRowLimit,
                     cacheState: .hit
                 )
             }
@@ -1122,8 +1152,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private func feedbackSnapshot(
         for generation: ContextStoredGeneration
     ) -> ContextFeedbackSnapshot {
-        let seeds = generation.atoms.map { atom in
-            ContextFeedbackSeed(
+        // One seed per atom id: the reducer rejects a duplicate seed, and a
+        // generation carrying the same atom twice must not be able to throw
+        // on the rebuild — let alone on the fallback rebuild below.
+        var seenSeedIDs: Set<ContextAtomID> = []
+        let seeds = generation.atoms.compactMap { atom -> ContextFeedbackSeed? in
+            guard seenSeedIDs.insert(atom.draft.id).inserted else { return nil }
+            return ContextFeedbackSeed(
                 atomID: atom.draft.id,
                 authority: atom.draft.authority,
                 privacy: atom.draft.privacy,
@@ -1148,7 +1183,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             seeds: seeds,
             events: applicable,
             through: Self.feedbackTimeBucket()
-        )) ?? (try! feedbackReducer.rebuild(seeds: seeds, events: []))
+        )) ?? (try? feedbackReducer.rebuild(seeds: seeds, events: []))
+            ?? ContextFeedbackSnapshot(states: [], appliedEventIDs: [], throughTimeBucket: nil)
     }
 
     private func recordFeedback(

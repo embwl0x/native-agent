@@ -1,3 +1,4 @@
+import DoctorChecks
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -13,13 +14,17 @@ import ProviderRouting
 ///
 /// Detectors (both fire independently; either trips a diagnostic pass):
 ///  1. Doctor HEALTHY→FAIL transition on the auto-doctor loop's
-///     `doctor/latest.json`. "Healthy" = no check has status "fail". A
+///     `doctor/latest.json`. "Healthy" = no HEARTBEAT-ELIGIBLE check has
+///     status "fail" — Doctor-only diagnostic rows are skipped entirely,
+///     because filing a proposal is an unattended decision (see
+///     `DoctorHeartbeatPolicy`). A
 ///     transition is only claimed when the PRIOR observed state was healthy
 ///     and the current state is not — a first run (no prior stamp) asserts
 ///     nothing, and a sustained-fail state does not re-fire every tick.
-///  2. `logs/errors.jsonl` burst — `errorBurstThreshold` rows whose timestamp
-///     falls inside `errorBurstWindow`. A handful of transient errors is
-///     normal; a tight cluster signals a systemic fault worth diagnosing.
+///  2. Error-feed burst — `errorBurstThreshold` rows across the watched error
+///     sinks (`errorFeeds`) whose timestamp falls inside `errorBurstWindow`. A
+///     handful of transient errors is normal; a tight cluster signals a
+///     systemic fault worth diagnosing.
 ///
 /// Cooldown: a flapping Doctor or a sustained error stream must not spam the
 /// proposal store. After a diagnostic proposal is filed, no further proposal
@@ -42,7 +47,8 @@ public struct SelfHealingHook: LoopRunner {
 
     // MARK: Detector constants (rationale inline — constant-change class)
 
-    /// Rows in `errors.jsonl` within the window required to call it a "burst."
+    /// Rows across the watched error feeds within the window required to call
+    /// it a "burst."
     /// Below this, transient/expected errors (a one-off network blip, a single
     /// failed probe) should NOT wake the diagnostic pass. 10 is high enough to
     /// mean "something is repeatedly failing," low enough to catch a fault
@@ -50,8 +56,14 @@ public struct SelfHealingHook: LoopRunner {
     public static let errorBurstThreshold = 10
     /// The recency window for the burst count. Short enough that the count
     /// reflects a CURRENT cluster, not errors accumulated over hours/days
-    /// (which `errors.jsonl` retains). 10 minutes ≈ two doctor cadences.
+    /// (which the feeds retain). 10 minutes ≈ two doctor cadences.
     public static let errorBurstWindow: TimeInterval = 10 * 60
+    /// A watched feed with no write in this long carries NO signal. It is not
+    /// evidence of health: `logs/errors.jsonl` reported "0 recent errors … ok"
+    /// for three months after its only writer (the retired Python daemon) went
+    /// away. 7 days is longer than any real quiet stretch on a live sink and
+    /// short enough to catch a writer that silently stopped.
+    public static let feedSilentAfter: TimeInterval = 7 * 24 * 60 * 60
     /// Minimum gap between diagnostic proposals. A Doctor that flaps
     /// fail→ok→fail, or a steady error stream, would otherwise file a fresh
     /// proposal every tick. 6 hours bounds it to a handful per day while still
@@ -116,18 +128,26 @@ public struct SelfHealingHook: LoopRunner {
             }
         }
 
-        // --- Detector 2: errors.jsonl burst ---------------------------------
+        // --- Cooldown (evaluated BEFORE the feed scan) ----------------------
+        // The watched feeds are live firehoses: `telegram/errors.jsonl` took
+        // 10,774 rows in one bad hour, and this hook wakes on every write to
+        // them. Re-reading four tails on each of those wakes, for six hours,
+        // to re-discover a burst it is not allowed to act on, would trade one
+        // dead nerve for an I/O storm. Nothing can be filed while the cooldown
+        // holds, so nothing is read.
+        if let last = loadCooldownStamp(), now.timeIntervalSince(last) < Self.cooldownSeconds {
+            if doctorTransition {
+                FileHandle.standardError.write(Data(
+                    "SelfHealingHook: trigger suppressed by cooldown (last \(Self.isoString(last)))\n".utf8))
+            }
+            return .skipped(reason: "self-healing cooldown active")
+        }
+
+        // --- Detector 2: error-feed burst -----------------------------------
         let burst = errorBurst(now: now)   // (count, lines) when over threshold
 
         guard doctorTransition || burst != nil else {
             return .skipped(reason: "no self-healing trigger")
-        }
-
-        // --- Cooldown -------------------------------------------------------
-        if let last = loadCooldownStamp(), now.timeIntervalSince(last) < Self.cooldownSeconds {
-            FileHandle.standardError.write(Data(
-                "SelfHealingHook: trigger suppressed by cooldown (last \(Self.isoString(last)))\n".utf8))
-            return .skipped(reason: "self-healing cooldown active")
         }
 
         // --- Build evidence (redacted) --------------------------------------
@@ -210,9 +230,11 @@ public struct SelfHealingHook: LoopRunner {
 
     struct DoctorSnapshot { let healthy: Bool; let rawText: String }
 
-    /// Reads `doctor/latest.json` and derives health. Healthy = no check has
-    /// status "fail" (warn is tolerated — it is not a failure). Returns nil
-    /// when the file is missing/unparseable (no observation to act on).
+    /// Reads `doctor/latest.json` and derives health. Healthy = no
+    /// heartbeat-eligible check has status "fail" (warn is tolerated — it is
+    /// not a failure). Returns nil when the file is missing/unparseable, or
+    /// when every row it holds is one this hook may not judge (no observation
+    /// to act on).
     func loadDoctorSnapshot() -> DoctorSnapshot? {
         let path = dataRoot.appendingPathComponent("doctor", isDirectory: true)
             .appendingPathComponent("latest.json")
@@ -227,7 +249,20 @@ public struct SelfHealingHook: LoopRunner {
         guard let checks = obj["checks"] as? [[String: Any]] else {
             return nil
         }
-        let anyFail = checks.contains { ($0["status"] as? String) == "fail" }
+        // 2026-09-02: filing an evolution proposal is an UNATTENDED decision,
+        // exactly like the heartbeat's push. Doctor-only diagnostic rows
+        // (`heartbeatEligible == false`) grade a measurement window and are
+        // for a person reading Doctor — they must never flip this verdict.
+        // The exclusion is derived from the real check registry, so it cannot
+        // drift from the flags on the checks themselves.
+        let judged = checks.filter { row in
+            guard let id = row["id"] as? String else { return true }
+            return DoctorHeartbeatPolicy.isEligible(id)
+        }
+        // Every row excluded ⇒ nothing was observed. Unavailable, never
+        // "healthy" — the same rule the malformed-shape branch above follows.
+        guard !judged.isEmpty else { return nil }
+        let anyFail = judged.contains { ($0["status"] as? String) == "fail" }
         return DoctorSnapshot(healthy: !anyFail, rawText: text)
     }
 
@@ -252,40 +287,117 @@ public struct SelfHealingHook: LoopRunner {
         try data.write(to: doctorStateStamp, options: .atomic)
     }
 
-    // MARK: - Error burst
+    // MARK: - Watched error feeds
 
-    /// Max bytes read from the END of errors.jsonl per tick. The file is
-    /// append-only and can be large; reading it whole every tick is a
+    /// One watched error sink.
+    public struct ErrorFeed: Sendable, Equatable {
+        /// Short name used in evidence and in the heartbeat line.
+        public let label: String
+        /// Path relative to the data root.
+        public let relativePath: String
+
+        public init(label: String, relativePath: String) {
+            self.label = label
+            self.relativePath = relativePath
+        }
+
+        public func url(dataRoot: URL) -> URL {
+            relativePath.split(separator: "/").reduce(dataRoot) {
+                $0.appendingPathComponent(String($1))
+            }
+        }
+    }
+
+    /// The error sinks this hook (and the heartbeat) watch.
+    ///
+    /// `logs/errors.jsonl` used to be the ONLY one, and it has had no Swift
+    /// writer since the Python daemon was retired — last row 2026-06-02, while
+    /// thirteen readers kept treating its emptiness as health. The live sinks
+    /// are the surface error feeds and the background-loop failure receipts.
+    /// The dead file stays listed so a returning writer is still seen, but the
+    /// `feedSilentAfter` guard now reports it as "no signal", never "clean".
+    public static let errorFeeds: [ErrorFeed] = [
+        ErrorFeed(label: "telegram", relativePath: "telegram/errors.jsonl"),
+        ErrorFeed(label: "slack", relativePath: "slack/errors.jsonl"),
+        ErrorFeed(label: "loops", relativePath: "logs/background_loop_failures.jsonl"),
+        ErrorFeed(label: "legacy", relativePath: "logs/errors.jsonl"),
+    ]
+
+    /// What one watched feed currently says. `silent` is the honesty flag: a
+    /// missing or long-unwritten feed proves nothing, so a zero `recentCount`
+    /// on a silent feed must never be reported as "no errors".
+    public struct ErrorFeedStatus: Sendable {
+        public let feed: ErrorFeed
+        /// Last modification time, or nil when the file does not exist.
+        public let lastWriteAt: Date?
+        /// Rows inside `errorBurstWindow` (always 0 for a silent feed — it is
+        /// not read at all).
+        public let recentCount: Int
+        /// Up to 30 of those rows, oldest-first, truncated for evidence.
+        public let recentLines: [String]
+        /// Missing, unreadable, or unwritten for `feedSilentAfter`.
+        public let silent: Bool
+
+        /// Human phrasing for the heartbeat line — "no signal" for a silent
+        /// feed, a row count for a live one.
+        public func summary(now: Date) -> String {
+            guard silent else { return "\(recentCount) row(s)" }
+            guard let lastWriteAt else { return "no signal (never written)" }
+            let days = Int(now.timeIntervalSince(lastWriteAt) / 86_400)
+            return "no signal (last write \(days)d ago)"
+        }
+    }
+
+    /// Max bytes read from the END of each feed per tick. The files are
+    /// append-only and can be large; reading them whole every tick is a
     /// cooperative-pool blocker. 256 KiB of tail comfortably covers any
     /// realistic 15-minute window (a burst that overflows it still trips
     /// the threshold from the lines that fit).
     static let errorLogTailBytes = 256 * 1024
 
-    /// Counts `errors.jsonl` rows whose timestamp is within the burst window
-    /// and, when over threshold, returns the count plus the kept lines (for
-    /// evidence). Only the file's tail is read (bounded, see
-    /// `errorLogTailBytes`). Rows WITHOUT a parseable timestamp are SKIPPED
-    /// from the count — counting undated/malformed historical rows as
-    /// "current" makes a stale corrupt log a permanent false burst trigger.
-    /// The whole bounded tail is scanned (no early break — interleaved
-    /// out-of-order timestamps must not hide newer rows).
-    func errorBurst(now: Date) -> (count: Int, lines: [String])? {
-        let path = dataRoot.appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("errors.jsonl")
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return nil }
+    /// Reads every watched feed's bounded tail and reports what it saw. Rows
+    /// WITHOUT a parseable timestamp are SKIPPED from the count — counting
+    /// undated/malformed historical rows as "current" makes a stale corrupt log
+    /// a permanent false burst trigger. The whole bounded tail is scanned (no
+    /// early break — interleaved out-of-order timestamps must not hide newer
+    /// rows). A silent feed is never opened: its rows cannot be current, and a
+    /// bogus future timestamp in a dead file must not manufacture a burst.
+    public static func scanErrorFeeds(dataRoot: URL, now: Date) -> [ErrorFeedStatus] {
+        errorFeeds.map { feed in
+            let path = feed.url(dataRoot: dataRoot)
+            let lastWriteAt = (try? FileManager.default.attributesOfItem(atPath: path.path))?[
+                .modificationDate] as? Date
+            let silent = lastWriteAt.map { now.timeIntervalSince($0) > feedSilentAfter } ?? true
+            guard !silent else {
+                return ErrorFeedStatus(
+                    feed: feed, lastWriteAt: lastWriteAt,
+                    recentCount: 0, recentLines: [], silent: true)
+            }
+            let kept = recentRows(at: path, now: now)
+            return ErrorFeedStatus(
+                feed: feed, lastWriteAt: lastWriteAt,
+                recentCount: kept.count,
+                recentLines: Array(kept.prefix(30).reversed()),
+                silent: false)
+        }
+    }
+
+    /// Newest-first rows inside the burst window from one feed's bounded tail.
+    private static func recentRows(at path: URL, now: Date) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: path) else { return [] }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
-        let start = size > UInt64(Self.errorLogTailBytes) ? size - UInt64(Self.errorLogTailBytes) : 0
+        let start = size > UInt64(errorLogTailBytes) ? size - UInt64(errorLogTailBytes) : 0
         try? handle.seek(toOffset: start)
         guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return nil }
-        let cutoff = now.addingTimeInterval(-Self.errorBurstWindow)
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        let cutoff = now.addingTimeInterval(-errorBurstWindow)
         var kept: [String] = []
         for line in text.split(separator: "\n").reversed() {
             guard let lineData = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                   let ts = (obj["createdAt"] as? String ?? obj["at"] as? String
-                    ?? obj["ts"] as? String ?? obj["timestamp"] as? String).flatMap(Self.parseISO)
+                    ?? obj["ts"] as? String ?? obj["timestamp"] as? String).flatMap(parseISO)
             else { continue }  // undated/malformed: never counted as current
             // No early break: writers can interleave slightly out-of-order
             // timestamps, and one stale row must not hide newer rows behind
@@ -293,9 +405,19 @@ public struct SelfHealingHook: LoopRunner {
             if ts < cutoff { continue }
             kept.append(line.prefix(280).description)
         }
-        guard kept.count >= Self.errorBurstThreshold else { return nil }
-        // Cap the evidence lines (newest-first kept, re-ordered oldest-first).
-        return (count: kept.count, lines: Array(kept.prefix(30).reversed()))
+        return kept
+    }
+
+    /// Total rows across every live feed inside the burst window and, when over
+    /// threshold, the feed-labelled evidence lines.
+    func errorBurst(now: Date) -> (count: Int, lines: [String])? {
+        let statuses = Self.scanErrorFeeds(dataRoot: dataRoot, now: now)
+        let total = statuses.reduce(0) { $0 + $1.recentCount }
+        guard total >= Self.errorBurstThreshold else { return nil }
+        let lines = statuses.flatMap { status in
+            status.recentLines.map { "[\(status.feed.label)] \($0)" }
+        }
+        return (count: total, lines: Array(lines.prefix(30)))
     }
 
     // MARK: - Cooldown

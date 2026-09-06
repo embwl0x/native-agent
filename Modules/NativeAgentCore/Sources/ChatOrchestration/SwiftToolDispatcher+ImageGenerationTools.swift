@@ -482,16 +482,25 @@ final class SwiftCodexOAuthImageGenerationClient: @unchecked Sendable {
             throw ImageGenerationToolError.invalidResponse("encode Codex image request: \(error.localizedDescription)")
         }
 
+        // User, 2026-09-06: the token the last attempt actually sent, handed to
+        // the forced refresh so a rotation another caller already performed is
+        // taken instead of burning a second single-use refresh_token — the
+        // same rule the chat loops follow.
+        var lastSentAccessToken: String?
         for attempt in 0...1 {
             let context: CodexOAuthAccessContext
             do {
-                context = try await authAdapter.codexAccessContext(forceRefresh: attempt == 1)
+                context = try await authAdapter.codexAccessContext(
+                    forceRefresh: attempt == 1,
+                    staleToken: attempt == 1 ? lastSentAccessToken : nil
+                )
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 throw ImageGenerationToolError.codexUnavailable
             }
 
+            lastSentAccessToken = context.accessToken
             var urlRequest = URLRequest(url: endpoint)
             urlRequest.httpMethod = "POST"
             urlRequest.timeoutInterval = TimeInterval(timeoutSeconds)

@@ -406,26 +406,9 @@ enum WorkshopObservatoryVetoPresentation {
 
 struct WorkshopObservatoryPanel: View {
     let snapshot: WorkshopObservatorySnapshot?
-    /// Veto action — the parent owns the resolved-root handler and refresh.
-    let onVeto: (String) -> Void
-    /// Handles whose mounted action is awaiting its durable outcome.
-    let pendingVetoHandles: Set<String>
 
-    init(
-        snapshot: WorkshopObservatorySnapshot?,
-        pendingVetoHandles: Set<String> = [],
-        onVeto: @escaping (String) -> Void
-    ) {
+    init(snapshot: WorkshopObservatorySnapshot?) {
         self.snapshot = snapshot
-        self.pendingVetoHandles = pendingVetoHandles
-        self.onVeto = onVeto
-    }
-
-    /// The mounted button's one action seam. Requiring the closure at
-    /// construction means an enabled Veto control can never silently discard a
-    /// user decision because an embedding route omitted its handler.
-    func triggerVeto(_ handle: String) {
-        onVeto(handle)
     }
 
     var body: some View {
@@ -454,7 +437,6 @@ struct WorkshopObservatoryPanel: View {
                 title: "Desk state unavailable",
                 detail: deskUnavailable)
         } else if let model = snapshot.model {
-            pursuitsSection(model)
             cadenceSection(model)
         }
 
@@ -498,144 +480,15 @@ struct WorkshopObservatoryPanel: View {
         .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    // MARK: pursuits (veto surface, L11)
-
-    @ViewBuilder
-    private func pursuitsSection(_ model: WorkshopObservatoryModel) -> some View {
-        Text("Open self-pursuits")
-            .font(NativeAgentFont.section)
-        if model.openPursuits.isEmpty {
-            Text("No open self-pursuits — the agent has not opened anything, or all are closed.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        } else {
-            ForEach(model.openPursuits) { pursuit in
-                pursuitCard(pursuit)
-                Divider()
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func pursuitCard(_ pursuit: WorkshopPursuitRow) -> some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(pursuit.displayName)
-                    .font(.callout.weight(.semibold))
-                    .textSelection(.enabled)
-                // The veto marker — User sees at a glance this was HER call.
-                Text("agent-opened")
-                    .font(.caption2.weight(.semibold))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(Color.purple.opacity(0.18)))
-                    .foregroundStyle(.purple)
-                Spacer()
-                Button("Veto", systemImage: "xmark.circle") {
-                    triggerVeto(pursuit.handle)
-                }
-                .font(.caption)
-                .buttonStyle(.borderless)
-                .foregroundStyle(.red)
-                .disabled(WorkshopObservatoryVetoPresentation.buttonIsDisabled(
-                    handle: pursuit.handle,
-                    pendingHandles: pendingVetoHandles
-                ))
-                .help("Close this pursuit (canceled) with a user-vetoed note.")
-            }
-            if pursuit.privateName?.isEmpty == false, pursuit.title != pursuit.displayName {
-                Text("title: \(pursuit.title)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-
-            labeled("Why", pursuit.why.isEmpty ? "—" : pursuit.why)
-            labeled("Done looks like", pursuit.doneLooksLike.isEmpty ? "—" : pursuit.doneLooksLike)
-
-            if !pursuit.citations.isEmpty {
-                Text("Evidence: \(pursuit.citations.joined(separator: ", "))")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            scoreRow(pursuit.score)
-            budgetRow(pursuit.budget)
-
-            HStack {
-                Text("Last worked")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(lastWorkedText(pursuit.lastWorkedAt))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let rationale = pursuit.latestChoiceRationale, !rationale.isEmpty {
-                Text(rationale)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .lineLimit(3)
-            }
-            if !pursuit.workReceipts.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(pursuit.workReceipts.enumerated()), id: \.offset) { _, receipt in
-                        Text("• \(receipt)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func scoreRow(_ score: WorkshopScoreView?) -> some View {
-        if let score {
-            VStack(alignment: .leading, spacing: 1) {
-                HStack {
-                    Text("Choice score")
-                        .font(.caption2.weight(.semibold))
-                    Spacer()
-                    Text(String(format: "%.2f", score.total))
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.teal)
-                }
-                Text(String(
-                    format: "ev %.2f · mom %.2f · close %.2f · drag −%.2f · recent −%.2f",
-                    score.evidenceStrength, score.momentum, score.closureProximity,
-                    score.noProgressPenalty, score.recentAttentionPenalty))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        } else {
-            Text("Choice score unavailable (no decodable pursuit payload).")
-                .font(.caption2)
-                .foregroundStyle(.orange)
-        }
-    }
-
-    @ViewBuilder
-    private func budgetRow(_ budget: WorkshopBudget?) -> some View {
-        if let budget {
-            HStack {
-                Text("Budget")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(budget.sessionsUsed)/\(budget.maxSessions) sessions · \(budget.todayCount)/\(budget.perDayCap) today")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        } else {
-            Text("Budget unavailable.")
-                .font(.caption2)
-                .foregroundStyle(.orange)
-        }
-    }
+    // MARK: pursuits
+    //
+    // The per-pursuit list, its score/budget readout and its Veto button used
+    // to live here — a second copy of `DeskView.pursuitsSection` behind the
+    // developer gate (Diagnostics ▸ Cognition ▸ Desk). Item 36 moved the owner
+    // control onto the Desk row User already reads and deleted the duplicate;
+    // what remains here is the COUNT in the header, which is what an
+    // observatory is for. The pure fold (`WorkshopObservatoryModel.openPursuits`
+    // → `WorkshopPursuitRow.from`) is unchanged and now feeds the Desk row.
 
     // MARK: cadence
 
@@ -707,25 +560,6 @@ struct WorkshopObservatoryPanel: View {
     }
 
     // MARK: helpers
-
-    private func labeled(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(label)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.caption2)
-                .textSelection(.enabled)
-        }
-    }
-
-    private func lastWorkedText(_ raw: String?) -> String {
-        guard let raw, !raw.isEmpty else { return "never" }
-        if let date = DeskClock.parseISO(raw) {
-            return date.formatted(date: .abbreviated, time: .shortened)
-        }
-        return raw
-    }
 
     private func receiptTimeText(_ raw: String) -> String {
         guard !raw.isEmpty else { return "—" }

@@ -27,7 +27,11 @@ struct ProviderSettingsAnthropicOAuthDirectPanelEvalTests {
             dataRoot: root
         )
         #expect(control.state == .complete)
-        #expect(control.detail == "Expired — refresh on next chat")
+        // 2026-09-06: 52f531d1 stopped promising a refresh that cannot happen — an
+        // expired credential with no refresh_token (this fixture persists only an
+        // access_token) now reads "sign in again"
+        // (NativeOAuthFlow+TokenStatus.swift:189-193).
+        #expect(control.detail == "Expired — sign in again")
         #expect(OAuthSignInPresentation.buttonControl(
             providerDisplayShort: "Anthropic", state: control.state
         ) == .init(title: "Re-authenticate Anthropic", isDisabled: false))

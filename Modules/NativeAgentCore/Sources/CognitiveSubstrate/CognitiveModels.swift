@@ -225,6 +225,46 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// so a long warm phase over old negative nodes cannot turn the line into a
     /// standing instruction (W4/P4).
     public var settlingRun: Int
+    /// The worn-token SET the rut nudge last spoke for, and when. The nudge is
+    /// change-driven, so it needs to remember what it already said rather than
+    /// re-deriving "a rut exists" every turn (2026-09-01).
+    public var soundRutSignature: String?
+    public var soundRutLastSurfacedAt: Date?
+    /// Accepted live capsules since the rut nudge last spoke. Counted rather
+    /// than timed so a burst of turns inside one minute cannot re-fire it.
+    public var soundRutTurnsSinceSurfaced: Int
+    /// Per-inner-line cadence ledger, keyed by the line's stable key.
+    /// A non-negative value counts capsules this line has LED; a negative value
+    /// counts the capsules of rest it still owes. Bounded by
+    /// `innerLineLedgerCapacity`; the whole map is presentation-only.
+    public var innerLineRuns: [String: Int]
+    /// PRESENTATION RECEIPTS for the two 2026-09-02 felt-line organs. Both are
+    /// counters, never text: how many accepted capsules carried an OBJECT on the
+    /// felt line, and how many carried the one allowed contradicting second
+    /// word, plus when that last happened. They gate nothing — they exist so
+    /// "did the ambivalence exception ever actually fire, and how often" is a
+    /// measurement rather than a story, which is the failure mode every other
+    /// line on this capsule has already had once.
+    public var feltObjectCount: Int
+    public var ambivalenceCount: Int
+    public var lastAmbivalenceAt: Date?
+    /// REMINDED-OF (2026-09-02). When the unbidden-recall line last spoke, and
+    /// how many accepted turns ago — the two halves of "at most once every
+    /// `remindedOfMinTurns` turns". `nil` last-surfaced means it has never
+    /// spoken, which is eligible.
+    public var remindedOfLastSurfacedAt: Date?
+    /// Accepted live turns since the line last spoke. Free-running (advanced by
+    /// the substrate's own accepted-turn tick), exactly like the Sound rut
+    /// counter, so a stretch of empty capsules cannot freeze the cadence.
+    public var remindedOfTurnsSinceSurfaced: Int
+    /// Moment ids this path has already put in front of her, and when. A memory
+    /// that arrived sideways yesterday arriving sideways again today is not a
+    /// second unbidden recall, it is a loop. Bounded by
+    /// `remindedOfLedgerCapacity`; ids only, never text.
+    public var remindedOfSurfaced: [String: Date]
+
+    public static let innerLineLedgerCapacity = 24
+    public static let remindedOfLedgerCapacity = 16
 
     public init(
         fingerprintFamily: String? = nil,
@@ -233,7 +273,17 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         lastLiveCapsuleAt: Date? = nil,
         lastSessionBridgeAt: Date? = nil,
         negativeSoundEchoRun: Int = 0,
-        settlingRun: Int = 0
+        settlingRun: Int = 0,
+        soundRutSignature: String? = nil,
+        soundRutLastSurfacedAt: Date? = nil,
+        soundRutTurnsSinceSurfaced: Int = 0,
+        innerLineRuns: [String: Int] = [:],
+        feltObjectCount: Int = 0,
+        ambivalenceCount: Int = 0,
+        lastAmbivalenceAt: Date? = nil,
+        remindedOfLastSurfacedAt: Date? = nil,
+        remindedOfTurnsSinceSurfaced: Int = 0,
+        remindedOfSurfaced: [String: Date] = [:]
     ) {
         self.fingerprintFamily = fingerprintFamily
         self.fingerprintCount = max(0, fingerprintCount)
@@ -242,6 +292,16 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.lastSessionBridgeAt = lastSessionBridgeAt
         self.negativeSoundEchoRun = max(0, negativeSoundEchoRun)
         self.settlingRun = max(0, settlingRun)
+        self.soundRutSignature = soundRutSignature
+        self.soundRutLastSurfacedAt = soundRutLastSurfacedAt
+        self.soundRutTurnsSinceSurfaced = max(0, soundRutTurnsSinceSurfaced)
+        self.innerLineRuns = innerLineRuns
+        self.feltObjectCount = max(0, feltObjectCount)
+        self.ambivalenceCount = max(0, ambivalenceCount)
+        self.lastAmbivalenceAt = lastAmbivalenceAt
+        self.remindedOfLastSurfacedAt = remindedOfLastSurfacedAt
+        self.remindedOfTurnsSinceSurfaced = max(0, remindedOfTurnsSinceSurfaced)
+        self.remindedOfSurfaced = remindedOfSurfaced
     }
 }
 
@@ -253,12 +313,24 @@ public struct CognitiveStandingViewCapsuleCandidate: Sendable, Equatable {
     public let line: String
     public let concernKeywords: [String]
     public let updatedAt: Date
+    /// Which TIER this candidate belongs to (2026-09-02). A held view — one she
+    /// adopted herself, unsigned — is ranked strictly below every user-approved
+    /// active view rather than competing with them on relevance score, so the
+    /// tier has to survive the freeze into the frozen read.
+    public let isHeld: Bool
 
-    public init(id: UUID, line: String, concernKeywords: [String], updatedAt: Date) {
+    public init(
+        id: UUID,
+        line: String,
+        concernKeywords: [String],
+        updatedAt: Date,
+        isHeld: Bool = false
+    ) {
         self.id = id
         self.line = line
         self.concernKeywords = concernKeywords
         self.updatedAt = updatedAt
+        self.isHeld = isHeld
     }
 }
 

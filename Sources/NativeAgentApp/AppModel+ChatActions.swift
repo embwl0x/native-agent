@@ -212,6 +212,21 @@ extension AppModel {
             return .failure(statusText)
         }
         var transcriptCleared = false
+        // 2026-09-06: republication is owed to the phone whenever the DURABLE
+        // transcript was cleared, not only when everything after the clear also
+        // succeeded. It used to sit on the success path alone, so a failed
+        // reload — or the metadata write failing after the bytes were already
+        // truncated — left the phone reading the pre-clear
+        // chat_transcripts.json forever, which is the bug this whole change is
+        // about. The engine's `isActive` guard makes it inert off-device, and
+        // the transcript version decides on the phone what the empty may do:
+        // when the index write failed the version never advanced, so the empty
+        // reaches the phone but is correctly refused authority to clear.
+        defer {
+            if transcriptCleared {
+                MacSyncEngine.shared.requestChatTranscriptSnapshotPublication()
+            }
+        }
         do {
             _ = try await clear(clearingSessionID)
             transcriptCleared = true
@@ -228,9 +243,15 @@ extension AppModel {
             }
             chatSessions = try await loadSessions()
             statusText = "Chat messages cleared"
+            // The shared publisher here is sessions-only; the transcript group
+            // is republished by the `defer` above.
             publishChatSnapshot()
             return .success(statusText)
         } catch let error as ChatMessageClearError {
+            // The durable transcript IS empty in this case — this error is only
+            // raised after the bytes were truncated, and names exactly what did
+            // not survive it (the index metadata).
+            transcriptCleared = true
             let lifecycleBeforeReload = chatTurnLifecycle(for: clearingSessionID)
             if let actual = try? await loadMessages(clearingSessionID) {
                 let lifecycleAfterReload = chatTurnLifecycle(for: clearingSessionID)
@@ -597,8 +618,12 @@ extension AppModel {
                 let replacement = chatSessions.first(where: { $0.archived != true })
                 activeChatSessionId = replacement?.id ?? ""
                 persistActiveChatSessionID(activeChatSessionId.isEmpty ? nil : activeChatSessionId)
-                chatMessages = []
-                latestContextReceipt = nil
+                // 2026-09-06: these two lines used to run through the
+                // ACTIVE-session accessors after the line above had already
+                // pointed them at the replacement conversation, so archiving
+                // one chat blanked the transcript and receipt of the chat it
+                // moved you to. The archived session's own copies are already
+                // gone — pruneSessionChatState above removes both.
             }
             statusText = "Chat archived"
             publishChatSnapshot()
@@ -910,6 +935,8 @@ extension AppModel {
         }
         if pauseQueuedTurns, !(queuedChatTurnsBySession[sid] ?? []).isEmpty {
             pausedChatQueueSessions.insert(sid)
+            // A Stop is the person's own doing; no failure to report.
+            chatQueuePauseReasons.removeValue(forKey: sid)
         } else if !pauseQueuedTurns {
             pausedChatQueueSessions.remove(sid)
         }
@@ -1044,6 +1071,14 @@ extension AppModel {
         // Preserve the user's turn at the head instead of dropping it.
         queuedChatTurnsBySession[sessionId, default: []].insert(next, at: 0)
         pausedChatQueueSessions.insert(sessionId)
+        // 2026-09-06: carry the rejection's own words to the queue strip. A
+        // pause with no stated cause is indistinguishable from one the person
+        // asked for.
+        if case .rejected(let failureMessage) = acceptance {
+            chatQueuePauseReasons[sessionId] = failureMessage
+        } else {
+            chatQueuePauseReasons.removeValue(forKey: sessionId)
+        }
     }
 
     @MainActor
@@ -1053,6 +1088,9 @@ extension AppModel {
         }
         if pausedChatQueueSessions.remove(oldSessionId) != nil {
             pausedChatQueueSessions.insert(newSessionId)
+        }
+        if let reason = chatQueuePauseReasons.removeValue(forKey: oldSessionId) {
+            chatQueuePauseReasons[newSessionId] = reason
         }
     }
 
@@ -1288,6 +1326,7 @@ extension AppModel {
                     chatMessagesBySession.removeValue(forKey: requestSessionId)
                     latestContextReceiptBySession.removeValue(forKey: requestSessionId)
                     chatDrafts.removeValue(forKey: requestSessionId)
+                    chatDraftLastEdited.removeValue(forKey: requestSessionId)
                     _ = await settleChatTurnLifecycle(
                         identity: MacChatTurnIdentity(
                             sessionId: requestSessionId,
@@ -1331,6 +1370,12 @@ extension AppModel {
                         // 50-cap eviction ordering. Fall back to now only when
                         // the placeholder never recorded a touch.
                         chatDraftLastTouched[sid] = chatDraftLastTouched.removeValue(forKey: requestSessionId) ?? Date()
+                    }
+                    // 2026-09-06: carry the edit stamp with the draft. No
+                    // fallback — inventing "now" here would outrank a live
+                    // composer's older-but-real typing and drop it.
+                    if let editedAt = chatDraftLastEdited.removeValue(forKey: requestSessionId) {
+                        chatDraftLastEdited[sid] = editedAt
                     }
                     migrateQueuedChatTurns(from: requestSessionId, to: sid)
                     if streamingSessions.contains(requestSessionId) {

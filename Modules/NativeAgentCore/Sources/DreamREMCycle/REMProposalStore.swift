@@ -249,11 +249,62 @@ public struct REMProposalStore: Sendable {
 
     // MARK: Append (dedupe by id)
 
+    /// What one append actually did — including what it REFUSED to write.
+    /// `droppedByTarget` is keyed by normalized doc name ("SOUL.md"), so the
+    /// REM receipt can say which persona doc the pass tried to reach.
+    public struct AppendReceipt: Sendable, Equatable, Codable {
+        public let appended: Int
+        public let droppedByTarget: [String: Int]
+
+        public init(appended: Int, droppedByTarget: [String: Int] = [:]) {
+            self.appended = appended
+            self.droppedByTarget = droppedByTarget
+        }
+
+        public var droppedCount: Int { droppedByTarget.values.reduce(0, +) }
+
+        /// The single line written to stderr on any drop. nil when nothing
+        /// was dropped — a clean pass stays quiet.
+        public var droppedLogLine: String? {
+            guard !droppedByTarget.isEmpty else { return nil }
+            let detail = droppedByTarget
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: " ")
+            return "REMProposalStore: dropped \(droppedCount) proposal(s) by target — \(detail)"
+                + " — only GROWTH.md proposals are accepted; the other persona docs are the owner's."
+        }
+    }
+
     /// Append proposals as pending rows, skipping ids already present.
     /// Returns the number of rows actually appended.
     @discardableResult
     public func appendPending(_ proposals: [REMProposal]) async throws -> Int {
-        guard !proposals.isEmpty else { return 0 }
+        try await appendPendingWithReceipt(proposals).appended
+    }
+
+    /// The same append, with the receipt (fable51 #11).
+    ///
+    /// The GROWTH.md-only fence stays — SOUL.md and VOICE.md are User's, and a
+    /// dream pass does not get to edit who she is. What changes is the
+    /// silence: a SOUL/VOICE-targeted proposal used to vanish inside the
+    /// `where` clause of this loop with no counter, no log line, and no
+    /// receipt, so a week could burn an Opus call, keep zero proposals, and
+    /// report nothing at all.
+    ///
+    /// Why the invitation stays: the REM system prompt embeds all four persona
+    /// docs so a distilled reflex is coherent with the whole self, and the
+    /// per-target guidance already tells the model not to write proposals for
+    /// non-GROWTH docs. The rest of the REM contract keeps its drops LOUD
+    /// rather than pre-censoring the model (`lastParseErrors`,
+    /// `lastEvidenceDateDrops`, `lastTargetMismatchDrops` all exist for
+    /// exactly this) — this is the last of those choke points to stay quiet,
+    /// so it is made loud in the same shape rather than narrowing the prompt.
+    @discardableResult
+    public func appendPendingWithReceipt(
+        _ proposals: [REMProposal]
+    ) async throws -> AppendReceipt {
+        guard !proposals.isEmpty else { return AppendReceipt(appended: 0) }
         return try await lockCore.withFileLock(proposalsURL) {
             // Dedupe against base AND feed: an id folded to base is a settled
             // decision, and re-appending it as pending would shadow it
@@ -263,7 +314,14 @@ public struct REMProposalStore: Sendable {
             seen.formUnion((self.readBaseRows() ?? []).map(\.id))
             var buffer = Data()
             var appended = 0
-            for p in proposals where !seen.contains(p.id) && Self.supportsProposalTarget(p.targetDoc) {
+            var droppedByTarget: [String: Int] = [:]
+            for p in proposals where !seen.contains(p.id) {
+                guard Self.supportsProposalTarget(p.targetDoc) else {
+                    // NAME the target. "1 proposal dropped" is a shrug; "1
+                    // dropped for SOUL.md" is a fact User can act on.
+                    droppedByTarget[Self.normalizedTargetDoc(p.targetDoc), default: 0] += 1
+                    continue
+                }
                 let row = REMProposalRow(from: p)
                 buffer.append(Data((try Self.encodeRow(row) + "\n").utf8))
                 seen.insert(p.id)
@@ -272,8 +330,13 @@ public struct REMProposalStore: Sendable {
             if !buffer.isEmpty {
                 try Self.appendData(buffer, to: self.proposalsURL)
             }
+            let receipt = AppendReceipt(
+                appended: appended, droppedByTarget: droppedByTarget)
+            if let line = receipt.droppedLogLine {
+                FileHandle.standardError.write(Data((line + "\n").utf8))
+            }
             try await self.compactIfNeededLocked()
-            return appended
+            return receipt
         }
     }
 

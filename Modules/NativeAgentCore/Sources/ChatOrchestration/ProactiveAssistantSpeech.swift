@@ -34,8 +34,9 @@ import PersistenceCore
 //
 // WHAT IS WIRED TODAY, DECLARED NOT SILENT: exactly one call site exists —
 // `NativeClient.postSpokenInboxMessage`, the morning-brief card's Act handler,
-// on the `.userRequested` route (L5 G6). The `.scheduled` route is built and
-// tested but has NO caller: nothing in this tree yet speaks into a transcript
+// on the `.userRequested` route (L5 G6). The `.scheduled` route is built but
+// has NO caller and, as of 2026-09-01, no direct tests (grep finds only this
+// file and its one caller): built, not proven. Nothing in this tree yet speaks into a transcript
 // without User pressing something, and turning the 8am tick into an unprompted
 // chat message is a separate product decision from building the seam. Wiring it
 // is one call in the trigger fire path with `initiative: .scheduled` — at which

@@ -98,12 +98,35 @@ struct TotalSurfaceContractEvalTests {
         // 2026-08-30: User authorized retiring the unused substrate.runReplay
         // compatibility API and its dedicated test. The other 640 IDs remain
         // frozen; the real app-level replay/integration surfaces remain live.
-        #expect(campaign.surfaces.count == 640, "The authorized burn-down must retain its reviewed 640-row boundary after the one explicit retirement.")
+        // 2026-09-01: User authorized retiring the metacognitive shadow. That
+        // deleted six `core.chat.persistence` ledger rows (shadowEvaluator,
+        // governorShadow, shadowEvaluation, outcomeTissue, calibrationReport,
+        // shadowLane), none of which were in this frozen campaign, so the
+        // boundary is unchanged; `chat.metacognition.livingFabricEvalRoute`
+        // stays because the CLI route itself is live, minus its metacognition
+        // sections.
+        // 2026-09-01: User authorized retiring Native Experience / Journey and
+        // the Spotlight overlay. That deleted fourteen ledger rows, FOUR of
+        // them frozen here — store.spotlightRecentPrompts,
+        // turn-ingredient.spotlightSessionId,
+        // public-api.SpotlightOverlayProbe.currentFrame and
+        // bridge.macctl.route.spotlightFrame — so the boundary moves 640 → 636.
+        // 2026-09-01: User authorized retiring the workflow run engine. That
+        // deleted nineteen ledger rows (the run/resume/cancel/rollback client
+        // and UI surfaces, the run ledger and its feed family, run-state step
+        // decision, attempt timeout, public run view, execution preflight, and
+        // the run motor projection), THREE of them frozen here —
+        // workflow.runsLedger.feedFamily, workflow.ui.runResumeCancelRollback
+        // and ui.Capabilities.workflowLifecycleButtons — so the boundary moves
+        // 636 → 633. workflows.listWorkflows / createWorkflow / factory and
+        // ui.Capabilities.workflowBuilder stay: the workflow REGISTRY is still
+        // live, and the approvals half was never part of the run engine.
+        #expect(campaign.surfaces.count == 633, "The authorized burn-down must retain its reviewed row boundary after the authorized retirements.")
         #expect(Set(campaign.surfaces).count == campaign.surfaces.count, "Campaign fence/ID keys must be unique.")
         #expect(Set(campaign.baselineInputs.keys) == Set(["phase1-fragments.json", "coverage-overrides.json"]))
         for (name, expectedHash) in campaign.baselineInputs {
             let data = try Data(contentsOf: Self.repo.appendingPathComponent("docs/evals/\(name)"))
-            #expect(Self.sha256(data) == expectedHash, "\(name) changed after the 640-row campaign was reviewed; deliberately regenerate/review its frozen membership")
+            #expect(Self.sha256(data) == expectedHash, "\(name) changed after the 633-row campaign was reviewed; deliberately regenerate/review its frozen membership")
         }
 
         var failures: [String] = []

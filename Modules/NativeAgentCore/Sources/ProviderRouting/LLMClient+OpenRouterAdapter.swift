@@ -15,17 +15,47 @@ public final class OpenRouterAdapter: LLMAdapter {
     private let endpoint: URL
     private let apiKeyOverride: String?
     private let dataRootOverride: URL?
+    /// User, 2026-09-06: OpenRouter was the only adapter with no `llm.call` row
+    /// at all — it decoded usage and threw it away, so every OpenRouter turn
+    /// was invisible to accounting and to the Turn Inspector.
+    private let telemetry: LLMCallTraceRecorder
 
     public init(
         session: URLSession = .shared,
         endpoint: URL = URL(string: "https://openrouter.ai/api/v1/chat/completions")!,
         apiKeyOverride: String? = nil,
-        dataRootOverride: URL? = nil
+        dataRootOverride: URL? = nil,
+        telemetryDataRootOverride: URL? = nil
     ) {
         self.session = session
         self.endpoint = endpoint
         self.apiKeyOverride = apiKeyOverride
         self.dataRootOverride = dataRootOverride
+        self.telemetry = LLMCallTraceRecorder(
+            dataRootOverride: telemetryDataRootOverride ?? dataRootOverride
+        )
+    }
+
+    /// User, 2026-09-06: the model picker advertises low/medium/high/xhigh for
+    /// every OpenRouter row (NativeClient+ProviderTelegramSessions) and the
+    /// request never carried the choice, so picking an effort did nothing at
+    /// all. OpenRouter's unified `reasoning` field is the wire form: `effort`
+    /// takes low/medium/high (xhigh and the ceiling efforts map to high), and
+    /// "none" turns reasoning off. Models with no reasoning mode ignore it.
+    static func applyReasoningControls(to body: inout [String: Any]) {
+        guard let raw = LLMCallContext.reasoningEffort?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(), !raw.isEmpty else { return }
+        switch raw {
+        case "none":
+            body["reasoning"] = ["enabled": false]
+        case "low", "medium", "high":
+            body["reasoning"] = ["effort": raw]
+        case "xhigh", "max", "ultra":
+            body["reasoning"] = ["effort": "high"]
+        default:
+            return
+        }
     }
 
     private func resolveKey() -> String? {
@@ -91,8 +121,10 @@ public final class OpenRouterAdapter: LLMAdapter {
 
         var body: [String: Any] = ["model": model, "messages": messages]
         try OpenAIAdapter.applyTools(to: &body, tools: tools)
+        Self.applyReasoningControls(to: &body)
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
+        let startedNs = DispatchTime.now().uptimeNanoseconds
         let data: Data
         let response: URLResponse
         do {
@@ -114,7 +146,16 @@ public final class OpenRouterAdapter: LLMAdapter {
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
-        return try OpenAIAdapter.parseCompletion(obj, status: status)
+        let reply = try OpenAIAdapter.parseCompletion(obj, status: status)
+        await telemetry.record(
+            provider: providerId,
+            model: model,
+            streaming: false,
+            usage: LLMUsage.fromOpenAIChatCompletions(obj["usage"] as? [String: Any]),
+            ttftMs: nil,
+            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+        )
+        return reply
     }
 
     public func streamMessages(
@@ -127,8 +168,12 @@ public final class OpenRouterAdapter: LLMAdapter {
         let endpoint = self.endpoint
         let keyResolved = self.resolveKey()
         let dataRoot = self.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let telemetry = self.telemetry
+        let providerId = self.providerId
         return AsyncThrowingStream { continuation in
             let task = Task {
+                let startedNs = DispatchTime.now().uptimeNanoseconds
+                var ttftMs: Int?
                 do {
                     guard let key = keyResolved, !key.isEmpty else {
                         throw LLMError.notConfigured(provider: "openrouter")
@@ -143,6 +188,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                         "stream": true,
                         "stream_options": ["include_usage": true],
                     ]
+                    Self.applyReasoningControls(to: &body)
                     try OpenAIAdapter.applyTools(to: &body, tools: tools)
                     req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -182,6 +228,9 @@ public final class OpenRouterAdapter: LLMAdapter {
                         if frame.reasoning != nil { continuation.yield(.keepAlive) }
                         if let content = frame.content {
                             sawContent = true
+                            if ttftMs == nil {
+                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+                            }
                             continuation.yield(.textDelta(content))
                         }
                         for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
@@ -204,6 +253,14 @@ public final class OpenRouterAdapter: LLMAdapter {
                             inputJSON: Data(call.arguments.utf8)
                         )))
                     }
+                    await telemetry.record(
+                        provider: providerId,
+                        model: model,
+                        streaming: true,
+                        usage: decoder.usage,
+                        ttftMs: ttftMs,
+                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+                    )
                     continuation.finish()
                 } catch let error as LLMError {
                     continuation.finish(throwing: error)
@@ -227,8 +284,12 @@ public final class OpenRouterAdapter: LLMAdapter {
         let session = self.session
         let endpoint = self.endpoint
         let keyResolved = self.resolveKey()
+        let telemetry = self.telemetry
+        let providerId = self.providerId
         return AsyncThrowingStream { continuation in
             let task = Task {
+                let startedNs = DispatchTime.now().uptimeNanoseconds
+                var ttftMs: Int?
                 guard let key = keyResolved, !key.isEmpty else {
                     continuation.finish(throwing: LLMError.notConfigured(provider: "openrouter"))
                     return
@@ -243,7 +304,17 @@ public final class OpenRouterAdapter: LLMAdapter {
                     messages.append(["role": "system", "content": sys])
                 }
                 messages.append(["role": "user", "content": prompt])
-                let body: [String: Any] = ["model": model, "messages": messages, "stream": true]
+                // User, 2026-09-06: this overload asked for neither usage nor
+                // the reasoning controls its structured sibling sends, so a
+                // turn that took this path recorded a token-less telemetry row
+                // and silently ignored the person's reasoning-effort pick.
+                var body: [String: Any] = [
+                    "model": model,
+                    "messages": messages,
+                    "stream": true,
+                    "stream_options": ["include_usage": true],
+                ]
+                Self.applyReasoningControls(to: &body)
                 do {
                     req.httpBody = try JSONSerialization.data(withJSONObject: body)
                 } catch {
@@ -312,6 +383,9 @@ public final class OpenRouterAdapter: LLMAdapter {
                         if frame.isDone { break }
                         guard let content = frame.content else { continue }
                         sawContent = true
+                        if ttftMs == nil {
+                            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+                        }
                         continuation.yield(content)
                     }
                     if !decoder.sawDone {
@@ -331,6 +405,14 @@ public final class OpenRouterAdapter: LLMAdapter {
                             message: "openrouter stream produced no content ([DONE], empty)"
                         )
                     }
+                    await telemetry.record(
+                        provider: providerId,
+                        model: model,
+                        streaming: true,
+                        usage: decoder.usage,
+                        ttftMs: ttftMs,
+                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
+                    )
                     continuation.finish()
                 } catch let err as LLMError {
                     continuation.finish(throwing: err)
@@ -348,6 +430,16 @@ public final class OpenRouterAdapter: LLMAdapter {
         provider: "openrouter",
         rateLimited: { String(data: $0, encoding: .utf8) ?? "rate limited" },
         serverError: { String(data: $0, encoding: .utf8) ?? "5xx" },
-        otherwise: { status, _ in .invalidResponse(status: status) }
+        // User, 2026-09-06: carry the body — see the OpenAI sibling. A 400
+        // whose message says "context length" arrived as a bare
+        // `.invalidResponse(400)`, so `isContextOverflow` had nothing to read
+        // and the turn retried the same oversized prompt instead of
+        // compacting.
+        otherwise: { status, data in
+            guard let detail = providerErrorDetail(data), !detail.isEmpty else {
+                return .invalidResponse(status: status)
+            }
+            return .providerError(message: "openrouter HTTP \(status): \(detail)")
+        }
     )
 }

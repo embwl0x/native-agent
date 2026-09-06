@@ -140,7 +140,7 @@ final class SwiftNativeCommandPaletteTests: XCTestCase {
         // when no live trust policy is loaded, `enableAutonomy` is treated as
         // false (Python L5972: "ready" if trust.get("enableAutonomy") else
         // "attention"), so the operating-map entry surfaces "attention". This
-        // is the baseline used by the MacSyncEngine/SpotlightOverlay carve
+        // is the baseline used by the MacSyncEngine/command-palette carve
         // where runtime is nil and no CommandPaletteContext can be built.
         let entries = commandPaletteEntries(context: .wave2NeutralBaseline)
         XCTAssertEqual(entries.first(where: { $0.id == "chat" })?.subtitle,

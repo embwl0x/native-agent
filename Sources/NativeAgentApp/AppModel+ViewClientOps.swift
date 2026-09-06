@@ -32,7 +32,21 @@ extension AppModel {
                 NSLocalizedDescriptionKey: "The approval request has no identifier."
             ])
         }
+        let normalizedDecision = decision
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
         if let task = approvalResolutionTasks[trimmedID] {
+            // 2026-09-06: joining is only honest for the SAME decision. The
+            // opposite one used to be swallowed and answered with the first
+            // decision's result, so pressing Deny over a running Approve read
+            // back as an approval nobody made.
+            if let inFlight = approvalResolutionDecisions[trimmedID],
+               inFlight != normalizedDecision {
+                throw NSError(domain: "NativeAgentApproval", code: 409, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "This request is already being \(inFlight). That decision was not sent."
+                ])
+            }
             return try await task.value
         }
 
@@ -45,9 +59,11 @@ extension AppModel {
             return try await resolverClient.resolveApproval(id: trimmedID, decision: decision)
         }
         approvalResolutionTasks[trimmedID] = task
+        approvalResolutionDecisions[trimmedID] = normalizedDecision
         approvalResolutionInFlightIDs.insert(trimmedID)
         defer {
             approvalResolutionTasks.removeValue(forKey: trimmedID)
+            approvalResolutionDecisions.removeValue(forKey: trimmedID)
             approvalResolutionInFlightIDs.remove(trimmedID)
         }
         return try await task.value
@@ -135,6 +151,27 @@ extension AppModel {
 
     func resumePendingOnboarding() async throws -> OnboardingCompleteResponse {
         try await client.resumePendingOnboarding()
+    }
+
+    /// User, 2026-09-06: the resident refresh is sequenced HERE, not inside the
+    /// client call, because only the app knows whether a turn is in flight.
+    /// Restarting Context Flow and reloading cognition underneath a running
+    /// turn changes the ground it is standing on mid-answer, so a repair that
+    /// lands during a turn defers its refresh to the turn's close.
+    func repairOnboardingProfile(agentName: String, personaType: String, userName: String) async throws -> OnboardingCompleteResponse {
+        let response = try await client.repairOnboardingProfile(
+            agentName: agentName, personaType: personaType, userName: userName
+        )
+        if response.ok {
+            // The personality reload (so `agentDisplayName` and AgentVoice stop
+            // showing the pre-repair name) and the resident refresh are ONE
+            // act, applied behind the same turn-idle gate. User, 2026-09-06: the
+            // reload used to run ahead of the gate, so a repair during a live
+            // turn re-taught the name and swapped the header underneath the
+            // answer in flight while the refresh it belongs with waited.
+            await refreshResidentMindAfterProfileRepair()
+        }
+        return response
     }
 
     func resetOnboarding(confirm: Bool = true) async throws -> OnboardingResetResponse {
@@ -295,8 +332,11 @@ extension AppModel {
         return response
     }
 
-    func testProvider(_ id: String) async throws -> ProviderTestResult {
-        try await client.testProvider(id)
+    /// `apiKeyOverride` is the unsaved key typed into the provider sheet; when
+    /// present the probe tests THAT credential instead of the one on disk
+    /// (User, 2026-09-06).
+    func testProvider(_ id: String, apiKeyOverride: String? = nil) async throws -> ProviderTestResult {
+        try await client.testProvider(id, apiKeyOverride: apiKeyOverride)
     }
 
     func clearProvider(_ id: String) async throws -> EmptyResponse {

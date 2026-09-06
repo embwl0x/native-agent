@@ -54,7 +54,96 @@ final class SnapshotFreshnessBadgeModifierEvalTests: XCTestCase {
         }
     }
 
-    /// The six screens E6 covers must actually apply the shared modifier. A
+    // MARK: - Per-group staleness (sweep 2026-09-01 item 2)
+
+    /// The failure this closes: `data/icloud/snapshot_skips.json` named
+    /// `memories` and `knowledge_graph` as unrebuildable while the phone
+    /// rendered both as current, because staleness was purely a function of
+    /// snapshot AGE and the sync timestamp itself was fresh.
+    func test_aGroupTheMacCouldNotRebuildBadgesTheScreenEvenWhenTheSyncIsFresh() {
+        let markers = ["memories": "The operation couldn’t be completed. (Swift.CancellationError error 1.)"]
+        let reason = MacSnapshotGroupStaleness.reason(in: markers, group: "memories")
+        XCTAssertNotNil(reason, "Memory renders a group the Mac skipped and says nothing")
+        XCTAssertEqual(reason, markers["memories"])
+
+        let freshState = StatusConnectionPresentation.syncState(
+            lastSyncedAt: now.addingTimeInterval(-5),
+            now: now
+        )
+        XCTAssertFalse(
+            StatusConnectionPresentation.needsAttention(freshState),
+            "age alone would hide this, which is exactly why the marker exists"
+        )
+        let badge = MacSnapshotFreshnessBadge(
+            lastSyncedAt: now.addingTimeInterval(-5),
+            staleGroupReason: reason
+        )
+        XCTAssertEqual(badge.staleGroupReason, reason)
+        XCTAssertTrue(MacSnapshotGroupStaleness.title.contains("STALE"))
+    }
+
+    func test_aGroupThatRebuiltIsNotBadged() {
+        // The Mac publishes an EMPTY marker on a healthy pass; a screen whose
+        // group is absent from it must render with no banner.
+        XCTAssertNil(MacSnapshotGroupStaleness.reason(in: [:], group: "memories"))
+        XCTAssertNil(
+            MacSnapshotGroupStaleness.reason(
+                in: ["knowledge_graph": "unreadable"],
+                group: "memories"
+            ),
+            "another group's failure must not badge this screen"
+        )
+        XCTAssertNil(MacSnapshotGroupStaleness.reason(in: ["memories": "x"], group: nil))
+        // A reason the Mac left blank is still a skip, and must still badge.
+        XCTAssertNotNil(MacSnapshotGroupStaleness.reason(in: ["memories": "   "], group: "memories"))
+    }
+
+    func test_memoryAndKnowledgeGraphNameTheGroupTheyRender() throws {
+        XCTAssertTrue(
+            try MobileEvalSources.mobileSource("MemoryView.swift")
+                .contains("macSnapshotFreshnessBadge(group: Self.snapshotGroup(for: segment))"),
+            "Memory renders Mac-owned rows with no per-group staleness badge"
+        )
+        XCTAssertTrue(
+            try MobileEvalSources.mobileSource("KnowledgeGraphView.swift")
+                .contains(#".macSnapshotFreshnessBadge(group: "knowledge_graph")"#)
+        )
+    }
+
+    /// Memory's two tabs come from two Mac groups that fail independently
+    /// (`memories` vs `memory_proposals`), and the marker lookup is an exact
+    /// key match — so a badge pinned to "memories" left a failed proposals
+    /// rebuild rendering as a fresh, measured-empty Proposals list.
+    func test_aFailedProposalsRebuildBadgesTheProposalsTabNotJustMemories() {
+        XCTAssertEqual(MemoryView.snapshotGroup(for: .memories), "memories")
+        XCTAssertEqual(MemoryView.snapshotGroup(for: .proposals), "memory_proposals")
+
+        let markers = ["memory_proposals": "memory proposals unreadable: EIO"]
+        XCTAssertEqual(
+            MacSnapshotGroupStaleness.reason(
+                in: markers,
+                group: MemoryView.snapshotGroup(for: .proposals)
+            ),
+            markers["memory_proposals"],
+            "a skipped memory_proposals group left the Proposals tab looking fresh"
+        )
+        XCTAssertNil(
+            MacSnapshotGroupStaleness.reason(
+                in: markers,
+                group: MemoryView.snapshotGroup(for: .memories)
+            ),
+            "the Memories tab must not be badged for the other tab's failure"
+        )
+        // ...and the reverse direction, so the two tabs never share a verdict.
+        XCTAssertNil(
+            MacSnapshotGroupStaleness.reason(
+                in: ["memories": "unreadable"],
+                group: MemoryView.snapshotGroup(for: .proposals)
+            )
+        )
+    }
+
+    /// The screens E6 covers must actually apply the shared modifier. A
     /// source check is the honest instrument here: the alternative is asserting
     /// on rendered SwiftUI internals, which passes when the modifier is applied
     /// to the wrong subtree.
@@ -66,10 +155,13 @@ final class SnapshotFreshnessBadgeModifierEvalTests: XCTestCase {
             "AutonomyView.swift",
             "SkillsToolsView.swift",
             "TurnInspectorView.swift",
+            // 2026-09-01: Memory was the screen this modifier's own header
+            // claimed to cover and never mounted on.
+            "MemoryView.swift",
         ] {
             let text = try MobileEvalSources.mobileSource(screen)
             XCTAssertTrue(
-                text.contains(".macSnapshotFreshnessBadge()"),
+                text.contains(".macSnapshotFreshnessBadge("),
                 "\(screen) renders Mac snapshot data with no freshness badge"
             )
         }

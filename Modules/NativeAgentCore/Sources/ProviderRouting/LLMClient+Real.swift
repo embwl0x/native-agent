@@ -584,18 +584,29 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         if lower.contains("/"), openRouter != nil {
             return AdapterResolution(choice: .openRouter, model: model, providerId: "openrouter")
         }
+        // User, 2026-09-06: this UNPINNED fallback used to pick OAuth on adapter
+        // EXISTENCE, and production builds every OAuth adapter unconditionally
+        // — so a user whose only credential was an API key had `claude-*` /
+        // `gpt-*` routed to the OAuth provider and got `notConfigured` from a
+        // provider they never connected. Choose OAuth only when its credential
+        // is actually on disk; otherwise the api-key adapter, which fails with
+        // its own honest shape when it too is unconfigured.
         if lower.hasPrefix("claude") {
             return AdapterResolution(
                 choice: .anthropic,
                 model: model,
-                providerId: anthropicOAuthDirect == nil ? "anthropic" : "anthropic_oauth_direct"
+                providerId: Self.oauthCredentialPresent(anthropicOAuthDirect)
+                    ? "anthropic_oauth_direct"
+                    : "anthropic"
             )
         }
         if lower.hasPrefix("gpt") {
             return AdapterResolution(
                 choice: .openAI,
                 model: model,
-                providerId: openAIOAuthDirect == nil ? "openai" : "openai_oauth_direct"
+                providerId: Self.oauthCredentialPresent(openAIOAuthDirect)
+                    ? "openai_oauth_direct"
+                    : "openai"
             )
         }
         if lower.hasPrefix("grok") {
@@ -631,6 +642,13 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
             return AdapterResolution(choice: .openRouter, model: model, providerId: "openrouter")
         }
         return AdapterResolution(choice: .codex, model: model, providerId: "codex")
+    }
+
+    /// True only when `adapter` exists AND its own credential file is present.
+    /// An adapter that cannot answer (a test double) reports absent, which
+    /// keeps the api-key branch — the same shape as no adapter at all.
+    private static func oauthCredentialPresent(_ adapter: (any LLMAdapter)?) -> Bool {
+        (adapter as? OAuthCredentialPresence)?.hasStoredOAuthCredential ?? false
     }
 
     private func openAIAdapter(for providerId: String) throws -> any LLMAdapter {
@@ -809,6 +827,104 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         return model
     }
 
+    /// Wall deadline for non-streaming completions. `ProviderStreamGuard` only
+    /// wraps the streaming paths; a plain request/response completion that the
+    /// server leaves open past URLSession's timeouts otherwise hangs the turn
+    /// with no error (observed 2026-09-05: an OAuth-direct request open >11 min).
+    private func withCompletionWall<T: Sendable>(
+        _ label: String,
+        _ work: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        // User, 2026-09-06: bound the per-call wall by what the whole turn has
+        // left, minus a reconnect reserve. At the shipped defaults the wall
+        // (600s) equalled the interactive/Telegram turn window (600s), so the
+        // first hung call spent the entire budget and the reconnect ladder
+        // exited on the budget instead of retrying.
+        let wall = ProviderRecoveryPolicy.callWallSeconds(
+            configured: streamGuardConfig.wallTimeout,
+            remainingTurnSeconds: LLMCallContext.remainingTurnSeconds
+        )
+        guard wall > 0 else { return try await work() }
+        // User, 2026-09-06: this used to race the call against a sleep inside a
+        // task group. Leaving a group WAITS for its cancelled children, so a
+        // provider that ignores cancellation never let the timeout return and
+        // the wall could not release the turn — exactly the hang it was added
+        // for. Both sides now run unstructured behind a resume-once gate, the
+        // shape `IntraTurnContextCompaction.withDeadline` uses (that type lives
+        // in ChatOrchestration, which ProviderRouting deliberately cannot see).
+        let child = Task { try await work() }
+        let sleeper = Task {
+            try? await Task.sleep(nanoseconds: UInt64(wall * 1_000_000_000))
+        }
+        let once = CompletionWallOnce<T>()
+        let outcome: Result<T, Error> = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Result<T, Error>, Never>) in
+                once.install(continuation)
+                Task {
+                    let value = await child.result
+                    sleeper.cancel()
+                    once.resume(value)
+                }
+                Task {
+                    await sleeper.value
+                    guard !sleeper.isCancelled else { return }
+                    // User, 2026-09-06: CLAIM FIRST, THEN CANCEL. Cancelling the
+                    // child first let a cooperative provider throw
+                    // CancellationError and win the once-gate, so a wall
+                    // timeout surfaced as a user Stop — the turn persisted
+                    // "cancelled" for a stop nobody pressed, and the recovery
+                    // ladder skipped a retry it was entitled to.
+                    once.resume(.failure(LLMError.transient(
+                        message: "\(label) completion wall timeout after \(Int(wall))s"
+                    )))
+                    child.cancel()
+                }
+            }
+        } onCancel: {
+            // A Stop returns NOW, even if the provider ignores cancellation.
+            child.cancel()
+            sleeper.cancel()
+            once.resume(.failure(CancellationError()))
+        }
+        return try outcome.get()
+    }
+
+    /// Resume-once gate for `withCompletionWall`'s two racers. Resuming before
+    /// the continuation is installed is remembered and applied on install, so a
+    /// cancellation that lands first still resolves the wait.
+    private final class CompletionWallOnce<T: Sendable>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Result<T, Error>, Never>?
+        private var pending: Result<T, Error>?
+        private var resolved = false
+
+        func install(_ continuation: CheckedContinuation<Result<T, Error>, Never>) {
+            lock.lock()
+            if let pending {
+                self.pending = nil
+                lock.unlock()
+                continuation.resume(returning: pending)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func resume(_ value: Result<T, Error>) {
+            lock.lock()
+            guard !resolved else { lock.unlock(); return }
+            resolved = true
+            if let continuation {
+                self.continuation = nil
+                lock.unlock()
+                continuation.resume(returning: value)
+                return
+            }
+            pending = value
+            lock.unlock()
+        }
+    }
+
     public func complete(prompt: String, system: String?, model: String?) async throws -> String {
         try await complete(prompt: prompt, system: system, model: model, surface: "chat", tools: nil)
     }
@@ -856,7 +972,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         // U1 step 1: bind the calling surface task-locally so the adapters'
         // llm.call telemetry rows can carry it (no signature changes).
         do {
-            let result = try await LLMCallContext.$surface.withValue(surface) {
+            let result = try await withCompletionWall("\(resolution.choice)") { [self] in try await LLMCallContext.$surface.withValue(surface) {
                 try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                 switch resolution.choice {
@@ -894,7 +1010,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 }
                     }
                 }
-            }
+            } }
             await providerLifecycleFinish(lifecycle, phase: .succeeded)
             return result
         } catch is CancellationError {
@@ -941,7 +1057,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         )
         // U1 step 1: bind the calling surface task-locally for telemetry.
         do {
-            let result = try await LLMCallContext.$surface.withValue(surface) {
+            let result = try await withCompletionWall("\(resolution.choice)") { [self] in try await LLMCallContext.$surface.withValue(surface) {
                 try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
                 switch resolution.choice {
@@ -953,6 +1069,23 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         messages: messages, system: system, model: effectiveModel, tools: tools
                     )
                 case .anthropic:
+                    // User, 2026-09-06: the STREAMING branch has carried this
+                    // guard since F1-M1; the non-streaming one did not, and
+                    // `runEphemeralToolTurn` (Workshop, Studio, swarm workers,
+                    // scheduler jobs) drives the structured loop through THIS
+                    // call with schemas attached. On an Anthropic OAuth surface
+                    // that reached the OAuth builder, which writes body["tools"]
+                    // — the one request shape NativeToolCapability exists to
+                    // keep off the Claude subscription connection. FAIL LOUD,
+                    // never silently strip: same message, same invariant.
+                    if tools != nil,
+                       !NativeToolCapability.providerSupportsNativeTools(resolution.providerId) {
+                        throw LLMError.providerError(message:
+                            "native tools[] bound to non-native Anthropic-family adapter "
+                            + "'\(resolution.providerId)' for model "
+                            + "'\(resolution.model)' — "
+                            + "gate/resolver disagreement (F1-M1)")
+                    }
                     return try await anthropicAdapter(for: resolution.providerId).completeMessages(
                         messages: messages, system: system, model: effectiveModel, tools: tools
                     )
@@ -979,7 +1112,7 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                 }
                     }
                 }
-            }
+            } }
             await providerLifecycleFinish(lifecycle, phase: .succeeded)
             return result
         } catch is CancellationError {
@@ -1015,7 +1148,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         routingSnapshot: routingSnapshot
                     )
 
-                    let streamGuardConfig = self.streamGuardConfig
+                    // Same per-call wall bound as `withCompletionWall`.
+                    var streamGuardConfig = self.streamGuardConfig
+                    streamGuardConfig.wallTimeout = ProviderRecoveryPolicy.callWallSeconds(
+                        configured: streamGuardConfig.wallTimeout,
+                        remainingTurnSeconds: LLMCallContext.remainingTurnSeconds
+                    )
 
                     func forward(
                         _ stream: AsyncThrowingStream<LLMMessageStreamEvent, Error>,
@@ -1121,6 +1259,11 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                     }
                     }
                     }
+                    // User, 2026-09-06: cancellation can resume the iteration's
+                    // next() with nil instead of throwing, so the in-loop
+                    // checkCancellation never runs and a stopped stream was
+                    // recorded as `.succeeded`. Ask once more at EOF.
+                    try Task.checkCancellation()
                     await self.providerLifecycleFinish(started, phase: .succeeded)
                     continuation.finish()
                 } catch is CancellationError {
@@ -1172,7 +1315,12 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
         AsyncThrowingStream { continuation in
             let codex = self.codex
             let router = self.router
-            let streamGuardConfig = self.streamGuardConfig
+            // Same per-call wall bound as `withCompletionWall`.
+            var streamGuardConfig = self.streamGuardConfig
+            streamGuardConfig.wallTimeout = ProviderRecoveryPolicy.callWallSeconds(
+                configured: streamGuardConfig.wallTimeout,
+                remainingTurnSeconds: LLMCallContext.remainingTurnSeconds
+            )
             // Hoist the worker Task into a binding so onTermination can cancel
             // it. Without this, a cancelled consumer (chat-turn aborted, view
             // dismissed, etc.) would leave the inner adapter.stream() iteration
@@ -1283,6 +1431,9 @@ public final class SwiftNativeLLMClient: LLMClient, StreamingLLMClient {
                         try Task.checkCancellation()
                         continuation.yield(chunk)
                     }
+                    // See the messages wrapper above: a cancellation that ends
+                    // the stream with nil must not record `.succeeded`.
+                    try Task.checkCancellation()
                     await self.providerLifecycleFinish(started, phase: .succeeded)
                     continuation.finish()
                 } catch is CancellationError {
@@ -1375,6 +1526,28 @@ public enum LLMCredentialResolver {
         )
     }
 
+    /// User, 2026-09-06: presence-only resolution against a provider config
+    /// object the CALLER already read — used by the routing snapshot, which
+    /// reads each `providers/<id>.json` once under the same per-file lock
+    /// `configureProvider` writes under. Reading the file a second time here,
+    /// unlocked, is exactly what let one snapshot decide "which provider is
+    /// connected" from one set of bytes and "what that provider defaults to"
+    /// from another. Precedence is the file resolver's, because it IS the file
+    /// resolver — only the config-object step is pre-supplied.
+    static func resolveAPIKey(
+        envVar: String,
+        providerConfigObject: [String: Any]?,
+        dataRoot: URL,
+        includeEnvironment: Bool = true
+    ) -> String? {
+        return resolveAPIKey(
+            envVar: envVar,
+            providerConfig: { providerConfigObject },
+            codexHomeDir: dataRoot.appendingPathComponent("codex_home", isDirectory: true),
+            includeEnvironment: includeEnvironment
+        )
+    }
+
     /// Core resolver: env var → `<providersDir>/<providerConfigFile>` `api_key`
     /// → (OpenAI only) `<codexHomeDir>/auth.json` `OPENAI_API_KEY`. Both public
     /// entry points funnel here so the precedence/parsing semantics stay in one
@@ -1387,6 +1560,27 @@ public enum LLMCredentialResolver {
         codexHomeDir: URL,
         includeEnvironment: Bool = true
     ) -> String? {
+        let providerPath = providersDir.appendingPathComponent(providerConfigFile)
+        return resolveAPIKey(
+            envVar: envVar,
+            providerConfig: {
+                guard let data = try? Data(contentsOf: providerPath) else { return nil }
+                return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            },
+            codexHomeDir: codexHomeDir,
+            includeEnvironment: includeEnvironment
+        )
+    }
+
+    /// The precedence itself, with the provider config object supplied by the
+    /// caller (read from disk, or handed over already-read). One copy so a
+    /// pre-read caller cannot drift from a file-reading one.
+    private static func resolveAPIKey(
+        envVar: String,
+        providerConfig: () -> [String: Any]?,
+        codexHomeDir: URL,
+        includeEnvironment: Bool
+    ) -> String? {
         if includeEnvironment, let v = ProcessInfo.processInfo.environment[envVar] {
             let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
@@ -1398,9 +1592,7 @@ public enum LLMCredentialResolver {
             }
         }
 
-        let providerPath = providersDir.appendingPathComponent(providerConfigFile)
-        if let data = try? Data(contentsOf: providerPath),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        if let obj = providerConfig(),
            let key = obj["api_key"] as? String {
             // Return the TRIMMED key, mirroring the env-var branch above —
             // stray whitespace in the config file flows into the auth header

@@ -53,6 +53,39 @@ struct MacChatTurnCardModel: Sendable, Equatable {
     /// state of its own and decides nothing.
     let approval: MacChatTurnCardApproval?
 
+    /// The timestamps the trailing readout is derived from, so the one-second
+    /// readout can advance itself without the whole card being re-projected.
+    /// `nil` means "no live clock": the card renders the frozen `elapsed` and
+    /// `secondsSinceMovement` it was projected with, which is what a terminal
+    /// turn (and every test that builds a model by hand) wants.
+    var clock: Clock? = nil
+
+    /// Raw inputs for the trailing readout. Deliberately the same three
+    /// timestamps the projection uses, so the self-advancing readout and a
+    /// re-projection can never disagree about what second it is.
+    struct Clock: Equatable {
+        let startedAt: Date
+        let endedAt: Date?
+        let lastMovementAt: Date
+        let isTerminal: Bool
+
+        /// Whole seconds, matching `MacChatTurnCardProjection.wholeSeconds`:
+        /// the readout shows seconds, so sub-second churn would re-render the
+        /// text at token rate for a string that never changes.
+        static func wholeSeconds(_ interval: TimeInterval) -> TimeInterval {
+            guard interval.isFinite, interval > 0 else { return 0 }
+            return interval.rounded(.down)
+        }
+
+        func elapsed(at instant: Date) -> TimeInterval {
+            Self.wholeSeconds((endedAt ?? instant).timeIntervalSince(startedAt))
+        }
+
+        func secondsSinceMovement(at instant: Date) -> TimeInterval? {
+            isTerminal ? nil : Self.wholeSeconds(instant.timeIntervalSince(lastMovementAt))
+        }
+    }
+
     /// True only while the card still offers something to click. A settled
     /// card with no pending decision floats over the transcript and must be
     /// inert; one holding a live approval must not be.
@@ -65,11 +98,12 @@ struct MacChatTurnCardModel: Sendable, Equatable {
     /// VoiceOver that becomes punctuation noise, so the same facts are spoken
     /// as a sentence instead.
     var spokenMeta: String {
-        var parts = [MacChatTurnCardFormat.elapsedPhrase(elapsed, isTerminal: isTerminal)]
-        if let movement = MacChatTurnCardFormat.movementPhrase(secondsSinceMovement) {
-            parts.append(movement)
-        }
-        return parts.joined(separator: ", ")
+        MacChatTurnCardFormat.metaLine(
+            elapsed: elapsed,
+            secondsSinceMovement: secondsSinceMovement,
+            isTerminal: isTerminal,
+            separator: ", "
+        )
     }
 }
 
@@ -195,7 +229,13 @@ enum MacChatTurnCardProjection {
             elapsed: elapsed,
             secondsSinceMovement: sinceMovement,
             cancellationPending: cancellationPending,
-            approval: approval
+            approval: approval,
+            clock: MacChatTurnCardModel.Clock(
+                startedAt: presentation.startedAt,
+                endedAt: presentation.endedAt,
+                lastMovementAt: presentation.lastMovementAt,
+                isTerminal: isTerminal
+            )
         )
     }
 
@@ -375,6 +415,21 @@ enum MacChatTurnCardFormat {
     }
 
     /// Only worth saying once movement has actually gone quiet.
+    /// The one place the timing readout is assembled, so the visual line, the
+    /// spoken line, and the model's own `spokenMeta` cannot drift apart.
+    static func metaLine(
+        elapsed: TimeInterval,
+        secondsSinceMovement: TimeInterval?,
+        isTerminal: Bool,
+        separator: String
+    ) -> String {
+        var parts = [elapsedPhrase(elapsed, isTerminal: isTerminal)]
+        if let movement = movementPhrase(secondsSinceMovement) {
+            parts.append(movement)
+        }
+        return parts.joined(separator: separator)
+    }
+
     static func movementPhrase(_ secondsSinceMovement: TimeInterval?) -> String? {
         guard let secondsSinceMovement,
               secondsSinceMovement >= MacChatTurnCardProjection.movementNoticeAfter else {
@@ -410,6 +465,10 @@ struct MacChatTurnCard: View {
     /// inbox. The card carries no authority: it hands "approved"/"denied" to
     /// the same resolve path every other approval surface uses.
     var onDecideApproval: ((String) -> Void)?
+    /// 2026-09-06: a decision is already on its way to the inbox. Both buttons
+    /// stay visible and go inert — leaving them live invited a second press
+    /// whose opposite decision the resolver could only discard.
+    var isResolvingApproval: Bool = false
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -446,14 +505,13 @@ struct MacChatTurnCard: View {
 
                     Spacer(minLength: NativeAgentSpacing.sm)
 
-                    Text(meta)
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.tertiary)
-                        .monospacedDigit()
-                        .lineLimit(1)
-                        .accessibilityLabel(model.spokenMeta)
-                        .accessibilityAddTraits(.updatesFrequently)
-                        .allowsHitTesting(false)
+                    MacChatTurnCardMetaText(
+                        clock: model.clock,
+                        isTerminal: model.isTerminal,
+                        fallback: meta,
+                        fallbackSpoken: model.spokenMeta
+                    )
+                    .allowsHitTesting(false)
 
                     // Controls outrank ALL text at narrow widths: at the
                     // detached-window floor (380pt) with a long meta readout,
@@ -466,14 +524,20 @@ struct MacChatTurnCard: View {
                         Button("Approve") { onDecideApproval("approved") }
                             .buttonStyle(.borderless)
                             .foregroundStyle(NativeAgentTheme.ok)
-                            .help("Approve \(approval.toolName)")
+                            .disabled(isResolvingApproval)
+                            .help(isResolvingApproval
+                                  ? "A decision is already being sent"
+                                  : "Approve \(approval.toolName)")
                             .accessibilityLabel("Approve \(approval.toolName)")
                             .fixedSize()
                             .layoutPriority(3)
                         Button("Deny") { onDecideApproval("denied") }
                             .buttonStyle(.borderless)
                             .foregroundStyle(NativeAgentTheme.fail)
-                            .help("Deny \(approval.toolName)")
+                            .disabled(isResolvingApproval)
+                            .help(isResolvingApproval
+                                  ? "A decision is already being sent"
+                                  : "Deny \(approval.toolName)")
                             .accessibilityLabel("Deny \(approval.toolName)")
                             .fixedSize()
                             .layoutPriority(3)
@@ -516,6 +580,21 @@ struct MacChatTurnCard: View {
                         .help(detail)
                         .padding(.leading, 12 + NativeAgentSpacing.sm)
                 }
+
+                // 2026-09-06: what the tool would run with. A decision asked
+                // for over a tool name and "autonomy=<level>" is a decision
+                // made blind.
+                if let approval = model.approval, approval.isActionable,
+                   let input = approval.inputSummary {
+                    Text(input)
+                        .font(NativeAgentFont.tag)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(input)
+                        .accessibilityLabel("Input: \(input)")
+                        .padding(.leading, 12 + NativeAgentSpacing.sm)
+                }
             }
         }
         // The card floats over the transcript, and clear glass keeps the text
@@ -549,11 +628,73 @@ struct MacChatTurnCard: View {
     }
 
     private var meta: String {
-        var parts = [MacChatTurnCardFormat.elapsedPhrase(model.elapsed, isTerminal: model.isTerminal)]
-        if let movement = MacChatTurnCardFormat.movementPhrase(model.secondsSinceMovement) {
-            parts.append(movement)
+        MacChatTurnCardFormat.metaLine(
+            elapsed: model.elapsed,
+            secondsSinceMovement: model.secondsSinceMovement,
+            isTerminal: model.isTerminal,
+            separator: " \u{00B7} "
+        )
+    }
+}
+
+/// The trailing timing readout, and the ONLY part of the card on a one-second
+/// schedule.
+///
+/// The 04:05 pin (2026-09-04) was a transcript layout cost, and this card is
+/// one of the invalidations that never let it settle: the whole card — glass,
+/// title, detail, buttons, pulsing dot — used to be rebuilt every second
+/// because a string inside it counts seconds. Now the schedule sits on the
+/// string. The card above it re-renders only when the turn's state actually
+/// changes.
+///
+/// A terminal turn has nothing left to count, so it renders statically with no
+/// schedule at all — as does a model built without a clock.
+struct MacChatTurnCardMetaText: View {
+    let clock: MacChatTurnCardModel.Clock?
+    let isTerminal: Bool
+    /// What to show when there is no live clock: the string the model was
+    /// projected with.
+    let fallback: String
+    let fallbackSpoken: String
+
+    var body: some View {
+        if let clock, !isTerminal {
+            TimelineView(.periodic(from: clock.startedAt, by: 1)) { context in
+                readout(at: context.date, clock: clock)
+            }
+        } else {
+            label(visible: fallback, spoken: fallbackSpoken)
         }
-        return parts.joined(separator: " \u{00B7} ")
+    }
+
+    @ViewBuilder
+    private func readout(at instant: Date, clock: MacChatTurnCardModel.Clock) -> some View {
+        let elapsed = clock.elapsed(at: instant)
+        let movement = clock.secondsSinceMovement(at: instant)
+        label(
+            visible: MacChatTurnCardFormat.metaLine(
+                elapsed: elapsed,
+                secondsSinceMovement: movement,
+                isTerminal: isTerminal,
+                separator: " \u{00B7} "
+            ),
+            spoken: MacChatTurnCardFormat.metaLine(
+                elapsed: elapsed,
+                secondsSinceMovement: movement,
+                isTerminal: isTerminal,
+                separator: ", "
+            )
+        )
+    }
+
+    private func label(visible: String, spoken: String) -> some View {
+        Text(visible)
+            .font(NativeAgentFont.tag)
+            .foregroundStyle(.tertiary)
+            .monospacedDigit()
+            .lineLimit(1)
+            .accessibilityLabel(spoken)
+            .accessibilityAddTraits(.updatesFrequently)
     }
 }
 
@@ -568,11 +709,22 @@ struct MacChatTurnCardHost: View {
     let sessionId: String
     var onStop: (() -> Void)?
 
+    /// Seconds between re-projections of the card. Only the derived `.stalled`
+    /// phase depends on the clock here; the readout keeps its own second.
+    static let phaseTick: TimeInterval = 5
+
     var body: some View {
         let state = appModel.chatTurnLifecycle(for: sessionId)
         Group {
             if let state, !state.presentation.isTerminal {
-                TimelineView(.periodic(from: state.presentation.startedAt, by: 1)) { context in
+                // The card itself is NOT on a one-second schedule any more —
+                // its trailing readout is (MacChatTurnCardMetaText). The only
+                // thing left here that the clock can change is the derived
+                // `.stalled` phase, whose threshold is 90s
+                // (TurnPresentationReducer.defaultStalledAfter), so a tick
+                // five times coarser surfaces a stall within 5s of the same
+                // instant while rebuilding the glass card a fifth as often.
+                TimelineView(.periodic(from: state.presentation.startedAt, by: Self.phaseTick)) { context in
                     card(state: state, at: context.date)
                 }
             } else {
@@ -603,7 +755,10 @@ struct MacChatTurnCardHost: View {
                 onStop: onStop,
                 onDecideApproval: model.approval?.isActionable == true
                     ? { decision in decideApproval(model, decision: decision) }
-                    : nil
+                    : nil,
+                isResolvingApproval: model.approval.map {
+                    appModel.isResolvingApproval(id: $0.approvalId)
+                } ?? false
             )
         }
     }

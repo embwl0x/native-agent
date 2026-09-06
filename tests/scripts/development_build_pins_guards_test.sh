@@ -53,8 +53,12 @@ awk '
   copying { print }
   END { if (!foundEnd) exit 1 }
 ' "$ROOT/script/test.sh" > "$TMP/canonical-swiftpm.sh"
-[[ "$(grep -Ec '^[[:space:]]*swift (build|test) ' "$TMP/canonical-swiftpm.sh")" == 5 ]] \
-  || { echo 'FAIL: canonical SwiftPM fixture did not capture all five call sites' >&2; exit 1; }
+# Six top-level SwiftPM call sites: activity-probe build, Core XCTest, the
+# one-time Core test-bundle build the shards --skip-build against, the solo
+# shard loop, NativeAgentShared and the root package. (The pooled shard runner
+# calls `swift test` inside an `xargs bash -c`, so it is not a top-level line.)
+[[ "$(grep -Ec '^[[:space:]]*swift (build|test) ' "$TMP/canonical-swiftpm.sh")" == 6 ]] \
+  || { echo 'FAIL: canonical SwiftPM fixture did not capture all six call sites' >&2; exit 1; }
 for sandbox in 0 1; do
   calls="$TMP/canonical-$sandbox.calls"
   PATH="$TMP/bin:$PATH" PIN_TEST_CALLS="$calls" \
@@ -69,10 +73,16 @@ for sandbox in 0 1; do
     ' > "$TMP/canonical-$sandbox.log" 2>&1 \
     || { echo 'FAIL: canonical SwiftPM calls did not preserve pins' >&2; exit 1; }
   shard_count="$(< "$TMP/shard-count")"
-  [[ "$(wc -l < "$calls" | tr -d ' ')" == "$((shard_count + 4))" ]] \
+  # activity-probe build + Core XCTest + Core test-bundle build + every shard
+  # (solo and pooled) + NativeAgentShared + the root package.
+  [[ "$(wc -l < "$calls" | tr -d ' ')" == "$((shard_count + 5))" ]] \
     || { echo 'FAIL: canonical fixture missed a build, test package, or shard' >&2; exit 1; }
-  [[ "$(grep -c -- '--skip-build' "$calls")" == "$((shard_count - 1))" ]] \
+  # Every shard now reuses the single up-front test-bundle build.
+  [[ "$(grep -c -- '--skip-build' "$calls")" == "$shard_count" ]] \
     || { echo 'FAIL: canonical shard reuse changed' >&2; exit 1; }
+  # The stated hazards stay pinned solo and internally serial; nothing else does.
+  [[ "$(grep -c -- '--no-parallel --filter' "$calls")" == 3 ]] \
+    || { echo 'FAIL: canonical solo-shard pinning changed' >&2; exit 1; }
   grep -q -- '--product activity-probe' "$calls"
   grep -q -- '--disable-swift-testing' "$calls"
   grep -q -- "--package-path $FIXTURE/Modules/NativeAgentShared" "$calls"

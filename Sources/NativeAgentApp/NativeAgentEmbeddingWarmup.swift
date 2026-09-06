@@ -106,13 +106,40 @@ func reconcileMemoryEmbeddingEpochAtLaunch() async {
             ])
             return
         }
-        let report = try await memory.reindexAllMemoryEmbeddingsForCurrentProvider()
+        // 2026-09-06: a memory written or forgotten while the batches were
+        // embedding invalidates the candidate snapshot, and activation refuses
+        // it (correctly). Recording that failure and returning left the
+        // provider on the new model while the store kept the old epoch — every
+        // recall for the rest of the process returned nothing. Retry with a
+        // FRESH snapshot; bounded, so a genuinely broken embedder still fails
+        // once and stops. Only `corpusDrift` is retried: the same refusal also
+        // covers duplicate staged rows, empty vectors and mixed dimensions, and
+        // re-embedding the whole corpus twice more cannot fix a provider that
+        // emits those.
+        let maximumActivationAttempts = 3
+        var attempt = 1
+        var report: MemoryEmbeddingEpochActivationReport
+        while true {
+            do {
+                report = try await memory.reindexAllMemoryEmbeddingsForCurrentProvider()
+                break
+            } catch let error as MemoryStorageError {
+                guard case .embeddingActivationInvalid(.corpusDrift, _) = error,
+                      attempt < maximumActivationAttempts else { throw error }
+                NSLog(
+                    "[memory-epoch] corpus changed under attempt %d; re-snapshotting: %@",
+                    attempt, String(describing: error)
+                )
+                attempt += 1
+            }
+        }
         writeReceipt([
             "status": "activated",
             "active_epoch": report.epoch,
             "memories": report.memories,
             "proposals": report.proposals,
             "tombstones": report.tombstones,
+            "attempts": attempt,
             "protected": true,
         ])
         NSLog("[memory-epoch] activated %@ across %d canonical rows", report.epoch, report.total)

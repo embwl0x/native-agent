@@ -110,30 +110,9 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
     }
 }
 
-struct NativeAgentWorkflowIntent: AppIntent {
-    static let title: LocalizedStringResource = "Launch NativeAgent Workflow"
-    static let description = IntentDescription("Launches a registered NativeAgent workflow through the approval-aware native action surface.")
-    static let openAppWhenRun = true
-
-    @Parameter(title: "Workflow ID")
-    var workflowId: String
-
-    @Parameter(title: "Objective")
-    var objective: String
-
-    static var parameterSummary: some ParameterSummary {
-        Summary("Launch workflow \(\.$workflowId)")
-    }
-
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let receipt = try await intentClient().runNativeAction(
-            id: "workflow.launch",
-            dryRun: false,
-            input: ["workflowId": workflowId, "objective": objective]
-        )
-        return .result(dialog: "Workflow action recorded as \(receipt.status).")
-    }
-}
+// 2026-09-01: `NativeAgentWorkflowIntent` ("Launch NativeAgent Workflow") was
+// retired with the workflow run engine (User authorized). It was never in
+// `appShortcuts`, and the native action it invoked no longer exists.
 
 struct NativeAgentApprovalsIntent: AppIntent {
     static let title: LocalizedStringResource = "Review NativeAgent Approvals"

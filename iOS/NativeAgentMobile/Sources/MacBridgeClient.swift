@@ -313,7 +313,10 @@ final class MacBridgeClient: ObservableObject {
         controls: ChatRuntimeControls = .defaults,
         attachments: [MultimodalAttachment] = [],
         suppressRemoteUserAppend: Bool = false,
-        replacementAssistantMessageID: UUID? = nil
+        replacementAssistantMessageID: UUID? = nil,
+        /// 2026-09-06: the caller mints the correlation id so it can name this
+        /// run in a Stop issued before this call returns.
+        messageID: String = UUID().uuidString
     ) async throws -> ChatSendResult {
         let metadata = Self.chatSendMetadata(
             controls: controls,
@@ -321,6 +324,7 @@ final class MacBridgeClient: ObservableObject {
             replacementAssistantMessageID: replacementAssistantMessageID
         )
         let msg = try await bridge.sendChatMessage(
+            id: messageID,
             text: text,
             sessionID: sessionID,
             metadata: metadata,
@@ -342,12 +346,16 @@ final class MacBridgeClient: ObservableObject {
         return metadata
     }
 
-    func cancelChat(sessionID: String?) async throws {
+    /// `runIDs` name the in-flight turns this Stop is for. The Mac cancels
+    /// only a run it was given, so a send issued straight after Stop is never
+    /// cancelled in place of the turn the user stopped.
+    func cancelChat(sessionID: String?, runIDs: [String] = []) async throws {
         let hasExplicitSession = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         _ = try await iCloudSyncEngine.shared.cancelChat(
             sessionId: sessionID,
             source: "ios_icloud",
-            sourceKey: hasExplicitSession ? nil : NativeAgentICloudBridgeConstants.mobileSourceKey
+            sourceKey: hasExplicitSession ? nil : NativeAgentICloudBridgeConstants.mobileSourceKey,
+            runIDs: runIDs
         )
         recordMacConfirmation()
     }
@@ -516,20 +524,30 @@ final class MacBridgeClient: ObservableObject {
 
     // MARK: - Chat history refresh (iCloud snapshot read)
 
-    func refreshChatHistory(sessionID: String?) async -> [ChatMessage]? {
+    /// 2026-09-06: the transcript read the chat store consumes. It keeps the
+    /// Mac's own distinction — no row published for this session vs. a row that
+    /// says the transcript is empty — instead of flattening both to "nothing".
+    func readChatTranscript(sessionID: String?) async -> MacTranscriptRead {
         let engine = iCloudSyncEngine.shared
         let sid: String
         if let sessionID, !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             sid = sessionID
         } else {
-            return nil
+            return .unavailable
         }
         // A refresh is also the missed-reply recovery path. Existing in-memory
         // rows do not prove that the latest Mac snapshot has been adopted.
         // The snapshot reader retains last-good rows if the read is unavailable.
         await engine.refreshChatTranscriptsSnapshot()
-        guard let records = engine.transcriptRecords(for: sid) else { return nil }
-        return Self.projectChatRecords(records)
+        return engine.transcriptRead(for: sid)
+    }
+
+    /// The pre-2026-09-06 array projection: an empty published transcript reads
+    /// as nil, exactly as before. Kept for callers that only want rows to show
+    /// and have no business clearing anything.
+    func refreshChatHistory(sessionID: String?) async -> [ChatMessage]? {
+        let messages = await readChatTranscript(sessionID: sessionID).messages
+        return messages.isEmpty ? nil : messages
     }
 
     static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {

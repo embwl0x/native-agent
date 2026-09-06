@@ -136,7 +136,16 @@ public enum TurnLifecycleMilestone: String, CaseIterable, Sendable {
     case turnAccepted = "turn.accepted"
     case contextReady = "context.ready"
     case providerRequestStarted = "provider.requestStarted"
+    /// The same provider call, re-issued in place after a recoverable drop.
+    /// Not a new request boundary: the conversation is unchanged (replay) or
+    /// carries only a non-persisted continuation nudge, and no tool re-runs.
+    case providerRetry = "provider.retry"
     case providerFirstDelta = "provider.firstDelta"
+    /// The in-flight conversation was trimmed mid-turn to keep fitting the
+    /// model's window — either measured over the pressure line before a call,
+    /// or after the provider refused the body as too long. Payload is the
+    /// compaction receipt (mode, trigger, charsBefore, charsAfter).
+    case contextIntraTurnCompaction = "context.intraTurnCompaction"
     case surfaceOutputEnqueued = "surface.outputEnqueued"
     case surfaceFirstRender = "surface.firstRender"
 }

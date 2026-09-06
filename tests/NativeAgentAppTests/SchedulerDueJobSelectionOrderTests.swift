@@ -142,6 +142,22 @@ func claimDueJobs_recoversAmbiguousOccurrenceWithoutRepeatingEffect() async thro
     #expect(batch.jobs.isEmpty)
     #expect(batch.recoveredUnknown.map(\.occurrenceKey) == [key])
 
+    // 2026-09-06: 215a211e split recovery in two. claimDueJobs is DETECTION
+    // ONLY now — it leaves the stale claim standing so a failed reconciliation
+    // notice can be retried on a later pass instead of losing the crossing.
+    let detectedData = try Data(contentsOf: runner.jobsPath)
+    let detected = try #require(
+        try JSONSerialization.jsonObject(with: detectedData) as? [[String: Any]]
+    )
+    let unchanged = try #require(detected.first)
+    #expect((unchanged["activeOccurrence"] as? [String: Any])?["key"] as? String == key)
+    #expect(unchanged["enabled"] as? Bool == true)
+
+    // The release is settleUnknownOccurrence, which the drain loop calls only
+    // once the notice is on record (SchedulerDueJobRunner.swift:286).
+    let recovery = try #require(batch.recoveredUnknown.first)
+    try await runner.settleUnknownOccurrence(recovery, now: now)
+
     let data = try Data(contentsOf: runner.jobsPath)
     let rows = try #require(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
     let row = try #require(rows.first)
@@ -170,6 +186,20 @@ func claimDueJobs_malformedClaimIsPreservedAndNotExecuted() async throws {
     let batch = try await runner.claimDueJobs(now: now, maxJobs: 1)
     #expect(batch.jobs.isEmpty)
     #expect(batch.recoveredUnknown.count == 1)
+    // 2026-09-06: 215a211e made claim-time recovery detection-only; the
+    // malformed claim is preserved verbatim until its notice is on record, and
+    // settleUnknownOccurrence is what fails the job closed
+    // (SchedulerDueJobRunner+Selection.swift:157).
+    let detectedData = try Data(contentsOf: runner.jobsPath)
+    let detected = try #require(
+        try JSONSerialization.jsonObject(with: detectedData) as? [[String: Any]]
+    )
+    let preserved = try #require(detected.first)
+    #expect(preserved["activeOccurrence"] != nil)
+    #expect(preserved["enabled"] as? Bool == true)
+
+    let recovery = try #require(batch.recoveredUnknown.first)
+    try await runner.settleUnknownOccurrence(recovery, now: now)
     let data = try Data(contentsOf: runner.jobsPath)
     let rows = try #require(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
     let row = try #require(rows.first)

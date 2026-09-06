@@ -107,16 +107,26 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
         continuation?.resume(returning: current)
     }
 
-    public func publish(_ embedding: [Float], modelFingerprint: String = "legacy-unverified") {
+    public func publish(
+        _ embedding: [Float],
+        alternate: [Float]? = nil,
+        modelFingerprint: String = "legacy-unverified"
+    ) {
         guard !embedding.isEmpty, embedding.allSatisfy(\.isFinite) else { return }
         let fingerprint = modelFingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !fingerprint.isEmpty else { return }
+        // The other voice is optional enrichment: a malformed second vector
+        // drops out rather than costing the turn its query embedding.
+        let alternateVector = alternate.flatMap {
+            !$0.isEmpty && $0.allSatisfy(\.isFinite) && $0.count == embedding.count ? $0 : nil
+        }
         var resolved: ContextQueryEmbeddingValue?
         var pending: [CheckedContinuation<ContextQueryEmbeddingValue?, Never>] = []
         lock.withLock {
             guard value == nil else { return }
             let published = ContextQueryEmbeddingValue(
                 values: embedding,
+                alternateValues: alternateVector,
                 modelFingerprint: fingerprint
             )
             value = published
@@ -131,10 +141,22 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
 
 public struct ContextQueryEmbeddingValue: Sendable, Equatable {
     public let values: [Float]
+    /// User, 2026-09-06: the SAME question in the other voice ("me" → the
+    /// agent's name, "you" → the user's), embedded in the same batch and
+    /// therefore in the same vector space as `values`. Selection takes the
+    /// better of the two cosines per atom, which is what the legacy recall
+    /// lane has always done (`MemoryV2+RecallQueryExpansion`). nil when the
+    /// question reads the same in both voices, or when no names are known.
+    public let alternateValues: [Float]?
     public let modelFingerprint: String
 
-    public init(values: [Float], modelFingerprint: String) {
+    public init(
+        values: [Float],
+        alternateValues: [Float]? = nil,
+        modelFingerprint: String
+    ) {
         self.values = values
+        self.alternateValues = alternateValues
         self.modelFingerprint = modelFingerprint
     }
 }
@@ -154,6 +176,9 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let cognitiveActivation: [ContextAtomID: Double]
     public let workingAtomIDs: Set<ContextAtomID>
     public let queryEmbedding: [Float]?
+    /// The question in the other voice, same vector space as `queryEmbedding`.
+    /// See `ContextQueryEmbeddingValue.alternateValues`.
+    public let alternateQueryEmbedding: [Float]?
     public let queryEmbeddingModelFingerprint: String?
     public let allowedPrivacy: Set<ContextPrivacy>
     public let permissionLabels: Set<String>
@@ -167,6 +192,27 @@ public struct ContextTurnRequest: Sendable, Equatable {
     /// retry. This keeps accumulated authoritative corrections from silently
     /// crowding all relevant memory and task context out of the packet.
     public let postMandatoryCharacterReserve: Int
+    /// The caller's STABLE system-prompt segment already carries the persona's
+    /// required documents verbatim, so the packet must not mirror them a second
+    /// time into the per-turn (dynamic, uncached) block.
+    ///
+    /// Default `false` keeps every other call site — harnesses, evals, direct
+    /// context callers — byte-identical to today, where only the kernel's own
+    /// documents (SOUL/VOICE + surface guidance) are precovered and the rest of
+    /// the persona rides the packet.
+    public let stableSegmentCarriesRequiredDocuments: Bool
+    /// Body length above which the caller's packet renderer replaces an atom's
+    /// full text with a lead plus a `context_expand` pointer. The selector uses
+    /// it for ONE thing: publishing an expandable pointer for every atom the
+    /// renderer will truncate, so the full body stays reachable. `0` (default)
+    /// means the caller renders atoms whole and no truncation pointers are
+    /// published — today's behavior.
+    public let packetAtomExpandThresholdChars: Int
+    /// One owner for how many `.memory` atoms the packet may carry. `nil`
+    /// (default) leaves the selector's own per-kind quota in charge, which is
+    /// what every pre-existing caller got. Identity, correction and instruction
+    /// atoms are never counted against it.
+    public let memoryAtomRowLimit: Int?
 
     public init(
         surface: ContextSurface,
@@ -183,12 +229,16 @@ public struct ContextTurnRequest: Sendable, Equatable {
         cognitiveActivation: [ContextAtomID: Double] = [:],
         workingAtomIDs: Set<ContextAtomID> = [],
         queryEmbedding: [Float]? = nil,
+        alternateQueryEmbedding: [Float]? = nil,
         queryEmbeddingModelFingerprint: String? = nil,
         allowedPrivacy: Set<ContextPrivacy> = [.localPrivate, .trustedRemote, .publicSafe],
         permissionLabels: Set<String> = [],
         characterBudget: Int = 6_000,
         maximumCharacterBudget: Int? = nil,
-        postMandatoryCharacterReserve: Int = 0
+        postMandatoryCharacterReserve: Int = 0,
+        stableSegmentCarriesRequiredDocuments: Bool = false,
+        packetAtomExpandThresholdChars: Int = 0,
+        memoryAtomRowLimit: Int? = nil
     ) {
         self.surface = surface
         self.origin = origin
@@ -206,6 +256,11 @@ public struct ContextTurnRequest: Sendable, Equatable {
         self.queryEmbedding = queryEmbedding.flatMap { vector in
             !vector.isEmpty && vector.allSatisfy(\.isFinite) ? vector : nil
         }
+        self.alternateQueryEmbedding = self.queryEmbedding == nil
+            ? nil
+            : alternateQueryEmbedding.flatMap { vector in
+                !vector.isEmpty && vector.allSatisfy(\.isFinite) ? vector : nil
+            }
         let fingerprint = queryEmbeddingModelFingerprint?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         self.queryEmbeddingModelFingerprint = self.queryEmbedding == nil
@@ -219,6 +274,9 @@ public struct ContextTurnRequest: Sendable, Equatable {
             maximumCharacterBudget ?? self.characterBudget
         )
         self.postMandatoryCharacterReserve = max(0, postMandatoryCharacterReserve)
+        self.stableSegmentCarriesRequiredDocuments = stableSegmentCarriesRequiredDocuments
+        self.packetAtomExpandThresholdChars = max(0, packetAtomExpandThresholdChars)
+        self.memoryAtomRowLimit = memoryAtomRowLimit.map { max(0, $0) }
     }
 }
 

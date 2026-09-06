@@ -232,20 +232,18 @@ func connectorReceipts(now: Date) -> Result {
 func workJournal(now: Date) -> Result {
     let directory = canonicalRoot.appendingPathComponent("work_journal", isDirectory: true)
     let latest = directory.appendingPathComponent("latest.json")
-    let daily = directory.appendingPathComponent("codex_daily.jsonl")
-    let observed = [latest, daily].filter { fm.fileExists(atPath: $0.path) }
-    guard !observed.isEmpty else { return .init(id: "feeds.work_journal", state: .absent, rows: 0, newest: nil, evidence: "source absent — not a zero") }
-    guard observed.count == 2,
-          let latestRow = object(latest), let latestID = latestRow["id"] as? String,
+    // Sweep item 21 (2026-09-01): `codex_daily.jsonl` is RETIRED. The writer
+    // appended the full 11.2 KB snapshot to it, uncapped, and no production
+    // reader ever opened it — this evaluator was the only consumer of the
+    // pairing, and a check is not a consumer. `latest.json` alone is the feed;
+    // the old daily rows stay on disk as history and are not re-read.
+    guard fm.fileExists(atPath: latest.path) else { return .init(id: "feeds.work_journal", state: .absent, rows: 0, newest: nil, evidence: "source absent — not a zero") }
+    guard let latestRow = object(latest), let latestID = latestRow["id"] as? String,
           latestID.hasPrefix("codex-work-"),
           latestRow["status"] as? String == "completed",
-          let latestAt = date(latestRow["generatedAt"]),
-          let dailyRows = jsonLines(daily), let lastDaily = dailyRows.last,
-          lastDaily["id"] as? String == latestID,
-          lastDaily["status"] as? String == "completed",
-          date(lastDaily["generatedAt"]) == latestAt
-    else { return .init(id: "feeds.work_journal", state: .unreadable, rows: 0, newest: observed.compactMap(modification).max(), evidence: "ledger contract revision: latest.json must match the final codex_daily.jsonl snapshot by id, status, and generatedAt") }
-    return .init(id: "feeds.work_journal", state: freshness(latestAt, now: now), rows: dailyRows.count, newest: latestAt, evidence: "ledger contract revision: writer appends codex_daily.jsonl then writes matching latest.json; cursor and codex_notes are not part of this production pair")
+          let latestAt = date(latestRow["generatedAt"])
+    else { return .init(id: "feeds.work_journal", state: .unreadable, rows: 0, newest: modification(latest), evidence: "ledger contract revision: latest.json must be a completed codex-work snapshot carrying a parseable generatedAt") }
+    return .init(id: "feeds.work_journal", state: freshness(latestAt, now: now), rows: 1, newest: latestAt, evidence: "ledger contract revision: latest.json is the whole production feed; the codex_daily.jsonl append was retired 2026-09-01 (no reader) and residual rows are history, not a pair; cursor and codex_notes are not part of this feed")
 }
 
 func researchRuns(id: String, path: String, configuredPath: String?, now: Date) -> Result {

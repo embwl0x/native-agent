@@ -138,12 +138,32 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         next.peripheralUncertainty = OrganismBodyConfidence.clamp(next.peripheralUncertainty * pow(0.84, hours))
         next.strategyCaution = OrganismBodyConfidence.clamp(next.strategyCaution * pow(0.82, hours))
         var expiredKinds: [OrganismPredictionKind] = []
+        var expiredHorizons = 0
         let decayed = next.predictions.values.map { prediction -> OrganismPrediction in
                 var copy = prediction
                 if copy.status == .pending && copy.dueAt < now {
-                    copy.status = .expired
-                    copy.lastUpdatedAt = now
-                    expiredKinds.append(copy.kind)
+                    // ONE expiry transition, shared with the live sweep
+                    // (`OrganismPredictiveBody.expireOverdue`) so the two can no
+                    // longer disagree about what an expired row looks like. It
+                    // also owns the horizon exception: a passed horizon goes
+                    // terminal without being counted as a miss, because Friday
+                    // arriving with nothing on it means she was waiting, not
+                    // wrong.
+                    if OrganismPredictiveBody.applyExpiryTransition(to: &copy, at: now) {
+                        expiredKinds.append(copy.kind)
+                    } else {
+                        expiredHorizons += 1
+                    }
+                    // ...and NOTHING after it. The uncertainty the transition
+                    // just stamped is evidence dated `now`; the generic decay
+                    // below forgets the window that ENDS at `now`, so applying
+                    // it here would age a fact that is zero seconds old and
+                    // leave the same expiry looking different depending on
+                    // whether she happened to be running when it ran out. Same
+                    // rule the outcome weights already follow two blocks down
+                    // ("Forget the elapsed window BEFORE stamping evidence
+                    // dated `now`").
+                    return copy
                 }
                 copy.uncertainty = OrganismBodyConfidence.clamp(copy.uncertainty * pow(0.94, hours))
                 return copy
@@ -161,6 +181,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         // same window that aged everything preceding it.
         next.outcomeCountsByKind = next.outcomeCountsByKind
             .map { forgottenOutcomeCounts($0, at: now, hours: hours) }
+        next.expiredCount += expiredHorizons
         for kind in expiredKinds.sorted(by: { $0.rawValue < $1.rawValue }) {
             next.expiredCount += 1
             OrganismPredictiveBody.recordOutcome(.expired, kind: kind, at: now, ledger: &next)

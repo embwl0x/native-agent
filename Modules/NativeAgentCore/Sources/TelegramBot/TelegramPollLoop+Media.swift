@@ -112,7 +112,7 @@ extension TelegramPollLoop {
         )
         let notice = "I can't read that \(kind) in Telegram. Please send an image or paste the relevant text."
         do {
-            try await sendMessage(token, message.chatId, notice)
+            try await sendMessage(token, message.destination, notice)
             await recordReceipt(kind: "attachment_dropped", update: update, message: message,
                                 text: "", reply: notice)
         } catch {

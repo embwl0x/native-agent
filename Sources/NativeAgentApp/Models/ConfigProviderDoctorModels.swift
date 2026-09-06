@@ -237,6 +237,13 @@ struct ModelCatalogResponse: Codable, Hashable {
     var reasoningEfforts: [ReasoningEffortOption]
     var current: ModelRoutingCurrent
     var updatedAt: String?
+    /// User, 2026-09-06: where the discovered provider rows in this response
+    /// actually came from — `live`, `cached`, `stale`, `built_in`,
+    /// `built_in_stale`. A failed refresh used to be indistinguishable from a
+    /// successful one, so the Providers UI reported "Model catalog refreshed"
+    /// for a refresh that never reached the network. Additive and optional:
+    /// a persisted `models.json` written before this decodes exactly as before.
+    var catalogFreshness: String?
 }
 
 struct TelegramBlockedEvent: Identifiable, Codable, Hashable {

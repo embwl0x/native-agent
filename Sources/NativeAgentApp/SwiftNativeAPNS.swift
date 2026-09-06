@@ -283,8 +283,7 @@ actor SwiftNativeAPNSSender {
                     title: title,
                     body: body,
                     userInfo: userInfo,
-                    urgency: urgency,
-                    dataRoot: dataRoot
+                    urgency: urgency
                 )
                 receipts.append(receipt)
             }
@@ -301,8 +300,7 @@ actor SwiftNativeAPNSSender {
         title: String,
         body: String,
         userInfo: [String: String],
-        urgency: String?,
-        dataRoot: URL
+        urgency: String?
     ) async -> SwiftNativeAPNSReceipt {
         let token = target.token
         let apnsId = UUID().uuidString
@@ -386,32 +384,12 @@ actor SwiftNativeAPNSSender {
             )
         }
 
-        await appendReceipt(receipt, dataRoot: dataRoot)
+        // Sweep item 21 (2026-09-01): the `mobile_push/receipts.jsonl` append
+        // is gone. 1,550 rows / 430 KB of APNs delivery evidence that no
+        // production code ever read back — the receipt is RETURNED to the
+        // caller, which is where every live decision about a send is made.
+        // Existing rows stay on disk; the runtime just stops adding to them.
         return receipt
-    }
-
-    private func appendReceipt(_ receipt: SwiftNativeAPNSReceipt, dataRoot: URL) async {
-        let path = dataRoot
-            .appendingPathComponent("mobile_push", isDirectory: true)
-            .appendingPathComponent("receipts.jsonl")
-        // C8 (2026-08-28): enrolled in the path-owned cap registry. A bare
-        // `appendJSONL` here grew the delivery ledger forever — and since F2
-        // moved enforcement to the byte writer, it now THROWS rather than
-        // silently growing. Route through the sanctioned capped append.
-        do {
-            try await persistence.withFileLock(path) {
-                try await appendPathOwnedJSONL(
-                    receipt.toJSON(),
-                    to: path,
-                    using: persistence,
-                    logLabel: "SwiftNativeAPNS",
-                    takeLock: false
-                )
-            }
-        } catch {
-            FileHandle.standardError.write(Data(
-                "SwiftNativeAPNS: receipt append failed: \(error)\n".utf8))
-        }
     }
 
     private func loadTokens(dataRoot: URL, config: APNSConfig) async -> [APNSToken] {

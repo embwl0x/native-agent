@@ -6,10 +6,35 @@ import NativeAgentShared
 import ScreenVision
 
 extension ChatView {
+    /// Stop recognition without writing anything through the composer. Called
+    /// when the dictating conversation stops being the one on screen — the
+    /// composer is already pointed elsewhere, so the stop has nothing to say
+    /// to it (2026-09-06).
+    func endDictation() {
+        voiceSessionId = ""
+        voiceDraftBeforeListening = ""
+        // 2026-09-06: also cancels a start that is still waiting on the
+        // microphone permission prompt, which has no recognition to stop yet.
+        voiceGeneration &+= 1
+        guard voiceInput.isListening else { return }
+        Task { @MainActor in _ = await voiceInput.stopListening() }
+    }
+
     func toggleVoice() {
         if voiceInput.isListening {
+            let listeningSession = voiceSessionId
             Task { @MainActor in
                 let result = await voiceInput.stopListeningResult()
+                // The stop suspends; the person may have moved to another
+                // conversation while it flushed. That conversation's composer
+                // is not this dictation's to write (2026-09-06).
+                guard listeningSession == appModel.activeChatSessionId,
+                      voiceSessionId == listeningSession
+                else {
+                    voiceSessionId = ""
+                    voiceDraftBeforeListening = ""
+                    return
+                }
                 let final = result.transcriptForSubmission
                 if final.isEmpty {
                     text = voiceDraftBeforeListening
@@ -18,12 +43,20 @@ extension ChatView {
                     text = composeVoiceDraft(final)
                 }
                 voiceDraftBeforeListening = ""
+                voiceSessionId = ""
             }
         } else {
             // Clear any prior error so we can detect fresh failures from the
             // current attempt (requestPermission may set errorMessage too).
             voiceInput.errorMessage = nil
             showToast("Checking microphone...")
+            // 2026-09-06: the conversation this dictation belongs to is the
+            // one the button was pressed in. Reading it after the permission
+            // prompt started listening on whichever conversation the person
+            // had moved to, and `endDictation` on the way out could not stop
+            // a start that had not happened yet.
+            let startSessionId = appModel.activeChatSessionId
+            let startGeneration = voiceGeneration
             Task {
                 let granted = await voiceInput.requestPermission()
                 guard granted else {
@@ -34,7 +67,16 @@ extension ChatView {
                     showToast(msg)
                     return
                 }
+                // The prompt suspends. If the conversation moved on while it
+                // was up, this dictation has nothing to dictate into.
+                // The composer may also have LEFT while the prompt was up
+                // (Chat → Settings) with the same conversation still active,
+                // which the session fence alone cannot see.
+                guard appModel.activeChatSessionId == startSessionId,
+                      voiceGeneration == startGeneration
+                else { return }
                 voiceDraftBeforeListening = text
+                voiceSessionId = startSessionId
                 voiceInput.startListening()
                 // startListening sets errorMessage if the audio engine refused
                 // (busy device, no input route, etc.) — surface that too.
@@ -49,6 +91,11 @@ extension ChatView {
 
     func captureScreen() {
         guard !isCapturing else { return }
+        // 2026-09-06: a screenshot send is a send, so it takes the send latch
+        // too. Admission suspends before it marks the session busy, so a
+        // Return whose send is still in flight leaves `isBusy` false and the
+        // capture button live — the screenshot was admitted as a second turn.
+        guard !isSubmittingSend else { return }
         guard appModel.trustPolicy?.multimodalPolicy?.screen_capture == true else {
             showToast("Enable screen capture in Trust → Multimodal Capabilities")
             return
@@ -59,15 +106,21 @@ extension ChatView {
         }
         let captureSessionId = appModel.activeChatSessionId
         let capturedDraft = text
+        // 2026-09-06: the snapshot's own edit time, for the send-clear below.
+        let capturedDraftEditedAt = draftEditedAt
         let capturedAttachments = pendingAttachments
         let capturedAttachmentIds = Set(capturedAttachments.map(\.id))
         isCapturing = true
+        isSubmittingSend = true
         showToast("Capturing screen...")
         let prompt = capturedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "Look at this screenshot and tell me what you see."
             : capturedDraft
         Task {
-            defer { isCapturing = false }
+            defer {
+                isCapturing = false
+                isSubmittingSend = false
+            }
             do {
                 // ScreenVision v1 (2026-06-06): the mouse-display hint is
                 // dropped — the new module captures the primary
@@ -105,8 +158,20 @@ extension ChatView {
                           currentAttachmentIds == capturedAttachmentIds
                     else { return }
                     text = ""
-                    appModel.commitChatDraft("", sessionId: captureSessionId)
+                    // 2026-09-06: a screenshot send is a send. It used to
+                    // commit an empty draft with a FRESH timestamp, which
+                    // outranked — and deleted — newer text typed in a detached
+                    // panel on the same session; and it left a live dictation
+                    // running, whose cumulative transcript wrote the words
+                    // just sent straight back into the emptied box.
+                    appModel.clearChatDraftAfterSend(
+                        capturedDraft,
+                        sessionId: captureSessionId,
+                        editedAt: capturedDraftEditedAt
+                    )
+                    draftAdoptedText = ""
                     pendingAttachments = []
+                    endDictation()
                 case .rejected(let message):
                     showToast(message)
                 }

@@ -80,6 +80,46 @@ struct DoctorLiveCoverageTests {
         #expect(NativeClient.searchDoctorCoverageCheck("not a URL").status == "fail")
     }
 
+    /// FIX-5c (2026-09-01): `live.search` is a URL-SYNTAX check wearing the
+    /// name "Search" — Doctor makes no request — and `live.tools` returned
+    /// "ok" on every non-throwing path. Neither may render green for
+    /// something it did not verify.
+    @Test("unprobed and degraded live subsystems never render as verified")
+    func unverifiedLiveSubsystemsAreNotGreen() {
+        let search = NativeClient.searchDoctorCoverageCheck("https://searx.example/search")
+        #expect(search.status == "warn")
+        #expect(search.detail.contains("syntax only, no request made"))
+
+        let record = { (name: String, status: String?) in
+            ToolRecord(
+                id: name, name: name, description: "", triggers: [],
+                language: nil, entrypoint: nil, permissions: nil, status: status,
+                phase: nil, autoCreated: nil, autoPromote: nil, autoRun: nil,
+                autoPromotable: nil, validationStatus: nil, validationErrors: nil,
+                proposalPath: nil, activePath: nil, quarantinePath: nil,
+                quarantineReason: nil, sourceRunId: nil, createdAt: nil,
+                updatedAt: nil, useCount: nil, lastUsedAt: nil
+            )
+        }
+        // Every path says what was actually verified: the registry file read.
+        #expect(NativeClient.toolsDoctorCoverageCheck([]).detail.contains("invoked no tool"))
+
+        let allActive = NativeClient.toolsDoctorCoverageCheck([record("a", "active"), record("b", nil)])
+        #expect(allActive.status == "ok")
+        #expect(allActive.detail.contains("2 active"))
+        #expect(allActive.detail.contains("invoked no tool"))
+
+        // A pending proposal is the self-building lane working, not a finding.
+        let proposed = NativeClient.toolsDoctorCoverageCheck([record("a", "active"), record("draft", "proposed")])
+        #expect(proposed.status == "ok")
+
+        // A registry holding a quarantined tool used to read identically to a
+        // clean one.
+        let degraded = NativeClient.toolsDoctorCoverageCheck([record("a", "active"), record("broken", "quarantined")])
+        #expect(degraded.status == "warn")
+        #expect(degraded.detail.contains("1 quarantined: broken"))
+    }
+
     @Test("a single poll interruption is not reported as a Telegram outage")
     func transientTelegramPollFailureDoesNotWarn() {
         var telegram = TelegramStatus(
@@ -183,8 +223,57 @@ struct DoctorLiveCoverageTests {
         #expect(DoctorView.categoryID(for: "live.providers") == "Provider")
         #expect(DoctorView.categoryID(for: "live.telegram") == "Connectors")
         #expect(DoctorView.categoryID(for: "live.search") == "Connectors")
+        #expect(DoctorView.categoryID(for: "live.background_loops") == "Runtime")
+        // 2026-09-02: the two per-turn health rows. Pinned here so a rename
+        // cannot quietly drop either into the "Release" catch-all, which is
+        // where an unowned id goes to be ignored.
+        #expect(DoctorView.categoryID(for: "prompt_prefix_health") == "Runtime")
+        #expect(DoctorView.categoryID(for: "subconscious_vitals") == "Cognition")
+        // 2026-09-06: cb9861ef ("Agent UI speaks the agent's name, never a gender")
+        // replaced every hard-coded pronoun with AgentVoice. Cognition's title is
+        // now the agent's possessive NAME plus "inner state" (DoctorView.swift:798),
+        // so derive it from the same voice rather than re-pinning a literal, and
+        // keep the invariant that moved it: no gendered pronoun in the copy.
+        let cognitionTitle = DoctorPlainCopy.sectionTitle(for: "Cognition")
+        #expect(cognitionTitle == "\(AgentVoice.live.possessive) inner state")
+        #expect(!["her ", "his ", "their "].contains { cognitionTitle.lowercased().hasPrefix($0) })
         #expect(DoctorView.categoryID(for: "live.tools") == "Tools")
         #expect(DoctorView.categoryID(for: "live.autonomy") == "Autonomy")
+    }
+
+    /// 2026-09-02 live incident: the heartbeat read `doctor/latest.json`,
+    /// counted two Doctor-only diagnostic rows among the failures, and pushed
+    /// "Doctor has 2 failing checks: prompt_prefix_health and
+    /// subconscious_vitals" to User's phone. Those rows grade a measurement
+    /// window and belong to a person looking at Doctor. The sweep must skip
+    /// them ENTIRELY — not counted in the totals, never the reason for an alert.
+    @Test("the heartbeat sweep skips Doctor-only rows entirely")
+    @MainActor
+    func heartbeatSkipsIneligibleDoctorRows() {
+        let rows: [[String: Any]] = [
+            ["id": "storage", "status": "ok"],
+            ["id": "prompt_prefix_health", "status": "fail"],
+            ["id": "subconscious_vitals", "status": "fail"],
+            ["id": "memory_store", "status": "warn"],
+        ]
+        let (eligible, skipped) = BackgroundLoopsAssembly.heartbeatEligibleDoctorRows(rows)
+        #expect(skipped == 2)
+        #expect(eligible.compactMap { $0["id"] as? String } == ["storage", "memory_store"])
+        // The whole point: nothing here is failing as far as the heartbeat is
+        // concerned, so no alert and no 3am push.
+        #expect(!eligible.contains { ($0["status"] as? String) == "fail" })
+    }
+
+    @Test("a snapshot of nothing but Doctor-only rows is unverifiable, not healthy")
+    @MainActor
+    func heartbeatAllExcludedIsUnverifiable() {
+        let rows: [[String: Any]] = [
+            ["id": "prompt_prefix_health", "status": "fail"],
+            ["id": "subconscious_vitals", "status": "warn"],
+        ]
+        let (eligible, skipped) = BackgroundLoopsAssembly.heartbeatEligibleDoctorRows(rows)
+        #expect(skipped == 2)
+        #expect(eligible.isEmpty)
     }
 
     @Test("unknown autonomy posture warns instead of pretending disabled")

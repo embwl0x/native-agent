@@ -129,7 +129,9 @@ public actor SwiftNativeTelegramBot: TelegramBotProtocol {
         }
         let text = message?.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            return try await _tgRetryAfterFloodControl {
+            // 2026-09-06: numeric targets join that chat's send lane; an
+            // @username target has no chat id to serialise on and goes direct.
+            return try await _tgRetryAfterFloodControl(chatId: Int(target)) {
                 guard let url = _tgBuildBotURL(token: cfg.botToken, method: "sendMessage") else {
                     throw TelegramBotError.invalidRequest
                 }
@@ -309,12 +311,32 @@ extension SwiftNativeTelegramBot {
         fromUserId: Int? = nil,
         chatType: String? = nil
     ) async throws -> TelegramSlashDispatchOutcome {
+        try await dispatchSwiftSlashCommandDetailed(
+            command,
+            args: args,
+            destination: .chat(chatId),
+            fromUserId: fromUserId,
+            chatType: chatType
+        )
+    }
+
+    /// 2026-09-06: the topic-aware entry point. Session commands (/new,
+    /// /reset, /clear, /compact, /session, /resume, /persona, /scratch) act on
+    /// the conversation the command was said in, which for a forum topic is
+    /// that topic and not the whole supergroup.
+    public func dispatchSwiftSlashCommandDetailed(
+        _ command: String,
+        args: [String],
+        destination: TelegramDestination,
+        fromUserId: Int? = nil,
+        chatType: String? = nil
+    ) async throws -> TelegramSlashDispatchOutcome {
         var cmd = command
         if cmd.hasPrefix("/") { cmd.removeFirst() }
         // Strip @botname suffix if present (Telegram appends it in groups).
         if let atIdx = cmd.firstIndex(of: "@") { cmd = String(cmd[..<atIdx]) }
         let lower = TelegramCommandRegistry.canonicalName(for: cmd) ?? cmd.lowercased()
-        if let baseReply = try await dispatchBaseSlashCommand(lower, args: args, chatId: chatId) {
+        if let baseReply = try await dispatchBaseSlashCommand(lower, args: args, destination: destination) {
             return TelegramSlashDispatchOutcome(reply: baseReply)
         }
         // chatId/fromUserId/chatType ride along for owner-gated completeness
@@ -323,7 +345,7 @@ extension SwiftNativeTelegramBot {
         // so a future multi-chat allowlist can't silently widen restart.
         return await dispatchCompletenessCommandDetailed(
             lower, args: args, depsOverride: completenessDeps,
-            chatId: chatId, fromUserId: fromUserId, chatType: chatType
+            chatId: destination.chatId, fromUserId: fromUserId, chatType: chatType
         )
     }
 
@@ -332,49 +354,37 @@ extension SwiftNativeTelegramBot {
     private func dispatchBaseSlashCommand(
         _ lower: String,
         args: [String],
-        chatId: Int
+        destination: TelegramDestination
     ) async throws -> String? {
         switch lower {
         case "status":
+            // One sentence User can read at a glance. The live poll loop
+            // answers with the running turn when it owns the dispatch; this
+            // path is the programmatic one, which can only speak for the
+            // model and whether the surface is actually up.
             let s = try await self.getStatus()
-            let enabled = s.enabled ?? false
-            let tokenConf = s.tokenConfigured ?? false
-            let poller = s.pollerEnabled ?? false
-            let seen = s.lastSeenAt ?? "never"
-            let session = try? await TelegramSessionStore(dataRoot: dataRoot).status(chatId: chatId)
-            var lines = [
-                "Telegram: enabled=\(enabled) tokenConfigured=\(tokenConf) lastSeenAt=\(seen)",
-                "Runtime: enabled=\(enabled) poller=\(poller) token=\(tokenConf)",
-                "Last seen: \(seen)",
-            ]
-            if let routing = completenessDeps?.routing,
-               let info = await routing.modelForSurface("telegram") {
-                lines.append(TelegramPollLoop._tgRedactToken("Model: \(info.model) @ \(info.provider)"))
-            } else {
-                lines.append("Model: not configured")
+            let up = (s.enabled ?? false) && (s.tokenConfigured ?? false)
+            let model = await telegramPlainModelPhrase()
+            if !up {
+                return "Telegram isn't connected right now — turn it on in the Mac app."
             }
-            if let session {
-                lines.append(TelegramPollLoop._tgRedactToken(
-                    "Session: \(session.sessionId) (\(session.messageCount) message(s), persona \(session.persona))"
-                ))
-            } else {
-                lines.append("Session: unavailable")
+            if let model {
+                return "I'm here and idle, on \(model). Nothing is waiting on you."
             }
-            lines.append("Task: see live Telegram poll loop")
-            return lines.joined(separator: "\n")
+            return "I'm here and idle, but no model is picked yet. Nothing is waiting on you."
         case "new":
-            let sessionId = try await TelegramSessionStore(dataRoot: dataRoot).startNewSession(chatId: chatId)
+            let sessionId = try await TelegramSessionStore(dataRoot: dataRoot).startNewSession(destination: destination)
             return "Started new Telegram session: \(sessionId)"
         case "reset":
-            let result = try await TelegramSessionStore(dataRoot: dataRoot).resetSession(chatId: chatId)
+            let result = try await TelegramSessionStore(dataRoot: dataRoot).resetSession(destination: destination)
             return "Reset Telegram session \(result.sessionId) (\(result.messagesBefore) message(s) cleared)."
         case "session":
-            return try await dispatchSessionCommand(args: args, chatId: chatId)
+            return try await dispatchSessionCommand(args: args, destination: destination)
         case "clear":
-            let result = try await TelegramSessionStore(dataRoot: dataRoot).clearSession(chatId: chatId)
+            let result = try await TelegramSessionStore(dataRoot: dataRoot).clearSession(destination: destination)
             return "Cleared Telegram session \(result.sessionId) (\(result.messagesBefore) message(s) removed)."
         case "compact":
-            let result = try await TelegramSessionStore(dataRoot: dataRoot).compactSession(chatId: chatId, force: true)
+            let result = try await TelegramSessionStore(dataRoot: dataRoot).compactSession(destination: destination, force: true)
             if result.compacted {
                 return "Compacted Telegram session \(result.sessionId): \(result.messagesBefore) -> \(result.messagesAfter) messages."
             }
@@ -397,7 +407,7 @@ extension SwiftNativeTelegramBot {
         case "resume":
             let requested = args.first ?? ""
             let status = try await TelegramSessionStore(dataRoot: dataRoot)
-                .bindSession(chatId: chatId, requestedSessionId: requested)
+                .bindSession(destination: destination, requestedSessionId: requested)
             return """
             Resumed Telegram session: \(status.sessionId)
             Persona: \(status.persona)
@@ -407,10 +417,10 @@ extension SwiftNativeTelegramBot {
             let store = TelegramSessionStore(dataRoot: dataRoot)
             let persona = args.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             if persona.isEmpty {
-                let current = try await store.persona(chatId: chatId) ?? "NativeAgent"
+                let current = try await store.persona(destination: destination) ?? "NativeAgent"
                 return "Telegram persona: \(current)"
             }
-            let saved = try await store.setPersona(chatId: chatId, persona: persona)
+            let saved = try await store.setPersona(destination: destination, persona: persona)
             return "Telegram persona set to \(saved)"
         case "remember":
             let text = args.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -443,7 +453,7 @@ extension SwiftNativeTelegramBot {
             let value = args.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !value.isEmpty else { return "/scratch requires <key> <value>" }
             let sessionId = try await TelegramSessionStore(dataRoot: dataRoot)
-                .writeScratch(chatId: chatId, key: key, value: value)
+                .writeScratch(destination: destination, key: key, value: value)
             return "Wrote scratch \(key) for Telegram session \(sessionId)"
         case "tools":
             return """
@@ -458,18 +468,18 @@ extension SwiftNativeTelegramBot {
         }
     }
 
-    private func dispatchSessionCommand(args: [String], chatId: Int) async throws -> String {
+    private func dispatchSessionCommand(args: [String], destination: TelegramDestination) async throws -> String {
         let store = TelegramSessionStore(dataRoot: dataRoot)
         let subcommand = args.first?.lowercased() ?? "status"
         switch subcommand {
         case "new":
-            let sessionId = try await store.startNewSession(chatId: chatId)
+            let sessionId = try await store.startNewSession(destination: destination)
             return "Started new Telegram session: \(sessionId)"
         case "reset", "clear":
-            let result = try await store.resetSession(chatId: chatId)
+            let result = try await store.resetSession(destination: destination)
             return "Reset Telegram session \(result.sessionId) (\(result.messagesBefore) message(s) cleared)."
         case "status", "current":
-            let status = try await store.status(chatId: chatId)
+            let status = try await store.status(destination: destination)
             return """
             Telegram session: \(status.sessionId)
             Persona: \(status.persona)

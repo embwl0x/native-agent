@@ -234,6 +234,13 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         return generated
     }
 
+    // context_expand is ALWAYS catalogued (2026-09-01). These three walks used
+    // to drop it whenever the current packet carried no expandable pointers,
+    // which made the advertised contract — and the cached prompt prefix —
+    // change shape between turns for a reason the model never asked about. It
+    // is in alwaysOnCoreNames; the floor does not move. With nothing to
+    // expand, impl_context_expand says so at dispatch, which costs one tool
+    // result instead of a whole prefix rewrite.
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
         let access = await fullMacToolAccess()
         var builtIn = cachedBuiltInToolSchemas(
@@ -244,9 +251,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             includeFullMacAccessibilityInjectionTools: access.accessibilityInjectionAllowed,
             includeActivityQueryTool: activityCaptureEnabled()
         )
-        if FluidContextToolScope.current?.packet.expandablePointers.isEmpty != false {
-            builtIn.removeAll { $0.name == "context_expand" }
-        }
         // R9: registry custom-tool schemas ride the eager catalog. Built-in
         // names win on collision — provider APIs reject duplicate tool names,
         // and the dispatch switch matches built-in cases first anyway.
@@ -277,9 +281,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             includeActivityQueryTool: activityCaptureEnabled(),
             requestedNames: allowed
         )
-        if FluidContextToolScope.current?.packet.expandablePointers.isEmpty != false {
-            builtIn.removeAll { $0.name == "context_expand" }
-        }
         // R9: registry custom tools are lazy — schemas appear only once the
         // session has tool_load'ed them (never in the always-on core).
         let builtInNames = Set(builtIn.map(\.name))
@@ -315,9 +316,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         // data/tools/registry.json is missing or empty (fresh installs).
         let existing0 = Set(names)
         names.append(contentsOf: Self.builtInToolNames.filter { !existing0.contains($0) })
-        if FluidContextToolScope.current?.packet.expandablePointers.isEmpty != false {
-            names.removeAll { $0 == "context_expand" }
-        }
         let access = await fullMacToolAccess()
         if access.fileOpsAllowed {
             let existing = Set(names)
@@ -347,6 +345,27 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
             // bare mouse move needs the accessibility category and an active
             // Full Mac window, and nothing above that.
             names.append(contentsOf: Self.fullMacNudgeToolNames.filter { !existing.contains($0) })
+            // fable51 item 30 — the clipboard READ rides the same access
+            // signal as the perception reads: it changes nothing and needs the
+            // accessibility category plus an active Full Mac window.
+            names.append(contentsOf: Self.macClipboardReadToolNames.filter { !existing.contains($0) })
+            // fable51 item 29 — the menu WALK is perception on the same signal.
+            names.append(contentsOf: Self.macMenuReadToolNames.filter { !existing.contains($0) })
+            // fable51 item 33 — the READ organ rides the same signal: it walks
+            // the same AX tree and moves a viewport it puts back. When the
+            // caller names a `path`, dispatch requires file_ops ON TOP — but
+            // the tool itself is reachable at read tier, because its ordinary
+            // use is "read what is in front of me" and that needs no file
+            // authority at all.
+            names.append(contentsOf: Self.macReadToolNames.filter { !existing.contains($0) })
+        }
+        // fable51 item 30 — the clipboard WRITE rides app control, not the read
+        // tier: it replaces what the next paste anywhere will produce.
+        if access.appControlAllowed {
+            let existing = Set(names)
+            names.append(contentsOf: Self.macClipboardWriteToolNames.filter { !existing.contains($0) })
+            // fable51 item 29 — the menu PRESS runs the app's own handler.
+            names.append(contentsOf: Self.macMenuPressToolNames.filter { !existing.contains($0) })
         }
         // W2/W3 — INJECTION. Same category, act tier. Catalog visibility here
         // is not authority: dispatch re-checks the category and MacControl
@@ -427,6 +446,9 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         .union(fullMacNudgeToolNames)
         .union(activityQueryToolNames)
         .union(fullMacAccessibilityInjectionToolNames)
+        .union(macClipboardToolNames)
+        .union(macMenuToolNames)
+        .union(macReadToolNames)
 
     static let reservedBuiltInNames: Set<String> = Set(builtInToolNames)
         .union(alwaysOnCoreNames)
@@ -440,6 +462,9 @@ public final class SwiftToolDispatcher: ToolDispatchClient, ActiveToolsStoreProv
         .union(fullMacBuilderToolNames)
         .union(fullMacRestartToolNames)
         .union(fullMacEvolutionToolNames)
+        .union(macClipboardToolNames)
+        .union(macMenuToolNames)
+        .union(macReadToolNames)
 
     /// Registry ownership must also reserve accepted alias spellings, but the
     /// public built-in inventory remains canonical so catalogs and eval-ledger

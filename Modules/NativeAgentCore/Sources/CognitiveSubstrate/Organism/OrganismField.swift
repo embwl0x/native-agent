@@ -194,6 +194,13 @@ public enum OrganismPlasticity {
         // (0.86/0.94/0.72 vs the kernel's 0.82/0.90/0.65), so activation,
         // charge, and Hebbian eligibility decayed at roughly double the
         // intended rate (eligibility half-life ~0.9h vs the designed ~1.7h).
+        // Item 5 (2026-09-02): a horizon refresh trains nothing. The kernel
+        // already routes that kind away from this function; this guard is the
+        // second lock, and it returns the field UNTOUCHED — including
+        // `mutationGeneration`, which downstream readers use as a cheap
+        // "did the field change" stamp and which a bare no-association pass
+        // would still have bumped on every deadline.
+        guard signal.kind != .horizonRefresh else { return field }
         var next = field
         next.mutationGeneration &+= 1
         if isRepairSignal(signal.kind) {
@@ -308,6 +315,13 @@ public enum OrganismPlasticity {
         case .userSpoke, .toolStarted, .toolCancelled, .providerStarted, .providerCancelled,
              .phoneDeliveryStarted, .deskItemCreated, .appWake, .appSleep:
             return .strengthen(0.7)
+        case .horizonRefresh:
+            // Unreachable by construction — `associations` returns [] for this
+            // kind, so there are no nodes to touch and no edges to learn on.
+            // Stated as an explicit zero rather than folded into a neighbouring
+            // case so that if associations are ever given to it, the default is
+            // "learns nothing" instead of somebody else's multiplier.
+            return .strengthen(0)
         }
     }
 
@@ -403,6 +417,14 @@ public enum OrganismPlasticity {
         case .resourcePressureChanged:
             return ["body:resource:\(resourcePressure(from: metadata)?.rawValue ?? bodySchema.resourcePressure.rawValue)"]
         case .userSpoke, .assistantSpoke, .correctionReceived, .deskItemCreated, .deskItemBlocked, .deskItemClosed:
+            return []
+        case .horizonRefresh:
+            // Item 5: NO association, deliberately. `.appWake` — the kind this
+            // lane used before it had one of its own — returns
+            // `body:mac:<awake>`, so every refresh pass re-touched the
+            // association meaning "the Mac is awake" and slowly made a calendar
+            // read look like evidence about the machine. A horizon refresh is
+            // evidence about nothing; it only moves the rows.
             return []
         }
     }

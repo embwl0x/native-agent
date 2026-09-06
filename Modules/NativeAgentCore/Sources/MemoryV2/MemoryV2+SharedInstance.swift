@@ -24,8 +24,10 @@ import PersistenceCore
 
 // MARK: - MemoryStorageBridge — MemoryStorage actor → MemoryStorageProtocol
 
-public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol, MemoryRecordLookupStorage {
+public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStorageProtocol, MemoryRecordLookupStorage, MomentProposalCountingStorage, AtomicProposalStagingStorage {
     private let storage: MemoryStorage
+    /// The SQLite file this bridge fronts; `profile.json` lives beside it.
+    public var path: URL { storage.path }
 
     public init(storage: MemoryStorage) {
         self.storage = storage
@@ -222,14 +224,37 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         topK: Int,
         persona: String?
     ) async throws -> [ScoredMemoryRecord] {
-        let hits = try await storage.recall(
+        try await recallReportingKeywordFallback(
+            embedding: embedding,
+            embeddingEpoch: embeddingEpoch,
+            queryText: queryText,
+            topK: topK,
+            persona: persona
+        ).hits
+    }
+
+    /// 2026-09-06: carries storage's own "this answer came from the keyword
+    /// lane" flag up to the recall wiring, which owns every downstream label.
+    public func recallReportingKeywordFallback(
+        embedding: [Float],
+        embeddingEpoch: MemoryEmbeddingEpoch?,
+        queryText: String,
+        topK: Int,
+        persona: String?
+    ) async throws -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool) {
+        let result = try await storage.recallReportingKeywordFallback(
             embedding: embedding,
             embeddingEpoch: embeddingEpoch,
             queryText: queryText,
             topK: topK,
             persona: persona
         )
-        return hits.map { ScoredMemoryRecord(record: Self.toMemoryRecord($0.memory), score: $0.similarity) }
+        return (
+            result.hits.map {
+                ScoredMemoryRecord(record: Self.toMemoryRecord($0.memory), score: $0.similarity)
+            },
+            result.usedKeywordFallback
+        )
     }
 
     /// Sweep R4 A5: lexical-only lane used when no usable query embedding
@@ -330,6 +355,38 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
         _ = try await storage.insertProposal(stored)
     }
 
+    /// User, 2026-09-06: one write lock for match + merge + insert. See
+    /// `MemoryStorage.stagePendingProposal`.
+    public func stagePendingProposal(
+        _ proposal: ProposalRecord,
+        embedding: [Float]?,
+        embeddingEpoch: MemoryEmbeddingEpoch?,
+        insertIfAbsent: Bool,
+        foldedKey: @Sendable (String) -> String,
+        merge: @Sendable (ProposalRecord) -> JSONValue?
+    ) async throws -> ProposalRecord? {
+        let stored = StoredProposal(
+            id: proposal.id,
+            content: proposal.content,
+            personaId: MemoryV2Defaults.personaID,
+            source: proposal.source,
+            stagedAt: proposal.createdAt,
+            status: proposal.status,
+            resolvedAt: nil,
+            rejectionReason: proposal.rejectionReason,
+            embedding: embedding,
+            embeddingEpoch: embeddingEpoch?.rawValue,
+            metadata: proposal.metadata
+        )
+        let result = try await storage.stagePendingProposal(
+            stored,
+            insertIfAbsent: insertIfAbsent,
+            foldedKey: foldedKey,
+            merge: { merge(Self.toProposalRecord($0)) }
+        )
+        return result.map(Self.toProposalRecord)
+    }
+
     public func getProposal(id: String) async throws -> ProposalRecord? {
         // U5 W-G fix (2026-06-11): by-id SQL lookup instead of a full
         // listProposals(status: nil) scan per call — the auto-accept sweep
@@ -341,6 +398,10 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
     public func acceptProposal(id: String) async throws -> MemoryRecord {
         let accepted = try await storage.acceptProposal(id: id)
         return Self.toMemoryRecord(accepted)
+    }
+
+    public func acceptReviewedMoment(id: String, review: ReviewedMomentAcceptance) async throws -> MemoryRecord {
+        Self.toMemoryRecord(try await storage.acceptProposal(id: id, review: review))
     }
 
     public func updateProposalStatus(id: String, status: String, rejectionReason: String?) async throws {
@@ -356,6 +417,12 @@ public actor MemoryStorageBridge: HybridMemoryStorageProtocol, KeywordRecallStor
             throw MemoryV2Error.recordNotFound
         }
         return Self.toProposalRecord(updated)
+    }
+
+    /// One scalar out of SQLite instead of every pending row through the
+    /// decoder — this runs on the turn path (the moments nudge line).
+    public func countMomentProposals(status: String?) async throws -> Int {
+        try await storage.countMomentProposals(status: status)
     }
 
     public func listProposals(status: String?) async throws -> [ProposalRecord] {
@@ -589,6 +656,12 @@ extension SwiftNativeMemoryV2 {
                     // mints junk entities (gpt-5.5 review HIGH,
                     // 2026-07-03).
                     if stored.id.hasPrefix(SwiftNativeMemoryV2.skillPointerIDPrefix) { return }
+                    // Settings ▸ "Knowledge graph": off means no graph is
+                    // PRODUCED. A delete still reaches the graph, and a write
+                    // while off retires the row's node, so a rewritten or
+                    // forgotten memory never lingers with old text (reviewer,
+                    // 2026-09-05). Read fresh per mutation.
+                    let deleted = deleted || !MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
                     try? await kgIndexer.indexMemory(
                         KnowledgeGraphMemoryFact(
                             id: stored.id,
@@ -609,7 +682,10 @@ extension SwiftNativeMemoryV2 {
                 let migrationMarker = dataRoot
                     .appendingPathComponent("memory", isDirectory: true)
                     .appendingPathComponent(".migrated_to_sqlite_v2_approved_only")
-                if FileManager.default.fileExists(atPath: migrationMarker.path) {
+                // Settings ▸ "Knowledge graph": the startup backfill is graph
+                // production too — off means it does not run.
+                if MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot),
+                   FileManager.default.fileExists(atPath: migrationMarker.path) {
                     do {
                         _ = try await kgIndexer.backfillMissingMemoryIndexRows()
                     } catch {
@@ -643,9 +719,15 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
     public init(memory: SwiftNativeMemoryV2 = .shared) {
         self.memory = memory
     }
+    /// User, 2026-09-06: retrieves WITHOUT crediting `use_count`. This adapter
+    /// feeds the chat turn's legacy recall lane, which then drops rows a REM
+    /// pin already states and trims the rest to the prompt's row/character
+    /// budget — so crediting here made rows the model never saw look used, and
+    /// use_count is the signal that vetoes eviction. The turn engine reports
+    /// what it actually delivered through `recordServedContextHits`.
     public func recall(_ query: String, k: Int) async throws -> [MemoryRecallHit] {
         let request = MemoryV2RecallRequest(text: query, topK: k, persona: nil)
-        let response = try await memory.recall(request)
+        let response = try await memory.recall(request, recordingUsage: false)
         return await annotatedWithRelatedEntities(response, query: request)
     }
 
@@ -661,7 +743,8 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
             persona: persona,
             surface: surface
         )
-        let response = try await memory.recall(request)
+        // Same contract as the overload above: retrieve, do not credit.
+        let response = try await memory.recall(request, recordingUsage: false)
         return await annotatedWithRelatedEntities(response, query: request)
     }
 
@@ -694,6 +777,9 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
         _ response: MemoryV2RecallResponse,
         query: MemoryV2RecallRequest
     ) async -> [MemoryRecallHit] {
+        // Settings ▸ "Knowledge graph": off means the graph is not USED either
+        // — recall gets no one-hop entity enrichment. Read fresh per recall.
+        guard MemoryPolicyGate.knowledgeGraphEnabled() else { return response.hits }
         guard !response.hits.isEmpty else { return response.hits }
         let disclosedIDs: Set<String> = Set(
             response.scored.compactMap { scoredRecord in

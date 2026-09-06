@@ -60,12 +60,56 @@ enum ChatPinnedSnapshotPublication {
     }
 }
 
+/// The anchor as the pin strip reads it.
+///
+/// The anchor is whichever remote conversation is currently live — User's phone
+/// chat today, any surface he connects tomorrow — and the strip merges it in
+/// front of his own pins without ever writing it into them.
+///
+/// Why a memo and not a bare `ConversationAnchor.currentSessionId()`: the strip
+/// is projected from `ChatView.body`, which runs at TOKEN cadence while a reply
+/// streams. The anchor file changes at CONVERSATION cadence — a `/new`, minutes
+/// apart. Reading it per body pass would be a file read and a JSON parse on the
+/// main thread for a value that cannot have moved. One second is far under any
+/// human sense of "one tap away" and far over the streaming rate.
+@MainActor
+enum MacConversationAnchorReading {
+    private static var cachedSessionId: String?
+    private static var readAt = Date.distantPast
+
+    static func currentSessionId(
+        now: Date = Date(),
+        maxAge: TimeInterval = 1,
+        read: () -> String? = { ConversationAnchor.currentSessionId() }
+    ) -> String? {
+        if now.timeIntervalSince(readAt) < maxAge { return cachedSessionId }
+        cachedSessionId = read()
+        readAt = now
+        return cachedSessionId
+    }
+
+    /// Tests own the clock; nothing in the app calls this.
+    static func resetForTesting() {
+        cachedSessionId = nil
+        readAt = .distantPast
+    }
+}
+
 extension ChatView {
-    func decodedPinnedSessionIds() -> [String] {
+    /// The human's pins WITHOUT the anchor — what `savePinnedSessionIds` must
+    /// persist. Writing the merged list back would silently adopt the anchor as
+    /// a real pin, and it would stay pinned after it stopped being the anchor.
+    func humanPinnedSessionIds() -> [String] {
         MacPinnedChatSessionStore.decode(pinnedChatSessionIdsRaw)
     }
 
-    func savePinnedSessionIds(_ ids: [String]) {
+    /// 2026-09-06: `includeTranscripts` exists because the published transcript
+    /// set is chosen from the pins as they were BEFORE this save. Publishing a
+    /// newly pinned session's tab without its transcript put an empty
+    /// conversation on the phone until some unrelated edge happened to publish
+    /// transcripts again. A pin that ADDS a session asks for them; pruning and
+    /// unpinning still do not — they only ever remove.
+    func savePinnedSessionIds(_ ids: [String], includeTranscripts: Bool = false) {
         do {
             pinnedChatSessionIdsRaw = try MacPinnedChatSessionStore.save(ids)
         } catch {
@@ -75,7 +119,9 @@ extension ChatView {
         guard ChatPinnedSnapshotPublication.request(
             encodedPinnedIDs: pinnedChatSessionIdsRaw,
             publish: { _ in
-                MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+                MacSyncEngine.shared.requestChatSnapshotPublication(
+                    includeTranscripts: includeTranscripts
+                )
             }
         ) else {
             showToast("Pinned tabs were saved, but their phone snapshot could not be verified")
@@ -86,7 +132,9 @@ extension ChatView {
     func prunePinnedSessions() {
         guard !appModel.chatSessions.isEmpty else { return }
         let liveIds = Set(appModel.chatSessions.map(\.id))
-        let current = decodedPinnedSessionIds()
+        // Prunes the HUMAN's list. Using the merged list here would write the
+        // anchor into their pins on the first prune pass.
+        let current = humanPinnedSessionIds()
         let pruned = current.filter { liveIds.contains($0) }
         if pruned != current {
             savePinnedSessionIds(pruned)
@@ -95,10 +143,12 @@ extension ChatView {
 
     func pinSession(_ sessionId: String, selectAfterPin: Bool = true) {
         guard let session = appModel.chatSessions.first(where: { $0.id == sessionId }) else { return }
-        var ids = decodedPinnedSessionIds()
+        // Explicitly pinning the anchor is allowed and meaningful: it says
+        // "keep this one even after it stops being the live conversation".
+        var ids = humanPinnedSessionIds()
         if !ids.contains(sessionId) {
             ids.append(sessionId)
-            savePinnedSessionIds(ids)
+            savePinnedSessionIds(ids, includeTranscripts: true)
             showToast("Pinned \(session.title)")
         }
         if selectAfterPin {

@@ -175,6 +175,26 @@ fileprivate func providerFileHasCredential(_ url: URL) -> Bool {
     return false
 }
 
+/// User, 2026-09-06: the UI bookkeeping `configureProvider` persists next to the
+/// credential — the "Model it falls back to" pick and the chosen auth mode. The
+/// synthesized provider record omitted both, so reopening the sheet always
+/// selected the first catalog model and the saved pick was invisible.
+fileprivate func providerFileBookkeeping(_ url: URL) -> (authMode: String?, defaultModel: String?) {
+    guard let data = try? Data(contentsOf: url), !data.isEmpty,
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return (nil, nil) }
+    func string(_ keys: [String]) -> String? {
+        for key in keys {
+            if let v = obj[key] as? String,
+               !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return v.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
+    }
+    return (string(["auth_mode", "authMode"]), string(["default_model", "defaultModel"]))
+}
+
 fileprivate func parseAuthExpiresAt(_ raw: Any?) -> Date? {
     guard let raw = raw else { return nil }
     if let i = raw as? Int { return Date(timeIntervalSince1970: TimeInterval(i)) }
@@ -362,13 +382,22 @@ extension NativeClient {
                 "detail": effectiveDetail,
                 "metadata": [:] as [String: String],
             ]
-            let providerDict: [String: Any] = [
+            var providerDict: [String: Any] = [
                 "provider_id": providerId,
                 "display_name": display,
                 "auth_modes": modes,
                 "auth_status": statusDict,
                 "models": modelsFor(providerId),
             ]
+            // User, 2026-09-06: carry the saved bookkeeping so the config sheet
+            // round-trips. Without it the sheet re-selected the first catalog
+            // model every time it opened and the saved "Model it falls back to"
+            // was silently dropped on the next Save.
+            let bookkeeping = providerFileBookkeeping(
+                providersDir.appendingPathComponent("\(providerId).json")
+            )
+            if let mode = bookkeeping.authMode { providerDict["auth_mode"] = mode }
+            if let model = bookkeeping.defaultModel { providerDict["default_model"] = model }
             if let providerJSON = try? JSONSerialization.data(withJSONObject: providerDict),
                let synthesized = try? JSONDecoder.nativeAgent.decode(ProviderInfo.self, from: providerJSON) {
                 byId[providerId] = synthesized
@@ -379,7 +408,21 @@ extension NativeClient {
         let registryPath = providersDir.appendingPathComponent("registry.json")
         if let data = try? Data(contentsOf: registryPath),
            let existing = try? JSONDecoder.nativeAgent.decode([ProviderInfo].self, from: data) {
-            for p in existing { byId[p.provider_id] = p }
+            for p in existing {
+                // User, 2026-09-06: a legacy registry row never goes through
+                // `synthesize`, and providers/<id>.json is where
+                // `configureProvider` saves the fallback model and the auth
+                // mode — so on a migrated install the sheet still lost the
+                // saved pick. OpenRouter felt it hardest: its own re-synthesize
+                // below is gated on there being no row at all.
+                var row = p
+                let bookkeeping = providerFileBookkeeping(
+                    providersDir.appendingPathComponent("\(p.provider_id).json")
+                )
+                if let mode = bookkeeping.authMode { row.auth_mode = mode }
+                if let model = bookkeeping.defaultModel { row.default_model = model }
+                byId[p.provider_id] = row
+            }
         }
 
         // Source 2: providers/<id>.json (Anthropic OAuth direct, OpenRouter, etc.)
@@ -596,14 +639,29 @@ extension NativeClient {
     // API key via LLMCredentialResolver (env → providers/<id>.json), then for
     // OpenAI hits GET /v1/models with a Bearer token and reports latency.
     // Anthropic has no free probe endpoint so we report tested:false.
-    func testProvider(_ id: String) async throws -> ProviderTestResult {
+    //
+    // User, 2026-09-06: `apiKeyOverride` is the key typed into the provider
+    // sheet but not saved yet. Without it the button tested the credential on
+    // disk while the sheet showed the result beside an unrelated draft — a bad
+    // pasted key could read "Saved and tested" off the old saved one, and a
+    // fresh install reported "no api key configured" for a valid pasted key.
+    func testProvider(_ id: String, apiKeyOverride: String? = nil) async throws -> ProviderTestResult {
         let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         // This write is deliberately attached to the canonical, user-initiated
         // reachability probe rather than to a provider-list refresh. A readable
         // credential is not evidence that the provider was reachable. If the
         // status-file write itself fails, leave the prior record untouched so
         // its age truthfully becomes stale instead of fabricating a fresh row.
+        let draftKey: String? = {
+            let trimmed = apiKeyOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed?.isEmpty == false ? trimmed : nil
+        }()
         func recordProbeResult(_ result: ProviderTestResult) async -> ProviderTestResult {
+            // A draft key is not this provider's credential — it has not been
+            // saved. Its probe answers the sheet only; writing it to the status
+            // feed would claim a configured provider was reachable when the
+            // configured one was never touched (User, 2026-09-06).
+            guard draftKey == nil else { return result }
             do {
                 try await LLMProviderStatusFeed.write(result, dataRoot: dataRoot)
             } catch {
@@ -628,7 +686,7 @@ extension NativeClient {
                 detail: "no native probe for \(id)", error: nil
             ))
         }
-        guard let apiKey = LLMCredentialResolver.resolveAPIKey(
+        guard let apiKey = draftKey ?? LLMCredentialResolver.resolveAPIKey(
             envVar: envVar, providerConfigFile: configFile, dataRoot: dataRoot
         ), !apiKey.isEmpty else {
             return await recordProbeResult(ProviderTestResult(
@@ -736,7 +794,10 @@ extension NativeClient {
     // from <dataRoot>/providers/registry.json under flock. Missing file or
     // non-array body → no-op (returns EmptyResponse cleanly, matching Python).
     func clearProvider(_ id: String) async throws -> EmptyResponse {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        // User, 2026-09-06: the client's own root, not the process default — a
+        // removal against an override root was deleting the default install's
+        // registry row and credential file and leaving the intended one intact.
+        let dataRoot = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let path = dataRoot.appendingPathComponent("providers/registry.json")
         let persistence = SwiftNativePersistenceCore()
         try await persistence.withFileLock(path) {

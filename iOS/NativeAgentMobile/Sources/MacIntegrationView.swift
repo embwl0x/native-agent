@@ -43,6 +43,18 @@ enum MacIntegrationCatalog {
     ]
 }
 
+/// The copy that tells the truth about where these values came from.
+enum MacIntegrationProjectionPresentation {
+    static let awaitingMacTitle = "Not yet received from the Mac"
+    static let awaitingMacDetail = """
+        This iPhone has not received the permission matrix from your Mac yet, \
+        so nothing below is confirmed policy. The rows show NativeAgent's \
+        built-in defaults as a placeholder only; open the Mac app (and check \
+        pairing) to publish the real settings.
+        """
+    static let placeholderRowNote = "Placeholder default \u{00b7} not confirmed by the Mac"
+}
+
 // MARK: - MacIntegrationView
 
 struct MacIntegrationView: View {
@@ -73,9 +85,31 @@ struct MacIntegrationView: View {
                 }
             }
 
+            // Sweep 2026-09-01 item 36. Before this, a phone that had never
+            // received a projection rendered the eleven hardcoded defaults as
+            // a live, editable, authoritative matrix with no error anywhere.
+            if case .awaitingMac = sync.projectionState {
+                Section {
+                    Text(MacIntegrationProjectionPresentation.awaitingMacDetail)
+                        .font(AppFont.label)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } header: {
+                    Label(
+                        MacIntegrationProjectionPresentation.awaitingMacTitle,
+                        systemImage: "icloud.slash"
+                    )
+                    .font(AppFont.section)
+                }
+            }
+
             ForEach(MacIntegrationCatalog.rows) { row in
                 Section {
-                    MacIntegrationRowView(row: row, sync: sync)
+                    MacIntegrationRowView(
+                        row: row,
+                        sync: sync,
+                        isPlaceholder: !sync.hasMacProjection
+                    )
                 }
             }
 
@@ -116,6 +150,11 @@ struct MacIntegrationView: View {
 private struct MacIntegrationRowView: View {
     let row: MacIntegrationRow
     @ObservedObject var sync: MacIntegrationPermissionsSync
+    /// True while the Mac has published nothing readable. The toggles then
+    /// show the built-in default, labelled as such, and cannot be moved —
+    /// editing a value the Mac never sent would write policy against a matrix
+    /// nobody has seen.
+    var isPlaceholder: Bool = false
     @State private var isSaving = false
     @State private var saveError: String?
 
@@ -169,7 +208,7 @@ private struct MacIntegrationRowView: View {
                 }
                 .toggleStyle(.switch)
                 .tint(NativeAgentPalette.agentAccent)
-                .disabled(!row.supportsRead || isSaving)
+                .disabled(!row.supportsRead || isSaving || isPlaceholder)
                 .opacity(row.supportsRead ? 1.0 : 0.4)
 
                 Toggle(isOn: writeBinding) {
@@ -178,8 +217,16 @@ private struct MacIntegrationRowView: View {
                 }
                 .toggleStyle(.switch)
                 .tint(NativeAgentPalette.agentAccent)
-                .disabled(!row.supportsWrite || isSaving)
+                .disabled(!row.supportsWrite || isSaving || isPlaceholder)
                 .opacity(row.supportsWrite ? 1.0 : 0.4)
+            }
+            if isPlaceholder {
+                Label(
+                    MacIntegrationProjectionPresentation.placeholderRowNote,
+                    systemImage: "questionmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
             if let saveError {
                 Text(saveError)
@@ -191,7 +238,8 @@ private struct MacIntegrationRowView: View {
     }
 
     private func update(read: Bool, write: Bool) {
-        guard !isSaving else { return }
+        // Never write a "change" measured against a matrix the Mac never sent.
+        guard !isSaving, !isPlaceholder else { return }
         let previousRead = sync.get(id: row.id, mode: "read")
         let previousWrite = sync.get(id: row.id, mode: "write")
         sync.applyProjection(

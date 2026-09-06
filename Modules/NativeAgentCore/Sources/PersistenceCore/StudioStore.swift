@@ -355,6 +355,25 @@ public struct StudioStanceValue: Sendable, Equatable {
 /// A typed link to an earlier entry. This is the ONLY revision mechanism: an
 /// entry is never rewritten, so changing her mind shows up as a later entry
 /// that `revises` or `contradicts` the first, and both survive.
+///
+/// ── RELATIONS ARE PROVENANCE NOW, NOT A GRAPH (desk 903 phase 3) ─────────────
+/// The queryable graph moved to the knowledge graph: works and creators are
+/// entities there, and each of these links becomes a real typed edge naming this
+/// entry as its source (`KnowledgeGraph+StudioRelations.swift`). What stays on
+/// the entry is the PROVENANCE record — the line the edge cites back to.
+///
+/// The choice was "provenance-only" versus "dropped from new writes", and this
+/// is the smaller honest change of the two. The journal is an append-only life
+/// record and its promise is that an entry never ceases to exist and never needs
+/// a second file to explain itself; an entry that says it revises an earlier one
+/// has to keep saying so, or the record stops being self-describing and the
+/// graph's own provenance points at a claim nobody can read. Dropping the field
+/// would also silently break `studio_recall`'s two relation filters for every
+/// future entry — a lossy change dressed as a smaller one.
+///
+/// This is not a dual write: the JSONL is not queried as a graph and never was.
+/// `recall` only ever asked "does THIS entry carry such a link", which is a
+/// property of the entry, not a traversal. Traversal is the graph's, exclusively.
 public struct StudioRelation: Sendable, Equatable {
     public var kind: StudioRelationKind
     public var entryId: String
@@ -516,6 +535,81 @@ public struct StudioRecallResult: Sendable, Equatable {
     public var entries: [StudioJournalEntry]
     public var matchedCount: Int
     public var hasMore: Bool
+}
+
+// MARK: - Encounter intake
+
+/// ONE UNATTENDED ARTIFACT ALREADY IN REACH — desk 903 phase 1.
+///
+/// "Pressure decides WHEN, intake decides WHAT. A seed mints only when an
+/// unattended artifact is already in reach. No intake, no encounter." This type
+/// is the WHAT: a thing that actually exists, that she has not written about,
+/// and that she could receive right now. It is deliberately not a suggestion, a
+/// recommendation, or a generated prompt — nothing here is invented.
+///
+/// It lives in PersistenceCore because it is the only vocabulary the studio
+/// store, the knowledge graph, and the cognitive substrate all share.
+public struct StudioEncounterCandidate: Sendable, Equatable, Hashable {
+    public enum Source: String, Sendable, CaseIterable, Equatable {
+        /// User named it: a consult filed with real artifact refs. His nudges are
+        /// "invitations left on a table, never assignments", which is exactly
+        /// what an intake row is.
+        case named
+        /// A work the knowledge graph holds that the journal never answered.
+        case unjournaledWork
+        /// SEAM ONLY. Nothing produces this yet and nothing in this build may:
+        /// "crossed the screen" needs screen capture, which is a separate
+        /// consent surface and a separate build. The case exists so the ranking
+        /// and the honest-encounter rules are already written for it, not so a
+        /// stub can pretend to watch a screen.
+        case crossedTheScreen
+    }
+
+    public var source: Source
+    /// What it is called, when anything actually knows. A consult carries refs,
+    /// not a title, and inventing one would be the dishonesty the whole design
+    /// exists to prevent — so this stays optional.
+    public var title: String?
+    public var creator: String?
+    /// The path or URL she would receive it through. TEXT: nothing in the
+    /// intake path opens it. An honest encounter happens in front of the work,
+    /// through the vision/browser organs, never by a queue quietly reading a file.
+    public var reference: String?
+    /// What names this candidate for dedup — a consult id, an entity id.
+    public var originID: String
+    public var noticedAt: String
+
+    public init(
+        source: Source,
+        title: String? = nil,
+        creator: String? = nil,
+        reference: String? = nil,
+        originID: String,
+        noticedAt: String
+    ) {
+        self.source = source
+        self.title = title
+        self.creator = creator
+        self.reference = reference
+        self.originID = originID
+        self.noticedAt = noticedAt
+    }
+
+    /// How it reads on a notification. Never an instruction, never a nag — the
+    /// design forbids "you haven't journaled lately" machinery, so this states
+    /// what is there and stops.
+    public var invitationLine: String {
+        var head = title ?? reference ?? originID
+        if let creator, !creator.isEmpty { head += " — \(creator)" }
+        switch source {
+        case .named:
+            return "\(head) is on the table, unanswered."
+        case .unjournaledWork:
+            return "\(head) is in the graph with nothing written about it."
+        case .crossedTheScreen:
+            return "\(head) crossed the screen and went unremarked."
+        }
+    }
 }
 
 // MARK: - Store
@@ -875,11 +969,147 @@ public struct SwiftNativeStudioStore: Sendable {
         return rows.compactMap { StudioJournalEntry.fromJSON($0) }
     }
 
+    /// 2026-09-06: the overflow shelf's entries, oldest archive first.
+    ///
+    /// The shelf was written as "never read by `recall` — it is the overflow
+    /// shelf, not a second journal". That is right for what `recall` SHOWS, and
+    /// wrong for everything derived from the journal: an archived entry still
+    /// answered its consult, still named its refs, still happened. Reading only
+    /// the hot file made overflow re-offer encounters User had already had, and
+    /// made a work she had written about read as one she never met.
+    ///
+    /// A shelf file this build cannot read is skipped rather than thrown: the
+    /// shelf deliberately holds bytes a future build may not decode, and the
+    /// cost of skipping is a re-offer, never a loss.
+    private func archivedJournalEntries() async -> [StudioJournalEntry] {
+        guard let paths = try? journalArchivePaths(), !paths.isEmpty else { return [] }
+        var out: [StudioJournalEntry] = []
+        for path in paths {
+            guard let rows = try? await persistence.readJSONL(path) else {
+                NSLog("%@: journal archive %@ could not be read — skipped",
+                      Self.logLabel, path.lastPathComponent)
+                continue
+            }
+            out.append(contentsOf: rows.compactMap { StudioJournalEntry.fromJSON($0) })
+        }
+        return out
+    }
+
+    /// Every journal entry that still exists — the shelf in age order, then the
+    /// hot file. What anything asking "has this already been journaled" must
+    /// read, and therefore the store's public read: `readJournal` alone answers
+    /// only for the hot file, and a caller that uses it to decide whether
+    /// something already happened gets "no" for everything the cap archived.
+    ///
+    /// 2026-09-06: taken under the journal's own flock, across BOTH reads. The
+    /// shelf was enumerated and the hot file read outside it, so an append that
+    /// archived and trimmed in the gap could hand back a list holding the
+    /// trimmed lines in neither half — the exact entries the shelf exists to
+    /// keep readable.
+    public func journalEntriesIncludingArchive() async throws -> [StudioJournalEntry] {
+        try await persistence.withFileLock(journalPath) {
+            await self.archivedJournalEntries() + (try await self.readJournal())
+        }
+    }
+
+    // MARK: Encounter intake
+
+    /// Every consult User left on the table that the journal never answered.
+    ///
+    /// A candidate is a consult that (1) carries real artifact refs — so there
+    /// IS a work to receive, the honest-encounter rule's whole point — and (2)
+    /// has no journal entry naming it, either by origin ref or by sharing one
+    /// of its refs. Description-only consults are excluded outright: they can
+    /// never become an encounter, so they can never become an invitation to one.
+    ///
+    /// Read-only. Nothing here opens a ref, and nothing here writes.
+    public func namedEncounterIntake(limit: Int = 20) async throws -> [StudioEncounterCandidate] {
+        let directory = consultsDirectory
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        // 2026-09-06: hot PLUS shelf — an archived entry answered its consult
+        // just as much as a hot one, and reading only the hot file re-offered
+        // encounters that had already been had.
+        let entries = try await journalEntriesIncludingArchive()
+        let answeredConsultIDs = Set(entries.compactMap { $0.origin.ref })
+        let journaledRefs = Set(entries.flatMap(\.artifactRefs))
+
+        var candidates: [StudioEncounterCandidate] = []
+        let files = try FileManager.default
+            .contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        for file in files {
+            let raw = await persistence.readJSON(file, defaultValue: .null)
+            guard let consult = StudioConsult.fromJSON(raw) else { continue }
+            // A description-only consult is not an encounter and never will be.
+            guard !consult.descriptionOnly, !consult.artifactRefs.isEmpty else { continue }
+            guard !answeredConsultIDs.contains(consult.id) else { continue }
+            guard journaledRefs.isDisjoint(with: consult.artifactRefs) else { continue }
+            candidates.append(StudioEncounterCandidate(
+                source: .named,
+                reference: consult.artifactRefs.first,
+                originID: consult.id,
+                noticedAt: consult.filedAt
+            ))
+        }
+        // Oldest first: something left unanswered longest is the one still
+        // sitting there, and nothing about this queue is a ranking of taste.
+        return Array(candidates.sorted { $0.noticedAt < $1.noticedAt }.prefix(max(0, limit)))
+    }
+
+    /// The work titles the journal has actually answered, folded for comparison
+    /// against another store's names. The knowledge-graph half of the intake
+    /// needs this to know what is already attended to.
+    public func journaledWorkTitles() async throws -> Set<String> {
+        Set(try await journalEntriesIncludingArchive().map {
+            $0.work.title.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+        })
+    }
+
+    /// User, 2026-09-06: what the journal has answered, identified the way the
+    /// graph identifies a work — title BY SOMEONE. Filtering the graph half of
+    /// the intake on the folded title alone suppressed an unjournaled work
+    /// because a DIFFERENT work by a different creator happened to share its
+    /// title, so the encounter she had never had was never offered.
+    public func journaledWorkIdentities() async throws -> Set<String> {
+        Set(try await journalEntriesIncludingArchive().map {
+            Self.journaledWorkIdentity(title: $0.work.title, creator: $0.work.creator)
+        })
+    }
+
+    /// The one spelling of that identity, so the journal side and the graph side
+    /// cannot drift apart.
+    public static func journaledWorkIdentity(title: String, creator: String?) -> String {
+        func fold(_ value: String) -> String {
+            value.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // User, 2026-09-06: length-prefixed, not delimited. A bare "|" join
+        // makes ("a|b", "") and ("a", "b|") the same identity, so one work
+        // suppresses another's encounter — the exact wrong-identity failure
+        // this key exists to prevent. Ephemeral comparison key, computed the
+        // same way on both sides, so nothing stored has to migrate.
+        let foldedTitle = fold(title)
+        let foldedCreator = fold(creator ?? "")
+        return "\(foldedTitle.count)|\(foldedTitle)|\(foldedCreator.count)|\(foldedCreator)"
+    }
+
     /// Read-only search. Returns matching entries VERBATIM, newest first, capped
     /// by `query.limit`, with an explicit `hasMore`. No scoring, no ranking, and
     /// nothing calls this on the agent's behalf.
     public func recall(_ query: StudioRecallQuery) async throws -> StudioRecallResult {
-        let entries = try await readJournal()
+        // 2026-09-06: the shelf is read too. `query.limit` still bounds what
+        // comes back, and the hot entries are newer so they still come first —
+        // an entry that overflowed simply stops being unfindable.
+        let entries = try await journalEntriesIncludingArchive()
         let matches = entries.reversed().filter { Self.matches($0, query) }
         let bounded = Array(matches.prefix(query.limit))
         return StudioRecallResult(

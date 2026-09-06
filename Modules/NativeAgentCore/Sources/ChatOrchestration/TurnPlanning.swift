@@ -444,21 +444,31 @@ public actor TurnPlanner {
         return false
     }
 
+    /// PARSE SITE 3 of 5, DELETED (one-thread-many-surfaces plan §1.2). The
+    /// `telegram:<chatId>` session-string parse that stood beside the verified
+    /// id is gone: a storage key is not identity. The transport binds the
+    /// verified chat id (and, on the envelope, the verified user id) or this
+    /// returns false — fail closed, no inference.
+    ///
+    /// `sessionId` is retained in the signature because callers pass it and
+    /// removing the parameter would hide, rather than record, what was deleted.
     private nonisolated static func telegramChatAllowed(sessionId: String, dataRoot: URL) -> Bool {
+        _ = sessionId
+        // CHAT identity only. `telegramAllowedIds` merges the chat and user
+        // allowlists into one set, so admitting a user id here would let a
+        // sender match a CHAT entry — a widening, and exactly the silent kind
+        // (plan §8 R1). The set of candidates is deliberately no larger than it
+        // was before the parse was deleted, minus the parse.
         let candidates = [
+            ChatToolSessionContext.envelope?.verifiedChatId,
             ChatToolSessionContext.verifiedChatId,
-            telegramChatIdFromSession(sessionId),
-        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
         guard !candidates.isEmpty else { return false }
         let allowed = telegramAllowedIds(dataRoot: dataRoot)
         guard !allowed.isEmpty else { return false }
         return candidates.contains { allowed.contains($0) }
-    }
-
-    private nonisolated static func telegramChatIdFromSession(_ sessionId: String) -> String? {
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.lowercased().hasPrefix("telegram:") else { return nil }
-        return String(trimmed.dropFirst("telegram:".count))
     }
 
     private nonisolated static func telegramAllowedIds(dataRoot: URL) -> Set<String> {
@@ -644,7 +654,11 @@ extension SwiftNativeTurnEngine {
                     ? addition
                     : existingSegments.dynamic + "\n\n" + addition
             }
-            segments = SystemPromptSegments(stable: existingSegments.stable, dynamic: dynamic)
+            segments = SystemPromptSegments(
+                stable: existingSegments.stable,
+                stableSuffix: existingSegments.stableSuffix,
+                dynamic: dynamic
+            )
             systemPrompt = segments?.combined
         } else {
             segments = nil
@@ -674,7 +688,10 @@ extension SwiftNativeTurnEngine {
             systemSegments: segments,
             imageBlocks: context.imageBlocks,
             fluidContextTurn: context.fluidContextTurn,
-            naturalExpressionCue: nil
+            naturalExpressionCue: nil,
+            historyMessages: context.historyMessages,
+            turnVolatileBlock: context.turnVolatileBlock,
+            historyWindowReceipt: context.historyWindowReceipt
         )
     }
 }

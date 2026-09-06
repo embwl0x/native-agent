@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 "use strict";
+// The agent and the user are addressed by their configured names; nothing in
+// this file names a specific person.
+const AGENT_NAME = process.env.NATIVE_AGENT_AGENT_NAME || "the agent";
+const USER_NAME = process.env.NATIVE_AGENT_USER_NAME || "the user";
 
 // claude_thread_wakeup.js — the her→me wake path.
 //
@@ -8,13 +12,13 @@
 // process, so this helper is deliberately MUCH simpler than
 // script/codex_thread_wakeup.js — no app-server RPC, no rollout watching, no
 // file inference. The return path is direct: the child's stdout is the reply,
-// and it goes straight back to Agent over the local bridge POST.
+// and it goes straight back to the agent over the local bridge POST.
 //
 // Flow (see docs/build_plans/claude-wakeup-parity.md — that file is the
 // contract):
 //   stdin payload -> O_EXCL job file (dedup on messageId) -> per-topic session
 //   pointer -> `claude -p` (--resume or --session-id) -> honest classification
-//   -> bridge POST to Agent -> delivery receipt.
+//   -> bridge POST to the agent -> delivery receipt.
 //
 // Production invocations detach: the foreground process claims the job and
 // hands the (minutes-long) run to a detached child so the Swift caller's
@@ -95,7 +99,7 @@ const STALE_TIMEOUT_MULTIPLIER = 2;
 // orphaned claim. Treat a job that young as live.
 const DEFAULT_SPAWN_GRACE_MS = 30_000;
 // Baseline wait for the per-topic lock. A waiter QUEUES BEHIND a live
-// in-flight wake (Agent work order 2026-07-25, Defect 3): the effective wait
+// in-flight wake (the agent work order 2026-07-25, Defect 3): the effective wait
 // extends to the owner's advertised deadline + margin, and on final failure
 // the wake is REJECTED loudly, naming the in-flight job — never silently
 // downgraded to a fresh, context-free session.
@@ -126,10 +130,35 @@ const DEFAULT_ABSENT_SETTLE_GRACE_MS = 120_000;
 const DEFAULT_RATE_WINDOW_MS = 10 * 60 * 1000;
 const DEFAULT_RATE_MAX_JOBS = 3;
 
+// A stalled or timed-out run gets exactly ONE automatic re-arm.
+//
+// Before this, a wedged Claude turn ended as a failure card and NOTHING
+// retried it: the live store carried 13 `stalled_after_600s` and 12 timeouts
+// with zero retries, each one waiting on a human to notice and re-send the
+// same message by hand.
+//
+// One is the whole budget on purpose. A second automatic retry of a run that
+// already burned its ceiling is a loop, not a recovery; past the budget the
+// honest end state is a failure card naming the reason.
+const DEFAULT_MAX_AUTO_REARMS = 1;
+// How far past its OWN advertised deadline a still-alive runner must be before
+// a duplicate may terminate it. The runner's two watchdogs own the normal
+// case; this margin exists only for a runner whose watchdogs are themselves
+// wedged (an event loop blocked inside a sync syscall), which is the only way
+// `deadlineAt + kill grace` can pass with the process still breathing.
+const WEDGED_RUNNER_MARGIN_MS = 120_000;
+// States in which the runner provably has NOT posted anything: it stamps
+// `delivering` on the job file BEFORE the bridge POST (performWake, fence 2).
+// This list is the entire safety argument for terminating a wedged runner.
+const PRE_DELIVERY_STATES = ["claimed", "dispatching", "queued", "running"];
+// Bound on one terminal-undelivered recovery pass. The sweep runs on the tail
+// of a real wake, so it must never become the thing that delays the next one.
+const DEFAULT_RECOVERY_MAX_PER_PASS = 5;
+
 // The ONLY stderr shapes that prove the pinned session is genuinely gone.
 // Anything else (auth blip, transient crash, our own timeout) must leave the
 // pointer alone — a conservative miss costs one fresh thread, a false positive
-// throws away Claude's whole conversation with Agent.
+// throws away Claude's whole conversation with the agent.
 const SESSION_GONE_MARKERS = [
   "no conversation found",
   "session not found",
@@ -276,6 +305,185 @@ function processStartIdentity(pid) {
   return crypto.createHash("sha256").update(String(result.stdout).trim()).digest("hex");
 }
 
+/// Is a `claude` process ALREADY open on this Mac with this session id on its
+/// command line? (2026-09-02 defect: a `conversation_mode=resume` wake whose
+/// pointer names a session the user has open INTERACTIVELY spawned a second,
+/// unattended `claude --resume <id>` into the same git tree. It clicked around
+/// his desktop, committed the live session's working tree out from under it,
+/// and then told the agent the live session was gone.) A resumed session that is
+/// currently open must never be spawned again, so this runs immediately before
+/// every resume attempt. Cheap and synchronous by design: one `ps`, no signals,
+/// no /proc walk. Returns the pid, or null when nothing proves a live holder —
+/// an unreadable `ps` is NOT evidence of liveness and falls through to the
+/// normal spawn, exactly as before.
+function realPathOrNull(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  try {
+    return fs.realpathSync(text);
+  } catch {
+    return null;
+  }
+}
+
+let cachedClaudeCliRealPath;
+
+/// The `claude` CLI this helper would itself spawn, fully resolved — the same
+/// override, then PATH, that `runClaude` uses. Null when it cannot be resolved,
+/// in which case the remaining signals below still stand on their own.
+function claudeCliRealPath() {
+  if (cachedClaudeCliRealPath !== undefined) return cachedClaudeCliRealPath;
+  let candidate = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN || null;
+  if (!candidate) {
+    const which = spawnSync("/usr/bin/env", ["which", "claude"], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (which.status === 0) {
+      candidate = String(which.stdout || "").trim().split("\n")[0] || null;
+    }
+  }
+  cachedClaudeCliRealPath = candidate ? realPathOrNull(candidate) : null;
+  return cachedClaudeCliRealPath;
+}
+
+/// pid -> executable path. On macOS `ps -o comm=` prints the full path of the
+/// binary actually running, which is what argv[0] cannot be trusted to say.
+/// An unreadable scan yields an empty map; the caller's own `command=` scan is
+/// what decides "unavailable".
+function processExecutablePaths() {
+  const map = new Map();
+  const probe = spawnSync("/bin/ps", ["-axo", "pid=,comm="], {
+    encoding: "utf8",
+    timeout: 5000,
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (probe.status !== 0) return map;
+  for (const line of String(probe.stdout || "").split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!Number.isInteger(pid)) continue;
+    map.set(pid, match[2].trim());
+  }
+  return map;
+}
+
+/// Is this process a `claude` CLI?
+///
+/// 2026-09-06: presence is established from the EXECUTABLE first. Matching
+/// only `path.basename(argv[0]) === "claude"` misses a renamed symlink and any
+/// wrapper that keeps its own argv[0], and a miss is not harmless: both scans
+/// then return null and the caller spawns an unattended session beside a live
+/// interactive one — the no-spawn rule this guard exists to enforce. Three
+/// signals, any one of which is enough:
+///   1. the executable path — its realpath is the CLI this helper itself
+///      resolves, or its basename is `claude`;
+///   2. argv[0]'s basename, or argv[0] resolving to that same CLI;
+///   3. the resolved CLI named as an argv token (a `node .../cli.js` launch).
+/// A match against the whole command line stays OUT: that is what used to let
+/// `tail -f /tmp/claude` or a `zsh -c "... && claude ..."` pass as a live
+/// Claude and leave a real wake message undelivered.
+function isClaudeProcess(command, executablePath) {
+  const cliPath = claudeCliRealPath();
+  const rawExec = String(executablePath || "").trim();
+  const exec = realPathOrNull(rawExec) || rawExec;
+  if (exec) {
+    if (cliPath && exec === cliPath) return true;
+    if (path.basename(exec) === "claude") return true;
+  }
+  const argv = String(command || "").trim().split(/\s+/);
+  const argv0 = argv[0] || "";
+  if (argv0) {
+    if (path.basename(argv0) === "claude") return true;
+    if (cliPath && realPathOrNull(argv0) === cliPath) return true;
+  }
+  if (cliPath) {
+    for (const token of argv.slice(1)) {
+      if (!token.startsWith("/")) continue;
+      if (token === cliPath || realPathOrNull(token) === cliPath) return true;
+    }
+  }
+  return false;
+}
+
+function liveClaudeSessionPid(sessionId) {
+  const id = String(sessionId || "").trim();
+  if (!id) return null;
+  const probe = spawnSync("/bin/ps", ["-axo", "pid=,command="], {
+    encoding: "utf8",
+    timeout: 5000,
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  // A failed or empty process scan is NOT proof of absence. Report it as
+  // such so the caller leaves the message in the inbox instead of spawning
+  // the unattended session this guard exists to prevent (Codex review
+  // 2026-09-05).
+  if (probe.status !== 0 || !String(probe.stdout || "").trim()) return "unavailable";
+  const executables = processExecutablePaths();
+  for (const line of String(probe.stdout).split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const command = match[2];
+    if (!Number.isInteger(pid) || pid === process.pid || pid === process.ppid) continue;
+    // This runner family (node .../claude_thread_wakeup.js --run ...) never
+    // carries a session id on its argv, but exclude it explicitly so a future
+    // argv change cannot make the guard see itself.
+    if (command.includes(path.basename(__filename))) continue;
+    if (!command.includes(id)) continue;
+    // The process itself must be the `claude` CLI, not merely some process
+    // that happens to mention the id.
+    if (!isClaudeProcess(command, executables.get(pid))) continue;
+    return pid;
+  }
+  return null;
+}
+
+/// Is an INTERACTIVE Claude open on this Mac at all? (the user, 2026-09-04: a
+/// `claude_message` is for the Claude he is talking to. While one is live,
+/// the durable inbox plus her session hook deliver it; spawning a headless
+/// `claude -p` next to her puts two Claudes in one git tree, which is how the
+/// probe call sites got swept into a commit and HEAD stopped compiling.) An
+/// interactive session is any `claude` process without `-p`/`--print` on its
+/// command line, which covers the terminal CLI and the desktop app's
+/// stream-json driver alike. The test harness sets
+/// NATIVE_AGENT_CLAUDE_WAKE_IGNORE_INTERACTIVE=1 so a Mac with a live Claude
+/// still exercises the spawn path; production never sets it (the app passes
+/// the real binary in NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN, so that variable
+/// cannot stand in for "this is a test").
+function liveInteractiveClaudePid() {
+  if (process.env.NATIVE_AGENT_CLAUDE_WAKE_IGNORE_INTERACTIVE === "1") return null;
+  const probe = spawnSync("/bin/ps", ["-axo", "pid=,command="], {
+    encoding: "utf8",
+    timeout: 5000,
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  // A failed or empty process scan is NOT proof of absence. Report it as
+  // such so the caller leaves the message in the inbox instead of spawning
+  // the unattended session this guard exists to prevent (Codex review
+  // 2026-09-05).
+  if (probe.status !== 0 || !String(probe.stdout || "").trim()) return "unavailable";
+  const executables = processExecutablePaths();
+  for (const line of String(probe.stdout).split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const command = match[2];
+    if (!Number.isInteger(pid) || pid === process.pid || pid === process.ppid) continue;
+    if (command.includes(path.basename(__filename))) continue;
+    if (!isClaudeProcess(command, executables.get(pid))) continue;
+    const argv = command.split(/\s+/);
+    if (argv.includes("-p") || argv.includes("--print")) continue;
+    return pid;
+  }
+  return null;
+}
+
 function currentProcessStartIdentity() {
   if (cachedCurrentProcessStartIdentity === undefined) {
     cachedCurrentProcessStartIdentity = processStartIdentity(process.pid);
@@ -334,13 +542,13 @@ function resolveLockWaitMs() {
 /// on the same topic must not both start fresh sessions (last writer wins) or
 /// both `--resume` the same session id.
 ///
-/// QUEUE-BEHIND (Agent work order 2026-07-25, Defect 3): a waiter behind a
+/// QUEUE-BEHIND (the agent work order 2026-07-25, Defect 3): a waiter behind a
 /// LIVE owner extends its wait to the owner's advertised hold deadline plus
 /// margin (capped at QUEUE_BEHIND_ABS_CAP_MS) so back-to-back wakes on one
 /// topic thread cleanly instead of colliding. If the lock is STILL held by a
 /// live owner at the final deadline, the caller must REJECT the wake, naming
 /// the in-flight job — the old fallback (run a fresh uncontinued session)
-/// silently delivered Agent's message to a context-free Claude and is gone.
+/// silently delivered the agent's message to a context-free Claude and is gone.
 async function acquireTopicLock(slug, waitMs, ownerMeta) {
   const lockDir = topicLockDir(slug);
   const startedMs = Date.now();
@@ -570,7 +778,7 @@ function sessionPointerPath(slug) {
   return path.join(WAKE_SESSIONS_DIR, `${slug}.txt`);
 }
 
-/// Pointer contract (same as invoke_claude's claude_agent_session.txt):
+/// Pointer contract (same as the invoke_claude session pointer file):
 /// line 1 = session id, line 2 = the cwd it was created in. Resume-by-id is
 /// project-scoped, so resuming from a different directory finds nothing.
 function readSessionPointer(slug) {
@@ -705,7 +913,7 @@ function bridgeURL() {
   return DEFAULT_BRIDGE_URL;
 }
 
-/// Where the app persists Agent's per-session transcript
+/// Where the app persists the agent's per-session transcript
 /// (data/chat/messages/<sessionId>.jsonl). The helper lives in <repo>/script
 /// and the app's data root is the repo checkout, so __dirname-relative is the
 /// production path; the env override exists for tests.
@@ -715,13 +923,13 @@ function messageStoreDir() {
 }
 
 /// The one line of the completion text unique to OUR posted receipt. The bare
-/// messageId is NOT a usable marker: Agent's transcript already carries it in
+/// messageId is NOT a usable marker: the agent's transcript already carries it in
 /// the original claude_message tool rows.
 function deliveryMarker(messageId) {
   return `Originating message id: ${messageId}`;
 }
 
-/// Orthogonal delivery observer (Agent, 2026-07-25): a transport must not
+/// Orthogonal delivery observer (the agent, 2026-07-25): a transport must not
 /// grade its own delivery. The bridge enqueues the row into her session store
 /// durably BEFORE her turn runs, so whether the completion reached her is
 /// answered by that store — never by whether the HTTP response came back in
@@ -761,7 +969,7 @@ function confirmDeliveryViaSessionStore(sessionId, messageId, expectedCompletion
 
 function formatPrompt(payload, jobPath) {
   const lines = [
-    "Agent woke you through NativeAgent's claude_message bridge. No human typed this — you are being started as an unattended turn.",
+    (AGENT_NAME + " woke you through NativeAgent's claude_message bridge. No human typed this — you are being started as an unattended turn."),
     "",
     `Message id: ${payload.messageId}`,
     `Topic: ${payload.topic || DEFAULT_TOPIC}`,
@@ -769,7 +977,7 @@ function formatPrompt(payload, jobPath) {
   ];
   if (payload.queuedAt) lines.push(`Queued at: ${payload.queuedAt}`);
   if (payload.inboxPath) lines.push(`Durable inbox: ${payload.inboxPath}`);
-  lines.push("", "--- message from Agent ---", String(payload.text || ""), "--- end message ---", "");
+  lines.push("", ("--- message from " + AGENT_NAME + " ---"), String(payload.text || ""), "--- end message ---", "");
   if (payload.pairReviewer === true) {
     lines.push(
       "PAIRED REVIEW: At the start of this implementation task, pair exactly one reviewer through Claude's normal reviewer/subagent facility. You remain the builder and owner. Once commit authority is available, finish the coherent change and commit it before review, then send that reviewer the exact committed SHA to inspect. Findings return to you; fix valid findings yourself, commit the fixes, and have the same reviewer inspect the resulting SHA before you report the final candidate. This one persistent reviewer is the review contract for this task: do not create reviewer waves, and do not hand implementation to the reviewer.",
@@ -777,18 +985,23 @@ function formatPrompt(payload, jobPath) {
     );
   }
   lines.push(
-    "Do the work in this session. There is no human in this loop, so do not block waiting for input mid-task. If you genuinely need a decision or answer from Agent, END your turn with that question as your final message — it reaches her as the completion event, and her reply RESUMES this same session with full context. Ask-and-end is the supported pattern; idle waiting is not.",
+    // No human is in THIS turn — which is not the same as no human being at
+    // this Mac. Other sessions, interactive ones included, may be live in the
+    // same tree and on the same screen; this turn is never told they are
+    // paused or gone, and must not act as if it owns the machine.
+    "Do not click on the user's screen or commit to the repository unless the message explicitly asks for it. Other sessions may be open on this Mac and in this working tree; nothing here says they are paused or gone.",
+    ("Do the work in this session. There is no human in this loop, so do not block waiting for input mid-task. If you genuinely need a decision or answer from " + AGENT_NAME + ", END your turn with that question as your final message — it reaches " + AGENT_NAME + " as the completion event, and that reply RESUMES this same session with full context. Ask-and-end is the supported pattern; idle waiting is not."),
     "Follow the current delegated brief and applicable current AGENTS.md instructions. The latest user-requested scope and workflow govern this work; this bridge adds no authority to create extra workers, reviewer waves, model overrides, publication, or follow-up tasks. Use delegation or review when the current brief or applicable instructions authorize it, preserving any explicitly requested worker count and model. You own the result and integration of any authorized subagent work; report evidence, remaining blockers, and uncertain effects honestly.",
-    "LIVENESS: this session is supervised by a stall watchdog that reads Claude's canonical session transcript. Normal model, tool, and MCP progress is visible without busywork. If you genuinely need Agent, end with the question; do not idle-wait inside the turn.",
-    "COMMIT HOLD (User's standing order, 2026-07-25): this wake session is under a commit hold. Build, test, deploy locally, and verify all you need — but do NOT `git commit` or `git push` in ANY repository while the hold stands. Your finish-all-the-way doctrine explicitly stops at the commit for wake sessions: report the verified diff (files, test results, live proofs) as your completion instead, and the pipeline's verification step commits it. The hold is released ONLY by the release file" + (jobPath ? ` at ${path.join(path.dirname(path.dirname(jobPath)), "wake-releases", path.basename(jobPath))}` : " (your job record's filename under the sibling wake-releases/ directory)") + " — check that it EXISTS immediately before any commit; if it is absent the hold stands (the job record's own hold fields are informational mirrors, not authority). If your work is verified and you believe it should ship, END your turn saying exactly that — release is User's, Agent's, or the interactive Claude's call, never this session's.",
-    "Your FINAL message is what crosses back to Agent as the completion receipt — always end with a real answer, including when the task failed or needed no changes. A completed session with an empty reply is a failure, not evidence."
+    ("LIVENESS: this session is supervised by a stall watchdog that reads Claude's canonical session transcript. Normal model, tool, and MCP progress is visible without busywork. If you genuinely need " + AGENT_NAME + ", end with the question; do not idle-wait inside the turn."),
+    ("COMMIT HOLD (" + USER_NAME + "'s standing order, 2026-07-25): this wake session is under a commit hold. Build, test, deploy locally, and verify all you need — but do NOT `git commit` or `git push` in ANY repository while the hold stands. Your finish-all-the-way doctrine explicitly stops at the commit for wake sessions: report the verified diff (files, test results, live proofs) as your completion instead, and the pipeline's verification step commits it. The hold is released ONLY by the release file") + (jobPath ? ` at ${path.join(path.dirname(path.dirname(jobPath)), "wake-releases", path.basename(jobPath))}` : " (your job record's filename under the sibling wake-releases/ directory)") + (" — check that it EXISTS immediately before any commit; if it is absent the hold stands (the job record's own hold fields are informational mirrors, not authority). If your work is verified and you believe it should ship, END your turn saying exactly that — release is " + USER_NAME + "'s, " + AGENT_NAME + "'s, or the interactive Claude's call, never this session's."),
+    ("Your FINAL message is what crosses back to " + AGENT_NAME + " as the completion receipt — always end with a real answer, including when the task failed or needed no changes. A completed session with an empty reply is a failure, not evidence.")
   );
   return lines.join("\n");
 }
 
 function formatCompletionForAgent(result, payload) {
   const lines = [
-    "[claude-wake] Automated completion event. Do NOT auto-fire another claude_message in response unless you have new work for Claude — OR unless Claude ended with a question or decision request, in which case answering on the SAME topic resumes her session with full context. Question-and-answer on one topic is the supported conversation pattern; reflexive acknowledgment messages are the loop to avoid.",
+    "[claude-wake] Automated completion event. Do NOT auto-fire another claude_message in response unless you have new work for Claude — OR unless Claude ended with a question or decision request, in which case answering on the SAME topic resumes that session with full context. Question-and-answer on one topic is the supported conversation pattern; reflexive acknowledgment messages are the loop to avoid.",
     "",
     deliveryMarker(payload.messageId),
     `Topic: ${payload.topic || DEFAULT_TOPIC}`,
@@ -801,6 +1014,22 @@ function formatCompletionForAgent(result, payload) {
   lines.push("");
   if (result.status === "completed") {
     lines.push("--- Claude's reply ---", result.reply, "--- end reply ---");
+  } else if (result.status === "delivered_inbox") {
+    // Presence could not be established. Say exactly that: no claim about a
+    // live session, and no completion to wait for.
+    lines.push(
+      result.detail || "This Mac could not be scanned for an open Claude session; the message is in the durable inbox and no wake was spawned",
+      "",
+      "The message is in the durable inbox and NO unattended session was started for it. Live presence could NOT be established — this is not evidence that a session is open, nor that one is gone. If an open session reads the inbox it picks the message up; otherwise it waits there. There is no reply to relay, and no completion event is coming for this message."
+    );
+  } else if (result.status === "delivered_live") {
+    // Not a failure and not a completion: the message reached a session that
+    // is already open, and nothing was run unattended.
+    lines.push(
+      result.detail || `Session ${result.sessionId} is open interactively; message left in the inbox for it, no wake spawned`,
+      "",
+      "NO unattended session was started for this message, and the live session was NOT interrupted, resumed, or replaced — it is still running and still owns its working tree. The message sits in the durable inbox and reaches that session when it next reads the inbox. There is no reply to relay yet; do not treat this as a completion, a failure, or evidence that the session is gone."
+    );
   } else if (result.status === "completed_without_reply") {
     lines.push(
       "Claude's session exited cleanly (exit 0) but produced NO output. There is no reply to relay — treat this as a failed wake, not as a silent success."
@@ -953,15 +1182,17 @@ function parseCpuTimeMs(raw) {
 
 /// Spawn `claude -p` and settle EXACTLY once. Four racers can finish this
 /// run — the exit handler, the deadline watchdog, the stall watchdog, and a
-/// spawn error — and any double-settle would double-post a completion to Agent.
+/// spawn error — and any double-settle would double-post a completion to the agent.
 function runClaude({ prompt, sessionArgs, sessionId, cwd, timeoutSeconds, stallSeconds, onProgress }) {
   return new Promise((resolve) => {
     const started = Date.now();
     const binOverride = process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_BIN;
     const command = binOverride || "/usr/bin/env";
+    // the user, 2026-09-04: a wake session is a worker, and workers run Opus 5.
+    const model = process.env.NATIVE_AGENT_CLAUDE_WAKE_MODEL || "claude-opus-5";
     const args = binOverride
-      ? [...sessionArgs, "-p", prompt]
-      : ["claude", ...sessionArgs, "-p", prompt];
+      ? [...sessionArgs, "-p", prompt, "--model", model]
+      : ["claude", ...sessionArgs, "-p", prompt, "--model", model];
 
     let settled = false;
     let timedOut = false;
@@ -1132,7 +1363,7 @@ function missingCompletionOrigin(sessionId) {
   if (typeof sessionId === "string" && sessionId.trim()) return null;
   return {
     status: "blocked", reason: "missing_origin_session", deliveryAttempted: false,
-    note: "Completion retained without posting. Identify the original Agent session and inspect this job before explicitly delivering the saved result; do not rerun the worker or guess from the current chat.",
+    note: ("Completion retained without posting. Identify the original " + AGENT_NAME + " session and inspect this job before explicitly delivering the saved result; do not rerun the worker or guess from the current chat."),
   };
 }
 
@@ -1278,15 +1509,36 @@ function postBridgeMessage(text, sessionId) {
 /// The actual wake. Runs in the detached child in production, or in-process
 /// when NATIVE_AGENT_CLAUDE_WAKE_INLINE=1.
 ///
-/// ONE in-flight wake per topic (Agent work order + correction, 2026-07-25,
+/// ONE in-flight wake per topic (the agent work order + correction, 2026-07-25,
 /// Defect 3 — promoted to top by live proof, twice): the topic lock is the
 /// serialization point, and a waiter QUEUES BEHIND the live owner out to its
 /// advertised hold deadline. If the lock still cannot be acquired, the wake
 /// is REJECTED LOUDLY, naming the in-flight job — the old fallback (run a
 /// fresh, context-free session that silently skips the topic's thread) is
-/// deleted. That downgrade turned Agent's most consequential message into an
+/// deleted. That downgrade turned the agent's most consequential message into an
 /// amnesiac 'Execution error' session; it must never be reachable again.
 async function runWakeJob(payload, jobPath, claimId) {
+  const envelope = await runWakeJobInner(payload, jobPath, claimId);
+  // Drain stranded completions on the TAIL of the wake, not the head: the
+  // recovery POST shares postBridgeMessage's generous reply ceiling, and
+  // nothing may sit in front of Claude's actual answer. This is the "next
+  // bridge contact" the recovery contract names — the detached runner (or an
+  // inline test) is the only place with the time to make it.
+  try {
+    const recovery = await sweepTerminalUndelivered();
+    if (recovery.eligible > 0 && envelope && typeof envelope === "object") {
+      envelope.recovery = recovery;
+    }
+  } catch (error) {
+    if (envelope && typeof envelope === "object") {
+      envelope.recovery = { status: "failed", reason: "recovery_sweep_error",
+        error: redactDiagnosticText(String((error && error.message) || error)) };
+    }
+  }
+  return envelope;
+}
+
+async function runWakeJobInner(payload, jobPath, claimId) {
   ensureDirs();
   const slug = topicSlug(payload.topic);
   const original = readJob(jobPath);
@@ -1333,7 +1585,7 @@ async function runWakeJob(payload, jobPath, claimId) {
 
 /// Loud rejection — Defect 3's contract. Never a silent fresh session: the
 /// job settles as failed naming the in-flight owner, the receipt is durable,
-/// and Agent is told over the bridge that the message was NOT worked and
+/// and the agent is told over the bridge that the message was NOT worked and
 /// remains in the durable inbox for a re-send after the in-flight job
 /// settles. deliveryLost can never arm here (there is no completed reply).
 async function rejectWakeTopicBusy(payload, jobPath, slug, claimId, lock) {
@@ -1436,7 +1688,47 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     const sessionId = attemptPointer ? attemptPointer.sessionId : crypto.randomUUID();
     const sessionArgs = isNewSession ? ["--session-id", sessionId] : ["--resume", sessionId];
     const cwd = resolveCwd(payload, attemptPointer);
-    // Ergonomics (Agent's correction, 2026-07-25): the enqueue->claim->start
+    // LIVE-SESSION GUARD. Before ANY externally visible act (no "running"
+    // admission, no spawn): if this resumed session is already open on this
+    // Mac, hand the message over by leaving it in the durable inbox that the
+    // Swift caller already wrote, and say so honestly. A second `claude
+    // --resume` of a session a human is sitting in acts unattended in that
+    // session's own working tree — the damage this guard exists to prevent.
+    const interactiveProbe = liveInteractiveClaudePid();
+    const interactivePid = interactiveProbe === "unavailable" ? null : interactiveProbe;
+    const sessionProbe = interactivePid || isNewSession ? null : liveClaudeSessionPid(sessionId);
+    const scanUnavailable = interactiveProbe === "unavailable" || sessionProbe === "unavailable";
+    const livePid = interactivePid || (sessionProbe === "unavailable" ? null : sessionProbe);
+    if (livePid || scanUnavailable) {
+      // 2026-09-06: an unscannable process table is NOT evidence of a live
+      // session. The no-spawn behaviour is deliberate and unchanged, but the
+      // receipt must not claim a live delivery it never observed: the message
+      // is in the durable inbox and presence is simply unknown.
+      const presenceUnknown = scanUnavailable && !livePid;
+      return {
+        status: presenceUnknown ? "delivered_inbox" : "delivered_live",
+        reason: presenceUnknown
+          ? "process_scan_unavailable"
+          : interactivePid ? "interactive_claude_live" : "session_open_interactively",
+        detail: presenceUnknown
+          ? "Could not scan this Mac for an open Claude session; the message is in the durable inbox and no wake was spawned, so whether a live session will read it is unknown"
+          : interactivePid
+          ? `An interactive Claude is open (pid ${interactivePid}); message left in the inbox for it, no wake spawned`
+          : `Session ${sessionId} is open interactively (pid ${livePid}); message left in the inbox for it, no wake spawned`,
+        livePid,
+        exitCode: null,
+        signal: null,
+        durationMs: 0,
+        timedOut: false,
+        stalled: false,
+        reply: "",
+        stderrTail: "",
+        sessionId,
+        sessionMode: "resume",
+        cwd,
+      };
+    }
+    // Ergonomics (the agent's correction, 2026-07-25): the enqueue->claim->start
     // gap was invisible and caused three deadline mis-filings. startedAt is
     // the RUNNER's clock zero for this attempt; deadlineAt is when the
     // watchdog will SIGTERM it. Judged from these, never from createdAt.
@@ -1529,6 +1821,49 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     });
   }
 
+  // ONE automatic re-arm for a stalled or timed-out run.
+  //
+  // A stall means the canonical transcript went silent for the entire watchdog
+  // window and the child was killed; a timeout means it burned the whole
+  // ceiling. Both are "the runner died without producing an answer", and until
+  // now the only recovery was a human noticing the failure card and re-sending
+  // the same message by hand.
+  //
+  // The budget is spent DURABLY BEFORE the retry runs. The counter lives on the
+  // job file and the write is claim-gated like every other write here, so a
+  // runner that dies mid-retry can never come back for a third attempt, and a
+  // later reader can tell a first-pass failure from a re-armed one.
+  //
+  // The retry resumes the SAME pointer. A stall is not evidence that the
+  // session is gone — only the explicit session-not-found marker above is — so
+  // re-arming must never quietly fork Claude's thread with the agent.
+  const rearmLimit = envNumber("NATIVE_AGENT_CLAUDE_WAKE_MAX_REARMS", DEFAULT_MAX_AUTO_REARMS);
+  const priorRearms = Number((readJob(jobPath) || {}).autoRearms) || 0;
+  let autoRearms = priorRearms;
+  if (!continuationUnavailable && rearmLimit > 0 && priorRearms < rearmLimit
+      && outcome.status === "failed" && (outcome.stalled === true || outcome.timedOut === true)) {
+    const armed = updateJob(jobPath, {
+      autoRearms: priorRearms + 1,
+      autoRearmAt: nowISO(),
+      autoRearmReason: outcome.reason,
+    }, claimId);
+    // A null write means the claim is gone (or the disk is): never start a
+    // second claude run on the strength of an in-memory record.
+    if (armed) {
+      autoRearms = priorRearms + 1;
+      outcome = await attempt(activePointer);
+      attempts.push({
+        sessionId: outcome.sessionId,
+        sessionMode: outcome.sessionMode,
+        status: outcome.status,
+        reason: outcome.reason,
+        exitCode: outcome.exitCode,
+        durationMs: outcome.durationMs,
+        rearm: autoRearms,
+      });
+    }
+  }
+
   // An explicit continuation may not silently become a fresh conversation,
   // even when the provider proves that its old session no longer exists.
   if (requireExistingConversation && activePointer && outcome.status === "failed"
@@ -1541,7 +1876,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
   // pointer with an unresumable id.
   // FENCE 1 — before anything externally visible. The claude run is over; if a
   // takeover happened while we were running, this process is a ghost: it must
-  // not write the topic pointer and must not post to Agent.
+  // not write the topic pointer and must not post to the agent.
   if (!ownsClaim(jobPath, claimId)) {
     return recordOrphanedClaim({ jobPath, claimId, payload, stage: "before_pointer_write" });
   }
@@ -1552,7 +1887,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
   } else if (outcome.sessionMode === "resume") {
     pointerPath = sessionPointerPath(slug);
   }
-  // Pointer-integrity check (Agent's correction): a wake on a topic that HAD
+  // Pointer-integrity check (the agent's correction): a wake on a topic that HAD
   // a pointer must end with that thread either resumed or explicitly healed
   // aside — a null pointerPath here means the thread was silently dropped,
   // which is Defect 3's damage shape. Loud in the receipt, never swallowed.
@@ -1571,6 +1906,8 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     runStatus: outcome.status,
     runReason: outcome.reason,
     runEndedAt: nowISO(),
+    detail: outcome.detail || null,
+    livePid: outcome.livePid || null,
   }, claimId);
   // FENCE 2 — immediately before the POST. Re-read rather than trusting fence
   // 1: the pointer write above is not instantaneous, and a double-posted
@@ -1614,10 +1951,16 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     timeoutSeconds,
     claudeSessionId: outcome.sessionId,
     sessionMode: outcome.sessionMode,
+    // Live-session guard evidence, in the ledger delegation_status reads: a
+    // `delivered_live` row must name the pid that already holds the session,
+    // or the ledger cannot tell "handed to a live session" from "never ran".
+    detail: outcome.detail || null,
+    livePid: outcome.livePid || null,
     sessionPointerPath: pointerPath,
     pointerIntegrity,
     selfHeal,
     attempts,
+    autoRearms,
     replyChars: outcome.reply ? outcome.reply.length : 0,
     stderrTail: outcome.stderrTail || null,
     bridge: {
@@ -1688,6 +2031,8 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     topicSlug: slug,
     sessionId: outcome.sessionId,
     sessionMode: outcome.sessionMode,
+    detail: outcome.detail || null,
+    livePid: outcome.livePid || null,
     exitCode: outcome.exitCode,
     durationMs: outcome.durationMs,
     timeoutSeconds,
@@ -1695,6 +2040,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
     stderrTail: outcome.stderrTail || null,
     selfHeal,
     pointerIntegrity,
+    autoRearms,
     bridge: receipt.bridge,
     receiptId: receipt.id,
     receiptPath: DELIVERIES_PATH,
@@ -1707,7 +2053,7 @@ async function performWake(payload, jobPath, slug, claimId, timeoutSeconds, stal
 }
 
 /// Replay ONLY the bridge delivery for a job that already holds a completed
-/// reply Agent never received. Deliberately does not re-run claude: the answer
+/// reply the agent never received. Deliberately does not re-run claude: the answer
 /// exists, the transport failed.
 ///
 /// At-most-once under concurrent duplicates: two helpers can both lose the
@@ -1798,7 +2144,9 @@ async function replayLostDelivery(jobPath, job) {
 
 async function replayLostDeliveryLocked(jobPath, job) {
   const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
-  const sessionId = job.agentSessionId || (job.payload && job.payload.sessionId) || null;
+  // 2026-09-06: jobs written before the rename carry `agentSessionId`; the
+  // live bridge still holds them, and a settled job must stay matchable.
+  const sessionId = job.agentSessionId || job.agentSessionId || (job.payload && job.payload.sessionId) || null;
   const missingOrigin = missingCompletionOrigin(sessionId);
   if (missingOrigin) {
     updateJob(jobPath, { bridgeStatus: "blocked", bridgeReason: missingOrigin.reason, deliveryLost: false });
@@ -1913,7 +2261,9 @@ async function replayLostDeliveryLocked(jobPath, job) {
 /// store-read evidence — a bare timeout can never produce it.
 async function settleUnknownDelivery(jobPath, job) {
   const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
-  const sessionId = job.agentSessionId || (job.payload && job.payload.sessionId) || null;
+  // 2026-09-06: jobs written before the rename carry `agentSessionId`; the
+  // live bridge still holds them, and a settled job must stay matchable.
+  const sessionId = job.agentSessionId || job.agentSessionId || (job.payload && job.payload.sessionId) || null;
   const check = confirmDeliveryViaSessionStore(sessionId, messageId, job.completionText);
   const base = {
     delivery: "claude_thread_wakeup",
@@ -1953,6 +2303,186 @@ async function settleUnknownDelivery(jobPath, job) {
     return replayLostDelivery(jobPath, armed || { ...job, deliveryLost: true });
   }
   return { ...base, status: "skipped", reason: "duplicate", note: "unknown_unresolved" };
+}
+
+/// ------------------------------------------- terminal-undelivered recovery
+///
+/// A completed reply that PROVABLY never reached the agent used to sit on its job
+/// file forever. `replayLostDelivery` existed, but it only ran when the SAME
+/// messageId was re-sent — which nobody does, because nobody knows the reply is
+/// stranded. This sweep is the missing trigger: every bridge contact drains a
+/// bounded slice of the stranded backlog.
+///
+/// "PROVABLY" is the entire contract, and the filter below is deliberately
+/// narrow:
+///   • `failed`                  — the transport DEMONSTRATED the post never
+///                                 landed (ECONNREFUSED, a proven-unsent
+///                                 socket error, an absence settled against
+///                                 the session store).
+///   • `missing_origin_session`  — no post was ever attempted at all.
+/// and nothing else. `unknown` is excluded ON PURPOSE: an ambiguous exchange
+/// may already have landed, and re-posting it is exactly the double-delivery
+/// this file exists to prevent. `suppressed` is an operator decision, not a
+/// transport fault. `delivered` is done.
+function terminalUndelivered(job) {
+  if (!job || job.state !== "settled") return false;
+  // The reply itself must still be on the record; without it there is nothing
+  // to re-post and nothing a card could point at. (The four legacy `failed`
+  // jobs in the live store predate completionText retention and are correctly
+  // out of scope here.)
+  if (typeof job.completionText !== "string" || !job.completionText.trim()) return false;
+  // Durable once-only marker. A job is swept AT MOST ONCE, ever.
+  if (job.deliveryRecoveryAt) return false;
+  if (job.bridgeReason === "missing_origin_session") return true;
+  return job.bridgeStatus === "failed";
+}
+
+async function recoverTerminalUndelivered(jobPath, job) {
+  const messageId = job.messageId || (job.payload && job.payload.messageId) || null;
+  // 2026-09-06: jobs written before the rename carry `agentSessionId`; the
+  // live bridge still holds them, and a settled job must stay matchable.
+  const sessionId = job.agentSessionId || job.agentSessionId || (job.payload && job.payload.sessionId) || null;
+  if (typeof sessionId !== "string" || !sessionId.trim()) {
+    // No origin to post INTO. Deliberately does NOT arm deliveryLost: that
+    // would flip the record out of the `blocked` outcome class the existing
+    // delegation-outcome card already reports it under, and the card is the
+    // whole point of this branch. Stamp the once-only marker and say, on the
+    // record, that the reply exists and where — the card renders the retained
+    // completion head alongside the job id.
+    const marked = updateJob(jobPath, {
+      deliveryRecoveryAt: nowISO(),
+      deliveryRecoveryOutcome: "carded_origin_unresolvable",
+      deliveryRecoveryNote:
+        `Completed reply is retained on ${jobPath}. No origin session is recorded, `
+        + "so it cannot be posted; identify the original conversation and deliver it "
+        + "explicitly. Do not rerun the worker.",
+    });
+    return {
+      messageId, jobPath, posted: false,
+      status: marked ? "carded" : "failed",
+      reason: marked ? "origin_unresolvable" : "recovery_mark_failed",
+    };
+  }
+  // Mark BEFORE posting. At-most-once beats at-least-once here: a crash
+  // between the mark and the POST costs one stranded reply that a human can
+  // still read straight off the record, while a repeat costs the agent a duplicate
+  // completion — the single worst thing this file can produce.
+  const armed = updateJob(jobPath, {
+    deliveryRecoveryAt: nowISO(),
+    deliveryRecoveryOutcome: "reposting",
+    // Proven-undelivered IS deliveryLost; legacy records simply never said so.
+    deliveryLost: true,
+    agentSessionId: sessionId,
+  });
+  if (!armed) {
+    return { messageId, jobPath, posted: false, status: "failed", reason: "recovery_mark_failed" };
+  }
+  // Reuse the existing replay path wholesale: it owns the per-job replay lock,
+  // the under-lock re-read, the final session-store check immediately before
+  // the POST, the redelivery receipt, and clearing completionText on success.
+  const replay = await replayLostDelivery(jobPath, armed);
+  const status = (replay && replay.status) || "unknown";
+  updateJob(jobPath, {
+    deliveryRecoveryOutcome: status,
+    deliveryRecoveryNote: status === "redelivered"
+      ? null
+      : `Completed reply is retained on ${jobPath}; the recovery post did not confirm delivery.`,
+  });
+  return {
+    messageId, jobPath,
+    status,
+    reason: (replay && replay.reason) || null,
+    posted: status === "redelivered",
+    replay,
+  };
+}
+
+/// One bounded pass over the job store. Runs on the TAIL of a real wake (and
+/// via `--recover`), never on the latency-bound foreground helper path.
+async function sweepTerminalUndelivered(limit) {
+  const max = limit == null
+    ? envNumber("NATIVE_AGENT_CLAUDE_WAKE_RECOVERY_MAX", DEFAULT_RECOVERY_MAX_PER_PASS)
+    : limit;
+  const empty = { scanned: 0, eligible: 0, attempted: 0, results: [] };
+  if (!(max > 0)) return empty;
+  let names;
+  try { names = fs.readdirSync(WAKE_JOBS_DIR); } catch { return empty; }
+  const candidates = [];
+  for (const name of names) {
+    // `.stale-<uuid>` takeovers are archived dead runs, never redelivery
+    // targets — the extension test excludes them exactly as the rate limiter's
+    // scan does.
+    if (!name.endsWith(".json")) continue;
+    const jobPath = path.join(WAKE_JOBS_DIR, name);
+    const job = readJob(jobPath);
+    if (!terminalUndelivered(job)) continue;
+    candidates.push({ jobPath, job, at: Date.parse(job.completedAt || job.updatedAt || "") || 0 });
+  }
+  // Oldest first: a backlog drains in the order it stranded.
+  candidates.sort((a, b) => a.at - b.at);
+  const slice = candidates.slice(0, max);
+  const results = [];
+  for (const candidate of slice) {
+    try {
+      results.push(await recoverTerminalUndelivered(candidate.jobPath, candidate.job));
+    } catch (error) {
+      results.push({
+        jobPath: candidate.jobPath,
+        messageId: candidate.job.messageId || null,
+        status: "failed",
+        reason: "recovery_error",
+        posted: false,
+        error: redactDiagnosticText(String((error && error.message) || error)),
+      });
+    }
+  }
+  return { scanned: names.length, eligible: candidates.length, attempted: results.length, results };
+}
+
+/// ------------------------------------------------------ wedged-runner re-arm
+///
+/// A runner is WEDGED when its own advertised deadline has passed by the kill
+/// grace plus a margin and the process is somehow still alive — i.e. both of
+/// its watchdogs failed to end it.
+///
+/// The state gate is the whole safety argument. performWake stamps
+/// `delivering` on the job file BEFORE the bridge POST, so a job still in a
+/// pre-delivery state cannot have delivered anything, and killing it cannot
+/// produce a double completion.
+function preDeliveryWedge(job) {
+  if (!job || !PRE_DELIVERY_STATES.includes(job.state)) return null;
+  const deadlineMs = Date.parse((job && job.deadlineAt) || "");
+  if (!Number.isFinite(deadlineMs)) return null;
+  const marginMs = envNumber("NATIVE_AGENT_CLAUDE_WAKE_WEDGED_MARGIN_MS", WEDGED_RUNNER_MARGIN_MS);
+  const overdueMs = Date.now() - (deadlineMs + KILL_GRACE_MS + marginMs);
+  if (overdueMs <= 0) return null;
+  return { deadlineAt: job.deadlineAt, overdueMs: Math.round(overdueMs), state: job.state };
+}
+
+/// SIGTERM the whole recorded runner tree, then SIGKILL after the same grace
+/// the in-run watchdogs use. Death is PROVEN by polling the recorded roots,
+/// never assumed: a survivor aborts the entire re-arm.
+async function terminateWedgedRunner(job) {
+  const roots = [Number(job && job.runnerPid), Number(job && job.pid)]
+    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+  const targets = new Set();
+  for (const root of roots) {
+    if (!pidAlive(root)) continue;
+    // Snapshot descendants BEFORE signalling: after SIGTERM the root is gone
+    // and its orphaned children are no longer reachable from it.
+    for (const pid of processTreePids(root)) targets.add(pid);
+    targets.add(root);
+  }
+  targets.delete(process.pid);
+  const signalledPids = [...targets];
+  for (const pid of signalledPids) { try { process.kill(pid, "SIGTERM"); } catch {} }
+  await sleep(KILL_GRACE_MS);
+  for (const pid of signalledPids) {
+    if (pidAlive(pid)) { try { process.kill(pid, "SIGKILL"); } catch {} }
+  }
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && roots.some((pid) => pidAlive(pid))) await sleep(100);
+  return { terminated: !roots.some((pid) => pidAlive(pid)), signalledPids, roots };
 }
 
 function knownUnstartedWake(job) {
@@ -2021,11 +2551,80 @@ async function resolveExistingJob(jobPath, payload, makeClaimRecord) {
 
   // Takeover requires that EVERY recorded owner pid be provably dead. A stale
   // heartbeat is NOT sufficient on its own: renaming a live runner's job aside
-  // lets two processes run the same wake and post two completions to Agent.
+  // lets two processes run the same wake and post two completions to the agent.
   // The tradeoff is deliberate — a wedged-but-alive runner blocks retries of
   // that messageId until it dies. Safety over availability; a stuck wake costs
-  // one message, a double wake costs Agent's trust in the receipt stream.
+  // one message, a double wake costs the agent's trust in the receipt stream.
   if (pidAlive(ownerPid) || (hasRunnerPid && pidAlive(runnerPid))) {
+    // The tradeoff above stands, with exactly ONE exception: a runner past its
+    // own advertised deadline whose watchdogs demonstrably failed to end it.
+    // That process is not doing work anybody is waiting on — it is a corpse
+    // holding a messageId hostage — so it is terminated here and the wake is
+    // re-armed once. Everything that makes this safe is checked below and
+    // AFTER the kill, never inferred.
+    const wedge = preDeliveryWedge(job);
+    if (wedge) {
+      const rearmLimit = envNumber("NATIVE_AGENT_CLAUDE_WAKE_MAX_REARMS", DEFAULT_MAX_AUTO_REARMS);
+      const priorRearms = Number(job.autoRearms) || 0;
+      const kill = await terminateWedgedRunner(job);
+      const fresh = readJob(jobPath);
+      if (!kill.terminated || !fresh) {
+        // Could not prove it dead. Two runners on one wake is strictly worse
+        // than one stuck wake; defer exactly as before.
+        return { action: "duplicate", job, note: "wedged_runner_survived", ageMs, staleMs, ownerPid };
+      }
+      // Re-read AFTER the process is provably dead. This closes the only
+      // window that mattered: `delivering` is written durably BEFORE the POST,
+      // so a runner that posted while we were killing it is visible here.
+      if (!preDeliveryWedge(fresh)) {
+        return { action: "duplicate", job: fresh, note: "wedged_runner_delivered", ageMs, staleMs, ownerPid };
+      }
+      if (priorRearms >= rearmLimit) {
+        // Budget spent. Settle it as a failure naming the reason so the
+        // delegation-outcome card fires, instead of leaving the record parked
+        // in `running` behind a pid that no longer exists.
+        updateJob(jobPath, {
+          state: "settled",
+          status: "failed",
+          reason: `wedged_runner_terminated_after_${priorRearms}_rearm${priorRearms === 1 ? "" : "s"}`,
+          bridgeStatus: "suppressed",
+          bridgeReason: "wedged_runner_terminated_no_completion",
+          completedAt: nowISO(),
+          deliveryLost: false,
+          wedgedTerminatedAt: nowISO(),
+          wedgedOverdueMs: wedge.overdueMs,
+          wedgedSignalledPids: kill.signalledPids,
+        });
+        return { action: "duplicate", job: readJob(jobPath), note: "wedged_runner_rearm_exhausted", ageMs, ownerPid };
+      }
+      // Same serialization the unstarted-recovery path uses. The dead runner's
+      // topic lock is reclaimed by acquireTopicLock's own dead-owner check.
+      const wedgeLock = await acquireTopicLock(
+        topicSlug((fresh.payload || job.payload || {}).topic), 0,
+        { messageId: payload.messageId, recoveryOnly: true }
+      );
+      if (!wedgeLock.acquired) return { action: "duplicate", job: fresh, note: "recovery_in_progress" };
+      try {
+        const current = readJob(jobPath);
+        if (!current || current.claimId !== fresh.claimId || !preDeliveryWedge(current)
+            || pidAlive(current.pid) || (current.runnerPid && pidAlive(current.runnerPid))) {
+          return { action: "duplicate", job: current, note: "claim_changed" };
+        }
+        const replacement = makeClaimRecord(current.payload || payload);
+        replacement.autoRearms = priorRearms + 1;
+        replacement.autoRearmAt = nowISO();
+        replacement.autoRearmReason = `wedged_runner_terminated_overdue_${wedge.overdueMs}ms`;
+        const stalePath = renameJobAside(jobPath);
+        if (!stalePath || !claimJob(jobPath, replacement)) {
+          return { action: "duplicate", job: readJob(jobPath), note: "claim_changed" };
+        }
+        return {
+          action: "reclaimed", stalePath, reason: "wedged_runner_terminated",
+          ownerPid, ageMs, claimId: replacement.claimId, payload: replacement.payload,
+          wedge, terminatedPids: kill.signalledPids,
+        };
+      } finally { wedgeLock.release(); }
+    }
     return {
       action: "duplicate",
       job,
@@ -2080,7 +2679,7 @@ async function resolveExistingJob(jobPath, payload, makeClaimRecord) {
   } finally { lock.release(); }
 }
 
-/// Structural ping-pong guard. The prompt preamble asks Agent not to auto-fire
+/// Structural ping-pong guard. The prompt preamble asks the agent not to auto-fire
 /// another claude_message on a completion receipt; this is the part that does
 /// not depend on her cooperating. Every wake of the SAME topic writes a job
 /// file, so counting recent same-topic jobs bounds the loop rate regardless of
@@ -2188,6 +2787,22 @@ async function spawnDetachedRunner(jobPath, claimId) {
 }
 
 async function main() {
+  // Standalone sweep. This is the hook a supervisor (or a human) uses to drain
+  // stranded completions without sending a wake — the "on start" half of the
+  // recovery contract, next to the per-wake half in runWakeJob.
+  if (process.argv.includes("--recover")) {
+    try {
+      ensureDirs();
+    } catch (error) {
+      jsonOut({ status: "failed", reason: "bridge_dir_create_failed",
+        error: String((error && error.message) || error) });
+      return;
+    }
+    const recovery = await sweepTerminalUndelivered();
+    jsonOut({ status: "ok", delivery: "claude_thread_wakeup", mode: "recover", ...recovery });
+    return;
+  }
+
   const runIndex = process.argv.indexOf("--run");
   if (runIndex >= 0) {
     const jobPath = process.argv[runIndex + 1];
@@ -2290,11 +2905,11 @@ async function main() {
       topicSlug: topicSlug(acceptedPayload.topic),
       timeoutSeconds: resolveTimeoutSeconds(acceptedPayload),
       stallSeconds: resolveStallSeconds(acceptedPayload) || null,
-      // Commit hold (task #49, User 2026-07-25): every wake session starts
+      // Commit hold (task #49, the user 2026-07-25): every wake session starts
       // held — build/test/verify and REPORT, but no git commit/push until
-      // User, Agent, or the interactive Claude releases this job. Two
+      // the user, the agent, or the interactive Claude releases this job. Two
       // same-day incidents of wake sessions pushing through intended pauses
-      // (5af594ae race, f9d62ff6 through User's held verification gate) —
+      // (5af594ae race, f9d62ff6 through the user's held verification gate) —
       // both shipped correct content; the hold restores WHO decides.
       // Released via script/wake_hold_release.js (atomic job-record update).
       commitPolicy: "hold",
@@ -2337,6 +2952,7 @@ async function main() {
         stalePath: resolution.stalePath || null,
         previousPid: resolution.ownerPid == null ? null : resolution.ownerPid,
         heartbeatAgeMs: resolution.ageMs == null ? null : resolution.ageMs,
+        ...(resolution.wedge ? { wedge: resolution.wedge, terminatedPids: resolution.terminatedPids || [] } : {}),
       };
       claimed = true;
       claimId = resolution.claimId;
@@ -2353,6 +2969,10 @@ async function main() {
       // stale threshold (we refuse to race it); `spawnGrace` means the
       // parent/child handoff window is still open.
       note: resolution.note || null,
+      ...(resolution.note === "wedged_runner_rearm_exhausted" ? {
+        wedgedRunnerTerminated: true,
+        guidance: "The wedged runner was terminated and its automatic re-arm budget was already spent. The job is settled as failed; re-send the message explicitly if the work is still wanted.",
+      } : {}),
       ...(resolution.note === "missing_origin_session" ? { bridge: missingCompletionOrigin(null), deliveryLost: false } : {}),
       ...(resolution.note === "execution_outcome_unknown" ? {
         executionOutcome: "unknown",
@@ -2426,12 +3046,17 @@ if (require.main === module) {
 
 module.exports = {
   bridgeURL,
+  preDeliveryWedge,
+  sweepTerminalUndelivered,
+  terminalUndelivered,
   classify,
   confirmDeliveryViaSessionStore,
   deliveryMarker,
   ownsClaim,
   formatCompletionForAgent,
   formatPrompt,
+  liveClaudeSessionPid,
+  liveInteractiveClaudePid,
   postBridgeMessage,
   redactDiagnosticText,
   resolveTimeoutSeconds,

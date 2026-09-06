@@ -399,11 +399,16 @@ func autonomyGatedDispatcher_trustedTelegramChatHistoryReadBypassesApprovalFiler
         verifiedSessionId: "telegram:123"
     )
 
-    let result = try await dispatcher.dispatch(
-        tool: "search_chat_history",
-        input: ["query": .string("earlier Mac chat")],
-        surface: "telegram"
-    )
+    // The session id no longer carries identity (one-thread-many-surfaces
+    // §1.2 deleted the five `telegram:<chatId>` parses). The transport binds
+    // the chat id it verified; same identity, honest provenance.
+    let result = try await ChatToolSessionContext.$verifiedChatId.withValue("123") {
+        try await dispatcher.dispatch(
+            tool: "search_chat_history",
+            input: ["query": .string("earlier Mac chat")],
+            surface: "telegram"
+        )
+    }
 
     #expect(result == .object(["count": .int(1)]))
     #expect(tools.dispatches.map(\.tool) == ["search_chat_history"])
@@ -447,14 +452,18 @@ func autonomyGatedDispatcher_fullMacYoloTrustedTelegramMemoryWriteBypassesApprov
         verifiedSessionId: "telegram:123"
     )
 
-    let result = try await dispatcher.dispatch(
-        tool: "commit_memory",
-        input: [
-            "kind": .string("fact"),
-            "text": .string("A durable user preference"),
-        ],
-        surface: "telegram"
-    )
+    // Identity comes from the transport, not from the session id string
+    // (one-thread-many-surfaces §1.2). Same chat, same allowlist, same verdict.
+    let result = try await ChatToolSessionContext.$verifiedChatId.withValue("123") {
+        try await dispatcher.dispatch(
+            tool: "commit_memory",
+            input: [
+                "kind": .string("fact"),
+                "text": .string("A durable user preference"),
+            ],
+            surface: "telegram"
+        )
+    }
 
     #expect(result == .object(["status": .string("committed")]))
     #expect(tools.dispatches.map(\.tool) == ["commit_memory"])

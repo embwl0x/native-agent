@@ -63,7 +63,11 @@ actor GitHubCommandRuntime {
                         userInfo: [NSLocalizedDescriptionKey: "canonical notification body unavailable for alternate data root"]
                     )
                 }
-                let receipt = try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+                // Item 26: a GitHub command notification is Agent handing User a
+                // decision — owner-waiting. Payload unchanged.
+                let outcome = try await AttentionRouter.shared.route(
+                    eventId: "github_command:\(intent.dedupKey)",
+                    importance: .ownerWaiting,
                     title: intent.title,
                     body: intent.body,
                     userInfo: [
@@ -72,6 +76,17 @@ actor GitHubCommandRuntime {
                         "dedupKey": intent.dedupKey,
                     ]
                 )
+                guard let receipt = outcome.receipt else {
+                    // Routed away from the phone (Telegram) or already
+                    // delivered under this exact dedup key. Either way the
+                    // knock happened; there is no APNS receipt to report.
+                    return (
+                        outcome.suppressed ? "duplicate" : "delivered_\(outcome.delivery.rawValue)",
+                        outcome.suppressed
+                            ? "already delivered under \(intent.dedupKey)"
+                            : "routed to \(outcome.delivery.rawValue)"
+                    )
+                }
                 let fields = JSONValue.object(receipt.deliveryFields())
                 return (receipt.status, Self.failureDetail(fields))
             },

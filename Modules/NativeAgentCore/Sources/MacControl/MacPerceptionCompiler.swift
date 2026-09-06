@@ -1910,6 +1910,25 @@ public extension SystemMacAXElementSource {
         }
     }
 
+    /// fable51 item 33 (gpt-5.5 review) — bound EVERY AX round trip to ONE app
+    /// for the duration of a heavy read, and put it back afterwards.
+    ///
+    /// Deliberately the APPLICATION element, never `AXUIElementCreateSystemWide`:
+    /// per `AXUIElement.h` the system-wide form retunes the timeout for the
+    /// WHOLE PROCESS, and exactly one organ in this app is allowed to do that
+    /// (`ActivityWatcher`, pinned by its architecture test). Scoped here, an
+    /// unresponsive app being read cannot wedge anything but its own read.
+    ///
+    /// `seconds: 0` restores the system default, which is what the caller's
+    /// `defer` passes — the bound belongs to the read, not to the app.
+    static func setMessagingTimeout(pid: Int32, seconds: Float) {
+        MacAXExecutionLane.sync {
+            // Same self-process fence as the flags above.
+            guard pid != getpid() else { return }
+            _ = AXUIElementSetMessagingTimeout(AXUIElementCreateApplication(pid), seconds)
+        }
+    }
+
     /// Read-back on either flag. `true` means the app really is in
     /// enhanced-accessibility mode, whatever the setter returned.
     private static func readsEnhancedAccessibility(app: AXUIElement) -> Bool {

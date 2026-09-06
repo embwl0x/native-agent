@@ -10,6 +10,7 @@
 import CryptoKit
 import Foundation
 import GRDB
+import NaturalLanguage
 import PersistenceCore
 
 public struct KnowledgeGraphMemoryFact: Sendable, Equatable {
@@ -75,7 +76,9 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     private enum IndexingControl: Error {
         case requiresCanonicalRebuild
     }
-    private static let indexVersion = "swift-memory-kg-v4"
+    // v5, 2026-09-05: names come from the on-device name tagger, not from
+    // capitalisation. Every row re-indexes on its next touch or a rebuild.
+    private static let indexVersion = "swift-memory-kg-v5"
     /// U5 W-C: stamped into metadata_json ON INSERT ONLY (never by touch
     /// updates) so GC can PROVE an entity was created by this indexer from a
     /// MemoryV2 memory. Entities lacking the stamp (daemon-era JSON imports,
@@ -90,6 +93,12 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     /// and profile renames take effect without restarting, never once per fact.
     private let explicitPrimaryUserName: String?
     private let primaryUserProfileURL: URL
+    /// The primary user's name, resolved once at init so the synchronous
+    /// extractor inside the database closures can name them as a person.
+    /// Internal, not private: GC (KnowledgeGraph+GC.swift) must extract with
+    /// the SAME list the indexer wrote with, from this one resolver
+    /// (2026-09-06 — see `collectGarbage`).
+    nonisolated let knownPeople: [String]
 
     /// U5 W-C re-entry fix, layer 1: per-memory-id serialization. The actor is
     /// re-entrant at every await, and the call site
@@ -118,6 +127,43 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         self.explicitPrimaryUserName = primaryUserName
         self.primaryUserProfileURL = memorySQLitePath.deletingLastPathComponent()
             .appendingPathComponent("profile.json")
+        let resolved = Self.resolvePrimaryUserName(
+            explicit: primaryUserName,
+            profileURL: self.primaryUserProfileURL
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        // The agent is a person in her own graph. Without her name here the
+        // tagger filed "Agent" as a concept in one row and a person in the
+        // next, and every rebuild kept both.
+        let agent = Self.resolveAgentName(profileURL: self.primaryUserProfileURL)
+        var people: [String] = []
+        if !resolved.isEmpty, resolved.lowercased() != "the user" { people.append(resolved) }
+        if let agent, !people.contains(where: { $0.lowercased() == agent.lowercased() }) {
+            people.append(agent)
+        }
+        // The builder agents the app itself delegates to (see the bridge
+        // lanes and `delegateName(forTool:)`): named peers, not places.
+        for peer in Self.builtInPeerAgents where !people.contains(where: { $0.lowercased() == peer.lowercased() }) {
+            people.append(peer)
+        }
+        self.knownPeople = people
+    }
+
+    private static let builtInPeerAgents = ["Claude", "Codex"]
+
+    /// The configured agent name from the persona profile beside the store,
+    /// nil when the profile is missing or the name is unusable.
+    private static func resolveAgentName(profileURL: URL) -> String? {
+        guard let data = try? Data(contentsOf: profileURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = object["name"] as? String else { return nil }
+        let trimmed = raw
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 80,
+              !["assistant", "the assistant", "agent", "the agent"].contains(trimmed.lowercased()),
+              trimmed.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { return nil }
+        return trimmed
     }
 
     /// Resolve the shared pool. The indexer never creates memory.sqlite:
@@ -188,7 +234,16 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     WHERE type = 'table' AND name = 'memories'
                     """) ?? 0) > 0
                 let canonicalFact: KnowledgeGraphMemoryFact?
-                if hasMemoryTable {
+                if deleted {
+                    // 2026-09-06: the caller's `deleted` is authority in BOTH
+                    // branches. It used to be read only when there was no
+                    // memories table, so the production hook's "graph disabled
+                    // — retire this node" (MemoryV2+SharedInstance) reread the
+                    // live row and indexed it anyway: committing a memory with
+                    // the Knowledge graph switch off still minted nodes and
+                    // edges. Retire the node, never index.
+                    canonicalFact = nil
+                } else if hasMemoryTable {
                     let columns = Set(try Row.fetchAll(
                         db, sql: "PRAGMA table_info(memories)"
                     ).compactMap { row -> String? in row["name"] })
@@ -243,7 +298,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                                 metadata: metadata
                             )
                         }
-                } else if deleted || fact.status != "active"
+                } else if fact.status != "active"
                             || fact.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     canonicalFact = nil
                 } else {
@@ -263,7 +318,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let contentHash = Self.contentHash("\(Self.indexVersion):\(content)")
                 let now = Self.nowISO8601()
-                let extracted = Self.extractEntities(from: content)
+                let extracted = Self.extractEntities(from: content, knownPeople: knownPeople)
 
                 // U5 W-C re-entry fix, layer 2: the hash check runs INSIDE the
                 // same write transaction as the upserts. A changed hash cannot
@@ -300,7 +355,17 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     /// stamp, and snapshots canonical rows under the same SQLite write lock so
     /// a concurrent memory mutation lands either before the rebuild snapshot or
     /// afterward through its ordinary indexing hook — never in a lost window.
-    public func rebuildMemoryDerivedGraphFromCanonicalStore() async throws -> KnowledgeGraphMemoryRebuildReport {
+    ///
+    /// User, 2026-09-06: `producing` false is Settings ▸ "Knowledge graph" off.
+    /// The removal half still runs and nothing is re-derived, so the rebuild
+    /// RETIRES every indexer-owned node instead of minting a fresh graph — the
+    /// same answer the mutation hook gives while the switch is off (it routes
+    /// every write as a delete). The gate lives in MemoryV2, which depends on
+    /// this module, so it arrives as an argument rather than a read from here.
+    /// Default true: every existing caller behaves exactly as before.
+    public func rebuildMemoryDerivedGraphFromCanonicalStore(
+        producing: Bool = true
+    ) async throws -> KnowledgeGraphMemoryRebuildReport {
         let dbPool = try await pool()
         let primaryUserName = resolvedPrimaryUserName()
         return try await dbPool.write { db in
@@ -331,7 +396,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                   AND id NOT LIKE 'skill-pointer:%'
                 ORDER BY id ASC
                 """)
-            let facts: [KnowledgeGraphMemoryFact] = rows.compactMap { row in
+            let facts: [KnowledgeGraphMemoryFact] = !producing ? [] : rows.compactMap { row in
                 guard let id: String = row["id"],
                       let content: String = row["content"] else { return nil }
                 let metadataRaw: String? = row["metadata_json"]
@@ -379,7 +444,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     """,
                 arguments: StatementArguments(Self.ownedIndexerVersions)
             )
-            let ownedEntitiesRemoved = db.changesCount
+            var ownedEntitiesRemoved = db.changesCount
             try db.execute(sql: "DELETE FROM kg_memory_index")
             let indexRowsRemoved = db.changesCount
 
@@ -392,6 +457,65 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     primaryUserName: primaryUserName
                 )
             }
+            var legacyRelationshipsRemoved = 0
+            // A canonical rebuild means "the graph is a function of the rows
+            // that exist now". Nodes no indexer stamped (daemon-era imports)
+            // used to survive every rebuild because upsertEntity matches by
+            // name and touches them, so "Agent" as a concept carried 42 000
+            // mentions and "instance_of" edges to User into 2026-09. Nothing
+            // about them is derivable from a current row: drop them, with
+            // every edge that no indexer wrote. The primary-user hub and the
+            // other live writers' own nodes stay. Runs AFTER primary-user
+            // consolidation so a legacy "User" row's edges are folded onto the
+            // hub first, not dropped as dangling.
+            //
+            // 2026-09-06: the predicate used to name the two provenance values
+            // the residue happened to carry (NULL, `default-concept`), so an
+            // import with any OTHER provenance survived — and upsertEntity
+            // adopted it by name, bumped mention_count and never stamped it,
+            // every rebuild, forever. Ownership is the test now: a row is kept
+            // if an indexer owns it or a known foreign writer wrote it (the
+            // studio journal, growth distillation, or the legacy importer,
+            // which stamps `legacy-import` on everything it lands). Anything
+            // else is what the old daemon left behind.
+            let foreignPlaceholders = Self.foreignWriterProvenances
+                .map { _ in "?" }
+                .joined(separator: ", ")
+            try db.execute(
+                sql: """
+                    DELETE FROM kg_relationships
+                    WHERE (provenance IS NULL
+                           OR provenance NOT IN (\(foreignPlaceholders)))
+                      AND json_extract(metadata_json, '$.indexer') IS NULL
+                    """,
+                arguments: StatementArguments(Self.foreignWriterProvenances)
+            )
+            legacyRelationshipsRemoved += db.changesCount
+            try db.execute(
+                sql: """
+                    DELETE FROM kg_entities
+                    WHERE (provenance IS NULL
+                           OR provenance NOT IN (\(foreignPlaceholders)))
+                      AND json_extract(metadata_json, '$.\(Self.createdByKey)') IS NULL
+                      AND COALESCE(json_extract(metadata_json, '$.role'), '') <> 'primary_user'
+                    """,
+                arguments: StatementArguments(Self.foreignWriterProvenances)
+            )
+            ownedEntitiesRemoved += db.changesCount
+            try db.execute(sql: """
+                DELETE FROM kg_relationships
+                WHERE from_id NOT IN (SELECT id FROM kg_entities)
+                   OR to_id NOT IN (SELECT id FROM kg_entities)
+                """)
+            legacyRelationshipsRemoved += db.changesCount
+            // The one node that survives a rebuild and is still counted by it.
+            // Its per-fact increment used to accumulate across rebuilds, so the
+            // hub's mention_count grew without a row to show for it: a rebuild
+            // states the count, it does not add to it.
+            try db.execute(sql: """
+                UPDATE kg_entities SET mention_count = 0
+                WHERE COALESCE(json_extract(metadata_json, '$.role'), '') = 'primary_user'
+                """)
             for fact in facts {
                 let memoryID = fact.id.trimmingCharacters(in: .whitespacesAndNewlines)
                 let content = fact.content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -403,14 +527,14 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     content: content,
                     contentHash: contentHash,
                     now: now,
-                    extracted: Self.extractEntities(from: content),
+                    extracted: Self.extractEntities(from: content, knownPeople: knownPeople),
                     primaryUserName: primaryUserName
                 )
             }
             return KnowledgeGraphMemoryRebuildReport(
                 factsIndexed: facts.count,
                 entitiesRemoved: ownedEntitiesRemoved + consolidation.entitiesRemoved,
-                relationshipsRemoved: ownedRelationshipsRemoved + consolidation.relationshipsRemoved,
+                relationshipsRemoved: ownedRelationshipsRemoved + legacyRelationshipsRemoved + consolidation.relationshipsRemoved,
                 indexRowsRemoved: indexRowsRemoved
             )
         }
@@ -494,7 +618,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     content: trimmed,
                     contentHash: Self.contentHash("\(Self.indexVersion):\(trimmed)"),
                     now: now,
-                    extracted: Self.extractEntities(from: trimmed),
+                    extracted: Self.extractEntities(from: trimmed, knownPeople: knownPeople),
                     primaryUserName: primaryUserName
                 )
                 indexed += 1
@@ -589,7 +713,10 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             """, arguments: [memoryID, contentHash, now, indexVersion])
     }
 
-    public nonisolated static func extractEntities(from content: String) -> [KnowledgeGraphExtractedEntity] {
+    public nonisolated static func extractEntities(
+        from content: String,
+        knownPeople: [String] = []
+    ) -> [KnowledgeGraphExtractedEntity] {
         let summary = "Mentioned in memory: \(clip(content, limit: 220))"
         var ordered: [KnowledgeGraphExtractedEntity] = []
         var seen: Set<String> = []
@@ -597,12 +724,18 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         func add(_ rawName: String, forcedType: String? = nil) {
             guard let name = cleanEntityName(canonicalFileEntityName(rawName)) else { return }
             let type = forcedType ?? inferType(name)
-            let key = "\(type)|\(name.lowercased())"
+            // One node per name. The same name under two types ("Agent" as a
+            // person AND a concept) is how the graph grew duplicate hubs; the
+            // first lane to claim a name wins, and people are added first.
+            let key = name.lowercased()
             guard !seen.contains(key) else { return }
             seen.insert(key)
             ordered.append(KnowledgeGraphExtractedEntity(name: name, type: type, summary: summary))
         }
 
+        for person in knownPeople where !person.isEmpty && knownTermMentioned(person, in: content) {
+            add(person, forcedType: "person")
+        }
         for term in knownTerms {
             // 2026-07-21 audit: the bare caseInsensitive substring match had
             // no word boundary, so "Apple" matched "pineapple" (and any
@@ -615,21 +748,193 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         }
 
         for match in regexCaptures(#"`([^`]{2,80})`"#, in: content) {
+            // `tests`, `Tests`, `main`: a bare word in backticks is prose
+            // emphasis or a directory name, not an entity. Identifiers carry
+            // punctuation, a digit, or a space ("git ls-files", "USER.md").
+            if match.range(of: "^[A-Za-z]+$", options: .regularExpression) != nil { continue }
             add(match)
         }
         for match in regexMatches(#"\b[A-Za-z0-9_./-]+\.(?:app|md|json|swift|sqlite|mlpackage|mlmodelc)\b"#, in: content) {
             add(match)
         }
-        for match in regexMatches(#"\b[A-Z]{2,8}\b"#, in: content) {
-            guard shouldPromoteGenericCandidate(match, in: content) else { continue }
-            add(match)
-        }
-        for match in regexMatches(#"\b[A-Z][A-Za-z0-9_+\-/]*(?:\s+[A-Z][A-Za-z0-9_+\-/]*){0,3}\b"#, in: content) {
-            guard shouldPromoteGenericCandidate(match, in: content) else { continue }
-            add(match)
+        // User, 2026-09-05: "the graph is probably messed up with the way she
+        // was writing memories." It was: two capitalisation lanes here turned
+        // "Existing", "Fails SOFT" and "VERIFICATION DISCIPLINE" into concept
+        // nodes. People, places and organisations now come from the
+        // on-device name tagger; a capital letter is not an entity.
+        // The people this store is about are known by name, whatever the
+        // tagger makes of a short row: the primary user (and any name the
+        // caller passes) is a person when mentioned whole.
+        for (name, type) in taggedNames(in: content, knownPeople: knownPeople) {
+            add(name, forcedType: type)
         }
 
         return Array(ordered.prefix(24))
+    }
+
+    /// Named entities the system's tagger is sure of — personal, place and
+    /// organisation names, joined across words ("NativeAgent Contributors", "New York") —
+    /// minus the shapes it gets wrong on short memory rows. Every rule in
+    /// `taggedNameIsCredible` is a failure observed in the live store on
+    /// 2026-09-05 ("Judge", "Nudge", "KG upgrades", "Greet User", "AI", "the
+    /// Sky", "Pacific time", "Agentic Systems Architect"). User: "Memory is
+    /// important. Get this right."
+    private nonisolated static func taggedNames(
+        in content: String,
+        knownPeople: [String]
+    ) -> [(String, String)] {
+        let tagger = NLTagger(tagSchemes: [.nameType])
+        tagger.string = content
+        // A two-line memory is too short for language detection; without a
+        // language the tagger returns nothing. Detect, and fall back to English.
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(content)
+        tagger.setLanguage(recognizer.dominantLanguage ?? .english, range: content.startIndex..<content.endIndex)
+        var found: [(String, String)] = []
+        tagger.enumerateTags(
+            in: content.startIndex..<content.endIndex,
+            unit: .word,
+            scheme: .nameType,
+            options: [.omitPunctuation, .omitWhitespace, .joinNames]
+        ) { tag, range in
+            let name = String(content[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard name.count >= 2 else { return true }
+            let type: String
+            switch tag {
+            case .personalName?: type = "person"
+            case .placeName?: type = "place"
+            case .organizationName?: type = "organization"
+            default: return true
+            }
+            guard taggedNameIsCredible(name, type: type, range: range, in: content, knownPeople: knownPeople) else {
+                return true
+            }
+            found.append((name, type))
+            return true
+        }
+        return found
+    }
+
+    private nonisolated static let nameParticles: Set<String> = [
+        "de", "van", "von", "der", "den", "di", "da", "la", "le", "du", "of", "y", "and", "del", "al", "bin", "ibn",
+    ]
+    private nonisolated static let roleNouns: Set<String> = [
+        "architect", "staff", "officer", "engineer", "manager", "assistant", "director", "chief",
+        "princess", "queen", "doll", "lead", "head", "president", "secretary",
+    ]
+    private nonisolated static let attributivePlaceFollowers: Set<String> = [
+        "time", "timezone", "style", "manual", "standard",
+    ]
+
+    /// False when a tagged name is one of the tagger's known mistakes on a
+    /// memory row. A known person is always credible.
+    nonisolated static func taggedNameIsCredible(
+        _ name: String,
+        type: String,
+        range: Range<String.Index>,
+        in content: String,
+        knownPeople: [String]
+    ) -> Bool {
+        let tokens = name.split(separator: " ").map(String.init)
+        let lowerKnown = knownPeople.map { $0.lowercased() }
+        if lowerKnown.contains(name.lowercased()) { return true }
+        // Glue: "KG upgrades", "User values Agent" — a lowercase word inside a
+        // name is the tagger joining a verb or noun onto a capital.
+        if tokens.count > 1,
+           tokens.contains(where: { ($0.first?.isLowercase ?? false) && !nameParticles.contains($0.lowercased()) }) {
+            return false
+        }
+        // A known person glued to a leading verb ("Greet User", "Reuse User").
+        // "User Rogan" leads with the known name and stays a person.
+        if type == "person", tokens.count > 1,
+           let known = lowerKnown.first(where: { tokens.map { $0.lowercased() }.contains($0) }),
+           tokens.first?.lowercased() != known {
+            return false
+        }
+        // Acronyms: "AI", "API", "CLI", "APFS" are not organisations. Known
+        // terms (APNS, MCP) were added before the tagger ran.
+        if tokens.count == 1, name.count <= 5, name == name.uppercased(),
+           name.rangeOfCharacter(from: .lowercaseLetters) == nil {
+            return false
+        }
+        // 2026-09-06: the same acronym glued to its neighbour. On "Codex SSHes
+        // into the VM through an SSH Bridge" the tagger returns "Codex SSHes"
+        // and "SSH Bridge" as organisations: a verb-inflected acronym, and an
+        // acronym plus the next capital. `isAcronymInflectedToken` only ever
+        // guarded the title-case lane, which was removed in v5, so nothing
+        // caught these once people/places/organisations came from the tagger.
+        // An acronym is not an organisation on its own (rule above); it does
+        // not become one by acquiring a neighbour.
+        if tokens.count > 1, tokens.contains(where: isAcronymFragmentToken) {
+            return false
+        }
+        // A title, not an organisation: "Agentic Systems Architect".
+        if type == "organization", tokens.count > 1,
+           let last = tokens.last?.lowercased(), roleNouns.contains(last) {
+            return false
+        }
+        let before = content[content.startIndex..<range.lowerBound]
+        let after = content[range.upperBound..<content.endIndex]
+        let prevWord = before.split(whereSeparator: { !$0.isLetter && $0 != "\'" }).last.map { String($0).lowercased() }
+        let nextWord = after.split(whereSeparator: { !$0.isLetter }).first.map { String($0).lowercased() }
+        // "the Sky" (Fear the Sky): an article before a single capital is a
+        // common noun the tagger capitalised into a name.
+        if tokens.count == 1, type != "person", let prevWord, ["the", "a", "an"].contains(prevWord) {
+            return false
+        }
+        // "Pacific time", "Chicago style": a place used as an adjective.
+        if type == "place", let nextWord, attributivePlaceFollowers.contains(nextWord) {
+            return false
+        }
+        // A sentence-initial single word ("Judge glass…", "Nudge it…",
+        // "Acceptance requires…") is capitalised because sentences are, not
+        // because it is a name — unless the same word also appears
+        // mid-sentence in this row.
+        if tokens.count == 1, isSentenceInitial(range.lowerBound, in: content) {
+            // A person at the start of a sentence is usually its subject:
+            // "Sarah is User's sister", "Sarah often visits", "Sarah, User's
+            // sister,", "Sarah's birthday", "Sarah and Mike". The imperative
+            // mistakes ("Judge glass…", "Nudge it…", "Greet User") put a noun,
+            // pronoun, determiner or adjective right after the word instead.
+            // (Codex review 2026-09-05: the blanket rule rejected new people.)
+            if type == "person" {
+                let rest = content[range.upperBound...]
+                let trimmed = rest.drop(while: { $0 == " " })
+                if trimmed.hasPrefix("'s") || trimmed.hasPrefix("’s") || trimmed.first == "," {
+                    return true
+                }
+                if let nextStart = trimmed.first.map({ _ in trimmed.startIndex }) {
+                    let lexical = NLTagger(tagSchemes: [.lexicalClass])
+                    lexical.string = content
+                    let tag = lexical.tag(at: nextStart, unit: .word, scheme: .lexicalClass).0
+                    switch tag {
+                    case .noun?, .pronoun?, .determiner?, .adjective?, .number?:
+                        return false
+                    default:
+                        return true
+                    }
+                }
+                return true
+            }
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b"
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+            let whole = NSRange(content.startIndex..., in: content)
+            let midSentence = regex.matches(in: content, range: whole).contains { match in
+                guard let r = Range(match.range, in: content) else { return false }
+                return !isSentenceInitial(r.lowerBound, in: content)
+            }
+            if !midSentence { return false }
+        }
+        return true
+    }
+
+    /// True when only whitespace, or a sentence terminator / bullet followed
+    /// by whitespace, precedes `index`.
+    private nonisolated static func isSentenceInitial(_ index: String.Index, in content: String) -> Bool {
+        let before = content[content.startIndex..<index]
+        let trimmed = before.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let last = trimmed.last else { return true }
+        return ".!?:;•-*)".contains(last)
     }
 
     /// One stable fact node per MemoryV2 row. Entity/edge extraction is still
@@ -1348,6 +1653,17 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         return !isSentenceInitial(ranges[0], in: content)
     }
 
+    /// A token the tagger should not have joined to a neighbour: a short
+    /// all-caps acronym ("SSH", "VM" — the same shape and bound the
+    /// single-token acronym rule rejects) or one inflected as a verb
+    /// ("SSHes"). 2026-09-06.
+    private nonisolated static func isAcronymFragmentToken(_ token: String) -> Bool {
+        let letters = token.filter(\.isLetter)
+        guard letters.count >= 2 else { return false }
+        if letters.count <= 5, letters.allSatisfy(\.isUppercase) { return true }
+        return isAcronymInflectedToken(token)
+    }
+
     private static func isAcronymInflectedToken(_ token: String) -> Bool {
         guard let regex = try? NSRegularExpression(pattern: #"^[A-Z]{2,}[a-z]+$"#) else {
             return false
@@ -1429,8 +1745,15 @@ public actor SwiftNativeKnowledgeGraphIndexer {
 
     private static let knownTerms: [(name: String, type: String)] = [
         ("NativeAgent", "project"),
-        ("Assistant", "person"),
-        ("User", "person"),
+        ("Claude", "tool"),
+        ("GPT", "tool"),
+        ("Astra", "tool"),
+        ("Gemini", "tool"),
+        ("Kimi", "tool"),
+        ("Grok", "tool"),
+        ("Mistral", "tool"),
+        ("Llama", "tool"),
+        ("DeepSeek", "tool"),
         ("Swift", "tool"),
         ("CoreML", "tool"),
         ("Core ML", "tool"),
@@ -1467,7 +1790,30 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         "swift-memory-kg-v1",
         "swift-memory-kg-v2",
         "swift-memory-kg-v3",
+        // v4 minted the capitalisation-lane junk; it must stay owned or a
+        // rebuild can never delete it (reviewer, 2026-09-05).
+        "swift-memory-kg-v4",
         indexVersion,
+    ]
+
+    /// Stamp the one-time legacy JSON importer puts on every row it lands
+    /// (`KnowledgeGraph+SQLite.maybeImportJSON`). 2026-09-06: imported rows kept
+    /// whatever provenance the JSON carried — usually none — so the ownership
+    /// purge below could not tell hand-written legacy content from daemon-era
+    /// residue and dropped it on the first rebuild after an import.
+    static let legacyImportProvenance = "legacy-import"
+
+    /// Provenance values other live writers own. A canonical rebuild leaves
+    /// their rows alone; every other unstamped row is daemon-era residue it
+    /// drops. `studio-journal` is the studio journal
+    /// (KnowledgeGraph+StudioRelations), `rem-growth-eviction` the growth
+    /// distillation summaries (KnowledgeGraph+GrowthDistillation),
+    /// `legacy-import` the one-time JSON import (KnowledgeGraph+SQLite) — none
+    /// of the three is derivable from a memory row.
+    private static let foreignWriterProvenances = [
+        studioProvenance,
+        "rem-growth-eviction",
+        legacyImportProvenance,
     ]
 
     private static let listItemPrefixRegex = try! NSRegularExpression(

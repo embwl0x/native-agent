@@ -96,9 +96,19 @@ public final class MoonshotAdapter: LLMAdapter {
             durationMs: duration
         )
         var pieces: [String] = parsed.text.isEmpty ? [] : [parsed.text]
-        pieces.append(contentsOf: parsed.toolCalls.map { call in
-            "<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(call.arguments)</tool_use>"
-        })
+        if let note = parsed.incompleteNote {
+            pieces.append(note)
+        } else {
+            pieces.append(contentsOf: parsed.toolCalls.map(chatCompletionsToolUseMarker))
+        }
+        // User, 2026-09-06: an empty reply used to be returned as "" and reach
+        // the chat as a blank turn. The streaming lanes call that
+        // `.streamTruncated`; this one does now too, and the ladder can retry.
+        guard !pieces.isEmpty else {
+            throw LLMError.streamTruncated(
+                message: "moonshot returned no content (empty reply)"
+            )
+        }
         return pieces.joined(separator: "\n")
     }
 
@@ -171,6 +181,7 @@ public final class MoonshotAdapter: LLMAdapter {
                     // stamping on the first content delta, and the reasoning
                     // ledger.
                     var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot")
+                    var sawContent = false
                     for try await event in SSEEventStream(bytes) {
                         try Task.checkCancellation()
                         let frame = try decoder.consume(payload: event.data)
@@ -179,6 +190,7 @@ public final class MoonshotAdapter: LLMAdapter {
                             continuation.yield(.keepAlive)
                         }
                         if let content = frame.content {
+                            sawContent = true
                             if ttftMs == nil {
                                 ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
                             }
@@ -192,6 +204,16 @@ public final class MoonshotAdapter: LLMAdapter {
                         throw LLMError.streamTruncated(message: "moonshot stream ended without [DONE]")
                     }
                     let completed = decoder.completedToolCalls(idPrefix: "moonshot_tool")
+                    // User, 2026-09-06: `[DONE]` with zero reply content AND zero
+                    // tool calls was accepted as a successful turn, so an
+                    // empty-and-silent response reached the surface as a blank
+                    // answer instead of a failure the ladder can retry. Same
+                    // rejection OpenAI and OpenRouter already apply; a tool-only
+                    // turn is NOT empty.
+                    if !sawContent, completed.isEmpty {
+                        throw LLMError.streamTruncated(
+                            message: "moonshot stream produced no content ([DONE], empty)")
+                    }
                     for call in completed {
                         continuation.yield(.toolCall(.init(
                             id: call.id,
@@ -324,26 +346,27 @@ public final class MoonshotAdapter: LLMAdapter {
     }
 
     private static func parseCompletion(data: Data, status: Int) throws -> (
-        text: String, reasoning: String, toolCalls: [MoonshotToolCall], usage: [String: Any]?
+        text: String, reasoning: String, toolCalls: [ChatCompletionsToolCall],
+        incompleteNote: String?, usage: [String: Any]?
     ) {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = root["choices"] as? [[String: Any]],
               let message = choices.first?["message"] as? [String: Any] else {
             throw LLMError.invalidResponse(status: status)
         }
-        let calls = (message["tool_calls"] as? [[String: Any]] ?? []).enumerated().compactMap { index, raw -> MoonshotToolCall? in
-            guard let function = raw["function"] as? [String: Any],
-                  let name = function["name"] as? String, !name.isEmpty else { return nil }
-            return MoonshotToolCall(
-                id: (raw["id"] as? String) ?? "moonshot_tool_\(index)_\(name)",
-                name: name,
-                arguments: (function["arguments"] as? String) ?? "{}"
-            )
-        }
+        // User, 2026-09-06: all-or-nothing on the tool set, same as the streams
+        // — the `compactMap` used to drop the entries it could not execute and
+        // run their siblings, which is half a plan the model wrote as one
+        // decision.
+        let toolSet = finalizeChatCompletionsToolCalls(
+            message["tool_calls"] as? [[String: Any]] ?? [],
+            idPrefix: "moonshot_tool"
+        )
         return (
             (message["content"] as? String) ?? "",
             (message["reasoning_content"] as? String) ?? "",
-            calls,
+            toolSet.calls,
+            toolSet.incompleteNote,
             root["usage"] as? [String: Any]
         )
     }
@@ -363,12 +386,6 @@ public final class MoonshotAdapter: LLMAdapter {
             response: response
         )
     }
-}
-
-private struct MoonshotToolCall: Sendable {
-    let id: String
-    let name: String
-    let arguments: String
 }
 
 private actor MoonshotReasoningLedger {

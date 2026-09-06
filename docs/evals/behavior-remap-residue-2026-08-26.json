@@ -462,12 +462,6 @@
   "assertion": "Pairing publication warnings persist across reconstructed presentation state."
  },
  {
-  "id": "public-api.SpotlightOverlayProbe.currentFrame",
-  "verdict": "unclear",
-  "note": "The test injects a result and never invokes currentFrame itself.",
-  "assertion": "Route serializes an injected probe outcome into HTTP geometry."
- },
- {
   "id": "scripts.verify_release_artifact.requireFlags",
   "verdict": "unclear",
   "note": "Source grep covers only one flag, not verifier behavior.",
@@ -646,11 +640,5 @@
   "verdict": "unclear",
   "note": "It does not execute Mac Control\u2019s visible shortcut controls.",
   "assertion": "Shared permission builder returns bounded System Settings URLs."
- },
- {
-  "id": "ui.spotlight.commandPaletteFind",
-  "verdict": "unclear",
-  "note": "The test never executes the command-palette find operation.",
-  "assertion": "Presentation caps supplied entries and maps supplied failures."
  }
 ]

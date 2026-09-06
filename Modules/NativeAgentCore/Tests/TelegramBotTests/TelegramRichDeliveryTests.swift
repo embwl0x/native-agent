@@ -43,13 +43,15 @@ private actor RichDeliverySpy {
     func setRichFinalError(_ error: Error?) { richFinalError = error }
 }
 
+// 2026-09-06: sends moved from a bare chatId to TelegramDestination
+// (chat + forum topic thread) in 9cb3ab08.
 private func makeRichDelivery(
     spy: RichDeliverySpy,
     richEnabled: Bool = true
 ) -> TelegramAssistantDeliveryDriver {
     let ordinary = TelegramDraftStreamer(
         token: "test-token",
-        chatId: 44,
+        destination: .chat(44),
         editIntervalSeconds: 0,
         sendReturningId: { _, _, text in
             await spy.sendOrdinaryDraft(text)
@@ -69,7 +71,7 @@ private func makeRichDelivery(
     }
     return TelegramAssistantDeliveryDriver(
         token: "test-token",
-        chatId: 44,
+        destination: .chat(44),
         turnId: UUID(uuidString: "00000000-0000-0000-0000-000000000044")!,
         ordinary: ordinary,
         sendOrdinary: { _, _, text in await spy.sendOrdinary(text) },

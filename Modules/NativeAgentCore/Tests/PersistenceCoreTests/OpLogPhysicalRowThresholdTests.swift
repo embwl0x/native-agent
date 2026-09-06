@@ -211,7 +211,16 @@ struct OpLogPhysicalRowThresholdTests {
             observedVersion: "observed-1", actionableEventVersion: nil,
             signals: [], headSHA: "abc123", waitingKind: .review
         )
-        _ = try await store.observe([observation, observation])
+        // Two DIFFERENT readings. `observe` drops an observation that would
+        // not move the reduced state, so repeating one would append a single
+        // operation and leave this gate one physical row short.
+        let moved = GitHubCommandObservation(
+            repository: "example/widgets", number: 11, kind: .pullRequest,
+            title: "Repair widget 11", isOpen: true,
+            observedVersion: "observed-2", actionableEventVersion: nil,
+            signals: [], headSHA: "def456", waitingKind: .review
+        )
+        _ = try await store.observe([observation, moved])
 
         for index in 0..<20 {
             try appendRawLine("torn garbage row \(index) {", to: store.opsPath)

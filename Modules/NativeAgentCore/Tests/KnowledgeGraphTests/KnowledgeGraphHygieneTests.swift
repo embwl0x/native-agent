@@ -325,8 +325,17 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
               (id, name, type, summary, aliases_json, mention_count,
                first_seen, last_seen, provenance, metadata_json)
             VALUES
+              -- 2026-09-06 (3a85e082, 2fe7e05c): the rebuild's purge used to
+              -- name the two provenance values the residue happened to carry,
+              -- so an import with any OTHER provenance survived, was adopted by
+              -- name in upsertEntity and had its mention count bumped every
+              -- rebuild, forever. Ownership is the test now: a row is kept only
+              -- if an indexer owns it or a KNOWN foreign writer wrote it - the
+              -- studio journal, growth distillation, or the legacy importer,
+              -- which stamps `legacy-import` on everything it lands. A bare
+              -- 'manual' stamp is exactly the old-daemon residue that goes.
               ('legacy-manual', 'Manual Truth', 'concept', 'operator-authored',
-               '[]', 1, NULL, NULL, 'manual', NULL),
+               '[]', 1, NULL, NULL, 'legacy-import', NULL),
               ('legacy-v1-owned', 'Two', 'concept', 'old indexer residue',
                '[]', 1, NULL, NULL, 'default-concept',
                '{"created_by_indexer":"swift-memory-kg-v1"}'),
@@ -356,7 +365,7 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
     let rebuiltVersions = try await pool.read { db in
         try Set(String.fetchAll(db, sql: "SELECT DISTINCT index_version FROM kg_memory_index"))
     }
-    #expect(rebuiltVersions == ["swift-memory-kg-v4"])
+    #expect(rebuiltVersions == ["swift-memory-kg-v5"])
 }
 
 @Test func canonicalEmptyRebuildRetractsAllMemoryDerivedRows() async throws {
@@ -759,12 +768,15 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
                '["Alex"]', 4, NULL, NULL, NULL,
                '{"indexer":"swift-memory-kg-v3"}'),
               ('manual-target', 'Manual Target', 'concept', 'manual graph truth',
-               '[]', 1, NULL, NULL, 'manual', NULL);
+               '[]', 1, NULL, NULL, 'legacy-import', NULL);
+            -- 2026-09-06 (3a85e082): only a KNOWN foreign writer's rows survive
+            -- a rebuild, and the legacy importer stamps `legacy-import`. A bare
+            -- 'manual' stamp is the old-daemon residue the purge now removes.
             INSERT INTO kg_relationships
               (from_id, to_id, type, weight, mention_count, provenance, metadata_json)
             VALUES
-              ('legacy-user', 'manual-target', 'knows', 0.4, 2, 'manual', NULL),
-              ('legacy-the-user', 'manual-target', 'knows', 0.8, 3, 'manual', NULL),
+              ('legacy-user', 'manual-target', 'knows', 0.4, 2, 'legacy-import', NULL),
+              ('legacy-the-user', 'manual-target', 'knows', 0.8, 3, 'legacy-import', NULL),
               ('derived-alex-concept', 'manual-target', 'knows', 0.6, 4, NULL, NULL);
             """)
     }
@@ -812,7 +824,9 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
         let mergedProvenance: String = merged["provenance"]
         #expect(mergedWeight == 0.8)
         #expect(mergedMentions == 9)
-        #expect(mergedProvenance == "manual")
+        // The fold keeps the surviving edge's own provenance, which is now the
+        // legacy importer's stamp for the same reason the seed above carries it.
+        #expect(mergedProvenance == "legacy-import")
     }
 }
 
@@ -914,13 +928,12 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
         """
     )
     let names = Set(extracted.map(\.name))
-    #expect(names.contains("River"))
-    #expect(names.contains("QZX"))
-    #expect(names.contains("Codex"))
-    #expect(names.contains("MemoryV2"))
-    #expect(names.contains("Knowledge Graph"))
-    #expect(names.contains("WAL"))
+    // v5 (2026-09-05): a capital letter is not an entity. Known terms stay;
+    // acronyms and title-case phrases no longer mint concept nodes.
     #expect(names.contains("NativeAgent"))
+    #expect(!names.contains("QZX"))
+    #expect(!names.contains("WAL"))
+    #expect(!names.contains("Knowledge Graph"))
     #expect(!names.contains("Empty"))
     #expect(!names.contains("Ordinary"))
 }
@@ -933,10 +946,10 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
         """
     )
     let names = Set(extracted.map(\.name))
-    #expect(names.contains("Codex"))
-    #expect(names.contains("SSH Bridge"))
-    #expect(names.contains("River Stone"))
-    #expect(names.contains("Knowledge Graph"))
+    // v5: no title-case lane, so "SSH Bridge" and "Knowledge Graph" are not
+    // entities; the verb-inflected fragment never was.
+    #expect(!names.contains("SSH Bridge"))
+    #expect(!names.contains("Knowledge Graph"))
     #expect(!names.contains("Codex SSHes"))
 }
 
@@ -949,10 +962,8 @@ private func mentionCount(_ store: KnowledgeGraphStore, name: String) -> Int? {
         """
     )
     let names = Set(extracted.map(\.name))
-    #expect(names.contains("Morgan"))
-    #expect(names.contains("Nova"))
-    #expect(names.contains("Calypso"))
-    #expect(names.contains("Claude Opus"))
+    // v5: people come from the name tagger, whose reach on invented names is
+    // not something a test should pin; the file lanes are deterministic.
     #expect(names.contains("SOUL.md"))
     #expect(names.contains("VOICE.md"))
     #expect(!names.contains("SOUL"))

@@ -369,6 +369,22 @@ if [[ "$INSTALL_LAUNCH_OK" == "1" ]] \
     "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 45; then
   APP_PID="$(pgrep -fxn "$APP_DEST/Contents/MacOS/NativeAgentApp" || true)"
   echo "OK — NativeAgentApp ready (pid=$APP_PID)."
+  # Agent, 2026-09-02: a bridge note is not a receipt. The install itself
+  # tells her which build is running, after the app is ready, so a note can
+  # never describe a build that is not there.
+  # User, 2026-09-04: off by default. Ten installs in one afternoon were ten
+  # full model turns in her main session answering "Received: installer
+  # reports build ...". She reads the running build from buildIdentity when
+  # she needs it. Set NA_INSTALL_RECEIPT=1 to post one.
+  if [ -r "$HOME/.config/claude-bridge/token" ] && [ -n "${NA_INSTALL_RECEIPT:-}" ] && command -v jq >/dev/null 2>&1; then
+    _na_sha=$(git -C "$(cd "$(dirname "$0")/.." && pwd)" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+    # Synchronous on purpose: a backgrounded curl did not survive the
+    # script's exit, so the receipt never arrived.
+    curl -sS --max-time 30 -X POST "http://127.0.0.1:8771/claude/message" \
+      -H "Authorization: Bearer $(cat "$HOME/.config/claude-bridge/token")" -H "Content-Type: application/json" \
+      -d "$(jq -n --arg t "[install_app.sh] Install receipt, posted by the install script itself, not by a person: build $_na_sha is running as pid $APP_PID." --arg s install_app.sh '{text:$t,sender:$s}')" \
+      >/dev/null 2>&1 || true
+  fi
   trap - EXIT ERR INT TERM HUP
   rm -rf "$APP_OLD" 2>/dev/null || true
   exit 0

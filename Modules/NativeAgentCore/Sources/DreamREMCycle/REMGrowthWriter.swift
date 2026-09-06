@@ -66,7 +66,16 @@ public enum REMGrowthWriter {
         }
         let persistence = SwiftNativePersistenceCore()
         return try await persistence.withFileLock(growth) {
-            let body = (try? String(contentsOf: growth, encoding: .utf8)) ?? ""
+            // Read failure aborts; only a genuinely absent file starts a new
+            // document (2026-09-06): `try?` turned an unreadable-but-present
+            // GROWTH.md into "", and the atomic write below then replaced her
+            // whole growth document with a header and one lesson.
+            let body: String
+            do {
+                body = try String(contentsOf: growth, encoding: .utf8)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                body = ""
+            }
             if containsEntryParagraph(body, text) { return false }
             // Body only — no derived `## heading` (User, 2026-07-03): any
             // heading machine-derived from the lesson just repeats its first

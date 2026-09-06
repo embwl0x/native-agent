@@ -144,7 +144,7 @@ struct ProviderExecutionControlPersistenceTests {
         }
     }
 
-    @Test func accountAndPublicCatalogsKeepTheirDistinctGPT56Capabilities() async throws {
+    @Test func accountCatalogsExposeAstraWithoutChangingPublicGPT56Capabilities() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("provider-model-scope-\(UUID().uuidString)", isDirectory: true)
         let providers = root.appendingPathComponent("providers", isDirectory: true)
@@ -164,7 +164,7 @@ struct ProviderExecutionControlPersistenceTests {
             .write(to: providers.appendingPathComponent("openai_oauth_direct.json"))
         try Data(#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","refresh_token":"test-refresh","account_id":"account-test"}}"#.utf8)
             .write(to: codexHome.appendingPathComponent("auth.json"))
-        try Data(#"{"models":[{"slug":"gpt-5.6-sol","display_name":"Sol","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}],"additional_speed_tiers":["fast"],"service_tiers":[{"id":"priority"}],"supported_in_api":true,"visibility":"list"}]}"#.utf8)
+        try Data(#"{"models":[{"slug":"gpt-6-astra","display_name":"GPT-6-Astra","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}],"additional_speed_tiers":["fast"],"service_tiers":[{"id":"priority"}],"supported_in_api":true,"visibility":"list","priority":1,"context_window":272000},{"slug":"gpt-5.6-sol","display_name":"Sol","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}],"additional_speed_tiers":["fast"],"service_tiers":[{"id":"priority"}],"supported_in_api":true,"visibility":"list"}]}"#.utf8)
             .write(to: codexHome.appendingPathComponent("models_cache.json"))
 
         let providersList = try await NativeClient(baseURL: "http://127.0.0.1").listProviders(
@@ -176,14 +176,47 @@ struct ProviderExecutionControlPersistenceTests {
         let apiKey = try #require(providersList.first { $0.provider_id == "openai" })
         let oauth = try #require(providersList.first { $0.provider_id == "openai_oauth_direct" })
 
+        let codexAstra = try #require(codex.models.first { $0.id == "gpt-6-astra" })
+        #expect(codexAstra.context_length == 272_000)
+        #expect(codexAstra.default_reasoning_effort == "medium")
+        #expect(codexAstra.supported_reasoning_efforts == ["low", "medium", "high", "xhigh", "max", "ultra"])
+        #expect(codexAstra.supports_fast == true)
         #expect(codex.models.contains { $0.id == "gpt-5.6-sol" })
+        #expect(apiKey.models.contains { $0.id == "gpt-6-astra" } == false)
         let publicSol = try #require(apiKey.models.first { $0.id == "gpt-5.6-sol" })
         #expect(publicSol.supported_reasoning_efforts == ["none", "low", "medium", "high", "xhigh", "max"])
         #expect(publicSol.supported_reasoning_efforts?.contains("ultra") == false)
         #expect(oauth.auth_status.state == "ready")
         let oauthSol = try #require(oauth.models.first { $0.id == "gpt-5.6-sol" })
+        let oauthAstra = try #require(oauth.models.first { $0.id == "gpt-6-astra" })
+        #expect(oauthAstra.supported_reasoning_efforts?.last == "ultra")
         #expect(oauthSol.supported_reasoning_efforts == ["low", "ultra"])
         #expect(oauthSol.supports_fast == true)
+    }
+
+    @Test func astraSelectionRoutesAndRoundTripsAcrossAccountTransports() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-astra-routing-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let client = NativeClient(baseURL: "")
+
+        for providerID in ["openai_oauth_direct", "codex"] {
+            let catalog = try await client.configureSurfaceSelection(
+                surface: "chat",
+                providerID: providerID,
+                model: "gpt-6-astra",
+                reasoningEffort: "ultra",
+                serviceTier: "priority",
+                dataRoot: root,
+                codexCacheURL: root.appendingPathComponent("missing-models-cache.json")
+            )
+            #expect(catalog.current.chat.model == "gpt-6-astra")
+            #expect(catalog.current.chat.reasoningEffort == "ultra")
+            #expect(catalog.current.chat.serviceTier == "priority")
+            let active = try await NativeClient.readActiveProvidersFromDisk(dataRoot: root)
+            #expect(active["chat"] == providerID)
+        }
     }
 
     @Test func staleGlobalCatalogCannotShadowVerifiedFirstPartyCapabilities() async throws {

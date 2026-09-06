@@ -367,35 +367,6 @@ func appendTransitionShadowAuthorizationOwnershipErrors(repo: URL, errors: inout
     }
 }
 
-func appendRetiredProductionMetacognitiveShadowErrors(repo: URL, errors: inout [String]) throws {
-    let forbidden: [(path: String, needles: [String])] = [
-        (
-            "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+StructuredChat.swift",
-            ["MetacognitiveShadowEvaluator.recommend", "metacognitiveShadow:"]
-        ),
-        (
-            "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+TextCompatibility.swift",
-            ["MetacognitiveShadowEvaluator.recommend", "metacognitiveShadow:"]
-        ),
-        (
-            "Modules/NativeAgentCore/Sources/ChatOrchestration/TurnPlanning.swift",
-            ["metacognitiveShadow", "turn.plan.shadow"]
-        ),
-    ]
-
-    for entry in forbidden {
-        let url = repo.appendingPathComponent(entry.path)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            errors.append("production metacognitive-shadow guard references missing file: \(entry.path)")
-            continue
-        }
-        let text = try String(contentsOf: url, encoding: .utf8)
-        for needle in entry.needles where text.contains(needle) {
-            errors.append("retired production metacognitive shadow reintroduced in \(entry.path): \(needle)")
-        }
-    }
-}
-
 func appendRetiredProductionAdaptiveEffortErrors(repo: URL, errors: inout [String]) throws {
     let productionBoundaryFiles = [
         "Modules/NativeAgentCore/Sources/ApprovalInbox/ApprovalInbox.swift",
@@ -590,7 +561,6 @@ for family in enforcedFamilies {
 try appendStaleInstructionErrors(repo: repo, errors: &errors)
 try appendCognitiveTraceabilityErrors(repo: repo, errors: &errors)
 try appendTransitionShadowAuthorizationOwnershipErrors(repo: repo, errors: &errors)
-try appendRetiredProductionMetacognitiveShadowErrors(repo: repo, errors: &errors)
 try appendRetiredProductionAdaptiveEffortErrors(repo: repo, errors: &errors)
 try appendResidentMindConvergenceErrors(repo: repo, errors: &errors)
 

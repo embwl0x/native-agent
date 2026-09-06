@@ -390,11 +390,16 @@ extension NativeClient {
                 NSLocalizedDescriptionKey: "mobile.notify requires message"
             ])
         }
-        let receipt = try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+        // Item 26: one exit, through the router. Owner-waiting and PINNED to
+        // the phone — `mobile.notify` names its channel. Payload unchanged.
+        let receipt = try await AttentionRouter.shared.route(
+            eventId: "mobile_notify:\(AttentionRouter.stableDigest(title + "|" + message))",
+            importance: .ownerWaiting,
             title: title,
             body: message,
-            userInfo: ["screen": "inbox", "source": connectorInputString(input["source"]) ?? "connector_action"]
-        )
+            userInfo: ["screen": "inbox", "source": connectorInputString(input["source"]) ?? "connector_action"],
+            pinnedTo: .phone
+        ).requireReceipt()
         var obj = receipt.deliveryFields()
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
@@ -516,12 +521,17 @@ extension NativeClient {
         ]))
 
         if persist {
-            let journalDir = dataRoot.appendingPathComponent("work_journal", isDirectory: true)
-            let journalPath = journalDir.appendingPathComponent("codex_daily.jsonl")
-            let latestPath = journalDir.appendingPathComponent("latest.json")
+            // Sweep item 21 (2026-09-01): the sibling `codex_daily.jsonl`
+            // append is gone. It was a raw uncapped `appendJSONL` of the FULL
+            // snapshot — 11.2 KB a row — and no production reader ever opened
+            // it: the only consumer of this action is `latest.json`, the same
+            // object, written on the line below. Existing rows stay on disk;
+            // the runtime just stops adding to them.
+            let latestPath = dataRoot
+                .appendingPathComponent("work_journal", isDirectory: true)
+                .appendingPathComponent("latest.json")
             let persistence = SwiftNativePersistenceCore()
-            try await persistence.withFileLock(journalPath) {
-                try await persistence.appendJSONL(snapshot, to: journalPath)
+            try await persistence.withFileLock(latestPath) {
                 try await persistence.writeJSON(snapshot, to: latestPath)
             }
         }

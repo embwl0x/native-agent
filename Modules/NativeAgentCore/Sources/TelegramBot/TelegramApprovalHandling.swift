@@ -10,10 +10,24 @@ public enum TelegramApprovalDecision: String, Sendable, Equatable {
 public struct TelegramApprovalCommand: Sendable, Equatable {
     public let id: String
     public let decision: TelegramApprovalDecision
+    /// 2026-09-06: the `@bot` the command was addressed to, if any
+    /// (`/approve@OtherBot id` -> "OtherBot"). The text parser used to strip
+    /// this suffix WITHOUT reading it, so the value was only recoverable by
+    /// re-parsing the raw text; the poll loop's own gate does that today, and
+    /// a future caller reaching the parser directly would have silently
+    /// answered an approval addressed to another bot in the room. Nil means
+    /// the command named no bot, or did not arrive as text at all (a callback
+    /// button is delivered only to the bot that sent it).
+    public let addressedBot: String?
 
-    public init(id: String, decision: TelegramApprovalDecision) {
+    public init(
+        id: String,
+        decision: TelegramApprovalDecision,
+        addressedBot: String? = nil
+    ) {
         self.id = id
         self.decision = decision
+        self.addressedBot = addressedBot
     }
 
     public static func parse(text raw: String) -> TelegramApprovalCommand? {
@@ -38,7 +52,11 @@ public struct TelegramApprovalCommand: Sendable, Equatable {
         }
         let id = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return nil }
-        return TelegramApprovalCommand(id: id, decision: decision)
+        return TelegramApprovalCommand(
+            id: id,
+            decision: decision,
+            addressedBot: TelegramCommandRegistry.addressedBotUsername(text: trimmed)
+        )
     }
 
     public static func parse(callbackData raw: String) -> TelegramApprovalCommand? {
@@ -75,10 +93,29 @@ public protocol TelegramApprovalHandling: Sendable {
 public struct TelegramApprovalResolution: Sendable, Equatable {
     public let acknowledgement: String
     public let continuationPrompt: String?
+    /// 2026-09-06: the chat session the interrupted turn belonged to, read off
+    /// the approval record. The continuation MUST resume that session: the
+    /// chat's active session binding can have moved (`/new`, `/resume`) while
+    /// the approval sat pending, and resolving the binding at delivery time
+    /// dropped the tool result into whatever session is current instead.
+    public let sessionId: String?
+    /// 2026-09-06: the chat and forum topic the approval was raised in, read
+    /// off the approval record. `/approve <id>` can be typed in any topic of
+    /// the supergroup (or in General), and the continuation, its progress card
+    /// and its reply belong to the topic the interrupted turn ran in — not to
+    /// wherever the command happened to be typed.
+    public let destination: TelegramDestination?
 
-    public init(acknowledgement: String, continuationPrompt: String? = nil) {
+    public init(
+        acknowledgement: String,
+        continuationPrompt: String? = nil,
+        sessionId: String? = nil,
+        destination: TelegramDestination? = nil
+    ) {
         self.acknowledgement = acknowledgement
         self.continuationPrompt = continuationPrompt
+        self.sessionId = sessionId
+        self.destination = destination
     }
 }
 
@@ -86,8 +123,15 @@ public struct TelegramApprovalCallback: Sendable, Equatable {
     public let callbackId: String
     public let command: TelegramApprovalCommand
     public let chatId: Int
+    /// 2026-09-06: the forum topic the button lives in, so the acknowledgement
+    /// and any continuation answer in that topic rather than in General.
+    public let threadId: Int?
     public let messageId: Int
     public let fromUserId: Int?
+
+    public var destination: TelegramDestination {
+        TelegramDestination(chatId: chatId, threadId: threadId)
+    }
 
     public init?(_ raw: JSONValue) {
         guard case .object(let obj) = raw else { return nil }
@@ -114,6 +158,7 @@ public struct TelegramApprovalCallback: Sendable, Equatable {
         self.callbackId = callbackId
         self.command = command
         self.chatId = chatId
+        self.threadId = TelegramDestination.topicThreadId(inMessageObject: message)
         self.messageId = messageId
         self.fromUserId = fromUserId
     }

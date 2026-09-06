@@ -158,14 +158,22 @@ func doctorBuildConfiguresICloudTracksTheResolvedID() async {
 func doctorCoreMLEmbedderVerdictMatchesRealLoad() async {
     let result = await CoreMLEmbedderCheck().run(repair: false)
     #expect(result.id == "coreml_embedder")
-    #expect(result.title == "Core ML Embedder (MiniLM)")
-    // This check has no "warn" state: MiniLM either loads or recall is degraded.
+    // 2026-09-06 (2d503c65): the row used to say "MiniLM" whatever was running.
+    // Since 2026-09-05 the runtime prefers an installed extras model, so the
+    // title and detail now name the model the runtime RESOLVES — the whole
+    // point of the change was that naming a model the store was not embedded
+    // with is a lie. Resolve it the same way the check does.
+    let resolvedModelID = CoreMLEmbeddingProvider.installedExtrasModel(root: defaultDataRoot())?
+        .modelID ?? CoreMLEmbeddingProvider.bundledModelID
+    #expect(result.title == "Core ML Embedder (\(resolvedModelID))")
+    // This check has no "warn" state: the model either loads or recall is degraded.
     #expect(result.status == "ok" || result.status == "fail")
 
-    let resourcesPresent = CoreMLEmbeddingProvider.bundledResourcesAvailable()
+    let resourcesPresent = CoreMLEmbeddingProvider.bundledResourcesAvailable(
+        extrasRoot: defaultDataRoot())
     var loadSucceeded = false
     if resourcesPresent {
-        loadSucceeded = ((try? CoreMLEmbeddingProvider.bundled()) != nil)
+        loadSucceeded = ((try? CoreMLEmbeddingProvider.bundled(extrasRoot: defaultDataRoot())) != nil)
     }
 
     // THE TOOTH: the check must not swallow a load failure into "ok". Its
@@ -191,7 +199,13 @@ func doctorCoreMLEmbedderVerdictMatchesRealLoad() async {
             #expect(result.repair == nil, "read-only run must not advertise a repair")
         }
     } else {
-        #expect(result.detail.contains("MiniLM loads"))
+        // The ok detail names the resolved model and its dimensions, then
+        // reports the bundled MiniLM floor SEPARATELY (2d503c65): an extras
+        // install that shadows a missing floor is a different situation from
+        // one that sits on top of it.
+        #expect(result.detail.contains("\(resolvedModelID), "))
+        #expect(result.detail.contains("-d, loads: model compiles/loads from cache"))
+        #expect(result.detail.contains("Bundled MiniLM floor is"))
         #expect(result.repair == nil)
     }
 }

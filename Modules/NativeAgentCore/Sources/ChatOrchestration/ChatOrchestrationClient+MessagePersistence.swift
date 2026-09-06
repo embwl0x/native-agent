@@ -197,11 +197,40 @@ public struct ChatMessageOrigin: Sendable, Equatable, Codable {
     /// a separate cryptographic attestation of the calling process. Nil when
     /// the lane is unattributed.
     public let agent: String?
+    /// Item 8 (2026-09-02). The lane's own statement that the AGENT composed
+    /// this text, rather than the bridge carrying the human's words through it.
+    ///
+    /// `surface` and `agent` describe the ROUTE, and a route cannot answer the
+    /// question the affect layer has to ask. Claude relaying "User says: ship
+    /// it" arrives on the same surface, from the same agent, as Claude saying
+    /// something herself — and only one of those is another person moving her.
+    /// Nil means unstated, which is read as the human: the honest default when
+    /// nobody has claimed authorship, and the same direction the render
+    /// allowlist fails in.
+    ///
+    /// Set ONLY by a lane that knows it is transcribing its own agent's output.
+    /// A future forwarding lane must leave it nil.
+    public let authored: ChatMessageAuthorship?
 
-    public init(surface: String, agent: String? = nil) {
+    public init(
+        surface: String,
+        agent: String? = nil,
+        authored: ChatMessageAuthorship? = nil
+    ) {
         self.surface = surface
         self.agent = agent
+        self.authored = authored
     }
+}
+
+/// Who composed the text on an out-of-band-origin row. Deliberately a closed
+/// two-case enum rather than a free string: this is a trust input, and the one
+/// value that grants anything (`agent`) must not be spellable by accident.
+public enum ChatMessageAuthorship: String, Sendable, Equatable, Codable {
+    /// The agent named by `origin.agent` wrote these words itself.
+    case agent
+    /// The lane carried a human's words. Same route, different speaker.
+    case human
 }
 
 /// Request-scoped identity stamped on the canonical assistant row before the
@@ -526,6 +555,18 @@ extension SwiftNativeChatOrchestrationClient {
             "inputJSON": .string(safeInputJSON),
             "resultSummary": .string(safeResultSummary),
             "ok": .bool(ok),
+            // A tool receipt is the record of an EXTERNAL EFFECT, read back by
+            // every surface. It gets the same durable envelope the
+            // conversational rows get, so "which surface's turn caused this
+            // effect, and where did that turn's reply go" survives on the row
+            // rather than being re-derived later from the session's current
+            // surface — a thing that stops being well-defined the moment more
+            // than one surface writes a transcript.
+            //
+            // Streaming PARTIALS deliberately do not carry it: they are
+            // superseded by the terminal assistant row within the same turn,
+            // and they take the fast append precisely to stay off the hot path.
+            "envelope": TurnEnvelope.current(surface: messageSource).persistedMetadata(),
         ]
         if let pendingApprovalID {
             // The post-resolution writer locates and replaces this row by the
@@ -538,8 +579,14 @@ extension SwiftNativeChatOrchestrationClient {
         // remains transport success; no-status legacy results stay unchanged.
         if let result = originalResult,
            case .object(let object) = result,
-           case .string? = object["status"] {
+           case .string(let recordedStatus)? = object["status"] {
             metadata["resultClass"] = .string(ChatToolOutcome.exactResultClass(result).rawValue)
+            // The class alone cannot tell "queued" from "accepted" from
+            // "running" — they all collapse to `.unknown`, which the renderer
+            // then reported as "completion unconfirmed" even when the envelope
+            // plainly said what state the work reached. Keep the exact word
+            // beside the class so the receipt can say what is actually known.
+            metadata["resultStatus"] = .string(recordedStatus)
         }
         record["metadata"] = .object(metadata)
         // Locked: see appendPartial — protects against the compactor/distiller
@@ -584,20 +631,6 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
-    /// User-visible message for the model. Attachments are NO LONGER
-    /// stringified into the text — vision-capable adapters consume them as
-    /// native image content blocks (see `imageBlocksFromAttachments` and
-    /// `TurnContext.imageBlocks`); non-vision adapters get an honest note
-    /// at the default-flatten tripwire (LLMClient+Real.swift). This helper
-    /// is kept as a passthrough so the few remaining call sites can be
-    /// retired incrementally without a churned diff.
-    nonisolated static func composeMessage(
-        message: String,
-        attachments: [MultimodalAttachment]
-    ) -> String {
-        return message
-    }
-
     /// Convert delivered `MultimodalAttachment`s into native `.image` content
     /// blocks. Skips non-image types (audio/file/etc.) and entries with empty
     /// base64. Returns `[]` when nothing actionable — callers stay on the
@@ -620,6 +653,248 @@ extension SwiftNativeChatOrchestrationClient {
         return out
     }
 
+    // MARK: - Trust ▸ Multimodal, at the point of use (2026-09-06)
+    //
+    // "Allow vision API calls" and "Allow PDF file ingestion" round-tripped to
+    // <dataRoot>/trust/policy.json and NOTHING read them: every attached image
+    // reached the provider with the switch off, and no PDF ever reached it with
+    // the switch on. These two readers close both halves.
+    //
+    // FRESH ON EVERY TURN, deliberately, the way MemoryPolicyGate reads the
+    // memory switches: no launch-time snapshot, so a flip in Trust lands on the
+    // next turn. The file is small and this runs once per turn.
+
+    /// One boolean out of `multimodalPolicy`. Missing file / missing key →
+    /// `fallback` (matching the shipped defaults in TrustCenter+Defaults, so
+    /// the gate and the switch can never disagree about "unset"). A file that
+    /// exists but cannot be read or parsed, a wrongly-typed `multimodalPolicy`
+    /// block, or a non-Bool value is policy TrustCenter itself rejects — those
+    /// fail CLOSED rather than quietly running the default.
+    nonisolated static func multimodalPolicyAllows(
+        _ key: String,
+        default fallback: Bool,
+        dataRoot: URL
+    ) -> Bool {
+        let path = dataRoot
+            .appendingPathComponent("trust", isDirectory: true)
+            .appendingPathComponent("policy.json")
+        guard FileManager.default.fileExists(atPath: path.path) else { return fallback }
+        guard let data = try? Data(contentsOf: path) else { return false }
+        guard let top = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        let present = top["multimodalPolicy"]
+        if present != nil, !(present is [String: Any]) { return false }
+        guard let block = present as? [String: Any] else { return fallback }
+        guard let raw = block[key] else { return fallback }
+        guard let value = raw as? Bool else { return false }
+        return value
+    }
+
+    /// Characters of extracted document text one attachment contributes to a
+    /// turn. A contract is worth reading; a 400-page appendix is not worth a
+    /// turn's whole context, and the note SAYS when the cut happened.
+    /// 2026-09-06: one cap for PDFs and plain text — an attached .md is as
+    /// capable of eating a turn's context as an attached .pdf.
+    static let documentIngestionCharacterCap = 40_000
+
+    /// Characters of extracted document text ALL of a turn's attachments may
+    /// contribute between them. 2026-09-06: the per-attachment cap was the only
+    /// bound, and both file pickers allow unlimited multiple selection — ten
+    /// documents were ten times 40k, and the turn's context went with them. The
+    /// budget is spent in attachment order; once it is gone the remaining
+    /// documents are skipped and the model is told how many and why.
+    static let turnDocumentCharacterBudget = 120_000
+
+    /// What the model gets for this turn's attachments: the image blocks it is
+    /// allowed to see, and the user message with an honest note appended for
+    /// anything that was skipped or read out of a document.
+    struct TurnAttachmentInput: Sendable {
+        let imageBlocks: [LLMContentBlock]
+        let userMessage: String
+    }
+
+    nonisolated static func turnAttachmentInput(
+        message: String,
+        attachments: [MultimodalAttachment],
+        dataRoot: URL
+    ) -> TurnAttachmentInput {
+        guard !attachments.isEmpty else {
+            return TurnAttachmentInput(imageBlocks: [], userMessage: message)
+        }
+        var notes: [String] = []
+
+        // "Allow vision API calls". Off → the images never become blocks, and
+        // the model is told so in the same shape LLMClient+Real uses when a
+        // non-vision adapter drops them: honest, and explicitly not licence to
+        // describe what it did not see.
+        let visionAllowed = multimodalPolicyAllows("vision_api_calls", default: true, dataRoot: dataRoot)
+        let imageBlocks = visionAllowed ? imageBlocksFromAttachments(attachments) : []
+        if !visionAllowed {
+            let skipped = imageBlocksFromAttachments(attachments).count
+            if skipped > 0 {
+                notes.append(
+                    "[NOTE TO ASSISTANT: the user attached \(skipped) image(s), but "
+                    + "\"Allow vision API calls\" is off in Trust Center ▸ Permissions, so the "
+                    + "image(s) were skipped and NOT sent. Tell the user honestly that you could "
+                    + "not view them and that the switch is what stopped it — do NOT guess or "
+                    + "pretend to describe them.]")
+            }
+        }
+
+        // 2026-09-06: a .txt/.md attachment reached the model as nothing at all
+        // — it attaches as type "file", never became a content block, and no
+        // lane read it. Same road as the PDF text, no switch: nothing in Trust
+        // claims to govern plain text. PDFs and plain text share one pass so
+        // they also share one per-turn character budget.
+        notes.append(contentsOf: documentAttachmentNotes(attachments, dataRoot: dataRoot))
+
+        guard !notes.isEmpty else {
+            return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: message)
+        }
+        let composed = ([message] + notes)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n\n")
+        return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: composed)
+    }
+
+    /// Every document attachment of a turn — PDFs under "Allow PDF file
+    /// ingestion", plain text under no switch (none claims to govern it) — read
+    /// in ONE pass, in attachment order, through the same extractors the `read`
+    /// organ uses. Anything skipped, cut, or unreadable is named to the model
+    /// rather than being left as a filename it can invent contents for.
+    ///
+    /// 2026-09-06: this was two passes with a 40k cap each and no ceiling on
+    /// how many attachments could claim one. One pass, one budget: each
+    /// document takes at most `documentIngestionCharacterCap`, and no more than
+    /// what is left of `turnDocumentCharacterBudget`; when the budget is spent
+    /// the rest are skipped and counted in a note that names the budget.
+    nonisolated static func documentAttachmentNotes(
+        _ attachments: [MultimodalAttachment],
+        dataRoot: URL
+    ) -> [String] {
+        let pdfCount = attachments.filter { isPDFAttachment($0) }.count
+        var notes: [String] = []
+        let pdfAllowed = pdfCount == 0
+            || multimodalPolicyAllows("file_ingestion_pdf", default: true, dataRoot: dataRoot)
+        if pdfCount > 0, !pdfAllowed {
+            notes.append(
+                "[NOTE TO ASSISTANT: \(pdfCount) PDF attachment(s) were skipped — "
+                + "\"Allow PDF file ingestion\" is off in Trust Center ▸ Permissions. Say so "
+                + "plainly; do NOT guess at what the document(s) say.]")
+        }
+
+        var remainingBudget = turnDocumentCharacterBudget
+        var skippedForBudget = 0
+        for attachment in attachments {
+            let isPDF = isPDFAttachment(attachment)
+            if isPDF, !pdfAllowed { continue }
+            guard isPDF || isPlainTextAttachment(attachment) else { continue }
+            let label = isPDF ? "PDF" : "text file"
+            let name = attachment.name ?? (isPDF ? "attachment.pdf" : "attachment.txt")
+            guard let data = Data(base64Encoded: attachment.base64), !data.isEmpty else {
+                notes.append(
+                    "[NOTE TO ASSISTANT: the \(label) \"\(name)\" was attached but its bytes could "
+                    + "not be read, so it was skipped. Say so; do NOT guess at its contents.]")
+                continue
+            }
+            // 2026-09-06: MacDocumentRead.decodeText rejects only a NUL in the
+            // first 4 KiB and then falls back to ISO-8859-1, which decodes ANY
+            // byte sequence — so a renamed binary with a .txt extension arrived
+            // as a page of mojibake presented as a document. The read organ
+            // keeps that latitude (a person named that file by path); a chat
+            // attachment named itself, so here the bytes must really be text.
+            if !isPDF, !attachmentBytesAreText(data) {
+                notes.append(
+                    "[NOTE TO ASSISTANT: the \(label) \"\(name)\" was skipped — "
+                    + "\(textSkipReason(.unreadableDocument)). Say so; do NOT guess at its "
+                    + "contents.]")
+                continue
+            }
+            switch MacDocumentRead.extract(data: data, kind: isPDF ? .pdf : .text) {
+            case .failure(let failure):
+                let reason = isPDF ? pdfSkipReason(failure) : textSkipReason(failure)
+                notes.append(
+                    "[NOTE TO ASSISTANT: the \(label) \"\(name)\" was skipped — \(reason). Say so; "
+                    + "do NOT guess at its contents.]")
+            case .success(let extracted):
+                guard remainingBudget > 0 else {
+                    skippedForBudget += 1
+                    continue
+                }
+                var text = extracted.text
+                var cut = extracted.truncated
+                let allowance = min(documentIngestionCharacterCap, remainingBudget)
+                if text.count > allowance {
+                    text = String(text.prefix(allowance))
+                    cut = true
+                }
+                remainingBudget -= text.count
+                let subject = isPDF ? "the attached PDF" : "the attached file"
+                let header = cut
+                    ? "[Text of \(subject) \"\(name)\", cut off after the first "
+                        + "\(text.count) characters — there is more you were not given:]"
+                    : "[Text of \(subject) \"\(name)\":]"
+                notes.append(header + "\n" + text)
+            }
+        }
+        if skippedForBudget > 0 {
+            notes.append(
+                "[NOTE TO ASSISTANT: \(skippedForBudget) further document attachment(s) were not "
+                + "read at all — this turn's \(turnDocumentCharacterBudget)-character budget for "
+                + "attached documents was already spent by the ones above. Say so, and offer to "
+                + "take them one at a time; do NOT guess at their contents.]")
+        }
+        return notes
+    }
+
+    nonisolated static func isPDFAttachment(_ attachment: MultimodalAttachment) -> Bool {
+        let mime = attachment.mime.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let name = (attachment.name ?? "").lowercased()
+        return mime == "application/pdf" || name.hasSuffix(".pdf")
+    }
+
+    /// UTF-8, or UTF-16 announced by a BOM. Deliberately narrower than
+    /// `MacDocumentRead.decodeText`, whose ISO-8859-1 fallback never fails and
+    /// so cannot tell a text file from a renamed binary.
+    nonisolated static func attachmentBytesAreText(_ data: Data) -> Bool {
+        if String(data: data, encoding: .utf8) != nil { return true }
+        let bom = [UInt8](data.prefix(2))
+        guard bom.count == 2, bom == [0xFF, 0xFE] || bom == [0xFE, 0xFF] else { return false }
+        return String(data: data, encoding: .utf16) != nil
+    }
+
+    /// Text by EXTENSION first (the same allow-list the `read` organ uses — a
+    /// .png decodes to garbage that looks like a short document), then by mime
+    /// for the surfaces that deliver a file without a usable name. Images and
+    /// PDFs are somebody else's job.
+    nonisolated static func isPlainTextAttachment(_ attachment: MultimodalAttachment) -> Bool {
+        let type = attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard type != "image" else { return false }
+        let mime = attachment.mime.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let name = (attachment.name ?? "").lowercased()
+        guard mime != "application/pdf", !name.hasSuffix(".pdf") else { return false }
+        if !name.isEmpty, MacDocumentRead.kind(forPath: name) == .text { return true }
+        if mime.hasPrefix("text/") { return true }
+        return mime == "application/json" || mime == "application/xml"
+    }
+
+    nonisolated static func textSkipReason(_ failure: MacDocumentRead.ExtractionFailure) -> String {
+        switch failure {
+        case .fileTooLarge: return "it is too large to read in one go"
+        case .unreadableDocument: return "its bytes are not readable text"
+        case .noTextInDocument: return "it is empty"
+        default: return "its text could not be extracted"
+        }
+    }
+
+    nonisolated static func pdfSkipReason(_ failure: MacDocumentRead.ExtractionFailure) -> String {
+        switch failure {
+        case .fileTooLarge: return "it is too large to read in one go"
+        case .encryptedDocument: return "it is password-protected"
+        case .noTextInDocument: return "it has no text layer — it is pictures of pages, not characters"
+        default: return "its text could not be extracted"
+        }
+    }
+
     /// Ack-on-enqueue seam (wake-delivery-classification, 2026-07-25): durably
     /// append the user row and return. The turn that consumes it runs later
     /// with `suppressUserAppend: true`, producing the same on-disk state the
@@ -636,7 +911,8 @@ extension SwiftNativeChatOrchestrationClient {
         message: String,
         sessionId: String?,
         persona: String?,
-        surface: String
+        surface: String,
+        attachments: [MultimodalAttachment] = []
     ) async throws -> EnqueuedUserMessage {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
@@ -649,7 +925,7 @@ extension SwiftNativeChatOrchestrationClient {
             role: "user",
             content: message,
             runId: runId,
-            attachments: [],
+            attachments: attachments,
             persona: persona,
             source: surface
         )
@@ -767,6 +1043,50 @@ extension SwiftNativeChatOrchestrationClient {
             }
             metadata["origin"] = .object(originObject)
         }
+        // `metadata.envelope` — the turn's surface identity and return route,
+        // durable on the row (one-thread-many-surfaces plan §2.3).
+        //
+        // WHY IT IS BROADER THAN `metadata.origin`, which stays exactly as it
+        // is above:
+        //
+        //   * origin is USER-ROW ONLY and deliberately so — an assistant row
+        //     is hers by construction, and stamping origin there would imply
+        //     the reply came from the bridge. The envelope has the opposite
+        //     job: it records WHERE THIS ROW'S TURN WAS SPOKEN AND WHERE ITS
+        //     REPLY WENT, which is a fact about the assistant row too.
+        //   * origin carries {surface, agent}. The envelope also carries the
+        //     verified identities and the delivery route, so a completion that
+        //     arrives after the originating loop has moved on can still find
+        //     its destination without re-deriving it from "the session's
+        //     surface" — which, with several surfaces writing one transcript,
+        //     is no longer a thing that exists.
+        //
+        // Both are written for one release (plan §6: rollback is only cheap
+        // while dual-write is on). The readers at MemoryV2+AdaptivePromoter
+        // and MacChatMessageProvenance keep reading `origin` untouched.
+        //
+        // NO TRUST VERDICT IS PERSISTED HERE, ever. See `TurnEnvelope`: a tool
+        // call's authority comes from the CURRENT turn's envelope, never from
+        // one in history. This row is a label a reader can trust to be honest
+        // about provenance, and it grants nothing.
+        let turnEnvelope: TurnEnvelope = {
+            let live = TurnEnvelope.current(surface: messageSource)
+            guard let origin = originProvenance else { return live }
+            // A bridged turn's honest surface is the bridge it arrived on, and
+            // its lane is the agent. `messageSource` is the TOOL-AUTHORIZATION
+            // surface (the bridges deliberately run as "chat"), so the two
+            // must not be conflated on a provenance row.
+            return TurnEnvelope(
+                surface: origin.surface,
+                agent: origin.agent,
+                verifiedChatId: live.verifiedChatId,
+                verifiedUserId: live.verifiedUserId,
+                commandSignatureVerified: live.commandSignatureVerified,
+                deliveryRoute: live.deliveryRoute,
+                declaredRemote: live.declaredRemote
+            )
+        }()
+        metadata["envelope"] = turnEnvelope.persistedMetadata()
         if canonicalAssistantCompletion,
            role == "assistant",
            let binding = ChatPersistenceContext.codexCompletionBinding,
@@ -1045,15 +1365,22 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         runId: String?
     ) async throws -> ChatSessionCompactionOutcome {
-        try await compactSession(
-            sessionId: sessionId,
-            model: model,
-            surface: surface,
-            runId: runId,
-            providerID: LLMCallContext.providerId,
-            trigger: "auto_threshold",
-            force: false
-        )
+        // A pre-seeding provider call is never a prefix-shaped request: this
+        // runs BEFORE the turn's context is built and its messages are seeded,
+        // so there is no replayed prefix for a v2 wire layout to describe.
+        // Binding here covers every caller of this entry point — the
+        // text-compat lane and both structured-chat sites.
+        try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+            try await compactSession(
+                sessionId: sessionId,
+                model: model,
+                surface: surface,
+                runId: runId,
+                providerID: LLMCallContext.providerId,
+                trigger: "auto_threshold",
+                force: false
+            )
+        }
     }
 
     /// Explicit user-requested compaction through the same canonical owner as
@@ -1104,6 +1431,13 @@ extension SwiftNativeChatOrchestrationClient {
             trigger: trigger,
             force: force
         )
+        // 2026-09-06: compaction rewrites the transcript, so it is a transcript
+        // write like any other and has to advance the session's transcript
+        // version. Outside the compactor's own message-file lock — this takes
+        // the index lock, and the two are never nested.
+        if outcome.compacted {
+            await bumpSessionTranscriptGeneration(sessionId: outcome.sessionId)
+        }
         // Fire-and-forget LLM distillation of the mechanical summary. Only when
         // distill is enabled AND a backup was taken (both encoded in the outcome
         // via a non-nil summaryRowId/backupPath). Never delays or fails the turn;
@@ -1140,15 +1474,22 @@ extension SwiftNativeChatOrchestrationClient {
                     },
                     now: clock
                 )
-                await distiller.distill(
-                    sessionId: sessionId,
-                    summaryRowId: rowId,
-                    backupPath: backupPath,
-                    messagesReplaced: messagesReplaced,
-                    turnModel: model,
-                    surface: surface,
-                    runId: runId
-                )
+                // `Task.detached` inherits no task-locals, so the caller's
+                // binding cannot reach here — and the distiller's own LLM call
+                // is a plain prompt with no replayed prefix. Say v1 outright
+                // rather than depending on unbound-means-legacy, which holds
+                // only while the adapters read `override` and not `.effective`.
+                await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+                    await distiller.distill(
+                        sessionId: sessionId,
+                        summaryRowId: rowId,
+                        backupPath: backupPath,
+                        messagesReplaced: messagesReplaced,
+                        turnModel: model,
+                        surface: surface,
+                        runId: runId
+                    )
+                }
             }
         }
         return outcome
@@ -1266,6 +1607,13 @@ extension SwiftNativeChatOrchestrationClient {
                     cognitiveOrigin["agent"] = .string(boundedAgent)
                 }
             }
+            // Item 8: forwarded ONLY when the lane stated it. Route provenance
+            // alone cannot say whether the agent spoke or merely carried the
+            // human's words, and the affect layer needs that distinction before
+            // it will let anyone other than the user move her.
+            if let authored = origin.authored {
+                cognitiveOrigin["authored"] = .string(authored.rawValue)
+            }
             metadata["origin"] = .object(cognitiveOrigin)
         }
         if let runId { metadata["runId"] = .string(runId) }
@@ -1297,7 +1645,10 @@ extension SwiftNativeChatOrchestrationClient {
         if normalizedRole == "assistant", kind == .assistantTurnCompleted {
             subject = CognitiveSubjectReference(
                 type: "chat.assistant_turn",
-                id: "\(sessionId):\(messageId)"
+                id: "\(sessionId):\(messageId)",
+                // Her own turns get a topic too (2026-09-02): a felt moment
+                // that read `chat.assistant_turn` pointed at nothing.
+                label: CognitiveSubstrate.feltTopicLabel(from: redactedSummary)
             )
         } else if kind == .userMessageReceived || kind == .userCorrection {
             // Audit C2 (2026-07-09): user turns get PER-TURN subjects, mirroring the
@@ -1310,7 +1661,16 @@ extension SwiftNativeChatOrchestrationClient {
             // appraisal's same-session evidence), not through node identity.
             subject = CognitiveSubjectReference(
                 type: "chat.user_turn",
-                id: "\(sessionId):\(messageId)"
+                id: "\(sessionId):\(messageId)",
+                // 2026-09-02 — the turn's TOPIC, so the felt line can say what
+                // it is about ("on edge — about deploy pipeline") instead of
+                // carrying a feeling with no sky. Up to three salient content
+                // words, from the REDACTED summary and through the same
+                // extractor Fluid Context uses for attention terms; nil when
+                // the turn has no salient term, and then the line simply has
+                // no object. Never the message itself: stopwords, pronouns,
+                // punctuation, grammar and digits do not survive it.
+                label: CognitiveSubstrate.feltTopicLabel(from: redactedSummary)
             )
         } else {
             subject = CognitiveSubjectReference(type: "chat.session", id: sessionId)
@@ -1629,13 +1989,28 @@ extension SwiftNativeChatOrchestrationClient {
         // still the one the count was measured against; anything else — an
         // external writer, a compaction rewrite, a truncation — recounts and
         // returns exactly what the scan would have.
-        let messageCount = ChatTranscriptLineCountCache.shared.count(
-            at: messagesPath,
-            recount: Self.countJSONLLines(at:)
-        )
         let persistence = self.persistence
         let retentionClock = self.clock
+        // 2026-09-06: `timestamp` is the MESSAGE's createdAt, captured before
+        // the transcript append. Stamping the index row's `updatedAt` with it
+        // left every synced row permanently behind its own transcript's mtime,
+        // and retention reads exactly that comparison as "this session has a
+        // pending index sync" — so `.activeCap` archiving could never fire for
+        // any ordinary session. The row's `updatedAt` says when the row was
+        // last brought level with its transcript, so it is read HERE, after the
+        // bytes are down. A new row's `createdAt` keeps the message stamp.
+        let syncedAt = Self.iso8601(retentionClock())
         try await persistence.withFileLock(sessionsPath) {
+            // 2026-09-06: READ UNDER THE INDEX LOCK. Taken before the lock, two
+            // concurrent appenders could each measure the transcript, then
+            // commit in the opposite order — the later writer stamping the
+            // EARLIER count over the index. Measured here, the last writer to
+            // hold this lock always measures a transcript that already contains
+            // every row committed before it, so the index cannot go backwards.
+            let messageCount = ChatTranscriptLineCountCache.shared.count(
+                at: messagesPath,
+                recount: Self.countJSONLLines(at:)
+            )
             let parent = sessionsPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
@@ -1647,18 +2022,56 @@ extension SwiftNativeChatOrchestrationClient {
                     remaining.append(row)
                     continue
                 }
-                row["updatedAt"] = .string(timestamp)
+                row["updatedAt"] = .string(syncedAt)
+                // 2026-09-06: a transcript write advances the session's
+                // transcript version. The phone reads it to order published
+                // transcripts; without a bump here, an empty snapshot built
+                // before this append still looks as new as the rebuilt
+                // transcript and would clear it on the phone.
+                ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
                 row["messageCount"] = .int(Int64(messageCount))
                 if !preview.isEmpty { row["lastMessagePreview"] = .string(preview) }
                 if let title,
                    Self.shouldReplaceSessionTitle(row["title"]) {
                     row["title"] = .string(title)
                 }
-                if source != "app" {
+                // §1.3, FIXED. This block used to read:
+                //
+                //     if source != "app" { row["source"] = .string(source) ... }
+                //
+                // i.e. the session index row's `source` was overwritten by
+                // WHICHEVER SURFACE APPENDED MOST RECENTLY. `source` is
+                // supposed to say what a conversation IS; last-writer-wins
+                // made it say who touched it last, and every downstream reader
+                // keyed on it (snapshot projection, iOS tab adoption, Doctor,
+                // retention diagnostics) flapped with it.
+                //
+                // A row's `source` is now written ONCE, at creation, and never
+                // restamped. What a later surface DOES contribute is the
+                // per-message `source` on its own transcript row, which is
+                // where per-turn provenance has always belonged and which the
+                // envelope now makes complete.
+                //
+                // `sourceKey` keeps its backfill-only behavior (set when
+                // absent, never overwritten) — it was already additive.
+                if row["source"] == nil {
                     row["source"] = .string(source)
-                    if row["sourceKey"] == nil, let sourceKey {
-                        row["sourceKey"] = .string(sourceKey)
-                    }
+                }
+                if row["sourceKey"] == nil, let sourceKey {
+                    row["sourceKey"] = .string(sourceKey)
+                }
+                // Additive classification so readers stop having to infer a
+                // conversation's nature from a field that describes traffic.
+                // Backfill-only: a kind assigned once is not re-decided by a
+                // later append, or we would have rebuilt the bug above.
+                if row["threadKind"] == nil {
+                    let existingSource: String = {
+                        if case .string(let value)? = row["source"] { return value }
+                        return source
+                    }()
+                    row["threadKind"] = .string(
+                        ChatThreadKind.inferred(fromSource: existingSource).rawValue
+                    )
                 }
                 updated = row
             }
@@ -1668,11 +2081,13 @@ extension SwiftNativeChatOrchestrationClient {
                     "id": .string(sessionId),
                     "title": .string(title ?? "New Chat"),
                     "source": .string(source),
+                    "threadKind": .string(ChatThreadKind.inferred(fromSource: source).rawValue),
                     "createdAt": .string(timestamp),
-                    "updatedAt": .string(timestamp),
+                    "updatedAt": .string(syncedAt),
                     "archived": .bool(false),
                     "messageCount": .int(Int64(messageCount)),
                     "summary": .string(""),
+                    ChatSessionIndexFile.transcriptGenerationKey: .int(1),
                 ]
                 if let sourceKey { row["sourceKey"] = .string(sourceKey) }
                 if !preview.isEmpty { row["lastMessagePreview"] = .string(preview) }
@@ -1714,6 +2129,32 @@ extension SwiftNativeChatOrchestrationClient {
                 now: retentionClock(),
                 context: "ChatOrchestrationClient.syncSessionIndex"
             )
+        }
+    }
+
+    /// 2026-09-06: advance a session's transcript version without touching any
+    /// other index field. Used by transcript writers that rewrite the messages
+    /// file without appending a message (compaction). Best effort: the version
+    /// is remote-display ordering, never grounds to fail a turn that already
+    /// wrote durable bytes.
+    private func bumpSessionTranscriptGeneration(sessionId: String) async {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return }
+        let sessionsPath = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
+        let persistence = self.persistence
+        do {
+            try await persistence.withFileLock(sessionsPath) {
+                var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+                guard let index = rows.firstIndex(where: {
+                    $0["id"] == .string(safeSessionId)
+                }) else { return }
+                ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
+                let out = try ChatSessionIndexFile.serializedData(for: rows)
+                try await persistence.writeDataAtomicDurable(out, to: sessionsPath)
+            }
+        } catch {
+            NSLog("ChatOrchestrationClient: transcript generation bump failed: \(error)")
         }
     }
 
@@ -1799,16 +2240,32 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
+    /// PARSE SITE 4 of 5, DELETED (one-thread-many-surfaces plan §1.2).
+    ///
+    /// This used to derive a session's `sourceKey` by asking whether the
+    /// session id STRING started with `telegram:` or `ios:` — the same
+    /// storage-key-as-identity mistake as the four trust sites, one layer down
+    /// in persistence. It meant a `/new` Telegram session (a bare UUID) got no
+    /// sourceKey at all, while an `app`-sourced row whose id happened to read
+    /// `telegram:codex-probe` got one.
+    ///
+    /// The sourceKey now comes from the turn's own envelope — the routing
+    /// facts the transport actually bound — or is left absent. Absent is
+    /// honest; inferred was not. `app` remains the constant it always was,
+    /// because a local Mac turn has one routing identity by construction.
+    ///
+    /// `sessionId` stays in the signature to keep the deletion legible at the
+    /// call site rather than invisible.
     private nonisolated static func sessionSourceKey(for sessionId: String, source: String) -> String? {
-        switch source {
-        case "telegram":
-            return sessionId.hasPrefix("telegram:") ? sessionId : nil
-        case "ios":
-            return sessionId.hasPrefix("ios:") ? sessionId : nil
-        case "app":
-            return "app"
-        default:
-            return nil
+        _ = sessionId
+        if let bound = ChatToolSessionContext.envelope?.deliveryRoute?.sourceKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !bound.isEmpty {
+            return bound
         }
+        if let route = ChatToolSessionContext.replyRoute?.sourceKey?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !route.isEmpty {
+            return route
+        }
+        return source == "app" ? "app" : nil
     }
 }

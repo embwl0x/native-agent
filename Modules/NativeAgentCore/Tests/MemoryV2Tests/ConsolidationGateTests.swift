@@ -383,6 +383,15 @@ struct MemoryConsolidationGateTests {
         // and USER.md regeneration is gated on that (fix-blank-install-
         // onboarding, 2026-08-02). Model the sentinel the wizard publishes.
         try Data("completed_at=test\n".utf8).write(to: fx.root.appendingPathComponent(".onboarded"))
+        // 2026-09-06 (84e56742): the consolidation reconcile is the one seam
+        // that rebuilds the whole graph from the store, and it ignored
+        // `knowledge_graph_enabled`. It now passes the gate, whose default is
+        // OFF — so the receipt this test reads only carries indexed facts on an
+        // install where the switch is on. Turn it on for the fixture.
+        let trustDir = fx.root.appendingPathComponent("trust", isDirectory: true)
+        try FileManager.default.createDirectory(at: trustDir, withIntermediateDirectories: true)
+        try Data(#"{"memoryPolicy":{"knowledge_graph_enabled":true}}"#.utf8)
+            .write(to: trustDir.appendingPathComponent("policy.json"))
         let spotlightClient = MockSpotlightIndexClient()
         let invalidations = ConsolidationInvalidationRecorder()
         let environment = MemoryConsolidationProjectionEnvironment(

@@ -231,6 +231,7 @@ struct EvolutionChatToolsWiringTests {
         }
         #expect(toolAutonomy["evolution_propose"] == JSONValue.string("confirm"))
         #expect(toolAutonomy["evolution_status"] == JSONValue.string("confirm"))
+        #expect(toolAutonomy["evolution_withdraw"] == JSONValue.string("confirm"))
         #expect(toolAutonomy["self_install"] == JSONValue.string("confirm"))
     }
 }

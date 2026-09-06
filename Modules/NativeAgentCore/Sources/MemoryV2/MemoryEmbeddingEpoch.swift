@@ -47,6 +47,13 @@ public struct MemoryEmbeddingEpoch: RawRepresentable, Sendable, Codable, Equatab
             .joined()
     }
 
+    /// Big-endian 64-bit length prefix — the frame marker for the directory
+    /// digest below.
+    private static func byteLength(_ count: Int) -> Data {
+        var big = UInt64(count).bigEndian
+        return withUnsafeBytes(of: &big) { Data($0) }
+    }
+
     static func sha256(directory url: URL) throws -> String {
         let keys: [URLResourceKey] = [.isRegularFileKey]
         guard let enumerator = FileManager.default.enumerator(
@@ -62,10 +69,18 @@ public struct MemoryEmbeddingEpoch: RawRepresentable, Sendable, Codable, Equatab
         var hasher = SHA256()
         for file in files {
             let relative = file.path.replacingOccurrences(of: url.path + "/", with: "")
-            hasher.update(data: Data(relative.utf8))
-            hasher.update(data: Data([0]))
-            hasher.update(data: try Data(contentsOf: file, options: [.mappedIfSafe]))
-            hasher.update(data: Data([0]))
+            let path = Data(relative.utf8)
+            let contents = try Data(contentsOf: file, options: [.mappedIfSafe])
+            // 2026-09-06: length-prefixed framing. NUL separators alone did not
+            // separate: {a=X, b=Y} and the single file a="X\0b\0Y" serialised
+            // to the same bytes, so two different model directories could share
+            // one epoch — and a store embedded by one would silently be treated
+            // as current under the other. Every install's fingerprint changes
+            // with this, so each re-embeds once at the next launch.
+            hasher.update(data: byteLength(path.count))
+            hasher.update(data: path)
+            hasher.update(data: byteLength(contents.count))
+            hasher.update(data: contents)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }

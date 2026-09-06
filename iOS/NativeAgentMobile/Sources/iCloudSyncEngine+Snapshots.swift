@@ -173,6 +173,11 @@ extension iCloudSyncEngine {
         // refreshSnapshots() also writes chatTranscripts — invalidate the
         // transcripts lane's in-flight reads too.
         chatTranscriptsRefreshGeneration &+= 1
+        // 2026-09-06: and it writes sessions/pins/anchor, so it must invalidate
+        // the session-list lane for the same reason — otherwise a targeted read
+        // that started before this one still passes its own guard afterward and
+        // restores an older list over the fresher one written here.
+        chatSessionListRefreshGeneration &+= 1
         let generation = snapshotRefreshGeneration
         refreshInFlight = true
         defer {
@@ -209,6 +214,7 @@ extension iCloudSyncEngine {
         organismLivingStatus = bundle.organismLivingStatus
         if let v = bundle.sessions { sessions = v }
         if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
+        if let v = bundle.chatAnchor { chatAnchor = v }
         if let v = bundle.chatTranscripts { chatTranscripts = Self.transcriptMap(v) }
         if let v = bundle.connectors { connectors = v }
         if let v = bundle.providers { providers = v }
@@ -222,6 +228,9 @@ extension iCloudSyncEngine {
             inboxItems = v
         }
         if let v = bundle.turnSummaries { turnSummaries = v }
+        await refreshSnapshotStaleness()
+        guard generation == snapshotRefreshGeneration,
+              lifecycle == lifecycleGeneration else { return }
         if bundle.loadedAllSnapshots {
             lastSyncAt = Date()
             syncError = nil
@@ -234,6 +243,10 @@ extension iCloudSyncEngine {
 
     func refreshLightweightSnapshots() async {
         guard let snapshotDir else { return }
+        // 2026-09-06: the daily half of the ephemeral-mailbox prune. Self-guarded
+        // to once every 24h, so a phone that stays up for weeks still sheds
+        // read responses and finished transaction rows without a timer of its own.
+        pruneEphemeralDirectoriesIfDue()
         let lifecycle = lifecycleGeneration
         if refreshInFlight {
             refreshQueued = true
@@ -243,6 +256,9 @@ extension iCloudSyncEngine {
         // 2026-07-21 audit fix: see refreshSnapshots() — full-refresh writes
         // must invalidate in-flight targeted refreshes.
         targetedRefreshGeneration &+= 1
+        // 2026-09-06: this pass writes sessions/pins/anchor too (see
+        // refreshSnapshots()).
+        chatSessionListRefreshGeneration &+= 1
         let generation = snapshotRefreshGeneration
         refreshInFlight = true
         defer {
@@ -265,6 +281,7 @@ extension iCloudSyncEngine {
         organismLivingStatus = bundle.organismLivingStatus
         if let v = bundle.sessions { sessions = v }
         if let v = bundle.pinnedChatSessions { pinnedChatSessions = v }
+        if let v = bundle.chatAnchor { chatAnchor = v }
         if let v = bundle.connectors { connectors = v }
         if let v = bundle.providers { providers = v }
         if let v = bundle.surfaceModels { applyRemoteSurfaceModels(v) }
@@ -290,6 +307,20 @@ extension iCloudSyncEngine {
             lastSyncAt = Date()
             syncError = nil
         }
+    }
+
+    /// Sweep 2026-09-01 item 2: read the Mac's per-group staleness marker. A
+    /// missing file is not evidence of health — an older Mac never wrote one —
+    /// so it leaves the previous verdict alone rather than clearing it.
+    func refreshSnapshotStaleness() async {
+        guard let snapshotDir else { return }
+        let lifecycle = lifecycleGeneration
+        guard let markers: [String: String] = await Self.loadSnapshotObjectOnly(
+            named: "snapshot_staleness.json",
+            in: snapshotDir
+        ) else { return }
+        guard lifecycle == lifecycleGeneration else { return }
+        staleSnapshotGroups = markers.filter { !$0.key.hasPrefix("_") }
     }
 
     func refreshApprovalsSnapshot() async {
@@ -358,6 +389,10 @@ extension iCloudSyncEngine {
         guard lifecycle == lifecycleGeneration else { return }
         if let memoryRows { memories = memoryRows }
         if let proposalRows { memoryProposals = proposalRows.filter(\.isPending) }
+        // Memory is the screen sweep item 2 was filed against: its own pull
+        // must re-read whether the Mac could rebuild this group at all.
+        await refreshSnapshotStaleness()
+        guard lifecycle == lifecycleGeneration else { return }
         if memoryRows != nil && proposalRows != nil {
             lastSyncAt = Date()
             syncError = nil
@@ -532,12 +567,27 @@ extension iCloudSyncEngine {
     func refreshChatSessionListSnapshot() async {
         guard let snapshotDir else { return }
         let lifecycle = lifecycleGeneration
+        // 2026-09-06: per-read sequence guard, mirroring the transcript reader
+        // below. ChatView refreshes this list from both `.onAppear` and the
+        // foreground scene-phase path, and those overlap; without the guard the
+        // slower (older) read could complete last and restore an older session
+        // list, pin set and anchor over the newer one already applied.
+        chatSessionListRefreshGeneration &+= 1
+        let generation = chatSessionListRefreshGeneration
         async let latestSessions: [ChatSession]? = Self.loadSnapshotArrayOnly(named: "sessions.json", in: snapshotDir)
         async let latestPinned: [ChatSession]? = Self.loadSnapshotArrayOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
-        let (sessionRows, pinnedRows) = await (latestSessions, latestPinned)
-        guard lifecycle == lifecycleGeneration else { return }
+        // The anchor rides in the same `.core` group as the two above, so it
+        // arrives on the same edge as the sessions it names. Its absence is
+        // normal (no surface has published one yet, or the file has not landed)
+        // and must leave the last proven anchor alone — same retain-last-good
+        // discipline as every other snapshot read here.
+        async let latestAnchor: ConversationAnchorPin? = Self.loadSnapshotObjectOnly(named: "chat_anchor.json", in: snapshotDir)
+        let (sessionRows, pinnedRows, anchorRow) = await (latestSessions, latestPinned, latestAnchor)
+        guard generation == chatSessionListRefreshGeneration,
+              lifecycle == lifecycleGeneration else { return }
         if let sessionRows { sessions = sessionRows }
         if let pinnedRows { pinnedChatSessions = pinnedRows }
+        if let anchorRow { chatAnchor = anchorRow }
         if sessionRows != nil && pinnedRows != nil {
             lastSyncAt = Date()
             syncError = nil
@@ -568,11 +618,17 @@ extension iCloudSyncEngine {
         }
     }
 
-    func transcriptRecords(for sessionID: String?) -> [ChatMessageRecord]? {
-        guard let sessionID,
-              let records = chatTranscripts[sessionID],
-              !records.isEmpty else { return nil }
-        return records
+    /// 2026-09-06: was `transcriptRecords(for:) -> [ChatMessageRecord]?`, which
+    /// returned nil both when the Mac published NO row for the session and when
+    /// it published an empty one. That collapse was the bottom of the chain
+    /// that left a chat cleared on the Mac showing its old messages on the
+    /// phone: no layer above could tell the two apart. Empty stays empty here.
+    func transcriptRead(for sessionID: String?) -> MacTranscriptRead {
+        guard let sessionID, let published = chatTranscripts[sessionID] else { return .unavailable }
+        return .published(
+            MacBridgeClient.projectChatRecords(published.records),
+            generation: published.generation
+        )
     }
 
     @discardableResult
@@ -614,6 +670,11 @@ extension iCloudSyncEngine {
         var organismLivingStatus: OrganismLivingStatusFile?
         var sessions: [ChatSession]?
         var pinnedChatSessions: [ChatSession]?
+        // Deliberately absent from `loadedAnySnapshot` / `loadedAllSnapshots`:
+        // there may legitimately be no anchor to publish, and counting its
+        // absence as an incomplete read would pin a permanent
+        // "still downloading" banner on a perfectly healthy sync.
+        var chatAnchor: ConversationAnchorPin?
         var chatTranscripts: [ChatTranscriptSnapshot]?
         var connectors: [ConnectorRecord]?
         var providers: [ProviderInfo]?
@@ -688,6 +749,8 @@ extension iCloudSyncEngine {
         var organismLivingStatus: OrganismLivingStatusFile?
         var sessions: [ChatSession]?
         var pinnedChatSessions: [ChatSession]?
+        // Excluded from the completeness checks below — see SnapshotBundle.
+        var chatAnchor: ConversationAnchorPin?
         var connectors: [ConnectorRecord]?
         var providers: [ProviderInfo]?
         var surfaceModels: [String: SurfaceModelPref]?
@@ -728,6 +791,7 @@ extension iCloudSyncEngine {
         async let organismLivingStatus: OrganismLivingStatusFile? = loadSnapshotObjectOnly(named: "organism_living_status.json", in: snapshotDir)
         async let sessions: [ChatSession]? = loadSnapshotArrayOnly(named: "sessions.json", in: snapshotDir)
         async let pinnedChatSessions: [ChatSession]? = loadSnapshotArrayOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
+        async let chatAnchor: ConversationAnchorPin? = loadSnapshotObjectOnly(named: "chat_anchor.json", in: snapshotDir)
         async let chatTranscripts: [ChatTranscriptSnapshot]? = loadSnapshotArrayOnly(named: "chat_transcripts.json", in: snapshotDir)
         async let connectors: [ConnectorRecord]? = loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let providers: [ProviderInfo]? = loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
@@ -749,6 +813,7 @@ extension iCloudSyncEngine {
             organismLivingStatus: organismLivingStatus,
             sessions: sessions,
             pinnedChatSessions: pinnedChatSessions,
+            chatAnchor: chatAnchor,
             chatTranscripts: chatTranscripts,
             connectors: connectors,
             providers: providers,
@@ -766,6 +831,7 @@ extension iCloudSyncEngine {
         async let organismLivingStatus: OrganismLivingStatusFile? = loadSnapshotObjectOnly(named: "organism_living_status.json", in: snapshotDir)
         async let sessions: [ChatSession]? = loadSnapshotArrayOnly(named: "sessions.json", in: snapshotDir)
         async let pinnedChatSessions: [ChatSession]? = loadSnapshotArrayOnly(named: "pinned_chat_sessions.json", in: snapshotDir)
+        async let chatAnchor: ConversationAnchorPin? = loadSnapshotObjectOnly(named: "chat_anchor.json", in: snapshotDir)
         async let connectors: [ConnectorRecord]? = loadSnapshotArrayOnly(named: "connectors.json", in: snapshotDir)
         async let providers: [ProviderInfo]? = loadSnapshotArrayOnly(named: "providers.json", in: snapshotDir)
         async let surfaceModels: [String: SurfaceModelPref]? = loadSnapshotObjectOnly(named: "model_preferences.json", in: snapshotDir)
@@ -777,6 +843,7 @@ extension iCloudSyncEngine {
             organismLivingStatus: organismLivingStatus,
             sessions: sessions,
             pinnedChatSessions: pinnedChatSessions,
+            chatAnchor: chatAnchor,
             connectors: connectors,
             providers: providers,
             surfaceModels: surfaceModels,
@@ -784,12 +851,23 @@ extension iCloudSyncEngine {
         )
     }
 
-    private nonisolated static func transcriptMap(_ rows: [ChatTranscriptSnapshot]) -> [String: [ChatMessageRecord]] {
-        var out: [String: [ChatMessageRecord]] = [:]
+    /// 2026-09-06: rows AND their transcript versions in one published value.
+    /// They were briefly two properties, and only the rows one was `@Published`
+    /// — so a republished empty transcript whose only change was a newer
+    /// version never reached the view that consumes it. A row with no version
+    /// (older Mac build) carries nil, and an empty transcript from such a build
+    /// can never claim authority to clear.
+    private nonisolated static func transcriptMap(
+        _ rows: [ChatTranscriptSnapshot]
+    ) -> [String: PublishedTranscript] {
+        var out: [String: PublishedTranscript] = [:]
         for row in rows {
             let clean = row.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty else { continue }
-            out[clean] = row.messages
+            out[clean] = PublishedTranscript(
+                records: row.messages,
+                generation: row.transcriptGeneration
+            )
         }
         return out
     }

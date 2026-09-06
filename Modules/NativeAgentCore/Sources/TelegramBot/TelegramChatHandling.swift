@@ -27,6 +27,16 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
     /// configure `allowed_user_ids`, which TrustCenter must be able to prove at
     /// the effect-time gate.
     public let fromUserId: Int?
+    /// 2026-09-06: the chat session this turn must run in, when the caller
+    /// already knows it. Only an approval continuation sets it — it has to
+    /// resume the session the interrupted turn ran in, not whichever session
+    /// the chat is bound to now. Nil means "resolve the chat's active session".
+    public let sessionId: String?
+    /// 2026-09-06: the forum topic this turn arrived in, when there is one.
+    /// The handler keys its chat session on (chatId, threadId): a topic in a
+    /// supergroup is its own conversation, and nil means the whole chat — a
+    /// DM, an ordinary group, or a forum's General topic.
+    public let threadId: Int?
     private let suppressUserAppendOverride: Bool
 
     public var isRetry: Bool { attemptIndex > 0 }
@@ -37,13 +47,18 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
         totalAttempts: Int,
         replyTo: TelegramReplyContext? = nil,
         fromUserId: Int? = nil,
-        suppressUserAppend: Bool = false
+        suppressUserAppend: Bool = false,
+        sessionId: String? = nil,
+        threadId: Int? = nil
     ) {
         self.attemptIndex = max(0, attemptIndex)
         self.totalAttempts = max(1, totalAttempts)
         self.replyTo = replyTo
         self.fromUserId = fromUserId
+        self.threadId = threadId
         self.suppressUserAppendOverride = suppressUserAppend
+        let trimmedSession = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.sessionId = (trimmedSession?.isEmpty ?? true) ? nil : trimmedSession
     }
 }
 

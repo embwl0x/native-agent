@@ -10,9 +10,9 @@
 //  throughput, responsiveness, cost. Never code-task benchmarks.
 //
 //  Hard rules, codified here and not just in the plan:
-//    1. Every sqlite reader works on a COPY in a temp dir. The live file is
-//       never opened — not even read-only — because a second connection can
-//       disturb the app.
+//    1. Metrics query a transactional SQLite backup in a temp dir. A short
+//       read-only source connection creates that backup; never copy a live
+//       database and its WAL independently or mutate the source database.
 //    2. JSONL is streamed read-only; nothing is ever written inside the data root.
 //       The tool REFUSES to run if --out resolves inside the data root.
 //    3. A metric whose source is missing is rendered "source absent" — never a
@@ -23,6 +23,7 @@
 //
 
 import Foundation
+import SQLite3
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Small utilities
@@ -777,35 +778,46 @@ func markStoreUnreadable(_ label: String, _ reason: String) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - sqlite copies (rule 1: never open the live file)
+// MARK: - transactional SQLite snapshots (read-only source, private query copy)
 // ─────────────────────────────────────────────────────────────────────────────
 
 var copyLog: [String] = []
 
-/// One copy attempt: main file + WAL/SHM sidecars. Sidecar failure is NOT
-/// best-effort — a database copied without the `-wal` that holds its newest
-/// committed transactions is a TORN snapshot, and reporting off it produces
-/// numbers that are quietly stale by however much sits in that WAL. It throws
-/// like any other copy failure.
+/// SQLite's backup API captures one consistent committed database, including
+/// its WAL. Independent physical copies can mix generations even when they
+/// pass quick_check. Never issue application queries against the live source.
 func copySQLiteOnce(src: String, dest: String) throws {
-    for suffix in ["", "-wal", "-shm"] {
-        let s = src + suffix, d = dest + suffix
-        if fm.fileExists(atPath: d) { try? fm.removeItem(atPath: d) }
-        guard suffix.isEmpty || fm.fileExists(atPath: s) else { continue }
-        do { try fm.copyItem(atPath: s, toPath: d) }
-        catch {
-            throw NSError(domain: "agent_instrument", code: 1, userInfo: [
-                NSLocalizedDescriptionKey:
-                    (suffix.isEmpty ? "database copy failed" : "sidecar \(suffix) copy failed")
-                    + ": \(error.localizedDescription)"])
-        }
+    func failure(_ reason: String) -> NSError {
+        NSError(domain: "agent_instrument", code: 1, userInfo: [NSLocalizedDescriptionKey: reason])
+    }
+    // Refuse an unreadable sidecar explicitly, including a stale sidecar that
+    // SQLite might otherwise ignore. Retain the existing diagnostic contract.
+    for suffix in ["-wal", "-shm"] where fm.fileExists(atPath: src + suffix) {
+        guard fm.isReadableFile(atPath: src + suffix) else { throw failure("sidecar \(suffix) copy failed: unreadable") }
+    }
+    var source: OpaquePointer?, destination: OpaquePointer?
+    guard sqlite3_open_v2(src, &source, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
+        if let source { sqlite3_close(source) }
+        throw failure("read-only snapshot source unavailable")
+    }
+    defer { sqlite3_close(source) }
+    guard sqlite3_open_v2(dest, &destination, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
+        if let destination { sqlite3_close(destination) }
+        throw failure("snapshot destination unavailable")
+    }
+    defer { sqlite3_close(destination) }
+    guard let backup = sqlite3_backup_init(destination, "main", source, "main") else {
+        throw failure("transactional snapshot initialization failed")
+    }
+    let step = sqlite3_backup_step(backup, -1)
+    let finish = sqlite3_backup_finish(backup)
+    guard step == SQLITE_DONE, finish == SQLITE_OK else {
+        throw failure("transactional snapshot unavailable (SQLite \(step)/\(finish)); source unchanged")
     }
 }
 
-/// `PRAGMA quick_check` on the COPY. This is the gate that turns "we copied
-/// some bytes while the app was writing" into a verdict: either the snapshot is
-/// coherent, or the source is UNREADABLE. Without it a torn copy answers every
-/// COUNT(*) with a plausible-looking small number.
+/// Structural validation on the private snapshot. Transactional consistency
+/// comes from sqlite3_backup, not from quick_check.
 func integrityDetail(_ db: SQLiteCopy) -> String? {
     switch db.run("PRAGMA quick_check;") {
     case .failed(let r): return r
@@ -829,9 +841,7 @@ func copySQLite(label: String, relative: String) -> StoreState {
     let dest = (workDir as NSString).appendingPathComponent((relative as NSString).lastPathComponent)
 
     var lastFailure = "unknown"
-    // Two attempts: a torn copy is usually a race with a live writer, and a
-    // race that loses once often wins the second time. Two is the whole budget
-    // — retrying forever would just be a slower lie.
+    // Two attempts handle transient SQLite contention without an unbounded wait.
     for attempt in 1...2 {
         do { try copySQLiteOnce(src: src, dest: dest) }
         catch {
@@ -1683,6 +1693,15 @@ struct ProviderRouteStat {
 }
 /// Per-surface provider/model traffic in window, for SYS-09's pin-vs-observed table.
 var routeStats: [String: ProviderRouteStat] = [:]
+// File modification time is a conservative lower bound, not a fabricated
+// per-surface change timestamp. Unknown/moving configuration cannot prove drift.
+func routingPinEpoch() -> Date? {
+    let paths = ["providers/surfaces.json", "providers/active.json"]
+    let dates = paths.compactMap { (try? fm.attributesOfItem(atPath: rootPath($0)))?[.modificationDate] as? Date }
+    return dates.count == paths.count ? dates.max() : nil
+}
+let capturedRoutingPinEpoch = routingPinEpoch()
+var currentPinRouteStats: [String: ProviderRouteStat] = [:]
 /// llm.call rows whose `status` is not `ok`, clustered by status and by the
 /// error text the row carries. An EMPTY cluster map on a feed that read is a
 /// real "no rejected call in window" — it is only the unread case that must
@@ -1870,6 +1889,12 @@ if eventsPresent, let stream = LineStream(path: eventsPath) {
             }
         }
         routeStats[surface] = r
+        if let epoch = capturedRoutingPinEpoch, ts >= epoch {
+            var current = currentPinRouteStats[surface] ?? ProviderRouteStat()
+            current.calls += 1
+            current.models[model, default: 0] += 1
+            currentPinRouteStats[surface] = current
+        }
     }
     sources.setRows("traces/events.jsonl", llmRowsTotal)
     settleJSONLSource("traces/events.jsonl", lines: eventsLines, malformed: eventsMalformed)
@@ -3975,7 +4000,7 @@ let providerSafeKeys: Set<String> = ["auth_mode", "default_model"]
 /// it is a pin no turn can ever consume.
 let canonicalProviderSurfaces: Set<String> = [
     "chat", "ios", "telegram", "slack", "workshop", "autonomy", "swarms", "dream", "rem", "training",
-    "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction", "self_improvement", "desk",
+    "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction", "self_improvement", "desk", "studio_wander",
 ]
 /// Persisted compatibility keys that shipped previously but no current route
 /// consumes. They are historical state to drain, not unknown surface drift.
@@ -4104,17 +4129,20 @@ for (surface, var pin) in surfacePins {
     surfacePins[surface] = pin
 }
 
-/// Surfaces whose pinned model was NEVER the model actually used in window.
+/// Only compare calls after both routing files' captured modification epoch.
+/// Historical calls remain in the table but cannot accuse a newer pin.
 /// Ties on surface name so two runs over the same bytes name the same surface.
 let pinDrifts: [(surface: String, pinned: String, observed: String, calls: Int)] =
     surfacePins.values.compactMap { pin in
+        guard capturedRoutingPinEpoch != nil, routingPinEpoch() == capturedRoutingPinEpoch,
+              let current = currentPinRouteStats[pin.surface], current.calls > 0 else { return nil }
         guard !retiredProviderSurfaces.contains(pin.surface),
               pin.calls > 0, let pinned = pin.model, !pin.observedModels.isEmpty else { return nil }
-        guard pin.observedModels[pinned] == nil else { return nil }
-        let top = pin.observedModels.sorted {
+        guard current.models[pinned] == nil else { return nil }
+        let top = current.models.sorted {
             $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value
         }.first
-        return (surface: pin.surface, pinned: pinned, observed: top?.key ?? "(none)", calls: pin.calls)
+        return (surface: pin.surface, pinned: pinned, observed: top?.key ?? "(none)", calls: current.calls)
     }.sorted { $0.calls == $1.calls ? $0.surface < $1.surface : $0.calls > $1.calls }
 
 /// Surfaces pinned to a provider with no credential file on disk. These cannot
@@ -6885,7 +6913,7 @@ for name in stageNamesSeen.sorted() {
         p50: percentile(s, 0.5),
         p95: percentile(s, 0.95),
         maxMs: s.last ?? .nan,
-        dark: !s.isEmpty && nonZero == 0,
+        dark: !s.isEmpty && nonZero == 0 && name != "contextFlow.attention.actorAdmission",
         lastNonZero: lane?.lastNonZeroAt))
 }
 let darkStages = stageRows.filter { $0.dark }
@@ -8088,7 +8116,9 @@ if skipFeedSection(ledgerPresent, "delegation outcomes", "orchestration/task_led
     }
 }
 
-line("### Workflow run ledger")
+line("### Workflow run ledger (RETIRED 2026-09-01 — frozen history)")
+line()
+line("The workflow run engine was retired on 2026-09-01 (User authorized). `runs.jsonl` and `run_state/*.json` are kept as history and are read by nothing; `registry.json` is still live for the workflow list. Nothing below is an in-flight condition or an action item.")
 line()
 if !workflowRegistryFeed.didRead && !workflowRunsFeed.didRead && !workflowRunStateFeed.didRead {
     line("**workflow ledger sources unavailable** — no workflow activity is reported as zero.")
@@ -8125,24 +8155,15 @@ if !workflowRegistryFeed.didRead && !workflowRunsFeed.didRead && !workflowRunSta
     line("- run state: \(stateReading)")
     if workflowRegistryFeed.didRead, !workflowUnsupportedKinds.isEmpty {
         line("- **unsupported step kinds:** \(topCounts(workflowUnsupportedKinds, 12))")
-        addLead(rank: 9, "Workflow registry contains unsupported step kinds",
-                evidence: "`workflows/registry.json`: \(topCounts(workflowUnsupportedKinds, 12)).",
-                action: "Keep these workflows non-runnable until `WorkflowExecutionPreflight` gains the matching executor, or retire the stale rows.")
     }
     if !workflowStaleNonTerminalStates.isEmpty {
         line("- other non-terminal state ids unchanged >1h: \(workflowStaleNonTerminalStates.prefix(12).map { "`\(mdCode($0))`" }.joined(separator: ", "))")
-        addLead(rank: 8, "\(workflowStaleNonTerminalStates.count) non-terminal workflow state(s) unchanged for >1h; attempt status unknown",
-                evidence: "`workflows/run_state/`: \(workflowStaleNonTerminalStates.prefix(12).joined(separator: ", ")).",
-                action: "File age alone does not prove in-flight work or a missed deadline. Inspect canonical run and approval records before any resume; never infer resend eligibility from this report.")
     }
     if !workflowOldApprovalWaits.isEmpty {
         line("- approval wait ids unchanged >1h, no persisted active attempt: \(workflowOldApprovalWaits.prefix(12).map { "`\(mdCode($0))`" }.joined(separator: ", ")). Historical approval waits are not evidence of in-flight dispatch or a missed drain deadline; review through the approval owner, not by resending work.")
     }
     if !workflowOldPersistedAttempts.isEmpty {
         line("- persisted attempt ids unchanged >1h: \(workflowOldPersistedAttempts.prefix(12).map { "`\(mdCode($0))`" }.joined(separator: ", "))")
-        addLead(rank: 8, "\(workflowOldPersistedAttempts.count) workflow persisted attempt(s) unchanged for >1h; outcome requires reconciliation",
-                evidence: "`workflows/run_state/`: \(workflowOldPersistedAttempts.prefix(12).joined(separator: ", ")). A persisted attempt is dispatch-intent evidence, not proof the owner is still running or an effect occurred.",
-                action: "Inspect the exact attempt, terminal receipts, and owner identity before resuming; reconcile or explicitly cancel unknown outcomes, never blindly replay them.")
     }
     line()
 }
@@ -8363,9 +8384,8 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
         line("**source absent** — no `stageMs` object in any `context.summary` row in the lookback.")
         line()
     } else {
-        line("A stage whose every in-window sample is zero is **DARK**: its clock is not being written.")
-        line("It is rendered as `dark`, never as `0 ms` — a stage that costs nothing and a stage nobody")
-        line("times are different facts and the report refuses to conflate them.")
+        line("All-zero stages are **DARK** (timing unresolved), not proof of a broken clock. Integer-millisecond timing can quantize fast work to zero.")
+        line("Known actor-free attention admission is exempt: its integer clock commonly rounds below 1 ms to zero.")
         line()
         line("| stage | samples | non-zero | p50 ms | p95 ms | max ms | state |")
         line("|---|---|---|---|---|---|---|")
@@ -8388,11 +8408,10 @@ if skipFeedSection(turnTracesPresent, "turn latency", "turn_traces/", turnTraceD
         for r in darkStages {
             let last = r.lastNonZero.map { "last non-zero \(stamp($0)) (\(fmt(now.timeIntervalSince($0) / 86400, 1))d ago)" }
                 ?? "never within the \(lookbackDays)d lookback"
-            addLead(rank: 14, "Assembly stage `stageMs.\(mdCode(r.name))` is DARK — its clock is not being written",
+            addLead(rank: 14, "Assembly stage `stageMs.\(mdCode(r.name))` is DARK — timing needs interpretation",
                     evidence: "\(r.samples) `context.summary` sample(s) in the \(days)d window, all exactly 0; \(last). "
-                        + "The stage still appears in `stageCount`, so the timer is wired but never advanced.",
-                    action: "Find the timer around this stage and prove it can emit a non-zero, or drop the key. "
-                        + "While it reads 0 the assembly breakdown silently under-counts this stage's real cost.")
+                        + "This may be sub-millisecond work, an unused stage, or missing instrumentation; zero alone cannot distinguish them.",
+                    action: "Inspect this stage's clock resolution and whether it ran before diagnosing missing timing. Use higher-resolution timing if this stage needs measurement.")
         }
     }
 
@@ -10490,7 +10509,7 @@ if sysProviderStatus == .measured || sysProviderStatus == .partial {
         let d = pinDrifts[0]
         addLead(rank: 11, "\(pinDrifts.count) surface(s) never used their pinned model in the \(days)d window",
                 evidence: "Worst: `\(mdCode(d.surface))` is pinned to `\(mdCode(d.pinned))` in "
-                    + "`providers/surfaces.json` but all \(d.calls) `llm.call` row(s) in window ran "
+                    + "`providers/surfaces.json` but all \(d.calls) `llm.call` row(s) after the current pin epoch ran "
                     + "`\(mdCode(d.observed))`. Full table in [(h) SYS-09 detail](#sec-h).",
                 action: "Either the pin is stale and should be updated to what the router really picks, or "
                     + "something upstream is overriding it. A pin nobody honours is a config file that "
@@ -11575,8 +11594,8 @@ if leads.isEmpty {
 
 line("---")
 line()
-line("*Read-only run. sqlite stores were copied to `\(workDirDisplay)` and queried there; the live files were")
-line("never opened. Nothing was written inside `\(resolvedDataRoot)`. Findings are leads for a human or")
+line("*Read-only run. SQLite stores were transactionally backed up to `\(workDirDisplay)` and queried there;")
+line("source connections were read-only. No application data was changed. Findings are leads for a human or")
 line("their agent to act on — this instrument never writes into memory, persona, or views.*")
 
 // ─────────────────────────────────────────────────────────────────────────────

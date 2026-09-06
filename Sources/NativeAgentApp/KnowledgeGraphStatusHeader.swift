@@ -1,6 +1,7 @@
 // PATCH-2026-05-07: kg-1 KnowledgeGraphView — Memory > Graph sub-section.
 // Shows entity list + edges. Simple adjacency list layout (no external libs).
 import SwiftUI
+import MemoryV2
 import KnowledgeGraph
 import PersistenceCore
 #if canImport(CloudKit)
@@ -33,7 +34,7 @@ public struct KGNativeStackStatus: Equatable, Sendable {
     public static func load(graphCounts: (entities: Int, edges: Int)) async -> KGNativeStackStatus {
         let dataRoot = PersistenceCore.defaultDataRoot()
         var status = KGNativeStackStatus.empty
-        status.embeddingDim = 384
+        status.embeddingDim = (await SwiftNativeMemoryV2.shared.embedderDimensions()) ?? 0
 
         status.sqliteEntities = graphCounts.entities
         let spotMarker = dataRoot
@@ -84,7 +85,7 @@ struct KGNativeStackHeader: View {
             Text("last-updated \(Self.relative(status.lastUpdated))").font(.caption).foregroundStyle(.secondary)
             Spacer()
             Label("\(status.sqliteEntities) SQLite", systemImage: "cylinder.split.1x2").font(.caption2)
-            Label("\(status.embeddingDim)d MiniLM", systemImage: "cpu").font(.caption2)
+            Label("\(status.embeddingDim)d vectors", systemImage: "cpu").font(.caption2)
             Label(status.cloudKitState, systemImage: "icloud").font(.caption2)
         }
         .padding(.vertical, 6).padding(.horizontal, 10)

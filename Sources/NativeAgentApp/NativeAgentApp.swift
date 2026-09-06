@@ -98,9 +98,17 @@ private final class NativeAgentHotkeyBootstrap {
             )
             self.voiceTurn = voiceTurn
         }
+        // User authorized retiring the Spotlight overlay, 2026-09-01. The tap
+        // half of ⌘⇧J now brings the real app forward instead of forking a
+        // hidden `sessionId = "spotlight"` thread; the hold half still arms
+        // voice, which is why the hotkey itself stays registered.
         hotkeyManager.onOpenWindow = {
             Task { @MainActor in
-                SpotlightOverlay.shared.toggle()
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows
+                    .first { $0.identifier?.rawValue.contains("main") == true }?
+                    .makeKeyAndOrderFront(nil)
+                NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
             }
         }
         hotkeyManager.onVoiceStart = {
@@ -179,10 +187,20 @@ struct NativeAgentApp: App {
     @State private var updateController = UpdateController.shared
     // PATCH-2026-05-06: wkwebview-browser Start IPC server at app launch
     @State private var browserController = BrowserWindowController.shared
-    @AppStorage("nativeagent.darkMode") private var preferDarkAppearance = false
+    @AppStorage("nativeagent.darkMode") private var preferDarkAppearance = true
+    @State private var appearance = AppearanceController.shared
     @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
 
     init() {
+        // User, 2026-09-03: native text on this app looked heavy next to the
+        // Claude desktop app's. That app is Chromium, which draws without
+        // macOS font smoothing (stem darkening). Turn it off for this process
+        // too; CoreGraphics reads the key from the app's own defaults domain
+        // at start, so the first launch that sets it renders the old way and
+        // every launch after renders thin and crisp.
+        if !UserDefaults.standard.bool(forKey: "CGFontRenderingFontSmoothingDisabled") {
+            UserDefaults.standard.set(true, forKey: "CGFontRenderingFontSmoothingDisabled")
+        }
         // Writing to a dead subprocess's stdin pipe (MCP children, builder
         // tools, invoke_claude) delivers SIGPIPE, which kills the entire
         // app by default. With SIG_IGN the write fails with EPIPE instead
@@ -226,7 +244,13 @@ struct NativeAgentApp: App {
             // Restart App).
             MainWindowContent()
                 .environment(appModel)
-                .preferredColorScheme(preferDarkAppearance ? .dark : nil)
+                // User, 2026-09-02: never a nil scheme. AppearanceController
+                // answers dark or light for both layers; "off" follows the
+                // system live. See AppearanceController.swift.
+                .preferredColorScheme(appearance.colorScheme)
+                .onChange(of: preferDarkAppearance, initial: true) { _, dark in
+                    appearance.setPreferDark(dark)
+                }
                 .frame(minWidth: 1040, minHeight: 680)
                 // evalfix3/T1: ASWebAuthenticationSession custom-scheme
                 // fallback — if the OS routes a nativeagent://oauth/... URL
@@ -239,6 +263,16 @@ struct NativeAgentApp: App {
                     }
                 }
         }
+        // Agent, 2026-09-02: one material per column, top edge to bottom edge.
+        // A titled window paints an opaque strip across the top of all three
+        // glass columns, so the top-left reads as system chrome bolted onto the
+        // room. Hidden title bar = transparent title bar over a full-size
+        // content view: the rail's glass runs up under the traffic lights and
+        // the room's glass runs up under the header, with no band and no
+        // hairline between them. Same rule the composer already follows — no
+        // painted strips on glass. Content position is preserved by the
+        // titleBarInset safe area in MainWindowContent.
+        .windowStyle(.hiddenTitleBar)
         .commands {
             ChatFocusedCommands()
             // RELEASE-2026-05-06: "Check for Updates…" in app menu (Task 4.3)
@@ -285,7 +319,7 @@ struct NativeAgentApp: App {
                 // developer-gated surface — its menu entry hides with the gate
                 // (explicit deep links still resolve). It carries no digit: the
                 // digits belong to the sidebar's primary order.
-                if showDeveloperSurfaces {
+                if NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces) {
                     Button("Knowledge Graph") { NativeAgentAppCoordinator.shared.request(.sidebar(.knowledge)) }
                 }
                 Divider()
@@ -299,7 +333,13 @@ struct NativeAgentApp: App {
         Settings {
             SlimSettingsView()
                 .environment(appModel)
-                .preferredColorScheme(preferDarkAppearance ? .dark : nil)
+                // User, 2026-09-02: never a nil scheme. AppearanceController
+                // answers dark or light for both layers; "off" follows the
+                // system live. See AppearanceController.swift.
+                .preferredColorScheme(appearance.colorScheme)
+                .onChange(of: preferDarkAppearance, initial: true) { _, dark in
+                    appearance.setPreferDark(dark)
+                }
                 .frame(width: 760, height: 720)
         }
 

@@ -67,6 +67,11 @@ public struct DelegationJobProjection: Sendable, Equatable {
         /// The record carries neither a deadline nor a stall threshold.
         /// `stalled` is reported false but that is ABSENCE OF EVIDENCE.
         case none
+        /// 2026-09-06: the run ended (`state: delivering`) and no settlement
+        /// followed within the delivery grace. The runner writes `delivering`
+        /// BEFORE it awaits the bridge POST, so a worker that dies there leaves
+        /// a record that says the run is over and never settles.
+        case deliveryStall = "delivery_stall"
     }
 
     public var id: String
@@ -124,6 +129,9 @@ public struct DelegationJobProjection: Sendable, Equatable {
     /// it when the text still needs replaying. Its absence means "delivered",
     /// not "missing".
     public var completionTextHead: String?
+    /// Read-only recovery evidence. A later receipt is not an automatic replay
+    /// authorization or proof that a different completion was consumed.
+    public var recoveryNote: String? = nil
     /// Contract/build identity stamped by the NativeAgent runtime that
     /// originated this wake. Absence means a legacy/unversioned producer.
     public var producerSchemaVersion: Int? = nil
@@ -164,6 +172,10 @@ public struct DelegationJobProjection: Sendable, Equatable {
         put("last_liveness", lastLiveness)
         put("completed_at", completedAt)
         put("completion_text_head", completionTextHead)
+        put("recovery_note", recoveryNote)
+        put("thread_id", recordedThreadID)
+        put("turn_id", recordedTurnID)
+        obj["accepted_message_ids"] = .array(acceptedMessageIDs.sorted().map(JSONValue.string))
         put("delivery_outcome", deliveryOutcome)
         put("delivery_reason", deliveryReason)
         put("producer_source_revision", producerSourceRevision)
@@ -285,12 +297,56 @@ public struct DelegationStatusProjector: Sendable {
         return Array(allJobs(now: now).prefix(bounded))
     }
 
+    /// Item 5 (2026-09-02): the jobs AND whether every configured store
+    /// actually answered, from ONE read of disk.
+    ///
+    /// `recentJobs` cannot express this. It swallows absent and unreadable
+    /// stores alike so that "a machine with only one bridge configured still
+    /// gets a useful answer" — which is right for a display, and wrong for any
+    /// caller that reads an EMPTY result as a fact about the world. The horizon
+    /// register is such a caller: a peer disappearing from the pending set means
+    /// "they wrote back", so a bridge directory that briefly could not be read
+    /// would otherwise mint relief for a reply that never came.
+    ///
+    /// `allStoresReadable` is true when every source is either `available` or
+    /// `absent`. Absent is deliberately fine: a bridge that is not configured on
+    /// this machine is not a failed read, it is a peer she does not have. Only
+    /// `unavailable` (present but unreadable) and `partial` (some records
+    /// unreadable or malformed) make the answer untrustworthy.
+    public func recentJobsWithAvailability(
+        now: Date,
+        limit: Int = DelegationStatusProjector.defaultLimit
+    ) -> (jobs: [DelegationJobProjection], allStoresReadable: Bool) {
+        let snapshot = readSnapshot(now: now)
+        let bounded = max(1, min(limit, Self.maxLimit))
+        return (
+            Array(snapshot.jobs.prefix(bounded)),
+            snapshot.sources.allSatisfy { $0.status == "available" || $0.status == "absent" }
+        )
+    }
+
     /// Complete ordered projection for reconciliation owners. This is
     /// deliberately separate from `recentJobs`: the latter is a model-visible
     /// display budget, while a durable outcome cursor must never skip an older
     /// record merely because more than 100 newer jobs arrived in one burst.
     public func allJobs(now: Date) -> [DelegationJobProjection] {
         readSnapshot(now: now).jobs
+    }
+
+    /// 2026-09-06: `allJobs` for a cursor owner, PLUS whether the read was
+    /// complete. An unreadable job file simply vanishes from the array, and a
+    /// cursor that advances its `last_seen` past that job while a newer sibling
+    /// settles rejects it forever once it becomes readable again. The
+    /// reconciliation owner needs the same availability half `delegation_status`
+    /// already gets from `recentJobsWithAvailability`, from ONE read of disk.
+    public func allJobsWithAvailability(
+        now: Date
+    ) -> (jobs: [DelegationJobProjection], allStoresReadable: Bool) {
+        let snapshot = readSnapshot(now: now)
+        return (
+            snapshot.jobs,
+            snapshot.sources.allSatisfy { $0.status == "available" || $0.status == "absent" }
+        )
     }
 
     /// Read each source once. Availability describes this same observation,
@@ -322,7 +378,19 @@ public struct DelegationStatusProjector: Sendable {
         // in-flight projection for the same originating message id.
         let deliveries = Self.readDeliveries(codexDeliveriesFile)
         sources.append(deliveries.availability)
-        for row in Self.projectCodexDeliveries(file: codexDeliveriesFile, now: now, objects: deliveries.objects) {
+        let deliveryRows = Self.projectCodexDeliveries(file: codexDeliveriesFile, now: now, objects: deliveries.objects)
+        for key in Array(codexRows.keys) {
+            guard var retained = codexRows[key], retained.deliveryOutcome == "unknown" else { continue }
+            let matching = deliveryRows.filter {
+                $0.deliveryOutcome == "delivered" && !retained.acceptedMessageIDs.isDisjoint(with: $0.acceptedMessageIDs)
+            }
+            let ids = Set(matching.flatMap(\.acceptedMessageIDs)).sorted()
+            retained.recoveryNote = ids.isEmpty
+                ? "No later delivered receipt matched the retained accepted-message IDs in readable evidence. Inspect the original reply before deciding; absence is not proof of loss."
+                : "Delivered receipt(s) also reference accepted message ID(s): \(ids.joined(separator: ", ")). Compare thread/turn identity and completion before treating this retained reply as consumed; no replay or deletion performed."
+            codexRows[key] = retained
+        }
+        for row in deliveryRows {
             if let existing = codexRows[row.id],
                existing.deliveryOutcome == "unknown",
                row.deliveryOutcome != "delivered" {
@@ -484,20 +552,42 @@ public struct DelegationStatusProjector: Sendable {
         // is over the moment the runner stamps runStatus — `delivering`
         // (L1457) and `spawn_failed` (L2222) both sit past that point with no
         // completedAt yet, and both carry a deadlineAt that will eventually
-        // pass. Without them in the terminal set, a job that finished an hour
-        // ago and is merely waiting on bridge delivery reads as STALLED — the
-        // exact false stuck-job report this tool exists to prevent.
+        // pass, so neither may be judged against the RUN's deadline: a job that
+        // finished an hour ago and is merely waiting on bridge delivery would
+        // read as STALLED, the exact false stuck-job report this tool exists to
+        // prevent. `spawn_failed` is terminal outright; `delivering` keeps a
+        // stall clock of its own, below.
         let state = string(job, "state")
-        let terminal = completedAt != nil
+        // 2026-09-06: `delivering` is no longer counted as terminal. The run IS
+        // over there, but the answer is still in flight, and the runner writes
+        // that state before it awaits the bridge POST — so a worker that dies
+        // in the POST leaves a record excluded from stall detection forever.
+        // Its clock is the delivery stamp (`runEndedAt`), never the run's own
+        // `deadlineAt`, which a long run has usually passed already: an
+        // ordinary delivery of a few seconds cannot trip it, and one that never
+        // lands does.
+        let delivering = completedAt == nil && state == "delivering"
+        let terminal = !delivering && (completedAt != nil
             || string(job, "runStatus") != nil
-            || ["settled", "delivering", "spawn_failed"].contains(state ?? "")
-        let (stalled, basis, stallDeadline) = stallVerdict(
-            terminal: terminal,
-            deadlineAt: string(job, "deadlineAt"),
-            stallSeconds: number(job, "stallSeconds"),
-            lastLiveness: liveness ?? startedAt ?? claimedAt ?? createdAt,
-            now: now
-        )
+            || ["settled", "spawn_failed"].contains(state ?? ""))
+        let stalled: Bool
+        let basis: DelegationJobProjection.StallBasis
+        let stallDeadline: Date?
+        if delivering {
+            let clock = firstDate(string(job, "runEndedAt"), liveness, startedAt, claimedAt, createdAt)
+            let deadline = clock?.addingTimeInterval(deliveryStallSeconds)
+            stalled = deadline.map { now >= $0 } ?? false
+            basis = deadline == nil ? .none : .deliveryStall
+            stallDeadline = deadline
+        } else {
+            (stalled, basis, stallDeadline) = stallVerdict(
+                terminal: terminal,
+                deadlineAt: string(job, "deadlineAt"),
+                stallSeconds: number(job, "stallSeconds"),
+                lastLiveness: liveness ?? startedAt ?? claimedAt ?? createdAt,
+                now: now
+            )
+        }
 
         var row = DelegationJobProjection(
             id: id,
@@ -869,6 +959,17 @@ public struct DelegationStatusProjector: Sendable {
     }
 
     // MARK: - Shared helpers
+
+    /// How long a finished run may sit in `delivering` before the delivery
+    /// itself is the stuck step. The POST is a localhost call with an ack, so
+    /// minutes here mean the worker died between the stamp and the settlement.
+    ///
+    /// 2026-09-06: must stay ABOVE the bridge POST's own ceiling. The helper
+    /// allows a delivery 600s (NATIVE_AGENT_CLAUDE_WAKE_BRIDGE_TIMEOUT_MS in
+    /// script/claude_thread_wakeup.js), so at 300s this clock called a
+    /// supported, still-running delivery stalled. 660s leaves the helper its
+    /// full window plus a minute to settle.
+    static let deliveryStallSeconds: TimeInterval = 660
 
     /// The single place a stall verdict is made, for every store.
     static func stallVerdict(

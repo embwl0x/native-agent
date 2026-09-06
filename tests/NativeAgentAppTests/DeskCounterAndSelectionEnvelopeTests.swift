@@ -97,8 +97,8 @@ private func pursuitPayload() -> Pursuit {
 
 // MARK: - the "Needs you" counter can never disagree with the strip
 
-/// `needsYouCount` is `approvalExecutions + attentionItems + needsUserGitHubItems`
-/// (DeskView.swift), while the section it scrolls to is built by
+/// The strip's counters are `waitingOnYouCount` + `blockedNotOnYouCount`
+/// (DeskView.swift), while the section they scroll to is built by
 /// `DeskAttentionStrip.plan` from FOUR collections — approvals, needs-User
 /// GitHub, non-GitHub attention, and GitHub-stamped-blocked attention.
 ///
@@ -108,7 +108,11 @@ private func pursuitPayload() -> Pursuit {
 /// That partition is the whole contract. Break it (make the predicate drop a
 /// row, or make one bucket filter something extra) and the counter says 5 while
 /// the section lists 3, with nothing failing.
-@Test("the needs-you counter re-adds to exactly what the attention section builds")
+///
+/// fable51 #6 adds the second half: `waitingOnYouItems` + `blockedItems` must
+/// re-add to `totalItems`, so splitting the headline into "Waiting on you · N"
+/// and "Blocked · M" can never lose or double-count a row.
+@Test("the attention counters re-add to exactly what the section builds")
 func needsYouCounterCanNeverDisagreeWithTheAttentionStrip() {
     // A mix that exercises every bucket, including rows that are blocked for a
     // hand-written reason (which must NOT roll up under GitHub).
@@ -131,9 +135,15 @@ func needsYouCounterCanNeverDisagreeWithTheAttentionStrip() {
     #expect(ghBlocked.count + nonGh.count == attention.count)
     #expect(Set(ghBlocked.map(\.handle)).isDisjoint(with: Set(nonGh.map(\.handle))))
 
-    // 2. Therefore the counter expression equals the section's honest total, in
-    //    both the collapsed and the revealed state.
-    let needsYouCount = approvals.count + attention.count + ghNeedsYou.count
+    // 2. Therefore the counter expressions equal the section's honest totals,
+    //    in both the collapsed and the revealed state.
+    let totalWaiting = approvals.count + attention.count + ghNeedsYou.count
+    // The view's split, taken from the SAME policy the view calls.
+    let waitingOnYou = OwnerAttentionPolicy.waitingOnOwnerCount(
+        approvalsWaiting: approvals.count,
+        ownerDecisionItems: OwnerAttentionPolicy.ownerDecisionCount(in: attention),
+        externalOwnerItems: ghNeedsYou.count)
+    let blocked = attention.count - OwnerAttentionPolicy.ownerDecisionCount(in: attention)
     for showingAll in [false, true] {
         let plan = DeskAttentionStrip.plan(
             approvals: approvals,
@@ -141,8 +151,13 @@ func needsYouCounterCanNeverDisagreeWithTheAttentionStrip() {
             otherAttention: nonGh,
             githubBlocked: ghBlocked,
             showingAll: showingAll)
-        #expect(plan.totalItems == needsYouCount,
-                "counter (\(needsYouCount)) disagrees with the section it scrolls to (\(plan.totalItems)), showingAll=\(showingAll)")
+        #expect(plan.totalItems == totalWaiting,
+                "counter (\(totalWaiting)) disagrees with the section it scrolls to (\(plan.totalItems)), showingAll=\(showingAll)")
+        #expect(plan.waitingOnYouItems == waitingOnYou,
+                "\"Waiting on you\" counter (\(waitingOnYou)) disagrees with the section (\(plan.waitingOnYouItems)), showingAll=\(showingAll)")
+        #expect(plan.blockedItems == blocked,
+                "\"Blocked\" counter (\(blocked)) disagrees with the section (\(plan.blockedItems)), showingAll=\(showingAll)")
+        #expect(plan.waitingOnYouItems + plan.blockedItems == plan.totalItems)
     }
 
     // 3. And the counter is nonzero exactly when the section has something in
@@ -152,6 +167,8 @@ func needsYouCounterCanNeverDisagreeWithTheAttentionStrip() {
         approvals: [], githubNeedsYou: [], otherAttention: [], githubBlocked: [],
         showingAll: false)
     #expect(empty.totalItems == 0)
+    #expect(empty.waitingOnYouItems == 0)
+    #expect(empty.blockedItems == 0)
     #expect(empty.isEmpty)
 }
 

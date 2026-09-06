@@ -10,15 +10,23 @@ import NativeAgentCore
 struct ProviderToolNameMap: Sendable {
     let schemas: [LLMToolSchema]
     private let providerToInternal: [String: String]
+    /// Reverse of `providerToInternal`. The mid-conversation tool-change
+    /// blocks reference tools by their PROVIDER name (the name in the request's
+    /// `tools` array), so the producer needs the exact alias this map minted —
+    /// recomputing it from `providerName(for:)` would miss the collision
+    /// suffix that `uniqueProviderName` adds.
+    private let internalToProvider: [String: String]
 
     init(_ internalSchemas: [LLMToolSchema]) {
         var used: Set<String> = []
         var aliases: [String: String] = [:]
+        var reverse: [String: String] = [:]
         var publicSchemas: [LLMToolSchema] = []
 
         for schema in internalSchemas {
             let providerName = Self.uniqueProviderName(for: schema.name, used: &used)
             aliases[providerName] = schema.name
+            if reverse[schema.name] == nil { reverse[schema.name] = providerName }
             let description: String
             if providerName == schema.name {
                 description = schema.description
@@ -28,16 +36,29 @@ struct ProviderToolNameMap: Sendable {
             publicSchemas.append(LLMToolSchema(
                 name: providerName,
                 description: description,
-                parametersJSON: schema.parametersJSON
+                parametersJSON: schema.parametersJSON,
+                // The Anthropic `defer_loading` flag is a property of the
+                // DECLARATION, so it has to survive the alias rewrite or the
+                // whole tool-change lane silently offers everything.
+                deferLoading: schema.deferLoading
             ))
         }
 
         self.schemas = publicSchemas
         self.providerToInternal = aliases
+        self.internalToProvider = reverse
     }
 
     func internalName(forProviderName providerName: String) -> String {
         providerToInternal[providerName] ?? providerName
+    }
+
+    /// The provider-visible alias this map minted for an internal tool name,
+    /// or nil when the name is not in this map at all — which is exactly the
+    /// "referencing a name not declared in `tools`" case a tool-change block
+    /// must never put on the wire.
+    func providerName(forInternalName internalName: String) -> String? {
+        internalToProvider[internalName]
     }
 
     static func providerName(for internalName: String) -> String {

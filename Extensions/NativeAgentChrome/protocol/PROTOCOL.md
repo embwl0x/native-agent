@@ -22,6 +22,15 @@ Responses echo `id` and `action`, set `ok`, and carry exactly one of `result`
 or `error`. Unsolicited extension events use `type: "event"` and have no
 request id. See `protocol-v1.schema.json` for the machine-readable envelope.
 
+2026-09-06: the relay-to-app Unix socket carries one extra frame that Chrome
+never sees. NativeAgent.app mints a per-launch secret and writes it, 0600, as
+`chrome-control.token` beside the socket; the relay reads it and sends
+`{"version":1,"type":"hello","token":"…"}` as the first frame on the
+connection. The app closes any connection that does not present the current
+secret, and such a caller never displaces the channel already in use. When no
+token file exists the relay sends nothing — the socket link is then exactly the
+opaque byte pump it has always been.
+
 Combined frame snapshots retain bounded in-flight invalidation evidence and
 recheck the active lease before publication. A frame mutation during capture
 returns `snapshot_stale`; a newer capture or navigation returns
@@ -94,7 +103,14 @@ automatic retry. `requestedUrl` remains distinct from the observed final `url`
 so redirects remain supported; a complete tab observation is explicitly
 `verified: false`, not proof that the requested navigation's intended outcome
 was achieved. Navigation-settlement waits reread the exact tab after their
-settle interval and never verify a cached completion event.
+settle interval and never verify a cached completion event. 2026-09-06: that
+interval must be QUIET — ANY update for the tab restarts it, so a redirect chain
+is no longer sampled mid-flight. One deadline, opened when the wait starts,
+bounds the completion wait and the settle interval together, so a wait never
+runs past the requested `timeoutMs`. A page still moving when that deadline
+arrives returns the distinct outcome `not_quiet` with `verification:
+"not_verified"` — never `verified` — and the Mac reads it as evidence still
+owed rather than as a settled navigation.
 Snapshot,
 click, fill, type, select, keypress, checked-state, double-click, element waits,
 and scroll are handled by isolated content agents; navigation settlement and
@@ -119,6 +135,29 @@ string and never splits a surrogate pair. A partial receipt uses
 fresh snapshot before continuing only the untyped suffix. Never blindly resend
 the original full text. Counts acknowledge append effects, not verified final
 page state; the receipt keeps `page_acknowledged` distinct from verification.
+
+2026-09-06: an action on a disabled control is refused (`node_disabled`)
+rather than dispatched — clicking one is a no-op the page never sees, and it
+used to be reported as done. Snapshot node ids also carry the tag, role and
+name the node advertised: an action re-checks them and refuses
+(`node_identity_changed`) if the id now names a different control. The page
+agent observes every open shadow root its walker entered, so a swap inside a
+component invalidates snapshots the way a document mutation always has; each
+snapshot drops the roots whose host has since left the document.
+
+Disabled means `:disabled` — an ancestor `<fieldset disabled>` counts, not only
+the node's own attribute — plus `aria-disabled`, and it refuses a keypress as
+well as a click, because `Enter` and `Space` are activation routes. 2026-09-06:
+every mutation goes through the same door — fill, type, select and checked-state
+are refused on a disabled control too, not just click and keypress.
+
+2026-09-06: an unmodified `Enter` keypress in a `<textarea>` inserts a newline.
+Only `Control+Enter` / `Meta+Enter` submits the surrounding form; the old
+behaviour submitted a half-written field the moment a newline was typed. A
+`page.scroll` naming a `targetNodeId` goes through the same actionable-node
+door as every other act: the node must have advertised `scroll`
+(`node_not_actionable`) and must still be what its id described
+(`node_identity_changed`).
 
 ## Structured page snapshot
 

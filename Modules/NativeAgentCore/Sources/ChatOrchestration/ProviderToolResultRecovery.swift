@@ -10,10 +10,45 @@ actor ProviderToolResultRecoveryStore {
     static let shared = ProviderToolResultRecoveryStore()
 
     static let pageUTF8Bytes = 8_000
+
+    /// User, 2026-09-06: a page is embedded as a JSON STRING in the
+    /// `tool_result_page` envelope, and this codebase serializes with
+    /// `ensure_ascii=True` — every non-ASCII scalar becomes `\uXXXX` (6 bytes,
+    /// 12 for a surrogate pair) and every quote/backslash/newline doubles. So
+    /// 8 000 RAW bytes of CJK or escape-heavy JSON serialized past the 12 000
+    /// byte `tool_result_page` projection ceiling, and the page spilled into
+    /// ANOTHER handle: paging a large result could never return the result.
+    /// Pages are now bounded by BOTH the raw cap above and this serialized
+    /// cap, which leaves the envelope's own fields room under that ceiling.
+    /// Pure ASCII is unaffected — the raw cap still binds first.
+    static let pageSerializedUTF8Bytes = 10_000
+
+    /// Bytes one scalar costs INSIDE a serialized JSON string, matching
+    /// `JSONValue.encodeString` exactly.
+    static func jsonEscapedByteCount(_ v: UInt32) -> Int {
+        switch v {
+        case 0x22, 0x5C, 0x08, 0x09, 0x0A, 0x0C, 0x0D: return 2
+        default:
+            if v < 0x20 { return 6 }
+            if v < 0x7F { return 1 }
+            if v <= 0xFFFF { return 6 }
+            return 12
+        }
+    }
     static let maxEntryBytes = 64 * 1024 * 1024
     static let maxTotalBytes = 128 * 1024 * 1024
     static let maxEntries = 32
     static let ttl: TimeInterval = 30 * 60
+
+    /// User, 2026-09-06: the 30-minute TTL ran from CREATION and nothing renewed
+    /// it, so a long permitted turn (Telegram and the agent bridges get 180
+    /// iterations and a 6 h ceiling) watched its own spill handles expire under
+    /// it and `tool_result_page` answered "expired, invalid, or belongs to a
+    /// different turn" for a handle it had just been handed. A handle whose turn
+    /// is still live is never expired; the idle TTL applies once the turn ends,
+    /// and this is the ceiling that stops a leaked scope from pinning bytes
+    /// forever. Matches the turn wall-clock ceiling.
+    static let liveTurnMaxLifetime: TimeInterval = 6 * 60 * 60
 
     struct Scope: Hashable, Sendable {
         let sessionId: String
@@ -44,11 +79,18 @@ actor ProviderToolResultRecoveryStore {
         let bytes: Int
         let pageByteOffsets: [Int]
         let createdAt: Date
+        /// Last time the model actually read a page. The idle clock runs from
+        /// here, not from creation.
+        var lastReadAt: Date
     }
 
     private let root: URL
     private var entries: [String: Entry] = [:]
     private var totalBytes = 0
+    /// Scopes whose turn has not ended yet. A turn seeds this the first time it
+    /// spills; `remove(scope:)` — which every loop calls in its `defer` — clears
+    /// it. Handles in a live scope survive the idle TTL.
+    private var liveScopes: Set<Scope> = []
 
     init(root: URL = FileManager.default.temporaryDirectory
         .appendingPathComponent("NativeAgent", isDirectory: true)
@@ -94,15 +136,20 @@ actor ProviderToolResultRecoveryStore {
         var pageByteOffsets = [0]
         var byteOffset = 0
         var pageStartByte = 0
+        var pageSerializedBytes = 0
         for scalar in content.unicodeScalars {
             let value = scalar.value
             let scalarBytes = value <= 0x7F ? 1 : value <= 0x7FF ? 2 : value <= 0xFFFF ? 3 : 4
-            if byteOffset > pageStartByte,
-               byteOffset - pageStartByte + scalarBytes > Self.pageUTF8Bytes {
+            let escapedBytes = Self.jsonEscapedByteCount(value)
+            let overRaw = byteOffset - pageStartByte + scalarBytes > Self.pageUTF8Bytes
+            let overSerialized = pageSerializedBytes + escapedBytes > Self.pageSerializedUTF8Bytes
+            if byteOffset > pageStartByte, overRaw || overSerialized {
                 pageByteOffsets.append(byteOffset)
                 pageStartByte = byteOffset
+                pageSerializedBytes = 0
             }
             byteOffset += scalarBytes
+            pageSerializedBytes += escapedBytes
         }
         if pageByteOffsets.last != byteOffset {
             pageByteOffsets.append(byteOffset)
@@ -118,6 +165,7 @@ actor ProviderToolResultRecoveryStore {
             return nil
         }
 
+        let now = Date()
         let entry = Entry(
             handle: handle,
             toolName: toolName,
@@ -126,9 +174,11 @@ actor ProviderToolResultRecoveryStore {
             characters: content.count,
             bytes: data.count,
             pageByteOffsets: pageByteOffsets,
-            createdAt: Date()
+            createdAt: now,
+            lastReadAt: now
         )
         entries[handle] = entry
+        liveScopes.insert(scope)
         totalBytes += data.count
         return Receipt(
             handle: handle,
@@ -181,6 +231,9 @@ actor ProviderToolResultRecoveryStore {
                 "reason": .string("result_spill_unreadable"),
             ])
         }
+        // Reading renews the handle: a result the model is still working
+        // through is in use, whatever the clock says.
+        entries[handle]?.lastReadAt = Date()
         let hasMore = page + 1 < pageCount
         let nextPage: JSONValue = hasMore ? .int(Int64(page + 1)) : .null
         return .object([
@@ -189,7 +242,7 @@ actor ProviderToolResultRecoveryStore {
             "result_handle": .string(handle),
             "page": .int(Int64(page)),
             "page_count": .int(Int64(pageCount)),
-            "page_bytes": .int(Int64(Self.pageUTF8Bytes)),
+            "page_bytes": .int(Int64(endByte - startByte)),
             "original_characters": .int(Int64(entry.characters)),
             "original_bytes": .int(Int64(entry.bytes)),
             "content": .string(content),
@@ -199,19 +252,35 @@ actor ProviderToolResultRecoveryStore {
     }
 
     func remove(scope: Scope) {
+        liveScopes.remove(scope)
         for handle in entries.values.filter({ $0.scope == scope }).map(\.handle) {
             remove(handle: handle)
         }
     }
 
     func resetForTests() {
+        liveScopes.removeAll()
         for handle in Array(entries.keys) { remove(handle: handle) }
     }
 
     private func cleanupExpired(now: Date) {
-        for entry in entries.values where now.timeIntervalSince(entry.createdAt) >= Self.ttl {
-            remove(handle: entry.handle)
+        for entry in Array(entries.values) {
+            // The absolute ceiling binds even on a live turn — it is the only
+            // thing that frees a scope whose `remove(scope:)` never arrived.
+            if now.timeIntervalSince(entry.createdAt) >= Self.liveTurnMaxLifetime {
+                remove(handle: entry.handle)
+                continue
+            }
+            // A live turn keeps its handles: the turn's own `defer` is what ends
+            // them, not the clock.
+            guard !liveScopes.contains(entry.scope) else { continue }
+            if now.timeIntervalSince(entry.lastReadAt) >= Self.ttl {
+                remove(handle: entry.handle)
+            }
         }
+        // A scope with nothing left to protect stops being tracked, so a turn
+        // that ended without its `defer` cannot pin the set forever.
+        liveScopes.formIntersection(Set(entries.values.map(\.scope)))
         let liveNames = Set(entries.values.map { $0.url.lastPathComponent })
         let cutoff = now.addingTimeInterval(-Self.ttl)
         let urls = try? FileManager.default.contentsOfDirectory(

@@ -689,7 +689,7 @@ func chatDriveReadOnlySubcommandsEmitDocumentedTopLevelShapes() throws {
     #expect(firstPreference["model"] is String)
 
     let doctor = try runCLI(
-        cli, ["doctor", "--repair", "false", "--check-llm", "false"], environment: environment
+        cli, ["doctor", "--repair", "false"], environment: environment
     )
     #expect(doctor.exitCode == 0, "doctor failed: \(doctor.stderr)")
     let doctorOutput = try jsonObject(doctor.stdout)
@@ -953,8 +953,8 @@ func chatDriveLivingFabricEvalRouteDisclosesTraceWindow() throws {
     defer { try? FileManager.default.removeItem(at: root) }
 
     // Missing turn_traces is a valid read-only evaluation window, not a crash
-    // or a fabricated 0% score. Both metacognition reports still name their
-    // no-evidence state explicitly.
+    // or a fabricated 0% score. The window receipt names the no-evidence state
+    // explicitly.
     let missingRoot = root.appendingPathComponent("missing", isDirectory: true)
     let missing = try runCLI(cli, ["living-fabric-eval", missingRoot.path])
     #expect(missing.exitCode == 0, "missing trace root failed: \(missing.stderr)")
@@ -962,11 +962,7 @@ func chatDriveLivingFabricEvalRouteDisclosesTraceWindow() throws {
     let missingWindow = try #require(missingReport["traceWindow"] as? [String: Any])
     #expect(missingWindow["inputStatus"] as? String == "no trace files found")
     #expect(missingWindow["filesScanned"] as? Int == 0)
-    let missingMetacognition = try #require(missingReport["metacognition"] as? [String: Any])
-    let missingShadow = try #require(missingMetacognition["shadowEvaluation"] as? [String: Any])
-    #expect(missingShadow["recommendationEmission"] as? String == "no recommendations emitted")
-    let missingCalibration = try #require(missingMetacognition["outcomeCalibration"] as? [String: Any])
-    #expect(missingCalibration["schema"] as? String == "metacognition.outcome-calibration.v1")
+    #expect(missingReport["metacognition"] == nil)
 
     let boundedRoot = root.appendingPathComponent("bounded", isDirectory: true)
     let traces = boundedRoot.appendingPathComponent("turn_traces", isDirectory: true)
@@ -978,10 +974,10 @@ func chatDriveLivingFabricEvalRouteDisclosesTraceWindow() throws {
     }
     let selectedFixture = traces.appendingPathComponent("2026-07-02.jsonl")
     try writeJSONLFixture([
-        #"{"turnId":"v5-turn","ts":"2026-07-02T12:00:00.000Z","kind":"turn.plan","surface":"chat","payload":{"metacognitiveShadow":{"schema":"metacognition.shadow.v5","controlAuthority":false,"computeLane":"frontier_standard","toolLane":"none","contextLane":"minimal"}}}"#,
+        #"{"turnId":"trace-turn","ts":"2026-07-02T12:00:00.000Z","kind":"turn.plan","surface":"chat","payload":{"goalType":"build_task"}}"#,
         #"{"turnId":"plain-turn","ts":"2026-07-02T12:00:01.000Z","kind":"turn.plan","surface":"chat","payload":{}}"#,
-        #"{"turnId":"v5-turn","ts":"2026-07-02T12:00:02.000Z","kind":"turn.terminal","payload":{"schema":"metacognition.observed.v1","status":"completed","modelUsed":"gpt-5.6","reasoningEffort":"high","turnElapsedMs":20,"contextSource":"fluid_context","contextSelectedAtomCount":1,"contextPacketCharacters":64,"contextExpandablePointerCount":0,"toolSchemaCount":1,"recalledMemoryCount":0,"toolDispatchCount":0,"failedToolDispatchCount":0,"contextExpansionCount":0}}"#,
-        #"{"turnId":"v5-turn","ts":"2026-07-02T12:00:03.000Z","kind":"llm.call","payload":{"provider":"openai","model":"gpt-5.6","durationMs":10}}"#,
+        #"{"turnId":"trace-turn","ts":"2026-07-02T12:00:02.000Z","kind":"turn.terminal","payload":{"schema":"metacognition.observed.v1","status":"completed","modelUsed":"gpt-5.6","reasoningEffort":"high","turnElapsedMs":20}}"#,
+        #"{"turnId":"trace-turn","ts":"2026-07-02T12:00:03.000Z","kind":"llm.call","payload":{"provider":"openai","model":"gpt-5.6","durationMs":10}}"#,
         "not-json",
         #"{"turnId":"rejected-event","kind":"turn.terminal","payload":{}}"#,
     ], to: selectedFixture)
@@ -997,27 +993,6 @@ func chatDriveLivingFabricEvalRouteDisclosesTraceWindow() throws {
     #expect(boundedWindow["rejectedEventRows"] as? Int == 1)
     #expect(boundedWindow["eventsRetained"] as? Int == 4)
     #expect(boundedWindow["eventsDiscardedByGlobalCap"] as? Int == 0)
-    let boundedMetacognition = try #require(boundedReport["metacognition"] as? [String: Any])
-    let boundedShadow = try #require(boundedMetacognition["shadowEvaluation"] as? [String: Any])
-    #expect(boundedShadow["recommendationEmission"] as? String == "recommendations emitted")
-    #expect(boundedShadow["recommendations"] as? Int == 1)
-    let boundedCalibration = try #require(boundedMetacognition["outcomeCalibration"] as? [String: Any])
-    #expect(boundedCalibration["recommendations"] as? Int == 1)
-
-    // A populated trace with only a non-v5 plan is distinct from a missing
-    // root, yet it must still say that no recommendations were emitted.
-    let noShadowRoot = root.appendingPathComponent("no-shadow", isDirectory: true)
-    try writeJSONLFixture([
-        #"{"turnId":"plain-only","ts":"2026-07-03T12:00:00.000Z","kind":"turn.plan","payload":{}}"#,
-        #"{"turnId":"plain-only","ts":"2026-07-03T12:00:01.000Z","kind":"turn.terminal","payload":{"status":"completed"}}"#,
-        #"{"turnId":"plain-only","ts":"2026-07-03T12:00:02.000Z","kind":"llm.call","payload":{"provider":"openai"}}"#,
-    ], to: noShadowRoot.appendingPathComponent("turn_traces/2026-07-03.jsonl"))
-    let noShadow = try runCLI(cli, ["living-fabric-eval", noShadowRoot.path])
-    #expect(noShadow.exitCode == 0, "no-shadow trace root failed: \(noShadow.stderr)")
-    let noShadowReport = try jsonObject(noShadow.stdout)
-    let noShadowMetacognition = try #require(noShadowReport["metacognition"] as? [String: Any])
-    let noShadowEvaluation = try #require(noShadowMetacognition["shadowEvaluation"] as? [String: Any])
-    #expect(noShadowEvaluation["recommendationEmission"] as? String == "no recommendations emitted")
 }
 
 // EVAL FENCE: core.misc / cli.chatDrive.livingFabricEval
@@ -1173,13 +1148,22 @@ func chatDriveCLIWellFormedOptionsPreservePositionalBinding() throws {
     #expect(transplantFixture.exitCode == 0, "fixture argv binding failed: \(transplantFixture.stderr)")
     #expect(FileManager.default.fileExists(atPath: fixture.path))
 
-    // Doctor owns no positionals, but its two booleans must still be consumed
-    // as options rather than drifting into a silently ignored argv tail.
+    // Doctor owns no positionals, but its boolean must still be consumed as an
+    // option rather than drifting into a silently ignored argv tail.
     let doctor = try runCLI(cli, [
-        "doctor", "--repair", "false", "--check-llm", "false",
+        "doctor", "--repair", "false",
     ], cwd: cwd, environment: ["NATIVE_AGENT_DATA_ROOT": dataRoot.path])
     #expect(doctor.exitCode == 0, "doctor option binding failed: \(doctor.stderr)")
-    #expect(doctor.stderr.contains("[doctor] repair=false checkLLM=false"))
+    #expect(doctor.stderr.contains("[doctor] repair=false"))
+
+    // FIX-5b: `--check-llm` never selected any behavior. It is gone from the
+    // CLI, and a caller that still passes it must be told so instead of
+    // getting a green report that pretends an LLM was probed.
+    let staleFlag = try runCLI(cli, [
+        "doctor", "--repair", "false", "--check-llm", "true",
+    ], cwd: cwd, environment: ["NATIVE_AGENT_DATA_ROOT": dataRoot.path])
+    #expect(staleFlag.exitCode == 64, "a retired flag must fail loudly: \(staleFlag.stderr)")
+    #expect(staleFlag.stderr.contains("unknown option: --check-llm"))
 
     // Provider-transplant evaluation also has no positionals. A missing
     // fixture is an intentionally non-egress positive binding probe: a bound

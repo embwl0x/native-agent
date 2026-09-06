@@ -523,7 +523,31 @@ private struct InternallyFailingCheck: DoctorCheck {
     // reporting it (upgrade sweep C9-3, 2026-08-28). Read-only — see
     // OAuthTokenExpiryCheckTests.
     #expect(ids.contains("oauth_token_expiry"))
-    #expect(results.count == 10)
+    // session_identity: the one-thread-many-surfaces Phase 0 row.
+    #expect(ids.contains("session_identity"))
+    // 2026-09-02: the two per-turn health rows over the turn-trace feed. Both
+    // are read-only and bounded; neither runs on a turn.
+    #expect(ids.contains("prompt_prefix_health"))
+    #expect(ids.contains("subconscious_vitals"))
+    #expect(results.count == 13)
+}
+
+/// 2026-09-02 incident: the heartbeat pushed "Doctor has 2 failing checks" to
+/// User's phone because two Doctor-only diagnostic rows graded pre-fix history.
+/// The exclusion the heartbeat filters by is DERIVED from these flags, so this
+/// is the one place the two must be kept honest.
+@Test func doctorOnlyChecksAreExcludedFromUnattendedSweeps() async throws {
+    let ineligible = SwiftNativeDoctorChecks.defaultChecks
+        .filter { !$0.heartbeatEligible }
+        .map(\.id)
+    #expect(Set(ineligible) == ["prompt_prefix_health", "subconscious_vitals"])
+    #expect(DoctorHeartbeatPolicy.ineligibleCheckIDs == Set(ineligible))
+    // Every other registered row keeps waking User when it should.
+    for check in SwiftNativeDoctorChecks.defaultChecks
+    where !["prompt_prefix_health", "subconscious_vitals"].contains(check.id) {
+        #expect(check.heartbeatEligible)
+        #expect(DoctorHeartbeatPolicy.isEligible(check.id))
+    }
 }
 
 @Test func swiftNative_runAll_repair_dispatches_to_repairable_checks() async throws {

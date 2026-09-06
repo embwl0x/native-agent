@@ -25,8 +25,6 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
         }
 
         switch route.lowercased() {
-        case "journey", "learning-journey", "experience":
-            return .activity(.journey)
         case "activity/approvals", "approvals":
             return .activity(.approvals)
         case "activity/inbox", "inbox":
@@ -246,7 +244,12 @@ final class NativeAgentAppCoordinator {
     private func installLegacyRouteObservers() {
         guard routeObserverTokens.isEmpty else { return }
 
-        observe(.openNextGenRequest) { _ in .sidebar(.capabilities) }
+        observe(.openNextGenRequest) { _ in
+            // The request is for the Next-gen section, which is collapsed by
+            // default; open it before landing on Capabilities.
+            CapabilitiesDisclosurePreference.setNextGenExpanded(true, in: .standard)
+            return .sidebar(.capabilities)
+        }
         observe(.openApprovalsRequest) { _ in .activity(.approvals) }
         observe(.openTelegramRequest) { _ in .sidebar(.telegram) }
         observe(.openTrustMultimodalRequest) { _ in .sidebar(.trust) }

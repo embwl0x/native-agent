@@ -173,6 +173,20 @@ public protocol SchedulerJobWriter: Sendable {
     /// required")`) or an unknown id (`ValueError("Unknown scheduled job: …")`).
     func cancelJob(jobId: String) async throws -> JSONValue
 
+    /// Pause or resume one scheduled job — the write behind the Scheduler
+    /// screen's enabled/paused control (Fable 5.1 sweep item 36). Returns
+    /// `{"ok": true, "job": <updated job>}` and appends a scheduler activity
+    /// receipt, exactly like `cancelJob`.
+    ///
+    /// Disabling stamps the SAME `enabled=false` + `cancelledAt` tombstone
+    /// `cancelJob` writes, and enabling strips `cancelledAt`. That is not
+    /// decoration: `SchedulerDueJobRunner`'s passive bootstrap pass
+    /// (`ensureDefaultCycleJobs`) forces `enabled=true` on its default cycle
+    /// jobs and only honors a row it can see was deliberately switched off —
+    /// the tombstone IS that signal. Writing a bare `enabled=false` would give
+    /// the user a toggle that silently flips itself back on the next pass.
+    func setJobEnabled(jobId: String, enabled: Bool) async throws -> JSONValue
+
     /// Mirrors `Daemon.list_jobs` — the READ side of
     /// `/v1/scheduler/jobs` (GET) and the `scheduler.list_jobs` connector action.
     /// Reads scheduler/jobs.json under the cross-process flock. Only a missing
@@ -192,6 +206,10 @@ public protocol SchedulerJobWriter: Sendable {
 public extension SchedulerJobWriter {
     func installBlueprintJob(body: JSONValue) async throws -> JSONValue {
         throw TriggerSchedulerError.schedulerInvalid("blueprint installation is unavailable")
+    }
+
+    func setJobEnabled(jobId: String, enabled: Bool) async throws -> JSONValue {
+        throw TriggerSchedulerError.schedulerInvalid("scheduler job pause/resume is unavailable")
     }
 }
 
@@ -506,6 +524,88 @@ extension SwiftNativeTriggerScheduler: SchedulerJobWriter {
         }
 
         // Daemon returns `{"ok": True, "job": dict(target)}`.
+        return .object(["ok": .bool(true), "job": updatedTarget])
+    }
+
+    /// Pause / resume one scheduled job. Same locked read-modify-write and
+    /// activity receipt as `cancelJob`; see the protocol doc for why disabling
+    /// writes the `cancelledAt` tombstone rather than a bare `enabled=false`.
+    public func setJobEnabled(jobId: String, enabled: Bool) async throws -> JSONValue {
+        if jobId.isEmpty {
+            throw TriggerSchedulerError.schedulerInvalid("jobId is required")
+        }
+
+        let updatedTarget: JSONValue = try await runSerialized {
+            [persistence, jobsPath, now] () async throws -> JSONValue in
+            let work: @Sendable () async throws -> JSONValue = {
+                var jobs = try Self.readJobsChecked(at: jobsPath)
+                var matched: JSONValue? = nil
+                for (idx, job) in jobs.enumerated() {
+                    guard case .object(var obj) = job else { continue }
+                    if SchedulerJobNormalizer.pyStrForId(obj["id"]) == jobId {
+                        obj["enabled"] = .bool(enabled)
+                        if enabled {
+                            // An explicit resume clears the tombstone, the same
+                            // way ensureDefaultCycleJobs(reactivateCancelled:)
+                            // does — otherwise the bootstrap pass keeps reading
+                            // this row as deliberately switched off.
+                            obj.removeValue(forKey: "cancelledAt")
+                        } else {
+                            obj["cancelledAt"] =
+                                .string(SwiftNativeTriggerScheduler.isoTimestamp(now()))
+                        }
+                        jobs[idx] = .object(obj)
+                        matched = .object(obj)
+                        break
+                    }
+                }
+                guard let target = matched else {
+                    throw TriggerSchedulerError.schedulerInvalid("Unknown scheduled job: \(jobId)")
+                }
+                do {
+                    try await persistence.writeJSON(.array(jobs), to: jobsPath)
+                } catch {
+                    throw TriggerSchedulerError.persistenceFailure(String(describing: error))
+                }
+                return target
+            }
+            return try await persistence.withFileLock(jobsPath, work)
+        }
+
+        let targetObj: [String: JSONValue]
+        if case .object(let o) = updatedTarget { targetObj = o } else { targetObj = [:] }
+        let detailRaw = SchedulerJobNormalizer.string(
+            SchedulerJobNormalizer.pyOr(targetObj["name"], .string(jobId))
+        ) ?? jobId
+        let title = enabled ? "Scheduled job resumed" : "Scheduled job paused"
+        _ = try await runSerialized { [persistence, activityPath, uuid, now] () async throws -> Int in
+            let event: JSONValue = .object([
+                "id": .string(uuid()),
+                "kind": .string("scheduler"),
+                "title": .string(SchedulerSecretRedactor.redactText(title)),
+                "detail": .string(SchedulerSecretRedactor.redactText(detailRaw)),
+                "status": .string(enabled ? "ok" : "warn"),
+                "executionId": .null,
+                "payload": SchedulerSecretRedactor.redactValue(.object([
+                    "jobId": .string(jobId),
+                    "enabled": .bool(enabled),
+                ])),
+                "createdAt": .string(SwiftNativeTriggerScheduler.isoTimestamp(now())),
+            ])
+            let activityWork: @Sendable () async throws -> Void = {
+                try await appendJSONLCapped(
+                    event,
+                    to: activityPath,
+                    using: persistence,
+                    maxLines: JSONLLineCaps.activityEvents,
+                    logLabel: "SchedulerJobs.setEnabled.activity",
+                    takeLock: false
+                )
+            }
+            try await persistence.withFileLock(activityPath, activityWork)
+            return 0
+        }
+
         return .object(["ok": .bool(true), "job": updatedTarget])
     }
 

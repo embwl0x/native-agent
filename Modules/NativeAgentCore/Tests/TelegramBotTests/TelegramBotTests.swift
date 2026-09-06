@@ -260,6 +260,25 @@ private func readTelegramJSONL(_ root: URL, _ name: String) throws -> [JSONValue
     }
 }
 
+/// 2026-09-06: a slash command no longer runs inline in `tick()`. It runs in
+/// its own detached task that also settles its own claim — handling it inline
+/// made the poll loop wait out the chat's flood cooldown, and detaching only
+/// the reply send let `/restart` arm termination while the reply was still on
+/// the wire. `tick()` therefore returns before the command's effects land, so
+/// a test that asserts those effects has to wait for them instead of reading
+/// straight after the await.
+func telegramWaitFor(
+    timeout: TimeInterval = 5,
+    _ condition: () async -> Bool
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    return await condition()
+}
+
 @Suite(.serialized)
 struct SwiftNativeTelegramBotPhaseBTests {
     private struct FakeVoiceDownloader: TelegramMediaDownloading {
@@ -509,10 +528,13 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let bot = SwiftNativeTelegramBot(dataRoot: root)
         let reply = try await bot.dispatchSwiftSlashCommand("/status", args: [], chatId: 1)
         let s = try #require(reply)
-        #expect(s.contains("Telegram:"))
-        #expect(s.contains("enabled=true"))
-        #expect(s.contains("tokenConfigured=true"))
-        #expect(s.contains("lastSeenAt=never"))
+        // One human sentence: no flag pairs, no session UUID, no poller state.
+        #expect(s.contains("I'm here and idle"))
+        #expect(s.contains("Nothing is waiting on you."))
+        #expect(!s.contains("="))
+        #expect(!s.contains("enabled"))
+        #expect(!s.contains("pollerEnabled"))
+        #expect(!s.contains("\n"))
     }
 
     @Test func dispatchSwiftSlashCommand_unknown_returns_nil() async throws {
@@ -524,7 +546,12 @@ struct SwiftNativeTelegramBotPhaseBTests {
     @Test func telegramApprovalCommand_parses_slash_and_callback_forms() throws {
         #expect(TelegramApprovalCommand.parse(text: "/approve abc") == TelegramApprovalCommand(id: "abc", decision: .approved))
         #expect(TelegramApprovalCommand.parse(text: "/allow abc") == TelegramApprovalCommand(id: "abc", decision: .approved))
-        #expect(TelegramApprovalCommand.parse(text: "/deny@native_agent_bot abc") == TelegramApprovalCommand(id: "abc", decision: .denied))
+        // 2026-09-06: the parser now KEEPS the `@bot` it was addressed to. It
+        // used to strip the suffix without reading it, so a caller reaching the
+        // parser directly would have silently answered an approval addressed to
+        // another bot in the room.
+        #expect(TelegramApprovalCommand.parse(text: "/deny@native_agent_bot abc")
+            == TelegramApprovalCommand(id: "abc", decision: .denied, addressedBot: "native_agent_bot"))
         #expect(TelegramApprovalCommand.parse(text: "/reject abc") == TelegramApprovalCommand(id: "abc", decision: .denied))
         #expect(TelegramApprovalCommand.parse(callbackData: "na_approval:approve:abc") == TelegramApprovalCommand(id: "abc", decision: .approved))
         #expect(TelegramApprovalCommand.parse(callbackData: "na_approval:deny:abc") == TelegramApprovalCommand(id: "abc", decision: .denied))
@@ -700,6 +727,83 @@ struct SwiftNativeTelegramBotPhaseBTests {
             return
         }
         #expect(object["offset"] == .int(702))
+    }
+
+    /// fable51 #9: the no-replay trade is correct; the silence was not. A
+    /// claim left `processing` by a dead process must produce ONE honest
+    /// message on the surface it happened on — and never a second one, however
+    /// many times the loop restarts.
+    @Test func telegramPollLoop_tellsTheSenderOnceThatARestartAteTheirAnswer() async throws {
+        actor Sends {
+            private(set) var chats: [Int] = []
+            private(set) var texts: [String] = []
+            func add(chat: Int, text: String) {
+                chats.append(chat)
+                texts.append(text)
+            }
+        }
+
+        func run(allowedChatIds: Set<Int64>, ticks: Int) async throws -> Sends {
+            let root = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("telegram_lost_turn_\(UUID().uuidString)", isDirectory: true)
+            let offset = root.appendingPathComponent("telegram", isDirectory: true)
+                .appendingPathComponent("last_offset.json")
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let update = TelegramUpdate(
+                updateId: 801,
+                message: TelegramMessage(
+                    messageId: 12,
+                    chatId: 77,
+                    chatType: "private",
+                    fromUserId: 11,
+                    text: "the message whose answer died",
+                    date: 1
+                )
+            )
+            let inbox = TelegramUpdateInbox(offsetURL: offset)
+            _ = try await inbox.ensurePending(update)
+            _ = try await inbox.transition(updateId: 801, from: [.pending], to: .processing)
+
+            let sends = Sends()
+            let emptySession = mockSession { request in
+                (makeResponse(request.url!, 200), Data(#"{"ok":true,"result":[]}"#.utf8))
+            }
+            let loop = TelegramPollLoop(
+                interval: 60,
+                token: tokenStr,
+                allowedChatIds: allowedChatIds,
+                bot: SwiftNativeTelegramBot(dataRoot: root),
+                session: emptySession,
+                dataRoot: root,
+                offsetURL: offset,
+                sendMessage: { _, chatId, text in await sends.add(chat: chatId, text: text) },
+                sendChatAction: { _, _, _ in },
+                sendMessageReturningId: discardTurnCardSend,
+                editMessageText: discardTurnCardEdit,
+                turnCardMinimumEditIntervalSeconds: 0,
+                turnCardHeartbeatNanoseconds: 0,
+                chatHandler: { _, _ in "must never run" },
+                typingRefreshNanoseconds: 0,
+                turnCoordinator: TelegramTurnCoordinator()
+            )
+            for _ in 0..<ticks { _ = await loop.tickOutcome() }
+            #expect(try await inbox.snapshots().first?.phase == .outcomeUnknown)
+            return sends
+        }
+
+        // Spoken once, on Telegram, to the chat it happened in — and a restart
+        // loop (three ticks) cannot repeat it, because the durable phase flip
+        // is the marker.
+        let spoken = try await run(allowedChatIds: [77], ticks: 3)
+        #expect(await spoken.texts == [TelegramPollLoop.lostTurnNotice])
+        #expect(await spoken.chats == [77])
+        #expect(await spoken.texts.first?.contains("say it again") == true)
+
+        // A claim is admitted durably BEFORE the allowlist runs, so an
+        // unauthorized chat can leave one behind. It hears nothing.
+        let silent = try await run(allowedChatIds: [999], ticks: 1)
+        #expect(await silent.texts.isEmpty)
     }
 
     @Test func telegramPollLoop_settlesRehydratedQueuedClaimThatNeverReEnqueues() async throws {
@@ -898,15 +1002,15 @@ struct SwiftNativeTelegramBotPhaseBTests {
             }
         )
         await loop.tick()
+        #expect(await telegramWaitFor { await cap.snapshot().count == 1 })
 
         let calls = await cap.snapshot()
         #expect(calls.count == 1)
         #expect(calls.first?.0 == 77)
-        #expect(calls.first?.1.hasPrefix("Telegram:") == true)
         let status = calls.first?.1 ?? ""
-        for required in ["Runtime:", "Model:", "Session:", "Task:"] {
-            #expect(status.contains(required), "live /status omitted \(required): \(status)")
-        }
+        // One sentence: what she's doing, and whether anything waits on User.
+        #expect(status == "I'm idle. Nothing is waiting on you.")
+        #expect(!status.contains("="))
         #expect(!status.contains(tokenStr))
     }
 
@@ -964,10 +1068,13 @@ struct SwiftNativeTelegramBotPhaseBTests {
             turnCoordinator: coordinator
         )
         await loop.tick()
+        #expect(await telegramWaitFor { await !capture.text.isEmpty })
         let status = await capture.text
-        for required in ["Runtime:", "Model:", "Session:", "Task:"] {
-            #expect(status.contains(required))
-        }
+        // The live surface answers in one sentence — what she's doing, the
+        // model in plain words, and whether anything waits on User.
+        #expect(status.contains("I'm working on"))
+        #expect(status.contains("Nothing is waiting on you."))
+        #expect(!status.contains("="), "live /status printed a flag pair: \(status)")
         #expect(!status.contains(secret), "live /status leaked a token-shaped value: \(status)")
         #expect(status.contains("[REDACTED_TELEGRAM_TOKEN]"))
     }
@@ -997,8 +1104,13 @@ struct SwiftNativeTelegramBotPhaseBTests {
             }
         )
         await loop.tick()
+        let errorsURL = root.appendingPathComponent("telegram/errors.jsonl")
+        #expect(await telegramWaitFor {
+            (try? String(contentsOf: errorsURL, encoding: .utf8))?
+                .contains("migrate_to_chat_id=\(migratedID)") == true
+        })
 
-        let errors = try String(contentsOf: root.appendingPathComponent("telegram/errors.jsonl"), encoding: .utf8)
+        let errors = try String(contentsOf: errorsURL, encoding: .utf8)
         #expect(errors.contains("migrate_to_chat_id=\(migratedID)"))
         let state = try String(contentsOf: root.appendingPathComponent("telegram/state.json"), encoding: .utf8)
         #expect(state.contains("migrate_to_chat_id=\(migratedID)"))
@@ -1283,6 +1395,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             }
         )
         await loop.tick()
+        #expect(await telegramWaitFor { await capture.snapshot().1.count == 1 })
 
         let (plain, menus) = await capture.snapshot()
         #expect(plain.isEmpty)
@@ -1606,6 +1719,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             turnCoordinator: coordinator
         )
         await loop.tick()
+        #expect(await telegramWaitFor { await capture.snapshot().0.count == 2 })
 
         let (sent, calls) = await capture.snapshot()
         #expect(sent == ["first reply", "retry reply"])
@@ -1719,10 +1833,11 @@ struct SwiftNativeTelegramBotPhaseBTests {
         )
 
         await loop.tick()
+        #expect(await telegramWaitFor { await capture.snapshot().count == 2 })
 
         #expect(await capture.snapshot() == [
             "first reply",
-            "(the retry came back empty - check the Mac error log)",
+            "(the retry came back empty \u{2014} check the Mac error log)",
         ])
         let receipts = try readTelegramJSONL(root, "receipts.jsonl")
         let receiptKinds = receipts.compactMap { row -> String? in
@@ -2168,6 +2283,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
             }
         )
         await loop.tick()
+        #expect(await telegramWaitFor { recorder.events.count == 3 })
 
         #expect(recorder.events == [
             "fired:wedged",
@@ -2247,11 +2363,11 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let captured = await cap.snapshot()
         #expect(captured.sent.map { $0.1 } == ["done"])
         #expect(captured.cards.count == 1)
-        #expect(captured.cards[0].1.hasPrefix("Acknowledged ·"))
+        #expect(captured.cards[0].1.hasPrefix("Got your message, starting now."))
         #expect(captured.edits.count > 8)
         #expect(captured.edits.allSatisfy { $0.0 == 333 })
-        #expect(captured.edits.contains { $0.1.contains("Delegate: Codex") })
-        #expect(captured.edits.last?.1.hasPrefix("Completed ·") == true)
+        #expect(captured.edits.contains { $0.1.contains("Codex is on") })
+        #expect(captured.edits.last?.1 == "Done.")
     }
 
     @Test func telegramPollLoop_uploads_generated_images_after_reply() async throws {
@@ -2404,7 +2520,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(await capture.richFinals.count == 1)
         #expect(await capture.ordinary.isEmpty)
         #expect(await capture.photos == [imagePath.path])
-        #expect(await capture.cardEdits.last?.hasPrefix("Completed ·") == true)
+        #expect(await capture.cardEdits.last == "Done.")
         let ledgerURL = root.appendingPathComponent("telegram/work_cards.json")
         let ledgerData = try Data(contentsOf: ledgerURL)
         let ledgerJSON = try JSONValue.parse(ledgerData)
@@ -2462,7 +2578,7 @@ struct SwiftNativeTelegramBotPhaseBTests {
 
         #expect(await capture.richFinalCount == 1)
         #expect(await capture.ordinary.isEmpty)
-        #expect(await capture.cardEdits.last?.hasPrefix("Outcome unknown ·") == true)
+        #expect(await capture.cardEdits.last?.hasPrefix("I can't tell how that ended") == true)
     }
 
     @Test func telegramPollLoop_retries_progress_handler_without_duplicate_user_append() async throws {
@@ -2624,6 +2740,15 @@ struct SwiftNativeTelegramBotPhaseBTests {
         let offset = root
             .appendingPathComponent("telegram", isDirectory: true)
             .appendingPathComponent("last_offset.json")
+        // 2026-09-06 (23e1d8de): the agent's own name left the built-in
+        // correction table — it is whatever the user configured, so its
+        // manglings live per-install at
+        // `<dataRoot>/config/transcript_terms.json` and the poll loop feeds
+        // them to the correction pass as `extra`. This install is Agent.
+        let configDir = root.appendingPathComponent("config", isDirectory: true)
+        try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        try Data(#"{"terms":[{"heard":"ayla","canonical":"Agent"},{"heard":"agent","canonical":"Agent"}]}"#.utf8)
+            .write(to: configDir.appendingPathComponent("transcript_terms.json"))
 
         let raw = #"""
         {"ok":true,"result":[{"update_id":94,"message":{"message_id":8,"chat":{"id":77},"from":{"id":11},"voice":{"file_id":"VOICE_FILE_ID","file_size":10,"mime_type":"audio/ogg","duration":3},"date":1}}]}
@@ -3011,8 +3136,8 @@ struct SwiftNativeTelegramBotPhaseBTests {
         #expect(captured.handlerCalls == 2)
         #expect(captured.sent.map { $0.1 } == ["(drafting stalled; try again in a moment)"])
         #expect(captured.cardSends.count == 1)
-        #expect(captured.cardEdits.contains { $0.hasPrefix("Retrying ·") })
-        #expect(captured.cardEdits.last?.hasPrefix("Failed ·") == true)
+        #expect(captured.cardEdits.contains { $0.hasPrefix("That hiccuped, trying again") })
+        #expect(captured.cardEdits.last?.hasPrefix("That didn't work") == true)
 
         let receipts = try readTelegramJSONL(root, "receipts.jsonl")
         guard case .object(let receiptRow)? = receipts.first else {

@@ -85,7 +85,8 @@ extension NativeClient {
             personaTypeOptions: options,
             abilityOverview: overview,
             pendingRecovery: r.pendingRecovery,
-            resetRequired: r.resetRequired
+            resetRequired: r.resetRequired,
+            profileRepairRequired: r.profileRepairRequired
         )
     }
 
@@ -125,6 +126,30 @@ extension NativeClient {
         )
     }
 
+    /// User, 2026-09-06: the repair lane for `profile_repair_required` — writes
+    /// only memory/profile.json and leaves every persona document untouched.
+    ///
+    /// Unlike complete/reset, this one does NOT refresh the resident mind
+    /// here. A repair happens on an install that has been running for months
+    /// and may well have a turn in flight; the refresh stops and restarts
+    /// Context Flow, so `AppModel.repairOnboardingProfile` owns its timing and
+    /// holds it until the turn closes.
+    func repairOnboardingProfile(agentName: String, personaType: String, userName: String) async throws -> OnboardingCompleteResponse {
+        let impl = onboardingClient()
+        let r = try await impl.repairProfile(payload: OnboardingCompletePayload(
+            agentName: agentName, personaType: personaType, userName: userName
+        ))
+        return OnboardingCompleteResponse(
+            ok: r.ok,
+            agentName: r.agentName,
+            personaType: r.personaType,
+            userName: r.userName,
+            docsWritten: r.docsWritten,
+            error: r.error,
+            detail: r.detail
+        )
+    }
+
     /// Wave 20 (2026-06-01): SwiftNative-only.
     func resetOnboarding(confirm: Bool = true) async throws -> OnboardingResetResponse {
         let impl = onboardingClient()
@@ -142,7 +167,7 @@ extension NativeClient {
 
     // SUBSYSTEM #17: retired Swift wrapper checkOnboardingNeeded — startOnboarding() remains live.
 
-    private func refreshResidentMindAfterOnboardingTransition() async {
+    func refreshResidentMindAfterOnboardingTransition() async {
         async let contextFlow: Void = NativeContextFlowRuntime.shared.reloadConfiguration()
         async let cognition = NativeCognitionRuntime.shared.refreshAfterOnboardingTransition()
         _ = await (contextFlow, cognition)

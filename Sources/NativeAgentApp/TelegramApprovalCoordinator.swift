@@ -72,6 +72,10 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
             "input": payload,
             "telegram": .object([
                 "chatId": .string(chatIdString),
+                // 2026-09-06: the forum topic the approving turn ran in, so
+                // the prompt and its buttons appear in that topic rather than
+                // in the supergroup's General.
+                "threadId": Self.nonEmptyStringValue(replyRoute?.threadId),
                 "sessionId": Self.nonEmptyStringValue(sessionId),
             ]),
             // Preserve the exact transport-authenticated identity through the
@@ -204,6 +208,20 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         )
 
         let resolved = (try? await inbox.get(id)) ?? pending
+        // 2026-09-06: the session the interrupted turn ran in, off the record
+        // itself. Delivering the continuation against the chat's CURRENT
+        // session binding landed the tool result in whatever session a /new or
+        // /resume created while the approval was pending.
+        let originSessionId = Self.approvalSessionId(pending.payload)
+        // 2026-09-06: the topic the interrupted turn ran in, off the record.
+        // The chat id is already proven equal to the caller's by
+        // `validateTelegramDecision`; the thread is not, because a typed
+        // `/approve <id>` can arrive from any topic in the supergroup. The
+        // continuation belongs to the recorded topic either way.
+        let originDestination = TelegramDestination(
+            chatId: chatId,
+            threadId: Self.telegramThreadId(pending.payload)
+        )
         switch decision {
         case .approved:
             if let executed = resolved.executedAction,
@@ -215,7 +233,9 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
                         toolName: pending.action,
                         executedAction: executed,
                         succeeded: false
-                    )
+                    ),
+                    sessionId: originSessionId,
+                    destination: originDestination
                 )
             }
             if let executed = resolved.executedAction {
@@ -226,15 +246,19 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
                         toolName: pending.action,
                         executedAction: executed,
                         succeeded: true
-                    )
+                    ),
+                    sessionId: originSessionId,
+                    destination: originDestination
                 )
             }
             return TelegramApprovalResolution(
-                acknowledgement: "Approved \(pending.action). NativeAgent saved the decision and will reconcile the execution receipt."
+                acknowledgement: "Approved \(pending.action). NativeAgent saved the decision and will reconcile the execution receipt.",
+                destination: originDestination
             )
         case .denied:
             return TelegramApprovalResolution(
-                acknowledgement: "Denied \(pending.action)."
+                acknowledgement: "Denied \(pending.action).",
+                destination: originDestination
             )
         }
     }
@@ -284,6 +308,31 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         guard let storedChatId = Self.telegramChatId(record.payload),
               storedChatId == String(chatId) else {
             throw TelegramApprovalError.chatMismatch
+        }
+    }
+
+    /// 2026-09-06: the chat session recorded on the approval, in the same two
+    /// places the replay executor reads it from (`origin.sessionId`, then the
+    /// legacy `telegram.sessionId`).
+    private static func approvalSessionId(_ payload: JSONValue) -> String? {
+        guard case .object(let obj) = payload else { return nil }
+        func read(_ container: JSONValue?) -> String? {
+            guard case .object(let dict)? = container,
+                  case .string(let value)? = dict["sessionId"] else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return read(obj["origin"]) ?? read(obj["telegram"])
+    }
+
+    private static func telegramThreadId(_ payload: JSONValue) -> Int? {
+        guard case .object(let obj) = payload,
+              case .object(let telegram)? = obj["telegram"] else { return nil }
+        switch telegram["threadId"] {
+        case .string(let value)?: return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        case .int(let value)?: return Int(value)
+        case .double(let value)?: return Int(value)
+        default: return nil
         }
     }
 
@@ -337,7 +386,10 @@ actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling 
         ])
         try await TelegramPollLoop.defaultSendMessageWithReplyMarkup(
             token,
-            chatId,
+            TelegramDestination(
+                chatId: chatId,
+                threadId: Self.telegramThreadId(approval.payload)
+            ),
             text,
             replyMarkup
         )

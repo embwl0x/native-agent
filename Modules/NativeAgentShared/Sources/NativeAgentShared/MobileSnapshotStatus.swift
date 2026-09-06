@@ -31,10 +31,19 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "organism_living_status.json",
                 "sessions.json",
                 "pinned_chat_sessions.json",
+                // The conversation anchor — which chat session the human is
+                // currently active in, on whichever remote surface published
+                // it. Rides in .core with the sessions it refers to so the
+                // phone never sees a pin naming a session it has not received.
+                "chat_anchor.json",
                 "connectors.json",
                 "providers.json",
                 "model_preferences.json",
                 "approvals.json",
+                // Which groups the Mac could NOT rebuild this pass. Rides in
+                // .core because it describes every other group, including the
+                // heavyweight ones the phone may not refresh for hours.
+                "snapshot_staleness.json",
             ]
         case .catalog:
             [

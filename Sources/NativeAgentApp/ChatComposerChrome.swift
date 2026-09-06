@@ -203,6 +203,14 @@ enum ChatComposerSendAction: Equatable {
 /// the live-turn controls whose timing matters.
 struct MacChatComposerControlStrip<InputContent: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    /// ui-simplify 2026-09-02 (Lane A). ON: one material, 16pt radius, a single
+    /// hairline, a soft shadow, plus and mic on the left and a plain send arrow
+    /// on the right — the thing you sit down at. OFF: the previous GlassCard
+    /// strip, unchanged, for the `uiClassicShell` kill switch and the detached
+    /// panels that have not been reshaped yet.
+    var shell: Bool = false
 
     let isListening: Bool
     let screenCaptureAllowed: Bool
@@ -222,9 +230,16 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     /// The whole card is now a focus target; interactive children (menu,
     /// stop/send) keep winning inside their own bounds.
     var onFocusRequest: (() -> Void)?
+    /// Agent, 2026-09-03: the composer must not look identical with the
+    /// keyboard in it as it does at rest. The view cannot own the focus —
+    /// the `@FocusState` belongs to the chat that owns the text field — so
+    /// the owner reports it here. One value, one call site (ChatView); the
+    /// detached panel is on the classic body and keeps the default.
+    var isFocused: Bool = false
     let inputContent: InputContent
 
     init(
+        shell: Bool = false,
         isListening: Bool,
         screenCaptureAllowed: Bool,
         screenCaptureDisabled: Bool,
@@ -239,8 +254,10 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         onStop: @escaping () -> Void,
         onSend: @escaping () -> Void,
         onFocusRequest: (() -> Void)? = nil,
+        isFocused: Bool = false,
         @ViewBuilder inputContent: () -> InputContent
     ) {
+        self.shell = shell
         self.isListening = isListening
         self.screenCaptureAllowed = screenCaptureAllowed
         self.screenCaptureDisabled = screenCaptureDisabled
@@ -255,6 +272,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         self.onStop = onStop
         self.onSend = onSend
         self.onFocusRequest = onFocusRequest
+        self.isFocused = isFocused
         self.inputContent = inputContent()
     }
 
@@ -272,6 +290,167 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     }
 
     var body: some View {
+        if shell {
+            shellBody
+        } else {
+            classicBody
+        }
+    }
+
+    // MARK: - The shell composer
+
+    private var shellBody: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            inputContent
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 6) {
+                Menu {
+                    Button(action: onCaptureScreen) {
+                        Label(
+                            screenCaptureAllowed ? "Show Agent My Screen" : "Enable Screen Capture in Trust",
+                            systemImage: "camera.viewfinder"
+                        )
+                    }
+                    .disabled(screenCaptureDisabled)
+                    Button(action: onAttach) {
+                        Label("Attach Image or File…", systemImage: "paperclip")
+                    }
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "plus")
+                            .font(ShellType.bodyMedium)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .frame(width: 32, height: 32)
+                            .contentShape(Rectangle())
+                        if pendingAttachmentCount > 0 {
+                            Text("\(pendingAttachmentCount)")
+                                .font(NativeAgentFont.tag)
+                                .foregroundStyle(.white)
+                                .padding(3)
+                                .background(NativeAgentBrand.accent, in: Circle())
+                                .offset(x: 4, y: -2)
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Screen capture and attachments")
+                .accessibilityLabel(optionsAccessibilityLabel)
+
+                Button(action: onToggleVoice) {
+                    Image(systemName: isListening ? "mic.fill" : "mic")
+                        .font(ShellType.bodyMedium)
+                        .foregroundStyle(isListening ? Color.red : NativeAgentShell.secondary)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isListening ? "Stop listening" : "Voice input")
+                .accessibilityLabel(isListening ? "Stop listening" : "Voice input")
+
+                Spacer(minLength: 8)
+
+                if isRunning {
+                    Button(action: onStop) {
+                        Image(systemName: "stop.fill")
+                            .font(ShellType.labelSemibold)
+                            .frame(width: 36, height: 36)
+                            .background(
+                                Color.red.opacity(0.85),
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            )
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Stop generation")
+                    .accessibilityLabel("Stop generation")
+                }
+
+                Button(action: onSend) {
+                    Image(systemName: "arrow.right")
+                        .font(ShellType.body)
+                        .frame(width: 36, height: 36)
+                        .background(
+                            canSend ? Color.primary.opacity(0.12) : NativeAgentShell.quietFill,
+                            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        )
+                        .foregroundStyle(canSend ? NativeAgentShell.text : NativeAgentShell.tertiary)
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSend)
+                .animation(
+                    NativeAgentMotion.respecting(NativeAgentMotion.snappy, reduceMotion: reduceMotion),
+                    value: canSend
+                )
+                .help("\(sendAction.label). \(sendAction.hint)")
+                .accessibilityLabel(sendAction.label)
+                .accessibilityHint(sendAction.hint)
+            }
+        }
+        // The room's gutter, inside the glass: the field's first character
+        // lands on the first character of her replies and the box's inner
+        // right edge on their last (708 + 2 x 16 = the 740 column).
+        // Agent, 2026-09-03: the box was 87,360px of fill against 76,291px of
+        // ink in a full screen of her reply — the emptiest object on screen
+        // was also the heaviest. Three of those points come back off the
+        // vertical padding (91 -> 88).
+        .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+        .padding(.top, 12)
+        .padding(.bottom, 11)
+        // User, 2026-09-03: the composer floats over content — the functional
+        // layer — so it is real glass now, not a painted slab. Glass carries
+        // its own lensing and shadow, so the hairline and the hand shadow are
+        // gone with it. Reduce transparency still gets the opaque fill: that
+        // setting asks for more opacity, never less.
+        .background {
+            if reduceTransparency {
+                RoundedRectangle(
+                    cornerRadius: NativeAgentShellLayout.composerRadius,
+                    style: .continuous
+                )
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .overlay {
+                    RoundedRectangle(
+                        cornerRadius: NativeAgentShellLayout.composerRadius,
+                        style: .continuous
+                    )
+                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+                }
+            }
+        }
+        .glassEffect(
+            reduceTransparency ? .identity : .regular.interactive(),
+            in: RoundedRectangle(
+                cornerRadius: NativeAgentShellLayout.composerRadius,
+                style: .continuous
+            )
+        )
+        // Agent, 2026-09-03: held. One hairline lift when the field has the
+        // keyboard — not a tint, not a glow, not a second shadow. Reduce
+        // transparency already draws this border permanently on its opaque
+        // fill, so the focused state stays out of its way there.
+        .overlay {
+            if isFocused, !reduceTransparency {
+                // Agent, 2026-09-03: the hairline only showed on the top rim
+                // over glass; one step of fill reads as "held" all round.
+                RoundedRectangle(
+                    cornerRadius: NativeAgentShellLayout.composerRadius,
+                    style: .continuous
+                )
+                .fill(Color.primary.opacity(0.04))
+                .allowsHitTesting(false)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isFocused)
+        .contentShape(Rectangle())
+        .onTapGesture { onFocusRequest?() }
+    }
+
+    // MARK: - The classic composer (unchanged)
+
+    private var classicBody: some View {
         GlassCard(tint: NativeAgentBrand.accent.opacity(0.2)) {
             HStack(alignment: .bottom, spacing: NativeAgentSpacing.sm) {
                 Menu {

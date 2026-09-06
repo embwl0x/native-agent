@@ -888,6 +888,21 @@ public actor SwiftNativeLoopScheduler {
     private var failureRecoveryProbePending: Set<String> = []
     private var lastFailurePushAt: [String: Date] = [:]
     private var consecutiveFailures: [String: Int] = [:]
+    /// FIX-13: the receipt row this process appended last. Coalescing a repeat
+    /// failure is decided from this plus `consecutiveFailures`, so the feed is
+    /// never read to write to it. `bytes` is the exact serialized line and is
+    /// re-verified against the file's tail before any in-place rewrite.
+    private struct LastFailureReceipt: Sendable {
+        let incident: FailureReceiptIncident
+        let id: String
+        let bytes: Data
+    }
+    private var lastFailureReceipt: LastFailureReceipt?
+    /// Byte budget that amortizes the failure-feed line cap, exactly as
+    /// `activityTrimTriggerBytes` / `traceTrimTriggerBytes` do for their feeds.
+    /// Below it the cap is not evaluated at all, so an append costs one write
+    /// rather than a full read + rewrite of the accumulated receipts.
+    private static let failureReceiptTrimTriggerBytes = 1024 * 1024
     private var failureStreakStartedAt: [String: Date] = [:]
     private let failurePushCooldown: TimeInterval = 6 * 60 * 60
     private let failurePushConsecutiveThreshold = 2
@@ -1641,6 +1656,20 @@ public actor SwiftNativeLoopScheduler {
         return "\(type(of: error)) (\(ns.domain) code \(ns.code))"
     }
 
+    /// FIX-13: per receipt, this path used to read the WHOLE failure feed,
+    /// coalesce in memory, rewrite it durably, and then let `enforceJSONLLineCap`
+    /// read and rewrite it a second time — all under the feed lock, at exactly
+    /// the moment a flapping loop mints receipts fastest (4 MB of I/O per row on
+    /// a 1 MB feed). It is now append-only:
+    ///   * the coalescing DECISION comes from the in-memory consecutive-failure
+    ///     streak plus the row this process last wrote, never from re-reading;
+    ///   * a coalesced repeat rewrites only the trailing line in place (and
+    ///     therefore needs no cap check — the line count did not change);
+    ///   * a new row goes through the shared capped append, whose line cap is
+    ///     amortized behind the same byte trigger `activity/events.jsonl` and
+    ///     `traces/events.jsonl` already use.
+    /// The on-disk shape is unchanged, so `durableLastPushAt` and every other
+    /// reader still see one coalesced row per incident.
     private func appendFailureReceipt(loopId: String, error: String) async {
         guard let failureReceiptsPath else { return }
         guard !Self.isOfflineError(error) else { return }
@@ -1649,43 +1678,94 @@ public actor SwiftNativeLoopScheduler {
             ? "unspecified failure (empty error description)"
             : String(trimmed.prefix(2_000))
         let now = ISO8601DateFormatter().string(from: clock())
-        let mayCoalesce = (consecutiveFailures[loopId] ?? 0) > 0
         let incident = FailureReceiptIncident(
             loopId: loopId,
             error: boundedError,
             firstAt: now,
             lastAt: now
         )
+        // Same predicate as before — "this loop is mid-streak and the last
+        // receipt was this exact failure" — but answered from memory.
+        let coalesceTarget: LastFailureReceipt? = {
+            guard (consecutiveFailures[loopId] ?? 0) > 0,
+                  let last = lastFailureReceipt,
+                  last.incident.loopId == loopId,
+                  last.incident.error == boundedError else { return nil }
+            return last
+        }()
+        let path = failureReceiptsPath
+        let persistence = self.persistence
         do {
-            try await persistence.withFileLock(failureReceiptsPath) {
-                let rows = (try? await persistence.readJSONL(failureReceiptsPath)) ?? []
-                let nextRows = coalescedFailureReceiptRows(
-                    rows,
-                    appending: incident,
-                    mayCoalesce: mayCoalesce
-                )
-                try await persistence.writeDataAtomicDurable(
-                    try renderJSONL(nextRows),
-                    to: failureReceiptsPath
-                )
-                let dropped = try enforceJSONLLineCap(
-                    at: failureReceiptsPath,
-                    maxLines: JSONLLineCaps.backgroundLoopFailures
-                )
-                if dropped > 0 {
-                    NSLog(
-                        "%@: %@ cap dropped %d oldest line(s)",
-                        "BackgroundLoops.failures",
-                        failureReceiptsPath.lastPathComponent,
-                        dropped
-                    )
+            let written: LastFailureReceipt? = try await persistence.withFileLock(path) {
+                if let target = coalesceTarget {
+                    let merged = target.incident.coalescing(incident)
+                    let row = merged.toJSON(id: target.id)
+                    if let bytes = try? Self.jsonlLineBytes(row),
+                       Self.replaceTrailingLine(target.bytes, with: bytes, at: path) {
+                        return LastFailureReceipt(incident: merged, id: target.id, bytes: bytes)
+                    }
+                    // The tail is not ours any more (another process appended,
+                    // or the feed was trimmed): fall through and append.
                 }
+                let id = UUID().uuidString.lowercased()
+                let row = incident.toJSON(id: id)
+                try await appendJSONLCapped(
+                    row,
+                    to: path,
+                    using: persistence,
+                    maxLines: JSONLLineCaps.backgroundLoopFailures,
+                    logLabel: "BackgroundLoops.failures",
+                    takeLock: false,
+                    trimWhenBytesExceed: Self.failureReceiptTrimTriggerBytes,
+                    durable: true
+                )
+                guard let bytes = try? Self.jsonlLineBytes(row) else { return nil }
+                return LastFailureReceipt(incident: incident, id: id, bytes: bytes)
             }
+            lastFailureReceipt = written
         } catch {
+            // The row may or may not have landed — forget the memo rather than
+            // coalescing the next failure into a line we cannot vouch for.
+            lastFailureReceipt = nil
             FileHandle.standardError.write(Data(
                 "BackgroundLoops: failed to persist \(loopId) failure receipt: \(error)\n".utf8
             ))
         }
+    }
+
+    /// The exact bytes `appendJSONLDurable` writes for one row.
+    private static func jsonlLineBytes(_ row: JSONValue) throws -> Data {
+        Data((try row.serialize(pretty: false) + "\n").utf8)
+    }
+
+    /// Rewrites ONLY the feed's trailing line, in place, and returns whether it
+    /// did. False means the tail is not the bytes we remember writing — another
+    /// process appended, or a trim moved the file — and the caller must append a
+    /// fresh row instead of clobbering someone else's receipt. The replacement
+    /// is written BEFORE the truncate so no interruption can leave the row
+    /// missing entirely. The caller holds the feed lock.
+    private static func replaceTrailingLine(
+        _ expected: Data, with replacement: Data, at path: URL
+    ) -> Bool {
+        guard !expected.isEmpty, !replacement.isEmpty else { return false }
+        guard let handle = try? FileHandle(forUpdating: path) else { return false }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd(), size >= UInt64(expected.count) else { return false }
+        let offset = size - UInt64(expected.count)
+        guard (try? handle.seek(toOffset: offset)) != nil,
+              let tail = try? handle.readToEnd(),
+              tail == expected else { return false }
+        do {
+            try handle.seek(toOffset: offset)
+            try handle.write(contentsOf: replacement)
+            try handle.truncate(atOffset: offset + UInt64(replacement.count))
+            // The append this replaces was fsync'd; the rewrite must not be the
+            // weak link.
+            try handle.synchronize()
+        } catch {
+            return false
+        }
+        return true
     }
 
     /// A4.2/A4.8: count this failure into the loop's consecutive-failure
@@ -1881,41 +1961,6 @@ public actor SwiftNativeLoopScheduler {
     }
 }
 
-private func coalescedFailureReceiptRows(
-    _ rows: [JSONValue],
-    appending incident: FailureReceiptIncident,
-    mayCoalesce: Bool
-) -> [JSONValue] {
-    guard mayCoalesce,
-          let last = rows.last,
-          let prior = FailureReceiptIncident(row: last),
-          prior.loopId == incident.loopId,
-          prior.error == incident.error else {
-        return rows + [incident.toJSON(id: UUID().uuidString.lowercased())]
-    }
-
-    var next = rows
-    next[next.count - 1] = prior.coalescing(incident).toJSON(
-        id: failureReceiptID(from: last) ?? UUID().uuidString.lowercased()
-    )
-    return next
-}
-
-private func failureReceiptID(from row: JSONValue) -> String? {
-    guard case .object(let object) = row,
-          case .string(let id)? = object["id"] else { return nil }
-    return id
-}
-
-private func renderJSONL(_ rows: [JSONValue]) throws -> Data {
-    var data = Data()
-    for row in rows {
-        data.append(try row.serializedData(pretty: false))
-        data.append(0x0A)
-    }
-    return data
-}
-
 // MARK: - DoctorAutoRunLoop
 
 import DoctorChecks
@@ -1951,12 +1996,19 @@ public struct DoctorAutoRunLoop: LoopRunner {
     public func tickOutcome() async -> LoopTickOutcome {
         do {
             let results = try await doctorChecks.runAll(repair: false, checkLLM: false)
+            // No checks ran ⇒ nothing was inspected. Persisting `{"checks":[]}`
+            // would be worse than useless: every reader derives "healthy" from
+            // "no check has status fail", so an empty snapshot reads as a clean
+            // bill of health for a body nobody examined.
+            guard !results.isEmpty else {
+                return .skipped(reason: "doctor produced no check results")
+            }
             let dir = try await storage()
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let target = dir.appendingPathComponent("latest.json")
             let payload = try encodePayload(results: results)
             try await SwiftNativePersistenceCore().writeJSON(payload, to: target)
-            return .completed(result: "doctor snapshot persisted")
+            return .completed(result: "doctor snapshot persisted (\(results.count) check(s))")
         } catch {
             FileHandle.standardError.write(Data("DoctorAutoRunLoop: tick failed: \(error)\n".utf8))
             return .failed(error: String(describing: error))

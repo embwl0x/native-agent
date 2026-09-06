@@ -5,14 +5,32 @@ public struct ProviderStreamGuardConfig: Sendable, Equatable {
     public var wallTimeout: TimeInterval
     public var checkInterval: TimeInterval
 
+    /// The ceiling every configured timeout is clamped to. User, 2026-09-06:
+    /// `TimeInterval("inf")` and `TimeInterval("1e400")` both parse, `max(0, …)`
+    /// let them straight through, and `UInt64(wall * 1_000_000_000)` at the
+    /// completion wall in `LLMClient+Real` TRAPS on a non-finite or
+    /// out-of-range Double — a typo in one env var crashed the process on the
+    /// next provider call. A day is far past any timeout that means anything
+    /// and is comfortably representable in nanoseconds.
+    public static let maximumTimeout: TimeInterval = 86_400
+
+    /// Clamp at construction, so every path — env parse, direct init, test
+    /// injection — carries a finite, representable number of seconds. NaN
+    /// (which compares false against everything) takes the floor, matching what
+    /// the old `max(0, …)` already did with it.
+    private static func bounded(_ value: TimeInterval, floor: TimeInterval) -> TimeInterval {
+        guard !value.isNaN else { return floor }
+        return Swift.min(Swift.max(floor, value), maximumTimeout)
+    }
+
     public init(
         idleTimeout: TimeInterval = 90,
         wallTimeout: TimeInterval = 600,
         checkInterval: TimeInterval = 0.5
     ) {
-        self.idleTimeout = max(0, idleTimeout)
-        self.wallTimeout = max(0, wallTimeout)
-        self.checkInterval = max(0.01, checkInterval)
+        self.idleTimeout = Self.bounded(idleTimeout, floor: 0)
+        self.wallTimeout = Self.bounded(wallTimeout, floor: 0)
+        self.checkInterval = Self.bounded(checkInterval, floor: 0.01)
     }
 
     public var isEnabled: Bool {

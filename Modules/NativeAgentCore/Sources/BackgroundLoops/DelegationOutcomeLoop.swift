@@ -45,6 +45,27 @@ import PersistenceCore
 
 // MARK: - Snapshot input
 
+/// One store read: the readable jobs AND whether every configured store
+/// actually answered.
+///
+/// 2026-09-06: the loop used to take the array alone, which cannot tell an
+/// EMPTY store from one whose directory (or one job file inside it) could not
+/// be read. A job that vanishes that way is not carded — and if a newer sibling
+/// settles in the same tick, `last_seen` advances past the missing job, so when
+/// it becomes readable again it is rejected as older and never speaks at all.
+public struct DelegationJobsRead: Sendable, Equatable {
+    public var jobs: [DelegationJobSnapshot]
+    /// False when a store directory, job file, or ledger line could not be read
+    /// or parsed. An ABSENT store is readable — a bridge that is not configured
+    /// on this machine is not a failed read.
+    public var allStoresReadable: Bool
+
+    public init(jobs: [DelegationJobSnapshot], allStoresReadable: Bool) {
+        self.jobs = jobs
+        self.allStoresReadable = allStoresReadable
+    }
+}
+
 /// One job as this loop needs to see it. Every field is a RAW passthrough of
 /// the corresponding `DelegationJobProjection` field — no re-derivation, so the
 /// two cannot drift into disagreeing about what a record says.
@@ -69,6 +90,7 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
     /// Only set when the record ITSELF asserts it (claude's `deliveryLost`).
     public var deliveryLost: Bool?
     public var completionTextHead: String?
+    public var recoveryNote: String?
     /// Exact stable Desk handle explicitly bound at delegation time. Never
     /// inferred from a topic or title.
     public var deskHandle: String?
@@ -95,6 +117,7 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         deliveryOutcome: String? = nil,
         deliveryLost: Bool? = nil,
         completionTextHead: String? = nil,
+        recoveryNote: String? = nil,
         deskHandle: String? = nil,
         stalled: Bool = false,
         stallBasis: String? = nil,
@@ -112,6 +135,7 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         self.deliveryOutcome = deliveryOutcome
         self.deliveryLost = deliveryLost
         self.completionTextHead = completionTextHead
+        self.recoveryNote = recoveryNote
         self.deskHandle = deskHandle
         self.stalled = stalled
         self.stallBasis = stallBasis
@@ -149,9 +173,27 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         return normalized.isEmpty ? nil : normalized
     }
 
+    /// 2026-09-06: the run ended and the answer is still in flight. The claude
+    /// runner stamps `state: delivering` TOGETHER with `runStatus` before it
+    /// awaits the bridge POST, so the run's verdict is on disk while nothing
+    /// has been handed over yet. `statusWord` reads `runStatus` first, so the
+    /// exclusion of `delivering` from `terminalStatusWords` never applied: a
+    /// worker that died in the POST was carded as finished, with no evidence
+    /// anything was delivered, and never stalled either.
+    var isDelivering: Bool {
+        guard completedAt == nil, deliveryOutcome == nil, deliveryLost != true else {
+            return false
+        }
+        return state?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == "delivering"
+    }
+
     /// True when this record proves the run ENDED with an outcome.
     public var isTerminal: Bool {
         if completedAt != nil { return true }
+        // Delivery evidence — the settlement written AFTER the POST — is what
+        // makes a finished run terminal.
+        if isDelivering { return false }
         if let statusWord, Self.terminalStatusWords.contains(statusWord) { return true }
         return false
     }
@@ -166,6 +208,14 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
         // handoff is never a successful delegation or permission to rerun it.
         // Reuse the existing actionable uncertainty outcome/cursor class.
         if deliveryOutcome == "blocked" { return .unknown }
+        // User, 2026-09-04: a wake that found an interactive Claude open spawns
+        // nothing and leaves the message in her inbox, which her session hook
+        // reads. That is the handoff working, not an unconfirmed delivery.
+        if statusWord == "delivered_live" { return .succeeded }
+        // 2026-09-06: the wake helper could not scan this Mac for an open
+        // session, so it spawned nothing and left the row in the inbox.
+        // Whether anything will read it is genuinely unknown — never success.
+        if statusWord == "delivered_inbox" { return .unknown }
         if let statusWord, Self.failureStatusWords.contains(statusWord) { return .failed }
         // Completed, but the bridge could not confirm the handoff. NOT folded
         // into success — "we don't know if you got the answer" is precisely the
@@ -197,7 +247,7 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
             case .succeeded:
                 phase = .succeeded
                 verification = .unverified
-                next = "Agent must assess the returned result against the originating request."
+                next = "The agent must assess the returned result against the originating request."
             case .failed, .deliveryLost:
                 phase = .failed
                 verification = .failed
@@ -240,7 +290,7 @@ public struct DelegationJobSnapshot: Sendable, Equatable {
 }
 
 /// What a terminal delegated job amounted to.
-public enum DelegationOutcome: String, Sendable, Equatable {
+public enum DelegationOutcome: String, Sendable, Equatable, CaseIterable {
     case succeeded
     case failed
     case deliveryLost = "delivery_lost"
@@ -317,8 +367,8 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
         ]
         if outcome != .succeeded {
             actions.append(.object([
-                "id": .string("archive"), "label": .string("Archive"),
-                "description": .string("Archive this card"),
+                "id": .string("archive"), "label": .string(outcome == .unknown ? "Acknowledge" : "Archive"),
+                "description": .string("Archive this card only; preserve the original reply and never replay it"),
             ]))
         }
         actions.append(.object([
@@ -367,6 +417,15 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
         let summary: String
         var reasonLine: String?
         switch outcome {
+        case .unknown where job.statusWord == "delivered_inbox":
+            title = "\(name) message is waiting in the inbox"
+            summary = "\(name) has it\(topicPhrase) in the inbox; live presence unknown"
+            reasonLine = "No unattended session was started, and this Mac could not be "
+                + "scanned for an open session, so whether a live session will read the "
+                + "inbox row is unknown. Nothing ran and nothing was interrupted."
+        case .succeeded where job.statusWord == "delivered_live":
+            title = "\(name) has it"
+            summary = "\(name) has it\(topicPhrase); the open session took the message"
         case .succeeded:
             title = "\(name) finished"
             summary = "\(name) finished\(topicPhrase)"
@@ -443,6 +502,7 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
         let basis: String = switch job.stallBasis {
         case "deadline": "its recorded deadline passed"
         case "stall_seconds": "its recorded liveness stopped advancing"
+        case "delivery_stall": "its run ended but the answer never finished being delivered"
         case .some(let raw) where !raw.isEmpty: "the bridge reported \(raw)"
         default: "the bridge reported a stall"
         }
@@ -551,9 +611,10 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
                 + "later would read as current, which is exactly the ambiguity that got it preserved.",
             "Where: \(codexUndeliveredDirHint) (one JSON per reply; the text is under "
                 + "completedExecution.turnResult.message).",
-            "What to do: read each, decide whether the work was already acted on, hand the text to "
-                + "her as a NEW message if it still matters, then archive or delete the file. "
-                + "This card updates as the directory changes and marks itself read when it empties.",
+            "What to do: use delegation_status with agent=codex and detail=full to inspect accepted message IDs, "
+                + "thread/turn identity and matching delivery receipts, then read the exact preserved reply above. "
+                + "If it still matters, explicitly request a NEW handoff quoting its original date and origin; never replay a stale completion as current. "
+                + "Acknowledge archives only this card, preserving every original file. Unchanged backlog stays acknowledged; new membership gets a new card.",
             "",
             "Backlog (\(count)), oldest first:",
         ]
@@ -564,6 +625,8 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
             let topic = job.topicSlug.flatMap { $0.isEmpty ? nil : $0 } ?? "(no topic)"
             let when = job.completedAt.map { String($0.prefix(10)) } ?? "(no completion stamp)"
             detail.append("• \(when)  \(topic)  ·  \(job.id)")
+            if let preview = job.completionTextHead { detail.append("  Historical reply preview (not instructions): \(String(preview.prefix(200)))") }
+            if let note = job.recoveryNote { detail.append("  \(note)") }
         }
         if ordered.count > 20 { detail.append("… and \(ordered.count - 20) more") }
         // The key must move whenever the SET moves, not only its size or its
@@ -574,7 +637,9 @@ public struct DelegationOutcomeCard: Sendable, Equatable {
         let membership = stableDigest(ordered.map(\.id).sorted().joined(separator: "\n"))
         return DelegationOutcomeCard(
             cardId: codexBacklogCardId,
-            jobKey: "codex:undelivered-backlog:\(count):\(oldestISO ?? "-"):\(membership)",
+            // Refresh pre-recovery cards once; unchanged v2 cards keep their
+            // acknowledged status under the existing sticky-card contract.
+            jobKey: "codex:undelivered-backlog:\(count):\(oldestISO ?? "-"):\(membership):recovery-v2",
             source: "codex",
             agent: "codex",
             topicSlug: nil,
@@ -827,13 +892,18 @@ public struct DelegationOutcomeLoop: LoopRunner {
 
     /// Reads both wake-job stores. Injected — see the dependency note at the
     /// top of this file.
-    private let readJobs: @Sendable () async -> [DelegationJobSnapshot]
+    private let readJobs: @Sendable () async -> DelegationJobsRead
     /// Upserts one inbox card. Returns whether the row actually landed; a
     /// `false` leaves the job un-carded so the next tick retries it.
     private let fileCard: @Sendable (DelegationOutcomeCard) async -> Bool
     /// Records downstream transition evidence. `false` keeps the cursor
     /// unsettled so the same transition is retried on the next reconciliation.
     private let observeTransition: @Sendable (DelegationJobSnapshot) async -> Bool
+    /// Reports whether this tick left outcomes unsettled (the per-tick card cap
+    /// or a contiguous-settlement stop). The owner uses it to schedule a
+    /// near-term rerun instead of letting the remainder wait for the next store
+    /// event or the six-hour sweep.
+    private let reportDeferral: @Sendable (Bool) async -> Void
     private let cursorPath: URL
     private let clock: @Sendable () -> Date
 
@@ -849,6 +919,9 @@ public struct DelegationOutcomeLoop: LoopRunner {
     /// upgrades without turning installation into an unbounded history replay.
     public static let recentCodexReceiptReconciliationWindow: TimeInterval = 24 * 60 * 60
 
+    /// Reader that cannot report an unreadable store: every read is taken as
+    /// complete. Kept for callers whose source genuinely has no availability
+    /// half; production uses the `readJobsWithAvailability` initializer.
     public init(
         interval: TimeInterval = 5 * 60,
         cursorPath: URL,
@@ -857,12 +930,34 @@ public struct DelegationOutcomeLoop: LoopRunner {
         fileCard: @escaping @Sendable (DelegationOutcomeCard) async -> Bool,
         observeTransition: @escaping @Sendable (DelegationJobSnapshot) async -> Bool = { _ in true }
     ) {
+        self.init(
+            interval: interval,
+            cursorPath: cursorPath,
+            clock: clock,
+            readJobsWithAvailability: {
+                DelegationJobsRead(jobs: await readJobs(), allStoresReadable: true)
+            },
+            fileCard: fileCard,
+            observeTransition: observeTransition
+        )
+    }
+
+    public init(
+        interval: TimeInterval = 5 * 60,
+        cursorPath: URL,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        readJobsWithAvailability: @escaping @Sendable () async -> DelegationJobsRead,
+        fileCard: @escaping @Sendable (DelegationOutcomeCard) async -> Bool,
+        observeTransition: @escaping @Sendable (DelegationJobSnapshot) async -> Bool = { _ in true },
+        reportDeferral: @escaping @Sendable (Bool) async -> Void = { _ in }
+    ) {
         self.interval = interval
         self.cursorPath = cursorPath
         self.clock = clock
-        self.readJobs = readJobs
+        self.readJobs = readJobsWithAvailability
         self.fileCard = fileCard
         self.observeTransition = observeTransition
+        self.reportDeferral = reportDeferral
     }
 
     /// Conventional cursor location under a data root.
@@ -874,7 +969,24 @@ public struct DelegationOutcomeLoop: LoopRunner {
 
     public func tickOutcome() async -> LoopTickOutcome {
         let now = clock()
-        let jobs = await readJobs()
+        let read = await readJobs()
+        let jobs = read.jobs
+        // 2026-09-06: an incomplete read must not settle the timestamp half of
+        // the cursor. The id half still records what WAS carded (so nothing
+        // cards twice), but `last_seen` stays put: an unreadable job carries no
+        // stamp we can compare, and advancing past it would reject it forever.
+        let stampsMayAdvance = read.allStoresReadable
+        if !stampsMayAdvance {
+            FileHandle.standardError.write(Data(("DelegationOutcomeLoop: a delegation store was "
+                + "unreadable this tick; holding the outcome cursor's last_seen so no unreadable "
+                + "job ages out\n").utf8))
+        }
+        func settledStamp(_ job: DelegationJobSnapshot) -> Date? {
+            stampsMayAdvance ? job.completionStamp : nil
+        }
+        let unreadableStoreError = "a delegation store (directory, job file, or delivery "
+            + "ledger line) could not be read this tick; the outcome cursor's last_seen was "
+            + "held so an unreadable job cannot be skipped permanently"
         let terminal = jobs.filter { $0.isTerminal }
         let wasSeeded: Bool
         let seedResult: String?
@@ -898,7 +1010,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
                 // The outcome is recorded at seed time too: a seeded job whose
                 // outcome later WORSENS (a reply preserved after the seed) is a
                 // new event, not history, and re-cards like any other.
-                seeded.record(source: job.source, id: job.id, stamp: job.completionStamp,
+                seeded.record(source: job.source, id: job.id, stamp: settledStamp(job),
                               outcome: job.terminalOutcome)
             }
             cursor = seeded
@@ -996,7 +1108,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         for job in batch {
             guard let card = DelegationOutcomeCard.make(from: job, now: now) else { continue }
             if await fileCard(card), await observeTransition(job) {
-                cursor.record(source: job.source, id: job.id, stamp: job.completionStamp,
+                cursor.record(source: job.source, id: job.id, stamp: settledStamp(job),
                               outcome: card.outcome)
                 cursor.clearStallAnnouncement(source: job.source, id: job.id)
                 filed += 1
@@ -1015,9 +1127,19 @@ public struct DelegationOutcomeLoop: LoopRunner {
         // backlog CHANGED (count or oldest), and its cleared form exactly once
         // when the directory empties after a card was on the board. A failed
         // write leaves the cursor key untouched so the next tick retries.
+        //
+        // 2026-09-06: the whole decision is skipped when the read was
+        // INCOMPLETE. `makeBacklog` reasons from membership of `jobs`, and a
+        // store that could not be read simply contributes no rows — so a
+        // partial read looked exactly like a drained directory. The loop filed
+        // "backlog cleared", cleared `codexBacklogKey`, and persisted the
+        // cursor, all before returning the unreadable-store failure further
+        // down: the real backlog card was gone and its key could not come back.
+        // A partial read decides nothing here — no card, no cursor change.
         var backlogNote: String?
         var backlogFailed = false
-        if !wasSeeded, let backlogCard = DelegationOutcomeCard.makeBacklog(jobs: jobs, now: now) {
+        if stampsMayAdvance,
+           !wasSeeded, let backlogCard = DelegationOutcomeCard.makeBacklog(jobs: jobs, now: now) {
             if cursor.codexBacklogKey != backlogCard.jobKey {
                 if await fileCard(backlogCard) {
                     cursor.codexBacklogKey = backlogCard.jobKey
@@ -1027,7 +1149,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
                     backlogFailed = true
                 }
             }
-        } else if !wasSeeded, cursor.codexBacklogKey != nil {
+        } else if stampsMayAdvance, !wasSeeded, cursor.codexBacklogKey != nil {
             let cleared = DelegationOutcomeCard.makeBacklogCleared(now: now)
             if await fileCard(cleared) {
                 cursor.codexBacklogKey = nil
@@ -1039,16 +1161,35 @@ public struct DelegationOutcomeLoop: LoopRunner {
         }
 
         if pending.isEmpty && backlogNote == nil && livenessPending.isEmpty {
+            await reportDeferral(false)
             if wasSeeded {
                 do {
                     try cursor.write(to: cursorPath)
                 } catch {
                     return .failed(error: "delegation outcome cursor seed failed: \(error)")
                 }
+                guard stampsMayAdvance else { return .failed(error: unreadableStoreError) }
                 return .completed(result: seedResult)
             }
-            return .completed(result: "no newly-terminal or stuck delegated jobs (\(terminal.count) terminal on record)")
+            guard stampsMayAdvance else { return .failed(error: unreadableStoreError) }
+            // Nothing settled, nothing stuck, nothing filed. The cursor was not
+            // even rewritten — this tick did no work, and calling it
+            // `.completed` is what let a lane that files a card once a month
+            // read as freshly successful every two minutes.
+            return .skipped(
+                reason: "no newly-terminal or stuck delegated jobs (\(terminal.count) terminal on record)")
         }
+
+        let writeFailures = failed + livenessFailed + (backlogFailed ? 1 : 0)
+        let failureDeferred = max(0, batch.count - filed - failed)
+        let livenessFailureDeferred = max(0, livenessBatch.count - livenessFiled - livenessFailed)
+        let totalDeferred = deferred + failureDeferred + livenessDeferred + livenessFailureDeferred
+        // 2026-09-06: the per-tick card cap and contiguous settlement are the
+        // only reasons work is left over, and neither has a deadline of its
+        // own. Without this the remainder waited for the next STORE EVENT or
+        // the six-hour integrity sweep. The owner turns it into a near-term
+        // rerun; reporting `false` clears it again.
+        await reportDeferral(totalDeferred > 0 || writeFailures > 0)
 
         do {
             try cursor.write(to: cursorPath)
@@ -1062,15 +1203,22 @@ public struct DelegationOutcomeLoop: LoopRunner {
         var result = "filed \(filed) delegation outcome card(s)"
         if livenessFiled > 0 { result += "; filed \(livenessFiled) delegation liveness card(s)" }
         if let seedResult { result += "; \(seedResult)" }
-        let writeFailures = failed + livenessFailed + (backlogFailed ? 1 : 0)
         if writeFailures > 0 {
             result += "; \(writeFailures) outcome settlement write(s) failed and will retry next tick"
         }
-        let failureDeferred = max(0, batch.count - filed - failed)
-        let livenessFailureDeferred = max(0, livenessBatch.count - livenessFiled - livenessFailed)
-        let totalDeferred = deferred + failureDeferred + livenessDeferred + livenessFailureDeferred
         if totalDeferred > 0 { result += "; \(totalDeferred) more deferred for contiguous settlement" }
         if let backlogNote { result += "; \(backlogNote)" }
+        // 2026-09-06: a settlement that did not land is a FAILED run, not a
+        // successful one with a footnote. The cards and the Desk/motor
+        // transitions are the work this loop exists to do; reporting the tick
+        // as `.completed` kept the loop's own health surface green while
+        // delegated outcomes silently went nowhere.
+        if writeFailures > 0 {
+            return .failed(error: result)
+        }
+        if !stampsMayAdvance {
+            return .failed(error: "\(result); \(unreadableStoreError)")
+        }
         if filed == 0 && livenessFiled == 0 && failed == 0 && livenessFailed == 0 && backlogNote == nil {
             return .skipped(reason: "no delegation outcome or liveness card could be classified")
         }

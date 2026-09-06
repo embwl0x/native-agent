@@ -13,6 +13,11 @@ import CoreGraphics
 #if canImport(AppKit)
 import AppKit
 #endif
+#if canImport(Carbon) && os(macOS)
+// Secure keyboard entry (`IsSecureEventInputEnabled`) lives in HIToolbox and
+// nowhere else — ApplicationServices does not re-export it.
+import Carbon.HIToolbox
+#endif
 
 // MARK: - The action organ (W2 + W3)
 //
@@ -372,9 +377,37 @@ public protocol MacEventSink: Sendable {
     /// False when this build/platform cannot synthesize events at all. The
     /// handlers then refuse honestly instead of reporting a no-op as success.
     var isAvailable: Bool { get }
+    /// True while macOS SECURE KEYBOARD ENTRY is on anywhere on this Mac.
+    ///
+    /// This is not an availability question — the sink is perfectly able to
+    /// post, and `CGEvent.post` returns nothing to say otherwise. The window
+    /// server simply does not DELIVER synthesized keystrokes while secure
+    /// input is enabled, so a keyboard site that posts anyway types into a
+    /// void and the closed loop reports an unexplained unchanged screen.
+    /// Keyboard only: mouse and scroll are unaffected and stay ungated.
+    var secureKeyboardEntryActive: Bool { get }
     func post(key: MacKeyEvent)
     func post(mouse: MacMouseEvent)
     func post(scroll: MacScrollEvent)
+}
+
+public extension MacEventSink {
+    /// A sink that cannot measure it must not INVENT it: an unmeasured `true`
+    /// would refuse every keystroke forever.
+    var secureKeyboardEntryActive: Bool { false }
+}
+
+/// The live probe. Carbon's `IsSecureEventInputEnabled()` is the only public
+/// answer macOS gives, and it is a global: it reports that SOME process has
+/// secure input on, never which one.
+public enum MacSecureEventInput {
+    public static func isEnabled() -> Bool {
+        #if canImport(Carbon) && os(macOS)
+        return IsSecureEventInputEnabled()
+        #else
+        return false
+        #endif
+    }
 }
 
 #if canImport(CoreGraphics) && os(macOS)
@@ -387,6 +420,8 @@ public struct CGEventSink: MacEventSink {
     public init() {}
 
     public var isAvailable: Bool { true }
+
+    public var secureKeyboardEntryActive: Bool { MacSecureEventInput.isEnabled() }
 
     private func source() -> CGEventSource? {
         CGEventSource(stateID: .hidSystemState)
@@ -453,9 +488,13 @@ public struct CGEventSink: MacEventSink {
         // Do not race the asynchronously posted modifier key-down against
         // creation of this event. Preserve any genuine HID flags as before.
         cg.flags.formUnion(flags(event.modifiers))
-        // A bare cursor move (`mac_nudge`) changes no app/focus state and must
-        // not hide nearby genuine human activity. Button/drag events can.
-        if event.phase != .move { NativeAgentMotorEpoch.noteAgentMotorEvent() }
+        // 2026-09-06: a bare cursor move (`mac_nudge`) used to go untagged so it
+        // could not hide nearby human activity — but it still resets the system
+        // idle clock, so an untagged nudge read as "the human came back" to
+        // every consumer that watches that clock. It is tagged like any other
+        // motor output; consumers separate it from human input by comparing the
+        // two ages, not by leaving our own events unrecorded.
+        NativeAgentMotorEpoch.noteAgentMotorEvent()
         cg.post(tap: .cghidEventTap)
     }
 
@@ -680,6 +719,15 @@ public protocol MacAXActSource: Sendable {
     /// Resolve a child-index chain from THAT window, not from whichever window
     /// of the app is focused now. `[]` is the window itself.
     func resolve(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution
+    /// fable51 item 29 — resolve a child-index chain from the app's `AXMenuBar`
+    /// instead of from a window. A menu bar is NOT under any window root, so
+    /// the window-relative resolvers above cannot address one; a menu path that
+    /// went through them would resolve to whatever element happened to sit at
+    /// those indices inside the document window, which is a wrong-element act.
+    ///
+    /// Default `.appGone` — a source that cannot reach a menu bar says so, and
+    /// the caller refuses in words rather than pressing something else.
+    func resolve(menuPath: [Int], inAppPid pid: Int32) -> MacAXPidResolution
     func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome
     func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome
     /// Give the element the keyboard focus WITHOUT invoking its handler.
@@ -733,6 +781,11 @@ public protocol MacAXActSource: Sendable {
 
 public extension MacAXActSource {
     func setFocused(_ target: MacAXActTarget) -> MacAXActOutcome { .unsupported }
+
+    /// fable51 item 29. Default `.appGone`: a source with no menu bar has
+    /// nothing to resolve against, and the menu organ turns that into words
+    /// ("this app publishes no menu bar") instead of pressing something else.
+    func resolve(menuPath: [Int], inAppPid pid: Int32) -> MacAXPidResolution { .appGone }
 
     /// A source with ONE tree per app has exactly one window, and that window
     /// IS the one the frame was captured from — there is no second window for
@@ -857,6 +910,30 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
 
     public func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution {
         MacAXExecutionLane.sync { resolveOnExecutionLane(path: path, pid: pid) }
+    }
+
+    public func resolve(menuPath: [Int], inAppPid pid: Int32) -> MacAXPidResolution {
+        MacAXExecutionLane.sync { resolveMenuOnExecutionLane(path: menuPath, pid: pid) }
+    }
+
+    private func resolveMenuOnExecutionLane(path: [Int], pid: Int32) -> MacAXPidResolution {
+        #if canImport(AppKit)
+        // The same self-process gate as every other resolve: an AX read of our
+        // own tree re-enters AppKit in-process and can deadlock.
+        guard pid != getpid() else { return .appGone }
+        guard NSRunningApplication(processIdentifier: pid) != nil else { return .appGone }
+        let appElement = AXUIElementCreateApplication(pid)
+        guard var current = copyElement(appElement, kAXMenuBarAttribute) else { return .appGone }
+        for index in path {
+            let children = copyElementArray(current, kAXChildrenAttribute)
+            guard index >= 0, index < children.count else { return .pathNotFound }
+            current = children[index]
+        }
+        guard let described = describe(current) else { return .pathNotFound }
+        return .resolved(described)
+        #else
+        return .appGone
+        #endif
     }
 
     private func resolveOnExecutionLane(path: [Int], pid: Int32) -> MacAXPidResolution {
@@ -1333,6 +1410,7 @@ public struct UnavailableMacAXActSource: MacAXActSource {
     public func isTrusted() -> Bool { false }
     public func resolve(path: [Int]) -> MacAXActTarget? { nil }
     public func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution { .pathNotFound }
+    public func resolve(menuPath: [Int], inAppPid pid: Int32) -> MacAXPidResolution { .pathNotFound }
     public func perform(_ target: MacAXActTarget, action: String) -> MacAXActOutcome { .invalidTarget }
     public func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome { .invalidTarget }
     public func reread(_ target: MacAXActTarget) -> MacAXActTarget? { nil }

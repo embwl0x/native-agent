@@ -163,6 +163,10 @@ public actor SwiftNativeMacControl: MacControlClient {
     /// deliberately separate from the event sink: the thing that DECIDES
     /// whether to post must not be the thing that posts.
     private let sessionStateSource: any MacSessionStateSource
+    /// fable51 item 30 — the pasteboard seam. Separate from every seam above
+    /// for the same reason they are separate from each other: nothing in it can
+    /// walk a tree, post an event, or capture a pixel.
+    private let pasteboardSource: any MacPasteboardSource
     /// Optional live-policy source for the in-process gate pre-flight
     /// (wave 30 W01). `nil` ⇒ pre-flight disabled ⇒ wave-29 behavior. The
     /// daemon remains the execution/approval/receipt authority regardless.
@@ -202,6 +206,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         attentionEventSource: any MacAttentionEventSource = defaultMacAttentionEventSource(),
         attentionStore: MacAttentionSessionStore = .shared,
         sessionStateSource: any MacSessionStateSource = defaultMacSessionStateSource(),
+        pasteboardSource: any MacPasteboardSource = defaultMacPasteboardSource(),
         policyProvider: (any MacControlPolicyProvider)? = nil,
         auditAppendPath: URL? = nil,
         operationStore: MacControlOperationStore? = nil
@@ -226,6 +231,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.attentionEventSource = attentionEventSource
         self.attentionStore = attentionStore
         self.sessionStateSource = sessionStateSource
+        self.pasteboardSource = pasteboardSource
         self.policyProvider = policyProvider
         self.auditAppendPath = auditAppendPath
         self.operationStore = operationStore
@@ -338,7 +344,16 @@ public actor SwiftNativeMacControl: MacControlClient {
         // returning stale screen state. Keep the same policy preflight inside
         // `executeAction`, but reserve durable begin/transition/replay records
         // for actions that can change the world.
-        if macControlAccessibilityReadActions.contains(normalized) {
+        // fable51 item 30 — `clipboard_read` joins the reads here for the same
+        // reason: it changes nothing, so a durable operation record would add
+        // filesystem latency and make a replay able to return a stale
+        // clipboard. `clipboard_write` deliberately does NOT join them.
+        // fable51 item 33 — `read` joins them for the same reason: it returns
+        // what a document says RIGHT NOW, and a replayable operation record
+        // would let a later call answer with a document that has since changed.
+        if macControlAccessibilityReadActions.contains(normalized)
+            || macControlClipboardReadActions.contains(normalized)
+            || macControlDocumentReadActions.contains(normalized) {
             return try await executeAction(normalized, body: body)
         }
 
@@ -549,8 +564,13 @@ public actor SwiftNativeMacControl: MacControlClient {
         // priority. Check once at tool entry; handlers recheck at the exact
         // effect boundary (and between multi-event gestures) so a mouse move
         // arriving after this line still stops the action.
+        // fable51 item 33 — `read` is here too, and it is the one READ that
+        // belongs in this list: the accumulate route moves the user's scroll
+        // position, and a human scrolling their own document must not have it
+        // yanked out from under them mid-gesture.
         if macControlAccessibilityInjectionActions.contains(normalized)
-            || macControlAccessibilityNudgeActions.contains(normalized),
+            || macControlAccessibilityNudgeActions.contains(normalized)
+            || macControlDocumentReadActions.contains(normalized),
            let refusal = await attentionActionRefusal(action: normalized, body: body) {
             return refusal
         }
@@ -598,6 +618,19 @@ public actor SwiftNativeMacControl: MacControlClient {
         // reads above, not through `dispatchApprovedInjection`: it emits one
         // bare mouse move and nothing else.
         case "nudge":       return await handleNudge(body)
+        // fable51 item 30 — THE CLIPBOARD ORGAN. The read is perception with a
+        // redaction boundary; the write replaces the general pasteboard and
+        // verifies itself by reading back what it put there.
+        case "clipboard_read":  return handleClipboardRead(body)
+        case "clipboard_write": return handleClipboardWrite(body)
+        // fable51 item 29 — THE MENU BAR ORGAN. `menu` walks; `menu_press`
+        // presses through the same actuator every other act uses.
+        case "menu":        return handleMenu(body)
+        case "menu_press":  return handleMenuPress(body)
+        // fable51 item 33 — THE READ ORGAN. Extract a named document, or
+        // scroll-and-accumulate the front window's text; either way it hands
+        // back the whole thing and the turn's spill pager retains it.
+        case "read":        return await handleRead(body)
         case let action where macControlUnsupportedActions.contains(action):
             return Self.unsupportedResult(action: action)
         default:
@@ -635,6 +668,15 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "act": return 30
         // W7 — one CGEvent post, in-process, nothing awaited.
         case "nudge": return 15
+        // fable51 item 30 — one in-process pasteboard read/write.
+        case "clipboard_read", "clipboard_write": return 10
+        // fable51 item 29 — one bounded AX menu-bar walk; one AXPress.
+        case "menu": return 20
+        case "menu_press": return 15
+        // fable51 item 33 — up to `maxFrames` walks with a settle between each,
+        // or one file read plus a PDFKit parse. The slowest read in the module
+        // by design: it is the only one that reads a whole document.
+        case "read": return 90
         // W6 — a nudge, a bounded settle wait, then a full `view` capture.
         case "wake": return 30
         case "shell": return 60
@@ -911,6 +953,23 @@ public actor SwiftNativeMacControl: MacControlClient {
         switch action {
         case "file/read", "file/list", "spotlight", "ax_status", "ax_tree", "ax_find", "view", "look":
             return .satisfied
+        // fable51 item 29 — the menu WALK is a read, like the reads above. The
+        // PRESS is not: it runs the app's own handler and is reported
+        // `unverified` with the injection actions below, because "I re-read the
+        // item" is not proof the handler ran.
+        case "menu":
+            return .satisfied
+        // fable51 item 30 — the clipboard READ is a read, like the reads above.
+        // The WRITE never reaches here: `handleClipboardWrite` publishes its own
+        // `verified` flag, decided by READING BACK what it put on the
+        // pasteboard rather than by having called `setString`.
+        case "clipboard_read":
+            return .satisfied
+        // fable51 item 33 — the read organ is a read. It scrolls, but the only
+        // state it touches is the one it puts back, and the text it returns is
+        // what the document said.
+        case "read":
+            return .satisfied
         case "notify", "file/write", "file/move", "file/trash", "focus_app", "quit_app", "applescript", "shell":
             return .unverified
         // W2/W3 injection. UNVERIFIED on purpose, including `ax_act`: the
@@ -918,7 +977,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         // but "I read the element again" is not proof the app's handler ran or
         // that the intended consequence happened. Claiming `satisfied` here
         // would manufacture settlement evidence out of a second read.
-        case "keystroke", "click", "scroll", "ax_act", "hand":
+        case "keystroke", "click", "scroll", "ax_act", "hand", "menu_press":
             return .unverified
         // native-look item 3 — `act` publishes `verified: false` above, so this
         // never decides it. Listed so the intent survives a refactor: the
@@ -1028,8 +1087,16 @@ public actor SwiftNativeMacControl: MacControlClient {
         // category alone must not be reachable through the bridge under an
         // expired window. It is named through its own set rather than folded
         // into either neighbour, so neither of their contracts has to bend.
+        // fable51 item 30: the clipboard organ carries the SAME Full Mac
+        // requirement as the reads, by the same rule — the accessibility
+        // category alone must not be reachable through the bridge under an
+        // expired window.
+        // fable51 item 33: the read organ carries the SAME Full Mac requirement,
+        // by the same rule.
         if macControlAccessibilityReadActions.contains(action)
             || macControlAccessibilityNudgeActions.contains(action)
+            || macControlClipboardActions.contains(action)
+            || macControlDocumentReadActions.contains(action)
             || macControlAccessibilityInjectionActions.contains(action),
            !(policy.trustPolicy.map { MacControlGate.fullMacActive($0, now: now()) } ?? false) {
             let reason = "full_mac_inactive: \(action) requires an active Full Mac trust window"
@@ -1877,6 +1944,845 @@ public actor SwiftNativeMacControl: MacControlClient {
         )
     }
 
+    // MARK: - fable51 item 29: the menu bar organ
+
+    /// Which app's menu bar. Defaults to the frontmost, but honours `app` the
+    /// same way `look` does — reading another app's menu is exactly as
+    /// focus-free as reading its window, and refusing to would have made the
+    /// two organs disagree about what "which app" means.
+    private enum MenuTarget {
+        case app(MacAXAppInfo)
+        case refused(MacControlResult)
+    }
+
+    private func menuTarget(_ body: [String: JSONValue]) -> MenuTarget {
+        let started = now()
+        func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
+            var output: [String: JSONValue] = [
+                "status": .string(code),
+                "error": .string(code),
+                "message": .string(words),
+            ]
+            for (key, value) in extra { output[key] = value }
+            return MacControlResult(
+                ok: false,
+                action: "menu",
+                output: .object(output),
+                error: code,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        guard let requested = body.stringValue("app")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !requested.isEmpty else {
+            guard let front = accessibilitySource.frontmostApp() else {
+                return .refused(refuse(
+                    "no_frontmost_app",
+                    "Nothing is frontmost right now, so there is no menu bar to read."
+                ))
+            }
+            return .app(front)
+        }
+        let resolution = MacBackgroundSight.resolve(
+            requested,
+            among: accessibilitySource.runningApps()
+        )
+        guard case .matched(let app) = resolution else {
+            let code: String = {
+                switch resolution {
+                case .selfProcess: return "self_inspection_refused"
+                case .ambiguous: return "app_ambiguous"
+                default: return "app_not_running"
+                }
+            }()
+            return .refused(refuse(
+                code,
+                MacBackgroundSight.words(for: resolution, requested: requested)
+                    ?? "I couldn't find a running app called \"\(requested)\".",
+                ["requested_app": .string(requested)]
+            ))
+        }
+        return .app(app)
+    }
+
+    /// THE WALK. One bounded descent, read-only, and it never opens a menu:
+    /// the AX tree publishes the items whether or not they are drawn.
+    private func handleMenu(_ body: [String: JSONValue]) -> MacControlResult {
+        let started = now()
+        guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "menu") }
+        let app: MacAXAppInfo
+        switch menuTarget(body) {
+        case .refused(let refusal): return refusal
+        case .app(let hit): app = hit
+        }
+        let reading = MacMenuBar.read(source: accessibilitySource, pid: app.processIdentifier)
+        var output: [String: JSONValue] = [:]
+        if case .object(let menuJSON) = MacMenuBar.json(reading) {
+            output = menuJSON
+        }
+        output["trusted"] = .bool(true)
+        output["app"] = app.toJSON()
+        if let unavailable = reading.unavailable {
+            output["message"] = .string(
+                unavailable == "no_menu_bar"
+                    ? "\(app.name) publishes no menu bar, so there is nothing to list."
+                    : "I can't read \(app.name)'s menu bar: \(unavailable)."
+            )
+            return MacControlResult(
+                ok: false,
+                action: "menu",
+                output: .object(output),
+                error: unavailable,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        return MacControlResult(
+            ok: true,
+            action: "menu",
+            output: .object(output),
+            error: nil,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
+    }
+
+    /// THE PRESS. Walk (to resolve the NAME into an address), then AXPress
+    /// through the same actuator `ax_act` uses.
+    ///
+    /// A DISABLED item refuses IN WORDS and presses nothing. That is the same
+    /// refusal shape `act` holds: greyed out is a fact about the app's state,
+    /// and pressing anyway would either do nothing (and be reported as done) or
+    /// hit whatever the index chain now points at.
+    private func handleMenuPress(_ body: [String: JSONValue]) -> MacControlResult {
+        let started = now()
+        guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "menu_press") }
+        func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
+            var output: [String: JSONValue] = [
+                "pressed": .bool(false),
+                "status": .string(code),
+                "error": .string(code),
+                "message": .string(words),
+            ]
+            for (key, value) in extra { output[key] = value }
+            return MacControlResult(
+                ok: false,
+                action: "menu_press",
+                output: .object(output),
+                error: code,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        guard let requested = body.stringValue("path")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !requested.isEmpty else {
+            return refuse(
+                "missing_path",
+                "menu_press needs `path` — the menu path to press, like \"File › Export › PDF\"."
+            )
+        }
+        let app: MacAXAppInfo
+        switch menuTarget(body) {
+        case .refused(let refusal): return refusal
+        case .app(let hit): app = hit
+        }
+        let reading = MacMenuBar.read(source: accessibilitySource, pid: app.processIdentifier)
+        if let unavailable = reading.unavailable {
+            return refuse(
+                unavailable,
+                "\(app.name) publishes no menu bar I can press through."
+            )
+        }
+        let resolution = MacMenuBar.resolve(requested, among: reading.items)
+        guard case .matched(let item) = resolution else {
+            let code: String = {
+                switch resolution {
+                case .disabled: return "menu_item_disabled"
+                case .ambiguous: return "menu_path_ambiguous"
+                default: return "menu_path_not_found"
+                }
+            }()
+            return refuse(
+                code,
+                MacMenuBar.words(for: resolution, requested: requested)
+                    ?? "I couldn't find \"\(requested)\" in \(app.name)'s menu bar.",
+                ["requested_path": .string(requested)]
+            )
+        }
+        // Resolved from the MENU BAR, never from a window root: a menu bar is
+        // not under any window, so a window-relative resolve of this index
+        // chain would land on an unrelated element inside the document.
+        let target: MacAXActTarget
+        switch accessibilityActSource.resolve(
+            menuPath: item.path,
+            inAppPid: app.processIdentifier
+        ) {
+        case .resolved(let hit):
+            target = hit
+        case .pathNotFound:
+            return refuse(
+                "menu_path_not_found",
+                "\"\(item.display)\" was in the menu a moment ago and is not there now; "
+                    + "read the menu again."
+            )
+        default:
+            return refuse(
+                "app_gone",
+                "\(app.name)'s menu bar is not reachable any more."
+            )
+        }
+        let outcome = accessibilityActSource.perform(target, action: "AXPress")
+        guard outcome == .performed else {
+            return refuse(
+                "menu_press_refused",
+                "\(app.name) refused the press on \"\(item.display)\" (\(outcome)); nothing happened.",
+                ["requested_path": .string(item.display)]
+            )
+        }
+        return MacControlResult(
+            ok: true,
+            action: "menu_press",
+            output: .object([
+                "pressed": .bool(true),
+                "trusted": .bool(true),
+                "app": app.toJSON(),
+                "path": MacScreenViewTextRedaction.redactedLegendString(
+                    item.display,
+                    valueChars: MacMenuBar.maxTitleChars * MacMenuBar.maxPathDepth
+                ),
+                "opens_submenu": .bool(item.hasSubmenu),
+                // The press ran the app's handler. Whether the INTENDED
+                // consequence happened is for the next look to say, never for
+                // this result to claim.
+                "verified": .bool(false),
+            ]),
+            error: nil,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
+    }
+
+    // MARK: - fable51 item 30: the clipboard organ
+
+    /// READ. The only channel through which pasteboard characters reach a
+    /// provider, and therefore the only place the redaction boundary has to
+    /// hold.
+    ///
+    /// Order matters: REDACT FIRST, then truncate. Truncating first could cut a
+    /// secret in half and hand out the surviving half as ordinary prose, and
+    /// the cut token would no longer match any shape the redactor knows.
+    private func handleClipboardRead(_ body: [String: JSONValue]) -> MacControlResult {
+        let started = now()
+        guard let contents = pasteboardSource.read() else {
+            return MacControlResult(
+                ok: false,
+                action: "clipboard_read",
+                output: .object([
+                    "available": .bool(false),
+                    "note": .string("There is no pasteboard on this system, so there is nothing to read."),
+                ]),
+                error: "clipboard_unavailable",
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        let maxChars = MacClipboardRead.clampedMaxChars(Self.intValue(body, "max_chars"))
+        var output: [String: JSONValue] = [
+            "available": .bool(true),
+            "change_count": .int(Int64(contents.changeCount)),
+            "types": MacClipboardRead.typesJSON(contents.types),
+            "has_non_text": .bool(MacClipboardRead.hasNonTextTypes(contents.types)),
+        ]
+        if let raw = contents.text {
+            let redaction = MacClipboardRead.redacted(raw)
+            let cut = MacClipboardRead.truncated(redaction.text, maxChars: maxChars)
+            output["has_text"] = .bool(true)
+            output["text"] = .string(cut.text)
+            output["chars"] = .int(Int64(redaction.text.count))
+            output["truncated"] = .bool(cut.truncated)
+            if cut.truncated { output["returned_chars"] = .int(Int64(cut.text.count)) }
+            output["redacted"] = .bool(redaction.didRedact)
+            if redaction.didRedact {
+                output["redactions"] = .array(redaction.redactedLines.map { line in
+                    .object(["line": .int(Int64(line.line)), "reason": .string(line.reason)])
+                })
+            }
+        } else {
+            output["has_text"] = .bool(false)
+            output["text"] = .null
+            output["chars"] = .int(0)
+            output["truncated"] = .bool(false)
+            output["redacted"] = .bool(false)
+        }
+        return MacControlResult(
+            ok: true,
+            action: "clipboard_read",
+            output: .object(output),
+            error: nil,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
+    }
+
+    /// WRITE. Replaces the general pasteboard's text and then READS IT BACK:
+    /// `verified` is that comparison, never the return value of the set call.
+    /// The text itself is never echoed — the caller wrote it, and an echo would
+    /// route it back out through a channel with no redactor on it.
+    private func handleClipboardWrite(_ body: [String: JSONValue]) -> MacControlResult {
+        let started = now()
+        func refuse(_ reason: String, _ words: String) -> MacControlResult {
+            MacControlResult(
+                ok: false,
+                action: "clipboard_write",
+                output: .object(["written": .bool(false), "note": .string(words)]),
+                error: reason,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        guard let text = body.stringValue("text") else {
+            return refuse("missing_text", "clipboard_write needs `text` — the characters to put on the clipboard.")
+        }
+        guard text.count <= MacClipboardRead.maxWriteChars else {
+            return refuse(
+                "text_too_long",
+                "That is \(text.count) characters; the clipboard write is bounded at "
+                    + "\(MacClipboardRead.maxWriteChars)."
+            )
+        }
+        guard pasteboardSource.write(text: text) else {
+            return refuse("clipboard_write_refused", "The system refused the clipboard write; nothing changed.")
+        }
+        let readBack = pasteboardSource.read()
+        return MacControlResult(
+            ok: true,
+            action: "clipboard_write",
+            output: .object([
+                "written": .bool(true),
+                "chars": .int(Int64(text.count)),
+                "verified": .bool(readBack?.text == text),
+                "change_count": readBack.map { .int(Int64($0.changeCount)) } ?? .null,
+            ]),
+            error: nil,
+            durationMs: Int(now().timeIntervalSince(started) * 1000),
+            viaSwift: true
+        )
+    }
+
+    // MARK: - fable51 item 33: the read organ
+
+    /// Milliseconds waited after a scroll before the next walk. A scroll is
+    /// delivered to the app asynchronously and an app that lays out on the next
+    /// runloop turn would otherwise be walked mid-scroll — which reads as "the
+    /// content did not change" and ends the accumulation one screen early.
+    static let documentReadSettleMilliseconds = 140
+
+    /// READ. The whole document, in words, and never through `look`'s budgets.
+    ///
+    /// Two routes and it picks by asking what the thing IS (see
+    /// `MacDocumentRead`'s header). The file route wins when there is a file,
+    /// because a PDF's own characters beat anything scraped off a rendering of
+    /// them — but a file this organ cannot parse falls THROUGH to the screen
+    /// route rather than refusing, because the window is still right there and
+    /// "I can see it but I refuse to read it" is not an answer a body gives.
+    private func handleRead(_ body: [String: JSONValue]) async -> MacControlResult {
+        let started = now()
+        func result(
+            ok: Bool,
+            _ output: [String: JSONValue],
+            error: String? = nil
+        ) -> MacControlResult {
+            MacControlResult(
+                ok: ok,
+                action: "read",
+                output: .object(output),
+                error: error,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        func refuse(_ code: String, _ words: String, _ extra: [String: JSONValue] = [:]) -> MacControlResult {
+            var output: [String: JSONValue] = [
+                "read": .bool(false),
+                "status": .string(code),
+                "error": .string(code),
+                "message": .string(words),
+            ]
+            for (key, value) in extra { output[key] = value }
+            return result(ok: false, output, error: code)
+        }
+
+        // fable51 item 32a/33 (gpt-5.5 review) — WHOSE WINDOW. Absent means the
+        // one in front, which is all `read` has ever meant. Named means that
+        // running app's front window, resolved through the SAME organ
+        // `screen(app:)` resolves through and read through `windowRoot(pid:)` —
+        // nothing here activates, launches or raises anything, so reading a
+        // document in a background window costs User no focus.
+        let requestedApp: String? = {
+            guard let raw = body.stringValue("app")?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+            return raw
+        }()
+
+        // Resolved ONCE and used by both routes: the file the window names and
+        // the window's own text have to come from the SAME window, or the
+        // answer is a splice of two of them.
+        var target: MacAXAppInfo?
+        if accessibilitySource.isTrusted() {
+            if let requestedApp {
+                let resolution = MacBackgroundSight.resolve(
+                    requestedApp,
+                    among: accessibilitySource.runningApps()
+                )
+                guard case .matched(let app) = resolution else {
+                    let code: String = {
+                        switch resolution {
+                        case .selfProcess: return "self_inspection_refused"
+                        case .ambiguous: return "app_ambiguous"
+                        default: return "app_not_running"
+                        }
+                    }()
+                    return refuse(
+                        code,
+                        MacBackgroundSight.words(for: resolution, requested: requestedApp)
+                            ?? "I couldn't find a running app called \"\(requestedApp)\".",
+                        ["requested_app": .string(requestedApp)]
+                    )
+                }
+                target = app
+            } else {
+                target = accessibilitySource.frontmostApp()
+            }
+        }
+
+        // Which file, if any. An explicit `path` is the caller naming one; with
+        // none, the window is ASKED whether it is showing a document.
+        let rawPath = body.stringValue("path")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedPath = (rawPath?.isEmpty ?? true) ? nil : rawPath
+        let namedByCaller = requestedPath != nil
+        var documentPath = requestedPath.map { NSString(string: $0).expandingTildeInPath }
+        // gpt-5.5 review — AN AX-INFERRED PATH IS STILL A FILE READ.
+        //
+        // A `read` with no `path` clears only the accessibility category at the
+        // tool layer, by design: "read the thing in front of me" is the same
+        // authority as `look`. But the window's `AXDocument` then handed a
+        // FILESYSTEM PATH to `extractDocument(at:)`, which opened the whole file
+        // off disk — so a call that never named a path got a file read that the
+        // file policy never saw, and a named path could not have got. The fence
+        // is not about who typed the path; it is about opening a file. So the
+        // inferred path clears the SAME file policy an explicit one clears, and
+        // when it does not, the file route is simply not taken: the window is
+        // right there, and its own text is what the accessibility category is
+        // actually the authority over.
+        var declinedInferredPath: (path: String, reason: String)?
+        if documentPath == nil, let target,
+           let inferred = accessibilitySource.frontmostDocumentPath(pid: target.processIdentifier) {
+            // User, 2026-09-06: the TURN's file-access mode outranks the Mac
+            // file policy here. Under fileAccess=none the chat gate refuses a
+            // pathful `read`; without this the pathless one still opened the
+            // front window's document, which is the same file read by another
+            // name. AX text only, and the receipt says which path was declined.
+            if MacControlTurnFileAccess.deniesFileReads {
+                declinedInferredPath = (path: inferred, reason: "file_access_none")
+            } else if let reason = await fileClearanceReason(forPath: inferred, body: body) {
+                declinedInferredPath = (path: inferred, reason: reason)
+            } else {
+                documentPath = inferred
+            }
+        }
+
+        // ROUTE (a): EXTRACT.
+        if let path = documentPath {
+            switch extractDocument(at: path) {
+            case .success(let extracted):
+                let redaction = MacClipboardRead.redacted(extracted.text)
+                var output: [String: JSONValue] = [
+                    "read": .bool(true),
+                    "source": .string("file"),
+                    "path": .string(path),
+                    "named_by": .string(namedByCaller ? "caller" : "front_window"),
+                    "chars": .int(Int64(redaction.text.count)),
+                    "truncated": .bool(extracted.truncated),
+                    "text": .string(redaction.text),
+                ]
+                if let target, !namedByCaller { output["app"] = target.toJSON() }
+                if let pages = extracted.pages { output["document_pages"] = .int(Int64(pages)) }
+                Self.attachRedaction(redaction, to: &output)
+                return result(ok: true, output)
+            case .failure(let failure):
+                // The CALLER named this file: their question was about the
+                // file, so the answer is about the file.
+                if namedByCaller {
+                    return refuse(
+                        failure.rawValue,
+                        MacDocumentRead.words(for: failure, path: path),
+                        ["path": .string(path)]
+                    )
+                }
+                // WE inferred it from the window. The window is still there and
+                // still readable, so fall through and read THAT, saying which
+                // file we could not parse and why.
+                return await readFromScreen(
+                    started: started,
+                    body: body,
+                    app: target,
+                    fellBackFrom: (path: path, reason: failure.rawValue),
+                    declinedInferredPath: nil
+                )
+            }
+        }
+
+        // ROUTE (b): ACCUMULATE.
+        return await readFromScreen(
+            started: started,
+            body: body,
+            app: target,
+            fellBackFrom: nil,
+            declinedInferredPath: declinedInferredPath
+        )
+    }
+
+    /// The file-policy clearance an AX-INFERRED document path must pass before
+    /// it may be opened, reported as a reason string or `nil` for cleared.
+    ///
+    /// Deliberately the same two layers `gatePreflightOutcome` runs for an
+    /// EXPLICIT `path` (`macControlFilePolicyPathKeys(forAction: "read")`), in
+    /// the same order: the `file_ops` category gate, then the workspace-root
+    /// file policy for this specific path. It lives HERE rather than at the
+    /// tool layer because the path does not exist yet when the tool layer runs
+    /// — the window has not been asked. And a nil provider proceeds, matching
+    /// the pre-flight's own convention for direct library callers and tests.
+    private func fileClearanceReason(
+        forPath path: String,
+        body: [String: JSONValue]
+    ) async -> String? {
+        guard let provider = policyProvider else { return nil }
+        guard let policy = await provider.currentPolicy() else {
+            return "mac_control_policy_unavailable"
+        }
+        let trigger = body.stringValue("trigger").flatMap { $0.isEmpty ? nil : $0 } ?? "user"
+        let decision = MacControlGate.gate(policy, category: "file_ops", trigger: trigger)
+        guard decision.allowed else { return decision.reason }
+        return MacControlGate.fileReason(policy, forPaths: [path], now: now())
+    }
+
+    /// Open the file and turn it into characters. Split out so the fall-through
+    /// above reads as one decision instead of a nest.
+    private func extractDocument(
+        at path: String
+    ) -> Result<MacDocumentRead.Extracted, MacDocumentRead.ExtractionFailure> {
+        // THE SAME FENCE `file/read` runs, before and after resolving symlinks,
+        // and it runs FIRST. "It is a document" is not an exemption: a
+        // credentials file is a text file, and an organ that reads text files
+        // would otherwise be the one door in the module that walks around this.
+        if let reason = MacControlSensitivePathFence.reason(forPath: path) {
+            _ = reason
+            return .failure(.sensitivePath)
+        }
+        let kind = MacDocumentRead.kind(forPath: path)
+        if case .unsupported = kind { return .failure(.unsupportedType) }
+        let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        if let reason = MacControlSensitivePathFence.reason(forPath: url.path) {
+            _ = reason
+            return .failure(.sensitivePath)
+        }
+        let data: Data
+        do {
+            data = try fileManagerAdapter.readData(
+                at: url,
+                maxBytes: MacDocumentRead.maxFileBytes
+            )
+        } catch {
+            return .failure(.unreadableDocument)
+        }
+        return MacDocumentRead.extract(data: data, kind: kind)
+    }
+
+    /// THE ACCUMULATE ROUTE. Walk the frontmost scroll container's text, scroll
+    /// one viewport (minus a deliberate overlap band), walk again, merge on the
+    /// seam, and stop the moment a frame adds nothing.
+    ///
+    /// WHAT IT EMITS, exhaustively: one `.move` to aim the wheel at the
+    /// container's centre, and vertical `.scroll` events. No key, no button, no
+    /// AX action, no attribute write. That emission set is the whole reason this
+    /// verb is graded a read, and `MacDocumentReadTests` greps the sink to keep
+    /// it true.
+    ///
+    /// AND IT PUTS THE SCROLL BACK. The user's document is left where it was
+    /// found: the same number of steps upward, then one more walk to CHECK —
+    /// `scroll_restored` is that comparison against the first frame, never the
+    /// fact that inverse events were posted.
+    private func readFromScreen(
+        started: Date,
+        body: [String: JSONValue],
+        app requestedTarget: MacAXAppInfo?,
+        fellBackFrom: (path: String, reason: String)?,
+        declinedInferredPath: (path: String, reason: String)?
+    ) async -> MacControlResult {
+        func result(ok: Bool, _ output: [String: JSONValue], error: String? = nil) -> MacControlResult {
+            var output = output
+            if let fellBackFrom {
+                output["fell_back_from"] = .object([
+                    "path": .string(fellBackFrom.path),
+                    "reason": .string(fellBackFrom.reason),
+                ])
+            }
+            // The file route was AVAILABLE and was not taken, because opening
+            // that file is file access this call does not hold. Said out loud:
+            // a silently downgraded read is a read the caller mistakes for the
+            // document.
+            if let declinedInferredPath {
+                output["file_route_declined"] = .object([
+                    "path": .string(declinedInferredPath.path),
+                    "reason": .string(declinedInferredPath.reason),
+                    "words": .string(
+                        MacDocumentRead.filePolicyDeclinedWords(path: declinedInferredPath.path)
+                    ),
+                ])
+            }
+            return MacControlResult(
+                ok: ok,
+                action: "read",
+                output: .object(output),
+                error: error,
+                durationMs: Int(now().timeIntervalSince(started) * 1000),
+                viaSwift: true
+            )
+        }
+        func refuse(_ code: String, _ words: String) -> MacControlResult {
+            result(
+                ok: false,
+                [
+                    "read": .bool(false),
+                    "source": .string("screen"),
+                    "status": .string(code),
+                    "error": .string(code),
+                    "message": .string(words),
+                ],
+                error: code
+            )
+        }
+
+        guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "read") }
+        guard let app = requestedTarget else {
+            return refuse("no_window", MacDocumentRead.noWindowWords)
+        }
+        // `windowRoot(pid:)` and NOT `frontmostWindowRoot()`: with `app` named,
+        // the window this reads must be that app's, whether or not it is the one
+        // in front — and asking by pid is what makes the read work without
+        // activating anything.
+        guard let window = accessibilitySource.windowRoot(pid: app.processIdentifier) else {
+            return refuse("no_window", MacDocumentRead.noWindowWords)
+        }
+
+        // gpt-5.5 review — THE CLOCK. See `MacDocumentRead`'s "The clock" note:
+        // this organ runs outside the operation store's deadline path on
+        // purpose, and it is the heaviest AX caller in the module, so it carries
+        // its own two bounds. The per-call one is scoped to THIS app's element
+        // and put back on the way out; the wall-clock one is checked between
+        // frames below.
+        let deadline = now().addingTimeInterval(MacDocumentRead.deadlineSeconds)
+        #if canImport(ApplicationServices) && os(macOS)
+        if accessibilitySource is SystemMacAXElementSource {
+            SystemMacAXElementSource.setMessagingTimeout(
+                pid: app.processIdentifier,
+                seconds: MacDocumentRead.axMessagingTimeoutSeconds
+            )
+        }
+        defer {
+            if accessibilitySource is SystemMacAXElementSource {
+                // 0 restores the system default — the bound belonged to this
+                // read, not to the app.
+                SystemMacAXElementSource.setMessagingTimeout(pid: app.processIdentifier, seconds: 0)
+            }
+        }
+        #endif
+
+        // The READ TARGET: the most specific scrollable/readable container the
+        // window offers, falling back to the window itself. A window that IS
+        // the text area answers at the first role.
+        var container = window
+        var containerRole = accessibilitySource.attributes(of: window)?.role ?? "AXWindow"
+        for role in MacDocumentRead.containerRoles {
+            if let hit = MacAccessibilityReader.findFirst(
+                role: role,
+                source: accessibilitySource,
+                root: window
+            ).hit {
+                container = hit.ref
+                containerRole = role
+                break
+            }
+        }
+        let containerFrame = accessibilitySource.attributes(of: container)?.frame
+        let scrollContainer = container
+        let takeover = MacDocumentReadTakeover()
+        let observation = attentionEventSource.start { _ in takeover.mark() }
+        defer { observation.stop() }
+        func stopReason() async -> String? {
+            if Task.isCancelled { return "cancelled" }
+            if takeover.occurred { return "yielded_to_user" }
+            if let refusal = await attentionActionRefusal(action: "read", body: body) {
+                return refusal.error ?? "yielded_to_user"
+            }
+            // Recheck after the actor hop, immediately before the emission.
+            if Task.isCancelled { return "cancelled" }
+            if takeover.occurred { return "yielded_to_user" }
+            guard let frame = containerFrame,
+                  accessibilitySource.documentScrollTargetIsCurrent(
+                    window: window, container: scrollContainer, frame: frame, pid: app.processIdentifier
+                  ) else { return "scroll_target_changed" }
+            return nil
+        }
+
+        var accumulator = MacDocumentRead.Accumulator()
+        let firstFrame = MacDocumentRead.frameLines(source: accessibilitySource, root: container)
+        if firstFrame.lines.isEmpty {
+            if firstFrame.secureNodes > 0 {
+                return refuse("secure_content", MacDocumentRead.secureContentWords)
+            }
+            // The clock, not the window: an app that ate the deadline before
+            // answering with a single line is UNRESPONSIVE, which is a
+            // different fact from a window that publishes no text — and
+            // reporting the second when the first is true sends the caller off
+            // to `screen` for a window that will not answer that either.
+            if now() >= deadline {
+                return refuse(
+                    MacDocumentRead.timedOutReason,
+                    MacDocumentRead.timedOutWords(app: app.name)
+                )
+            }
+            return refuse("no_readable_text", MacDocumentRead.emptyScreenWords)
+        }
+        _ = accumulator.absorb(firstFrame.lines)
+
+        // Can we move the viewport at all? Answer honestly rather than
+        // returning one screenful as if it were the document.
+        let canScroll = eventSink.isAvailable && (containerFrame?.h ?? 0) > 0
+        var framesRead = 1
+        var steps = 0
+        var reachedEnd = false
+        var truncationReason: String?
+
+        if canScroll, let frame = containerFrame {
+            let delta = MacDocumentRead.scrollStepPoints(viewportHeight: frame.h)
+            let centreX = frame.x + frame.w / 2
+            let centreY = frame.y + frame.h / 2
+            truncationReason = await stopReason()
+            if truncationReason == nil {
+                eventSink.post(mouse: MacMouseEvent(phase: .move, button: .left, x: centreX, y: centreY))
+            }
+            while framesRead < MacDocumentRead.maxFrames {
+                if truncationReason != nil { break }
+                if let reason = await stopReason() { truncationReason = reason; break }
+                // THE WALL CLOCK, checked BEFORE the next scroll rather than
+                // after it: a step already taken has to be put back, and there
+                // is no point buying one more frame from an app that has
+                // already spent the budget. Breaking here (rather than
+                // returning) is deliberate — the scroll restoration below is
+                // owed to User's document whether the read finished or not.
+                if now() >= deadline {
+                    truncationReason = MacDocumentRead.deadlineTruncationReason
+                    break
+                }
+                // `down` moves the content up, which is what a person means by
+                // scrolling down — the same sign convention `act` uses.
+                eventSink.post(scroll: MacScrollEvent(deltaX: 0, deltaY: -delta, unit: .pixel))
+                steps += 1
+                await Self.settleForDocumentRead()
+                if let reason = await stopReason() { truncationReason = reason; break }
+                let next = MacDocumentRead.frameLines(source: accessibilitySource, root: container)
+                framesRead += 1
+                let absorbed = accumulator.absorb(next.lines)
+                if case .nothingNew = absorbed {
+                    reachedEnd = true
+                    break
+                }
+                if accumulator.characters >= MacDocumentRead.maxAccumulatedChars {
+                    truncationReason = "char_cap"
+                    break
+                }
+            }
+            if !reachedEnd && truncationReason == nil && framesRead >= MacDocumentRead.maxFrames {
+                truncationReason = "frame_cap"
+            }
+        }
+
+        // PUT IT BACK, then CHECK. Restoration is a claim, so it is measured.
+        var restored: Bool?
+        if steps > 0, let frame = containerFrame {
+            let delta = MacDocumentRead.scrollStepPoints(viewportHeight: frame.h)
+            var safelyRestored = true
+            for _ in 0..<steps {
+                if let reason = await stopReason() {
+                    truncationReason = reason
+                    safelyRestored = false
+                    break
+                }
+                eventSink.post(scroll: MacScrollEvent(deltaX: 0, deltaY: delta, unit: .pixel))
+            }
+            if safelyRestored { await Self.settleForDocumentRead() }
+            let finalStop = await stopReason()
+            restored = safelyRestored && finalStop == nil && MacDocumentRead
+                .frameLines(source: accessibilitySource, root: container)
+                .lines == firstFrame.lines
+        }
+
+        let redaction = MacClipboardRead.redacted(accumulator.text)
+        var output: [String: JSONValue] = [
+            "read": .bool(true),
+            "source": .string("screen"),
+            "app": app.toJSON(),
+            "container_role": .string(containerRole),
+            "frames": .int(Int64(framesRead)),
+            "scroll_steps": .int(Int64(steps)),
+            "reached_end": .bool(reachedEnd),
+            "truncated": .bool(truncationReason != nil || firstFrame.truncated),
+            "gaps": .bool(accumulator.sawGap),
+            "chars": .int(Int64(redaction.text.count)),
+            "text": .string(redaction.text),
+        ]
+        if let truncationReason { output["truncation_reason"] = .string(truncationReason) }
+        if let restored { output["scroll_restored"] = .bool(restored) }
+        if !canScroll {
+            output["scrollable"] = .bool(false)
+            output["message"] = .string(MacDocumentRead.scrollUnavailableWords)
+        }
+        // The clock wins the message when it bit: "this is the beginning, not
+        // the document" is the thing the caller most needs to hear, and it is
+        // the only truncation reason that is about the APP rather than about a
+        // cap this organ chose.
+        if truncationReason == MacDocumentRead.deadlineTruncationReason {
+            output["timed_out"] = .bool(true)
+            output["message"] = .string(MacDocumentRead.deadlineWords(app: app.name))
+        }
+        if accumulator.sawGap {
+            output["gap_note"] = .string(
+                "Two screenfuls shared no line, so I cannot promise nothing fell between them."
+            )
+        }
+        Self.attachRedaction(redaction, to: &output)
+        return result(ok: true, output)
+    }
+
+    private static func settleForDocumentRead() async {
+        try? await Task.sleep(nanoseconds: UInt64(documentReadSettleMilliseconds) * 1_000_000)
+    }
+
+    /// The redaction channel, identical on both routes: a blanked line is
+    /// REDACTION and says so, never a short document.
+    private static func attachRedaction(
+        _ redaction: MacClipboardRead.Redaction,
+        to output: inout [String: JSONValue]
+    ) {
+        output["redacted"] = .bool(redaction.didRedact)
+        guard redaction.didRedact else { return }
+        output["redactions"] = .array(redaction.redactedLines.map { line in
+            .object(["line": .int(Int64(line.line)), "reason": .string(line.reason)])
+        })
+    }
+
     private func handleAXStatus() -> MacControlResult {
         let started = now()
         let trusted = accessibilitySource.isTrusted()
@@ -2389,6 +3295,64 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
         guard accessibilitySource.isTrusted() else { return axUntrustedResult(action: "look") }
 
+        // fable51 item 32a — BACKGROUND SIGHT. `app` names a running app whose
+        // front window is read WITHOUT activating it: the anchor
+        // `lookSnapshot` has always accepted, finally reachable by a caller.
+        // Nothing on this path focuses, launches or raises anything.
+        var anchorPid: Int32?
+        var anchoredApp: MacAXAppInfo?
+        if let requested = body.stringValue("app")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !requested.isEmpty {
+            guard grade != "stare" else {
+                return MacControlResult(
+                    ok: false,
+                    action: "look",
+                    output: .object([
+                        "error": .string("background_stare_unsupported"),
+                        "message": .string(
+                            "A background window can be read at glance or look; stare is the "
+                            + "frontmost raw tree only."
+                        ),
+                    ]),
+                    error: "background_stare_unsupported",
+                    durationMs: Int(now().timeIntervalSince(started) * 1000),
+                    viaSwift: true
+                )
+            }
+            let resolution = MacBackgroundSight.resolve(
+                requested,
+                among: accessibilitySource.runningApps()
+            )
+            guard case .matched(let app) = resolution else {
+                let words = MacBackgroundSight.words(for: resolution, requested: requested)
+                    ?? "I couldn't find a running app called \"\(requested)\"."
+                let code: String = {
+                    switch resolution {
+                    case .selfProcess: return "self_inspection_refused"
+                    case .ambiguous: return "app_ambiguous"
+                    default: return "app_not_running"
+                    }
+                }()
+                return MacControlResult(
+                    ok: false,
+                    action: "look",
+                    output: .object([
+                        "trusted": .bool(true),
+                        "grade": .string(grade),
+                        "requested_app": .string(requested),
+                        "status": .string(code),
+                        "error": .string(code),
+                        "message": .string(words),
+                    ]),
+                    error: code,
+                    durationMs: Int(now().timeIntervalSince(started) * 1000),
+                    viaSwift: true
+                )
+            }
+            anchorPid = app.processIdentifier
+            anchoredApp = app
+        }
+
         if grade == "stare" {
             // The SAME payload mac_ax_tree returns, from the same handler.
             let tree = handleAXTree(body)
@@ -2420,21 +3384,38 @@ public actor SwiftNativeMacControl: MacControlClient {
             )
         }
         let limits = Self.axLimits(from: body)
-        let (read, seam, anchor) = await lookSnapshot(limits: limits, scope: scope)
+        let (read, seam, anchor) = await lookSnapshot(
+            limits: limits,
+            scope: scope,
+            anchorPid: anchorPid
+        )
         if case .selfProcess? = anchor {
             return selfInspectionResult(action: "look", started: started)
         }
         guard let read else {
+            // An anchored read that found nothing is a DIFFERENT fact from "no
+            // frontmost window": the app is running but has no readable window
+            // (minimized, or all windows closed). Saying the frontmost thing
+            // would describe a window that was never asked about.
+            let status = anchoredApp == nil ? "no_frontmost_window" : "no_window_in_app"
+            var output: [String: JSONValue] = [
+                "trusted": .bool(true),
+                "grade": .string(grade),
+                "status": .string(status),
+                "error": .string(status),
+            ]
+            if let anchoredApp {
+                output["requested_app"] = .string(anchoredApp.name)
+                output["message"] = .string(
+                    "\(anchoredApp.name) is running but has no window I can read right now "
+                    + "(it may be minimized or have every window closed)."
+                )
+            }
             return MacControlResult(
                 ok: false,
                 action: "look",
-                output: .object([
-                    "trusted": .bool(true),
-                    "grade": .string(grade),
-                    "status": .string("no_frontmost_window"),
-                    "error": .string("no_frontmost_window"),
-                ]),
-                error: "no_frontmost_window",
+                output: .object(output),
+                error: status,
                 durationMs: Int(now().timeIntervalSince(started) * 1000),
                 viaSwift: true
             )
@@ -2467,6 +3448,17 @@ public actor SwiftNativeMacControl: MacControlClient {
                 "captured_at": .string(ISO8601DateFormatter().string(from: capturedAt)),
                 "frame_ttl_seconds": .int(Int64(MacLookFrameStore.ttlSeconds)),
                 "seam": .object(seam),
+                // fable51 item 32a — WHOSE window this is, and whether it is in
+                // front. Both grades publish it because the caller's renderer
+                // must not print "in front" over a background read: an
+                // unanchored look is frontmost by construction, an anchored one
+                // is only frontmost by coincidence.
+                "front": .bool(
+                    anchoredApp.map {
+                        accessibilitySource.frontmostApp()?.processIdentifier == $0.processIdentifier
+                    } ?? true
+                ),
+                "anchored": .bool(anchoredApp != nil),
                 // Agent round 2 — `max_nodes`/`max_depth` read as "silently
                 // ignored" because nothing in the payload said what they
                 // resolved to. They are honored and CLAMPED (a caller may only
@@ -2478,6 +3470,17 @@ public actor SwiftNativeMacControl: MacControlClient {
                     "hard_max_depth": .int(Int64(MacAXLimits.hardMaxDepth)),
                 ]),
             ]
+            // fable51 item 32b (gpt-5.5 review) — THE WINDOW'S OWN RECTANGLE.
+            // Both grades publish it because a caller that has to decide
+            // whether raising this window would cover a point elsewhere on the
+            // screen cannot answer that from the elements read INSIDE it: a
+            // title bar, a toolbar and a blank body publish no element and are
+            // still the window. The cross-app drag's coverage refusal turns on
+            // this; absent when the walk could not name a window, which the
+            // caller reads as "unknown", never as "empty".
+            if let windowFrame = read.windowIdentity?.frame {
+                output["window_frame"] = windowFrame.toJSON()
+            }
             if grade == "glance" {
                 output["glance"] = .string(percept.glanceLine())
                 output["addressable_handles"] = .int(Int64(percept.affordances.count))
@@ -3476,6 +4479,20 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
         if let refusal = injectionPreconditions(action: "keystroke", requiresSink: true) {
             return refusal
+        }
+        // SECURE KEYBOARD ENTRY (sweep item 8). The sink is available and
+        // `CGEvent.post` will report nothing wrong — the window server just
+        // never delivers synthesized keys while secure input is on, so every
+        // character below would vanish and the receipt would say `typed`.
+        // Preflighted once, before a single event, and refused in words.
+        if let refusal = MacActClosedLoop.secureInputRefusal(
+            active: eventSink.secureKeyboardEntryActive
+        ) {
+            return injectionRefusal(
+                action: "keystroke",
+                error: refusal.reason,
+                extra: ["note": .string(refusal.note), "key_events": .int(0)]
+            )
         }
 
         var keyEvents = 0
@@ -5972,6 +6989,28 @@ var effect: [String: JSONValue] = [
             // refused by name (`verb_not_supported_on_element`), never
             // approximated with a different act.
             guard MacActClosedLoop.canType(role: target.role) else { return nil }
+            // A PASSWORD FIELD IS A BOUNDARY, NOT A MECHANISM FAILURE (sweep
+            // item 8). AXSetValue would happily fill one, and the keystroke
+            // fallback below would post into a void — macOS has secure
+            // keyboard entry on whenever such a field holds focus. Both
+            // answers are wrong for the same reason: the credential is User's
+            // to type. Refuse here, above every actuation, in words.
+            if let refusal = MacActClosedLoop.secureFieldRefusal(role: target.role) {
+                return MacActPerformed(
+                    ok: false,
+                    method: "none",
+                    requestedAction: "type",
+                    fallbackReason: refusal.reason,
+                    error: refusal.reason,
+                    target: target,
+                    postState: nil,
+                    actedHandle: handle,
+                    extra: [
+                        "posted_events": .int(0),
+                        "guidance": .string(refusal.note),
+                    ]
+                )
+            }
             // AXSetValue first: that is how you fill a field without
             // simulating 40 keystrokes, and it cannot be intercepted by
             // whatever else has focus.
@@ -6020,6 +7059,30 @@ var effect: [String: JSONValue] = [
             // The keystroke fallback: AXSetValue could not carry this, so the
             // characters go through the window server and land wherever the key
             // window is. Refuse rather than type into another app.
+            //
+            // SECURE KEYBOARD ENTRY FIRST (sweep item 8), because it is a pure
+            // read and the key-window gate below can RAISE a window — no point
+            // moving User's screen around for keystrokes that cannot be
+            // delivered to anything.
+            if let refusal = MacActClosedLoop.secureInputRefusal(
+                active: eventSink.secureKeyboardEntryActive
+            ) {
+                return MacActPerformed(
+                    ok: false,
+                    method: "none",
+                    requestedAction: "type",
+                    fallbackReason: refusal.reason,
+                    error: refusal.reason,
+                    target: target,
+                    postState: accessibilityActSource.reread(target),
+                    actedHandle: handle,
+                    extra: [
+                        "posted_events": .int(0),
+                        "focus_method": .string(focusMethod),
+                        "guidance": .string(refusal.note),
+                    ]
+                )
+            }
             if let refusal = refuseInput("type") { return refusal }
             for event in MacEventPlanner.typeText(text) {
                 eventSink.post(key: event)

@@ -2,6 +2,12 @@
 
 Runtime pruning is owned by the app-owned Swift runtime. Do not attribute current pruning, TTL, or startup-maintenance behavior to retired runtime paths.
 
+A row belongs here only while a live writer is bounded by it. Retired
+2026-09-01 (sweep item 21): `data/runs/runs.jsonl` claimed a 10,000-line
+app-owned retention it never had — no code has ever written or read that path
+(`RunLedger` writes `runs/runs.json`), so the file was an unbounded 4 MB fossil
+sitting under a retention row that described nothing.
+
 | Subsystem | Cap | Eviction | Notes |
 |-----------|-----|----------|-------|
 | Memory facts | 2000 | Lifecycle/value class, then least-recently-used (`lastUsedAt`/`updatedAt`); pinned/identity evicted only after ordinary rows | Enforced transactionally on direct insert, proposal acceptance, approved consolidation swap, and store open; overflow emits bounded retention receipts and removes stale derived projections |
@@ -21,5 +27,4 @@ Runtime pruning is owned by the app-owned Swift runtime. Do not attribute curren
 | Harness benchmark runs (`data/harness/benchmark/runs.jsonl`) | 5000 lines | Oldest dropped after every append | PersistenceCore path-owned cap |
 | Builder audit receipts (`data/builder_audit/<uuid>.json`) | 500 JSON receipts | Oldest modification time first; filename tie-break | Best-effort prune removes each retired receipt and its matching `<uuid>-*` sidecars; failures surface without changing tool success |
 | Telegram errors (`data/telegram/errors.jsonl`) | 5 MiB live file + one rotated `.1` backup | Replace the prior backup, move the full live file, then resume appends | Byte-owned rotation; there is no 5,000-line cap |
-| Run log (`data/runs/runs.jsonl`) | 10 000 lines | Oldest dropped by Swift runtime retention/startup maintenance | App-owned run retention |
 | Memory proposals (`data/memory_proposals/*.json`) | 30-day TTL | Files deleted by Swift MemoryV2/proposal hygiene if older than 30 days | App-owned memory proposal retention |

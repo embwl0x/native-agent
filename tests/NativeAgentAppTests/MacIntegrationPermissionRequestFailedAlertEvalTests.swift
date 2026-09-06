@@ -21,8 +21,11 @@ struct MacIntegrationPermissionRequestFailedAlertEvalTests {
 
     @Test("save and request failures remain independently bound")
     func alertGatesCannotSwapTheirErrorStates() {
-        #expect(MacIntegrationPermissionFailurePresentation.saveAlertTitle == "Permission Save Failed")
-        #expect(MacIntegrationPermissionFailurePresentation.requestAlertTitle == "Permission Request Failed")
+        // 2026-09-06: the Advanced page kit (f4ba3bd8) restyled both alert titles to
+        // sentence case; MacIntegrationView.swift:201-202 is the source of truth. The
+        // pin that matters here is that the two titles stay distinct strings.
+        #expect(MacIntegrationPermissionFailurePresentation.saveAlertTitle == "Permission save failed")
+        #expect(MacIntegrationPermissionFailurePresentation.requestAlertTitle == "Permission request failed")
 
         #expect(MacIntegrationPermissionFailurePresentation.saveAlertIsPresented(
             persistenceError: "could not persist", requestError: nil

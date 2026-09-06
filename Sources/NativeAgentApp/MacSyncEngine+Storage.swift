@@ -302,28 +302,153 @@ extension MacSyncEngine {
         }
     }
 
+    /// What the durable ledger says about one transaction id.
+    /// 2026-09-06: `absent` and `unreadable` are DIFFERENT answers and the
+    /// caller must not conflate them. Absent means no row was ever written, so
+    /// the action is fresh work. Unreadable means a row may exist and we cannot
+    /// tell what it says — the outcome is unknown, and an unknown outcome may
+    /// never be re-executed.
+    enum InboxTransactionLookup: Sendable {
+        case absent
+        case unreadable
+        case present(ICloudTransactionRecord)
+    }
+
+    /// Read the durable transaction ledger row for `id`.
+    /// 2026-09-06: the CloudKit action lane needs a durable "this already began
+    /// executing" marker that survives a signing/response-write failure and a
+    /// restart; the ledger's "running" state is written before dispatch, so it
+    /// is that marker. The Drive lane gets the same guarantee from its
+    /// `pending_` file rename.
+    func readTransaction(id: String) async -> InboxTransactionLookup {
+        guard let transactionDir,
+              let url = InboxActionFileBoundary.jsonURL(
+                in: transactionDir,
+                validatedID: id
+              ) else {
+            // No ledger directory (or a path we refuse to derive) means we
+            // cannot prove the action has not already run. Unknown, not fresh.
+            return .unreadable
+        }
+        return await Task.detached(priority: .utility) { [url] () -> InboxTransactionLookup in
+            switch Self.coordinatedReadOutcome(at: url) {
+            case .missing:
+                return .absent
+            case .failed:
+                return .unreadable
+            case .data(let data):
+                guard let record = try? JSONDecoder().decode(
+                    ICloudTransactionRecord.self,
+                    from: data
+                ) else { return .unreadable }
+                return .present(record)
+            }
+        }.value
+    }
+
+    /// SHA-256 over the same canonical body the inner HMAC covers: the action
+    /// envelope re-encoded with sorted keys and the `signature` key removed.
+    /// 2026-09-06: the ledger is keyed by `transactionId`, which the PHONE
+    /// supplies and which is only defaulted to `msgId`. Two different actions
+    /// can therefore arrive under one transaction id, so the reservation has to
+    /// be bound to the envelope itself, not just to its id.
+    nonisolated static func inboxActionDigest(envelope: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: envelope) as? [String: Any]
+        else { return nil }
+        var withoutSignature = object
+        withoutSignature.removeValue(forKey: "signature")
+        guard let canonical = try? JSONSerialization.data(
+            withJSONObject: withoutSignature,
+            options: [.sortedKeys]
+        ) else { return nil }
+        return SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// True when `record` is the reservation for THIS envelope rather than for
+    /// a different action that happens to carry the same transaction id.
+    /// 2026-09-06: a row written before the binding fields existed records
+    /// neither, so the transaction id was its only evidence and ANY envelope
+    /// carrying that id was served that row's outcome. Such a row still names
+    /// the action it was written for: an unbound row belongs to this envelope
+    /// only when the action names agree, and otherwise it is a collision.
+    static func inboxLedgerRow(
+        _ record: ICloudTransactionRecord,
+        matchesMsgId msgId: String,
+        digest: String?,
+        action: String
+    ) -> Bool {
+        if let storedMsgId = record.msgId, storedMsgId != msgId { return false }
+        if let storedDigest = record.actionDigest, let digest, storedDigest != digest { return false }
+        let bound = record.msgId != nil || (record.actionDigest != nil && digest != nil)
+        if !bound, record.action != action { return false }
+        return true
+    }
+
+    /// True when the ledger state proves the action's effect has already been
+    /// dispatched to the router, so a redelivery must never run it again.
+    static func inboxActionDidExecute(_ state: String) -> Bool {
+        switch state {
+        case "running", "completed", "failed", "pending_approval",
+             "response_write_failed", "completed_unarchived", "unknown":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Returns true when the ledger row is durably on disk afterwards.
+    /// 2026-09-06: this used to return Void and swallow every encode,
+    /// coordination and write failure, so the "running" reservation the
+    /// CloudKit action lane relies on could silently never land while the lane
+    /// dispatched anyway. Callers that depend on the reservation must check it.
+    @discardableResult
     func writeTransaction(
         id: String,
         action: String,
         state: String,
         attempts: Int = 0,
         error: String? = nil,
-        response: [String: String]? = nil
-    ) async {
+        response: [String: String]? = nil,
+        msgId: String? = nil,
+        actionDigest: String? = nil
+    ) async -> Bool {
         guard let transactionDir,
               let url = InboxActionFileBoundary.jsonURL(
                 in: transactionDir,
                 validatedID: id
               ) else {
             NSLog("[MacSyncEngine] Refused transaction write for invalid remote id")
-            return
+            return false
         }
         let now = ISO8601DateFormatter().string(from: Date())
         // Off-main read-modify-write, AWAITED so sequential state transitions for
         // the same transaction id (received -> running -> done) complete in order
         // and can't clobber each other under iCloud slowness.
-        await Task.detached(priority: .utility) { [id, action, state, attempts, error, response, url, now] in
-            let existing = Self.coordinatedRead(at: url).flatMap { try? JSONDecoder().decode(ICloudTransactionRecord.self, from: $0) }
+        let wrote = await Task.detached(priority: .utility) { [id, action, state, attempts, error, response, msgId, actionDigest, url, now] () -> Bool in
+            // 2026-09-06: this read used to collapse "no row yet" and "the row
+            // is there and unreadable" into the same nil, and then wrote a
+            // fresh record over the top — so a rejection (or any other state
+            // transition) taken while the ledger was unreadable DESTROYED the
+            // prior row, including a completed action's stored response. A row
+            // that cannot be read is left exactly as it is; the caller sees the
+            // write fail and the lane treats the outcome as unknown.
+            let existing: ICloudTransactionRecord?
+            switch Self.coordinatedReadOutcome(at: url) {
+            case .missing:
+                existing = nil
+            case .failed:
+                NSLog("[MacSyncEngine] Ledger row for %@ unreadable; left intact rather than overwritten", id)
+                return false
+            case .data(let data):
+                guard let decoded = try? JSONDecoder().decode(
+                    ICloudTransactionRecord.self,
+                    from: data
+                ) else {
+                    NSLog("[MacSyncEngine] Ledger row for %@ did not decode; left intact rather than overwritten", id)
+                    return false
+                }
+                existing = decoded
+            }
             let record = ICloudTransactionRecord(
                 id: id,
                 direction: "ios_to_mac",
@@ -333,36 +458,96 @@ extension MacSyncEngine {
                 updatedAt: now,
                 attempts: max(attempts, existing?.attempts ?? 0),
                 lastError: error ?? existing?.lastError,
-                response: response ?? existing?.response
+                response: response ?? existing?.response,
+                msgId: msgId ?? existing?.msgId,
+                actionDigest: actionDigest ?? existing?.actionDigest
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-            if let data = try? encoder.encode(record) {
-                Self.coordinatedWrite(data: data, to: url)
-            }
+            guard let data = try? encoder.encode(record) else { return false }
+            return Self.coordinatedWrite(data: data, to: url)
         }.value
+        if !wrote {
+            NSLog("[MacSyncEngine] Transaction ledger write failed for %@ (state %@)", id, state)
+        }
+        return wrote
+    }
+
+    /// Why a coordinated read produced no data. `missing` is a normal answer;
+    /// `failed` means the file may exist and we could not read it.
+    enum CoordinatedReadOutcome: Sendable {
+        case data(Data)
+        case missing
+        case failed
+    }
+
+    /// Coordinated read of an iCloud-resident file, distinguishing "there is no
+    /// such file" from "the read failed". nonisolated static — safe to call
+    /// from detached tasks off the main actor.
+    nonisolated static func coordinatedReadOutcome(at url: URL) -> CoordinatedReadOutcome {
+        var outcome: CoordinatedReadOutcome = .failed
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordError: NSError?
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordError) { readURL in
+            do {
+                outcome = .data(try Data(contentsOf: readURL))
+            } catch {
+                outcome = Self.isNoSuchFileError(error) ? .missing : .failed
+            }
+        }
+        if let coordError {
+            outcome = Self.isNoSuchFileError(coordError) ? .missing : .failed
+        }
+        return outcome
+    }
+
+    /// True only for "no such file or directory" — the one error that means
+    /// absence rather than an unknown outcome.
+    nonisolated static func isNoSuchFileError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           nsError.code == NSFileReadNoSuchFileError || nsError.code == NSFileNoSuchFileError {
+            return true
+        }
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(ENOENT) {
+            return true
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isNoSuchFileError(underlying)
+        }
+        return false
     }
 
     /// Coordinated read of an iCloud-resident file. Returns nil if missing or unreadable.
     /// nonisolated static — safe to call from detached tasks off the main actor.
     nonisolated static func coordinatedRead(at url: URL) -> Data? {
-        var data: Data?
-        let coordinator = NSFileCoordinator(filePresenter: nil)
-        var coordError: NSError?
-        coordinator.coordinate(readingItemAt: url, options: [], error: &coordError) { readURL in
-            data = try? Data(contentsOf: readURL)
-        }
+        guard case .data(let data) = coordinatedReadOutcome(at: url) else { return nil }
         return data
     }
 
     /// Coordinated write of `data` to an iCloud-resident `url` with `.forReplacing` intent.
+    /// Returns true only when both the coordination and the write succeeded.
     /// nonisolated static — safe to call from detached tasks off the main actor.
-    nonisolated static func coordinatedWrite(data: Data, to url: URL) {
+    @discardableResult
+    nonisolated static func coordinatedWrite(data: Data, to url: URL) -> Bool {
+        var wrote = false
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordError: NSError?
         coordinator.coordinate(writingItemAt: url, options: [.forReplacing], error: &coordError) { writeURL in
-            try? data.write(to: writeURL, options: .atomic)
+            do {
+                try data.write(to: writeURL, options: .atomic)
+                wrote = true
+            } catch {
+                NSLog("[MacSyncEngine] coordinated write failed for %@: %@",
+                      writeURL.lastPathComponent, String(describing: error))
+            }
         }
+        if let coordError {
+            NSLog("[MacSyncEngine] file coordination failed for %@: %@",
+                  url.lastPathComponent, coordError.localizedDescription)
+            return false
+        }
+        return wrote
     }
 
     // fix-KVS-quota: NSUbiquitousKeyValueStore is hard-capped at 1024 keys / 1 MB.

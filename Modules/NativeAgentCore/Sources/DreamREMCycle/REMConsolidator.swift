@@ -73,19 +73,35 @@ public struct REMReport: Sendable, Codable, Equatable {
     public var tombstoneSkips: Int
     public var growthMDEvicted: Int
     public var archivedEntries: Int
+    /// Proposals the store REFUSED, keyed by persona doc ("SOUL.md": 2).
+    /// nil (and omitted on the wire) when nothing was dropped — and optional
+    /// so run reports written before this field decode unchanged. The fence
+    /// itself is unchanged; this is the fence saying what it stopped.
+    public var personaTargetDrops: [String: Int]?
+    /// Why this pass did no work, when it did none. 2026-09-06: losing the run
+    /// reservation to a concurrent pass returned a report indistinguishable
+    /// from a genuine zero-proposal week, so the scheduler recorded the week
+    /// "completed" and never came back — the week was silently dropped. nil on
+    /// a pass that actually ran, and omitted on the wire so older run reports
+    /// decode unchanged.
+    public var skipReason: String?
 
     public init(
         proposalsGenerated: Int,
         evidenceDatesMin: Int,
         tombstoneSkips: Int,
         growthMDEvicted: Int,
-        archivedEntries: Int = 0
+        archivedEntries: Int = 0,
+        personaTargetDrops: [String: Int]? = nil,
+        skipReason: String? = nil
     ) {
         self.proposalsGenerated = proposalsGenerated
         self.evidenceDatesMin = evidenceDatesMin
         self.tombstoneSkips = tombstoneSkips
         self.growthMDEvicted = growthMDEvicted
         self.archivedEntries = archivedEntries
+        self.personaTargetDrops = personaTargetDrops
+        self.skipReason = skipReason
     }
 }
 
@@ -204,6 +220,51 @@ public actor REMConsolidator {
 
         let now = clock()
 
+        // ONE REM AT A TIME (2026-09-06). The weekly marker below is a claim on
+        // the WEEK; it is not a claim on the RUN. A forced manual pass bypasses
+        // the freshness check entirely, so a "Run REM now" click landing beside
+        // the scheduled job had both passes reading the same diary week,
+        // calling the model, and appending two proposal sets under fresh
+        // UUIDs — the store's id dedupe cannot see identical content as one
+        // row. Same crash-safe `flock` shape the dream runner takes: a run that
+        // cannot take the reservation exits having written nothing, and the
+        // kernel releases a crashed run's lock.
+        let harnessDir = dataRoot.appendingPathComponent("harness", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: harnessDir, withIntermediateDirectories: true)
+        let runReservation: DreamRunReservation?
+        do {
+            runReservation = try DreamRunReservation.acquire(
+                at: harnessDir.appendingPathComponent(".rem_run.lock"))
+        } catch {
+            await persistRunReport(
+                outcome: .failed,
+                reason: "rem_reservation_error",
+                error: error,
+                startedAt: runStartedAt
+            )
+            throw error
+        }
+        guard let runReservation else {
+            FileHandle.standardError.write(Data(
+                "REMConsolidator: another REM pass holds the run reservation — skipping\n".utf8
+            ))
+            let report = REMReport(
+                proposalsGenerated: 0,
+                evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
+                tombstoneSkips: 0, growthMDEvicted: 0, archivedEntries: 0,
+                skipReason: "already_running"
+            )
+            await persistRunReport(
+                outcome: .skipped,
+                reason: "rem_already_running",
+                report: report,
+                startedAt: runStartedAt
+            )
+            return report
+        }
+        defer { runReservation.release() }
+
         // Only a reservation which this invocation acquired needs rollback.
         // Keeping it optional lets pre-reservation failures become durable run
         // records too, without manufacturing a marker mutation to undo.
@@ -318,7 +379,9 @@ public actor REMConsolidator {
         // voice unless the user has explicitly pinned `rem` to a different model.
         let diary = DreamDiaryReader(dataRoot: dataRoot)
         let helper = SwiftNativeREMConsolidator(llm: llm, diary: diary)
-        let since = now.addingTimeInterval(-7 * 86_400)
+        // 2026-09-06: calendar days, not 7 × 86,400 seconds — see
+        // `DreamDiaryReader.startOfLocalDay(_:daysBefore:)`.
+        let since = DreamDiaryReader.startOfLocalDay(now, daysBefore: 7)
         let personaDocs = try readPersonaDocs()
         let contextDocs = try readContextDocs()
         // Pin-only lookup on `rem` so a daemon-era seed can't override
@@ -362,6 +425,21 @@ public actor REMConsolidator {
                     + "should be the model returning [], not a parse casualty.\n"
                 FileHandle.standardError.write(Data(zeroMsg.utf8))
             }
+            // 2026-09-06: A REPLY THAT DID NOT DECODE IS A FAILED RUN, not a
+            // quiet week. The parse casualty above used to fall straight
+            // through to `.completed` with proposalsGenerated=0: the weekly
+            // claim stayed stamped, the scheduler reported a finished pass,
+            // and a real week of dreams was silently discarded until the next
+            // Sunday. Throwing here unwinds to the marker rollback, so the
+            // claim is released and the next tick retries the distillation.
+            let decodeFailures = await helper.lastDecodeFailures
+            if decodeFailures > 0 {
+                throw DreamREMCycleError.underlying(
+                    "REM distillation could not decode the model's reply "
+                    + "(\(decodeFailures) failure(s)): "
+                    + parseErrors.joined(separator: "; ")
+                )
+            }
         }
 
         // (4) Evidence-date floor (_REM_MIN_EVIDENCE_DATES).
@@ -401,7 +479,10 @@ public actor REMConsolidator {
         // (7) Append to rem_proposals.jsonl as status='pending' through the
         // shared canonical appender (flock'd, id-deduped).
         try Task.checkCancellation()
-        try await store.appendPending(kept)
+        // The append REFUSES non-GROWTH targets (persona docs are the owner's).
+        // Its receipt carries what it refused, by doc name, so the drop reaches
+        // the run report instead of dying inside the store (fable51 #11).
+        let appendReceipt = try await store.appendPendingWithReceipt(kept)
 
         // (7b) Stage ONE approval record per newly-appended pending proposal.
         // Staging stamps each row with the approval id, so a re-run can't
@@ -431,7 +512,9 @@ public actor REMConsolidator {
             evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
             tombstoneSkips: tombSkips,
             growthMDEvicted: evicted,
-            archivedEntries: moved
+            archivedEntries: moved,
+            personaTargetDrops: appendReceipt.droppedByTarget.isEmpty
+                ? nil : appendReceipt.droppedByTarget
         )
         await persistRunReport(
             outcome: .completed,
@@ -511,7 +594,11 @@ public actor REMConsolidator {
         guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {
             return []
         }
-        let cutoff = now.addingTimeInterval(TimeInterval(-days * 86_400))
+        // 2026-09-06: same window rule as `DreamDiaryReader.entriesSince` — the
+        // boundary DAY in the local calendar, inclusive. This gate used mtime,
+        // so it disagreed with the helper that actually feeds the LLM and could
+        // skip the distillation entirely for a week the helper would have read.
+        let cutoff = DreamDiaryReader.startOfLocalDay(now, daysBefore: days)
         let names = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
         let stemRE = try NSRegularExpression(pattern: "^(\\d{4}-\\d{2}-\\d{2})(?:_.+)?$")
         let isoOut = ISO8601DateFormatter()
@@ -526,7 +613,8 @@ public actor REMConsolidator {
             let url = dir.appendingPathComponent(name)
             guard let attrs = try? fm.attributesOfItem(atPath: url.path) else { continue }
             let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
-            if mtime < cutoff { continue }
+            guard let entryDay = DreamDiaryReader.localDate(fromDateStem: date),
+                  entryDay >= cutoff else { continue }
             let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
             let size = (attrs[.size] as? NSNumber)?.intValue ?? text.utf8.count
             out.append(DreamEntry(
@@ -695,15 +783,65 @@ public actor REMConsolidator {
                 (id: row.id, text: row.proposalText, createdAt: row.createdAt)
             )
         }
+        // RECONCILE AGAINST THE LIVE DOCUMENT (2026-09-06). An approved row is
+        // a historical fact and stays one; a PIN is a live instruction that
+        // rides into every chat turn. Removing or correcting a lesson in
+        // GROWTH.md left the old text pinned forever — the approval log still
+        // said approved, so the injector kept feeding the retracted wording.
+        // A pin now survives only while its lesson is still an entry in the
+        // document it was approved into.
+        let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
+        var documents: [String: String?] = [:]
         var out: [String: [REMPin]] = [:]
         for (doc, items) in perDoc {
-            let sorted = items.sorted { $0.createdAt > $1.createdAt }.prefix(3)
+            let document: String?
+            if let cached = documents[doc] {
+                document = cached
+            } else {
+                // ABSENT and UNREADABLE are different facts (2026-09-06). A
+                // document that is gone retires its pins — deleting GROWTH.md
+                // means those lessons are no longer instructions — so it
+                // reconciles against an EMPTY body. A document that exists but
+                // cannot be read keeps every pin: a transient read failure must
+                // never silently strip her prompt. Both say which on stderr.
+                let url = personaRoot.appendingPathComponent(doc)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    do {
+                        document = try String(contentsOf: url, encoding: .utf8)
+                    } catch {
+                        document = nil
+                        FileHandle.standardError.write(Data(
+                            "REMConsolidator: \(doc) unreadable (\(error)); keeping its pins\n".utf8
+                        ))
+                    }
+                } else {
+                    document = ""
+                    FileHandle.standardError.write(Data(
+                        "REMConsolidator: \(doc) is absent; retiring its pins\n".utf8
+                    ))
+                }
+                documents[doc] = document
+            }
+            let live = items.filter { Self.pinIsLive($0.text, inDocument: document) }
+            let sorted = live.sorted { $0.createdAt > $1.createdAt }.prefix(3)
             out[doc] = sorted.map { REMPin(id: $0.id, text: $0.text, createdAt: $0.createdAt) }
         }
         let enc = JSONEncoder()
         enc.outputFormatting = [.sortedKeys, .prettyPrinted]
         let data = try enc.encode(out)
         try data.write(to: pinsURL, options: .atomic)
+    }
+
+    /// True when an approved lesson is still present in `document` as its own
+    /// entry paragraph — the same standalone-entry test the writer uses to
+    /// decide it has already been appended (2026-09-06). `nil` document (the
+    /// file exists but could not be read) keeps the pin; an ABSENT document is
+    /// passed as an empty body by the caller, so its pins retire.
+    static func pinIsLive(_ text: String, inDocument document: String?) -> Bool {
+        guard let document else { return true }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return REMGrowthWriter.containsEntryParagraph(document, trimmed)
     }
 
     // MARK: GROWTH.md eviction-to-KG
@@ -899,12 +1037,30 @@ public actor REMConsolidator {
             prompt: prompt, system: nil, model: pickedModel, surface: "training"
         )
         let summary = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // User, 2026-09-06: an empty model response is a FAILURE, not a node.
+        // The old `summary.isEmpty ? "empty distillation" : summary` minted a
+        // content-free node that passed the KG writer's nonempty check, so the
+        // caller went on to splice the source slice out of GROWTH.md — the
+        // user's growth text destroyed and replaced by the literal string
+        // "empty distillation". Reachable whenever the adapter returns ""
+        // (OpenAIAdapter.parseCompletion does, for an empty completion).
+        // Throwing here aborts the eviction with GROWTH.md intact; the
+        // marker-restore defer makes the next weekly tick retry.
+        guard !summary.isEmpty else {
+            throw NSError(
+                domain: "REMConsolidator",
+                code: -210,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "GROWTH distillation returned an empty summary; refusing to "
+                    + "evict the source slice. Retrying on the next REM tick."]
+            )
+        }
         return KGNode(
             // Stable over the source slice, not the model summary. If the KG
             // commit succeeds but the following GROWTH.md splice fails, the
             // next pass upserts this same entity instead of minting a duplicate.
             id: Self.growthDistillationID(text),
-            summary: summary.isEmpty ? "empty distillation" : summary,
+            summary: summary,
             sourceLines: text.split(separator: "\n").count,
             createdAt: isoNow()
         )

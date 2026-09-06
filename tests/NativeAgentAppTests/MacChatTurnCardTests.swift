@@ -580,9 +580,24 @@ struct MacChatTurnCardTests {
         #expect(!card.spokenMeta.contains("\u{00B7}"))
 
         // And it must be wired, not merely available — an unreferenced
-        // accessibility helper is the same as no accessibility at all.
+        // accessibility helper is the same as no accessibility at all. Since
+        // the readout became its own view the spoken form is handed to it and
+        // applied there; assert BOTH ends, so neither half can go missing.
         let source = try AppSourceScraping.appSource("MacChatTurnCard.swift")
-        #expect(source.contains(".accessibilityLabel(model.spokenMeta)"))
+        #expect(source.contains("fallbackSpoken: model.spokenMeta"))
+        #expect(source.contains(".accessibilityLabel(spoken)"))
+
+        // The live branch speaks the same sentence it is showing, built from
+        // the same seconds — separator apart.
+        let clock = try #require(card.clock)
+        #expect(
+            MacChatTurnCardFormat.metaLine(
+                elapsed: clock.elapsed(at: time(120)),
+                secondsSinceMovement: clock.secondsSinceMovement(at: time(120)),
+                isTerminal: clock.isTerminal,
+                separator: ", "
+            ).contains("no movement for")
+        )
     }
 
     @Test func aSettledCardNeverSwallowsTranscriptClicks() throws {
@@ -606,7 +621,10 @@ struct MacChatTurnCardTests {
     @Test func theTitleIsNeverTruncatedInFavourOfTheElapsedReadout() throws {
         let source = try AppSourceScraping.appSource("MacChatTurnCard.swift")
         let title = try #require(source.range(of: "Text(model.title)"))
-        let meta = try #require(source.range(of: "Text(meta)"))
+        // The readout is its own view now (it owns the one-second schedule
+        // the whole card used to carry); the compression contract below is
+        // unchanged and still pins it as the first thing to give.
+        let meta = try #require(source.range(of: "MacChatTurnCardMetaText("))
         // Guard the ordering explicitly: slicing an inverted range would TRAP
         // rather than fail this test if the two rows were ever swapped.
         #expect(title.lowerBound < meta.lowerBound, "The title must precede the meta readout")
@@ -647,9 +665,20 @@ struct MacChatTurnCardTests {
         // the old 56 back at the layout sites and this test would never
         // notice; sweep 2026-08-21 caught the previous pin counting
         // occurrences inside the computed property instead of the sites).
+        // The two layout sites now live in two files: the transcript's bottom
+        // spacer stayed in ChatView, and the composer's clearance moved to the
+        // shell column when that was extracted. Scraping only ChatView made
+        // this pin silently stale — it had been asserting a line that no
+        // longer existed there and failing for a move, not a regression.
         let chatView = try AppSourceScraping.appSource("ChatView.swift")
+        let shellColumn = try AppSourceScraping.appSource("ChatView+ShellColumn.swift")
         #expect(occurrences(of: ".frame(height: turnCardClearance)", in: chatView) == 1)
-        #expect(occurrences(of: ".padding(.bottom, showThinkingRow ? turnCardClearance : 18)", in: chatView) == 1)
+        #expect(
+            occurrences(
+                of: ".padding(.bottom, showThinkingRow ? turnCardClearance : 18)",
+                in: shellColumn
+            ) == 1
+        )
         #expect(chatView.contains("ChatViewportPresentation.turnCardClearance("))
         #expect(!chatView.contains(".frame(height: 56)"))
         #expect(!chatView.contains("showThinkingRow ? 56"))
@@ -685,12 +714,66 @@ struct MacChatTurnCardTests {
 
     @Test func theCardOwnsNoClockOfItsOwn() throws {
         let source = try AppSourceScraping.appSource("MacChatTurnCard.swift")
-        // One SwiftUI schedule, entered only on the live branch.
-        #expect(occurrences(of: "TimelineView(", in: source) == 1)
+        // Two SwiftUI schedules, each entered only on a live branch, and
+        // nothing else that ticks. 2026-09-04, the 04:05 main-thread pin: the
+        // whole glass card used to rebuild every second because a string
+        // inside it counts seconds. The one-second schedule now sits on that
+        // string; the card re-projects on the coarse phase tick, which exists
+        // only for the derived `.stalled` phase.
+        #expect(occurrences(of: "TimelineView(", in: source) == 2)
         #expect(source.contains("if let state, !state.presentation.isTerminal {"))
+        #expect(source.contains("TimelineView(.periodic(from: clock.startedAt, by: 1))"))
+        #expect(source.contains("by: Self.phaseTick"))
         #expect(!source.contains("Timer."))
         #expect(!source.contains("Task.sleep"))
         #expect(!source.contains("@State"))
+    }
+
+    @Test func theCoarsePhaseTickStillCatchesAStallLongBeforeItMatters() {
+        // The card re-projects on this tick, so it bounds how late a stall can
+        // surface. Anything approaching the 90s threshold itself would make
+        // the readout and the card disagree about the same turn.
+        #expect(MacChatTurnCardHost.phaseTick > 0)
+        #expect(MacChatTurnCardHost.phaseTick <= TurnPresentationReducer.defaultStalledAfter / 10)
+    }
+
+    @Test func theSelfAdvancingReadoutMatchesTheProjectionItReplaced() throws {
+        // The readout derives its own seconds now. If its arithmetic ever
+        // drifted from the projection's, the card's title would describe one
+        // instant and the line beside it another.
+        let identity = route(session: "s", turn: "t")
+        var state = MacChatTurnLifecycleState(identity: identity, startedAt: time(0))
+        state = reduce(state, .working(action: "Streaming"), at: 10)
+
+        for offset in [10.0, 12.4, 30.0, 95.0] {
+            let projected = try #require(project(state, at: offset))
+            let clock = try #require(projected.clock)
+            #expect(clock.elapsed(at: time(offset)) == projected.elapsed)
+            #expect(clock.secondsSinceMovement(at: time(offset)) == projected.secondsSinceMovement)
+            #expect(
+                MacChatTurnCardFormat.metaLine(
+                    elapsed: clock.elapsed(at: time(offset)),
+                    secondsSinceMovement: clock.secondsSinceMovement(at: time(offset)),
+                    isTerminal: clock.isTerminal,
+                    separator: ", "
+                ) == projected.spokenMeta
+            )
+        }
+    }
+
+    @Test func aTerminalTurnRunsNoScheduleAtAll() throws {
+        // Nothing left to count: a settled card must render statically, or a
+        // card that floats over the transcript until the next turn would tick
+        // forever for a string that can never change.
+        let identity = route(session: "s", turn: "t")
+        var state = MacChatTurnLifecycleState(identity: identity, startedAt: time(0))
+        state = reduce(state, .outcomeUnknown(reason: "no evidence"), at: 30)
+        let card = try #require(project(state, at: 200))
+        let clock = try #require(card.clock)
+        #expect(clock.isTerminal)
+        #expect(clock.secondsSinceMovement(at: time(500)) == nil)
+        // Frozen: the elapsed reading does not move once the turn ended.
+        #expect(clock.elapsed(at: time(500)) == clock.elapsed(at: time(1_000)))
     }
 
     // MARK: - Helpers

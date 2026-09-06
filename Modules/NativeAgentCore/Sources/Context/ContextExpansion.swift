@@ -82,12 +82,18 @@ public struct ContextExpander: Sendable {
         self.configuration = configuration
     }
 
+    /// - Parameter offeredTruncationAtomIDs: the atom ids this turn's packet
+    ///   actually published as expandable. It is the CALLER's packet, so the
+    ///   caller supplies it; the expander will not infer it. Empty (the
+    ///   default) means no truncation pointers were offered, so only genuine
+    ///   `.onDemand` atoms expand — which is every pre-existing caller.
     public func expand(
         _ pointer: ContextAtomPointer,
         for need: NeedSignal,
         from generation: ContextStoredGeneration,
         pinnedTo snapshot: ContextGenerationSnapshot? = nil,
-        maximumCharacters requestedMaximum: Int? = nil
+        maximumCharacters requestedMaximum: Int? = nil,
+        offeredTruncationAtomIDs: Set<ContextAtomID> = []
     ) throws -> ContextExpansionResult {
         if let requestedMaximum, requestedMaximum <= 0 {
             throw ContextExpansionError.invalidCharacterLimit
@@ -178,7 +184,30 @@ public struct ContextExpander: Sendable {
         guard source.health != .removed else {
             throw ContextExpansionError.sourceRemoved(source.descriptor.id)
         }
-        guard atom.draft.injectionPolicy == .onDemand else {
+        // Two ways an atom is expandable, and only two.
+        //
+        //  1. `.onDemand` — the classic lazy pointer, selected as a pointer and
+        //     never as a body.
+        //  2. A SELECTED atom whose body THIS TURN's packet actually offered as
+        //     a truncation pointer.
+        //
+        // Case 2 requires BOTH halves, and the offered set is the load-bearing
+        // one. Authorizing on the recomputed `body.count > threshold` predicate
+        // alone would let any caller expand any long atom in the generation by
+        // handing over a hand-built pointer — the atom would never have been
+        // selected, never rendered, never offered, and the packet's bound would
+        // have bought nothing. Membership is what ties the expansion to a
+        // pointer the model was actually shown. The threshold check stays as
+        // the second half: it is what makes the offer legible as truncation
+        // rather than a general expansion grant.
+        //
+        // `.neverInject` stays refused either way: truncation never converts a
+        // withheld atom into a readable one.
+        let truncatedInPacket = offeredTruncationAtomIDs.contains(atom.draft.id)
+            && need.packetAtomExpandThresholdChars > 0
+            && atom.draft.injectionPolicy != .neverInject
+            && atom.draft.body.count > need.packetAtomExpandThresholdChars
+        guard atom.draft.injectionPolicy == .onDemand || truncatedInPacket else {
             throw ContextExpansionError.atomNotExpandable(policy: atom.draft.injectionPolicy)
         }
         guard source.descriptor.injectionPolicy != .neverInject else {

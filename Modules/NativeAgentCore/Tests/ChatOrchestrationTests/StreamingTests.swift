@@ -261,9 +261,16 @@ func textToolCompatibilityLayout_cachesToolContractBeforeVolatileContext() throw
     )
     let resolved = try #require(layout.segments)
     #expect(layout.system == resolved.combined)
+    // THREE segments since 2026-09-01: the persona's stable bytes stay
+    // byte-identical at the head, the protocol prose and the always-on floor
+    // catalog ride behind them, and the session-loaded run — `write_file` is
+    // not floor — lands in `stableSuffix`, where growing it cannot disturb a
+    // single byte of `stable`.
     #expect(resolved.stable.hasPrefix(stable))
     #expect(resolved.stable.contains("NativeAgent Swift tool protocol"))
-    #expect(resolved.stable.contains("write_file"))
+    #expect(!resolved.stable.contains("write_file"))
+    #expect(resolved.stableSuffix.contains("write_file"))
+    #expect(!resolved.stableSuffix.contains("NativeAgent Swift tool protocol"))
     #expect(resolved.dynamic == dynamic)
     #expect(!resolved.dynamic.contains("NativeAgent Swift tool protocol"))
     #expect(layout.system.range(of: "write_file")!.lowerBound

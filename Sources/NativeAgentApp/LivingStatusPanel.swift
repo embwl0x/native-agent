@@ -12,8 +12,11 @@ enum LivingAttentionPolicy {
         "self_improvement.apply",
     ]
 
+    /// Delegates to Core's `OwnerAttentionPolicy` — the single owner of
+    /// "does she need User?". This surface and the Desk headline read the same
+    /// rule, so they cannot answer differently in the same minute.
     static func ownerDecisionDeskCount(in items: [DeskItem]) -> Int {
-        items.filter(\.requiresOwnerInput).count
+        OwnerAttentionPolicy.ownerDecisionCount(in: items)
     }
 
     static func organismNeedsAttention(_ organism: OrganismSnapshot) -> Bool {
@@ -38,7 +41,10 @@ enum LivingAttentionPolicy {
     }
 
     static func needsUser(requiredApprovals: Int, ownerDecisionDeskCount: Int) -> Bool {
-        requiredApprovals > 0 || ownerDecisionDeskCount > 0
+        OwnerAttentionPolicy.needsOwner(
+            approvalsWaiting: requiredApprovals,
+            ownerDecisionItems: ownerDecisionDeskCount
+        )
     }
 }
 

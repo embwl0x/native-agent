@@ -5,6 +5,11 @@ import PersistenceCore
 /// Anthropic Messages API adapter. URLSession is injectable for tests.
 public final class AnthropicAdapter: LLMAdapter {
     public let providerId: String
+    /// Request timeout for the API-key lane. Same resolved value the OAuth
+    /// direct adapters use (240s), so both lanes fail a stalled request the
+    /// same way instead of inheriting whatever the injected session carries.
+    static let requestTimeoutSeconds: TimeInterval = 240
+
     // INTERNAL (not private): the native-tools lane lives in
     // LLMClient+AnthropicNativeTools.swift — same module, separate file, so it
     // needs module-internal visibility on the transport seams. Still not
@@ -32,8 +37,28 @@ public final class AnthropicAdapter: LLMAdapter {
     /// 30s in production (well under the 90s idle default); injectable so tests
     /// can drive it under a short idle window without waiting 30 wall seconds.
     let nativeToolKeepAliveInterval: TimeInterval
+    /// Does THIS instance talk to Anthropic's own first-party Messages API
+    /// (api.anthropic.com, `x-api-key`)? True for the default init, false for
+    /// `kimiCode()`.
+    ///
+    /// It gates the two native-tool behaviors that are documented by Anthropic
+    /// but were never wire-probed against Kimi's coding endpoint:
+    ///   1. REAL SSE tool streaming (content_block_start → input_json_delta →
+    ///      content_block_stop). kimi-code deliberately rides the blocking
+    ///      call + keepalive shape it launched on (see streamMessages).
+    ///   2. `strict: true` on closed tool schemas, so the PROVIDER validates
+    ///      structured arguments instead of the repair machinery downstream.
+    /// Set at construction — never re-derived from `providerId` at a call
+    /// site, so there is exactly one place to audit.
+    let firstPartyAnthropicToolContract: Bool
     /// U1 step 1 — per-call llm.call telemetry writer (override is test-only).
     let telemetry: LLMCallTraceRecorder
+    /// Native-tools lane only: the thinking blocks that came back with each
+    /// tool-calling response, keyed by that response's tool_use ids, so the
+    /// next round can replay them (claude-fable-5-1 has thinking always on and
+    /// 400s on a tool_result round whose assistant turn dropped them). In
+    /// memory, bounded, never persisted — see AnthropicThinkingLedger.
+    let thinkingLedger = AnthropicThinkingLedger()
 
     private var credentialRoot: URL {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -72,7 +97,8 @@ public final class AnthropicAdapter: LLMAdapter {
         providerId: String = "anthropic",
         credentialEnvVar: String = "ANTHROPIC_API_KEY",
         credentialConfigFile: String = "anthropic.json",
-        nativeToolKeepAliveInterval: TimeInterval = 30
+        nativeToolKeepAliveInterval: TimeInterval = 30,
+        firstPartyAnthropicToolContract: Bool = true
     ) {
         self.session = session
         self.endpoint = endpoint
@@ -83,6 +109,7 @@ public final class AnthropicAdapter: LLMAdapter {
         self.credentialEnvVar = credentialEnvVar
         self.credentialConfigFile = credentialConfigFile
         self.nativeToolKeepAliveInterval = max(0.001, nativeToolKeepAliveInterval)
+        self.firstPartyAnthropicToolContract = firstPartyAnthropicToolContract
         // Keep credential discovery and telemetry inside the same injected
         // body by default. A caller may still override telemetry explicitly,
         // but a secondary/test provider root must never leak traces into the
@@ -130,7 +157,12 @@ public final class AnthropicAdapter: LLMAdapter {
             providerId: "kimi-code",
             credentialEnvVar: "KIMI_CODE_API_KEY",
             credentialConfigFile: "kimi-code.json",
-            nativeToolKeepAliveInterval: nativeToolKeepAliveInterval
+            nativeToolKeepAliveInterval: nativeToolKeepAliveInterval,
+            // Kimi's coding endpoint was probed for shapes A/B/C only (request
+            // tools[], tool_use response, tool_result replay, parallel calls).
+            // Its SSE tool framing and its handling of `strict` are unprobed,
+            // so this lane keeps the exact wire it launched on.
+            firstPartyAnthropicToolContract: false
         )
     }
 
@@ -175,21 +207,37 @@ public final class AnthropicAdapter: LLMAdapter {
            !seg.stable.isEmpty, !seg.dynamic.isEmpty,
            seg.reassembles(into: sys)
         {
-            return [
-                [
-                    // Stable block carries the "\n\n" separator as its
-                    // suffix so stable-block-text + dynamic-block-text ==
-                    // `sys` byte-for-byte.
+            // `stableSuffix` is session-stable text assembled AFTER `stable`
+            // (e.g. the "Also loaded this session" tool catalog). It rides
+            // INSIDE the cached prefix as its own block, and the breakpoint
+            // moves to the LAST stable block so `stable` stays a strict
+            // prefix of the cached mass. Emitting only [stable][dynamic]
+            // here would silently DROP it from the model's view — the
+            // reassembles() guard passes either way, because it checks the
+            // SEGMENTS against `sys`, not the blocks this branch emits.
+            // Separators ride as suffixes, so the block texts still
+            // concatenate to `sys` byte-for-byte; with an empty suffix the
+            // emitted blocks are byte-identical to the old two-block shape.
+            let hasSuffix = !seg.stableSuffix.isEmpty
+            var blocks: [[String: Any]] = [[
+                "type": "text",
+                "text": seg.stable + "\n\n",
+            ]]
+            if hasSuffix {
+                blocks.append([
                     "type": "text",
-                    "text": seg.stable + "\n\n",
+                    "text": seg.stableSuffix + "\n\n",
                     "cache_control": ["type": "ephemeral"],
-                ],
-                [
-                    // Dynamic tail: NO cache_control — churns per turn.
-                    "type": "text",
-                    "text": seg.dynamic,
-                ],
-            ]
+                ])
+            } else {
+                blocks[0]["cache_control"] = ["type": "ephemeral"]
+            }
+            // Dynamic tail: NO cache_control — churns per turn.
+            blocks.append([
+                "type": "text",
+                "text": seg.dynamic,
+            ])
+            return blocks
         }
         if cacheEligible {
             return [[
@@ -222,6 +270,10 @@ public final class AnthropicAdapter: LLMAdapter {
         req.setValue(key, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
+        // An injected session may carry URLSession's 60s default (or none at
+        // all); match the OAuth lanes' resolved 240s so a stalled completion
+        // fails instead of hanging the turn.
+        req.timeoutInterval = Self.requestTimeoutSeconds
 
         var body: [String: Any] = [
             "model": model,
@@ -260,7 +312,11 @@ public final class AnthropicAdapter: LLMAdapter {
         }
         if (500..<600).contains(status) {
             let body = String(data: data, encoding: .utf8) ?? "5xx"
-            throw LLMError.underlying(message: body)
+            // User, 2026-09-06: the raw body alone discarded the status, and
+            // ProviderRecoveryPolicy classifies `.underlying` by reading a code
+            // out of the message — so a 5xx here rode the phrase ladder or
+            // nothing at all. Name the status the way the policy parses it.
+            throw LLMError.underlying(message: "\(providerId) HTTP \(status): \(body)")
         }
         guard (200..<300).contains(status) else {
             // Preserve the provider's own explanation (2026-07-19: a Kimi 403
@@ -342,7 +398,12 @@ public final class AnthropicAdapter: LLMAdapter {
             // pre-vision path. No image blocks → no tripwire note.
             var parts: [String] = []
             for m in messages {
-                let prefix = m.role == .user ? "USER:" : "ASSISTANT:"
+                let prefix: String
+                switch m.role {
+                case .user: prefix = "USER:"
+                case .assistant: prefix = "ASSISTANT:"
+                case .system: prefix = "SYSTEM:"
+                }
                 for block in m.content {
                     switch block {
                     case .text(let t):
@@ -397,10 +458,28 @@ public final class AnthropicAdapter: LLMAdapter {
                     blocks.append(["type": "text", "text": "[tool_result] \(content)"])
                 }
             }
-            anthropicMessages.append([
-                "role": m.role == .user ? "user" : "assistant",
+            // Mid-conversation tool changes never ride THIS lane (it ships no
+            // `tools` array, so there is nothing a `tool_reference` could name
+            // and any block here would be a 400). Drop a message that carries
+            // nothing else rather than emitting an empty `content` array,
+            // which the Messages API rejects. Unreachable in production — the
+            // structured native lane is the only producer — and byte-identical
+            // for every message that has content.
+            guard !blocks.isEmpty else { continue }
+            // Three-way role: a `.system` message is emitted as a
+            // MID-CONVERSATION system message here too, so the api-key lane
+            // never silently relabels it as assistant text. `clear_at` rides
+            // with it; the api-key transport sends no beta header, so a model
+            // that cannot honour it will reject the request loudly rather
+            // than silently dropping the turn-scoped semantics.
+            var entry: [String: Any] = [
+                "role": AnthropicOAuthDirectAdapter.wireRole(m.role),
                 "content": blocks,
-            ])
+            ]
+            if m.turnScopedClearAtNextUserMessage {
+                entry["clear_at"] = "next_user_message"
+            }
+            anthropicMessages.append(entry)
         }
 
         var req = URLRequest(url: endpoint)
@@ -408,6 +487,16 @@ public final class AnthropicAdapter: LLMAdapter {
         req.setValue(key, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         req.setValue("application/json", forHTTPHeaderField: "content-type")
+        // An injected session may carry URLSession's 60s default (or none at
+        // all); match the OAuth lanes' resolved 240s so a stalled completion
+        // fails instead of hanging the turn.
+        req.timeoutInterval = Self.requestTimeoutSeconds
+        // clear_at in the body REQUIRES its beta header. Same rule as the
+        // OAuth lane: present iff a message carries the flag, absent
+        // otherwise, so every pre-existing request stays byte-identical.
+        if let beta = AnthropicOAuthDirectAdapter.midConversationBetas(for: messages) {
+            req.setValue(beta, forHTTPHeaderField: "anthropic-beta")
+        }
 
         var body: [String: Any] = [
             "model": model,
@@ -441,7 +530,10 @@ public final class AnthropicAdapter: LLMAdapter {
             throw LLMError.rateLimited(message: msg, retryAfterSeconds: parseRetryAfterSeconds(from: response))
         }
         if (500..<600).contains(status) {
-            throw LLMError.underlying(message: String(data: data, encoding: .utf8) ?? "5xx")
+            // User, 2026-09-06: carry the status — see the sibling above.
+            throw LLMError.underlying(
+                message: "\(providerId) HTTP \(status): "
+                    + (String(data: data, encoding: .utf8) ?? "5xx"))
         }
         guard (200..<300).contains(status) else {
             // Preserve the provider's own explanation (2026-07-19: a Kimi 403

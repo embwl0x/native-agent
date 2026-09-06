@@ -31,33 +31,10 @@ struct MacAppBehaviorWave2EvalTests {
         }
     }
 
-    @Test("recent Spotlight prompts are deduplicated, newest-first, and bounded")
-    func spotlightRecentPromptsAreBounded() throws {
-        let suite = "NativeAgentSpotlightEval-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        defaults.set((0..<35).map { "prompt-\($0)" }, forKey: SpotlightRecentPrompts.defaultsKey)
-        let recorded = SpotlightRecentPrompts.record("prompt-10", in: defaults)
-
-        // Literal mutation fence: the stored preference must never grow past
-        // the 30-item product bound, even if the implementation constant is
-        // accidentally widened with it.
-        #expect(recorded.count == 30)
-        #expect(recorded.first == "prompt-10")
-        #expect(recorded.filter { $0 == "prompt-10" }.count == 1)
-        #expect(!recorded.contains("prompt-34"))
-        #expect(SpotlightRecentPrompts.load(from: defaults) == recorded)
-    }
-
-    @Test("Spotlight frame probe distinguishes absence from a main-thread timeout")
-    func spotlightProbeOutcomeIsHonest() {
-        #expect(SpotlightOverlayProbe.resolve(completed: true, frame: nil) == .absent)
-        #expect(SpotlightOverlayProbe.resolve(completed: false, frame: (1, 2, 3, 4)) == .timedOut)
-        #expect(SpotlightOverlayProbe.resolve(completed: true, frame: (1, 2, 480, 280)) == .frame(1, 2, 480, 280))
-    }
-
-    @Test("all Spotlight command routes resolve before panel dismissal")
-    func spotlightCommandEntriesResolveToNativeDestinations() {
+    // User authorized retiring the Spotlight overlay, 2026-09-01. The catalog
+    // this asserts on is the ⌘K command palette's, which outlived the panel.
+    @Test("every command-palette route resolves to a real destination")
+    func commandEntriesResolveToNativeDestinations() {
         let entries = commandPaletteEntries().map {
             CoordinationCommandEntry(
                 id: $0.id,
@@ -77,22 +54,6 @@ struct MacAppBehaviorWave2EvalTests {
             #expect(NativeAgentNavigationDestination.commandEntry(entry) != nil)
         }
         #expect(NativeAgentNavigationDestination.commandEntry(.init(id: "bad", route: "not-a-route")) == nil)
-    }
-
-    @Test("Spotlight fetch and render share one command-palette limit")
-    func spotlightCommandPaletteLimitIsAppliedAtPresentation() {
-        let entries = (0..<9).map { CoordinationCommandEntry(id: "entry-\($0)", route: "chat") }
-        let visible = SpotlightCommandPalettePresentation.visibleEntries(entries)
-        #expect(SpotlightCommandPalettePresentation.maximumEntries == 6)
-        #expect(visible.count == SpotlightCommandPalettePresentation.maximumEntries)
-        #expect(visible.map(\.id) == (0..<6).map { "entry-\($0)" })
-
-        struct Offline: LocalizedError {
-            var errorDescription: String? { "offline" }
-        }
-        let unavailable = SpotlightCommandPalettePresentation.resolved(.failure(Offline()))
-        #expect(unavailable.entries.isEmpty)
-        #expect(unavailable.error == "Command shortcuts unavailable: offline")
     }
 
     @Test("hotkey tap, hold, and interleaved presses settle exactly once")

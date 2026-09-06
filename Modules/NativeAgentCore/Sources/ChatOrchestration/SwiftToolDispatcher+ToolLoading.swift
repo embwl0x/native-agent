@@ -290,7 +290,8 @@ extension SwiftToolDispatcher {
 
         let allTools = Set((try? await listAvailableTools()) ?? Self.builtInToolNames)
             .subtracting(Self.legacyMacModelToolNames)
-        let existing = await activeToolsStore.load(sessionId: sessionId).activeTools
+        var sessionState = await activeToolsStore.load(sessionId: sessionId)
+        let existing = sessionState.activeTools
         let turnScoped = LLMCallContext.turnActiveTools ?? []
         let effectiveExisting = existing.union(turnScoped)
 
@@ -329,9 +330,32 @@ extension SwiftToolDispatcher {
         // Mechanical turn-only readiness must still never become persistent.
         let toPersist = validNames.subtracting(turnScoped)
         if !toPersist.isEmpty {
-            newActive = (try await activeToolsStore.addLoaded(
-                sessionId: sessionId, names: toPersist
-            )).activeTools
+            // Pin the descriptor this load actually SAW. Without it the slot
+            // reaches the next turn start with no pinned schema, and if the
+            // tool is missing from that catalog snapshot — a registry/custom
+            // tool whose readiness flapped, exactly the case pinning exists
+            // for — `commitTurnStartContract` releases the row rather than
+            // promise a body it does not have. The contract is the authority
+            // now, so a released row is a tool the model was told it loaded
+            // and then silently cannot see.
+            var descriptors: [String: PinnedToolSchema] = [:]
+            for schema in allSchemas
+            where toPersist.contains(schema.name) && descriptors[schema.name] == nil {
+                descriptors[schema.name] = PinnedToolSchema(schema)
+            }
+            sessionState = try await activeToolsStore.addLoaded(
+                sessionId: sessionId, names: toPersist, descriptors: descriptors
+            )
+            newActive = sessionState.activeTools
+        }
+        // Everything the caller VALIDLY named is now explicit, including names
+        // that needed no write because this turn's preload had already promoted
+        // them (those are subtracted from `toPersist`, so `addLoaded` never saw
+        // them and their promoted marker would otherwise stand forever).
+        if let reclassified = await activeToolsStore.markExplicitlyRequested(
+            sessionId: sessionId, names: validNames
+        ) {
+            sessionState = reclassified
         }
 
         var addedSchemas: [JSONValue] = []
@@ -365,6 +389,10 @@ extension SwiftToolDispatcher {
             "already_active": .array(alreadyActive.map { .string($0) }),
             "turn_active": .array(turnActive.map { .string($0) }),
             "session_active_count": .int(Int64(newActive.count)),
+            // Where this number came from and when it was last written, so a
+            // count that moved without a load or an unload is diagnosable from
+            // the receipt alone instead of from the state file on disk.
+            "pinned_set_provenance": sessionState.pinnedSetProvenance,
             "schemas_added": .array(addedSchemas),
             "next_turn_note": .string(readinessNote + loadNote),
         ])

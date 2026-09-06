@@ -94,8 +94,11 @@ struct UIRouteStep {
     let sidebarOnly: Bool
 }
 
-func userModeRoutes(includeNativeExperience: Bool) -> [UIRoute] {
-    var routes = [
+// User authorized retiring the Native Experience surface, 2026-09-01. Its
+// eight screenshot routes went with it; there is no longer a preference that
+// adds pages to this walk.
+func userModeRoutes() -> [UIRoute] {
+    return [
         UIRoute(id: "chat", steps: [commandStep("1", labels: ["Chat"])], displayName: "Chat", expectedDetailText: ["Sessions", "System Health"]),
         UIRoute(id: "activity", steps: [commandStep("2", labels: ["Activity"])], displayName: "Activity", expectedDetailText: ["Needs your eyes", "Approvals"]),
         UIRoute(id: "activity-approvals", steps: [commandShiftStep("a", labels: ["Approvals"])], displayName: "Activity > Approvals", expectedDetailText: ["Approvals include tool calls"]),
@@ -129,23 +132,6 @@ func userModeRoutes(includeNativeExperience: Bool) -> [UIRoute] {
         UIRoute(id: "mcp", steps: [appRouteStep("e", labels: ["MCP"])], displayName: "MCP Hub", expectedDetailText: ["MCP Hub", "Servers"]),
         UIRoute(id: "telegram", steps: [commandPaletteStep("telegram", labels: ["Command Palette", "Telegram"])], displayName: "Telegram", expectedDetailText: ["Telegram Status", "Bot token"])
     ]
-    if includeNativeExperience {
-        let experienceRoot = [
-            commandStep("2", labels: ["Activity"]),
-            axStep(["Native Experience"])
-        ]
-        routes.append(contentsOf: [
-            UIRoute(id: "native-experience", steps: experienceRoot, displayName: "Native Experience", expectedDetailText: ["Learning Journey", "Recent evidence"]),
-            UIRoute(id: "native-experience-context", steps: experienceRoot + [axStep(["Context"])], displayName: "Native Experience > Context", expectedDetailText: ["Context Economics", "Fluid Context"]),
-            UIRoute(id: "native-experience-projects", steps: experienceRoot + [axStep(["Projects & Sessions"])], displayName: "Native Experience > Projects & Sessions", expectedDetailText: ["Project Spaces", "Conversation lineage"]),
-            UIRoute(id: "native-experience-automations", steps: experienceRoot + [axStep(["Automations"])], displayName: "Native Experience > Automations", expectedDetailText: ["Automation Blueprints", "Compile"]),
-            UIRoute(id: "native-experience-capabilities", steps: experienceRoot + [axStep(["Capabilities"])], displayName: "Native Experience > Capabilities", expectedDetailText: ["Capability Readiness", "Capability Kits"]),
-            UIRoute(id: "native-experience-workbench", steps: experienceRoot + [axStep(["Workbench"])], displayName: "Native Experience > Workbench", expectedDetailText: ["Choose a saved project", "Pane"]),
-            UIRoute(id: "native-experience-skills", steps: experienceRoot + [axStep(["Skill Evolution"])], displayName: "Native Experience > Skill Evolution", expectedDetailText: ["Current version", "Version history"]),
-            UIRoute(id: "native-experience-remote-nodes", steps: experienceRoot + [axStep(["Remote Nodes"])], displayName: "Native Experience > Remote Nodes", expectedDetailText: ["Trusted Remote Node", "Effect boundary"])
-        ])
-    }
-    return routes
 }
 
 func userModeAdvancedRouteIDs() -> Set<String> {
@@ -156,21 +142,13 @@ func userModeAdvancedRouteIDs() -> Set<String> {
     ]
 }
 
-func userModeExpectedAdditionalRouteIDs(includeNativeExperience: Bool) -> Set<String> {
-    var routeIDs: Set<String> = [
+func userModeExpectedAdditionalRouteIDs() -> Set<String> {
+    let routeIDs: Set<String> = [
         "activity-approvals", "activity-inbox", "activity-memory-proposals",
         "activity-self-improvement", "workshop-schedule", "workshop-research",
         "diagnostics-status", "diagnostics-cognition", "diagnostics-inspector",
         "mac-assistant-watch-setup", "telegram", "tools"
     ]
-    if includeNativeExperience {
-        routeIDs.formUnion([
-            "native-experience", "native-experience-context",
-            "native-experience-projects", "native-experience-automations",
-            "native-experience-capabilities", "native-experience-workbench",
-            "native-experience-skills", "native-experience-remote-nodes"
-        ])
-    }
     return routeIDs
 }
 
@@ -882,7 +860,7 @@ func pressFirst(appElement: AXUIElement, labels: [String], sidebarOnly: Bool = f
     let region: ((CGRect?) -> Bool)? = sidebarOnly ? sidebarRegion(appElement: appElement) : { frame in
         guard let frame, let window else { return false }
         // Child-page actions belong to the detail, never a same-named global
-        // sidebar item (for example Native Experience > Capabilities).
+        // sidebar item (for example Diagnostics > Status).
         return frame.minX >= window.minX + 265 && frameIsFullyVisible(frame, within: window)
     }
     guard let element = findActionable(appElement, labels: labels, budget: &budget, region: region) else { return false }
@@ -1116,7 +1094,7 @@ func runVisibilityContract(artifactDir: URL, recorder: Recorder) {
         )
     }
 
-    let semanticRoutes = userModeRoutes(includeNativeExperience: false).filter {
+    let semanticRoutes = userModeRoutes().filter {
         ["providers", "trust", "personality", "knowledge", "mac-assistant-watch-setup"].contains($0.id)
     }
     if semanticRoutes.count == 5 && semanticRoutes.allSatisfy({
@@ -1471,7 +1449,6 @@ func userModeRouteID(forSidebarCase name: String) -> String? {
 func checkUserModeRouteCoverage(
     repo: URL,
     routes: [UIRoute],
-    includeNativeExperience: Bool,
     recorder: Recorder
 ) {
     guard let sidebarModel = readSidebarModelText(repo: repo) else {
@@ -1503,9 +1480,7 @@ func checkUserModeRouteCoverage(
         return
     }
     let sidebarRouteIDs = Set(sidebarCases.compactMap(userModeRouteID(forSidebarCase:)))
-    let expectedRouteIDs = sidebarRouteIDs.union(
-        userModeExpectedAdditionalRouteIDs(includeNativeExperience: includeNativeExperience)
-    )
+    let expectedRouteIDs = sidebarRouteIDs.union(userModeExpectedAdditionalRouteIDs())
     let routeIDCounts = Dictionary(grouping: routes.map(\.id), by: { $0 }).mapValues(\.count)
     let duplicates = routeIDCounts.filter { $0.value > 1 }.map(\.key).sorted()
     let actualRouteIDs = Set(routeIDCounts.keys)
@@ -1959,9 +1934,7 @@ try fm.createDirectory(at: artifactDir, withIntermediateDirectories: true)
 let recorder = Recorder()
 let appURL = installedAppURL(repo: repo)
 let bundleID = bundleIdentifier(appURL: appURL)
-let includeNativeExperience = UserDefaults(suiteName: bundleID)?
-    .bool(forKey: "nativeagent.experience.enabled") == true
-let routes = userModeRoutes(includeNativeExperience: includeNativeExperience)
+let routes = userModeRoutes()
 
 if options.processContractOnly {
     runProcessContract(recorder: recorder)
@@ -1984,12 +1957,7 @@ if options.processContractOnly {
     checkInbox(repo: repo, recorder: recorder)
     checkMemoryHygiene(repo: repo, recorder: recorder)
     checkScheduler(repo: repo, recorder: recorder)
-    checkUserModeRouteCoverage(
-        repo: repo,
-        routes: routes,
-        includeNativeExperience: includeNativeExperience,
-        recorder: recorder
-    )
+    checkUserModeRouteCoverage(repo: repo, routes: routes, recorder: recorder)
 
     if fm.fileExists(atPath: appURL.path), let app = launchOrActivate(appURL: appURL, bundleID: bundleID, recorder: recorder) {
         runUIEval(app: app, dataRoot: dataRoot, artifactDir: artifactDir, options: options, routes: routes, recorder: recorder)

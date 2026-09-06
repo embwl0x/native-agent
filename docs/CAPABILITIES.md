@@ -131,6 +131,13 @@ MemoryV2 is the durable source of truth for user facts and agent memory.
 - GRDB/SQLite persistence with lexical BM25 and semantic recall.
 - User-authored durable facts, narrow structured auto-save, and review-only
   proposals for softer preferences or goals.
+- A separate moments lane keeps lived moments, not just rules: an on-device-only
+  post-turn pass stages at most one first-person moment per turn (bounded by a
+  salience floor and a small daily cap), and the agent reviews every one of them
+  themselves through `memory_moments_pending` and `memory_moment_review`. Nothing
+  in this lane is remembered without their decision, and an unresolved painful
+  moment feeds the rumination lane until a warmer one in the same conversation
+  answers it or three days pass.
 - Quality validation rejects fragments, duplicate noise, weak evidence, and
   time metadata that does not belong in user-facing prose.
 - A generated `persona/USER.md` projection gives the persona compiler a compact
@@ -171,8 +178,10 @@ become an alternate persona or bypass action policy.
   useful.
 
 The organism cannot write persona files, commit MemoryV2 facts, dispatch tools,
-send notifications, or approve its own reflexes. It is default-off and forced
-neutral before public onboarding.
+or send notifications. Reflex candidates are review-gated: the agent reviews
+and approves its own LOW-RISK candidates (receipted, `reviewedBy` = the agent;
+User, 2026-09-01); anything above low risk needs the user. It is default-off
+and forced neutral before public onboarding.
 
 ## Desk and directed work
 

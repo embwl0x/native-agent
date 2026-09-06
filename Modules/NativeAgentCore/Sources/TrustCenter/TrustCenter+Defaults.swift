@@ -187,6 +187,7 @@ extension SwiftNativeTrustCenter {
         // candidate — NEEDS-USER.
         "evolution_propose": .string("confirm"),
         "evolution_status": .string("confirm"),
+        "evolution_withdraw": .string("confirm"),
         "self_install": .string("confirm"),
         "remote_node_execute": .string("confirm"),
         "remote_node_list": .string("auto"),
@@ -234,6 +235,7 @@ extension SwiftNativeTrustCenter {
         "browser.read_links": .string("auto"),
         "browser.screenshot": .string("auto"),
         "browser.chrome_acquire": .string("auto"),
+        "browser.chrome_renew": .string("auto"),
         "browser.chrome_navigate": .string("auto"),
         "browser.chrome_snapshot": .string("auto"),
         "browser.chrome_click": .string("confirm"),
@@ -309,6 +311,41 @@ extension SwiftNativeTrustCenter {
         // any card speak `mac.nudge`.
         "mac.nudge": .string("auto"),
         "mac_nudge": .string("auto"),
+        // fable51 item 30 — THE CLIPBOARD ORGAN. Both spellings, for the same
+        // reason every Mac pair above carries both: `autonomyForTool` matches
+        // the override key LITERALLY, and the gate is asked about
+        // `clipboard_read` while the connector registry and any card speak
+        // `mac.clipboard_read`.
+        //
+        // The READ is "auto" for the same reason the perception reads are: it
+        // changes nothing, and its real protection is the shape redactor that
+        // runs inside the handler — asking User to approve a read whose secrets
+        // are already blanked would be theatre.
+        //
+        // The WRITE is "auto" under User's 2026-08-12 YOLO call, which covers
+        // every Mac motor action. Full Mac + the accessibility category still
+        // gate it; what is gone is the per-call prompt, which made these dead
+        // on any non-interactive surface.
+        "mac.clipboard_read": .string("auto"),
+        "clipboard_read": .string("auto"),
+        "mac.clipboard_write": .string("auto"),
+        "clipboard_write": .string("auto"),
+        // fable51 item 29 — THE MENU BAR ORGAN, both spellings for the same
+        // reason as every Mac pair above. The walk sits with the perception
+        // reads; the press sits with the motor actions under User's YOLO call,
+        // gated by Full Mac + the accessibility category exactly like ax_act.
+        "mac.menu": .string("auto"),
+        "menu": .string("auto"),
+        "mac.menu_press": .string("auto"),
+        "menu_press": .string("auto"),
+        // fable51 item 33 — THE READ ORGAN, both spellings for the same reason
+        // as every Mac pair above. It sits with the perception reads: it
+        // returns what a document says, puts the scroll position back, and its
+        // real protection is the same shape redactor the clipboard read has —
+        // asking User to approve a read whose secrets are already blanked would
+        // be theatre.
+        "mac.read": .string("auto"),
+        "read": .string("auto"),
         // USER 2026-08-12 — YOLO: "Nothing should be approval gated for her. Nothing."
         // Every Mac motor action is `auto`. His machine, his agent, his call: the
         // Full-Mac grant IS the consent. Per-call approval made these dead on any
@@ -410,6 +447,10 @@ extension SwiftNativeTrustCenter {
         // underscore form silently falls through to the approval default.
         "search_chat_history": .string("auto"),
         "session_search": .string("auto"),
+        // Agent, 2026-09-06: the whole-message read behind a search hit. Same
+        // plain local read as the search that names it; without an explicit
+        // entry it falls through to the approval default (see above).
+        "read_chat_message": .string("auto"),
         "search_kg": .string("auto"),
         "recent_trace_summary": .string("auto"),
         "scratchpad_read": .string("auto"),
@@ -454,6 +495,7 @@ extension SwiftNativeTrustCenter {
         // default:"auto" auto-fire path. See defaultToolAutonomy for rationale.
         "evolution_propose": .string("confirm"),
         "evolution_status": .string("confirm"),
+        "evolution_withdraw": .string("confirm"),
         "self_install": .string("confirm"),
         "remote_node_execute": .string("confirm"),
         "remote_node_list": .string("auto"),
@@ -538,6 +580,7 @@ extension SwiftNativeTrustCenter {
         "browser.read_text": .string("auto"),
         "browser.read_links": .string("auto"),
         "browser.chrome_acquire": .string("auto"),
+        "browser.chrome_renew": .string("auto"),
         "browser.chrome_navigate": .string("auto"),
         "browser.chrome_snapshot": .string("auto"),
         "browser.chrome_click": .string("confirm"),
@@ -561,6 +604,10 @@ extension SwiftNativeTrustCenter {
         "recall_memory": .string("auto"),
         "search_chat_history": .string("auto"),
         "session_search": .string("auto"),
+        // Agent, 2026-09-06: the whole-message read behind a search hit. Same
+        // plain local read as the search that names it; without an explicit
+        // entry it falls through to the approval default (see above).
+        "read_chat_message": .string("auto"),
         "search_kg": .string("auto"),
         "recent_trace_summary": .string("auto"),
         "scratchpad_read": .string("auto"),

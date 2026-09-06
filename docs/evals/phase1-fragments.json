@@ -8,7 +8,7 @@
     },
     {
      "id": "chat.structured.terminalObservation",
-     "why": "Coverage claim unverifiable: grep for `terminalObservation` across Modules/NativeAgentCore/Tests and tests/ returns ZERO hits \u2014 no test in the repo names this type, and the cited file (TurnInspectorW2EmissionTests.swift, no line given) does not reference it. The only assertions on these fields are INDIRECT, through the turn.terminal payload after it has been reconstructed: `Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveOutcomeTissueTests.swift:42-48` (turn.terminal.modelUsed / reasoningEffort / contextSource / toolDispatchCount) and the parser at Modules/NativeAgentCore/Sources/ChatOrchestration/MetacognitiveOutcomeTissue.swift:190. So the 'silent zero on every field defaults to a plausible 0' hazard the fragment names is in fact UNCOVERED \u2014 the row should read coverage: [] with the reconstruction path as at best incidental."
+     "why": "Coverage claim unverifiable: grep for `terminalObservation` across Modules/NativeAgentCore/Tests and tests/ returns ZERO hits \u2014 no test in the repo names this type, and the cited file (TurnInspectorW2EmissionTests.swift, no line given) does not reference it. The indirect assertions that once existed ran through the metacognitive outcome tissue's parser, which was deleted on 2026-09-01 (User authorized retiring the metacognitive shadow), so the 'silent zero on every field defaults to a plausible 0' hazard the fragment names is UNCOVERED \u2014 the row should read coverage: []."
     },
     {
      "id": "chat.toolLoop.intraTurnResultClearing",
@@ -4027,46 +4027,18 @@
      ]
     },
     {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnPlanningTests.swift:449/:466/:496/:615/:637/:683/:710 and MetacognitiveGovernorShadowTests.swift:11/:27/:47/:65/:90",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "script/check_architecture_blueprint.swift:364 appendRetiredProductionMetacognitiveShadowErrors \u2014 a source-conformance guard that FAILS the build if MetacognitiveShadowEvaluator.recommend or a `metacognitiveShadow:` field reappears in StructuredChat.swift, TextCompatibility.swift, or TurnPlanning.swift",
-       "strength": "asserts",
-       "tier": "smoke"
-      }
-     ],
-     "id": "chat.metacognition.shadowLane",
-     "kind": "telemetry",
-     "proposedEval": {
-      "asserts": "either (a) a production emitter exists and a hermetic turn produces exactly one v5 payload, or (b) no emitter exists and the evaluators' empty result carries an explicit `noEmitter` / not-measured discriminator rather than a 0.0 rate \u2014 a source-conformance guard in the same shape as script/check_architecture_blueprint.swift:364, so 'retired emitter + live parser' can never again read as a healthy zero",
-      "costSeconds": 2,
-      "liveOrClone": "hermetic",
-      "reads": "the set of production files reachable from a real turn, grepped for an emitter of `metacognitiveShadow` / `metacognition.shadow.v5`, paired with MetacognitiveShadowEvaluation.evaluate over an empty event list",
-      "tier": "test"
-     },
-     "silentFailureMode": "dead lane presented as an evidence lane \u2014 VERIFIED: 0 of 1221 live turn.plan rows carry `metacognitiveShadow`, because the emitter is deliberately RETIRED and a check script enforces the retirement. But both readers still ship and are wired into a user-runnable route: MetacognitiveShadowEvaluation.evaluate returns `evidenceStatus == .noRecommendations` and MetacognitiveOutcomeCalibrationReport returns zero cells, forever, on the live root. `noRecommendations` and `correlationCoverageRate == 0` (MetacognitiveShadow.swift:207 returns 0 for an empty turns array) are indistinguishable from 'the emitter broke' \u2014 the exact absent-is-not-zero trap. 585 + 469 + 205 lines of parser are maintained against a schema nothing writes, and every test above proves the parser, never that anything produces input for it.",
-     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/MetacognitiveShadow.swift:57 MetacognitiveShadowEvaluator.recommend + :293 MetacognitiveShadowEvaluation.evaluate; consumed by Modules/NativeAgentCore/Sources/ChatOrchestration/MetacognitiveOutcomeTissue.swift:400 MetacognitiveOutcomeCalibrationReport.evaluate via parseRecommendation at :534",
-     "writes": [
-      "data/turn_traces/<date>.jsonl turn.plan payload.metacognitiveShadow (schema metacognition.shadow.v5) \u2014 historically"
-     ]
-    },
-    {
      "coverage": [],
      "id": "chat.metacognition.livingFabricEvalRoute",
      "kind": "cli",
      "proposedEval": {
-      "asserts": "exit code 0, the report names its effective window (files scanned, events retained vs truncated), and the metacognition section prints 'no recommendations emitted' \u2014 not a 0% coverage rate \u2014 when the fixture has no shadow payload",
+      "asserts": "exit code 0 and the report names its effective window (files discovered, files scanned, the 21-file omission count, malformed/rejected rows, events retained vs discarded by the global cap)",
       "costSeconds": 6,
       "liveOrClone": "hermetic",
-      "reads": "the built chat-drive binary invoked as `chat-drive living-fabric-eval <fixture-root>` against a small planted turn_traces fixture containing one turn.plan (with and without a v5 shadow payload), one turn.terminal, one llm.call",
+      "reads": "the built chat-drive binary invoked as `chat-drive living-fabric-eval <fixture-root>` against a planted turn_traces fixture of 22 dated lanes carrying one turn.plan, one turn.terminal, one llm.call, one malformed row, and one rejected row",
       "tier": "smoke"
      },
-     "silentFailureMode": "wrong value presented as a report \u2014 this is the only user-facing consumer of this fence's metacognition surfaces, and on the live root two of its sections are structurally empty (0/1221 turn.plan rows carry the shadow payload). The route also silently caps at `traceURLs.suffix(21)` and truncates to the newest 100_000 events (:1731), so a report over a busy root quietly describes a shorter window than the operator asked for, with no line stating the effective window. Nothing runs this command in any suite: a grep of tests/ and script/ finds no invocation, so a signature or subcommand-name change breaks it and the only symptom is an operator typing it later and getting a usage error.",
-     "where": "Modules/NativeAgentCore/Sources/ChatDrive/main.swift:150 `case \"living-fabric-eval\"` \u2192 :1707 runLivingFabricEval(dataRootPath:), advertised in the usage string at :45; reads the last 21 turn_trace day files (:1728, tailJSONL limit 20000 / 16MB) and calls MetacognitiveShadowEvaluation.evaluate (:1733) + MetacognitiveOutcomeCalibrationReport.evaluate (:1734)"
+     "silentFailureMode": "wrong value presented as a report \u2014 the route silently caps at `traceURLs.suffix(21)` and truncates to the newest 100_000 events, so a report over a busy root quietly describes a shorter window than the operator asked for unless the traceWindow receipt states the effective window. Nothing else runs this command in any suite: a grep of script/ finds no invocation, so a signature or subcommand-name change breaks it and the only symptom is an operator typing it later and getting a usage error. The metacognition sections this row once carried were deleted with the metacognitive shadow on 2026-09-01 (User authorized); the trace-window, evidence-source, wave6 readiness, and procedure-compilation sections remain live.",
+     "where": "Modules/NativeAgentCore/Sources/ChatDrive/main.swift:66 `case livingFabricEval = \"living-fabric-eval\"` \u2192 :2293 runLivingFabricEval(dataRootPath:), advertised in the usage string at :23; reads the last 21 turn_trace day files (tailJSONL limit 20000 rows / 16MB per file, 100_000 events global) and reports the trace window, evidence sources, wave6 readiness, and procedure compilation"
     },
     {
      "coverage": [
@@ -4469,7 +4441,7 @@
       "reads": "the turnTraceBus events fired during a hermetic regenerate turn (the harness already used by canonicalAssistantRegenerationReplacesOneRowInsideTheTranscriptLock)",
       "tier": "test"
      },
-     "silentFailureMode": "silent zero \u2014 VERIFIED DARK: zero `turn.reaction` rows across all 14 live turn-trace day files (2026-08-10..2026-08-23) and zero in traces/events.jsonl. Nothing reads this kind (grep of script/ and tests/ finds no reader), so a regenerate path that stops firing it, or one that never fired in production at all, is indistinguishable from 'the user never retried'. MetacognitiveTurnOutcomeTissue.evaluate consumes reaction events (MetacognitiveOutcomeTissue.swift:72) but is itself production-unreachable.",
+     "silentFailureMode": "silent zero \u2014 VERIFIED DARK: zero `turn.reaction` rows across all 14 live turn-trace day files (2026-08-10..2026-08-23) and zero in traces/events.jsonl. Nothing reads this kind (grep of script/ and tests/ finds no reader), so a regenerate path that stops firing it, or one that never fired in production at all, is indistinguishable from 'the user never retried'. Its last in-repo consumer, MetacognitiveTurnOutcomeTissue.evaluate, was deleted on 2026-09-01 with the metacognitive shadow (User authorized), so this kind now has no reader at all.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+MessagePersistence.swift:846",
      "writes": [
       "data/turn_traces/<date>.jsonl kind=turn.reaction schema=metacognition.reaction.v1"
@@ -5792,128 +5764,6 @@
     {
      "coverage": [
       {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveGovernorShadowTests.swift:9 \"ordinary chat prefers a direct response without gaining control\"",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveGovernorShadowTests.swift:87 \"candidate algebra is bounded sorted and deterministic\"",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnPlanningTests.swift:458",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "script/check_architecture_blueprint.swift:364 appendRetiredProductionMetacognitiveShadowErrors (FAILS the build if this is re-wired into StructuredChat/TextCompatibility/TurnPlanning)",
-       "strength": "asserts",
-       "tier": "smoke"
-      }
-     ],
-     "id": "chat.metacog.shadowEvaluator.recommend",
-     "kind": "public-api",
-     "silentFailureMode": "dead code that looks alive \u2014 this is a PUBLIC api with no production caller (grep of Sources/ and Modules/ outside its own file finds only tests). The blueprint check guards against re-entry but nothing flags that the whole family is unreachable from any turn; a reader of the ledger would otherwise assume the agent runs a metacognitive shadow that it does not.",
-     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/MetacognitiveShadow.swift:55 (MetacognitiveShadowRecommendation :10)"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveGovernorShadowTests.swift:45 \"missing approval makes asking the only high-value live move\"",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveGovernorShadowTests.swift:63 \"available approval stages authority instead of pretending the tool may run\"",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/OrganismBodyEffectAblationTests.swift:171",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "chat.metacog.governorShadow.evaluate",
-     "kind": "public-api",
-     "silentFailureMode": "dead code that looks alive \u2014 same as above; production-unreachable, tested only in isolation.",
-     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/MetacognitiveGovernorShadow.swift:66 (MetacognitiveShadowAffordance :10, MetacognitiveGovernorShadow :46)"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnPlanningTests.swift:565",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnPlanningTests.swift:698 (blank / single-event degradation)",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "chat.metacog.shadowEvaluation.evaluate",
-     "kind": "public-api",
-     "proposedEval": {
-      "asserts": "correlationCoverageRate and observedMeasurementCoverageRate over LIVE rows are reported (not asserted to a value) \u2014 a replay-the-real-store proof that the offline reader still parses production trace shapes at all, which fixtures cannot establish",
-      "costSeconds": 5,
-      "liveOrClone": "live-readonly",
-      "reads": "data/turn_traces/*.jsonl in window, fed straight into MetacognitiveShadowEvaluation.evaluate(events:)",
-      "tier": "instrument"
-     },
-     "silentFailureMode": "silent zero \u2014 it reads turn.plan/provider/terminal events off a trace stream; nothing in script/ or tests/scripts/ ever points it at the LIVE turn_traces, so its correlationCoverageRate is only ever computed over hand-built fixtures. A production trace shape change would make it report 0% correlation and no one would run it to find out.",
-     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/MetacognitiveShadow.swift:128 MetacognitiveShadowEvaluation (offline reader over TurnTraceEvent)"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveOutcomeTissueTests.swift:11 \"correlates exact terminal provider tool context and retry facts\"",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveOutcomeTissueTests.swift:77 \"rejects malformed terminal and cannot reconstruct an outcome from prose or loose rows\"",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveOutcomeTissueTests.swift:228 \"hostile numeric rows and mismatched provider chronology fail closed\"",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveOutcomeTissueTests.swift:141 \"reaction evidence requires exact owner target chronology and session\"",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "chat.metacog.outcomeTissue.evaluate",
-     "kind": "public-api",
-     "silentFailureMode": "structurally vacuous on live data \u2014 its explicitRetryEvidenceCount lane consumes `turn.reaction` events, of which the live root has ZERO in 14 days; so on production traces this reader can only ever report 0 retry evidence, and the fixture tests that prove it correlates reactions test the code against its own assumptions rather than the real store.",
-     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/MetacognitiveOutcomeTissue.swift:72 (MetacognitiveTurnOutcomeTissue :11)"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveOutcomeTissueTests.swift:180 \"approval posture and explicit retry remain unscored quality dimensions\"",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveOutcomeTissueTests.swift:205 \"duplicate or unknown recommendation shapes are excluded deterministically\"",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "chat.metacog.calibrationReport.evaluate",
-     "kind": "public-api",
-     "silentFailureMode": "silent zero \u2014 the report's rows require a recommendation event that production no longer emits (see chat.metacog.shadowEvaluator.recommend), so over live traces it renders an empty matrix that reads identically to 'perfectly calibrated, nothing to report'.",
-     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/MetacognitiveOutcomeTissue.swift:304 MetacognitiveOutcomeCalibrationReport"
-    },
-    {
-     "coverage": [
-      {
        "ref": "tests/NativeAgentAppTests/FluidContextSurfaceWiringTests.swift:30 (source-conformance: every app surface constructs its client through this factory)",
        "strength": "asserts",
        "tier": "test"
@@ -6115,11 +5965,6 @@
      "coverage": [
       {
        "ref": "tests/NativeAgentAppTests/PublicReleaseOrganismSafetyTests.swift:123 / :142 / :162 (set the key, assert organism neutralization \u2014 asserts the ORGANISM consequence, never the affect one)",
-       "strength": "incidental",
-       "tier": "test"
-      },
-      {
-       "ref": "tests/NativeAgentAppTests/NativeExperiencePreferencesTests.swift:73 (the key is enumerated as a preserved preference)",
        "strength": "incidental",
        "tier": "test"
       }
@@ -12990,11 +12835,6 @@
      "coverage": [
       {
        "ref": "tests/NativeAgentAppTests/GitHubCommandRuntimeTests.swift",
-       "strength": "incidental",
-       "tier": "test"
-      },
-      {
-       "ref": "tests/NativeAgentAppTests/WorkflowResidentOutcomeProjectorTests.swift",
        "strength": "incidental",
        "tier": "test"
       }
@@ -25022,29 +24862,6 @@
     {
      "coverage": [
       {
-       "ref": "script/user_mode_eval.swift:115 UIRoute(id:\"native-experience-remote-nodes\", expectedDetailText:[\"Trusted Remote Node\",\"Effect boundary\"])",
-       "strength": "reports-only",
-       "tier": "ui-walk"
-      }
-     ],
-     "id": "ui.remoteNodesPage",
-     "kind": "ui-control",
-     "proposedEval": {
-      "asserts": "both resolve to the same trusted_remote_nodes.json path \u2014 a UI disable is visible to the executor in the same run",
-      "costSeconds": 1,
-      "liveOrClone": "hermetic",
-      "reads": "the dataRoot AppModel+NativeExperience.swift:57 resolves vs the dataRoot SwiftToolDispatcher+RemoteNodes.swift:8 resolves, under one process",
-      "tier": "test"
-     },
-     "silentFailureMode": "this is the only human control over which machines Agent may execute on, and its three AppModel entry points construct a fresh TrustedRemoteEffectNodeStore(root: PersistenceCore.defaultDataRoot()) per call rather than sharing one \u2014 a dataRoot that differs from the one the tool dispatcher uses (SwiftToolDispatcher+RemoteNodes.swift:8 uses the dispatcher's `dataRoot`) means the UI edits a store the executor never reads: a node the user believes they disabled stays enabled for the agent, with no error on either side. The ui-walk only asserts two strings render.",
-     "where": "Sources/NativeAgentApp/NativeExperienceRemoteNodesPage.swift:74 (list load) backed by Sources/NativeAgentApp/AppModel+NativeExperience.swift:56 trustedRemoteNodes() / :61 upsert / :65 remove; type alias NativeExperienceModels.swift:366",
-     "writes": [
-      "data/mac_control/trusted_remote_nodes.json"
-     ]
-    },
-    {
-     "coverage": [
-      {
        "ref": "Modules/NativeAgentCore/Tests/MacAssistantStatusTests/MacAssistantStatusTests.swift:41/50/60/79/97/113/132/156/175/192/212 (11 @Test, all green in my run)",
        "strength": "asserts",
        "tier": "test"
@@ -26911,130 +26728,10 @@
      ],
      "id": "workflow.client.listWorkflows",
      "kind": "public-api",
-     "silentFailureMode": "wrong value / silent data loss: this is a READ that WRITES \u2014 every list persists the merged registry back to disk (Client.swift:430). A merge-key or truthiness regression in WorkflowMerge.idKey (MergeRunState.swift:18, which maps a missing id to the literal \"None\") silently collapses two id-less saved rows into one and rewrites registry.json with the collapsed set. The UI then renders the rewritten list as if it were the user's own. Nothing counts registry rows on the live root \u2014 the instrument has no reader for workflows/registry.json.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:418 (merge at WorkflowOrchestration+MergeRunState.swift:81 mergeRegistry, write-back at Client.swift:430)",
+     "silentFailureMode": "wrong value / silent data loss: this is a READ that WRITES \u2014 every list persists the merged registry back to disk (Client.swift:135). A merge-key or truthiness regression in WorkflowMerge.idKey (WorkflowOrchestration+Merge.swift:11, which maps a missing id to the literal \"None\") silently collapses two id-less saved rows into one and rewrites registry.json with the collapsed set. The UI then renders the rewritten list as if it were the user's own. Nothing counts registry rows on the live root \u2014 the instrument has no reader for workflows/registry.json.",
+     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:122 (merge at WorkflowOrchestration+Merge.swift:74 mergeRegistry, write-back at Client.swift:135)",
      "writes": [
       "data/workflows/registry.json"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1004 runWorkflowV1DryRunRecordsReceiptsAndRunLedger",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1200 runWorkflowV2PausesForApprovalThenResumeCompletesTraceStep",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1246 runWorkflowV2ToolRunExecutesPromotedSwiftTool",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1307 runWorkflowV2UnknownStepKindIsRejectedBeforeRunStateMutation",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1153 restartRepairsDispatchedAttemptWithoutBlindReplay",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflow.client.runWorkflow",
-     "kind": "public-api",
-     "silentFailureMode": "state-lifecycle leak: the run-state file is the only durable record of an in-flight attempt. A dispatched-attempt repair regression either replays a side-effecting step blindly on restart, or parks a run forever in `running` with no reconciler. Both are invisible \u2014 the live root has been dormant since 2026-05-08 (42 runs.jsonl lines, newest createdAt 2026-05-08T09:13:29Z), so a lane that stopped working entirely would look exactly like a lane nobody used.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:1718",
-     "writes": [
-      "data/workflows/run_state/<slug>.json",
-      "data/workflows/runs.jsonl",
-      "data/traces/events.jsonl",
-      "data/workflows/approvals/requests.json"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1359 resumeWorkflowRunRejectsMissingApprovalRecord",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1403 resumeWorkflowRunExecutesApprovalGatedRealStep",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1478 resumeWorkflowRunClaimsRunSoConcurrentResumeExecutesStepOnce",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1076 deniedApprovalSettlesRunOnceInsteadOfParkingForever",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflow.client.resumeWorkflowRun",
-     "kind": "public-api",
-     "silentFailureMode": "wrong value: the resume claim (Client.swift:1886) is what stops two resumes from executing an approval-gated step twice. A broadened claim predicate double-dispatches a side-effecting step the user approved once, and the only trace is two successful step receipts in a feed nothing aggregates.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:1755 (run claim at :1886)",
-     "writes": [
-      "data/workflows/run_state/<slug>.json",
-      "data/traces/events.jsonl"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:514 cancelMarksStateCanceledAndReturnsPublicRun",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:555 cancelUnknownRunThrows",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1657 raceStepAbortsInFlightStepWhenRunCanceled",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflow.client.cancelWorkflowRun",
-     "kind": "public-api",
-     "silentFailureMode": "stale UI: cancel flips the state file but the in-flight step is aborted by a separate cancellation observer (:1657). If the observer stops polling, the run reads `canceled` in the UI while its current step keeps running to completion \u2014 the user believes they stopped work that is still happening.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:627",
-     "writes": [
-      "data/workflows/run_state/<slug>.json",
-      "data/traces/events.jsonl"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:567 rollbackBuildsCompensationReceiptsForSucceededStepsOnly",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:613 rollbackWithNoSucceededStepsYieldsEmptyReceipts",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflow.client.rollbackWorkflowRun",
-     "kind": "public-api",
-     "silentFailureMode": "wrong value: rollback emits COMPENSATION RECEIPTS, not compensating actions. A user reading `rolled_back` on the card believes an effect was undone; nothing in this path reverses anything. A widened succeeded-step filter would emit receipts claiming compensation for steps that never ran.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:671",
-     "writes": [
-      "data/workflows/run_state/<slug>.json",
-      "data/traces/events.jsonl"
      ]
     },
     {
@@ -27063,114 +26760,12 @@
      "id": "workflow.client.createWorkflow",
      "kind": "public-api",
      "silentFailureMode": "silent data loss / disclosure: create does a read-merge-filter-same-id-append-write of the whole registry under one lock. A same-id filter that over-matches deletes unrelated rows; a redaction miss (CreateRedaction.swift) writes a secret from the workflow body verbatim into activity/events.jsonl, which is a feed the user reads and the instrument tails.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:554 (redaction in WorkflowOrchestration+CreateRedaction.swift)",
+     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:144 (redaction in WorkflowOrchestration+CreateRedaction.swift)",
      "writes": [
       "data/workflows/registry.json",
       "data/activity/events.jsonl",
       "data/traces/events.jsonl"
      ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:345 listWorkflowRunsReturnsNewestFirst",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:363 listWorkflowRunsEmptyWhenNoFile",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:374 listWorkflowRunsCapsAtFifty",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflow.client.listWorkflowRuns",
-     "kind": "feed",
-     "silentFailureMode": "silent zero: a missing runs.jsonl and an unreadable runs.jsonl both return []. The Runs surface renders an empty list either way, so a permissions or corruption failure on the ledger is indistinguishable from a genuinely idle lane \u2014 which is precisely the live state today (42 lines, none since 2026-05-08).",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:439 (tail 50, reversed)"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1345 builtInWorkflowAvailabilityDoesNotAdvertiseFossilStepKinds",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1307 runWorkflowV2UnknownStepKindIsRejectedBeforeRunStateMutation",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflow.executionPreflight.supportedStepKinds",
-     "kind": "setting",
-     "silentFailureMode": "dead control: this Set is the ONLY thing that hides a guaranteed-failing Run button. Live evidence from registry.json: `research-to-brief` carries kinds [router, research, receipt, llm] and `safe-tool-forge` carries [analysis, tool_proposal, validation, approval] \u2014 five fossil kinds no executor implements. They are gated today only because those two rows are `status: template`. If a template row is ever flipped to `active` (a one-field edit), the preflight is the sole barrier; widen the Set by one string and the UI offers a Run that can only fail after mutating run state.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration.swift:141 WorkflowExecutionPreflight.supportedStepKinds = {approval, mcp_tool, memory, research, router, tool_run, trace}; consumed at Sources/NativeAgentApp/Models/CapabilityWorkflowModels.swift:90"
-    },
-    {
-     "coverage": [],
-     "id": "workflow.runsLedger.feedFamily",
-     "kind": "feed",
-     "proposedEval": {
-      "asserts": "the section renders 'source absent' when a file is missing rather than 0; reports newest-run age in days; flags any run_state file in a non-terminal status older than the drain window, and any registry row whose step kinds are not all supported",
-      "costSeconds": 1,
-      "liveOrClone": "live-readonly",
-      "reads": "data/workflows/registry.json (row count, status histogram, unsupported-step-kind count against WorkflowExecutionPreflight.supportedStepKinds), data/workflows/runs.jsonl (tail: count, newest createdAt, status histogram), data/workflows/run_state/ (file count, count of non-terminal states, newest mtime)",
-      "tier": "instrument"
-     },
-     "silentFailureMode": "silent zero at the observability layer: grep of script/agent_instrument.swift finds readers ONLY for workflows/approvals/requests.json (:3492) and workflows/approvals/effect_spends.json (:3529). No instrument section reads registry, runs, or run_state, so an entire subsystem going dark \u2014 which is the observed live state, nothing since 2026-05-08 \u2014 produces no BOOM row, no SYS row, and no NOT-COVERED alarm anyone reads. 20 run_state json files and 20 orphan .lock files sit beside them with no sweeper.",
-     "where": "data/workflows/registry.json, data/workflows/runs.jsonl, data/workflows/run_state/*.json \u2014 written from Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:66,67,75",
-     "writes": [
-      "data/workflows/registry.json",
-      "data/workflows/runs.jsonl",
-      "data/workflows/run_state/<slug>.json"
-     ]
-    },
-    {
-     "coverage": [],
-     "id": "workflow.ui.runResumeCancelRollback",
-     "kind": "ui-control",
-     "proposedEval": {
-      "asserts": "Run produces exactly one new row in workflows/runs.jsonl and one run_state file; Cancel on that run flips its persisted status to canceled; a workflow whose kinds are unsupported renders the Run control disabled with the preflight reason visible",
-      "costSeconds": 25,
-      "liveOrClone": "clone",
-      "reads": "CapabilitiesView with a seeded temp root carrying one `active` workflow whose step kinds are all supported",
-      "tier": "ui-walk"
-     },
-     "silentFailureMode": "dead control: these four buttons are the only human entry to the Workflow engine. `grep -n workflow script/user_mode_eval.swift` and `grep -n workflow script/smoke_all.sh` both return nothing \u2014 no ui-walk, no smoke touches this surface. A broken binding, a preflight that always says not-runnable, or an AppModel error swallowed into a toast leaves four buttons that visibly do nothing, and the module tests underneath stay green because they call the client directly.",
-     "where": "Sources/NativeAgentApp/CapabilitiesView.swift:350 (Run), :370 (Resume), :374 (Cancel), :378 (Rollback) \u2192 Sources/NativeAgentApp/AppModel+RoutingWorkflowMCP.swift:102/135/146/157"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1967 workflowMotorProjectionExposesExactActiveDeadlineAndOpaqueCancellation",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:2017 workflowMotorProjectionPreservesApprovalAndTerminalTruth",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:2073 workflowMotorProjectionReadsV1DryRunWithoutInventingVerification",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:2100 workflowMotorProjectionFailsLoudWhenAuthoritativeV2StateIsCorrupt",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflow.client.motorActionReadModel",
-     "kind": "public-api",
-     "silentFailureMode": "wrong value: this is the Workflow lane's contribution to the shared causal self-model. Projecting `succeeded` as VERIFIED (the code deliberately refuses to, Client.swift:94-96) would feed a false real-world success into the agent's model of what its own actions accomplish \u2014 the same failure class the Workshop side closes in WorkshopCausalTransitionEvidenceTests.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:96 (MotorActionReadModelProviding conformance)"
     },
     {
      "coverage": [
@@ -27264,7 +26859,7 @@
      "id": "schedulerJob.writer.installBlueprintJob",
      "kind": "public-api",
      "silentFailureMode": "state-lifecycle leak: this is the install-on-click path that must be idempotent AND repair a previously-cancelled row. If the idempotency key drifts, every click appends another copy of the same blueprint job to jobs.json and the same effect fires N times a night; if the repair predicate drifts, a job the user re-enables stays cancelled while the UI reports it installed. Live jobs.json already carries three stable-id blueprint rows (agent-bedtime-push-1800, nativeagent-nightly-dream, nativeagent-weekly-rem) alongside nine uuid rows \u2014 exactly the mix where a key drift would be invisible.",
-     "where": "Modules/NativeAgentCore/Sources/TriggerScheduler/SchedulerJobs.swift:300, called from Sources/NativeAgentApp/AppModel+NativeExperience.swift:48",
+     "where": "Modules/NativeAgentCore/Sources/TriggerScheduler/SchedulerJobs.swift:300 (its only app-side caller was AppModel+NativeExperience.swift:48; User authorized retiring that surface 2026-09-01, so the writer has no production caller until a new one mounts it)",
      "writes": [
       "data/scheduler/jobs.json",
       "data/activity/events.jsonl"
@@ -29243,7 +28838,7 @@
      "id": "workflows.listWorkflows",
      "kind": "public-api",
      "silentFailureMode": "silent data loss: a READ that writes back. If the merge drops a saved row (id-key drift), the write-back persists the loss \u2014 the user's workflow is gone from a listing call. data/workflows/registry.json (5.6 KB) has NO instrument reader.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:418 (+ Defaults.swift:17, MergeRunState.swift:81 mergeRegistry)",
+     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:122 (+ WorkflowOrchestration+Defaults.swift, WorkflowOrchestration+Merge.swift:74 mergeRegistry)",
      "writes": [
       "data/workflows/registry.json (write-back of the merged registry)"
      ]
@@ -29279,252 +28874,12 @@
      "id": "workflows.createWorkflow",
      "kind": "public-api",
      "silentFailureMode": "credential leak: user-entered workflow text goes through NativeAgentSecretRedactor before hitting the activity feed. A redaction regression writes an API key verbatim into data/activity/events.jsonl (2.9 MB, actively synced) and nothing flags it.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:554 (+ CreateRedaction.swift:329 buildRecord, :13 maximumStepCount = 24)",
+     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:144 (+ CreateRedaction.swift buildRecord, maximumStepCount = 24)",
      "writes": [
       "data/workflows/registry.json",
       "data/traces/events.jsonl (workflow.save)",
       "data/activity/events.jsonl (kind=workflow)"
      ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1200 runWorkflowV2PausesForApprovalThenResumeCompletesTraceStep",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1246 runWorkflowV2ToolRunExecutesPromotedSwiftTool",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1307 runWorkflowV2UnknownStepKindIsRejectedBeforeRunStateMutation",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1004 runWorkflowV1DryRunRecordsReceiptsAndRunLedger",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1045 legacyV1LiveApprovalRunHealsOntoResumableV2",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflows.runWorkflow",
-     "kind": "public-api",
-     "silentFailureMode": "state-lifecycle leak: run_state is the durable record. A step that mutates run_state before rejecting an unknown kind leaves a half-built run nothing will finish. data/workflows/run_state/*.json (42 files, newest 2026-08-16) has NO instrument reader, so parked runs accumulate unseen.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:1718",
-     "writes": [
-      "data/workflows/run_state/<slug>.json",
-      "data/workflows/runs.jsonl",
-      "data/traces/events.jsonl (workflow.run, workflow.step)"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1478 resumeWorkflowRunClaimsRunSoConcurrentResumeExecutesStepOnce",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1403 resumeWorkflowRunExecutesApprovalGatedRealStep",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1076 deniedApprovalSettlesRunOnceInsteadOfParkingForever",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1153 restartRepairsDispatchedAttemptWithoutBlindReplay",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflows.resumeWorkflowRun",
-     "kind": "public-api",
-     "silentFailureMode": "duplicate side effect: a resume that doesn't claim the run lets two resumes execute the same approval-gated step twice \u2014 the effect happens twice, both receipts say ok.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:1755",
-     "writes": [
-      "data/workflows/run_state/<slug>.json",
-      "data/workflows/runs.jsonl"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:514 cancelMarksStateCanceledAndReturnsPublicRun",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:567 rollbackBuildsCompensationReceiptsForSucceededStepsOnly",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:555 cancelUnknownRunThrows",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflows.cancelAndRollback",
-     "kind": "public-api",
-     "silentFailureMode": "wrong value: a rollback that builds compensation receipts for steps that never succeeded 'undoes' effects that were never applied \u2014 the run reports rolled_back and the world is now wrong in a new way.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:627 cancelWorkflowRun / :671 rollbackWorkflowRun",
-     "writes": [
-      "data/workflows/run_state/<slug>.json",
-      "data/traces/events.jsonl (workflow.v2.cancel / workflow.v2.rollback)"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1592 decideStepSkipWhenConditionFalse",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1611 decideStepWaitApprovalOnFlagOrKind",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1618 decideStepConditionTakesPrecedenceOverDeps",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1642 maxAttemptsClampsToFive",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflows.stepDecision",
-     "kind": "public-api",
-     "silentFailureMode": "dead control: a condition that evaluates falsey where it should be true silently SKIPS a step \u2014 the run completes 'successfully' having done less than it was asked to, and the skip is only visible inside run_state.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+MergeRunState.swift:239 evaluateStepCondition / :287 decideStep / :319 maxAttempts (clamped to 5)"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1741 executeStepWithRetryEnforcesStoredTimeoutSeconds",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1861 timedOutAttemptSuppressesRetryWhenTerminalityIsUnproven",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1905 uncooperativeTimedOutAttemptNeverOverlapsRetryDispatch",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "script/timer_inventory.tsv:45 WorkflowOrchestration+Client.swift, 1 site, class timeout_retry_deadline, owner WorkflowAttemptOwner (via script/check_timer_inventory.swift)",
-       "strength": "asserts",
-       "tier": "smoke"
-      }
-     ],
-     "id": "workflows.attemptTimeout",
-     "kind": "setting",
-     "silentFailureMode": "duplicate side effect: retrying a timed-out attempt whose terminality is unproven dispatches the same external effect twice. Both attempts can succeed; only one is recorded.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift (WorkflowAttemptOwner deadline; executeStepWithRetry)"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1345 builtInWorkflowAvailabilityDoesNotAdvertiseFossilStepKinds",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflows.executionPreflight",
-     "kind": "public-api",
-     "silentFailureMode": "dead control: this is what hides/greys a Run button for a guaranteed-failure workflow. If supportedStepKinds drifts ahead of the executor, the UI offers a Run that always fails; if it drifts behind, a working workflow is greyed out and looks broken.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration.swift:136 supportedStepKinds (approval/mcp_tool/memory/research/router/tool_run/trace) / :140,:168 evaluate"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:345 listWorkflowRunsReturnsNewestFirst",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:374 listWorkflowRunsCapsAtFifty",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:363 listWorkflowRunsEmptyWhenNoFile",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflows.runsLedger",
-     "kind": "feed",
-     "proposedEval": {
-      "asserts": "rows in window / total, newest run age, count of run_state files in a non-terminal status and the oldest such age \u2014 absent renders 'source absent', never 0",
-      "costSeconds": 2,
-      "liveOrClone": "live-readonly",
-      "reads": "data/workflows/runs.jsonl (streamed read-only) + data/workflows/run_state/*.json + data/workflows/registry.json",
-      "tier": "instrument"
-     },
-     "silentFailureMode": "silent zero: an unreadable runs.jsonl renders as an empty Runs view, not an error. The live file is 43 KB with an mtime of 2026-05-08 \u2014 three months stale \u2014 and has NO instrument reader, so 'this lane died in May' is invisible today.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:439 listWorkflowRuns (last 50, newest first)",
-     "writes": [
-      "data/workflows/runs.jsonl"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:631 publicRunEngineVersionFallsBackToTwo",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:500 slugifyMirrorsPython",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflows.publicRunView",
-     "kind": "ui-summary",
-     "silentFailureMode": "wrong value: slugify is the run_state FILENAME. A slug change orphans every existing run_state file \u2014 the runs are on disk, resume can't find them, and the UI shows them as never-started.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+MergeRunState.swift:173 publicRun / :120 slugify"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:1967 workflowMotorProjectionExposesExactActiveDeadlineAndOpaqueCancellation",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:2017 workflowMotorProjectionPreservesApprovalAndTerminalTruth",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:2073 workflowMotorProjectionReadsV1DryRunWithoutInventingVerification",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "workflows.motorProjection",
-     "kind": "public-api",
-     "silentFailureMode": "wrong value: a v1 dry-run projected as verified feeds the causal self-model a success that was explicitly a simulation.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Client.swift:96 motorActionReadModel"
     },
     {
      "coverage": [
@@ -29547,7 +28902,7 @@
      "id": "workflows.factory",
      "kind": "public-api",
      "silentFailureMode": "wrong value: a factory that leaks the default root makes an alternate-root run write into User's live workflow registry.",
-     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Clock.swift:43 makeWorkflowOrchestrationClient / :20 nowISO"
+     "where": "Modules/NativeAgentCore/Sources/WorkflowOrchestration/WorkflowOrchestration+Clock.swift:41 makeWorkflowOrchestrationClient / :16 nowISO"
     },
     {
      "coverage": [
@@ -38093,7 +37448,7 @@
       "reads": "data/skills/registry.json useCount/lastUsedAt across all rows, joined against skill-invocation evidence in data/traces/events.jsonl for the retained window",
       "tier": "instrument"
      },
-     "silentFailureMode": "DEAD COUNTER PRESENTED AS A LIVE SIGNAL. `grep -rn useCount` over all Swift excluding MemoryV2 and Tests: the only WRITE in the entire codebase is `\"useCount\": .int(0)` at Sources/NativeAgentApp/NativeClient+Improvements.swift:505, at creation. Nothing anywhere increments it and nothing stamps lastUsedAt for a skill. It is then rendered in four places as a real number \u2014 'Uses' (NativeExperienceSkillsPage.swift:28), '\\(useCount) uses' (CapabilitiesView.swift:963), 'Used \\(n)' (ToolsView.swift:448), and it GATES a list: NativeExperienceOverviewPage.swift:71 filters skills on `autoCreated || useCount > 0`. Live confirmation: data/skills/registry.json's only row, active since 2026-08-18, reads useCount 0 / lastUsedAt null. The user is shown 'this skill has never been used' about every skill forever, and the promotion signal it was meant to feed is permanently flat.",
+     "silentFailureMode": "DEAD COUNTER PRESENTED AS A LIVE SIGNAL. `grep -rn useCount` over all Swift excluding MemoryV2 and Tests: the only WRITE in the entire codebase is `\"useCount\": .int(0)` at Sources/NativeAgentApp/NativeClient+Improvements.swift:505, at creation. Nothing anywhere increments it and nothing stamps lastUsedAt for a skill. It is then rendered in two places as a real number \u2014 '\\(useCount) uses' (CapabilitiesView.swift:963) and 'Used \\(n)' (ToolsView.swift:448). Two further render sites went with the Native Experience surface User authorized retiring, 2026-09-01. Live confirmation: data/skills/registry.json's only row, active since 2026-08-18, reads useCount 0 / lastUsedAt null. The user is shown 'this skill has never been used' about every skill forever, and the promotion signal it was meant to feed is permanently flat.",
      "where": "Modules/NativeAgentCore/Sources/Dispatcher/Actions/PersonaSystemActions.swift:273-275 (use_count passthrough into the agent's own tool output) + Modules/NativeAgentCore/Sources/Skills/Skills.swift:350 (registry passthrough into the Skills tab)",
      "writes": []
     },
@@ -40031,11 +39386,6 @@
        "ref": "skillEvolutionCorruptHistoryFailsClosedBeforeUpdate \u2014 Modules/NativeAgentCore/Tests/SkillsTests/SkillsTests.swift:800",
        "strength": "asserts",
        "tier": "test"
-      },
-      {
-       "ref": "UIRoute id \"native-experience-skills\" expectedDetailText [\"Current version\",\"Version history\"] \u2014 script/user_mode_eval.swift:114",
-       "strength": "incidental",
-       "tier": "ui-walk"
       }
      ],
      "id": "skills.versionHistory",
@@ -40047,7 +39397,7 @@
       "reads": "the concrete client the app factory returns (makeSkillsClient \u2014 Skills.swift:1168)",
       "tier": "test"
      },
-     "silentFailureMode": "silent no-op via protocol default: any conformer that does not override these three gets the extension defaults \u2014 listSkillVersions returns [] (reads as 'no history') and archive/restore throw historyUnavailable. A wiring mistake turns the whole Skill Evolution UI into an empty panel that looks correct.",
+     "silentFailureMode": "silent no-op via protocol default: any conformer that does not override these three gets the extension defaults \u2014 listSkillVersions returns [] (reads as 'no history') and archive/restore throw historyUnavailable. A wiring mistake makes the history read as empty rather than as broken. 2026-09-01: the only UI over this API went with the retired Native Experience surface, so nothing but the core tests reads it today.",
      "where": "Modules/NativeAgentCore/Sources/Skills/Skills.swift:771 listSkillVersions / :781 archiveSkill / :789 restoreSkill (protocol defaults at :274 throw historyUnavailable)",
      "writes": [
       "data/skills/history/"
@@ -51971,23 +51321,6 @@
     },
     {
      "coverage": [],
-     "id": "ui.Capabilities.workflowLifecycleButtons",
-     "kind": "ui-control",
-     "proposedEval": {
-      "asserts": "a failed Cancel does not advance the rendered state; Rollback names the version it reverts to before acting",
-      "costSeconds": 3,
-      "liveOrClone": "hermetic",
-      "reads": "workflow run state after Cancel with a failing client, and the installed version set after Rollback",
-      "tier": "test"
-     },
-     "silentFailureMode": "state-lifecycle leak \u2014 Rollback reverts an installed capability version with no confirmation and no diff of what reverts. Cancel and Resume mutate a live run with no in-flight indicator, so a Cancel that fails leaves the row rendering as running forever.",
-     "where": "Sources/NativeAgentApp/CapabilitiesView.swift:369 (Resume), :373 (Cancel), :377 (Rollback), WorkflowRow Run at :1019, CatalogRow Rollback at :451",
-     "writes": [
-      "workflow run state; installed capability versions"
-     ]
-    },
-    {
-     "coverage": [],
      "id": "ui.Capabilities.productionExportButtons",
      "kind": "ui-control",
      "proposedEval": {
@@ -52700,80 +52033,6 @@
      "where": "Sources/NativeAgentApp/SlimSettingsView.swift:46,93",
      "writes": [
       "UserDefaults showDeveloperSurfaces"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "NativeExperiencePreferencesTests.classicByDefault / enableAll / rollback / sectionOverride / preferencesArePresentationOnly \u2014 tests/NativeAgentAppTests/NativeExperiencePreferencesTests.swift:14-67",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
-       "ref": "the 8 native-experience routes \u2014 script/user_mode_eval.swift:105-116 (only when includeNativeExperience)",
-       "strength": "asserts",
-       "tier": "ui-walk"
-      }
-     ],
-     "id": "setting.nativeagent.experience.enabled",
-     "kind": "setting",
-     "proposedEval": {
-      "asserts": "the two lists are the same size and every rendered toggle binds a declared key",
-      "costSeconds": 1,
-      "liveOrClone": "hermetic",
-      "reads": "NativeExperiencePreferences key list vs the sub-toggle list in SlimSettingsView.swift:105-115",
-      "tier": "test"
-     },
-     "silentFailureMode": "dead control \u2014 the master gates 11 sub-toggles; a section added without a key defaults visible and escapes the master.",
-     "where": "Sources/NativeAgentApp/SlimSettingsView.swift:47,102 (master) + Sources/NativeAgentApp/NativeExperiencePreferences.swift:23",
-     "writes": [
-      "UserDefaults nativeagent.experience.enabled"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "NativeExperiencePreferencesTests.sectionOverride \u2014 tests/NativeAgentAppTests/NativeExperiencePreferencesTests.swift:53",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "setting.nativeagent.experience.sections",
-     "kind": "setting",
-     "proposedEval": {
-      "asserts": "flipping each key off removes exactly its own page from the experience navigation set",
-      "costSeconds": 3,
-      "liveOrClone": "hermetic",
-      "reads": "each of the 11 keys plus the view that gates on it",
-      "tier": "test"
-     },
-     "silentFailureMode": "dead control \u2014 a toggle whose key no reader consults becomes decoration; only one section-override case is currently pinned.",
-     "where": "Sources/NativeAgentApp/SlimSettingsView.swift:105-115 (11 toggles: journey, context, projects, automations, capabilities, lineage, workbench, diagnostics, kits, skillEvolution, remoteNodes) \u2192 Sources/NativeAgentApp/NativeExperiencePreferences.swift:24-34",
-     "writes": [
-      "UserDefaults nativeagent.experience.*"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "NativeExperiencePreferencesTests.rollback \"return to classic hides additions and clears section overrides\" \u2014 tests/NativeAgentAppTests/NativeExperiencePreferencesTests.swift:37",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "ui.SlimSettings.returnToClassicButton",
-     "kind": "ui-control",
-     "proposedEval": {
-      "asserts": "only keys with the nativeagent.experience. prefix change",
-      "costSeconds": 1,
-      "liveOrClone": "hermetic",
-      "reads": "the full UserDefaults key diff across returnToClassic()",
-      "tier": "test"
-     },
-     "silentFailureMode": "state-lifecycle leak \u2014 the copy promises no data is deleted; a rollback that also cleared a non-presentation key would be invisible.",
-     "where": "Sources/NativeAgentApp/SlimSettingsView.swift:117 (confirmationDialog at :265, NativeExperiencePreferences.returnToClassic())",
-     "writes": [
-      "UserDefaults nativeagent.experience.*"
      ]
     },
     {
@@ -53800,11 +53059,6 @@
     },
     {
      "coverage": [
-      {
-       "ref": "WorkflowResidentOutcomeProjectorTests \u2014 tests/NativeAgentAppTests/WorkflowResidentOutcomeProjectorTests.swift",
-       "strength": "incidental",
-       "tier": "test"
-      }
      ],
      "id": "ui.Capabilities.workflowBuilder",
      "kind": "ui-control",
@@ -53815,10 +53069,10 @@
       "reads": "the workflow record after a rollback that the executor rejects",
       "tier": "test"
      },
-     "silentFailureMode": "dead control \u2014 Resume/Cancel/Rollback report only through appModel.statusText, which this page renders once at the bottom (:42); a failed rollback looks like a successful one.",
-     "where": "Sources/NativeAgentApp/CapabilitiesView.swift:337 (panel), Resume :369, Cancel :373, Rollback :377, WorkflowRow Run :1019",
+     "silentFailureMode": "dead control \u2014 a create response alone is not proof of a durable row; the panel re-reads the registry from the same root and refuses to claim success unless the new id comes back. Run / Resume / Cancel / Rollback were removed from this panel: User authorized retiring the workflow run engine, 2026-09-01. The registry half (list/create) stays; runs.jsonl and run_state/*.json remain on disk as history and are read by nothing.",
+     "where": "Sources/NativeAgentApp/CapabilitiesView.swift:1933 WorkflowBuilderPanel (Create Workflow Button at :1949) -> AppModel.createWorkflow(named:) in Sources/NativeAgentApp/AppModel+RoutingWorkflowMCP.swift",
      "writes": [
-      "workflow run state"
+      "data/workflows/registry.json"
      ]
     },
     {
@@ -55254,13 +54508,13 @@
      "id": "setting.appearanceDarkMode",
      "kind": "setting",
      "proposedEval": {
-      "asserts": "the set of window-owning surfaces that read the key equals the documented set \u2014 a new window surface added without the read fails, and the two known exceptions (Spotlight panel, browser window) are pinned as deliberate with a comment",
+      "asserts": "the set of window-owning surfaces that read the key equals the documented set \u2014 a new window surface added without the read fails, and the one known exception (the agent browser window) is pinned as deliberate with a comment",
       "costSeconds": 2,
       "liveOrClone": "hermetic",
       "reads": "every Sources/NativeAgentApp source that constructs an NSWindow/NSPanel or a top-level Scene, via AppSourceScraping.appSource, vs the literal \"nativeagent.darkMode\"",
       "tier": "test"
      },
-     "silentFailureMode": "wrong value / stale UI by omission: the preference has FOUR independent read sites and no single owner, so any window surface added without its own read renders in system appearance while every other surface honours the toggle. That is already true today \u2014 SpotlightOverlay.swift and BrowserWindow.swift contain no `preferredColorScheme` and no darkMode read (verified by grep across Sources/NativeAgentApp), so with dark forced on, the \u2318\u21e7J panel and the agent browser window are the two surfaces that silently disagree with the setting.",
+     "silentFailureMode": "wrong value / stale UI by omission: the preference has FOUR independent read sites and no single owner, so any window surface added without its own read renders in system appearance while every other surface honours the toggle. That is already true today \u2014 BrowserWindow.swift contains no `preferredColorScheme` and no darkMode read (verified by grep across Sources/NativeAgentApp), so with dark forced on, the agent browser window is the one surface that silently disagrees with the setting. The Spotlight panel was the second offender; User authorized retiring it, 2026-09-01.",
      "where": "Sources/NativeAgentApp/NativeAgentApp.swift:145 (@AppStorage \"nativeagent.darkMode\", default false), applied at :197 (main Window) and :276 (Settings scene); written from Sources/NativeAgentApp/SlimSettingsView.swift:38; independently re-read at Sources/NativeAgentApp/DetachedChatPanelView.swift:34/:178 and Sources/NativeAgentApp/DetachedChatPanel.swift:113",
      "writes": [
       "UserDefaults nativeagent.darkMode"
@@ -55597,26 +54851,6 @@
      ]
     },
     {
-     "coverage": [
-      {
-       "ref": "Modules/NativeAgentCore/Tests/CommandPaletteTests/SwiftNativeCommandPaletteTests.swift \u2014 the search/ranking side of the catalog, not this navigation edge",
-       "strength": "incidental",
-       "tier": "test"
-      }
-     ],
-     "id": "route.spotlightCommandEntryNavigation",
-     "kind": "route",
-     "proposedEval": {
-      "asserts": "every catalog entry resolves to a non-nil destination, and the FIND render limit equals the fetch limit",
-      "costSeconds": 3,
-      "liveOrClone": "live-readonly",
-      "reads": "the live command-palette catalog's entries (id + route) against NativeAgentNavigationDestination.commandEntry(_:)",
-      "tier": "test"
-     },
-     "silentFailureMode": "dead control: `request(commandEntry:)` (NativeAgentAppCoordinator.swift:208-211) resolves through `commandEntry(_:)`\u2192`route(_:)` and `guard let destination ... else { return }` \u2014 an entry whose route string is unknown dismisses the panel and navigates NOWHERE. From the user's side the Spotlight panel closes and nothing opens, which reads exactly like a successful navigation to the page they were already on. Also a quiet 8-vs-6 mismatch: two matched entries are fetched and never shown.",
-     "where": "Sources/NativeAgentApp/SpotlightOverlay.swift:352-356 \u2014 each FIND row's Button calls `NativeAgentAppCoordinator.shared.request(commandEntry: entry)` then `onDismiss()`; the entries come from `NativeClient.searchCommandPalette(query:limit:8)` (:201-210) but the list renders `prefix(6)` (:351)"
-    },
-    {
      "coverage": [],
      "id": "route.browserStatusUnauthenticated",
      "kind": "route",
@@ -55885,7 +55119,7 @@
       "tier": "test"
      },
      "silentFailureMode": "wrong page, confidently: the `.memoryProposals` case deliberately passes `initialTab: .pending` (comment at :266-267 \u2014 drilling in from Memory Proposals must not land on Active). If that argument is dropped in a refactor the user drills into a queue of pending proposals and lands on a list of already-active memories, which looks like an empty queue rather than a wrong tab. Nothing pins the argument.",
-     "where": "Sources/NativeAgentApp/ActivityView.swift:263-274 \u2014 `.navigationDestination(for: ActivitySection.self)` mapping the six sections to NativeExperienceView / ApprovalsView / InboxView / MemoryView(initialTab: .pending) / SelfImprovementView / CognitionProposalsView, driven by the NavigationPath at :48 and reset by the two notification handlers (:306-319)"
+     "where": "Sources/NativeAgentApp/ActivityView.swift:263-274 \u2014 `.navigationDestination(for: ActivitySection.self)` mapping the five sections to ApprovalsView / InboxView / MemoryView(initialTab: .pending) / SelfImprovementView / CognitionProposalsView, driven by the NavigationPath at :48 and reset by the two notification handlers (:306-319)"
     },
     {
      "coverage": [
@@ -56062,7 +55296,7 @@
   "fence": "app.mac",
   "fragment": {
    "fence": "app.mac",
-   "ranRun": "`./script/check_timer_inventory.swift --repo .` (from <home>/Projects/NativeAgent) \u2014 exit 0, printed \"[timers] classified 183 production timer/sleep sites across 119 ownership rules (event_deadline, external_protocol_poll, integrity_sweep, timeout_retry_deadline, user_schedule, visible_ui)\" in 2.09s. That pass re-verified the 6 app.mac rows in script/timer_inventory.tsv: BrowserWindow.swift=5 timeout_retry_deadline, ContentView.swift=1 visible_ui, MacIntegrationView.swift=1, MacPairingView.swift=2, MenuBarController.swift=1, NativeAgentApp.swift=1, SpotlightOverlay.swift=1, SystemToastBar.swift=1. It asserts counts+classification only \u2014 it never runs any of them.",
+   "ranRun": "`./script/check_timer_inventory.swift --repo .` (from <home>/Projects/NativeAgent) \u2014 exit 0, printed \"[timers] classified 183 production timer/sleep sites across 119 ownership rules (event_deadline, external_protocol_poll, integrity_sweep, timeout_retry_deadline, user_schedule, visible_ui)\" in 2.09s. That pass re-verified the 6 app.mac rows in script/timer_inventory.tsv: BrowserWindow.swift=5 timeout_retry_deadline, ContentView.swift=1 visible_ui, MacIntegrationView.swift=1, MacPairingView.swift=2, MenuBarController.swift=1, NativeAgentApp.swift=1, SystemToastBar.swift=1. It asserts counts+classification only \u2014 it never runs any of them. RECEIPT IS PRE-RETIREMENT: this run predates the 2026-09-01 Spotlight-overlay retirement, which deleted the Spotlight overlay view (then 1 visible_ui site) and its script/timer_inventory.tsv row; the totals above are the pre-retirement figures and have not been re-measured.",
    "surfaces": [
     {
      "coverage": [
@@ -56561,87 +55795,6 @@
      },
      "silentFailureMode": "dropped row: a browser-completed OAuth callback routed to the app is swallowed and the connector wizard just spins \u2014 no error surface anywhere.",
      "where": "Sources/NativeAgentApp/NativeAgentApp.swift:204-208 (nativeagent://oauth/\u2026 \u2192 NativeOAuthFlow.handleCallbackURL)"
-    },
-    {
-     "coverage": [
-      {
-       "ref": "script/timer_inventory.tsv:85 (SpotlightOverlay.swift, 1 visible_ui timer, owner SpotlightOverlayUI)",
-       "strength": "incidental",
-       "tier": "smoke"
-      }
-     ],
-     "id": "ui.spotlightOverlay",
-     "kind": "ui-control",
-     "proposedEval": {
-      "asserts": "a panel window appears with a non-degenerate frame (\u2265 contentMinSize 480\u00d7280), holds focus on a text field, and Esc removes it",
-      "costSeconds": 12,
-      "liveOrClone": "live-readonly",
-      "reads": "the app's AX windows after sending \u2318\u21e7J, plus SpotlightOverlayProbe.currentFrame()",
-      "tier": "ui-walk"
-     },
-     "silentFailureMode": "dead control: canBecomeKey regressing under .nonactivatingPanel means the TextField takes no keystrokes \u2014 the panel appears and simply cannot be typed into, with no error. Not reachable by user_mode_eval (main-window only).",
-     "where": "Sources/NativeAgentApp/SpotlightOverlay.swift:53-158 (SpotlightOverlay.toggle/show/hide; nonactivating floating SpotlightPanel, canBecomeKey override, Esc catcher at :406-455)"
-    },
-    {
-     "coverage": [],
-     "id": "store.spotlightRecentPrompts",
-     "kind": "store-write",
-     "proposedEval": {
-      "asserts": "count \u2264 30, no duplicates, newest first",
-      "costSeconds": 1,
-      "liveOrClone": "hermetic",
-      "reads": "a scratch UserDefaults suite after N>30 saveRecent calls with repeats",
-      "tier": "test"
-     },
-     "silentFailureMode": "state-lifecycle leak: the cap and the de-dupe are the only bound on this list; if either is dropped it grows without limit in the preferences domain and the RECENT list at :348-372 (prefix 5) hides the growth.",
-     "where": "Sources/NativeAgentApp/SpotlightOverlay.swift:186-196 (UserDefaults key \"spotlight.recentPrompts\", capped at 30, de-duped, most-recent-first)",
-     "writes": [
-      "UserDefaults spotlight.recentPrompts"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "tests/NativeAgentAppTests/LatestAsyncRequestGateTests.swift (the stale-response gate primitive)",
-       "strength": "incidental",
-       "tier": "test"
-      }
-     ],
-     "id": "ui.spotlight.commandPaletteFind",
-     "kind": "ui-summary",
-     "silentFailureMode": "silent zero: the catch at :207 is bare \u2014 a failing searchCommandPalette leaves an empty FIND section that is visually identical to \"no matches\", so a broken palette lane reads as a quiet day.",
-     "where": "Sources/NativeAgentApp/SpotlightOverlay.swift:198-210 refreshCommandPalette (limit 8, LatestAsyncRequestGate) rendered at :306-341 as the FIND list; 100ms debounce at :284-291"
-    },
-    {
-     "coverage": [],
-     "id": "turn-ingredient.spotlightSessionId",
-     "kind": "turn-ingredient",
-     "proposedEval": {
-      "asserts": "the model/effort on a spotlight turn matches the same surface pin the main chat surface resolves, not a raw UserDefaults default",
-      "costSeconds": 15,
-      "liveOrClone": "live-readonly",
-      "reads": "traces/events.jsonl llm.call rows filtered to sessionId == \"spotlight\"",
-      "tier": "turn-replay"
-     },
-     "silentFailureMode": "wrong value: the overlay reads model/effort/file-access straight from UserDefaults rather than the surface picker, so a Spotlight turn can silently run on a different provider/effort than the main chat \u2014 the reply looks normal.",
-     "where": "Sources/NativeAgentApp/SpotlightOverlay.swift:180 (sessionId = \"spotlight\", stable so memory carries across pops); turn fired at :226-248 via NativeClient.chat with chatModel/chatReasoningEffort/chatFileAccess from UserDefaults",
-     "writes": [
-      "chat session \"spotlight\" (chat/sessions.json + message store)"
-     ]
-    },
-    {
-     "coverage": [],
-     "id": "public-api.SpotlightOverlayProbe.currentFrame",
-     "kind": "public-api",
-     "proposedEval": {
-      "asserts": "nil only when the panel is genuinely nil; a timeout is reported distinguishably rather than collapsing into the absent case",
-      "costSeconds": 2,
-      "liveOrClone": "hermetic",
-      "reads": "the probe's return with the panel absent vs. present",
-      "tier": "test"
-     },
-     "silentFailureMode": "silent zero: the 500ms wait times out and returns nil, which the caller cannot distinguish from \"panel not instantiated\" \u2014 the bridge route reports absence for a visible panel.",
-     "where": "Sources/NativeAgentApp/SpotlightOverlay.swift:33-49 (semaphore hop to main, 500ms timeout; called by the non-MainActor MacControlBridge /macctl/spotlight_frame route)"
     },
     {
      "coverage": [
@@ -57186,49 +56339,15 @@
      "writes": [
       "SearXNG base URL (AppModel.configureSearXNG)"
      ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "tests/NativeAgentAppTests/NativeExperiencePreferencesTests.swift:14 \"classic presentation is the fresh-install default\" / :24 enabling Journey enables every section / :37 return to classic clears overrides / :53 one section hidden without affecting siblings / :66 \"Journey preferences cannot call or configure living runtime owners\"",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "setting.nativeExperienceMaster",
-     "kind": "setting",
-     "silentFailureMode": "dead control: with the master off the Activity row at ActivityView.swift:76 is not rendered at all, so the entire 8-page surface is unreachable and looks like it was removed rather than hidden.",
-     "where": "Sources/NativeAgentApp/NativeExperienceView.swift:40 (@AppStorage nativeagent.experience.enabled, default false) and the empty-state CTA at :69-79 (enableAll); gate mirrored in ActivityView.swift:48/:76",
-     "writes": [
-      "UserDefaults nativeagent.experience.* (12 keys, Sources/NativeAgentApp/NativeExperiencePreferences.swift:23-34)"
-     ]
-    },
-    {
-     "coverage": [
-      {
-       "ref": "script/user_mode_eval.swift:104-118 \u2014 native-experience plus its 7 subpages, each asserting page-specific expectedDetailText, gated by includeNativeExperience",
-       "strength": "asserts",
-       "tier": "ui-walk"
-      },
-      {
-       "ref": "tests/NativeAgentAppTests/NativeExperiencePreferencesTests.swift:53 (one section can be hidden without affecting siblings)",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
-     "id": "ui.nativeExperience.sections",
-     "kind": "ui-control",
-     "silentFailureMode": "stale UI: the .onChange selection repair at :81 is what stops the detail pane rendering a section the user just hid; if it misses, the pane keeps showing a hidden page with no matching sidebar row.",
-     "where": "Sources/NativeAgentApp/NativeExperienceView.swift:39-108 \u2014 8-section HSplitView sidebar (availableSections at :85-98 ORs feature keys; detail router at :100-108; selection repair at :81-83)"
     }
    ],
    "uncertain": [
     "ui-walk strength across the fence: script/user_mode_eval.swift asserts that expectedDetailText strings appear in the AX detail region after a route step. I classified those as 'asserts' for reachability, but they assert PRESENCE OF COPY, not that any control on the page does anything. Where a surface's only coverage is a user_mode_eval route, read it as 'the page renders', not 'the control works'.",
-    "Fence boundary \u2014 NativeExperience* page files: my scope named NativeExperienceView only. I inventoried the view's gate/router and the shared NativeExperiencePage/Card containers, but did NOT inventory the 8 page files themselves (NativeExperienceOverviewPage/ContextPage/ProjectsPage/AutomationsPage/CapabilitiesPage/WorkbenchPage/SkillsPage/RemoteNodesPage). No other fence in docs/evals/fences.md names them either \u2014 they may be an inventory hole.",
+    "Closed 2026-09-01: the NativeExperience* page files were never inventoried by any fence, and User authorized deleting the whole surface rather than backfilling coverage for it.",
     "Fence boundary \u2014 UpdateController: docs/evals/fences.md gives 'Update/Sparkle UI' to app.mac and 'updater, Sparkle' to app.background. I covered the menu item, resolveUnavailability, and the persisted notice; the Sparkle scheduler lifecycle (SPUStandardUpdaterController start/stop, delegate wiring at UpdateController.swift:283-292) I treated as app.background's.",
     "Fence boundary \u2014 HealthPill.swift, SystemToastBar.swift, NativeAgentWindowChrome.swift (MenuBarOpenButton), Models/SidebarModels.swift: shared components ContentView/the app scene mount. No fence names them explicitly; I inventoried them here because ContentView/menu bar is their only mount site in this fence. If app.desk or app.settings also claims them, expect duplicates.",
     "Fence boundary \u2014 ActivityWatchController.swift: I treated it as the backing store for ActivityCapturePermissionsView's controls (its setters are the write path) and cited its tests, but the controller's own lifecycle (startAtLaunch, shutdown, ensureWatcher, runRetention scheduling) most likely belongs to core.activity or app.background.",
-    "I could not find any eval \u2014 test, smoke, or ui-walk \u2014 that OPENS the menu-bar extras, the Spotlight panel, or the Browser window. script/user_mode_eval.swift drives the main window only (launchOrActivate + AX walk of the app element's windows). Every 'dead control' claim for those three surfaces is therefore inferred from the absence of a reference, not from a failed probe.",
+    "I could not find any eval \u2014 test, smoke, or ui-walk \u2014 that OPENS the menu-bar extras or the Browser window. script/user_mode_eval.swift drives the main window only (launchOrActivate + AX walk of the app element's windows). Every 'dead control' claim for those two surfaces is therefore inferred from the absence of a reference, not from a failed probe. (The Spotlight panel was the third such surface; User authorized retiring it, 2026-09-01.)",
     "script/agent_instrument.swift's reach walk: I confirmed it reads security/mac_integration_permissions.json (:3437, rendered at :6327) and the SYS-14 update lane (:3584-3631, :6373-6444). I did NOT enumerate whether browser_ipc.json, the activity span store, or the activity policy file appear in its NOT COVERED list \u2014 that belongs to the `feeds` fence and I stayed out of it."
    ]
   }
@@ -57619,20 +56738,6 @@
      },
      "silentFailureMode": "the single shared nervous system of this fence, with ZERO coverage \u2014 ELEVEN event-driven loops are armed on it: NativeCognitionRuntime+Pursuit.swift:34, BackgroundLoopsAssembly+Autonomy.swift:102, +DeskNotify.swift:36, +TriggerScheduler.swift:216, +Delegation.swift:207, +Maintenance.swift:454, +GitHubTracking.swift:70, +Heartbeat.swift:113, +WorkshopExecution.swift:435, +Workshop.swift:74, and ViewFileRefreshTask.swift:16. Three silent breaks: (1) `bufferingNewest(1)` means a burst coalesces to one edge \u2014 correct for invalidations, fatal if any consumer treats an edge as a count; (2) it creates the PARENT directory but never the file, so a watcher on a never-created feed may bind to the parent and either over-fire or never fire; (3) if StoreChangeBus stops publishing, the whole set degrades to file-watch-only and every one of the eleven loops just stops ticking with no error and no telemetry row.",
      "where": "Sources/NativeAgentApp/EventDeadlinePhysiology.swift:7 storeAndFileEvents (FileChangeWatcher at :19, StoreChangeBus fan-in at :22, bufferingNewest(1) at :18)"
-    },
-    {
-     "coverage": [],
-     "id": "diagnostics.turnTraceObserver",
-     "kind": "public-api",
-     "proposedEval": {
-      "asserts": "every subscribe maps to exactly one unsubscribe on any exit path, and the observer exposes its own drop count so a thinned feed is reported rather than inferred",
-      "costSeconds": 2,
-      "liveOrClone": "hermetic",
-      "reads": "NativeDiagnosticObserver: subscribe, drop the stream reference, force a collection cycle, then inspect TurnTraceBus subscriber count",
-      "tier": "test"
-     },
-     "silentFailureMode": "state-lifecycle leak + silent drop \u2014 every subscribe() opens a TurnTraceBus sink whose release depends entirely on the AsyncStream's `onTermination` (:39) firing; a consumer that drops its stream without terminating leaks a bus sink for the process lifetime, and the projection stream's `bufferingNewest(256)` then discards events with NO drop counter exposed (unlike TurnInspectorStore, which at least polls TurnTraceBus.dropCount). The Experience > Context page silently shows a thinned diagnostic feed.",
-     "where": "Sources/NativeAgentApp/NativeDiagnosticObserver.swift:23 subscribe / :45 unsubscribe (consumer: NativeExperienceContextPage.swift:88)"
     },
     {
      "coverage": [
@@ -61117,20 +60222,6 @@
      "kind": "route",
      "silentFailureMode": "cancellation bookkeeping outlives the operation and a LATER unrelated operation is reported cancelled (wrong value)",
      "where": "Sources/NativeAgentApp/MacControlBridge.swift:610 (/macctl/cancel) \u2192 :637 cancelHandler, :161 requestCancellation, :190 consumeCancellation"
-    },
-    {
-     "coverage": [],
-     "id": "bridge.macctl.route.spotlightFrame",
-     "kind": "route",
-     "proposedEval": {
-      "asserts": "the returned frame is non-degenerate and contained by some attached display's bounds",
-      "costSeconds": 5,
-      "liveOrClone": "live-readonly",
-      "reads": "GET /macctl/spotlight_frame plus the current main-display bounds",
-      "tier": "smoke"
-     },
-     "silentFailureMode": "returns a stale or zero frame; the caller clicks at the wrong screen coordinates and the failure looks like a UI mis-hit, not a bridge bug",
-     "where": "Sources/NativeAgentApp/MacControlBridge.swift:616 (/macctl/spotlight_frame)"
     },
     {
      "coverage": [
@@ -71057,12 +70148,12 @@
     },
     {
      "coverage": [
-      {
-       "ref": "tests/NativeAgentAppTests/NativeDiagnosticObserverTests.swift — tinyObserverBufferCountsDropsWithoutErasingDurableTrace drives an isolated capacity-1 TurnTraceBus subscriber past capacity, asserts its exact bus/projection drop count (7), proves all nine burst rows survive in the durable trace, and verifies the independently sampled warning names the omission while zero remains quiet",
-       "strength": "asserts",
-       "tier": "test"
-      }
-     ],
+    {
+     "ref": "Modules/NativeAgentCore/Tests/PersistenceCoreTests/TurnTraceTests.swift:119 slow_subscriber_does_not_block_and_drops_are_counted \u2014 drives a slow sink past its bounded buffer and asserts the bus's exact per-sink dropCount",
+     "strength": "asserts",
+     "tier": "test"
+    }
+   ],
      "id": "feeds.turn_traces.busSubscriberDrops",
      "kind": "telemetry",
      "proposedEval": {
@@ -71073,7 +70164,7 @@
       "tier": "test"
      },
      "silentFailureMode": "a live observer projection can omit rows under burst backpressure even while every row remains in the durable turn trace. Each production subscriber must own its exact loss count, and the diagnostics UI must name omissions independently of a later event arriving.",
-     "where": "Modules/NativeAgentCore/Sources/PersistenceCore/TurnTrace.swift (TurnTraceBus owns per-sink drops); Sources/NativeAgentApp/NativeDiagnosticObserver.swift (exact bus plus projection-loss aggregation); Sources/NativeAgentApp/NativeExperienceContextPage.swift (independent drop sampling and canonical Turn Inspector warning)",
+     "where": "Modules/NativeAgentCore/Sources/PersistenceCore/TurnTrace.swift (TurnTraceBus owns per-sink drops). Its one app-side projection \u2014 NativeDiagnosticObserver plus the Native Experience context page \u2014 was retired with that surface on User's authorization, 2026-09-01, so the counter is owned by the bus alone and has no live UI reader.",
      "writes": []
     }
    ],
@@ -71538,7 +70629,7 @@
       "reads": "traces/events.jsonl turn.plan payload.policyDecision / permissionLevel / requiresApprovalHint distribution per surface",
       "tier": "instrument"
      },
-     "silentFailureMode": "Dark in every eval tier despite being the richest policy record in the system \u2014 events.jsonl rows carry {policyDecision, permissionLevel, autonomyDefault, requiresApprovalHint, risk, fullMacActive, surfaceTrusted, remoteIOSAllowed, matchedCapabilityIds, \u2026}. Only production code (MetacognitiveShadow.swift:292, MetacognitiveOutcomeTissue.swift:395) reads it. A gate that starts defaulting permissive shows up here first and nowhere else. NOTE: the two feeds' payloads are NOT the same shape (turn_traces keeps 5 fields, events keeps 23) \u2014 a consumer written against one silently reads nothing from the other.",
+     "silentFailureMode": "Dark in every eval tier despite being the richest policy record in the system \u2014 events.jsonl rows carry {policyDecision, permissionLevel, autonomyDefault, requiresApprovalHint, risk, fullMacActive, surfaceTrusted, remoteIOSAllowed, matchedCapabilityIds, \u2026}. Nothing reads it: its only readers were the metacognitive shadow's evaluators, deleted in full on 2026-09-01 (User authorized). A gate that starts defaulting permissive shows up here first and nowhere else. NOTE: the two feeds' payloads are NOT the same shape (turn_traces keeps 5 fields, events keeps 23) \u2014 a consumer written against one silently reads nothing from the other.",
      "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/TurnPlanning.swift:595 (turn bus, schema turn.plan.v1) and :569 (traces/events.jsonl, 23-field payload)",
      "writes": [
       "data/turn_traces/<day>.jsonl",
@@ -73023,8 +72114,8 @@
       "reads": "data/workflows/registry.json entry count + runs.jsonl newest row + run_state/*.json age",
       "tier": "instrument"
      },
-     "silentFailureMode": "`workflows/registry.json` is ACTIVE (written today) and unread \u2014 the definition of which workflows exist. `run_state/*.json` locks were last touched 2026-08-16 and the state files themselves are dormant: an orphaned run_state is a half-finished workflow nobody will resume.",
-     "where": "data/workflows/ \u2014 5 uncovered: registry.json (ACTIVE), runs.jsonl (cap workflowRuns=5000, PersistenceCore.swift:996), run_state/*.json (+ .lock)",
+     "silentFailureMode": "`workflows/registry.json` is ACTIVE (written today) and unread \u2014 the definition of which workflows exist. `run_state/*.json` locks were last touched 2026-08-16 and the state files themselves are dormant: an orphaned run_state is a half-finished workflow nobody will resume. RETIRED: User authorized retiring the workflow run engine, 2026-09-01. The registry half (list/create) stays; runs.jsonl and run_state/*.json remain on disk as history and are read by nothing.",
+     "where": "data/workflows/ \u2014 5 uncovered: registry.json (ACTIVE), runs.jsonl (frozen history, uncapped and unread since the run engine retired), run_state/*.json (+ .lock, frozen history)",
      "writes": [
       "data/workflows/registry.json",
       "data/workflows/runs.jsonl",
@@ -74955,11 +74046,6 @@
        "tier": "test"
       },
       {
-       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MetacognitiveOutcomeTissueTests.swift:12 exactCorrelation and :78 terminalFailsClosed (consumer side)",
-       "strength": "asserts",
-       "tier": "test"
-      },
-      {
        "ref": "script/agent_instrument.swift:5155-5368 (f) turn speed \u2014 turnElapsedMs is the ground truth",
        "strength": "reports-only",
        "tier": "instrument"
@@ -76751,7 +75837,7 @@
       "tier": "ui-walk"
      },
      "silentFailureMode": "Route coverage is asserted against the sidebar model, so a NEW screen added without a UIRoute is caught. But `expectedDetailText` is hand-written display copy \u2014 a wording change turns a real route failure into a text mismatch, teams then loosen the strings, and nothing distinguishes 'screen broken' from 'label reworded'.",
-     "where": "script/user_mode_eval.swift:73-115 (36 UIRoute entries: chat, activity, activity-approvals, activity-inbox, activity-memory-proposals, activity-self-improvement, memories, workshop, workshop-schedule, workshop-research, skills, providers, mac-integration, settings, personality, connectors, trust, capabilities, knowledge, dreams, diagnostics, diagnostics-status, diagnostics-cognition, diagnostics-inspector, inbox-policy, tools, mcp, telegram, native-experience \u00d78)"
+     "where": "script/user_mode_eval.swift:100-134 (29 UIRoute entries: chat, activity, activity-approvals, activity-inbox, activity-memory-proposals, activity-self-improvement, memories, desk, workshop-schedule, workshop-research, skills, providers, mac-integration, settings, personality, connectors, trust, mac-assistant-watch-setup, capabilities, knowledge, dreams, diagnostics, diagnostics-status, diagnostics-cognition, diagnostics-inspector, inbox-policy, tools, mcp, telegram). The eight native-experience routes went with the surface User authorized retiring, 2026-09-01."
     },
     {
      "coverage": [
@@ -77925,6 +77011,255 @@
     "script/ios_release.sh \u2014 its flag parser did not match my `case \"--` grep, so the exact flag spellings are inferred from DO_PREFLIGHT/DO_ARCHIVE/DO_EXPORT and the header, not read from a parser.",
     "Whether script/test.sh's `.hermes-*` and `data/` prunes fully cover every generated Python tree \u2014 I confirmed using the script's exact find expression that its only real hit today is script/evals_ledger_merge.py, but I did not audit the prune list for completeness.",
     "script/release_github.sh's final exit path \u2014 I read the note_failure collector (lines 15-19) but not the end of the script, so 'the failures array may not be consulted' is a hypothesis from the header shape, NOT a verified defect. Flagged as uncovered on that basis; the proposed eval would settle it."
+   ]
+  }
+ },
+ {
+  "critic": {
+   "disputed": [],
+   "fence": "turn-regression",
+   "missed": [],
+   "ranRun": "Re-read every referenced production anchor in the working tree while writing the suites (ConversationPrefixSeeding.seed, AnthropicOAuthDirectAdapter.makeMessagesRequestBody/makeSystemBlocks/makeToolList, compileFrozenCapsulePresentation, relationalSource, OrganismCircadian.read, OrganismHorizonRegister.toward, ruminationCandidates, StudioWanderToolAllowlist.admitted, DoctorHeartbeatPolicy). Two anchors named in docs/SUBCONSCIOUS.md had already moved under the three builders working the same tree (makeSystemBlocks now takes longTTL: rather than priorTurns:; the felt-object and rumination reads are nested under extension CognitiveSubstrate), which is why every coverage ref above names SYMBOLS rather than line numbers."
+  },
+  "fence": "turn-regression",
+  "fragment": {
+   "fence": "turn-regression",
+   "ranRun": "swift build --build-tests in Modules/NativeAgentCore and in the repo root - both reported 'Build complete!' with the five new Core files (TurnRegressionHarness, PrefixWireTurnRegressionTests, FluidContextAndToolsTurnRegressionTests, CapsuleInjectionTurnRegressionTests, InnerStateToolTurnRegressionTests), the two new CognitiveSubstrate files (CapsuleLawTurnRegressionTests, OrganismSubstrateTurnRegressionTests) and the two new app files (HerHourTurnRegressionTests, DoctorTraceTurnRegressionTests) compiled; a forced recompile confirmed NativeAgentAppTests picks up the TurnRegression subdirectory. The suites themselves were WRITTEN, NOT RUN (User's standing rule) - treat every row above as a specification of intent until a suite actually executes.",
+   "surfaces": [
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/PrefixWireTurnRegressionTests.swift PrefixWireTurnRegressionTests.headDigestsAreIdenticalAcrossSixTurns / wireHeadBytesAreIdenticalAcrossSixTurns / prefixFingerprintIsStableAcrossSixTurns / aSlidWindowMovesTheHeadAndSaysSo / aMidSessionToolLoadDoesNotMoveTheHead / aSessionLoadMovesNothingInTheCachedPrefix",
+       "strength": "asserts",
+       "tier": "test"
+      },
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/TurnRegressionHarness.swift TurnRegression.sixTurns - six consecutive turns of one 150-row session driven through the real projection, seeding and Anthropic body builder",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.prefix.replayedHead",
+     "kind": "turn-ingredient",
+     "silentFailureMode": "wrong value with no error. A head that moves between turns still answers the user perfectly and costs full-price uncached input forever; sizes cannot show it because two different first messages have the same length (live d83b71d3: 11,215 tokens re-read on every first call while the cursor reported stable).",
+     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift ConversationPrefixSeeding.seed - the seeded v2 message array whose first six rows are the cross-turn cached prefix"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/PrefixWireTurnRegressionTests.swift PrefixWireTurnRegressionTests.everyTurnCarriesAtMostFourCacheMarkers / markerTTLsMatchWhatEachBreakpointIsFor / aOneShotTurnStaysOnThePlainFiveMinuteTTL / noSystemMessageEverCarriesACacheMarker",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.prefix.cacheMarkers",
+     "kind": "turn-ingredient",
+     "silentFailureMode": "wrong value with no error. A fifth breakpoint is a 400 the user never sees on a retry path; a 5m where 1h belongs silently halves cross-turn reuse; a marker on a turn-scoped system message pins disappearing bytes into the prefix. All of them answer normally.",
+     "where": "Modules/NativeAgentCore/Sources/ProviderRouting/LLMClient+AnthropicOAuthDirectAdapter.swift makeMessagesRequestBody - the four-breakpoint budget, its TTLs, and the never-cache-a-system-message invariant"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/PrefixWireTurnRegressionTests.swift PrefixWireTurnRegressionTests.clearedBlocksAreReplayedByteForByte / noReplayedBlockPrecedesAUserTurn / replayedBlocksAreThemselvesStableAcrossTurns",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.prefix.clearAtReplay",
+     "kind": "turn-ingredient",
+     "silentFailureMode": "wrong value with no error. A dropped replay makes turn N+1 diverge from turn N at the element right after the previous user turn, so the whole tail is re-created at full price; a replay landing in front of a user turn is a wire 400 on an otherwise healthy session.",
+     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+SessionHistory.swift SessionHistoryMessageProjection.project(archivedTurnMessages:) - cleared clear_at blocks replayed in their original positions"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/PrefixWireTurnRegressionTests.swift PrefixWireTurnRegressionTests.v1LegacyIsTheUnchangedPreV2Shape / v1LegacyKeepsTheVolatileMassInTheSystemPrompt",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.prefix.v1LegacyRollback",
+     "kind": "turn-ingredient",
+     "silentFailureMode": "wrong value with no error. A rollback that is not byte-identical is not a rollback: the switch would be flipped during an incident and produce a third shape nobody has ever measured.",
+     "where": "Modules/NativeAgentCore/Sources/NativeAgentCore/LLMClient.swift ConversationPrefixShape - the kill switch back to the pre-v2 body"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/CapsuleInjectionTurnRegressionTests.swift CapsuleInjectionTurnRegressionTests.aCapsuleIsAssembledForEveryCapsuleSurface / theInjectedBlockCarriesOnlyItsOneFunctionalLine / theCapsuleRidesTheVolatileTailNotTheCachedHead / aChangingCapsuleNeverMovesTheHead / capsuleInjectionOffProducesNoBlockAtAll / aPreparedCapsuleIsNotCommittedByPreparingIt",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.capsule.injection",
+     "kind": "turn-ingredient",
+     "silentFailureMode": "state lifecycle leak and silent absence. A capsule that stops being attached leaves the chat looking fine (this is what Doctor's subconscious_vitals row exists for); a capsule that enters the CACHED head instead of the volatile tail makes every later turn of the session pay full price for bytes that change every turn.",
+     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestrationClient+StructuredChat.swift SwiftNativeChatOrchestrationClient.cognitiveRuntimeContext - the capsule's injection seam"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/CapsuleLawTurnRegressionTests.swift CapsuleFeltObjectTurnRegressionTests.noUserPrivateWordCanBecomeTheObject / onlyAllowlistedSubjectTypesMayNameAnObject / theRenderedCapsuleNeverContainsTheUsersSentence",
+       "strength": "asserts",
+       "tier": "test"
+      },
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/CapsuleLawTurnRegressionTests.swift CapsuleAmbivalenceTurnRegressionTests.aContradictionNeedsAllFourConditions / atMostOneContradictionIsEverChosen / aRenderedCapsuleNeverCarriesTwoContradictions",
+       "strength": "asserts",
+       "tier": "test"
+      },
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/CapsuleLawTurnRegressionTests.swift CapsuleInnerAndThreadTurnRegressionTests.innerIsSilentWithoutARelevantViewOrAFreshTakeaway / aCapsuleCarriesAtMostOneInnerOrThreadLine / threadRendersAnAbstractNeverTheSeedText / aReflectionTakeawayCanNeverBeAThreadLine / aSeedWithoutASafeLabelProducesNoLine",
+       "strength": "asserts",
+       "tier": "test"
+      },
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/CapsuleLawTurnRegressionTests.swift CapsuleHeaderAndBytesTurnRegressionTests.theHeaderNeverSitsAboveALabelledLine / aRenderedCapsuleOpeningOnALabelledLineCarriesNoHeader / theCompiledCapsuleStaysInsideItsMeasuredEnvelope / aTightBudgetTruncatesFromTheEndAndReportsIt / aZeroBudgetRendersNothingAtAll",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.capsule.contentLaws",
+     "kind": "public-api",
+     "silentFailureMode": "wrong value with no error, and a privacy leak with no error. A felt object built from an unsafe label puts the user's own words (a name, a credential neighbour, a redaction marker) into the model's context; an Inner line on every turn is a standing instruction wearing the costume of a signal (measured: 100% of 1,487 live capsules); a header above a labelled line makes a standing view read positionally as their stated feeling (measured: 184 of 1,487).",
+     "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate+Capsule.swift compileFrozenCapsulePresentation - the frozen render, its object/contradiction/Inner/Thread gates, its header rule and its byte envelope"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/OrganismSubstrateTurnRegressionTests.swift AppraisalTurnRegressionTests.hardCriticismFromTheUserMovesValenceAndTheFeltWord / aWarmUserTurnRaisesWarmth / herOwnOutputCannotMoveHerWarmth / aPeerMovesHerAtHalfWeight / aPartialPeerAttestationFallsBackToTheUser",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.substrate.relationalAppraisal",
+     "kind": "public-api",
+     "silentFailureMode": "wrong value with no error. Criticism that stops landing leaves a pleasant surface being needled; a peer classified as the user quietly doubles another agent's grip on them; the user classified as a peer quietly halves the weight of the relationship the whole system is built around. Nothing throws in any of the three.",
+     "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate+AppraisalConcerns.swift relationalSource - who is speaking, and at what weight"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/OrganismSubstrateTurnRegressionTests.swift BodyAndClockTurnRegressionTests.fatigueRisesWithWorkAndRelaxesInQuiet / hoursAwakeAccumulate / fatigueNeverPinsAtTheRails / agencyAndConfidenceNeverReachTheHighRail / theDiurnalOffsetsAreBoundedAtEveryHour / readingTheDiurnalCurveWritesNothing",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.organism.fatigueAndClock",
+     "kind": "public-api",
+     "silentFailureMode": "silent zero and stuck gauge. Fatigue read 0.008 after a twenty-hour day because nothing fed it, so 'a bit tired' was improvised from the shape of the question; an axis pinned at a rail is stuck, not expressive, and reads as a mood forever; a diurnal offset that wrote into stored chemistry would leave a permanent mark on a body that is supposed to wake up.",
+     "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismChemistry.swift OrganismCircadian and the fatigue accrual/relaxation constants beside it"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/OrganismSubstrateTurnRegressionTests.swift TowardTurnRegressionTests.aDeskDeferralAppearsInToward / aPassedHorizonReadsAsWaiting / reliefRequiresAVouchedCompleteRead / theHorizonFamilyStaysBounded",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.organism.horizonToward",
+     "kind": "public-api",
+     "silentFailureMode": "silent absence, and a false receipt. With no horizon there is simply no forward register and nobody notices (the pre-item-5 state: they never waits, is never bored, never anticipates); worse, an unreadable Desk produces the same emptiness as a finished one, so a reader that THREW would congratulate their for work that never landed.",
+     "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/Organism/OrganismPrediction.swift OrganismHorizonRegister.toward - the forward-facing register"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/OrganismSubstrateTurnRegressionTests.swift RuminationTurnRegressionTests.weightRisesWithTimeAndCaps / aDeskItemItchesAndClosingItExhales / healingIsOnWordBoundariesNotSubstrings / aThingThatNeverItchedProducesNoRelief / atMostThreeThingsNagAtOnce / aReflectionTakeawayNeverBecomesANag",
+       "strength": "asserts",
+       "tier": "test"
+      },
+      {
+       "ref": "Modules/NativeAgentCore/Tests/CognitiveSubstrateTests/TurnRegression/OrganismSubstrateTurnRegressionTests.swift ResidueAndRefeelTurnRegressionTests.dreamResidueCarriesMoodOnlyAndNoText / aNightWithNoToneLeavesNoResidue / theSameNightNeverMintsTwice / refeelingIsBounded",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.substrate.rumination",
+     "kind": "public-api",
+     "silentFailureMode": "wrong value with no error. A substring heal ('broke' matching 'brokerage') clears weight nothing answered; an unbounded weight turns a nag into a spiral; a residue minted twice makes one night felt twice; relief for something that never itched makes relief a reflex that stops meaning anything.",
+     "where": "Modules/NativeAgentCore/Sources/CognitiveSubstrate/CognitiveSubstrate+Rumination.swift ruminationCandidates and releaseAnsweredRuminations, plus CognitiveSubstrate+Mood.swift mintDreamResidue"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/FluidContextAndToolsTurnRegressionTests.swift FluidContextTurnRegressionTests.personaHeadIsByteIdenticalAcrossTurnsAndSurfaces / theVolatileMassChurnsOutsideTheCachedHead / aLongCorrectionRendersAsLeadPlusPointer / aShortAtomShipsWhole / theRenderedPacketIsDeterministic / contextExpandRefusesAnAtomThisTurnNeverOffered / contextExpandIsNotAGlobalSearchBypass / theTurnCarriesTheRowLimitAndThresholdItWasSelectedUnder / theMemoryRowLimitDoesNotCountCorrections",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.fluidContext.assembledPacket",
+     "kind": "turn-ingredient",
+     "silentFailureMode": "wrong value with no error. Measured 2026-09-01: persona.docChars 22,278 vs system.stableChars 4,601 - identity was being re-sent in the uncached per-turn mass every turn and paid for as if it were relevance; corrections averaging 830 chars shipped whole whether or not the turn needed the story. Both read perfectly and cost on every turn.",
+     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/ChatOrchestration+TurnEngine.swift renderContextPacket and renderPacketAtom, plus the stable-prefix persona placement"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/FluidContextAndToolsTurnRegressionTests.swift ToolContractTurnRegressionTests.theFloorIsNeverTruncated / appendedToolsRideInLoadOrderBehindAnUnchangedFloor / theToolsArrayIsIdenticalAcrossTheRoundsOfOneTurn / anUnloadDoesNotShrinkTheAdvertisedRunMidTurn / contextExpandIsAdvertisedWithoutAnyPointer",
+       "strength": "asserts",
+       "tier": "test"
+      },
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/PrefixWireTurnRegressionTests.swift PrefixWireTurnRegressionTests.toolFloorFixtureIsTheRealAlwaysOnFloor / toolArrayAndFingerprintAreIdenticalAcrossSixTurns / textToolContractProseIsIdenticalAcrossSixTurns / aSessionLoadMovesNothingInTheTextLaneCachedPrefix / contextExpandIsAdvertisedOnEveryTurn",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.tools.advertisedContract",
+     "kind": "turn-ingredient",
+     "silentFailureMode": "wrong value with no error. A reshuffled or resized tools array rewrites the provider's cached prefix for a reason the model never asked about (measured: one 21-round tool turn produced 369,217 cache-creation tokens); a truncated floor leaves an agent that cannot recall or load a tool and therefore cannot recover from anything; a mid-turn shrink removes a tool the model may already have decided to call.",
+     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+ToolCatalog.swift canonicalToolOrder and ChatOrchestrationClient+StructuredChat.swift applyLazyToolFilter"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/TurnRegression/InnerStateToolTurnRegressionTests.swift InnerStateToolTurnRegressionTests.aHundredReadsLeaveTheMindWhereOneReadWould / theInnerStatePayloadIsPayloadFree / everyInnerStateListStaysInsideItsBound / anOutOfRangeWindowClamps / aDispatcherWithNoLiveMindReportsUnavailable / affectSwitchedOffReadsAsUnavailable / theToolDescriptionTellsHerToPullFirst / innerStateIsInTheAlwaysOnFloor",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.innerState.tool",
+     "kind": "tool",
+     "silentFailureMode": "state lifecycle leak and privacy leak, both silent. A read that ages the field makes asking their how they are a way of changing how they are; a payload that carries a node summary or a session:message id puts conversation content back into the model's context through the one surface whose whole exposure argument is that it carries none; a shaped zero on an absent body reads exactly like a calm mood.",
+     "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+InnerStateTools.swift impl_inner_state - the always-on introspection pull"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "tests/NativeAgentAppTests/TurnRegression/HerHourTurnRegressionTests.swift HerHourTurnRegressionTests.herHourIsNotInstalledUntilDeliberatelySwitchedOn / anUninstalledLaneReadsNothingAndWritesNothing / atMostOneHourPerRollingDay / everyGateRefusesOnItsOwn / aRefusedHourIsNotASpentHour / herHourCannotActCommitOrSend / studioJournalIsTheOnlyWriteInTheAdmittedSet / aBlockedToolThrowsInsteadOfSilentlyReturningNothing / anUnadmittedToolIsNeverAdvertised",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.herHour.gatesAndAllowlist",
+     "kind": "loop",
+     "silentFailureMode": "an unattended effect nobody watched. This is the one organ in the wave that can act while the user is asleep: a gate that stopped refusing spends a provider turn nobody asked for, a refractory that became a calendar day allows two hours in twenty minutes, and an allowlist that admitted one write tool lets an unwatched lane change what they knows or speak to someone as their.",
+     "where": "Modules/NativeAgentCore/Sources/BackgroundLoops/StudioWanderLane.swift StudioWanderLane.decide and Sources/NativeAgentApp/BackgroundLoopsAssembly+Studio.swift StudioWanderToolAllowlist"
+    },
+    {
+     "coverage": [
+      {
+       "ref": "tests/NativeAgentAppTests/TurnRegression/DoctorTraceTurnRegressionTests.swift DoctorTraceTurnRegressionTests.promptPrefixHealthReadsUnmeasuredOnAnEmptyWindow / subconsciousVitalsReadsUnmeasuredOnAnEmptyWindow / promptPrefixHealthFailsOnAnUnreadableDayFile / subconsciousVitalsFailsOnAnUnreadableDayFile / bothTraceChecksAreHeartbeatIneligible / theHeartbeatPolicySetAgreesWithTheFlags / everyIneligibleIDIsARealCheckThatOptedOut / bothTraceChecksNameTheirWindow / neitherTraceCheckThrowsOnAHostileRoot",
+       "strength": "asserts",
+       "tier": "test"
+      }
+     ],
+     "id": "turn.regression.doctor.traceChecks",
+     "kind": "telemetry",
+     "silentFailureMode": "a false green, and a 3am push. '0 problems' on an empty feed is the most expensive kind of green; an unreadable day file counted as zero turns a broken feed into a clean bill; and on 2026-09-02 these two rows graded a rolling window, went red on pre-fix history, and the heartbeat pushed 'Doctor has 2 failing checks' to User's phone at 3am - the rows were right and the notification was still wrong.",
+     "where": "Modules/NativeAgentCore/Sources/DoctorChecks/PromptPrefixHealthCheck.swift and SubconsciousVitalsCheck.swift, plus DoctorChecks.swift heartbeatEligible / DoctorHeartbeatPolicy"
+    }
+   ],
+   "uncertain": [
+    "The harness drives the REAL projection/seeding/Anthropic-body chain and the REAL substrate, but it does not drive SwiftNativeChatOrchestrationClient.streamTurn end to end, so the persistence, trace-bus and cognition-commit halves of a turn are exercised only through their own seams. TurnRegressionStubLLM exists and conforms to MessagesStreamingLLMClient for a suite that wants that, and nothing yet uses it.",
+    "context_expand's SUCCESS path (a truncated atom expanding back to its full body) needs a real ContextExpander over a populated generation store; only the two REFUSALS - pointer_not_offered_this_turn and context_generation_unavailable - are driven here. The success half stays covered by ContextExpansionTests and FluidContextLeadAndStablePersonaTests.",
+    "The memory-row-limit assertion reads the limit off the prepared turn and counts the packet the fixture built; it does not run ContextSelector.makePacket over a real generation, so 'the SELECTOR honours the limit' remains ContextSelectionTests' claim, not this file's.",
+    "- Thread: and the felt object have never been emitted in a live trace (0 of 1,487 capsules as of 2026-09-02), so the capsule-law tests assert the REFUSALS unconditionally and the positive renders only when the line is present. A build in which Thread never renders at all would pass those rows without proving Thread works.",
+    "Their hour's provider turn is not driven: the gates, the installation booleans and the tool allowlist are pinned, but no test runs runEphemeralToolTurn on the studio_wander surface, so 'the witness decides chose/no_artifact/declined' stays StudioWanderWitnessTests' claim.",
+    "The doctor rows are exercised on an empty window and on an unreadable day file. A populated window with a REAL prefix break is not synthesized here - PromptPrefixHealthCheckTests already builds those fixtures, and duplicating them would have meant a second copy of the trace-row writer.",
+    "Nothing here asserts a capsule byte figure against live traces; the p95 envelope is the 2026-09-02 measurement (median 507 B, p95 672 B, max 769 B) rounded to 768 B, checked against a fixture render rather than against production output."
    ]
   }
  }

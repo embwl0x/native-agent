@@ -100,58 +100,6 @@ struct MacControlBridgeInfoRouteResponse: Equatable, Sendable {
     }
 }
 
-/// The exact HTTP contract for the read-only Spotlight frame route. Keeping
-/// this separate from the NWConnection writer makes an absent panel, a
-/// main-thread timeout, and a bad request method independently observable.
-enum MacControlSpotlightFrameRoute {
-    struct Frame: Equatable {
-        let x: Int
-        let y: Int
-        let width: Int
-        let height: Int
-    }
-
-    struct Response: Equatable {
-        let status: Int
-        let frame: Frame?
-        let error: String?
-
-        var object: [String: Any] {
-            if let frame {
-                return [
-                    "ok": true,
-                    "x": frame.x,
-                    "y": frame.y,
-                    "width": frame.width,
-                    "height": frame.height,
-                ]
-            }
-            return ["ok": false, "error": error ?? "spotlight_probe_unavailable"]
-        }
-    }
-
-    static func response(
-        method: String,
-        readProbe: () -> SpotlightOverlayProbeResult
-    ) -> Response {
-        guard method == "GET" else {
-            return Response(status: 405, frame: nil, error: "method_not_allowed")
-        }
-        switch readProbe() {
-        case let .frame(x, y, width, height):
-            return Response(
-                status: 200,
-                frame: Frame(x: x, y: y, width: width, height: height),
-                error: nil
-            )
-        case .absent:
-            return Response(status: 404, frame: nil, error: "panel_not_open")
-        case .timedOut:
-            return Response(status: 503, frame: nil, error: "spotlight_probe_timed_out")
-        }
-    }
-}
-
 /// The truthful readiness surface for `GET /macctl/health`. A bound listener
 /// is not enough to call the bridge healthy: Trust policy must still allow the
 /// capability and at least one execution slot must remain available.
@@ -1068,11 +1016,6 @@ final class MacControlBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 return
             }
             cancelHandler(conn: conn, body: body)
-        case "/macctl/spotlight_frame":
-            let response = MacControlSpotlightFrameRoute.response(method: method) {
-                SpotlightOverlayProbe.currentFrame()
-            }
-            writeJSON(conn, status: response.status, obj: response.object)
         default:
             writeJSON(conn, status: 404, obj: ["error": "unknown_path", "path": path])
         }

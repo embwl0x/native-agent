@@ -96,11 +96,6 @@ extension NativeClient {
         return EmptyResponse()
     }
 
-    func skillVersions(id: String) async throws -> [ExperienceSkillVersion] {
-        let impl = makeSkillsClient(root: PersistenceCore.defaultDataRoot())
-        return try await impl.listSkillVersions(id: id).compactMap(ExperienceSkillVersion.decode)
-    }
-
     func archiveSkill(id: String) async throws -> SkillRecord {
         try await Self.archiveSkill(
             id: id, dataRoot: PersistenceCore.defaultDataRoot(), memory: .shared,

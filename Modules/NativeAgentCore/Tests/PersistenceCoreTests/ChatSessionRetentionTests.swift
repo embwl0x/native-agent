@@ -158,10 +158,20 @@ struct ChatSessionRetentionTests {
         }
         try await writer.value
 
-        #expect(report.archivedSessions == 1)
-        #expect(activeSessionIds(root: root) == ["new"])
+        // 2026-09-06 (24b6fed3, 91618a10): "an active-cap victim written during
+        // the pass is not a victim". A writer commits its transcript row before
+        // synchronizing sessions.json, and archiving in that gap deleted the
+        // hot transcript while the writer's later index sync recreated an
+        // active row with none of its history. This test IS that gap — the
+        // concurrent writer appends while retention runs — so `old` is now
+        // correctly skipped and archived next pass instead. The invariant the
+        // test exists for is unchanged and asserted below: every row stays
+        // reachable exactly once, through exactly one file.
+        #expect(report.archivedSessions == 0)
+        #expect(activeSessionIds(root: root) == ["new", "old"])
 
         let archived = try archivedRows(root: root)
+        #expect(archived.isEmpty)
         let reachablePaths = Set(
             activeSessionIds(root: root)
                 .map { messagePath(root: root, sessionId: $0) }
@@ -650,13 +660,29 @@ struct ChatSessionRetentionTests {
         try JSONValue.array(rows).serializedData(pretty: true).write(to: path)
     }
 
-    private func writeTranscript(root: URL, sessionId: String) throws {
+    /// 2026-09-06 (91618a10): retention refuses to archive a transcript that is
+    /// NEWER than its own index row's `updatedAt` — that gap is a pending index
+    /// sync, and archiving into it deleted the hot transcript while the
+    /// writer's sync then recreated an active row with none of its history. A
+    /// freshly written fixture file carries the wall-clock mtime of the test
+    /// run, which is years after the synthetic `updatedAt` stamps these rows
+    /// use, so every session looked like a writer mid-sync and nothing was ever
+    /// a victim. Stamp the transcript as SYNCED: mtime at or before the index
+    /// row, which is what a quiet, archivable session looks like on disk.
+    private func writeTranscript(
+        root: URL,
+        sessionId: String,
+        syncedAt: Date = Date(timeIntervalSince1970: 1_000_000)
+    ) throws {
         try FileManager.default.createDirectory(
             at: messagePath(root: root, sessionId: sessionId).deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        let path = messagePath(root: root, sessionId: sessionId)
         let line = try transcriptRow(id: "seed-\(sessionId)", sessionId: sessionId).serialize(pretty: false)
-        try (line + "\n").write(to: messagePath(root: root, sessionId: sessionId), atomically: true, encoding: .utf8)
+        try (line + "\n").write(to: path, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: syncedAt], ofItemAtPath: path.path)
     }
 
     private func transcriptRow(id: String, sessionId: String) -> JSONValue {
@@ -687,6 +713,9 @@ struct ChatSessionRetentionTests {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("archive", isDirectory: true)
             .appendingPathComponent("sessions.jsonl")
+        // 2026-09-06: a pass that archives nothing writes no archive index, and
+        // "no archive index" means "nothing archived" — not a read failure.
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
         let text = try String(contentsOf: path, encoding: .utf8)
         return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { raw in
             guard let data = String(raw).data(using: .utf8),

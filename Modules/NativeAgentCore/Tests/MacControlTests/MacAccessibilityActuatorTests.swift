@@ -625,7 +625,12 @@ private func _buttonTree() -> _FakeAXActNode {
     // injection that quietly dropped to read tier.
     // native-look item 3 added `act` (the closed-loop verb); the four-verb
     // surface's bounded physical executor, `hand`, is injection too.
-    #expect(macControlAccessibilityInjectionActions == ["keystroke", "click", "scroll", "ax_act", "wake", "act", "hand"])
+    // fable51 item 29 added `menu_press`: it AXPresses a menu item, which runs
+    // the app's own handler (File › Quit is one press away), so it carries the
+    // same three gates as `ax_act`. The menu WALK is deliberately NOT here —
+    // it is in the read set, and listing a menu must never confer pressing it.
+    #expect(macControlAccessibilityInjectionActions
+        == ["keystroke", "click", "scroll", "ax_act", "wake", "act", "hand", "menu_press"])
 }
 
 @Test func keystrokeAndClickMovedIntoThePortedSetWithoutDisturbingDaemonParity() {

@@ -44,12 +44,15 @@ struct CognitiveReceiptWrite: Sendable, Equatable {
 /// pruneArtifacts always deletes exactly `count - cap` rows (protected rows sort
 /// last, but they are still spent once the unprotected supply runs out), so the
 /// table is bounded at `cap` no matter how many families are listed here or how
-/// lopsidedly they fill. Floors sum to 624 against the live artifact cap of 604
+/// lopsidedly they fill. Floors sum to 625 against the live artifact cap of 604
 /// (`artifactCap` = 128 seeds + 256 nodes + 128 seeds + 2 reflections × 14 + 64):
 /// deliberately ABOVE the cap, which under a full-of-protected-rows worst case
 /// costs the lowest-priority family its floor and still lands the table on 604.
 private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "affect": 32,
+    // One row, rewritten in place: the capsule cadence ledger. Tiny, but losing
+    // it re-opens a suppressed nag on the next relaunch.
+    "capsule_presentation": 1,
     "disposition": 32,
     "emotional_consolidation": 32,
     "thought_seed": 128,

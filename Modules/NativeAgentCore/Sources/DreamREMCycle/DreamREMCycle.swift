@@ -472,7 +472,9 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
         gate: DreamREMGatePolicy? = nil,
         dreamMemoryDeltaProvider: DreamMemoryDeltaProvider? = nil,
         dreamFeltSummaryProvider: DreamFeltSummaryProvider? = nil,
-        dreamMoodSink: DreamMoodSink? = nil,
+        dreamFeltOriginProvider: DreamFeltOriginProvider? = nil,
+        dreamReceiptSink: DreamReceiptSink? = nil,
+        dreamMoodSink: DreamDatedMoodSink? = nil,
         remStageApproval: REMApprovalStager? = nil,
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
     ) {
@@ -503,14 +505,16 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
             // above: the scheduler-driven nightly builds its runner HERE, not in
             // BackgroundLoopsAssembly — unwired, the scheduled dream would feel the
             // day but the day would never feel the dream.
-            let resolvedMoodSink: DreamMoodSink = dreamMoodSink ?? { _ in }
+            let resolvedMoodSink: DreamDatedMoodSink = dreamMoodSink ?? { _, _ in true }
             self.dreamRunner = dreamRunner ?? DreamCycleRunner(
                 dataRoot: dataRoot,
                 personaRoot: personaRoot,
                 llm: llm,
                 memoryDeltaProvider: resolvedDeltaProvider,
                 feltSummaryProvider: resolvedFeltProvider,
-                moodSink: resolvedMoodSink
+                feltOriginProvider: dreamFeltOriginProvider ?? { [] },
+                receiptSink: dreamReceiptSink ?? { _, _ in },
+                datedMoodSink: resolvedMoodSink
             )
             // remStageApproval is app-wired (ApprovalInbox + inbox card) so
             // the manual /v1/rem/run path stages approvals like the loop does.
@@ -542,6 +546,14 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
     }
 
     public func runDream(force: Bool) async throws -> DreamRunResult {
+        try await runDream(force: force, trigger: .schedule)
+    }
+
+    /// The single dream path, with the waking lane named. `runDream(force:)`
+    /// (the protocol requirement) is the `.schedule` case of exactly this; the
+    /// organism's pressure lane calls it with `.pressure`. Same gate, same
+    /// runner, same dedupe — only the receipt and the target day differ.
+    public func runDream(force: Bool, trigger: DreamTrigger) async throws -> DreamRunResult {
         // WAVE 35 W15: pure-compute pre-check mirrors the retired daemon
         // (the POST route 403s when `_dream_cycle.is_enabled()` is false). The
         // `force` flag re-runs even if the target entry exists — it does NOT
@@ -559,16 +571,21 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
         guard let dreamRunner else {
             throw DreamREMCycleError.underlying("native dream runner unavailable")
         }
-        let report = try await dreamRunner.runNightlyDreamCycle(force: force)
-        return DreamRunResult(rawResponse: .object([
+        let report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger)
+        var response: [String: JSONValue] = [
             "ok": .bool(report.errors.isEmpty),
             "backend": .string("swift"),
             "force": .bool(force),
+            "trigger": .string(report.trigger.rawValue),
             "sessionsProcessed": .int(Int64(report.sessionsProcessed)),
             "entriesWritten": .int(Int64(report.entriesWritten)),
             "disabled": .bool(report.disabled),
             "errors": .array(report.errors.map { .string($0) }),
-        ]))
+        ]
+        if let skipReason = report.skipReason {
+            response["skipReason"] = .string(skipReason)
+        }
+        return DreamRunResult(rawResponse: .object(response))
     }
 
     public func runREM(force: Bool) async throws -> REMRunResult {
@@ -591,7 +608,7 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
         // without this, /v1/rem/run within 6 days of the scheduled pass
         // silently no-oped (gpt-5.5 review 2026-06-09).
         let report = try await remConsolidator.runWeeklyREM(force: force)
-        return REMRunResult(rawResponse: .object([
+        var response: [String: JSONValue] = [
             "ok": .bool(true),
             "backend": .string("swift"),
             "force": .bool(force),
@@ -600,7 +617,14 @@ public actor SwiftNativeDreamREMCycle: DreamREMCycleProtocol {
             "tombstoneSkips": .int(Int64(report.tombstoneSkips)),
             "growthMDEvicted": .int(Int64(report.growthMDEvicted)),
             "archivedEntries": .int(Int64(report.archivedEntries)),
-        ]))
+        ]
+        // 2026-09-06: carry the skip reason out, the way the dream path does.
+        // A pass that lost the run reservation reports zero of everything, and
+        // without this the caller cannot tell it from a quiet week.
+        if let skipReason = report.skipReason {
+            response["skipReason"] = .string(skipReason)
+        }
+        return REMRunResult(rawResponse: .object(response))
     }
 
     private nonisolated static func makeDefaultLLMClient(
@@ -672,7 +696,7 @@ public func makeDreamREMCycle(
     root: URL = PersistenceCore.defaultDataRoot(),
     gate: DreamREMGatePolicy? = nil,
     remStageApproval: REMApprovalStager? = nil,
-    dreamMoodSink: DreamMoodSink? = nil,
+    dreamMoodSink: DreamDatedMoodSink? = nil,
     lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
 ) -> any DreamREMCycleProtocol {
     return SwiftNativeDreamREMCycle(

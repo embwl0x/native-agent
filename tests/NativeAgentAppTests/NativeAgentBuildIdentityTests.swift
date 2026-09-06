@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import NativeAgentCore
 @testable import NativeAgentApp
 
 @Suite("NativeAgent build identity")

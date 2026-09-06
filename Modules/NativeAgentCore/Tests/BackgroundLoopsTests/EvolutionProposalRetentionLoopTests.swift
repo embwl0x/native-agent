@@ -40,6 +40,21 @@ private final class SweepRecorder: @unchecked Sendable {
     #expect(outcome == .completed(result: "evolution proposal sweep removed 3"))
 }
 
+@Test func evolutionRetention_emptySweepSkipsRatherThanClaimingSuccess() async {
+    // FIX 4: "removed 0" was reported `.completed`, which advanced
+    // lastSuccessfulWorkAt on a lane that had not touched the store — the exact
+    // inversion that made honestly-`.skipped` lanes look dormant instead.
+    let recorder = SweepRecorder(removed: 0)
+    let loop = EvolutionProposalRetentionLoop(sweep: { try recorder.run() })
+    let outcome = await loop.tickOutcome()
+    #expect(recorder.calls == 1)
+    guard case .skipped(let reason, _) = outcome else {
+        Issue.record("expected .skipped, got \(outcome)")
+        return
+    }
+    #expect(reason.contains("no terminal proposals"))
+}
+
 @Test func evolutionRetention_sweepFailureIsHonest() async {
     let recorder = SweepRecorder(shouldThrow: true)
     let loop = EvolutionProposalRetentionLoop(sweep: { try recorder.run() })

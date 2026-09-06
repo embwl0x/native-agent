@@ -94,6 +94,12 @@ final class iCloudBridge: ObservableObject {
     private var deviceDrainInFlight = false
     private var deviceDrainQueued = false
     private var deviceDrainTimerTask: Task<Void, Never>?
+    // 2026-09-06: the retention sweep's own single-flight slot. It runs beside
+    // the drain, never inside it, so a slow or timing-out sweep cannot delay
+    // message delivery; a sweep still running when the next drain finishes is
+    // simply not started again.
+    private var deviceRetentionSweepInFlight = false
+    private var deviceRetentionSweepTask: Task<Void, Never>?
     /// E3: decides whether each fallback tick actually spends a CloudKit fetch.
     var drainPolicy = AdaptiveDrainPolicy()
     private var lastDeviceDrainAt = Date.distantPast
@@ -425,13 +431,14 @@ final class iCloudBridge: ObservableObject {
         registerIncomingTransportObserver(transport)
         Task {
             await transport.observeStatus(
-                key: NAVisualNotificationCapability.statusKey
-            ) { [weak self] value in
-                await MainActor.run {
-                    self?.cloudKitVisualNotificationPeerReady =
-                        NAVisualNotificationCapability.isReady(value)
+                key: NAVisualNotificationCapability.statusKey,
+                onChange: { [weak self] value in
+                    await MainActor.run {
+                        self?.cloudKitVisualNotificationPeerReady =
+                            NAVisualNotificationCapability.isReady(value)
+                    }
                 }
-            }
+            )
         }
         Task {
             let pairingPublished = await PairingSecretManager.publishMaterial(to: transport)
@@ -1231,9 +1238,16 @@ final class iCloudBridge: ObservableObject {
                 var files: [String: Data] = [:]
                 for filename in group.filenames {
                     let url = snapshotDirectory.appendingPathComponent(filename)
-                    if let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) {
-                        files[filename] = data
-                    }
+                    // 2026-09-06: a file that is NOT THERE is a projection this
+                    // pass did not write — the group publishes without it, as
+                    // it always has. A file that is there and will not read is
+                    // a different thing: publishing the group without it ships
+                    // the phone a group that says it is complete while missing
+                    // one of its files, and the Mac then keeps that file's
+                    // digest and never rewrites it. Fail the group instead —
+                    // the caller forgets the digests and republishes next pass.
+                    guard FileManager.default.fileExists(atPath: url.path) else { continue }
+                    files[filename] = try Data(contentsOf: url, options: [.mappedIfSafe])
                 }
                 guard !files.isEmpty else { continue }
                 let value = try NAMobileSnapshotStatusCodec.encode(
@@ -1250,6 +1264,10 @@ final class iCloudBridge: ObservableObject {
                 lastPublishedMobileSnapshotStatus[group] = value
             } catch {
                 allSucceeded = false
+                // Forget what was last published for this group: the retained
+                // value is what suppresses the next attempt, and this group is
+                // now known not to be on the phone as published.
+                lastPublishedMobileSnapshotStatus[group] = nil
                 NSLog(
                     "[iCloudBridge] mobile snapshot %@ publication failed: %@",
                     group.rawValue,
@@ -1265,9 +1283,12 @@ final class iCloudBridge: ObservableObject {
         text: String,
         sessionID: String,
         correlationID: String,
-        metadata: [String: String]
+        metadata: [String: String],
+        key: String = NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest,
+        mirrorKey: String? = nil
     ) async -> Bool {
         let msg: BridgeMessage
+        let mirror: BridgeMessage?
         do {
             let secret = try testPairingSecret ?? PairingSecretManager.loadOrGenerateSecret()
             msg = try Self.makeKVSChatProgressMessage(
@@ -1277,6 +1298,25 @@ final class iCloudBridge: ObservableObject {
                 metadata: metadata,
                 secret: secret
             )
+            if let mirrorKey, mirrorKey != key {
+                // 2026-09-06: a phone that predates the notice key admits only
+                // kind "progress", so the mirrored copy has to carry that kind
+                // or it is dropped and the notice is lost on that phone. It
+                // keeps the SAME message id — that is what an updated phone
+                // dedupes on — and `noticeKind` rides along either way.
+                var mirrorMetadata = metadata
+                mirrorMetadata["kind"] = "progress"
+                mirror = try Self.makeKVSChatProgressMessage(
+                    id: msg.id,
+                    text: text,
+                    sessionID: sessionID,
+                    correlationID: correlationID,
+                    metadata: mirrorMetadata,
+                    secret: secret
+                )
+            } else {
+                mirror = nil
+            }
         } catch {
             syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
             NSLog("[iCloudBridge] failed to sign KVS progress msg=%@: %@", correlationID, "\(error)")
@@ -1286,8 +1326,10 @@ final class iCloudBridge: ObservableObject {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data: Data
+        let mirrorData: Data?
         do {
             data = try encoder.encode(msg)
+            mirrorData = try mirror.map { try encoder.encode($0) }
         } catch {
             NSLog("[iCloudBridge] failed to encode KVS progress msg=%@: %@", correlationID, "\(error)")
             return false
@@ -1298,12 +1340,30 @@ final class iCloudBridge: ObservableObject {
             seconds: 3
         ) { () -> ICloudKVSProgressDeliveryResult in
             let kvs = NSUbiquitousKeyValueStore.default
+            var existingKeys = Set(kvs.dictionaryRepresentation.keys)
             let admission = ICloudKVSProgressWriteAdmission.assess(
-                keys: Set(kvs.dictionaryRepresentation.keys),
-                progressKey: KVSKey.chatProgressLatest
+                keys: existingKeys,
+                progressKey: key
             )
             guard admission.isAllowed else { return .blocked(admission) }
-            kvs.set(data, forKey: KVSKey.chatProgressLatest)
+            // 2026-09-06: the mirror carries the same message id, so a phone
+            // that reads both keys drops the second copy, while a phone that
+            // only knows the old key still receives the event.
+            if let mirrorKey, let mirrorData, mirrorKey != key {
+                // 2026-09-06: the mirror is admitted against the keyspace AS
+                // IT WILL BE once the primary key is written. Assessing both
+                // from one pre-write snapshot admitted two NEW keys at 959 and
+                // pushed the store past its own 960 ceiling, after which every
+                // later progress overwrite was rejected outright.
+                existingKeys.insert(key)
+                let mirrorAdmission = ICloudKVSProgressWriteAdmission.assess(
+                    keys: existingKeys,
+                    progressKey: mirrorKey
+                )
+                guard mirrorAdmission.isAllowed else { return .blocked(mirrorAdmission) }
+                kvs.set(mirrorData, forKey: mirrorKey)
+            }
+            kvs.set(data, forKey: key)
             return kvs.synchronize() ? .synchronized : .synchronizeFailed
         } ?? .timedOut
 
@@ -1333,6 +1393,7 @@ final class iCloudBridge: ObservableObject {
     }
 
     nonisolated static func makeKVSChatProgressMessage(
+        id: String = UUID().uuidString,
         text: String,
         sessionID: String,
         correlationID: String,
@@ -1345,6 +1406,7 @@ final class iCloudBridge: ObservableObject {
         compactMetadata["source"] = compactMetadata["source"] ?? "mac"
 
         let unsigned = BridgeMessage.make(
+            id: id,
             sender: "mac",
             text: String(text.prefix(240)),
             sessionID: sessionID,
@@ -1360,9 +1422,9 @@ final class iCloudBridge: ObservableObject {
               cloudKitObservedStatusKeys.insert(key).inserted
         else { return }
         Task { [weak self] in
-            await transport.observeStatus(key: key) { [weak self] value in
+            await transport.observeStatus(key: key, onChange: { [weak self] value in
                 await MainActor.run { self?.deliverObservedStatus(key: key, value: value) }
-            }
+            })
         }
     }
 
@@ -1562,11 +1624,31 @@ final class iCloudBridge: ObservableObject {
             } else {
                 scheduleNextDeviceDrainFallback()
             }
+            // 2026-09-06: kicked off AFTER the single-flight flag is released,
+            // so the housekeeping sweep never sits in front of a drain.
+            startDeviceRetentionSweepIfIdle(ck)
         }
         let dispatched = await ck.drainIncoming()
         await ck.drainPairing()
         await ck.drainStatus()
         return dispatched > 0
+    }
+
+    /// 2026-09-06: the Mac is the retention owner for the shared CloudKit
+    /// records — it is the always-on device, and the phone never deletes. The
+    /// sweep used to run INSIDE the drain's single-flight window, where its
+    /// CloudKit round-trips (a 10 s query plus a 15 s delete, per record type)
+    /// held off the next drain by up to 50 s in the worst timeout sequence and
+    /// delayed message delivery by that much. It is housekeeping: it gets its
+    /// own single-flight slot at low priority, and no drain ever waits on it.
+    /// The transport still self-throttles (hourly) and bounds each run.
+    private func startDeviceRetentionSweepIfIdle(_ ck: DeviceSyncTransport) {
+        guard !deviceRetentionSweepInFlight else { return }
+        deviceRetentionSweepInFlight = true
+        deviceRetentionSweepTask = Task(priority: .utility) { [weak self] in
+            await ck.sweepExpiredRecords()
+            self?.deviceRetentionSweepInFlight = false
+        }
     }
 
     // MARK: - Poll / flush iOS outbox (called by metadata query or on-demand)
@@ -2002,6 +2084,9 @@ final class iCloudBridge: ObservableObject {
         deviceDrainTimerTask = nil
         deviceDrainInFlight = false
         deviceDrainQueued = false
+        deviceRetentionSweepTask?.cancel()  // 2026-09-06: stop the retention sweep
+        deviceRetentionSweepTask = nil
+        deviceRetentionSweepInFlight = false
         if let deliveryNudgeQueue {
             Task { await deliveryNudgeQueue.cancelAll() }
             self.deliveryNudgeQueue = nil

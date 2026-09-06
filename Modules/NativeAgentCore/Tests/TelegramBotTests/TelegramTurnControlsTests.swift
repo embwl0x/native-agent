@@ -316,7 +316,7 @@ struct TelegramTurnControlsTests {
         await capture.waitForSecond()
 
         let outcome = await coordinator.requestStop(
-            chatId: 77,
+            destination: .chat(77),
             turnId: interrupted,
             confirmationTimeoutNanoseconds: 0,
             sleeper: { _ in }
@@ -369,7 +369,13 @@ struct TelegramTurnControlsTests {
                 "restart must reuse the durable queued card instead of sending a replacement")
         #expect(await capture.cardEditMessageIds.contains(777))
         #expect(captured.cardEdits.contains { $0.text.hasPrefix("Running now ·") })
-        #expect(try await inbox.snapshots().first?.phase == .completed)
+        // 2026-09-06: the claim is settled by the turn's OWN task when the turn
+        // ends, not by the tick that promoted it. This fixture's handler sleeps
+        // 60 s and is never released, so at this point the promoted row is
+        // legitimately still `.processing` — the promotion is what this test is
+        // about, and asserting `.completed` here would only have passed while
+        // the tick settled a claim whose work was still running.
+        #expect(try await inbox.snapshots().first?.phase == .processing)
 
         await loop.shutdown()
     }
@@ -544,7 +550,7 @@ struct TelegramTurnControlsTests {
         #expect(steeredSnapshot.promptPreview == "race this")
         #expect(captured.cardSends.count == 3)
         #expect(captured.plainMessages.isEmpty)
-        #expect(captured.cardEdits.contains { $0.text.hasPrefix("Work details") })
+        #expect(captured.cardEdits.contains { $0.text.contains("Started ") && $0.text.contains("last update") })
         #expect(captured.cardEdits.contains { $0.text.hasPrefix("Running now ·") })
         #expect(captured.callbackAnswers.contains { $0.0 == "cb-steer" })
 
@@ -591,13 +597,19 @@ struct TelegramTurnControlsTests {
 
         responses.setUpdate(telegramMessageUpdate(updateId: 12, messageId: 12, text: "/stop"))
         _ = await loop.tickOutcome()
+        // 2026-09-06: a slash command runs in its own detached task and settles
+        // its own claim, so the tick returns before /stop has cancelled the
+        // turn and written the terminal card edit.
+        #expect(await telegramWaitFor {
+            await capture.snapshot().cardEdits.last?.text == "Stopped."
+        })
 
         let captured = await capture.snapshot()
         #expect(captured.handlerCanceled)
         let stoppedSnapshot = await coordinator.snapshot(chatId: 77)
         #expect(!stoppedSnapshot.isRunning)
         #expect(captured.cardSends.count == 1)
-        #expect(captured.cardEdits.last?.text.hasPrefix("Canceled ·") == true)
+        #expect(captured.cardEdits.last?.text == "Stopped.")
         #expect(captured.plainMessages.isEmpty)
 
         await loop.shutdown()
@@ -619,7 +631,7 @@ struct TelegramTurnControlsTests {
         )!
         let card = TelegramTurnProgressCardDriver(
             token: "token",
-            chatId: 77,
+            destination: .chat(77),
             turnId: activeId,
             heartbeatNanoseconds: 0,
             sleeper: { _ in },
@@ -630,7 +642,7 @@ struct TelegramTurnControlsTests {
         #expect(await coordinator.attachCard(card, chatId: 77, turnId: activeId))
 
         let outcome = await coordinator.requestStop(
-            chatId: 77,
+            destination: .chat(77),
             confirmationTimeoutNanoseconds: 0,
             sleeper: { _ in }
         )
@@ -714,6 +726,6 @@ struct TelegramTurnControlsTests {
         let snapshot = await coordinator.snapshot(chatId: 77)
         #expect(captured.handlerCanceled)
         #expect(!snapshot.isRunning)
-        #expect(captured.cardEdits.last?.text.hasPrefix("Canceled ·") == true)
+        #expect(captured.cardEdits.last?.text == "Stopped.")
     }
 }

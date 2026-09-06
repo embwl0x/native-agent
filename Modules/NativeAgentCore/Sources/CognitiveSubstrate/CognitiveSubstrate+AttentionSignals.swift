@@ -225,7 +225,9 @@ extension CognitiveSubstrate {
     /// purpose (the ranker's lexical overlap tolerates a little noise; a big
     /// clever list is maintenance debt). Bracketed routing prefixes like
     /// "[from: claude, via bridge]" are stripped before tokenizing.
-    private static let summaryStopwords: Set<String> = [
+    /// Internal (was private) so the felt line's SAFE object extractor can
+    /// reuse the same boring list rather than growing a second one that drifts.
+    static let summaryStopwords: Set<String> = [
         "the", "and", "for", "that", "this", "with", "was", "were", "you",
         "your", "yours", "she", "her", "hers", "him", "his", "its", "our",
         "are", "but", "not", "all", "any", "can", "had", "has", "have",
@@ -238,6 +240,19 @@ extension CognitiveSubstrate {
         "yeah", "yes", "okay", "hey", "well", "also", "really", "actually",
         "thing", "things", "today", "tonight", "day", "long", "via", "bridge",
         "assistant", "agent", "owner",
+        // Apostrophe-less contractions and function verbs. Live felt-moment
+        // subjects read `dont`, `went`, `those` (2026-09-02): a feeling about
+        // "went" is a feeling about nothing. Evaluations ("great") are not
+        // topics either.
+        "dont", "cant", "wont", "didnt", "isnt", "arent", "wasnt", "werent",
+        "doesnt", "hasnt", "havent", "youre", "thats", "theyre", "whats",
+        "wheres", "hows", "those", "these", "went", "goes", "going", "gone",
+        "come", "came", "make", "made", "take", "took", "know", "knew",
+        "think", "thought", "said", "says", "tell", "told", "want", "need",
+        "because", "cause", "kind", "sort", "little", "stuff", "something",
+        "anything", "nothing", "everything", "someone", "anyone", "whether",
+        "either", "only", "even", "ever", "never", "always", "maybe", "mean",
+        "means", "sure", "fine", "good", "nice", "great", "cool",
     ]
 
     /// Up to 4 salient content words from a node summary: bracketed routing
@@ -267,7 +282,7 @@ extension CognitiveSubstrate {
 
     /// A conservative opaque-id test: canonical uuid shape, or an all
     /// hex/digit/dash blob (a digest or numeric id) with no letters at all.
-    private static func isOpaqueIdentifier(_ value: String) -> Bool {
+    static func isOpaqueIdentifier(_ value: String) -> Bool {
         if value.range(
             of: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
             options: .regularExpression

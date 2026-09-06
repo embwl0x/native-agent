@@ -1035,9 +1035,13 @@ struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         // installedAppFallbackBundle paths covered. Falls back to the
         // <dataRoot>/extras/coreml legacy path for users who staged the
         // model manually.
-        if CoreMLEmbeddingProvider.bundledResourcesAvailable() {
+        if let installed = CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
             snap.coreMLReady = true
-            snap.coreMLModelLabel = "all-MiniLM-L6-v2 (bundled)"
+            snap.coreMLModelLabel = installed.modelID + " (installed)"
+            snap.embedderDimensions = installed.dimensions
+        } else if CoreMLEmbeddingProvider.bundledResourcesAvailable() {
+            snap.coreMLReady = true
+            snap.coreMLModelLabel = CoreMLEmbeddingProvider.bundledModelID + " (bundled)"
         } else {
             let extrasURL = dataRoot
                 .appendingPathComponent("extras", isDirectory: true)

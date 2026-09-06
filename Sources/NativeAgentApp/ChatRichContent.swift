@@ -94,9 +94,15 @@ enum ChatRichContentParser {
 
             if ticks >= 3 {
                 let info = leading.dropFirst(ticks).trimmingCharacters(in: .whitespaces)
-                flushProse()
-                fence = (ticks: ticks, language: info.isEmpty ? nil : info)
-                continue
+                // 2026-09-06: CommonMark — a backtick fence's info string may
+                // not contain a backtick. Without that rule a one-line
+                // ```inline``` example opened a code block that swallowed the
+                // rest of the reply.
+                if !info.contains("`") {
+                    flushProse()
+                    fence = (ticks: ticks, language: info.isEmpty ? nil : info)
+                    continue
+                }
             }
 
             prose.append(line)

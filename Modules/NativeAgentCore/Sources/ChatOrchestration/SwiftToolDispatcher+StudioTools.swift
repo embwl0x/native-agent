@@ -1,4 +1,6 @@
+import CognitiveSubstrate
 import Foundation
+import KnowledgeGraph
 import NativeAgentCore
 import PersistenceCore
 
@@ -28,6 +30,15 @@ import PersistenceCore
 //     than dropping it, so a caller can never believe one was recorded.
 //   • There is no update tool and no delete tool. Revision is a later entry
 //     linked with `relations` — the contradiction is kept, never flattened.
+//
+// WHAT A FILED ENTRY NOW SETS IN MOTION (desk 903 phases 2, 3, 5) — all three
+// in `studioJournalDidAppend`, all three after the append is already durable,
+// none of them able to fail the write:
+//   1. a context-index wake-up, so the entry's POINTER is reachable next turn;
+//   2. a knowledge-graph re-derive, so her typed links become real edges that
+//      cite the entry as provenance;
+//   3. a publish onto the cognitive bus, so the entry is FELT — sized by the
+//      judgment she wrote, not by the act of filing.
 
 /// The EXACT field tree `studio_journal` accepts, to any depth.
 ///
@@ -166,6 +177,7 @@ extension SwiftToolDispatcher {
     /// into the journal, does NOT retrieve journal entries, and does NOT carry
     /// or suggest a verdict: the judgment is hers, live, when she answers.
     func impl_studio_consult(input: [String: JSONValue]) async throws -> JSONValue {
+        await ensureStudioGraphIndexed()
         let refs = try studioStringArray(input, "artifact_refs", tool: "studio_consult")
         let question = optionalString(input, "question")?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -203,6 +215,7 @@ extension SwiftToolDispatcher {
     /// studio_consult_read — pull one consult envelope back, verbatim, so the
     /// full bundle is in front of her when she answers.
     func impl_studio_consult_read(input: [String: JSONValue]) async throws -> JSONValue {
+        await ensureStudioGraphIndexed()
         let id = try requireString(input, "consult_id")
         do {
             let consult = try await studioStore().readConsult(id: id)
@@ -229,6 +242,7 @@ extension SwiftToolDispatcher {
         // (extractSessionId's key set). That is runtime plumbing, not caller
         // payload — strip it at the TOP level only, so a nested
         // `stance.session_id` is still refused like any other unknown field.
+        await ensureStudioGraphIndexed()
         var input = input
         for key in ["__session_id", "session_id", "sessionId"] {
             input.removeValue(forKey: key)
@@ -322,15 +336,125 @@ extension SwiftToolDispatcher {
                 relations: relations,
                 tags: try studioStringArray(input, "tags", tool: "studio_journal")
             )
-            return .object([
+            let graph = await studioJournalDidAppend(entry)
+            var result: JSONValue = .object([
                 "status": .string("ok"),
                 "entry_id": .string(entry.id),
                 "recorded_at": .string(entry.recordedAt),
                 "entry": entry.toJSON(),
             ])
+            // The edges this entry's relations became, said out loud rather than
+            // asserted. Each one names this entry as its provenance in the
+            // graph, so the claim can be traced back to the judgment.
+            if case .object(var obj) = result, let graph, graph.graphAvailable {
+                obj["graph"] = .object([
+                    "works": .int(Int64(graph.worksIndexed)),
+                    "creators": .int(Int64(graph.creatorsIndexed)),
+                    "edges": .int(Int64(graph.edgesWritten)),
+                    "unresolved_relations": .int(Int64(graph.unresolvedRelations)),
+                ])
+                result = .object(obj)
+            }
+            return result
         } catch let error as StudioError {
             return studioRefusal(error)
         }
+    }
+
+    // MARK: - After an entry lands
+
+    /// Everything a FILED entry sets in motion, in one place.
+    ///
+    /// The append itself is already durable when this runs. Nothing here may
+    /// throw back into the tool: a graph that will not open or a coordinator
+    /// that is not installed is a reason for a quieter system, never a reason
+    /// for the journal write to look like it failed. The entry is the canonical
+    /// record; these are derived consumers waking up.
+    @discardableResult
+    private func studioJournalDidAppend(_ entry: StudioJournalEntry) async -> StudioGraphIndexReport? {
+        // 1. Wake the resident context index so the pointer for this entry is
+        //    reachable on the NEXT turn instead of after the next launch.
+        //    `NativeStudioContextProjection` consumes exactly this namespace and
+        //    this locator; it rereads the journal itself, as the contract
+        //    requires — the event is a wake-up, never source data.
+        await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
+            namespace: "studio",
+            stableID: entry.id,
+            operation: .changed,
+            canonicalLocator: studioStore().journalPath.standardizedFileURL.path,
+            reason: "studio_journal_entry_filed"
+        ))
+        // 2. Her relations become graph edges (desk 903 phase 3). The pass
+        //    re-derives the WHOLE journal and is idempotent, so this single call
+        //    also completes any history that predates the graph — which is why
+        //    there is no separate backfill code path, only a first-run trigger
+        //    (`ensureStudioGraphIndexed`) for the case where she never files
+        //    again.
+        let report = await indexStudioJournalIntoGraph(reason: "entry_filed")
+        // 3. The entry rides the cognitive bus (desk 903 phase 2). The delta
+        //    comes from the ENTRY — sign and size from the judgment she wrote,
+        //    zero for an abstention — and it is derived on the cognition side,
+        //    which owns the appraisal. This lane only says that an entry landed.
+        await StudioJournalCognitiveBus.publish(entry)
+        return report
+    }
+
+    /// The knowledge-graph half. Never throws back into the tool: a graph that
+    /// will not open is a quieter system, not a failed journal write. The entry
+    /// is already durable when this runs.
+    @discardableResult
+    private func indexStudioJournalIntoGraph(reason: String) async -> StudioGraphIndexReport? {
+        do {
+            // 2026-09-06: hot PLUS shelf — an archived entry still names its
+            // work and its relations, and indexing only the hot file dropped
+            // those edges out of the graph on the first cap trim.
+            let entries = try await studioStore().journalEntriesIncludingArchive()
+            guard !entries.isEmpty else { return nil }
+            let indexer = try SwiftNativeKnowledgeGraphIndexer(
+                // The SAME store `NativeKnowledgeGraphContextProjection` reads,
+                // so a studio edge is selectable exactly like the other 94.
+                memorySQLitePath: dataRoot
+                    .appendingPathComponent("memory/memory.sqlite")
+                    .standardizedFileURL
+            )
+            let report = try await indexer.indexStudioJournal(entries)
+            // Agent's addendum (2026-09-01): relations stay provenance-only and
+            // accepted, WITH a guard — every relation must have a graph edge
+            // citing that entry id back. Same trigger as the backfill. Fail
+            // loud, never repair, never block recall.
+            await StudioCanonTending.recordAudit(
+                (try? await indexer.auditStudioRelations(entries)) ?? .unavailable,
+                dataRoot: dataRoot
+            )
+            return report
+        } catch {
+            NSLog("[studio] knowledge-graph index skipped (%@): %@",
+                  reason, String(describing: error))
+            return nil
+        }
+    }
+
+    /// ONE-SHOT BACKFILL. The journal predates the graph, so the entries already
+    /// on disk have to arrive once even if she never files another. Guarded by a
+    /// receipt beside the journal, so it runs once per install and not once per
+    /// call; a run that finds no graph writes NO receipt and is retried later.
+    func ensureStudioGraphIndexed() async {
+        let receipt = studioStore().studioRoot
+            .appendingPathComponent("journal", isDirectory: true)
+            .appendingPathComponent("kg_backfill_receipt.json")
+        guard !FileManager.default.fileExists(atPath: receipt.path) else { return }
+        guard let report = await indexStudioJournalIntoGraph(reason: "backfill"),
+              report.graphAvailable else { return }
+        try? await SwiftNativePersistenceCore().writeJSON(
+            .object([
+                "ran_at": .string(StudioClock.nowISO()),
+                "works": .int(Int64(report.worksIndexed)),
+                "creators": .int(Int64(report.creatorsIndexed)),
+                "edges": .int(Int64(report.edgesWritten)),
+                "unresolved_relations": .int(Int64(report.unresolvedRelations)),
+            ]),
+            to: receipt
+        )
     }
 
     // MARK: - studio_recall
@@ -339,6 +463,7 @@ extension SwiftToolDispatcher {
     /// VERBATIM (the response text is the point), newest first, bounded, with an
     /// explicit has_more. No relevance score is computed or exposed.
     func impl_studio_recall(input: [String: JSONValue]) async throws -> JSONValue {
+        await ensureStudioGraphIndexed()
         var relationKind: StudioRelationKind?
         if let raw = optionalString(input, "relation_kind") {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -363,6 +488,24 @@ extension SwiftToolDispatcher {
             limit: optionalInt(input, "limit") ?? StudioRecallQuery.defaultLimit
         )
         let result = try await studioStore().recall(query)
+        // Desk 903 phase 4: the "used in a REAL PRODUCTION JUDGMENT" evidence
+        // door for the canon. Deliberately NOT "any successful recall" — she
+        // browses her own journal, the tending pass reads it, and a bridge can
+        // query it, and none of those are a work proving itself in use. Two
+        // runtime-derived conditions, both required, neither from tool input:
+        //   1. the SAME live-local-turn provenance the canon seat demands, so a
+        //      bridge tool run or a replay counts nothing;
+        //   2. the turn is a taste judgment by the projection's OWN admission
+        //      rule, so "pulled in production" means the same thing here as it
+        //      does where the pointer gets selected.
+        // Anything else reads the journal and records nothing.
+        if !result.entries.isEmpty,
+           case .success = StudioCanonSeatGate.liveTurnProvenance(),
+           StudioCanonSeatGate.isProductionTasteJudgment() {
+            await studioStore().noteRecallPulls(
+                titles: result.entries.map { ($0.work.title, $0.work.creator) }
+            )
+        }
         return .object([
             "status": .string("ok"),
             "entries": .array(result.entries.map { $0.toJSON() }),

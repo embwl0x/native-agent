@@ -200,7 +200,7 @@ struct TelegramTurnCardLedgerTests {
         let ledger = TelegramTurnCardLedger(storage: storage)
         let driver = TelegramTurnProgressCardDriver(
             token: "token",
-            chatId: 94,
+            destination: .chat(94),
             turnId: UUID(uuidString: "00000000-0000-0000-0000-000000000004")!,
             minimumEditInterval: 0,
             heartbeatNanoseconds: 0,
@@ -235,7 +235,7 @@ struct TelegramTurnCardLedgerTests {
         let spy = TurnCardRepairSpy()
         let driver = TelegramTurnProgressCardDriver(
             token: "token",
-            chatId: 95,
+            destination: .chat(95),
             turnId: UUID(uuidString: "00000000-0000-0000-0000-000000000005")!,
             minimumEditInterval: 0,
             heartbeatNanoseconds: 0,

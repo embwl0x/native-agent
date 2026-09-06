@@ -48,15 +48,7 @@ enum MacPIMConnectorActions {
         let limit = clampedInt(input["limit"] ?? input["max"], defaultValue: 20, min: 1, max: 100)
         let calendarName = inputString(input["calendar_name"] ?? input["calendarName"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let calendars = filteredCalendars(
-            store.calendars(for: .event),
-            matching: calendarName
-        )
-        let predicate = store.predicateForEvents(withStart: window.start, end: window.end, calendars: calendars)
-        let events = store.events(matching: predicate)
-            .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
-            .prefix(limit)
-            .map { eventJSON($0) }
+        let events = await upcomingEventRows(window: window, calendarName: calendarName, limit: limit)
 
         var payload: [String: JSONValue] = [
             "status": .string("completed"),
@@ -73,6 +65,32 @@ enum MacPIMConnectorActions {
             payload["day"] = .string(day)
         }
         return .object(payload)
+    }
+
+    /// The EventKit read for `calendarListUpcoming`, off the main actor.
+    ///
+    /// 2026-09-06: `store.events(matching:)` is a synchronous enumeration, and
+    /// running it (plus the sort over EVERY event in the window, before the
+    /// limit) on `@MainActor` froze the UI for the length of the query. EventKit
+    /// reads are safe off the main thread when the caller owns its own store
+    /// instance — process-wide authorization is unchanged — so the query runs in
+    /// a detached task and only the rendered JSON comes back.
+    nonisolated private static func upcomingEventRows(
+        window: CalendarListWindow,
+        calendarName: String?,
+        limit: Int
+    ) async -> [JSONValue] {
+        await Task.detached(priority: .userInitiated) { () -> [JSONValue] in
+            let store = EKEventStore()
+            let calendars = filteredCalendars(store.calendars(for: .event), matching: calendarName)
+            let predicate = store.predicateForEvents(
+                withStart: window.start, end: window.end, calendars: calendars
+            )
+            return store.events(matching: predicate)
+                .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+                .prefix(limit)
+                .map { eventJSON($0) }
+        }.value
     }
 
     static func remindersListDueToday(input: [String: JSONValue]) async throws -> JSONValue {
@@ -148,8 +166,29 @@ enum MacPIMConnectorActions {
         let endDate = parseInputDate(input["end"]) ?? startDate.addingTimeInterval(3600)
         let notes = inputString(input["notes"])
         let location = inputString(input["location"])
-        let calendarName = inputString(input["calendar_name"] ?? input["calendarName"])?
+        let calendarNameField = input["calendar_name"] ?? input["calendarName"]
+        let calendarName = inputString(calendarNameField)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // 2026-09-06: only an ABSENT (or null) key means "use the default
+        // calendar". A supplied-but-empty name used to fall through to the
+        // default, so `calendar_name: "  "` silently wrote to whatever calendar
+        // the default happened to be — the same silent-wrong-destination the
+        // no-such-name error above exists to prevent.
+        let calendarNameSupplied: Bool = {
+            guard let calendarNameField else { return false }
+            if case .null = calendarNameField { return false }
+            return true
+        }()
+        if calendarNameSupplied, (calendarName ?? "").isEmpty {
+            return .object([
+                "status": .string("failed"),
+                "actionId": .string("mac.calendar_create_event"),
+                "reason": .string(
+                    "calendar_name was supplied but names no calendar. Omit calendar_name to "
+                    + "use the default calendar, or pass the name of a real one."
+                ),
+            ])
+        }
 
         // gpt-5.5 review NEEDS_FIX: `.writeOnly` users CAN write but CANNOT
         // enumerate calendars. The old code called store.calendars(for:.event)
@@ -164,14 +203,38 @@ enum MacPIMConnectorActions {
             }
             return false
         }()
+        // 2026-09-06: the schema says the default calendar is used when
+        // `calendar_name` is OMITTED. A supplied name that matched nothing used
+        // to fall back to the default too, so the event silently landed on a
+        // different calendar than the one asked for. A named destination that
+        // does not exist is an error that names the real ones.
         let pickedCalendar: EKCalendar?
         if isWriteOnly {
+            if let calendarName, !calendarName.isEmpty {
+                return .object([
+                    "status": .string("failed"),
+                    "actionId": .string("mac.calendar_create_event"),
+                    "reason": .string(
+                        "calendar_name '\(calendarName)' cannot be honoured: Calendar access is "
+                        + "write-only, so calendars cannot be enumerated. Omit calendar_name to "
+                        + "use the default calendar, or grant full Calendar access."
+                    ),
+                ])
+            }
             pickedCalendar = store.defaultCalendarForNewEvents
+        } else if let calendarName, !calendarName.isEmpty {
+            let calendars = store.calendars(for: .event)
+            guard let matched = pickCalendar(calendars, named: calendarName) else {
+                return .object([
+                    "status": .string("failed"),
+                    "actionId": .string("mac.calendar_create_event"),
+                    "reason": .string("No calendar named '\(calendarName)'"),
+                    "available": .array(calendars.map { .string($0.title) }),
+                ])
+            }
+            pickedCalendar = matched
         } else {
-            pickedCalendar = pickCalendar(
-                store.calendars(for: .event),
-                named: calendarName
-            ) ?? store.defaultCalendarForNewEvents
+            pickedCalendar = store.defaultCalendarForNewEvents
         }
         guard let targetCalendar = pickedCalendar else {
             return .object([
@@ -351,13 +414,44 @@ enum MacPIMConnectorActions {
         }
         let notes = inputString(input["notes"])
         let dueDate = parseInputDate(input["due_date"] ?? input["dueDate"])
-        let listName = inputString(input["list_name"] ?? input["listName"])?
+        let listNameField = input["list_name"] ?? input["listName"]
+        let listName = inputString(listNameField)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // 2026-09-06: same contract as calendar_create_event — supplied-but-
+        // empty is an error, only an absent key selects the default list.
+        let listNameSupplied: Bool = {
+            guard let listNameField else { return false }
+            if case .null = listNameField { return false }
+            return true
+        }()
+        if listNameSupplied, (listName ?? "").isEmpty {
+            return .object([
+                "status": .string("failed"),
+                "actionId": .string("mac.reminders_create"),
+                "reason": .string(
+                    "list_name was supplied but names no reminder list. Omit list_name to use "
+                    + "the default list, or pass the name of a real one."
+                ),
+            ])
+        }
 
-        let pickedList = pickCalendar(
-            store.calendars(for: .reminder),
-            named: listName
-        ) ?? store.defaultCalendarForNewReminders()
+        // 2026-09-06: same contract as calendar_create_event — the default list
+        // applies when `list_name` is OMITTED, not when a supplied name misses.
+        let pickedList: EKCalendar?
+        if let listName, !listName.isEmpty {
+            let lists = store.calendars(for: .reminder)
+            guard let matched = pickCalendar(lists, named: listName) else {
+                return .object([
+                    "status": .string("failed"),
+                    "actionId": .string("mac.reminders_create"),
+                    "reason": .string("No reminder list named '\(listName)'"),
+                    "available": .array(lists.map { .string($0.title) }),
+                ])
+            }
+            pickedList = matched
+        } else {
+            pickedList = store.defaultCalendarForNewReminders()
+        }
         guard let targetList = pickedList else {
             return .object([
                 "status": .string("failed"),
@@ -694,7 +788,7 @@ enum MacPIMConnectorActions {
         ])
     }
 
-    private static func filteredCalendars(_ calendars: [EKCalendar], matching name: String?) -> [EKCalendar]? {
+    nonisolated private static func filteredCalendars(_ calendars: [EKCalendar], matching name: String?) -> [EKCalendar]? {
         guard let name, !name.isEmpty else { return nil }
         let needle = name.lowercased()
         let filtered = calendars.filter { $0.title.lowercased().contains(needle) }
@@ -761,7 +855,7 @@ enum MacPIMConnectorActions {
             .map { $0 }
     }
 
-    private static func eventJSON(_ event: EKEvent) -> JSONValue {
+    nonisolated private static func eventJSON(_ event: EKEvent) -> JSONValue {
         var obj: [String: JSONValue] = [
             // gpt-5.5 review BLOCKING: include eventIdentifier so callers can
             // pass it back into mac_calendar_modify_event. Without this the

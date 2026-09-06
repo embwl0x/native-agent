@@ -228,13 +228,21 @@ extension AppModel {
         }
         do {
             let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let response = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).recall(
-                MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil)
+            let owner = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
+            // User, 2026-09-06: retrieve WITHOUT crediting use_count. This runs
+            // on every keystroke pause and asks for 50 rows, most of which
+            // never reach the list below; crediting them made browsing look
+            // like use and blunted the eviction veto. The rows actually shown
+            // are credited after the mapping.
+            let response = try await owner.recall(
+                MemoryV2RecallRequest(text: trimmed, topK: 50, persona: nil),
+                recordingUsage: false
             )
             // Map each recall hit's id back onto the UI's MemoryRecord. Hits
             // carry their record id under `extras.id` (see Wiring.recall).
             var seen = Set<String>()
             var ordered: [MemoryRecord] = []
+            var deliveredIDs: [String] = []
             for hit in response.hits {
                 var hitId: String? = nil
                 if case .object(let obj)? = hit.extras,
@@ -246,6 +254,7 @@ extension AppModel {
                 else { continue }
                 seen.insert(id)
                 ordered.append(rec)
+                deliveredIDs.append(id)
             }
             // Union with lexical matches (preserving semantic order first) so
             // pure substring hits don't disappear when the embedder is mock /
@@ -258,6 +267,12 @@ extension AppModel {
             memorySearchResults = ordered
             memorySearchError = nil
             memorySearchIsLoading = false
+            // Credit exactly what the semantic lane delivered into the list.
+            // Fire-and-forget, like recall's own bump: this is a UI path and a
+            // dropped bump self-heals on the next serve.
+            if !deliveredIDs.isEmpty {
+                Task { try? await owner.recordRecallHits(ids: deliveredIDs) }
+            }
         } catch {
             guard !Task.isCancelled, memorySearchGate.accepts(requestToken) else { return }
             memorySearchResults = lexical

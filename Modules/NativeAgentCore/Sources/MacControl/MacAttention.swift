@@ -49,6 +49,24 @@ public enum NativeAgentMotorEpoch {
         return uptime >= last && uptime - last <= window
     }
 
+    /// Age of the last agent-synthesized motor event, `.infinity` when there
+    /// has been none.
+    ///
+    /// 2026-09-06: `isAgentDriven` answers a 3 s window, which is useless to a
+    /// consumer whose own tick is a minute long — an agent click 30 s ago has
+    /// reset the system idle clock and is long out of the window, so the read
+    /// came back "human". Comparing this age against the system's
+    /// seconds-since-last-input tells the two apart at any cadence.
+    public static func secondsSinceLastAgentMotorEvent(
+        atUptime uptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> TimeInterval {
+        lock.lock()
+        let last = lastAgentMotorUptime
+        lock.unlock()
+        guard uptime.isFinite, last.isFinite, uptime >= last else { return .infinity }
+        return uptime - last
+    }
+
     static func resetForTesting() {
         lock.lock()
         lastAgentMotorUptime = -Double.infinity

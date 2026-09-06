@@ -1,7 +1,7 @@
 {
   "baselineInputs": {
-    "coverage-overrides.json": "279ca49d0cb95221fb0ac32ddfb8829c8c5728cbdc5cbb0562d1fcf95da830a5",
-    "phase1-fragments.json": "06073e8f8a8ec4cfea304a7cb188130f251060826eae3c29ba46cfe716ba52fe"
+    "coverage-overrides.json": "06abc9b533f6056d2a267e5e49d96003ef07ebddb9edfdb91a1a55db942874af",
+    "phase1-fragments.json": "df5a626c741bbfe12a1805e71c13595fcbb71a8c0e694481704afffa66b46ec2"
   },
   "surfaces": [
     {
@@ -179,14 +179,6 @@
     {
       "fence": "core.maccontrol",
       "id": "ui.deadSystemAndShortcutWorkbench"
-    },
-    {
-      "fence": "core.workshop",
-      "id": "workflow.runsLedger.feedFamily"
-    },
-    {
-      "fence": "core.workshop",
-      "id": "workflow.ui.runResumeCancelRollback"
     },
     {
       "fence": "core.workshop",
@@ -1266,10 +1258,6 @@
     },
     {
       "fence": "app.settings",
-      "id": "ui.Capabilities.workflowLifecycleButtons"
-    },
-    {
-      "fence": "app.settings",
       "id": "ui.Capabilities.productionExportButtons"
     },
     {
@@ -1295,18 +1283,6 @@
     {
       "fence": "app.mac",
       "id": "route.onOpenURL.oauthCallback"
-    },
-    {
-      "fence": "app.mac",
-      "id": "store.spotlightRecentPrompts"
-    },
-    {
-      "fence": "app.mac",
-      "id": "turn-ingredient.spotlightSessionId"
-    },
-    {
-      "fence": "app.mac",
-      "id": "public-api.SpotlightOverlayProbe.currentFrame"
     },
     {
       "fence": "app.mac",
@@ -1495,10 +1471,6 @@
     {
       "fence": "app.bridges",
       "id": "bridge.macctl.route.info"
-    },
-    {
-      "fence": "app.bridges",
-      "id": "bridge.macctl.route.spotlightFrame"
     },
     {
       "fence": "app.bridges",

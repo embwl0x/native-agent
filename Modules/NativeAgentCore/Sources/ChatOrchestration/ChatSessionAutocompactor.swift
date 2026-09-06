@@ -6,9 +6,16 @@ import ProviderRouting
 public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
     public static let defaultsKey = "nativeagent.compactionThresholdTokens"
     public static let distillEnabledKey = "nativeagent.compactionDistillEnabled"
+    public static let agingEnabledKey = "nativeagent.compactionAgingEnabled"
     public static let defaultThresholdTokens = 200_000
     public static let defaultKeepCount = 20
     public static let maximumContextWindowFraction = 0.40
+    /// Fraction of the threshold at which older turns start aging into
+    /// recollection — the continuous lane (NORTHSTAR clause 4, sweep item 45).
+    /// A quarter is deliberately far below the backstop: by the time a session
+    /// could reach the stop-the-world threshold, aging has already folded its
+    /// older turns away several times, so the synchronous check finds nothing.
+    public static let defaultAgingFraction = 0.25
 
     public var enabled: Bool
     public var thresholdTokens: Int
@@ -18,17 +25,26 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
     /// compaction summary for a richer, recollection-voice distillation. Any
     /// distill failure leaves the mechanical summary untouched (fail-safe).
     public var distillEnabled: Bool
+    /// The continuous lane. When true, the append that crosses the aging
+    /// boundary schedules a background distillation of the session's older
+    /// turns. Off → the pre-turn threshold is the only lane, exactly as before.
+    public var agingEnabled: Bool
+    public var agingFraction: Double
 
     public init(
         enabled: Bool = true,
         thresholdTokens: Int = Self.defaultThresholdTokens,
         keepCount: Int = Self.defaultKeepCount,
-        distillEnabled: Bool = true
+        distillEnabled: Bool = true,
+        agingEnabled: Bool = true,
+        agingFraction: Double = Self.defaultAgingFraction
     ) {
         self.enabled = enabled
         self.thresholdTokens = max(1, thresholdTokens)
         self.keepCount = max(1, keepCount)
         self.distillEnabled = distillEnabled
+        self.agingEnabled = agingEnabled
+        self.agingFraction = min(0.95, max(0.01, agingFraction))
     }
 
     /// Reads the app preference at the production boundary.  The defaults
@@ -42,11 +58,17 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
         let distill = defaults.object(forKey: distillEnabledKey) == nil
             ? true
             : defaults.bool(forKey: distillEnabledKey)
+        // Absent key → aging on by default; explicit false → off (the pre-turn
+        // threshold then behaves exactly as it did before the aging lane).
+        let aging = defaults.object(forKey: agingEnabledKey) == nil
+            ? true
+            : defaults.bool(forKey: agingEnabledKey)
         return ChatSessionAutocompactionConfig(
             enabled: true,
             thresholdTokens: stored > 0 ? stored : defaultThresholdTokens,
             keepCount: defaultKeepCount,
-            distillEnabled: distill
+            distillEnabled: distill,
+            agingEnabled: aging
         )
     }
 
@@ -72,6 +94,22 @@ public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
         )
         return min(thresholdTokens, modelPressureThreshold)
     }
+
+    /// The boundary at which a session's OLDER turns start aging into
+    /// recollection, in the background. Always below the pre-turn threshold —
+    /// that one is the backstop.
+    public func effectiveAgingThresholdTokens(
+        forModel model: String,
+        providerID: String? = nil,
+        dataRoot: URL? = nil
+    ) -> Int {
+        let ceiling = effectiveThresholdTokens(
+            forModel: model,
+            providerID: providerID,
+            dataRoot: dataRoot
+        )
+        return max(1, min(ceiling, Int(Double(ceiling) * agingFraction)))
+    }
 }
 
 public struct ChatSessionCompactionOutcome: Sendable, Equatable {
@@ -95,6 +133,19 @@ public struct ChatSessionCompactionOutcome: Sendable, Equatable {
     /// Filesystem path of the pre-compaction backup the distiller reads, present
     /// under the same condition as `summaryRowId`.
     public let backupPath: String?
+
+    /// WHICH lane consolidated this session, derived from the trigger so the
+    /// receipt never has to be guessed at from a timestamp. `aging` is the
+    /// continuous background lane; `backstop` is the pre-turn threshold that
+    /// should now be rare; `manual` is an explicit user request.
+    /// (NORTHSTAR clause 2 — a receipt records what actually ran.)
+    public var lane: String { Self.lane(forTrigger: trigger) }
+
+    public static func lane(forTrigger trigger: String) -> String {
+        if trigger.hasPrefix("aging") { return "aging" }
+        if trigger.hasPrefix("manual") { return "manual" }
+        return "backstop"
+    }
 
     public init(
         sessionId: String,
@@ -164,7 +215,17 @@ struct ChatSessionAutocompactor: Sendable {
         runId: String?,
         providerID: String? = nil,
         trigger: String = "auto_threshold",
-        force: Bool = false
+        force: Bool = false,
+        // The continuous aging lane runs the SAME body at a lower boundary.
+        // Nothing about the contract changes: validator, verified backup,
+        // keep-tail, durable write and receipts are one implementation.
+        thresholdTokensOverride: Int? = nil,
+        // Aging folds everything older than the keep-tail and stops there. The
+        // backstop additionally shrinks the tail until the result fits under
+        // the threshold — correct when the alternative is a context-length
+        // failure, wrong for a routine background pass, which would otherwise
+        // strip a busy session down to a summary plus one message.
+        keepTailFixed: Bool = false
     ) async throws -> ChatSessionCompactionOutcome {
         // Manual compaction is an explicit user action. It bypasses the
         // automatic enable/threshold gates, but never the transcript validator,
@@ -194,11 +255,13 @@ struct ChatSessionAutocompactor: Sendable {
             )
         }
 
-        let effectiveThresholdTokens = config.effectiveThresholdTokens(
+        let modelThresholdTokens = config.effectiveThresholdTokens(
             forModel: model,
             providerID: providerID,
             dataRoot: dataRoot
         )
+        let effectiveThresholdTokens = thresholdTokensOverride
+            .map { max(1, min($0, modelThresholdTokens)) } ?? modelThresholdTokens
         let divisor = Self.tokenDivisor(forModel: model)
         if !force,
            Double(sourceBytesBefore) < Double(effectiveThresholdTokens) * divisor {
@@ -230,12 +293,43 @@ struct ChatSessionAutocompactor: Sendable {
                 )
             }
 
-            let replaceCount = Self.replacementCount(
+            let candidateReplaceCount = keepTailFixed
+                ? Self.fixedKeepTailReplacementCount(rows: rows, keepCount: config.keepCount)
+                : Self.replacementCount(
+                    rows: rows,
+                    keepCount: config.keepCount,
+                    thresholdTokens: effectiveThresholdTokens,
+                    divisor: divisor
+                )
+            // A recollection must never STRADDLE the dream lane's high-water
+            // mark. The reader admits a row whose coverage ENDS after the mark,
+            // whole — so a row covering T1..T10 written after the dream already
+            // consumed T1..T6 raw gets T1..T6 dreamed a second time. Once the
+            // row exists the split is impossible (the raw turns are gone), so
+            // the fix belongs here: fold only what the dream has already passed
+            // and leave the post-mark turns raw for the next pass.
+            let replaceCount = Self.markSafeReplacementCount(
                 rows: rows,
-                keepCount: config.keepCount,
-                thresholdTokens: effectiveThresholdTokens,
-                divisor: divisor
+                replaceCount: candidateReplaceCount,
+                mark: ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
             )
+            // Clamped to a prefix with no raw turn left in it → this pass would
+            // only rewrite an existing recollection into an identical-coverage
+            // one. Skip honestly instead of churning the transcript.
+            if replaceCount < candidateReplaceCount,
+               !Self.containsRawTurn(Array(rows.prefix(replaceCount))) {
+                return skipped(
+                    sessionId: sessionId,
+                    reason: "clamped by dream consolidation mark",
+                    trigger: trigger,
+                    thresholdTokens: effectiveThresholdTokens,
+                    estimatedTokensBefore: estimatedTokens,
+                    transcriptCharsBefore: transcriptChars,
+                    messagesBefore: before,
+                    messagesAfter: before,
+                    sourceBytesBefore: sourceBytesBefore
+                )
+            }
             guard replaceCount > 0 else {
                 return skipped(
                     sessionId: sessionId,
@@ -259,11 +353,23 @@ struct ChatSessionAutocompactor: Sendable {
             // also gives the optional distiller the exact replaced source.
             let backupURL = try backupCurrentMessages(sessionId: sessionId, messagesPath: messagesPath)
             let willDistill = config.distillEnabled
+            // WHICH stretch of life this recollection stands for. Recorded so a
+            // second consolidation owner (the dream lane) can tell whether it
+            // has already consumed this material, without re-reading the backup
+            // or re-summarizing the same turns. See ChatSessionRecollections.
+            let coverage = Self.coverageRange(replaced)
             var summaryMetadata: [String: JSONValue] = [
-                "kind": .string("compaction_summary"),
+                "kind": .string(ChatSessionRecollections.rowKind),
                 "messages_replaced": .int(Int64(replaceCount)),
                 "trigger": .string(trigger),
+                "lane": .string(ChatSessionCompactionOutcome.lane(forTrigger: trigger)),
             ]
+            if let from = coverage.from {
+                summaryMetadata[ChatSessionRecollections.coversFromKey] = .string(from)
+            }
+            if let until = coverage.until {
+                summaryMetadata[ChatSessionRecollections.coversUntilKey] = .string(until)
+            }
             if willDistill {
                 summaryMetadata["distill"] = .string("pending")
             }
@@ -466,11 +572,12 @@ struct ChatSessionAutocompactor: Sendable {
             payload.append(Data((try row.serialize(pretty: false)).utf8))
             payload.append(0x0A)
         }
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try payload.write(to: path, options: .atomic)
+        // Transcript REPLACEMENT is the one write that destroys its own source.
+        // `Data.write(.atomic)` renames without fsync, so a power loss between
+        // rename and writeback can leave the transcript truncated with the raw
+        // turns already gone. The durable writer fsyncs the temp file AND the
+        // parent directory before returning, and chmods 0600 exactly as before.
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(payload, to: path)
     }
 
     private func emitCompactionTrace(
@@ -488,6 +595,7 @@ struct ChatSessionAutocompactor: Sendable {
             "sessionId": .string(outcome.sessionId),
             "surface": .string(surface),
             "trigger": .string(outcome.trigger),
+            "lane": .string(outcome.lane),
             "reason": .string(outcome.reason),
             "model": .string(model),
             "thresholdTokens": .int(Int64(outcome.thresholdTokens)),
@@ -534,6 +642,7 @@ struct ChatSessionAutocompactor: Sendable {
         var payload: [String: JSONValue] = [
             "sessionId": .string(outcome.sessionId),
             "trigger": .string(outcome.trigger),
+            "lane": .string(outcome.lane),
             "model": .string(model),
             "thresholdTokens": .int(Int64(outcome.thresholdTokens)),
             "estimatedTokensBefore": .int(Int64(outcome.estimatedTokensBefore)),
@@ -585,6 +694,123 @@ struct ChatSessionAutocompactor: Sendable {
         return messageCount - 1
     }
 
+    /// The aging lane's replacement count: everything older than the keep-tail,
+    /// and nothing more. No shrink loop — a background pass must never eat into
+    /// the recent stretch of a session just because that stretch is large.
+    static func fixedKeepTailReplacementCount(rows: [JSONValue], keepCount: Int) -> Int {
+        let messageCount = rows.count
+        guard messageCount > 1 else { return 0 }
+        let tail = preferredTailCount(messageCount: messageCount, keepCount: keepCount)
+        var count = max(0, messageCount - tail)
+        // User, 2026-09-06: aging must not eat a recollection the distiller is
+        // still writing. The backstop lane compacts, schedules aging, and hands
+        // the distiller a row id; with one summary plus the retained tail this
+        // count came back as 1 and selected that very summary, so aging
+        // replaced S1 with S2 and the in-flight distillation landed on
+        // `row_missing` — its whole pass thrown away. Stop the prefix before
+        // the first row still marked `distill: pending`.
+        if let pending = rows.prefix(count).firstIndex(where: hasPendingDistillation) {
+            count = pending
+        }
+        // And never rewrite a prefix that holds nothing but recollections:
+        // that pass buys identical coverage in new bytes. The threshold lane
+        // already refuses this when the dream mark clamps it; the background
+        // lane, which has no obligation to get under anything, refuses it
+        // always.
+        guard count > 0, containsRawTurn(Array(rows.prefix(count))) else { return 0 }
+        return count
+    }
+
+    /// True when the row is a recollection whose LLM distillation was started
+    /// and has not been swapped in yet (`metadata.distill == "pending"`, set by
+    /// the pass that wrote the row and rewritten to `llm` on success).
+    static func hasPendingDistillation(_ row: JSONValue) -> Bool {
+        guard case .object(let obj) = row,
+              case .object(let metadata)? = obj["metadata"],
+              case .string("pending")? = metadata["distill"]
+        else { return false }
+        return true
+    }
+
+    /// The ISO timestamps bounding the material a recollection stands for.
+    /// A replaced row that is ITSELF a recollection contributes its own
+    /// coverage, so a session consolidated repeatedly keeps an honest span
+    /// rather than collapsing to the last compaction's clock.
+    static func coverageRange(_ rows: [JSONValue]) -> (from: String?, until: String?) {
+        func createdAt(_ row: JSONValue) -> String? {
+            guard case .object(let obj) = row,
+                  case .string(let value)? = obj["createdAt"] else { return nil }
+            return value
+        }
+        func metadataString(_ row: JSONValue, _ key: String) -> String? {
+            guard case .object(let obj) = row,
+                  case .object(let metadata)? = obj["metadata"],
+                  case .string(let value)? = metadata[key] else { return nil }
+            return value
+        }
+        var from: String?
+        for row in rows {
+            if let value = metadataString(row, ChatSessionRecollections.coversFromKey)
+                ?? createdAt(row) {
+                from = value
+                break
+            }
+        }
+        var until: String?
+        for row in rows.reversed() {
+            if let value = metadataString(row, ChatSessionRecollections.coversUntilKey)
+                ?? createdAt(row) {
+                until = value
+                break
+            }
+        }
+        return (from, until)
+    }
+
+    /// Shrink `replaceCount` so the recollection it produces never straddles
+    /// the dream lane's high-water mark. A span wholly at-or-before the mark is
+    /// already safe (the dream skips it); a span wholly after it is safe too
+    /// (the dream reads all of it, once). Only a straddling span is a double
+    /// count — clamp it to the leading rows whose material ENDS at or before
+    /// the mark and leave the rest raw. No mark → nothing to respect.
+    static func markSafeReplacementCount(
+        rows: [JSONValue],
+        replaceCount: Int,
+        mark: Date?
+    ) -> Int {
+        guard replaceCount > 0, let mark else { return replaceCount }
+        let replaced = Array(rows.prefix(replaceCount))
+        let span = coverageRange(replaced)
+        guard let until = ChatSessionRecollections.parseTimestamp(span.until.map { .string($0) }),
+              until > mark
+        else { return replaceCount }
+        guard let from = ChatSessionRecollections.parseTimestamp(span.from.map { .string($0) }),
+              from <= mark
+        else { return replaceCount }
+        var safe = 0
+        for row in replaced {
+            guard let rowUntil = ChatSessionRecollections.parseTimestamp(
+                      coverageRange([row]).until.map { .string($0) }
+                  ),
+                  rowUntil <= mark
+            else { break }
+            safe += 1
+        }
+        return safe
+    }
+
+    /// True when at least one row is an ordinary turn rather than a recollection
+    /// the earlier passes already folded.
+    static func containsRawTurn(_ rows: [JSONValue]) -> Bool {
+        rows.contains { row in
+            guard case .object(let obj) = row,
+                  case .object(let metadata)? = obj["metadata"],
+                  case .string(let kind)? = metadata["kind"]
+            else { return true }
+            return kind != ChatSessionRecollections.rowKind
+        }
+    }
+
     private static func preferredTailCount(messageCount: Int, keepCount: Int) -> Int {
         if messageCount > keepCount {
             return keepCount
@@ -623,8 +849,18 @@ struct ChatSessionAutocompactor: Sendable {
     }
 
     private static func compactionSummary(for rows: [JSONValue]) -> String {
-        var lines: [String] = []
-        lines.append("[NativeAgent compacted \(rows.count) earlier message(s).]")
+        let header = "[NativeAgent compacted \(rows.count) earlier message(s).]"
+        var lines: [String] = [header]
+        // 2026-09-05: a PRIOR recollection at the head of the replaced range is
+        // the only carrier of everything that happened before it; the 500-char
+        // per-row cap truncated it to its first paragraph, so when the distill
+        // failed the fallback silently amputated the session's earlier arc.
+        // The leading recollection row(s) keep their full body (their own
+        // maxSummaryChars); the raw turns after them are capped exactly as
+        // before.
+        var pinnedLines: [String] = []
+        var restLines: [String] = []
+        var pinning = true
         for row in rows {
             guard case .object(let obj) = row else { continue }
             let role: String = {
@@ -635,10 +871,39 @@ struct ChatSessionAutocompactor: Sendable {
                 obj,
                 collapseNewlines: true
             ) else { continue }
-            lines.append("\(role): \(String(body.prefix(500)))")
-            if lines.joined(separator: "\n").count > 12_000 { break }
+            if pinning, ChatCompactionRowRendering.isRecollection(obj) {
+                pinnedLines.append("\(role): \(body)")
+                continue
+            }
+            pinning = false
+            restLines.append("\(role): \(String(body.prefix(500)))")
         }
-        return String(lines.joined(separator: "\n").prefix(12_000))
+        // User, 2026-09-06: one bounded rolling window, the shape
+        // `IntraTurnContextCompaction`'s mechanical fold already uses. This
+        // used to keep up to 12 000 characters of the prior recollection PLUS
+        // another 12 000 of the newly replaced rows — about 24 000 — and the
+        // next pass read that row back with `prefix(12 000)`, so every repeat
+        // mechanical compaction threw away exactly the material it had just
+        // summarised. The caps now COMPOSE inside one budget, and the prior
+        // note contributes its TAIL: the oldest material is what ages out, not
+        // the newest. Recency retention by design, as in the in-turn lane.
+        // User, 2026-09-06: the cap is on the WHOLE stored value. The header
+        // and its newline used to sit OUTSIDE it, so the row written here was
+        // reliably longer than the `prefix(maxSummaryChars)` the next pass
+        // reads it back with — the overflow was silently dropped on re-read.
+        let cap = max(0, ChatCompactionDistiller.maxSummaryChars - header.count - 1)
+        let prior = pinnedLines.joined(separator: "\n")
+        let rest = restLines.joined(separator: "\n")
+        // The prior note may claim at most two thirds; whatever it does not use
+        // goes to the new rows, so a short recollection never strands budget.
+        var body = prior.isEmpty ? "" : String(prior.suffix(cap * 2 / 3))
+        if !rest.isEmpty {
+            let separator = body.isEmpty ? "" : "\n"
+            let room = max(0, cap - body.count - separator.count)
+            if room > 0 { body += separator + String(rest.suffix(room)) }
+        }
+        if !body.isEmpty { lines.append(String(body.prefix(cap))) }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -698,6 +963,16 @@ enum ChatCompactionRowRendering {
                 ? ChatTranscriptEvidenceRendering.recordedOriginLabel(metadata?["origin"]) : nil,
             incompleteReplyLabel: role == "assistant" && !isCompactionSummary
                 ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: obj, metadata: metadata) : nil)
+    }
+
+    /// True when this row is a consolidated recollection a PRIOR compaction
+    /// wrote, rather than an ordinary turn. The one place that knows the shape
+    /// for both compaction paths (see `ChatSessionRecollections.rowKind`).
+    static func isRecollection(_ obj: [String: JSONValue]) -> Bool {
+        guard case .object(let metadata)? = obj["metadata"],
+              case .string(let kind)? = metadata["kind"]
+        else { return false }
+        return kind == ChatSessionRecollections.rowKind
     }
 
     /// `toolName (ok): result summary` — nil when the row has no tool metadata.

@@ -103,3 +103,56 @@ struct AffectMoodJourneyTests {
         _ = (working, pressure)
     }
 }
+
+// 2026-09-01 — the same blind protocol, aimed at the two lines UNDER the
+// fingerprint. Measured on 777 live turns, the rut nudge rode 82% of capsules
+// and the Inner line had 15 distinct texts with three of them leading 124 / 108
+// / 98 turns. A journey has to move those lines too, or the capsule is a
+// fingerprint on top of two standing instructions.
+extension AffectMoodJourneyTests {
+
+    @Test func theInnerLineMovesAcrossAJourneyInsteadOfRepeating() async throws {
+        let clock = Clock(Date(timeIntervalSince1970: 2_000_000))
+        let mind = try await makeSubstrate(clock)
+        let dyn = PersonalityDynamicsConfiguration.default
+        var state = CognitiveCapsulePresentationState()
+        // Three views that are ALL relevant right now — the exact situation
+        // where the old selector kept re-showing the first one for days.
+        let candidates = [
+            "- Inner: An honest blank is healthier than performing depth",
+            "- Inner: A quiet dream is valid integration, not a failed process",
+            "- Inner: Quiet from a healthy system is signal of rest, not hidden failure",
+        ]
+        var seen: [String] = []
+        for _ in 0..<(dyn.innerLineRepeatLimit * 3) {
+            clock.advance(120)
+            if let line = mind.selectInnerLine(
+                from: candidates, dynamics: dyn, presentationState: &state) {
+                seen.append(line)
+            }
+        }
+        #expect(Set(seen).count >= 2,
+                "the Inner line never rotated across the journey: \(Set(seen))")
+        #expect(seen.count > 0, "rotation must not silence the line entirely")
+    }
+
+    @Test func theRutNudgeDoesNotRideEveryTurnOfAJourney() async throws {
+        let clock = Clock(Date(timeIntervalSince1970: 2_000_000))
+        let mind = try await makeSubstrate(clock)
+        let dyn = PersonalityDynamicsConfiguration.default
+        var state = CognitiveCapsulePresentationState()
+        // A rut that persists for days — the live case, where the worn set never
+        // empties because the window itself is days long.
+        let rut = CognitiveSubstrate.wornTokenSignature(["handsome", "gorgeous", "exactly"])
+        var spoke = 0
+        for _ in 0..<12 {
+            clock.advance(300)
+            if mind.soundRutAwarenessShouldSpeak(
+                signature: rut, at: clock.now(), dynamics: dyn, presentationState: &state) {
+                spoke += 1
+            }
+        }
+        #expect(spoke == 1,
+                "an unchanged rut spoke \(spoke) times in 12 turns; 82% of turns was the defect")
+    }
+}

@@ -212,6 +212,22 @@ extension NativeClient {
         return try JSONDecoder().decode(SchedulerJob.self, from: data)
     }
 
+    /// Pause / resume one scheduled job — the write behind the Scheduler
+    /// screen's enabled/paused control (item 36). Routes into the same flocked
+    /// `scheduler/jobs.json` writer the create/cancel paths use, and lands a
+    /// scheduler activity receipt.
+    func setSchedulerJobEnabled(id: String, enabled: Bool) async throws -> SchedulerJob {
+        let writer = makeSchedulerJobWriter(
+            connectorActionIDs: Self.connectorActionIDSet(),
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+        let result = try await writer.setJobEnabled(jobId: id, enabled: enabled)
+        guard case .object(let object) = result, let job = object["job"] else {
+            throw SchedulerJobsFeedError.unavailable("scheduler pause/resume returned no job")
+        }
+        return try JSONDecoder().decode(SchedulerJob.self, from: job.serializedData(pretty: false))
+    }
+
     func cancelSchedulerJob(id: String) async throws -> SchedulerJob {
         let writer = makeSchedulerJobWriter(
             connectorActionIDs: Self.connectorActionIDSet(),

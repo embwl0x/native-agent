@@ -31,8 +31,14 @@ struct FluidContextToolDispatchTests {
         )
     }
 
+    /// 2026-09-01 inversion. context_expand used to disappear from the catalog
+    /// on any turn whose packet offered no pointers, which changed the shape of
+    /// the advertised contract — and therefore the cached prompt prefix — for a
+    /// reason the model never asked about. It is an always-on core tool; the
+    /// floor does not move. With nothing to expand the DISPATCH says so, which
+    /// is what `contextExpandWithoutPointersFailsPolitely` covers.
     @Test
-    func contextExpandIsHiddenWithoutOfferedPointers() async throws {
+    func contextExpandStaysAdvertisedWithoutOfferedPointers() async throws {
         let dispatcher = makeDispatcher()
         let prepared = try makePreparedTurn(offeredAtomIDs: [])
 
@@ -43,8 +49,8 @@ struct FluidContextToolDispatchTests {
             try await dispatcher.listAvailableToolSchemas()
         }
 
-        #expect(!names.contains("context_expand"))
-        #expect(!schemas.contains { $0.name == "context_expand" })
+        #expect(names.contains("context_expand"))
+        #expect(schemas.contains { $0.name == "context_expand" })
     }
 
     @Test

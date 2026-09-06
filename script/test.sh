@@ -184,15 +184,14 @@ echo "[test] tracked privacy"
 
 # Bridge wakeup helpers are production code with node-only test suites; run
 # them all so a new suite can never sit orphaned outside the gate.
+# One `node --test` per suite paid a fresh Node startup each time; the runner
+# takes every path at once and reports them individually. Same suites (the
+# glob is unchanged), same failure behavior — a non-zero run still aborts here.
 echo "[test] bridge wakeup helpers (node)"
-for suite in "$ROOT"/script/tests/*.test.js; do
-  node --test "$suite"
-done
+node --test "$ROOT"/script/tests/*.test.js
 
 echo "[test] Chrome extension (mock browser, node)"
-for suite in "$ROOT"/Extensions/NativeAgentChrome/tests/*.test.js; do
-  node --test "$suite"
-done
+node --test "$ROOT"/Extensions/NativeAgentChrome/tests/*.test.js
 
 # U4 Wave B: when this script runs as the `run_tests` builder tool it is wrapped
 # in an OUTER macOS sandbox-exec (workspace-scoped writes). SwiftPM self-sandboxes
@@ -224,10 +223,13 @@ echo "[test] NativeAgentCore Swift Testing shards"
 # assertion failure after heavy stderr/test-event output. Sharding by test target
 # keeps full coverage while avoiding helper-channel overload and isolates the
 # timing-sensitive ProviderRouting tests from SelfImprovement's git subprocesses.
-# Keep each shard serial too: ChatOrchestration contains real sandboxed SwiftPM
-# fixture builds, and parallel `dsymutil` children can block each other until a
-# tool watchdog fires or outlive an interrupted helper. Sharding still bounds
-# event volume; `--no-parallel` makes child-process ownership reliable.
+# THREE shards are pinned solo — run one at a time, `--no-parallel` inside:
+# ChatOrchestration (real sandboxed SwiftPM fixture builds, whose parallel
+# `dsymutil` children block each other until a tool watchdog fires or outlive
+# an interrupted helper), SelfImprovement (git subprocesses) and ProviderRouting
+# (wall-clock timing). Those are the only stated hazards, so the remaining
+# shards — which spawn nothing and measure nothing — run pooled and internally
+# parallel. Sharding still bounds event volume for all of them.
 # For a single-command full Core sweep, use `swift test --package-path
 # Modules/NativeAgentCore --no-parallel`; do not use the bare parallel helper
 # path as the broad gate.
@@ -257,20 +259,54 @@ CORE_SWIFT_TEST_SHARDS=(
   # (Swift Testing) added to any of them is NOT silently skipped by the shards.
   "CommandPaletteTests|OnboardingTests|MacIntegrationTests|XConnectorTests"
 )
+# The three hazard targets named above. A shard containing any of them is
+# pinned solo; every other shard is pooled.
+CORE_SOLO_SHARD_TARGETS='ChatOrchestrationTests|SelfImprovementTests|ProviderRoutingTests'
+CORE_SHARD_POOL="${NATIVEAGENT_CORE_SHARD_POOL:-4}"
 CORE_TEST_SOURCE_DIGEST="$(nativeagent_source_state_digest "$ROOT/Modules/NativeAgentCore")"
-core_shard_index=0
+core_solo_shards=()
+core_pooled_shards=()
 for shard in "${CORE_SWIFT_TEST_SHARDS[@]}"; do
-  echo "[test] NativeAgentCore Swift Testing shard: $shard"
-  core_shard_build_flag=()
-  if [[ "$core_shard_index" -gt 0 ]]; then
-    core_shard_build_flag=(--skip-build)
+  if [[ "$shard" =~ $CORE_SOLO_SHARD_TARGETS ]]; then
+    core_solo_shards+=("$shard")
+  else
+    core_pooled_shards+=("$shard")
   fi
-  swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
-    ${core_shard_build_flag[@]+"${core_shard_build_flag[@]}"} \
-    --package-path "$ROOT/Modules/NativeAgentCore" \
-    --disable-xctest --no-parallel --filter "^(${shard})\\."
-  core_shard_index=$((core_shard_index + 1))
 done
+echo "[test] Core shard plan: ${#CORE_SWIFT_TEST_SHARDS[@]} shards — ${#core_solo_shards[@]} pinned solo (--no-parallel), ${#core_pooled_shards[@]} pooled ${CORE_SHARD_POOL}-way"
+# Build the test bundle ONCE up front so every shard can --skip-build. This
+# replaces the old "first shard owns the build" ordering, which a pool cannot
+# honor. The digest check below still refuses a stale --skip-build success.
+swift build --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
+  --package-path "$ROOT/Modules/NativeAgentCore" --build-tests
+for shard in ${core_solo_shards[@]+"${core_solo_shards[@]}"}; do
+  echo "[test] NativeAgentCore Swift Testing shard (solo): $shard"
+  swift test --force-resolved-versions --skip-update ${SWIFTPM_SANDBOX_FLAG[@]+"${SWIFTPM_SANDBOX_FLAG[@]}"} \
+    --skip-build --package-path "$ROOT/Modules/NativeAgentCore" \
+    --disable-xctest --no-parallel --filter "^(${shard})\\."
+done
+if [[ "${#core_pooled_shards[@]}" -gt 0 ]]; then
+  echo "[test] NativeAgentCore Swift Testing shards (pooled ${CORE_SHARD_POOL}-way): ${#core_pooled_shards[@]}"
+  core_pooled_logs="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-core-shards.XXXXXX")"
+  # --skip-build makes the built products shared read-only, so shards only
+  # contend for CPU. Output is captured per shard and printed on failure so a
+  # diagnosis is not shredded across concurrent writers.
+  printf '%s\n' "${core_pooled_shards[@]}" \
+    | xargs -P "$CORE_SHARD_POOL" -I{} bash -c '
+        shard="$1"; logs="$2"; sandbox_flag="$3"; package="$4"
+        log="$logs/$(printf "%s" "$shard" | tr -c "A-Za-z0-9" "_").log"
+        if swift test --force-resolved-versions --skip-update $sandbox_flag \
+             --skip-build --package-path "$package" \
+             --disable-xctest --filter "^($shard)\\." > "$log" 2>&1; then
+          printf "[test]   shard ok: %s\n" "$shard"
+        else
+          printf "[test]   SHARD FAILED: %s\n" "$shard"
+          cat "$log"
+          exit 1
+        fi
+      ' _ {} "$core_pooled_logs" "${SWIFTPM_SANDBOX_FLAG[0]:-}" "$ROOT/Modules/NativeAgentCore"
+  rm -rf "$core_pooled_logs"
+fi
 CORE_TEST_SOURCE_DIGEST_AFTER="$(nativeagent_source_state_digest "$ROOT/Modules/NativeAgentCore")"
 if [[ "$CORE_TEST_SOURCE_DIGEST" != "$CORE_TEST_SOURCE_DIGEST_AFTER" ]]; then
   echo "[test] ERROR: NativeAgentCore source/resource state changed during sharded execution; refusing stale --skip-build success." >&2

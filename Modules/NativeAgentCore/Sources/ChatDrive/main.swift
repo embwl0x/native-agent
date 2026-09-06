@@ -10,7 +10,11 @@
 //     path the Mac UI uses.
 //   `chat-drive provider-prefs [surface]` — print checked read-only Swift
 //     provider/model picks without recovering pending picker state.
-//   `chat-drive doctor [--repair true|false] [--check-llm true|false]` — run Swift Doctor checks.
+//   `chat-drive doctor [--repair true|false]` — run Swift Doctor checks.
+//     FIX-5b (2026-09-01): `--check-llm` is GONE. It was documented here and
+//     threaded all the way into `runAll`, which has never read it — this
+//     Doctor makes no provider call by design, so the flag promised a probe
+//     that does not exist. Passing it now fails loudly instead of lying.
 //   `chat-drive memory-migrate <dataRoot>` — run MemoryV2 migration/repair.
 //   `chat-drive memory-recall <dataRoot> '<query>' [k]` — verify SQLite recall.
 //   `chat-drive memory-embedding-epoch {status|activate|rollback} <dataRoot>` — atomically manage vector-space identity.
@@ -225,11 +229,8 @@ struct ChatDriveMain {
             try await runProviderPrefs(surface: parsed.positionals.first)
 
         case .doctor:
-            let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: ["repair", "check-llm"])
-            try await runDoctor(
-                repair: boolOption(parsed.options["repair"], defaultValue: false),
-                checkLLM: boolOption(parsed.options["check-llm"], defaultValue: false)
-            )
+            let parsed = parseOptions(Array(args.dropFirst()), allowedOptions: ["repair"])
+            try await runDoctor(repair: boolOption(parsed.options["repair"], defaultValue: false))
 
         case .memoryMigrate:
             guard args.count >= 2 else {
@@ -1047,9 +1048,11 @@ struct ChatDriveMain {
         ]
     }
 
-    static func runDoctor(repair: Bool, checkLLM: Bool) async throws {
-        FileHandle.standardError.write(Data("[doctor] repair=\(repair) checkLLM=\(checkLLM)\n".utf8))
-        let results = try await makeDoctorChecks().runAll(repair: repair, checkLLM: checkLLM)
+    static func runDoctor(repair: Bool) async throws {
+        FileHandle.standardError.write(Data("[doctor] repair=\(repair)\n".utf8))
+        // checkLLM: false — the flag is dead everywhere (FIX-5b); this CLI no
+        // longer offers a switch whose only effect was to print itself back.
+        let results = try await makeDoctorChecks().runAll(repair: repair, checkLLM: false)
         let status: String = {
             if results.contains(where: { $0.status == "fail" }) { return "fail" }
             if results.contains(where: { $0.status == "warn" }) { return "warn" }
@@ -1068,7 +1071,6 @@ struct ChatDriveMain {
         let payload: JSONValue = .object([
             "status": .string(status),
             "repair": .bool(repair),
-            "checkLLM": .bool(checkLLM),
             "checks": .array(checks),
         ])
         print((try? payload.serialize(pretty: true)) ?? "\(payload)")
@@ -1098,7 +1100,7 @@ struct ChatDriveMain {
         // and quietly ships the wrong answer. `NATIVE_AGENT_EMBEDDING_MOCK=1`
         // is the explicit developer test opt-in.
         let embedder: any EmbeddingProvider = {
-            if let coreML = try? CoreMLEmbeddingProvider.bundled() { return coreML }
+            if let coreML = try? CoreMLEmbeddingProvider.bundled(extrasRoot: dataRoot) { return coreML }
             if ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1" {
                 return MockEmbeddingProvider(dimensions: 384)
             }
@@ -1191,7 +1193,7 @@ struct ChatDriveMain {
         let embedder: any EmbeddingProvider
         if embeddingMock {
             embedder = MockEmbeddingProvider(dimensions: 384)
-        } else if let coreML = try? CoreMLEmbeddingProvider.bundled() {
+        } else if let coreML = try? CoreMLEmbeddingProvider.bundled(extrasRoot: dataRoot) {
             embedder = coreML
         } else {
             let out: JSONValue = .object([
@@ -2343,8 +2345,6 @@ struct ChatDriveMain {
                 continue
             }
         }
-        let shadow = MetacognitiveShadowEvaluation.evaluate(events: traceEvents)
-        let outcomeCalibration = MetacognitiveOutcomeCalibrationReport.evaluate(events: traceEvents)
 
         let operationalEvidence = try await collectOperationalProcedureEvidence(
             dataRoot: dataRoot,
@@ -2443,57 +2443,6 @@ struct ChatDriveMain {
 
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let shadowValue: JSONValue = .object([
-            "schema": .string("metacognition.shadow-evaluation.v1"),
-            "recommendationEmission": .string(
-                shadow.turns.isEmpty ? "no recommendations emitted" : "recommendations emitted"
-            ),
-            "recommendations": .int(Int64(shadow.turns.count)),
-            "legacyExcludedRecommendations": .int(Int64(shadow.legacyExcludedRecommendationCount)),
-            "correlatedTurns": .int(Int64(shadow.correlatedTurnCount)),
-            "incompleteCorrelation": .int(Int64(shadow.incompleteCorrelationCount)),
-            "correlationCoverage": .double(shadow.correlationCoverageRate),
-            "completeObservedMeasurements": .int(Int64(shadow.completeObservedMeasurementCount)),
-            "observedMeasurementCoverage": .double(shadow.observedMeasurementCoverageRate),
-            "toolLaneAgreement": .double(shadow.toolLaneAgreementRate),
-            // Tool use is the only recommendation dimension with an exact
-            // terminal observation today. Compute/context quality require a
-            // later authoritative outcome and are deliberately not inferred
-            // from latency, model choice, or packet size.
-            "scoredRecommendationDimensions": .array([.string("tool_use")]),
-            "unscoredRecommendationDimensions": .object([
-                "compute": .string("no_authoritative_quality_outcome"),
-                "context": .string("no_authoritative_usefulness_outcome"),
-                "model": .string("recommendation_does_not_choose_a_model"),
-                "correction_rate": .string("explicit_regenerate_only; not_a_causal_quality_label"),
-                "unnecessary_model_calls": .string("no_counterfactual_no_call_baseline"),
-                "tool_usefulness": .string("terminal_receipt_proves_use_not_value"),
-            ]),
-            // Closed-schema v1 terminal receipts plus explicit regenerate
-            // edges. This supersedes inference from silence/prose while
-            // remaining payload-free and observational.
-            "authoritativeOutcomeCalibration": outcomeCalibration.traceValue,
-            "recommendationObservations": .object([
-                "compute": computeLaneObservationJSON(shadow.turns),
-                "context": contextLaneObservationJSON(shadow.turns),
-                "tool": toolLaneObservationJSON(shadow.turns),
-            ]),
-            "recommendedAffordances": .object(shadow.affordanceCounts.mapValues { .int(Int64($0)) }),
-            "observedProviders": .object(shadow.providerCounts.mapValues { .int(Int64($0)) }),
-            "observedProviderModels": .object(shadow.providerModelCounts.mapValues { .int(Int64($0)) }),
-            "observedEngineModels": .object(shadow.modelCounts.mapValues { .int(Int64($0)) }),
-            "observedReasoningEffort": .object(shadow.reasoningEffortCounts.mapValues { .int(Int64($0)) }),
-            "observedContextSources": .object(shadow.contextSourceCounts.mapValues { .int(Int64($0)) }),
-            "turnLatencyMs": integerMetricSummaryJSON(shadow.turnLatency),
-            "providerLatencyMs": integerMetricSummaryJSON(shadow.providerLatency),
-            "contextPacketCharacters": integerMetricSummaryJSON(shadow.contextPacketCharacters),
-            "contextSelectedAtoms": integerMetricSummaryJSON(shadow.contextSelectedAtoms),
-            "evidenceStatus": .string(shadow.evidenceStatus.rawValue),
-            "firstRecommendationAt": shadow.firstRecommendationAt.map { .string(formatter.string(from: $0)) } ?? .null,
-            "lastRecommendationAt": shadow.lastRecommendationAt.map { .string(formatter.string(from: $0)) } ?? .null,
-            "surfaces": .object(shadow.surfaceCounts.mapValues { .int(Int64($0)) }),
-            "controlAuthority": .bool(false),
-        ])
         let readinessValue: JSONValue = .object([
             "readyForShadowTraining": .bool(gate.readyForShadowTraining),
             "blockers": .array(gate.blockers.map { .string($0.rawValue) }),
@@ -2648,11 +2597,6 @@ struct ChatDriveMain {
                 "globalEventLimit": .int(Int64(maximumTraceEvents)),
             ]),
             "evidenceSources": evidenceSourcesValue,
-            "metacognition": .object([
-                "shadowEvaluation": shadowValue,
-                "outcomeCalibration": outcomeCalibration.traceValue,
-            ]),
-            "wave5": shadowValue,
             "wave6": readinessValue,
             "procedureCompilation": procedureValue,
         ])
@@ -2681,64 +2625,6 @@ struct ChatDriveMain {
             "payloadFree": .bool(true),
         ])
         print((try? output.serialize(pretty: true)) ?? "\(output)")
-    }
-
-    static func integerMetricSummaryJSON(
-        _ summary: MetacognitiveShadowEvaluation.IntegerMetricSummary
-    ) -> JSONValue {
-        .object([
-            "count": .int(Int64(summary.count)),
-            "minimum": summary.minimum.map { .int(Int64($0)) } ?? .null,
-            "maximum": summary.maximum.map { .int(Int64($0)) } ?? .null,
-            "mean": summary.mean.map(JSONValue.double) ?? .null,
-        ])
-    }
-
-    static func computeLaneObservationJSON(
-        _ turns: [MetacognitiveShadowEvaluation.Turn]
-    ) -> JSONValue {
-        .object(Dictionary(grouping: turns, by: \.recommendedComputeLane).mapValues { group in
-            let correlated = group.filter(\.hasCorrelatedProviderOutcome)
-            return .object([
-                "recommendations": .int(Int64(group.count)),
-                "correlatedTurns": .int(Int64(correlated.count)),
-                "providerCalls": integerMetricSummaryJSON(.init(correlated.map(\.providerCallCount))),
-                "turnLatencyMs": integerMetricSummaryJSON(.init(correlated.compactMap(\.turnElapsedMs))),
-            ])
-        })
-    }
-
-    static func contextLaneObservationJSON(
-        _ turns: [MetacognitiveShadowEvaluation.Turn]
-    ) -> JSONValue {
-        .object(Dictionary(grouping: turns, by: \.recommendedContextLane).mapValues { group in
-            let complete = group.filter(\.hasCompleteObservedMeasurements)
-            return .object([
-                "recommendations": .int(Int64(group.count)),
-                "completeObservedMeasurements": .int(Int64(complete.count)),
-                "packetCharacters": integerMetricSummaryJSON(.init(complete.compactMap(\.contextPacketCharacters))),
-                "selectedAtoms": integerMetricSummaryJSON(.init(complete.compactMap(\.contextSelectedAtomCount))),
-                "expansions": integerMetricSummaryJSON(.init(complete.map(\.contextExpansionCount))),
-            ])
-        })
-    }
-
-    static func toolLaneObservationJSON(
-        _ turns: [MetacognitiveShadowEvaluation.Turn]
-    ) -> JSONValue {
-        .object(Dictionary(grouping: turns, by: \.recommendedToolLane).mapValues { group in
-            let correlated = group.filter(\.hasCorrelatedProviderOutcome)
-            let agreement = correlated.isEmpty
-                ? nil
-                : Double(correlated.filter(\.toolLaneMatchedObservedUse).count) / Double(correlated.count)
-            return .object([
-                "recommendations": .int(Int64(group.count)),
-                "correlatedTurns": .int(Int64(correlated.count)),
-                "useAgreement": agreement.map(JSONValue.double) ?? .null,
-                "dispatches": integerMetricSummaryJSON(.init(correlated.map(\.toolDispatchCount))),
-                "failedDispatches": integerMetricSummaryJSON(.init(correlated.map(\.failedToolDispatchCount))),
-            ])
-        })
     }
 
     static func parseLivingFabricDate(_ raw: String) -> Date? {

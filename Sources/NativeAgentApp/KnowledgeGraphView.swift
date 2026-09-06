@@ -199,141 +199,123 @@ struct KnowledgeGraphView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 12) {
             KGNativeStackHeader(
                 status: nativeStack,
                 totalEntities: totalEntities,
                 totalEdges: totalEdges ?? 0
             )
-            .padding(.horizontal, NativeAgentSpacing.lg)
-            .padding(.top, NativeAgentSpacing.md)
 
             // 2026-06-06: filter row — kind multi-select + time-window picker.
             // Sits above the search bar and view-mode toggle; applies to both.
-            HStack(spacing: NativeAgentSpacing.sm) {
-                Menu {
-                    Button(selectedKinds.isEmpty ? "✓ All kinds" : "All kinds") {
-                        selectedKinds.removeAll()
-                    }
-                    Divider()
-                    ForEach(kindCatalog, id: \.self) { kind in
-                        Button(action: {
-                            if selectedKinds.contains(kind) {
-                                selectedKinds.remove(kind)
-                            } else {
-                                selectedKinds.insert(kind)
-                            }
-                        }) {
-                            Label(
-                                "\(selectedKinds.contains(kind) ? "✓ " : "")\(kind.capitalized)",
-                                systemImage: KGEntityRow.typeIcon(kind)
-                            )
+            AdvancedCard {
+                HStack(spacing: 8) {
+                    Menu {
+                        Button(selectedKinds.isEmpty ? "✓ All kinds" : "All kinds") {
+                            selectedKinds.removeAll()
                         }
-                    }
-                } label: {
-                    HStack(spacing: NativeAgentSpacing.xs) {
-                        Image(systemName: "line.3.horizontal.decrease.circle")
+                        Divider()
+                        ForEach(kindCatalog, id: \.self) { kind in
+                            Button(action: {
+                                if selectedKinds.contains(kind) {
+                                    selectedKinds.remove(kind)
+                                } else {
+                                    selectedKinds.insert(kind)
+                                }
+                            }) {
+                                Label(
+                                    "\(selectedKinds.contains(kind) ? "✓ " : "")\(kind.capitalized)",
+                                    systemImage: KGEntityRow.typeIcon(kind)
+                                )
+                            }
+                        }
+                    } label: {
                         Text(selectedKinds.isEmpty
                              ? "All kinds"
                              : selectedKinds.count == 1
                                 ? selectedKinds.first!.capitalized
                                 : "\(selectedKinds.count) kinds")
-                            .font(NativeAgentFont.label)
+                            .font(ShellType.label)
                     }
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
 
-                Picker("Time", selection: $timeWindow) {
-                    ForEach(KGTimeWindow.allCases) { w in
-                        Text(w.rawValue).tag(w)
+                    Picker("Time", selection: $timeWindow) {
+                        ForEach(KGTimeWindow.allCases) { w in
+                            Text(w.rawValue).tag(w)
+                        }
                     }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
 
-                Spacer()
+                    Spacer()
 
-                Picker("View", selection: viewModeSelection) {
-                    ForEach(KGViewMode.allCases) { mode in
-                        Label(mode.rawValue, systemImage: mode.systemImage).tag(mode)
+                    Picker("View", selection: viewModeSelection) {
+                        ForEach(KGViewMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    .accessibilityLabel("Knowledge Graph view mode")
+                    .accessibilityValue(viewMode.rawValue)
+                    .help(viewModeNotice ?? "Choose whether to browse the graph as a list or a graph.")
                 }
-                .pickerStyle(.segmented)
-                .fixedSize()
-                .accessibilityLabel("Knowledge Graph view mode")
-                .accessibilityValue(viewMode.rawValue)
-                .help(viewModeNotice ?? "Choose whether to browse the graph as a list or a graph.")
+
+                // Search + (legacy single-type) filter bar
+                HStack(spacing: 8) {
+                    TextField("Search entities…", text: $searchText)
+                        .textFieldStyle(.plain)
+                        .font(ShellType.label)
+                    Spacer()
+                    Picker("Type", selection: $filterType) {
+                        ForEach(entityTypes, id: \.self) { t in
+                            Text(t.capitalized).tag(t)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                }
             }
-            .padding(.horizontal, NativeAgentSpacing.md)
-            .padding(.vertical, NativeAgentSpacing.xs)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
-            .padding(.horizontal, NativeAgentSpacing.lg)
-            .padding(.top, NativeAgentSpacing.md)
 
             if let viewModeNotice {
-                Label(viewModeNotice, systemImage: "exclamationmark.triangle.fill")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.orange)
+                Text(viewModeNotice)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, NativeAgentSpacing.lg)
-                    .padding(.top, NativeAgentSpacing.xs)
             }
 
             if knowledgeGraphEnabled == true,
                let completion = enableActionPresentation.completionMessage {
-                Label(completion, systemImage: "checkmark.circle")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
+                Text(completion)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, NativeAgentSpacing.lg)
-                    .padding(.top, NativeAgentSpacing.xs)
             }
 
             if let failure = enableActionPresentation.failureMessage {
-                Label(failure, systemImage: "exclamationmark.triangle.fill")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.red)
+                Text(failure)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, NativeAgentSpacing.lg)
-                    .padding(.top, NativeAgentSpacing.xs)
             }
-
-            // Search + (legacy single-type) filter bar
-            HStack(spacing: NativeAgentSpacing.sm) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search entities…", text: $searchText)
-                    .textFieldStyle(.plain)
-                Spacer()
-                Picker("Type", selection: $filterType) {
-                    ForEach(entityTypes, id: \.self) { t in
-                        Text(t.capitalized).tag(t)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-            }
-            .padding(NativeAgentSpacing.md)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
-            .padding(.horizontal, NativeAgentSpacing.lg)
-            .padding(.top, NativeAgentSpacing.xs)
 
             if let conflict = filterConflict.message {
-                HStack(spacing: NativeAgentSpacing.sm) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
+                HStack(spacing: 8) {
                     Text(conflict)
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                     Spacer()
                     Button("Clear kind filter") {
                         selectedKinds.removeAll()
                     }
                     .controlSize(.small)
                 }
-                .padding(.horizontal, NativeAgentSpacing.lg)
-                .padding(.vertical, NativeAgentSpacing.xs)
                 .accessibilityElement(children: .combine)
             }
 
@@ -349,31 +331,26 @@ struct KnowledgeGraphView: View {
                 entityCount: entities.count,
                 errorOrigin: errorOrigin
             ) {
-                HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.yellow)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(err)
-                            .font(NativeAgentFont.label)
-                            .foregroundStyle(.red)
-                        if isStale {
-                            Text("Showing previously loaded data — it may be stale.")
-                                .font(NativeAgentFont.label)
-                                .foregroundStyle(.secondary)
+                AdvancedCard(spacing: 8) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(err)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.trouble)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if isStale {
+                                Text("Showing previously loaded data — it may be stale.")
+                                    .font(ShellType.label)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                            }
                         }
+                        Spacer()
+                        Button("Retry") {
+                            Task { await loadGraph() }
+                        }
+                        .controlSize(.small)
                     }
-                    Spacer()
-                    Button {
-                        Task { await loadGraph() }
-                    } label: {
-                        Label("Retry", systemImage: "arrow.clockwise")
-                    }
-                    .controlSize(.small)
                 }
-                .padding(NativeAgentSpacing.md)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel))
-                .padding(.horizontal, NativeAgentSpacing.lg)
-                .padding(.top, NativeAgentSpacing.xs)
             }
 
             switch KnowledgeGraphPresentation.content(
@@ -387,46 +364,38 @@ struct KnowledgeGraphView: View {
                 policyReadError: policyReadError
             ) {
             case .loading:
-                ProgressView("Loading graph…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                AdvancedWaitingLine("Reading the knowledge graph…")
             case let .unavailable(err):
                 // U5 W-C fix-round (gpt-5.5 NEEDS_FIX): error state WINS.
                 // Pre-fix, a corrupt store on first load still rendered the
                 // healthy "No entities yet" empty state with the real error
                 // buried at the bottom — a fabricated-healthy lie. With
                 // nothing loaded to show, the error is the whole story.
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "Couldn't load the knowledge graph",
                     detail: err,
-                    systemImage: "exclamationmark.triangle",
                     actionTitle: "Retry",
-                    actionImage: "arrow.clockwise",
                     action: { Task { await loadGraph() } }
                 )
             case .policyUnavailable:
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "Checking Knowledge Graph permission",
                     detail: "The Memory Policy has not loaded yet, so this page will not guess that the graph is off.",
-                    systemImage: "clock",
                     actionTitle: "Retry",
-                    actionImage: "arrow.clockwise",
                     action: { Task { await reloadKnowledgeGraphPolicyAndGraph() } }
                 )
             case .policyUnreadable(let detail):
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "Knowledge Graph permission unavailable",
                     detail: detail,
-                    systemImage: "exclamationmark.triangle",
                     actionTitle: "Retry",
-                    actionImage: "arrow.clockwise",
                     action: { Task { await reloadKnowledgeGraphPolicyAndGraph() } }
                 )
             case .disabled:
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "Knowledge Graph is off",
                     detail: "Turn on Knowledge Graph in Memory Policy to start tracking entities from conversations.",
-                    systemImage: "circle.hexagongrid",
                     actionTitle: enableButtonControl.title,
-                    actionImage: enableButtonControl.systemImage,
                     actionIsDisabled: enableButtonControl.isDisabled,
                     action: {
                         Task {
@@ -435,45 +404,36 @@ struct KnowledgeGraphView: View {
                     }
                 )
             case .empty:
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "No entities yet",
-                    detail: "Future conversations will populate entity links here. Use refresh after the next chat turn.",
-                    systemImage: "circle.hexagongrid",
-                    actionTitle: "Refresh Graph",
-                    actionImage: "arrow.clockwise",
+                    detail: "Future conversations will populate entity links here. Refresh after the next chat turn.",
+                    actionTitle: "Refresh the graph",
                     action: { Task { await loadGraph() } }
                 )
             case .filteredEmpty:
                 // Entities exist but the active filter set excludes all of
                 // them. Distinct empty state with a clear-all-filters action
                 // so the canvas/list never silently goes blank.
-                VStack(spacing: NativeAgentSpacing.md) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text("No entities match these filters.")
-                        .font(NativeAgentFont.body)
-                        .foregroundStyle(.secondary)
-                    Button("Clear filters") {
+                AdvancedEmptyState(
+                    title: "No entities match these filters",
+                    detail: "Clearing the kind, time and search filters brings the whole graph back.",
+                    actionTitle: "Clear filters",
+                    action: {
                         selectedKinds.removeAll()
                         timeWindow = .all
                         filterType = "all"
                         searchText = ""
                     }
-                    .buttonStyle(.borderedProminent)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                )
             case .list:
                 splitListAndDetail
             case let .graphSafetyNet(count):
-                VStack(spacing: NativeAgentSpacing.sm) {
-                    HStack {
-                        Image(systemName: "info.circle").foregroundStyle(.secondary)
-                        Text("Graph too large (\(count) entities) — showing list. Tighten the filters above to render as a graph.")
-                            .font(NativeAgentFont.label).foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    .padding(.horizontal, NativeAgentSpacing.lg)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Graph too large (\(count) entities) — showing the list. Tighten the filters above to render as a graph.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     splitListAndDetail
                 }
             case .graph:
@@ -498,8 +458,12 @@ struct KnowledgeGraphView: View {
                                 )
                                     .frame(minWidth: 300)
                             } else {
-                                NativeEmptyState(title: "Tap a node", detail: "", systemImage: "hand.tap")
-                                    .frame(minWidth: 300)
+                                AdvancedEmptyState(
+                                    title: "No node picked",
+                                    detail: "Click a node on the canvas to read what the agent knows about it."
+                                )
+                                .padding(.horizontal, 16)
+                                .frame(minWidth: 300, alignment: .topLeading)
                             }
                 }
             }
@@ -509,29 +473,24 @@ struct KnowledgeGraphView: View {
 
             // Footer: total count + explicit GC trigger
             if !entities.isEmpty {
-                HStack {
+                HStack(spacing: 8) {
                     Text("\(totalEntities) entities\(totalEdges.map { " · \($0) edges" } ?? "")")
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
                     Spacer()
                     if let gcStatus {
                         Text(gcStatus)
-                            .font(NativeAgentFont.label)
-                            .foregroundStyle(.secondary)
+                            .font(ShellType.caption)
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
-                    Button {
+                    Button(gcRunning ? "Sweeping…" : "Sweep orphans…") {
                         Task { await previewGCSweep() }
-                    } label: {
-                        Label(gcRunning ? "Sweeping…" : "Sweep orphans…",
-                              systemImage: "trash.slash")
                     }
                     .controlSize(.small)
                     .disabled(gcRunning)
                     .help("Find entities whose source memories were deleted. Shows a preview first — nothing is removed without your confirmation.")
                 }
-                .padding(.horizontal, NativeAgentSpacing.lg)
-                .padding(.vertical, NativeAgentSpacing.xs)
-                .background(.ultraThinMaterial)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .confirmationDialog(
@@ -572,7 +531,8 @@ struct KnowledgeGraphView: View {
             List(displayEntities, selection: $selectedId) { entity in
                 KGEntityRow(entity: entity).tag(entity.id)
             }
-            .listStyle(.sidebar)
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
             .frame(minWidth: 200, idealWidth: 260)
 
             if let entity = selectedEntity {
@@ -583,8 +543,12 @@ struct KnowledgeGraphView: View {
                 )
                     .frame(minWidth: 300)
             } else {
-                NativeEmptyState(title: "Select an entity", detail: "", systemImage: "hand.tap")
-                    .frame(minWidth: 300)
+                AdvancedEmptyState(
+                    title: "No entity picked",
+                    detail: "Pick a row on the left to read what the agent knows about it."
+                )
+                .padding(.horizontal, 16)
+                .frame(minWidth: 300, alignment: .topLeading)
             }
         }
     }

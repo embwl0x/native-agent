@@ -156,6 +156,35 @@ extension NativeCognitionRuntime {
                 )
             }
         }
+        await drainRuminationReleasesIntoSubstrate()
+    }
+
+    /// Item 6 (2026-09-02) — HEAL. The substrate stages a relief felt-moment
+    /// when an itching seed is answered, exactly as the kernel stages its own
+    /// resolution felt-moments, and this is the same drain shape: back through
+    /// `ingestResident`, where the D-2 stakes gate decides whether it becomes a
+    /// node at all. Nothing here composes a feeling — the lane already sized it
+    /// to the weight that was actually carried.
+    ///
+    /// Rides the felt-resolution drain because that runs after every accepted
+    /// event on both kernel-feed paths, so a nag answered in the user's next
+    /// sentence heals within the same turn.
+    ///
+    /// HONEST SCOPE: that drain runs only when the somatic bus accepted, i.e.
+    /// only while the organism is enabled. With the organism off, the WEIGHT
+    /// still clears the instant the thing is answered — the pressure floors are
+    /// a pure read over seeds that no longer exist, so the exhale is real — and
+    /// only the felt NODE waits for the buffer's next drain (capped drop-oldest
+    /// at the source, so it cannot grow).
+    func drainRuminationReleasesIntoSubstrate() async {
+        for event in await substrate.drainRuminationReleaseEvents() {
+            if await substrate.ingestResident(event) {
+                scheduleDirtyMicrocycle(
+                    reason: "rumination_release",
+                    turnClass: InstalledPhysiologySoakRecorder.physiologyTurnClass(event.turnKind)
+                )
+            }
+        }
     }
 
     func ingestOrganismSignal(
@@ -577,6 +606,32 @@ extension NativeCognitionRuntime {
         let integratesChemistry: Bool
     }
 
+    /// Item 4 (2026-09-02) — THE BODY'S CLOCK, pushed from the ONE source the
+    /// turn engine already reads.
+    ///
+    /// `TurnQuietHoursWindow.read(dataRoot:)` is the turn engine's own reader for
+    /// `data/user_prefs.json` → `quiet_hours.{start,end}` (it renders the clock
+    /// line's quiet-hours clause). Reusing it verbatim is the point: two answers
+    /// to "is it quiet right now" is exactly the shape that makes an agent
+    /// contradict itself, and item 4 must not introduce a second config surface.
+    /// An absent file or window degrades to zone-only, and the curve falls back
+    /// to its shipped 4 AM trough.
+    ///
+    /// Behind the kernel's own five-minute staleness gate, so a preference that
+    /// changes roughly never is not re-read on every tool result.
+    private func refreshOrganismDiurnalClockIfStale(at fixedAt: Date) async {
+        guard await organismKernel.diurnalClockIsStale(at: fixedAt) else { return }
+        let window = TurnQuietHoursWindow.read(dataRoot: dataRoot)
+        await organismKernel.configureDiurnalClock(
+            OrganismDiurnalClock(
+                timeZoneIdentifier: TimeZone.current.identifier,
+                quietStartHour: window?.startHour,
+                quietEndHour: window?.endHour
+            ),
+            at: fixedAt
+        )
+    }
+
     func refreshOrganismBodySchema(reason _: String) async {  // internal for actor extensions (move-only Wave C)
         let fixedAt = now()
         let sample = await organismBodySample(at: fixedAt)
@@ -589,6 +644,14 @@ extension NativeCognitionRuntime {
     }
 
     func organismBodySample(at fixedAt: Date) async -> OrganismBodySample {  // internal for actor extensions (move-only Wave C)
+        // The frozen per-turn read (`refreshBodySchemaAndFrozenRead`) enters
+        // here too, so the clock is fresh for the capsule as well as for the
+        // background refresh above.
+        await refreshOrganismDiurnalClockIfStale(at: fixedAt)
+        // Item 6's external lane rides the same cadence. Its own staleness gate
+        // is a clock read, and the Desk load it may start is DETACHED — this
+        // await never waits on disk (see `+Rumination`).
+        await refreshDeskRuminationsIfStale(at: fixedAt)
         var liveRead: OrganismBodyRead
         if let cached = cachedBodyRead, fixedAt.timeIntervalSince(cached.at) < 2.0 {
             liveRead = cached.read

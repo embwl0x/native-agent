@@ -167,6 +167,13 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     public var mode: CognitiveCapsuleMode
     public var maximumCharacters: Int?
     public var organismProjection: OrganismProjection?
+    /// Item 5 (2026-09-02) — the nearest open horizon, when the caller has one.
+    /// Payload-free by construction (`OrganismTowardRead` is a label, a sign and
+    /// a date). Carried on the REQUEST rather than folded into the projection
+    /// because it comes from the prediction ledger, which the projection does
+    /// not own; nil everywhere it is not supplied, and then the felt line has
+    /// no forward object — silence, not an invented one.
+    public var toward: OrganismTowardRead?
     /// Trusted local teammate bridges may read the current inner-state
     /// projection without allowing their diagnostic traffic to become felt
     /// experience. Event turn-kind filtering remains independent.
@@ -188,6 +195,7 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         mode: CognitiveCapsuleMode = .inspectOnly,
         maximumCharacters: Int? = nil,
         organismProjection: OrganismProjection? = nil,
+        toward: OrganismTowardRead? = nil,
         allowNonLiveProjection: Bool = false,
         turnKind: CognitiveTurnKind? = nil
     ) {
@@ -198,6 +206,7 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
         self.mode = mode
         self.maximumCharacters = maximumCharacters
         self.organismProjection = organismProjection
+        self.toward = toward
         self.allowNonLiveProjection = allowNonLiveProjection
         self.turnKind = turnKind
     }
@@ -478,7 +487,22 @@ public struct CognitiveStandingView: Sendable, Equatable, Identifiable {
 
     public enum Status: String, Sendable, Equatable, CaseIterable {
         case proposed, active, retired
+        /// HELD (User, 2026-09-02: "she should be able to have some views of her
+        /// own"). A view she adopted herself, from her own live turn — no user
+        /// signature, a weaker lean than `.active`, and retirable by the user
+        /// who never had to sign it. It is deliberately a fourth STATUS rather
+        /// than a flag on `.active`: every existing `status == .active` test in
+        /// the tree — the cap, the lived concerns, the capsule ranking, the
+        /// disposition nudge — then continues to mean "the user signed this",
+        /// and each place that should also honour a held view had to be changed
+        /// on purpose.
+        case held
     }
+
+    /// True for the two statuses that lean her at all. Never symmetric between
+    /// them: a `.held` view is ranked and weighted strictly under a `.active`
+    /// one everywhere both are consulted.
+    public var isLeaning: Bool { status == .active || status == .held }
 
     public init(
         id: UUID,

@@ -209,17 +209,16 @@ struct DeliveryEnvelopeTelemetryTests {
         #expect(await s.consumeDeliveryEnvelopeTelemetry(
             replyCharacters: 100, sessionId: session, at: now.addingTimeInterval(5)) == nil)
 
-        // …and it lands on disk, under logs/, in the STORE's data root.
+        // …and it lands in the in-memory slot, NOT on disk. Sweep item 21
+        // (2026-09-01) retired `logs/delivery_envelope_telemetry.jsonl`: the
+        // envelope is telemetry-only and nothing ever read the file back, so
+        // the feed was write-only disk. The pairing itself is unchanged.
+        #expect(await s.lastDeliveryEnvelopeTelemetryRow == row)
         let path = root.appendingPathComponent("logs/delivery_envelope_telemetry.jsonl")
-        var landed = false
-        for _ in 0..<100 where !landed {
-            if FileManager.default.fileExists(atPath: path.path) { landed = true; break }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        #expect(landed)
-        let text = try String(contentsOf: path, encoding: .utf8)
-        #expect(text.contains("delivery_envelope_telemetry.v1"))
-        #expect(text.contains("\"replyCharacters\""))
+        // Generous window: the retired writer was DETACHED, so an accidental
+        // resurrection would land a little after the call returns.
+        try await Task.sleep(nanoseconds: 250_000_000)
+        #expect(!FileManager.default.fileExists(atPath: path.path))
     }
 
     /// THE PRODUCTION WIRING PIN (2026-08-11). The first cut stashed on
@@ -268,19 +267,15 @@ struct DeliveryEnvelopeTelemetryTests {
             ]
         ))
 
-        let path = root.appendingPathComponent("logs/delivery_envelope_telemetry.jsonl")
-        var text = ""
-        for _ in 0..<100 {
-            text = (try? String(contentsOf: path, encoding: .utf8)) ?? ""
-            if text.contains("\"replyCharacters\"") { break }
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        let row = try #require(text.split(separator: "\n").last)
-        guard case .object(let fields) = try JSONValue.parse(Data(row.utf8)) else {
+        let row = try #require(await s.lastDeliveryEnvelopeTelemetryRow)
+        guard case .object(let fields) = row else {
             Issue.record("telemetry row is not an object")
             return
         }
         #expect(fields["replyCharacters"] == .int(640))
+        // The retired feed must stay retired on the INGEST path too.
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("logs/delivery_envelope_telemetry.jsonl").path))
     }
 
     /// A completion from a different session is not the reply this envelope was
@@ -301,15 +296,45 @@ struct DeliveryEnvelopeTelemetryTests {
             replyCharacters: 100, sessionId: "a", at: stale) == nil)
     }
 
-    /// HERMETICITY. A substrate with no store has no telemetry path, so no test
-    /// and no store-less runtime can leak a row into the live app's data root.
-    @Test("a store-less substrate has no telemetry path at all")
-    func storeLessSubstrateWritesNothing() async {
+    /// HERMETICITY, now by construction rather than by careful path derivation:
+    /// after sweep item 21 there is no telemetry writer at all, so neither a
+    /// store-backed nor a store-less substrate can leak a row into any data
+    /// root. Pinned as source fact, because "no writer" is exactly the kind of
+    /// absence a green build never mentions.
+    @Test("no substrate writes a delivery-envelope feed anywhere")
+    func noSubstrateWritesATelemetryFeed() async throws {
         let s = CognitiveSubstrate(
             configuration: config(),
             dependencies: CognitiveSubstrateDependencies(now: { self.now }))
-        #expect(await s.deliveryEnvelopeTelemetryPath == nil)
-        #expect(await s.storeDataRoot == nil)
+        await s.stashDeliveryEnvelope(
+            signals: signals(),
+            request: CognitiveCapsuleRequest(
+                surface: "chat", userMessage: "hey", sessionId: "s", mode: .inspectOnly),
+            at: now)
+        _ = await s.consumeDeliveryEnvelopeTelemetry(
+            replyCharacters: 100, sessionId: "s", at: now.addingTimeInterval(1))
+
+        // CODE only — the retirement is documented in a comment that necessarily
+        // names the retired path, and a raw substring scan would flag its own
+        // gravestone. A resurrected writer is code, not prose.
+        let organ = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent().deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent(
+                    "Sources/CognitiveSubstrate/CognitiveSubstrate+DeliveryEnvelope.swift"),
+            encoding: .utf8)
+        let code = organ
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        for writerShape in [
+            "appendJSONL", "appendJSONLCapped", "SwiftNativePersistenceCore",
+            "deliveryEnvelopeTelemetryPath", "delivery_envelope_telemetry.jsonl",
+            "logs",
+        ] {
+            #expect(!code.contains(writerShape), "telemetry writer resurrected: \(writerShape)")
+        }
     }
 
     // MARK: - ZERO EFFECT (the staged-ship contract)

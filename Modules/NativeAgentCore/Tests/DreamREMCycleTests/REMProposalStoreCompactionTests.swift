@@ -17,6 +17,20 @@ private func compactionTempRoot() -> URL {
     return root
 }
 
+/// 2026-09-06: 4c631d6d made pin emission reconcile approved rows against the
+/// live document, and 51f1dc75 made an absent document retire every pin.
+/// `PersistenceCore.defaultPersonaRoot(dataRoot:)` resolves that document at
+/// `<dataRoot>/persona` once a SOUL.md marks it a real persona root.
+private func seedPersonaGrowth(_ dataRoot: URL, lessons: [String]) throws {
+    let persona = dataRoot.appendingPathComponent("persona", isDirectory: true)
+    try FileManager.default.createDirectory(at: persona, withIntermediateDirectories: true)
+    try "# SOUL\n".write(
+        to: persona.appendingPathComponent("SOUL.md"), atomically: true, encoding: .utf8)
+    let body = "# GROWTH.md\n\n" + lessons.map { $0 + "\n" }.joined(separator: "\n")
+    try body.write(
+        to: persona.appendingPathComponent("GROWTH.md"), atomically: true, encoding: .utf8)
+}
+
 private func prop(_ i: Int) -> REMProposal {
     REMProposal(
         id: "p\(i)",
@@ -37,6 +51,9 @@ private func feedLineCount(_ root: URL) -> Int {
 @Test func compactionFoldsTerminalRowsIntoBaseAndPreservesThem() async throws {
     let root = compactionTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    // Both approved lessons are live entries in GROWTH.md, so their pins are
+    // eligible; the denied one never reaches pin building at all.
+    try seedPersonaGrowth(root, lessons: ["reflex 0", "reflex 1", "reflex 2"])
     let store = REMProposalStore(dataRoot: root, compactionThreshold: 6, keepTail: 2)
 
     _ = try await store.appendPending((0..<8).map(prop))

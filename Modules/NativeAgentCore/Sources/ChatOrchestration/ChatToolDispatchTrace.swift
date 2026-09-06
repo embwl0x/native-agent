@@ -116,6 +116,39 @@ public enum ChatToolOutcome {
         return .unknown
     }
 
+    /// User, 2026-09-06: a slot the Stop reached NEVER RAN. Its envelope is
+    /// synthetic (`SwiftNativeTurnEngine.cancelledToolResult`) and carries an
+    /// `error` string only so the model reads a reason — it is not evidence of
+    /// an effect, and not evidence of a failure. Every counter that grades a
+    /// turn asks this before it grades a record.
+    public static func wasCancelled(_ output: JSONValue) -> Bool {
+        exactResultClass(output) == .cancelled
+    }
+
+    /// User, 2026-09-06: a tool that filed an approval and returned
+    /// `waiting_approval` DID NOT RUN. The row is honest as it stands — it is
+    /// not a failure — but it is not PROGRESS either, and counting it as one let
+    /// a model that kept re-asking for the same CONFIRM renew the whole-turn
+    /// budget on every round and run the turn out at the iteration cap.
+    public static func isWaitingApproval(_ output: JSONValue) -> Bool {
+        guard case .object(let object) = output,
+              case .string(let raw)? = object["status"] else { return false }
+        let status = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return status == "waiting_approval"
+            || status == "awaiting_approval"
+            || status == "pending_approval"
+    }
+
+    /// User, 2026-09-06: a cancelled envelope whose dispatch HAD STARTED
+    /// (`SwiftNativeTurnEngine.interruptedToolResult`). Still not a failure, but
+    /// the tool may have written before it unwound, so retry safety counts it
+    /// as an effect while the failure counters keep skipping it.
+    public static func effectsUnknown(_ output: JSONValue) -> Bool {
+        guard case .object(let object) = output,
+              case .bool(true)? = object["effects_unknown"] else { return false }
+        return true
+    }
+
     /// Generic chat-tool completion must not duplicate an existing motor
     /// owner's consequence. Those domains publish from their canonical read
     /// models; their immediate tool envelope is transport evidence only.
@@ -145,13 +178,18 @@ public enum ChatToolOutcome {
                 return .unknown
             }
             switch resultClass {
-            case .failed, .cancelled, .timeout: return .failed
-            case .succeeded, .unknown: return .unknown
+            case .failed, .timeout: return .failed
+            case .cancelled, .succeeded, .unknown: return .unknown
             }
         }
         switch resultClass {
         case .succeeded: return .succeeded
-        case .failed, .cancelled, .timeout: return .failed
+        case .failed, .timeout: return .failed
+        // User, 2026-09-06: a Stop is not the tool failing. A cancelled slot
+        // never reached its implementation, so it is no evidence either way —
+        // grading it as a failure manufactured a low-confidence tool reflex out
+        // of the user pressing stop.
+        case .cancelled: return .unknown
         case .unknown: return .unknown
         }
     }

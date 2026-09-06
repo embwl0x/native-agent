@@ -95,11 +95,29 @@ extension BackgroundLoopsAssembly {
                 return !yolo.admitted
             },
             stageProposal: { proposal in
+                // SKIP-IF-PRESENT (2026-09-06). A sweep that failed partway
+                // rolls its weekly marker back, so the next tick re-runs the
+                // whole pass — and every proposal that HAD staged got a second
+                // card under a fresh UUID. The finding's own content digest
+                // rides in the payload and is checked against the pending
+                // queue first. Only PENDING rows suppress: a finding the user
+                // already approved or denied is free to return in a later week.
+                let findingId = proposal.findingId
+                if let existing = try? await inbox.list(
+                    filter: ApprovalFilter(status: "pending", action: "self_improvement.apply")
+                ), existing.contains(where: { record in
+                    guard case .object(let payload) = record.payload,
+                          case .string(let staged)? = payload["findingId"] else { return false }
+                    return staged == findingId
+                }) {
+                    return
+                }
                 let body: JSONValue = .object([
                     "title": .string(proposal.title),
                     "action": .string("self_improvement.apply"),
                     "payload": .object([
                         "kind": .string("self_improvement"),
+                        "findingId": .string(findingId),
                         "evidence": .string(proposal.evidence),
                         "proposedChange": .string(proposal.proposedChange),
                         "apply": .object([
@@ -136,12 +154,34 @@ extension BackgroundLoopsAssembly {
             // stageEvolutionApprovals.
             fileCodeFinding: { finding in
                 let store = EvolutionProposalStore(dataRoot: dataRoot)
+                let evidence = finding.evidence
+                    + "\n\nproposed change: " + finding.proposedChange
+                // Same skip-if-present as the approvals stager above
+                // (2026-09-06): a retried sweep re-files every code finding it
+                // already filed. Live rows only — a terminal proposal
+                // (verified/reverted/denied) is settled and must not block the
+                // finding from returning.
+                //
+                // Second pass, same day: this matched on the title plus the
+                // EVIDENCE TEXT, and the evidence carries the week's
+                // timestamps — so no two passes ever agreed and the guard never
+                // fired. It keys on the finding's own content digest now, the
+                // one the approvals stager uses, which is computed over the
+                // fields with dates normalised out.
+                let findingId = finding.findingId
+                if let existing = try? await store.list(),
+                   existing.contains(where: {
+                       $0.source == .weekly && !$0.status.isTerminal
+                           && $0.findingId == findingId
+                   }) {
+                    return
+                }
                 do {
                     _ = try await store.propose(
                         source: .weekly,
                         title: finding.title,
-                        evidence: finding.evidence
-                            + "\n\nproposed change: " + finding.proposedChange)
+                        evidence: evidence,
+                        findingId: findingId)
                 } catch {
                     // FIX 3 (A4.5): rethrow — a swallowed propose() dropped the
                     // code finding silently while the pass reported success.
@@ -250,8 +290,13 @@ extension BackgroundLoopsAssembly {
                 + "(over the \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget).")
         }
         for offender in report.largeDirectories.prefix(10) {
+            // A residue store is listed at ANY size and is not a "large branch"
+            // finding at all — it is a directory that must not be here. Say
+            // which one it is, or the card reads as ordinary growth.
+            let residue = DataRootDiskHygiene.isResidue(relativePath: offender.relativePath)
+                ? " — residue: this store should not be here" : ""
             lines.append("▸ \(offender.relativePath)/ — "
-                + "\(DataRootDiskHygiene.humanSize(offender.sizeBytes)) across the whole branch")
+                + "\(DataRootDiskHygiene.humanSize(offender.sizeBytes)) across the whole branch\(residue)")
         }
         for offender in report.largeFiles.prefix(20) {
             lines.append("• \(offender.relativePath) — \(DataRootDiskHygiene.humanSize(offender.sizeBytes))")
@@ -536,29 +581,12 @@ private struct TurnTraceRetentionRunner: LoopRunner {
             let backupReport = await ChatCompactionBackupRetention.enforce(dataRoot: dataRoot)
             let legacyContextReport = await SwiftNativeContextClient(dataRoot: dataRoot)
                 .pruneLegacyReceipts(at: now)
-            try await MaintenanceSweepFeed.append(
-                traceReport: traceReport,
-                lockReport: lockReport,
-                dataRoot: dataRoot,
-                completedAt: now
-            )
-            try await MaintenanceSweepFeed.appendCompactionBackupRetention(
-                removedArtifactPaths: backupReport.removedArtifactPaths,
-                sessionsScanned: backupReport.sessionsScanned,
-                failures: backupReport.failures,
-                truncated: backupReport.truncated,
-                dataRoot: dataRoot,
-                completedAt: now
-            )
-            try await MaintenanceSweepFeed.appendLegacyContextReceiptRetention(
-                removedArtifactPaths: legacyContextReport.removedArtifactPaths,
-                discovered: legacyContextReport.discovered,
-                protected: legacyContextReport.protected,
-                failedRemovals: legacyContextReport.failedRemovals,
-                unavailable: legacyContextReport.unavailable,
-                dataRoot: dataRoot,
-                completedAt: now
-            )
+            // 2026-09-01 (User): this pass no longer writes
+            // `data/logs/maintenance_sweep.jsonl`. It had accumulated 2,921 rows
+            // / 613 KB with no production reader — only an eval instrument and
+            // its own test. The sweep itself is unchanged; what it removed is
+            // still reported through the NSLog lines and the tick outcome below,
+            // which is what anyone actually reads.
             if traceReport.removedDays > 0 || traceReport.removedLocks > 0 {
                 NSLog("turn_trace_retention: removed %d day file(s) and %d lock(s), kept %d day(s)",
                       traceReport.removedDays, traceReport.removedLocks, traceReport.keptDays)
@@ -590,7 +618,17 @@ private struct TurnTraceRetentionRunner: LoopRunner {
             let legacyContext = legacyContextReport.removed > 0
                 ? "; removed \(legacyContextReport.removed) legacy context receipt(s)"
                 : ""
-            return .completed(result: "maintenance retention completed\(bounded)\(backupBounded)\(legacyContext)")
+            // A sweep that removed nothing and deferred nothing did no work.
+            // Reporting it `.completed` every hour kept the dormancy clock
+            // fresh regardless of whether retention was actually running.
+            let swept = traceReport.removedDays + traceReport.removedLocks
+                + lockReport.reaped + backupReport.removed + legacyContextReport.removed
+            guard swept > 0 else {
+                return .skipped(reason: "nothing past any retention cutoff\(bounded)")
+            }
+            return .completed(
+                result: "maintenance retention removed \(swept) artifact(s)"
+                    + "\(bounded)\(backupBounded)\(legacyContext)")
         } catch {
             NSLog("turn_trace_retention: sweep failed: %@", String(describing: error))
             return .failed(error: String(describing: error))

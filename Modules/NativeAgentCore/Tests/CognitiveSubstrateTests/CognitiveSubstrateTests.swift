@@ -1102,7 +1102,12 @@ private func event(
     // asserting" voice cue) are gone (2026-07-08) — replaced by the single felt
     // fingerprint under the header. The Inner: line (from the reflection-takeaway
     // thought seed) is unaffected and remains the meaningful check here.
-    #expect(capsule.combined.contains("How you feel:"))
+    // THE HEADER IS A PROMISE THAT FEELING WORDS FOLLOW (`capsuleStableKernel`).
+    // Nothing here is felt strongly enough for the fingerprint to speak, so the
+    // first dynamic line is the labelled `- Inner:` reflection — and a standing
+    // view read positionally under "How you feel:" IS her stated feeling, which
+    // is why the kernel is deliberately omitted rather than left hanging.
+    #expect(!capsule.combined.contains("How you feel:"))
     #expect(capsule.combined.contains("Inner: warm, connected, low-tension."))
     // Commitments no longer surface in the subconscious capsule (that's the Desk's role).
     #expect(!capsule.combined.contains("Follow through:"))

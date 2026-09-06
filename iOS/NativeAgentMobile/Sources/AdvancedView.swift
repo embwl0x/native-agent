@@ -8,6 +8,10 @@
 // PATCH-2026-06-07: mac-integration-tab-ios — Mac Integration row added to
 // the Manage section so the user can flip per-integration READ/WRITE toggles from
 // his iPhone. Backed by NSUbiquitousKeyValueStore mirror of the Mac side.
+// 2026-09-01 sweep item 20/36: WorkshopView shipped with no call site at all,
+// so directed work could not be handed over from the phone even though the
+// signed submit/approve/reject path was already wired. Mounted here — the
+// launch-argument and notification routers already send "workshop" to More.
 import SwiftUI
 import NativeAgentShared
 
@@ -80,6 +84,11 @@ struct AdvancedView: View {
 
                 // ── Manage — everything the Mac sidebar promotes to primary ──
                 Section {
+                    NavigationLink {
+                        WorkshopView(embedInNavigationStack: false)
+                    } label: {
+                        Label("Workshop", systemImage: "hammer")
+                    }
                     NavigationLink {
                         SkillsToolsView(embedInNavigationStack: false)
                     } label: {

@@ -39,24 +39,9 @@ struct NativeActionRootIsolationTests {
         }
     }
 
-    @Test func workflowNativeActionOuterReceiptUsesTheSameRootAsItsWorkflow() async throws {
-        let root = try temporaryRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let directory = root.appendingPathComponent("workflows")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try Data("""
-        [{"id":"selected-root","name":"Selected root","status":"active","engineVersion":"2","steps":[{"id":"trace","title":"Trace","kind":"trace"}]}]
-        """.utf8).write(to: directory.appendingPathComponent("registry.json"))
-        let client = NativeClient(baseURL: "", dataRootOverride: root)
-        let receipt = try await client.runNativeAction(
-            id: "workflow.launch", dryRun: true, input: ["workflowId": "selected-root"]
-        )
-        #expect(receipt.status == "dry_run")
-        #expect(try await client.getNativeActionReceipts().map(\.id) == [receipt.id])
-        let runs = try jsonRows(directory.appendingPathComponent("runs.jsonl"))
-        #expect(runs.count == 1)
-        #expect(runs[0]["mode"] as? String == "dry_run")
-    }
+    // 2026-09-01: the `workflow.launch` root-isolation test went with the
+    // workflow run engine (User authorized). Root isolation for the remaining
+    // native actions is still covered by the cases around it.
 
     @Test func explicitRootOverridesReadContextWithoutChangingOrdinaryDefaults() throws {
         let root = try temporaryRoot()

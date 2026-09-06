@@ -4,6 +4,7 @@
 // InboxWatcher: NSMetadataQuery on `inbox/`. When iOS drops an action JSON, dispatch to
 //   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
 
+import ChatOrchestration
 import CommonCrypto
 import CryptoKit
 import AppKit
@@ -131,6 +132,10 @@ extension MacSyncEngine {
             chatTurnCompletedNotificationCenter.removeObserver(chatTurnCompletedObserver)
             self.chatTurnCompletedObserver = nil
         }
+        if let chatTranscriptDidChangeObserver {
+            chatTurnCompletedNotificationCenter.removeObserver(chatTranscriptDidChangeObserver)
+            self.chatTranscriptDidChangeObserver = nil
+        }
         chatTranscriptSnapshotPublicationTask?.cancel()
         chatTranscriptSnapshotPublicationTask = nil
         chatSnapshotCoalescer.reset()
@@ -223,6 +228,22 @@ extension MacSyncEngine {
         }
         chatTurnCompletedObserver = chatTurnCompletedNotificationCenter.addObserver(
             forName: .chatTurnCompleted,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.requestChatSnapshotPublication(includeTranscripts: true)
+            }
+        }
+        // 2026-09-06: the same edge for a transcript rewritten outside a turn
+        // (the compaction distiller's swap). It bumps the session's transcript
+        // version, so without a publication the phone keeps the mechanical
+        // summary and every later publish looks no newer than what it holds.
+        if let chatTranscriptDidChangeObserver {
+            chatTurnCompletedNotificationCenter.removeObserver(chatTranscriptDidChangeObserver)
+        }
+        chatTranscriptDidChangeObserver = chatTurnCompletedNotificationCenter.addObserver(
+            forName: .nativeAgentChatTranscriptDidChange,
             object: nil,
             queue: .main
         ) { [weak self] _ in

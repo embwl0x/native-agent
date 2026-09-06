@@ -350,6 +350,26 @@ struct TelegramApprovalFilerTests {
         #expect(transcript.count == 1)
     }
 
+    // 2026-09-06: LEFT FAILING ON PURPOSE — this is a production regression,
+    // not a stale pin, so nothing here is moved. 2cb58a71 ("Every replay
+    // exemption is verified against the approval inbox, and burned") added
+    // ApprovalInboxApprovedReplayVerifier, whose first rule is
+    // "an executed record is a finished record": any non-null `executedAction`
+    // returns `.alreadyConsumed`
+    // (InjectionApprovalVerifier.swift ApprovalInboxApprovedReplayVerifier
+    // .verifyApprovedReplay). The one sanctioned heal added by 34b3ae5c
+    // ("Repair approved persona tool replay") is the exact opposite case:
+    // `chatToolApprovalReplayNeedsExecution`
+    // (NativeClient+ApprovalExecutors.swift:806) re-runs a persona_write /
+    // persona_append_section record PRECISELY BECAUSE it carries a failed
+    // `executedAction` whose error is the noninteractive-surface no-filer
+    // denial. 2cb58a71 did not touch that predicate, so the reconciler still
+    // logs "reconciling eligible ..." and the dispatch is then denied with
+    // `approved_replay_evidence_unverified: approval_already_consumed`;
+    // the persona note is never filed. Fixing it means changing production
+    // (either the verifier admits the executor's own re-run of a FAILED
+    // execution, or the heal path clears/supersedes the failed annotation
+    // before re-dispatch), which is out of this reconciliation's scope.
     @Test func reconcileApprovedPersonaReplay_recoversPriorDoubleApprovalFailureExactlyOnce() async throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

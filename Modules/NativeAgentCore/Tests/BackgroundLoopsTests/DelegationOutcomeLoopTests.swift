@@ -373,10 +373,14 @@ struct DelegationOutcomeLoopTests {
 
         let failingLoop = makeLoop(cursor: path, jobs: { [job] }, recorder: failing)
         let outcome = await failingLoop.tickOutcome()
-        guard case .completed(let result) = outcome else {
-            Issue.record("expected completed, got \(outcome)"); return
+        // 2026-09-06 (bdaf05fc): a settlement that did not land is a FAILED
+        // run, not a completed one with a footnote — reporting `.completed`
+        // kept the loop's own health surface green while delegated outcomes
+        // went nowhere. The retry contract below is unchanged.
+        guard case .failed(let result) = outcome else {
+            Issue.record("expected failed, got \(outcome)"); return
         }
-        #expect(result?.contains("will retry") == true)
+        #expect(result.contains("will retry"))
         #expect(failing.cards.isEmpty)
         let cursor = try #require(DelegationOutcomeCursor.load(from: path))
         #expect(cursor.store("claude").cardedIDs.isEmpty)
@@ -460,10 +464,13 @@ struct DelegationOutcomeLoopTests {
             topicSlug: "t", state: "running")
         let loop = makeLoop(cursor: path, jobs: { [running] }, recorder: recorder)
         let outcome = await loop.tickOutcome()
-        guard case .completed(let result) = outcome else {
-            Issue.record("expected completed, got \(outcome)"); return
+        // FIX 4: a tick that filed no card and moved no cursor is `.skipped`,
+        // not `.completed` — it did no work and must not advance the dormancy
+        // clock.
+        guard case .skipped(let reason, _) = outcome else {
+            Issue.record("expected skipped, got \(outcome)"); return
         }
-        #expect(result?.contains("no newly-terminal or stuck") == true)
+        #expect(reason.contains("no newly-terminal or stuck"))
         #expect(recorder.cards.isEmpty)
     }
 
@@ -703,6 +710,9 @@ struct DelegationOutcomeLoopTests {
         #expect(card.detail.contains("mac-chat-658-16"))
         #expect(!card.detail.contains("in-flight"))
         #expect(card.detail.contains("NOTHING re-delivers"))
+        #expect(card.detail.contains("Acknowledge archives only this card"))
+        #expect(card.detail.contains("NEW handoff"))
+        #expect(card.detail.contains("detail=full"))
         // Oldest first in the listing.
         let oldIdx = try #require(card.detail.range(of: "continuum-583-takeover")?.lowerBound)
         let newIdx = try #require(card.detail.range(of: "mac-chat-658-16")?.lowerBound)
@@ -769,8 +779,12 @@ struct DelegationOutcomeLoopTests {
         cursor.record(source: "codex", id: "p1", stamp: Self.now.addingTimeInterval(-7_200), outcome: .unknown)
         try cursor.write(to: path)
         let outcome = await makeLoop(cursor: path, jobs: { jobs }, recorder: failing).tickOutcome()
-        guard case .completed(let result) = outcome else { Issue.record("expected completed, got \(outcome)"); return }
-        #expect(result?.contains("backlog card write failed") == true)
+        // 2026-09-06 (bdaf05fc): a failed settlement fails the tick; see
+        // failedInboxWriteIsRetriedOnTheNextTick.
+        guard case .failed(let result) = outcome else {
+            Issue.record("expected failed, got \(outcome)"); return
+        }
+        #expect(result.contains("backlog card write failed"))
         #expect(try #require(DelegationOutcomeCursor.load(from: path)).codexBacklogKey == nil)
         let succeeding = CardRecorder()
         _ = await makeLoop(cursor: path, jobs: { jobs }, recorder: succeeding).tickOutcome()

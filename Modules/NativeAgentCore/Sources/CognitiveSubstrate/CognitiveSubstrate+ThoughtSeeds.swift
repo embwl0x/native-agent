@@ -254,7 +254,13 @@ extension CognitiveSubstrate {
         for victim in victims { thoughtSeeds.removeValue(forKey: victim) }
     }
 
-    private func interruptionScore(
+    /// `internal`, not `private` (2026-09-02): the shoulder-tap lane needs the
+    /// SAME interruption model through a PURE workspace read
+    /// (`CognitiveSubstrate+InnerState.swift`). Widening the access is the whole
+    /// change — reimplementing this scoring next door would let the model that
+    /// decides whether a phone buzzes drift from the model the Observatory
+    /// shows.
+    func interruptionScore(
         for seed: CognitiveThoughtSeed,
         workspaceNodeIds: [UUID],
         affect currentAffect: CognitiveAffectState,
@@ -287,7 +293,10 @@ extension CognitiveSubstrate {
         }
     }
 
-    private func thoughtSuggestionReason(
+    /// `internal` for the same reason as `interruptionScore` above. Its output
+    /// is a CLOSED vocabulary — four kind words and three condition words — and
+    /// the push lane depends on that, so it must be the one producer.
+    func thoughtSuggestionReason(
         for seed: CognitiveThoughtSeed,
         workspaceNodeIds: [UUID],
         affect currentAffect: CognitiveAffectState
@@ -321,6 +330,12 @@ extension CognitiveSubstrate {
 
     func restoreThoughtSeeds(from payloads: [JSONValue]) {
         thoughtSeeds.removeAll(keepingCapacity: true)
+        // A restore is a fresh seed family. The release markers are their own
+        // family and restore AFTER this one (`applyRestoreBundle`), so a
+        // marker that survived in memory must not pre-close a seed the bundle
+        // brought back — otherwise a crash between the two writes reads as
+        // healed when the durable truth is that it itches.
+        ruminationReleasedAt.removeAll()
         for payload in payloads {
             guard case .object(let object) = payload,
                   let id = uuidValue(object["id"]),

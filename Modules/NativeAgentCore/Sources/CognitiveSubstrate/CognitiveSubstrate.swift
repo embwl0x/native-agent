@@ -20,19 +20,40 @@ public struct CognitiveSubstrateDependencies: Sendable {
     /// physics without rebuilding the substrate actor. Defaults to
     /// `.default`, which is byte-for-byte the pre-P1 literals.
     public var dynamics: @Sendable () -> PersonalityDynamicsConfiguration
+    /// UNBIDDEN RECALL (2026-09-02). A LOCAL, provider-free lookup of felt
+    /// moments by the words of the felt line — not by the user's message. The
+    /// substrate never learns what a memory store is: it hands over a felt line
+    /// and gets back moments, or nothing.
+    ///
+    /// THE SURFACE IS NOT OPTIONAL CONTEXT — it is the disclosure boundary. A
+    /// memory restricted to one surface must never arrive unbidden on another,
+    /// and this line is the least expected place for a leak precisely because
+    /// nobody asked for it. The substrate passes the capsule request's own
+    /// surface; the wiring must hand it to the store's disclosure policy rather
+    /// than recalling unfiltered.
+    ///
+    /// Default is silence, and silence is the honest degraded state: a cold or
+    /// unavailable memory store simply means she is not reminded of anything
+    /// this turn. It must never cost a provider call.
+    public var recallMoments: @Sendable (
+        _ feltLine: String, _ k: Int, _ surface: String
+    ) async -> [CognitiveRecalledMoment]
 
     public init(
         now: @escaping @Sendable () -> Date = { Date() },
         makeUUID: @escaping @Sendable () -> UUID = { UUID() },
         userName: @escaping @Sendable () -> String = { "" },
         attentionProjectionSink: @escaping @Sendable (CognitiveAttentionSignals?, Date) -> Void = { _, _ in },
-        dynamics: @escaping @Sendable () -> PersonalityDynamicsConfiguration = { .default }
+        dynamics: @escaping @Sendable () -> PersonalityDynamicsConfiguration = { .default },
+        recallMoments: @escaping @Sendable (String, Int, String) async -> [CognitiveRecalledMoment]
+            = { _, _, _ in [] }
     ) {
         self.now = now
         self.makeUUID = makeUUID
         self.userName = userName
         self.attentionProjectionSink = attentionProjectionSink
         self.dynamics = dynamics
+        self.recallMoments = recallMoments
     }
 
     public static let live = CognitiveSubstrateDependencies()
@@ -67,13 +88,21 @@ public actor CognitiveSubstrate {
     var field = ContinuityField()
     var thoughtSeeds: [UUID: CognitiveThoughtSeed] = [:]
     var thoughtSeedRevision: UInt64 = 0
-    private var episodes: [UUID: CognitiveEpisodeReference] = [:]
+    /// Item 47: internal rather than private — the developmental recall pull
+    /// (CognitiveSubstrate+DevelopmentalRecall.swift) is a read of these two
+    /// stores from a sibling file in the same module. Still no external writer.
+    var episodes: [UUID: CognitiveEpisodeReference] = [:]
     var schemaProposals: [UUID: CognitiveSchemaProposal] = [:]
     /// Wave E: proposal-shaped standing views. Every view enters `.proposed`; only
     /// `resolveStandingView(approved:)` (User) activates one. Persisted one artifact per view
     /// (kind "standing_view"), restored on boot. See CognitiveSubstrate+StandingViews.swift.
     var standingViews: [UUID: CognitiveStandingView] = [:]
-    private var developmentalTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
+    /// 2026-09-06: the cap repair's artifact deletes used to be swallowed, so a
+    /// store that cannot accept deletes re-demoted the same views on every
+    /// launch in silence. One log line per launch — the repair itself stays
+    /// best-effort, and a line per overflowing view per restore would be noise.
+    var didLogStandingViewCapRepairFailure = false
+    var developmentalTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
     private var replayEvidenceIds: Set<String> = []
     var reflectionReceipts: [UUID: CognitiveReflectionReceipt] = [:]
     /// A planned reflection already owns the next daily budget slot until its
@@ -96,10 +125,53 @@ public actor CognitiveSubstrate {
     /// the ~20h consolidation ticks; persisted inside the disposition artifact
     /// so a same-day restart cannot re-nudge. Pruned to the current day only.
     var resolutionPatternNudgeDay: [String: String] = [:]
+    /// 2026-09-06 — which NIGHT's dream tone is already baked into the
+    /// disposition above (same key the residue is claimed under). Recorded in
+    /// the SAME artifact write as the value it describes, so a retry of a
+    /// partially failed dream integration cannot nudge her twice for one night.
+    var dreamDispositionNight: String?
     // Extensions implementing read projections must consult the same
     // actor-isolated intervention map; it remains module-internal rather than
     // becoming a second public configuration surface.
     var ablations: [String: Bool] = [:]
+
+    // MARK: - Personality depth wave, items 6 and 7 (2026-09-02)
+    // Four in-memory ledgers. NONE of them persists, on purpose:
+    //   • a released nag re-derives from the seed's own age after a restart, and
+    //     the seed is gone, so there is nothing to re-derive;
+    //   • a re-feel budget that survives a restart would be a second clock to
+    //     keep honest for no gain — the worst case is one extra small nudge;
+    //   • the night's residue is by definition about the turns right after
+    //     waking, and a restart is a different waking.
+    // Each is bounded by its own owner (see `+Rumination`, `+Affect`, `+Mood`).
+
+    /// Item 6 — seeds whose weight has been cleared, and when. Pruned past
+    /// `ruminationReleaseMemory`.
+    var ruminationReleasedAt: [UUID: Date] = [:]
+    /// Item 6 — relief felt-moments staged for the runtime's drain, capped
+    /// drop-oldest (`pendingRuminationReleaseCap`).
+    var pendingRuminationReleases: [CognitiveEvent] = []
+    /// Item 7 — the night's residue: a mood with no source, spent over the
+    /// first accepted turns after waking. Persisted (family `dream_residue`)
+    /// alongside its claim key so a restart neither loses nor re-mints it.
+    var dreamResidue: CognitiveDreamResidue?
+    /// Item 7 — which night the current residue belongs to (the committed
+    /// dream's id, else the local calendar day). One night, one residue.
+    var dreamResidueClaimKey: String?
+    /// Item 6 (2026-09-02) — open things an EXTERNAL owner holds (Desk items
+    /// she opened), pushed by the owner-side reader. In-memory: canonical Desk
+    /// state is the durable copy, and re-reading it is one file away.
+    var externalRuminations: [String: CognitiveExternalRumination] = [:]
+    /// When that set was last read, so a turn can ask "is it stale" without
+    /// touching disk.
+    var externalRuminationsRefreshedAt: Date?
+    /// Item 7 — when each felt node was last RE-FELT through recall. One nudge
+    /// per node per hour; pruned by the same owner.
+    var lastRefeltAt: [UUID: Date] = [:]
+    /// Per-RECORD re-feel refractory beside the per-node one: every recall turn
+    /// mints a fresh node naming the same record.
+    var lastRefeltRecordAt: [String: Date] = [:]
+
     var dirtySince: Date?
     var dirtyRevision: UInt64 = 0
     /// Defense-in-depth single-flight at the state owner. Core normally
@@ -263,6 +335,29 @@ public actor CognitiveSubstrate {
     }
     var pendingCompletion: PendingCompletion?
 
+    /// Item 46, review fix (1). `reconsolidatePendingCompletion` CONSUMES the
+    /// slot during ingest, and the runtime asks for semantic metadata AFTER
+    /// ingest — so by the time `semanticReactionLabel(for:)` runs the evidence
+    /// it needs is already gone, every user reply came back unlabelled, and
+    /// every expectation expired instead of resolving. The consume site now
+    /// stashes what it read, and the metadata derivation reads the stash.
+    ///
+    /// One slot, same discipline as `pendingCompletion` itself: memory-only,
+    /// single-use (cleared on read), session-scoped, and expired by the same
+    /// `pendingCompletionMaxAge` so a stash can never answer a later turn.
+    struct SemanticReactionStash: Sendable, Equatable {
+        /// Session the completion and its reaction share.
+        var sessionID: String
+        /// The completion turn this reaction answers — `PendingCompletion.nodeKey`,
+        /// which ChatOrchestration mints per turn. An opaque `type:id` key; no
+        /// content.
+        var turnID: String
+        /// `pushback` / `confirmed` / `neutral`.
+        var reaction: String
+        var recordedAt: Date
+    }
+    var lastSemanticReaction: SemanticReactionStash?
+
     /// How long a completion stays open to being re-felt. Past this the next
     /// message is a new beginning, not a verdict on the last thing she said.
     static let pendingCompletionMaxAge: TimeInterval = 10 * 60
@@ -285,6 +380,39 @@ public actor CognitiveSubstrate {
     var negativeSoundEchoRun = 0
     var settlingRun = 0
 
+    /// 2026-09-01 — the rut nudge's change-driven cadence, and the inner line's
+    /// per-text cadence ledger. Both are PRESENTATION state in exactly the sense
+    /// the fingerprint run already is: memory-only, live-path only, advanced by
+    /// `applyCapsulePresentationCommit` after the provider accepts the turn.
+    var soundRutSignature: String?
+    var soundRutLastSurfacedAt: Date?
+    var soundRutTurnsSinceSurfaced = 0
+    /// Bounded like every other counted family: once it is past any gate it
+    /// could satisfy, a larger number carries no more meaning.
+    static let soundRutTurnCounterCap = 10_000
+    var innerLineRuns: [String: Int] = [:]
+    /// Presentation receipts for the felt line's object + ambivalence organs
+    /// (2026-09-02). Counters only — see `CognitiveCapsulePresentationState`.
+    var feltObjectCount = 0
+    var ambivalenceCount = 0
+    var lastAmbivalenceAt: Date?
+    /// REMINDED-OF (2026-09-02) — presentation cadence for the unbidden-recall
+    /// line, and the id-only ledger of what it has already surfaced. Same shape
+    /// and same lifetime as the rut nudge's: memory-only, live-path only, and
+    /// advanced by `applyCapsulePresentationCommit` except for the turn counter,
+    /// which free-runs on the accepted-turn tick below.
+    var remindedOfLastSurfacedAt: Date?
+    var remindedOfTurnsSinceSurfaced = 0
+    var remindedOfSurfaced: [String: Date] = [:]
+    /// The felt weight of MOMENTS this turn's recall actually saw, keyed by
+    /// memory record id. This is what lets a served moment be RE-FELT with its
+    /// own valence instead of neutrally: a MemoryV2 record carries a feeling the
+    /// field may have no node for. Bounded, memory-only (see `+RemindedOf`).
+    var momentAffect: [String: MomentAffect] = [:]
+    /// Set when an accepted turn moved the durable cadence ledger; cleared by
+    /// `flushCapsulePresentationIfNeeded`.
+    var capsulePresentationDirty = false
+
     /// W7/P6 — TELEMETRY ONLY. The delivery envelope the mechanism WOULD have
     /// chosen for this turn, stashed at live capsule compile (the one place the
     /// real felt signals and the real user-turn size are both in hand) and paired
@@ -295,16 +423,16 @@ public actor CognitiveSubstrate {
     /// `clear()` — the same lifecycle discipline as `pendingCompletion`.
     var pendingDeliveryEnvelope: PendingDeliveryEnvelope?
 
-    /// The data root this substrate's store lives under, or nil when there is no
-    /// store. `store.databaseURL` is `<dataRoot>/cognition/cognition.sqlite`, so
-    /// the root is two levels up. Deriving it here rather than defaulting to
-    /// `PersistenceCore.defaultDataRoot()` is what keeps every W7 telemetry write
-    /// hermetic: a store-less test substrate simply has nowhere to write.
-    var storeDataRoot: URL? {
-        store?.databaseURL
-            .deletingLastPathComponent()   // …/cognition/
-            .deletingLastPathComponent()   // …/<dataRoot>/
-    }
+    /// The last pairing row `consumeDeliveryEnvelopeTelemetry` produced, held
+    /// IN MEMORY ONLY.
+    ///
+    /// Sweep item 21 (2026-09-01): the `logs/delivery_envelope_telemetry.jsonl`
+    /// append is retired — nothing read the file, so it was write-only disk —
+    /// and `storeDataRoot`, which existed solely to give that append a hermetic
+    /// path, went with it. This slot keeps the pairing observable in-process
+    /// without a durable feed nobody consumes. Single slot, overwritten per
+    /// paired completion, dropped on `clear()`.
+    var lastDeliveryEnvelopeTelemetryRow: JSONValue?
 
     /// W7/P10 — the bounded landing verdict for one exemplar node, 0 when the
     /// node has never been reacted to.
@@ -326,7 +454,17 @@ public actor CognitiveSubstrate {
             lastLiveCapsuleAt: lastLiveCapsuleAt,
             lastSessionBridgeAt: lastSessionBridgeAt,
             negativeSoundEchoRun: negativeSoundEchoRun,
-            settlingRun: settlingRun
+            settlingRun: settlingRun,
+            soundRutSignature: soundRutSignature,
+            soundRutLastSurfacedAt: soundRutLastSurfacedAt,
+            soundRutTurnsSinceSurfaced: soundRutTurnsSinceSurfaced,
+            innerLineRuns: innerLineRuns,
+            feltObjectCount: feltObjectCount,
+            ambivalenceCount: ambivalenceCount,
+            lastAmbivalenceAt: lastAmbivalenceAt,
+            remindedOfLastSurfacedAt: remindedOfLastSurfacedAt,
+            remindedOfTurnsSinceSurfaced: remindedOfTurnsSinceSurfaced,
+            remindedOfSurfaced: remindedOfSurfaced
         )
     }
 
@@ -490,14 +628,30 @@ public actor CognitiveSubstrate {
         // rescanning the same already-loaded text and standing views.
         let buildsAffectBundle = configuration.affectEnabled
             && event.turnKind.contributesToLivedState
-        let userAppraisal = buildsAffectBundle && Self.isUserAuthored(event.kind)
-            ? conversationalAppraisal(in: event.summary)
+        // Item 8 (2026-09-02) — OTHERS MOVE HER. This used to read
+        // `isUserAuthored(event.kind) ? conversationalAppraisal(…) : empty`,
+        // which cannot tell User from a bridge peer: both arrive as
+        // `.userMessageReceived`, so another agent's words moved her at HIS
+        // weight, wearing his subject. `relationalAppraisal` keeps that
+        // behaviour exactly for User (and for her own output, which stays at
+        // zero — Law 3) and lands a peer at half weight with its own subject.
+        // Still the single pure scan per admitted event: it is threaded into
+        // semanticAppraisal, emotionTag, applyAffectFromEvent and
+        // reconsolidatePendingCompletion below, exactly as before.
+        // See CognitiveSubstrate+AppraisalConcerns.swift.
+        let userAppraisal = buildsAffectBundle
+            ? relationalAppraisal(for: event)
             : AffectAppraisal()
         // Semantic relationship stake historically samples this lexical cue
         // for every lived event, while affect consumes it only for user turns.
         // Compute it once without changing either caller's gating.
+        // Item 8: the same relational weight applies — warmth from a peer is
+        // real warmth, at half the reach of his.
         let turnWarmthBoost = (buildsAffectBundle || event.kind == .userMessageReceived)
-            ? relationalWarmthBoost(in: event.summary)
+            ? relationalWarmthBoost(
+                for: event,
+                precomputed: relationalWarmthBoost(in: event.summary)
+              )
             : 0
         let evicted = evictSpentVerificationNodes(before: event, at: now)
         let ingestOutcome = field.ingest(
@@ -511,6 +665,24 @@ public actor CognitiveSubstrate {
         }
         markDirty(at: now)
         let contributesToLivedState = event.turnKind.contributesToLivedState
+        // THE ACCEPTED-TURN TICK for the Sound nudge's cadence (2026-09-01).
+        // It used to advance inside the capsule render and stick only through
+        // `applyCapsulePresentationCommit` — so a turn whose capsule came back
+        // EMPTY (`prepareFrozenCapsulePresentation` returns nil, no commit) did
+        // not count, and a stretch of those froze the "20 capsules since it
+        // last spoke" hatch. A completed live assistant turn is the one
+        // accepted-turn boundary the substrate owns by itself, and it happens
+        // whether or not any capsule text was emitted. Free-running on purpose:
+        // it is deliberately excluded from the presentation-commit equality
+        // guard below so an ingest between prepare and commit cannot reject the
+        // whole commit.
+        if contributesToLivedState, event.kind == .assistantTurnCompleted {
+            soundRutTurnsSinceSurfaced = min(soundRutTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
+            // The reminded-of cadence counts the same boundary for the same
+            // reason: it is the one accepted-turn tick the substrate owns.
+            remindedOfTurnsSinceSurfaced = min(
+                remindedOfTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
+        }
         if contributesToLivedState, event.kind == .userMessageReceived {
             lastUserPresenceAt = now
             // Anchor the ambient warmth floor to genuinely warm moments only, so a pure-work
@@ -541,7 +713,12 @@ public actor CognitiveSubstrate {
             // heavy ~10-pass lexicon scan on the identical summary (hot-path dedup).
             // Concerns depend on the post-event affect epoch, so derive them
             // once here after applyAffectFromEvent rather than before it.
-            let standingViewConcerns = standingViews.values.contains { $0.status == .active }
+            // LEANING, not just signed (2026-09-02): this is a hot-path SKIP,
+            // and an empty array here is not "derive them yourself" — it is a
+            // precomputed empty set that matches nothing. With held views but
+            // no active one, the old test silently deleted her own views from
+            // every appraisal.
+            let standingViewConcerns = standingViews.values.contains { $0.isLeaning }
                 ? appraisalConcerns()
                 : []
             let semantic = semanticAppraisal(
@@ -668,15 +845,33 @@ public actor CognitiveSubstrate {
         // a stale claim would suppress a legitimate post-clear nudge until a
         // restart reset the map (review e74d2856bd9b).
         resolutionPatternNudgeDay.removeAll(keepingCapacity: false)
+        dreamDispositionNight = nil
         ablations.removeAll(keepingCapacity: false)
         verificationNodeMayExist = false
         pendingCompletion = nil
+        // Item 46: the reaction stash describes the completion slot above; it
+        // clears with it.
+        lastSemanticReaction = nil
         // W7: the three memory-only slots this wave added clear with the field
         // they describe — a landing verdict, an echo run, or a delivery envelope
         // that survived a wipe would be describing nodes that no longer exist.
         landingScores.removeAll(keepingCapacity: false)
         negativeSoundEchoRun = 0
+        // The rut signature and the inner-line ledger name text that came from
+        // the field being wiped; they clear with it.
+        soundRutSignature = nil
+        soundRutLastSurfacedAt = nil
+        soundRutTurnsSinceSurfaced = 0
+        // The reminded-of ledgers describe memories she was reminded OF while
+        // this field existed; they clear with it.
+        remindedOfLastSurfacedAt = nil
+        remindedOfTurnsSinceSurfaced = 0
+        remindedOfSurfaced.removeAll(keepingCapacity: false)
+        momentAffect.removeAll(keepingCapacity: false)
+        innerLineRuns.removeAll(keepingCapacity: false)
+        capsulePresentationDirty = false
         pendingDeliveryEnvelope = nil
+        lastDeliveryEnvelopeTelemetryRow = nil
         dirtySince = nil
         lastUserPresenceAt = nil
         lastWarmPresenceAt = nil
@@ -788,7 +983,22 @@ public actor CognitiveSubstrate {
     private func restoreArtifactFamilyLoads() -> [CognitiveArtifactFamilyLoad] {
         [
             CognitiveArtifactFamilyLoad(key: "affect", kindPrefix: "affect", limit: 1),
+            CognitiveArtifactFamilyLoad(
+                key: "capsule_presentation",
+                kindPrefix: "capsule_presentation",
+                limit: 1
+            ),
             CognitiveArtifactFamilyLoad(key: "disposition", kindPrefix: "disposition", limit: 1),
+            // Personality depth wave, items 6 and 7 (2026-09-02). Both are
+            // at-most-once claims, so they must outlive a crash: a released nag
+            // must not heal twice, and a committed dream must leave exactly one
+            // residue.
+            CognitiveArtifactFamilyLoad(key: "dream_residue", kindPrefix: "dream_residue", limit: 1),
+            CognitiveArtifactFamilyLoad(
+                key: "rumination_release",
+                kindPrefix: "rumination_release",
+                limit: 64
+            ),
             CognitiveArtifactFamilyLoad(
                 key: "emotional_consolidation",
                 kindPrefix: "emotional_consolidation",
@@ -842,9 +1052,16 @@ public actor CognitiveSubstrate {
         switch family {
         case "affect":
             return dateValue(object["updatedAt"]) != nil
+        case "capsule_presentation":
+            return dateValue(object["updatedAt"]) != nil
         case "disposition":
             return dateValue(object["updatedAt"]) != nil
                 && doubleValue(object["valence"]) != nil
+        case "dream_residue":
+            return dateValue(object["updatedAt"]) != nil
+        case "rumination_release":
+            return uuidValue(object["seedId"]) != nil
+                && dateValue(object["releasedAt"]) != nil
         case "emotional_consolidation":
             return dateValue(object["ranAt"]) != nil
         case "thought_seed":
@@ -919,9 +1136,14 @@ public actor CognitiveSubstrate {
         )
         verificationNodeMayExist = bundle.nodes.contains { $0.turnKind == .verification }
         restoreAffect(from: payloads("affect"))
+        restoreCapsulePresentation(from: payloads("capsule_presentation"))
         restoreDisposition(from: payloads("disposition"))
         restoreEmotionalConsolidation(from: payloads("emotional_consolidation"))
         restoreThoughtSeeds(from: payloads("thought_seed"))
+        restoreDreamResidue(from: payloads("dream_residue"))
+        // AFTER the seed family: a release marker drops the seed it released, so
+        // a seed row that outlived its own removal cannot come back and nag.
+        restoreRuminationReleases(from: payloads("rumination_release"))
         restoreEpisodes(from: payloads("episode"))
         restoreSchemaProposals(from: payloads("schema_proposal"))
         let clampedStandingViewIds = restoreStandingViews(from: payloads("standing_view"))
@@ -1034,6 +1256,8 @@ public actor CognitiveSubstrate {
         var stagedSchemas: [UUID: CognitiveSchemaProposal] = [:]
         var stagedTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
         var insertedReplayEvidence: Set<String> = []
+        /// Bounded by the `prefix(8)` on the proposal loop below.
+        var acceptedIdentityBoundaries: [(title: String, summary: String, evidenceNodeIds: [UUID])] = []
 
         do {
 
@@ -1089,6 +1313,21 @@ public actor CognitiveSubstrate {
                 existing.status = status
                 schemaProposals[existingId] = existing
                 stagedSchemas[existing.id] = existing
+                // Item 47 (2026-09-01): `recordEpisode` shipped with no
+                // production caller. This is the episode boundary the system
+                // already HAS — a REM proposal she lived through crossing into
+                // accepted is the moment experience becomes identity
+                // (NORTHSTAR clause 1's episodic→identity spine). No scheduler
+                // invented; the transition already happens right here.
+                // Recorded AFTER the commit below so a failed transaction
+                // cannot leave an episode for an integration that rolled back.
+                if status == .accepted {
+                    acceptedIdentityBoundaries.append((
+                        title: existing.title,
+                        summary: existing.body,
+                        evidenceNodeIds: existing.evidenceNodeIds
+                    ))
+                }
                 writes.append(CognitiveArtifactWrite(
                     kind: "schema_proposal", id: existing.id, status: existing.status.rawValue,
                     score: existing.confidence, payload: existing.toJSON()
@@ -1184,6 +1423,17 @@ public actor CognitiveSubstrate {
         enforceEpisodeCap()
         enforceSchemaProposalCap()
         enforceReplayEvidenceCap()
+        // Item 47: the episode boundaries this integration crossed, recorded
+        // only now that the integration is durable. `recordEpisode` enforces
+        // its own cap and persists its own artifact; a failure there loses an
+        // episode, never the integration.
+        for boundary in acceptedIdentityBoundaries {
+            await recordEpisode(
+                title: "Became mine: \(boundary.title)",
+                summary: boundary.summary,
+                evidenceNodeIds: boundary.evidenceNodeIds
+            )
+        }
         return CognitiveReplayIntegrationResult(
             episodeIds: episodeIds,
             schemaProposalIds: schemaProposalIds,
@@ -1382,7 +1632,9 @@ public actor CognitiveSubstrate {
             currentAffect.socialWarmth
         )
         let budget = max(1, configuration.dailyReflectionCallBudget)
-        let pressure = Double(reflectionReceiptsToday()) / Double(budget)
+        // Read the SAME window the ceiling enforces (rolling 24h), so the
+        // welfare line cannot report a free budget the admission just refused.
+        let pressure = Double(reflectionCallsInCostWindow(at: now)) / Double(budget)
         return CognitiveWelfareBounds(
             withinBounds: maxAffect <= 1 && pressure <= 1,
             maxAffectValue: maxAffect,
@@ -1880,9 +2132,23 @@ public actor CognitiveSubstrate {
     /// artifact — the timeline carries the history — so bounded restores and the global
     /// prune can never crowd out live state with retired rows).
     func deleteArtifactRecord(id: UUID) async {
-        guard configuration.persistenceEnabled, let store else { return }
-        guard !persistenceWritesBlocked else { return }
-        try? await store.deleteArtifact(id: id)
+        try? await deleteArtifactRecordChecked(id: id)
+    }
+
+    /// Same delete, but a caller that has already changed in-memory state on
+    /// the strength of it can SEE the failure (2026-09-06): silently swallowing
+    /// it let a retirement report success while the artifact stayed in the
+    /// store, so the view came back on the next restore.
+    func deleteArtifactRecordChecked(id: UUID) async throws {
+        guard configuration.persistenceEnabled else { return }
+        guard let store else { throw CognitivePersistenceError.storeUnavailable }
+        guard !persistenceWritesBlocked else {
+            throw CognitivePersistenceError.writesBlocked(
+                status: persistenceHealth.status,
+                detail: persistenceHealth.failureDetail
+            )
+        }
+        try await store.deleteArtifact(id: id)
     }
 
     private func artifactCap(_ configuration: CognitiveConfiguration) -> Int {
@@ -2210,6 +2476,15 @@ public actor CognitiveSubstrate {
            eventSession == pendingSession {
             pendingCompletion = nil
             let reaction = (precomputedAppraisal ?? conversationalAppraisal(in: event.summary)).valence
+            // Item 46 fix (1): the ONLY moment this pairing is visible. Stash it
+            // for the after-ingest metadata hop before the slot is gone. Same
+            // appraisal, same read, no second lexicon pass.
+            lastSemanticReaction = SemanticReactionStash(
+                sessionID: eventSession,
+                turnID: pending.nodeKey,
+                reaction: Self.semanticReactionLabel(fromValence: reaction),
+                recordedAt: now
+            )
             // A turn cannot be the reaction to ITSELF. Both kinds map to the
             // .conversationFocus node kind, so the two turns share a field key unless
             // the subjects differ per-turn (which ChatOrchestration mints — audit C2).
@@ -2251,9 +2526,9 @@ public actor CognitiveSubstrate {
             )
             // W7/P6 — TELEMETRY ONLY. The completion is the first moment the
             // ACTUAL reply length exists, so this is where the envelope stashed
-            // at capsule compile gets paired with what really happened. It writes
-            // a JSONL row and returns; nothing here reads the envelope back into
-            // the turn, and no flag exists that could.
+            // at capsule compile gets paired with what really happened. It
+            // records the paired row in memory and returns; nothing here reads
+            // the envelope back into the turn, and no flag exists that could.
             let replyCharacters: Int = {
                 if case .int(let value)? = event.metadata[
                     Self.replyCharacterCountMetadataKey

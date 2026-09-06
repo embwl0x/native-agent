@@ -23,7 +23,11 @@ struct MacHighRiskSurfaceBehaviorEvalTests {
         #expect(ToolPillPresentation.outcome(ok: true) == .succeeded)
         #expect(ToolPillPresentation.Outcome.pending.icon == "clock")
         #expect(ToolPillPresentation.Outcome.failed.icon == "xmark.circle.fill")
-        #expect(ToolPillPresentation.durationText(nil) == "unknown duration")
+        // 2026-09-06: 3ccfb925 (ui-simplify lane A) dropped the "unknown duration"
+        // confession — an absent duration now renders nothing and the outcome glyph
+        // carries pending-vs-done (ChatMessageListView.swift:176-184). Still the real
+        // pin: a missing duration must never be dressed up as a measured one.
+        #expect(ToolPillPresentation.durationText(nil) == "")
         #expect(ToolPillPresentation.durationText(0) == "0ms")
     }
 

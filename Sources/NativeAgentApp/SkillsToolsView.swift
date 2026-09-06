@@ -7,24 +7,20 @@ struct SkillsToolsView: View {
     @Binding var selection: SkillsToolsSection
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Spacer()
-                Picker("Skills and Tools page", selection: $selection) {
-                    ForEach(SkillsToolsSection.allCases) { section in
-                        Text(section.rawValue).tag(section)
-                    }
+        // 2026-09-03 Advanced refinement: the picker was centred over a full
+        // width rule, which read as a toolbar bolted above the page. It sits
+        // on the page's own left edge now, and the rule is gone — the pages
+        // below it already tell themselves apart.
+        VStack(alignment: .leading, spacing: 16) {
+            Picker("Skills and tools page", selection: $selection) {
+                ForEach(SkillsToolsSection.allCases) { section in
+                    Text(section.rawValue).tag(section)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 360)
-                .accessibilityIdentifier("skills-tools-section-picker")
-                Spacer()
             }
-            .padding(.horizontal, NativeAgentSpacing.xl)
-            .padding(.vertical, NativeAgentSpacing.md)
-
-            Divider()
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 360)
+            .accessibilityIdentifier("skills-tools-section-picker")
 
             switch selection {
             case .skills:
@@ -33,6 +29,7 @@ struct SkillsToolsView: View {
                 ToolsView()
             }
         }
-        .navigationTitle("Skills & Tools")
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .navigationTitle("Skills and tools")
     }
 }

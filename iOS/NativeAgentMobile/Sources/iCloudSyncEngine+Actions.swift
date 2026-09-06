@@ -459,6 +459,11 @@ extension iCloudSyncEngine {
             payload: [
                 "eventId": cleanID,
                 "channel": String(channel.prefix(80)),
+                // The Mac router requires an explicit direction; without it
+                // every receipt this lane ever sent was rejected as
+                // `invalid_direction`. This phone is confirming that a Mac→iOS
+                // delivery arrived here, so that is the direction it states.
+                "direction": "mac_to_ios",
             ]
         )
         do {
@@ -1143,10 +1148,21 @@ extension iCloudSyncEngine {
     }
 
     @discardableResult
-    func cancelChat(sessionId: String?, source: String? = nil, sourceKey: String?) async throws -> String {
+    func cancelChat(
+        sessionId: String?,
+        source: String? = nil,
+        sourceKey: String?,
+        runIDs: [String] = []
+    ) async throws -> String {
         var payload: [String: String] = [:]
         if let sessionId, !sessionId.isEmpty {
             payload["sessionId"] = sessionId
+        }
+        // The runs this Stop is for. The Mac cancels a named run only while it
+        // still holds the session; a later turn is not this Stop's business.
+        let namedRuns = runIDs.filter { !$0.isEmpty }
+        if !namedRuns.isEmpty {
+            payload["runId"] = namedRuns.joined(separator: ",")
         }
         if let source, !source.isEmpty {
             payload["source"] = source

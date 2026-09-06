@@ -176,7 +176,17 @@ struct AppChatReportsOnlyWave3BehaviorTests {
         }
         #expect(normalActionIDs.allSatisfy { CommandPaletteRecentAction(rawValue: $0) != nil })
         #expect(developerActionIDs.allSatisfy { CommandPaletteRecentAction(rawValue: $0) != nil })
-        #expect(!normalPool.contains(where: { $0.id == "tab.\(SidebarItem.diagnostics.rawValue)" }))
+        // 2026-09-06: User, 2026-09-04 (NativeAgentDesign.swift:386 and
+        // SidebarModels.swift:180) — the new shell gates NOTHING; the stored
+        // switch only still gates the classic sidebar, and `developerItems` is
+        // empty outside it. A hard pin on "Diagnostics is hidden from a normal
+        // pool" therefore describes only the classic shell. What must hold in
+        // both is that the pool asks `developerItems`/`visibleAdvancedItems`
+        // rather than inventing its own visibility rule.
+        #expect(
+            normalPool.contains(where: { $0.id == "tab.\(SidebarItem.diagnostics.rawValue)" })
+                == !SidebarItem.developerItems.contains(.diagnostics)
+        )
         #expect(developerPool.contains(where: { $0.id == "tab.\(SidebarItem.diagnostics.rawValue)" }))
 
         let normalTabs = Set(normalPool.compactMap { item -> SidebarItem? in
@@ -191,10 +201,21 @@ struct AppChatReportsOnlyWave3BehaviorTests {
         #expect(developerOnlyTabs.isDisjoint(with: normalTabs))
         #expect(developerOnlyTabs.isSubset(of: developerTabs))
 
+        // 2026-09-06: same reason — the pool routes the caller's flag through
+        // `developerSurfacesShown`, which is unconditionally true in the new
+        // shell, so `open_doctor` is in BOTH pools there and only the classic
+        // shell hides it. Pin the delegation instead of the outcome: a pool
+        // that stopped calling `visible(showDeveloperSurfaces:)` fails this in
+        // either shell, and the direct gate is still pinned above.
+        #expect(normalActionIDs == CommandPaletteRecentAction.visible(
+            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(false)
+        ).map(\.rawValue))
+        #expect(developerActionIDs == CommandPaletteRecentAction.visible(
+            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(true)
+        ).map(\.rawValue))
         let developerOnlyActions = Set(CommandPaletteRecentAction.allCases.filter(\.isDeveloperOnly))
         #expect(developerOnlyActions.allSatisfy { action in
-            !normalActionIDs.contains(action.rawValue)
-                && developerActionIDs.contains(action.rawValue)
+            developerActionIDs.contains(action.rawValue)
         })
 
         let normalSlash = ChatSlashCommandRegistry.visible(showDeveloperSurfaces: false)

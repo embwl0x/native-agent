@@ -139,6 +139,13 @@ enum MemoryConsolidationHygiene {
         // exists) — the full GC only runs on the rare swap path, so leaked
         // index rows otherwise sit forever. Best-effort: a reconcile failure
         // never fails the hygiene run.
+        // Settings ▸ "Memory hygiene": off skips this cleanup block (index
+        // reconcile, backfill, orphan sweep) too. Consolidation above is
+        // untouched. Read fresh on the run.
+        // ...and Settings ▸ "Knowledge graph": the backfill below PRODUCES
+        // graph rows, so off means it does not run either (reviewer, 2026-09-05).
+        if MemoryPolicyGate.hygieneEnabled(dataRoot: dataRoot),
+           MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) {
         do {
             let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
             let reconciled = try await indexer.reconcileStaleMemoryIndexRows()
@@ -180,6 +187,7 @@ enum MemoryConsolidationHygiene {
         } catch {
             FileHandle.standardError.write(Data(
                 "MemoryConsolidationHygiene: KG reconcile/sweep failed: \(error)\n".utf8))
+        }
         }
         let after = (try? await storage.listMemories(persona: nil, status: nil, limit: nil).count) ?? before
         let now = Date()
@@ -301,6 +309,12 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
     }
 
     func tickOutcome() async -> LoopTickOutcome {
+        // Settings ▸ "Nightly memory consolidation": off means this tick stages
+        // no card. Read fresh on the tick, so a flip lands on the next run.
+        guard MemoryPolicyGate.consolidationEnabled(dataRoot: dataRoot) else {
+            return .skipped(reason:
+                "Memory consolidation is turned off in Settings, so no hygiene card was staged.")
+        }
         let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .fullMacYoloAuthority(
                 tool: Self.approvalAction,
@@ -310,18 +324,19 @@ struct MemoryConsolidationHygieneRunner: LoopRunner {
                     isRemote: false
                 )
             )
-        if yolo.admitted || yolo.state == .explicitlyBlocked {
-            // Candidate construction and the canonical swap share a locked,
-            // approval-backed protocol. This background tick cannot safely
-            // auto-swap without changing that authority contract, so record a
-            // non-prompt deferred/refused result and leave live memory intact.
+        // User, 2026-09-04: only an EXPLICIT block stops the tick. 8eccf9a1
+        // (Full Mac, prompt-free) also skipped whenever Full Mac was admitted,
+        // and on a Mac that never expires that meant the weekly card was never
+        // staged again after 08-28, silently: the skip stamped the loop as run
+        // and wrote no failure. Staging the card is not a prompt; it is the
+        // loop's product, and Full Mac admits the card the same way it admits
+        // everything else.
+        if yolo.state == .explicitlyBlocked {
             let now = Date()
             let report = MemoryHygieneReport(
                 id: "hygiene-\(UUID().uuidString.lowercased())",
-                status: yolo.admitted ? "deferred" : "refused",
-                reason: yolo.admitted
-                    ? "Active Full Mac authority suppresses approval prompts; background consolidation was deferred without changing live memory."
-                    : "Memory consolidation is explicitly blocked; no approval was staged.",
+                status: "refused",
+                reason: "Memory consolidation is explicitly blocked; no approval was staged.",
                 version: "swift-memory-v2-consolidator",
                 createdAt: ISO8601DateFormatter().string(from: now),
                 beforeCount: nil,

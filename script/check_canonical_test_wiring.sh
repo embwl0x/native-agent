@@ -38,6 +38,8 @@ done
 # These mock-only Node families are production regression coverage, not live
 # browser/provider checks. Require both the directory glob and its execution;
 # merely mentioning a directory (or looping without running it) earns no credit.
+# Two accepted shapes: the per-file loop, or one `node --test` over the glob
+# (the runner takes every path at once and still reports them individually).
 for directory in script/tests Extensions/NativeAgentChrome/tests; do
   [[ -d "$ROOT/$directory" ]] || continue
   if ! awk -v directory="$directory" '
@@ -46,7 +48,8 @@ for directory in script/tests Extensions/NativeAgentChrome/tests; do
       line = $0
       sub(/^[[:space:]]*/, "", line)
       sub(/[[:space:]]*$/, "", line)
-      if (line == "for suite in \"$ROOT\"/" directory "/*.test.js; do") armed = 1
+      if (line == "node --test \"$ROOT\"/" directory "/*.test.js") found = 1
+      else if (line == "for suite in \"$ROOT\"/" directory "/*.test.js; do") armed = 1
       else if (armed && line == "node --test \"$suite\"") found = 1
       else if (line == "done") armed = 0
     }

@@ -56,11 +56,20 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         enforceAutonomySecurity: Bool = true,
         includeAppOwnedTools: Bool = true,
         mobileNotificationSender: @escaping @Sendable (String, String, [String: String]) async throws -> MobileNotificationDeliveryReceipt = { title, body, userInfo in
-            try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+            // Item 26: one exit, through the router. Owner-waiting (an
+            // explicitly invoked notify IS Agent reaching for User), but PINNED
+            // to the phone: this tool's name is its contract, and a real APNS
+            // receipt is what the caller gets back. Payload unchanged.
+            let outcome = try await AttentionRouter.shared.route(
+                eventId: userInfo["itemId"].flatMap { $0.isEmpty ? nil : $0 }
+                    ?? "mobile_notify:\(AttentionRouter.stableDigest(title + "|" + body))",
+                importance: .ownerWaiting,
                 title: title,
                 body: body,
-                userInfo: userInfo
+                userInfo: userInfo,
+                pinnedTo: .phone
             )
+            return try outcome.requireReceipt()
         },
         macNotificationSender: @escaping @Sendable (String, String) async throws -> NativeAgentNotificationPostResult = { title, body in
             await NativeAgentNotifications.postAndReport(title: title, body: body)
@@ -111,7 +120,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
     }
 
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        if !includeAppOwnedTools, Self.appToolNames.contains(tool) {
+        // 2026-09-06: the bridge canonicalizes `mobile.notify` to `mobile_notify`
+        // before this dispatcher sees it, and the fence matched the dotted
+        // spelling only — so on a synthetic root the call fell through to
+        // `runMobileNotify` and attempted a real push. Fence the canonical
+        // notification name too.
+        let canonicalNotification = Self.canonicalNotificationToolName(tool)
+        if !includeAppOwnedTools,
+           Self.appToolNames.contains(tool)
+            || canonicalNotification.map({ Self.appToolNames.contains($0) }) == true {
             return .object([
                 "status": .string("failed"),
                 "reason": .string("canonical_body_unavailable"),
@@ -650,13 +667,15 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         let sessionId = Self.inputString(input["session_id"] ?? input["__session_id"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var sessionActive: Set<String> = Set(loaded)
+        var sessionPinned: Set<String> = []
         var loadedNow = loaded
         var alreadyActive: [String] = []
         var turnActive: [String] = []
         var sessionActiveCount = sessionActive.count
         var status = unavailable.isEmpty ? "loaded" : "partial"
         if let sessionId, !sessionId.isEmpty {
-            let existing = await activeToolsStore.load(sessionId: sessionId).activeTools
+            let existingState = await activeToolsStore.load(sessionId: sessionId)
+            let existing = existingState.activeTools
             let turnScoped = LLMCallContext.turnActiveTools ?? []
             let effectiveExisting = existing.union(turnScoped)
             alreadyActive = loaded.filter { effectiveExisting.contains($0) }
@@ -664,19 +683,46 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             loadedNow = loaded.filter { !effectiveExisting.contains($0) }
             if loadedNow.isEmpty {
                 sessionActive = existing
+                sessionPinned = Set(existingState.pinnedSchemas.keys)
             } else {
                 let state = try await activeToolsStore.addLoaded(
                     sessionId: sessionId,
                     names: Set(loadedNow)
                 )
                 sessionActive = state.activeTools
+                sessionPinned = Set(state.pinnedSchemas.keys)
             }
             sessionActiveCount = sessionActive.count
         } else {
             status = unavailable.isEmpty ? "ok" : "partial"
         }
         let activeForTurn = sessionActive.union(LLMCallContext.turnActiveTools ?? [])
-        let activeTools = SwiftToolDispatcher.alwaysOnCoreNames.union(activeForTurn).sorted()
+        // Agent, 2026-09-06: this list reported names tool_catalog never
+        // offered — loading doctor_status and telegram_status came back with
+        // mac_focus_app and mac_quit_app active, because an older session row
+        // still pinned the internal mac_* organs. tool_catalog's available set
+        // is `modelVisibleCatalogToolNames(listAvailableTools())`; one
+        // inventory means this passes the same boundary, exactly as
+        // agent_introspect's active_tools already does.
+        //
+        // 2026-09-06: the availability snapshot ALONE was too narrow. The
+        // session contract deliberately keeps advertising a loaded tool from
+        // its pinned descriptor when this turn's catalog is missing it
+        // (`applyLazyToolFilter`, ChatOrchestrationClient+StructuredChat), so
+        // during a readiness or policy-catalog flap the model still had the
+        // tool while this receipt said it was gone. Same rule as the contract:
+        // available NOW or pinned by this session. The mac_* organs stay out
+        // either way — they are pinned like anything else in the load order
+        // (`commitTurnStartContract` freezes a descriptor from the eager
+        // catalog, which still carries them), so it is the model-visibility
+        // boundary, not the pin, that keeps them off this list.
+        let catalogNames = SwiftToolDispatcher.modelVisibleCatalogToolNames(
+            available.union(sessionPinned)
+        )
+        let activeTools = SwiftToolDispatcher.alwaysOnCoreNames
+            .union(activeForTurn)
+            .intersection(catalogNames)
+            .sorted()
         let schemasAdded = Self.appToolSchemas()
             .filter { loadedNow.contains($0.name) }
             .map { schema -> JSONValue in
@@ -745,9 +791,19 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         // (gpt-5.5 review), so the two-envelope union would omit the forwarded
         // tools. Re-read the session store for the true active set.
         if let sessionId, !sessionId.isEmpty, case .object(var obj) = merged {
+            // Same one inventory as the app-only path above: never report a
+            // name tool_catalog does not offer (Agent, 2026-09-06), and
+            // available-now OR pinned-by-this-session, so a flap does not make
+            // the receipt disagree with the contract (2026-09-06).
+            let state = await activeToolsStore.load(sessionId: sessionId)
+            let catalogNames = SwiftToolDispatcher.modelVisibleCatalogToolNames(
+                Set((try? await listAvailableTools()) ?? [])
+                    .union(state.pinnedSchemas.keys)
+            )
             let active = SwiftToolDispatcher.alwaysOnCoreNames
-                .union(await activeToolsStore.load(sessionId: sessionId).activeTools)
+                .union(state.activeTools)
                 .union(LLMCallContext.turnActiveTools ?? [])
+                .intersection(catalogNames)
                 .sorted()
             obj["active_tools"] = .array(active.map { .string($0) })
             merged = .object(obj)
@@ -836,6 +892,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         "browser.read_links",
         "browser.screenshot",
         "browser.chrome_acquire",
+        "browser.chrome_renew",
         "browser.chrome_navigate",
         "browser.chrome_snapshot",
         "browser.chrome_click",
@@ -929,6 +986,8 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
             return "browser.screenshot"
         case "browser.chrome_acquire", "browser_chrome_acquire", "chrome.acquire", "chrome_acquire":
             return "browser.chrome_acquire"
+        case "browser.chrome_renew", "browser_chrome_renew", "chrome.renew", "chrome_renew":
+            return "browser.chrome_renew"
         case "browser.chrome_navigate", "browser_chrome_navigate", "chrome.navigate", "chrome_navigate":
             return "browser.chrome_navigate"
         case "browser.chrome_snapshot", "browser_chrome_snapshot", "chrome.snapshot", "chrome_snapshot":
@@ -1116,7 +1175,6 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
 
     private static func securityOrigin(input: [String: JSONValue], surface: String) -> SecurityOriginContext {
         let _ = input
-        let normalizedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         // Read the per-turn session bound by the authoritative AutonomyGatedDispatcher
         // upstream (ChatToolSessionContext). Without it this gate hardcoded
         // sessionId: nil, so a TRUSTED remote surface (allowlisted Telegram) could
@@ -1127,32 +1185,29 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         let sessionId = ChatToolSessionContext.verifiedSessionId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let usableSessionId = (sessionId?.isEmpty == false) ? sessionId : nil
-        // Prefer the transport-verified chatId (covers UUID telegram sessions
-        // where the id can't be parsed from the session string); fall back to
-        // the legacy `telegram:<chatId>` session form. Mirrors the authoritative
-        // gate's resolution so both reach the same trust. See ChatToolSessionContext.
-        let verifiedChatId = ChatToolSessionContext.verifiedChatId?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedChatId = (verifiedChatId?.isEmpty == false)
-            ? verifiedChatId
-            : telegramChatId(fromSessionId: usableSessionId)
+        // PARSE SITE 5 of 5, DELETED (one-thread-many-surfaces plan §1.2). The
+        // `telegram:<chatId>` session-string fallback that used to stand here
+        // is gone; the session id is a storage key, not evidence.
+        //
+        // This gate MIRRORS `AutonomyGatedDispatcher.securityOrigin` field for
+        // field, and for the same reason: the projection is the TURN ENVELOPE's,
+        // not the dispatch `surface`'s. An adapter that binds an envelope for a
+        // remote surface while dispatching under the shared "chat" tool surface
+        // must reach the same — remote, allowlist-gated — verdict in BOTH gates,
+        // or the weaker one becomes the way in.
+        let envelope = TurnEnvelope.current(surface: surface)
+        let remote = ConversationSurfaceProfile(envelope.surface).isRemote
+            || envelope.declaredRemote == true
         return SecurityOriginContext(
-            surface: surface,
+            surface: envelope.surface,
             sessionId: usableSessionId,
-            userId: ChatToolSessionContext.verifiedUserId,
-            chatId: resolvedChatId,
+            userId: envelope.verifiedUserId,
+            chatId: envelope.verifiedChatId,
             deviceId: nil,
             source: "app_chat_tool_dispatcher",
-            isRemote: ["telegram", "slack", "ios", "mobile", "remote", "watch"].contains(normalizedSurface),
-            commandSignatureVerified: ChatToolSessionContext.commandSignatureVerified
+            isRemote: remote,
+            commandSignatureVerified: envelope.commandSignatureVerified
         )
-    }
-
-    private static func telegramChatId(fromSessionId sessionId: String?) -> String? {
-        guard let sessionId else { return nil }
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("telegram:") else { return nil }
-        return String(trimmed.dropFirst("telegram:".count))
     }
 
     private static func securityGateResponse(_ envelope: SecurityToolEnvelope) -> JSONValue {
@@ -1352,6 +1407,18 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                         ("lease_duration_ms", intSchema("Lease duration from 30000 through 300000 milliseconds. Defaults 60000.")),
                     ],
                     required: []
+                )
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_renew",
+                description: "Extend an existing real Chrome tab lease before it expires. The lease is the only thing that keeps a Chrome task alive; without a renew every task has a hard 60-second ceiling. Renewing does not touch the page.",
+                parametersJSON: params(
+                    properties: [
+                        ("lease_id", strSchema("Lease id from browser.chrome_acquire.")),
+                        ("expected_user_sequence", intSchema("User sequence from the lease; a renew fails if the user has touched the tab since.")),
+                        ("lease_duration_ms", intSchema("New lease duration from 30000 through 300000 milliseconds. Defaults 60000.")),
+                    ],
+                    required: ["lease_id", "expected_user_sequence"]
                 )
             ),
             LLMToolSchema(
@@ -1666,6 +1733,13 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                     "title": .string(string("expected_title") ?? ""),
                 ])
             }
+        case "browser.chrome_renew":
+            effect = .renew
+            payload = [
+                "leaseId": .string(string("lease_id") ?? ""),
+                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
+            ]
+            if let value = integer("lease_duration_ms") { payload["leaseDurationMs"] = .int(Int64(value)) }
         case "browser.chrome_navigate":
             effect = .navigate
             payload = [
@@ -1783,7 +1857,82 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         let response = try await ChromeControlRuntime.shared.perform(effect, payload: payload)
         guard case .object(let object) = response,
               let result = object["result"] else { throw ChromeControlRuntimeError.invalidResponse }
+        // ITEM 10b. The extension already builds a per-action receipt with
+        // outcome / verification / retry and it was being handed back as raw
+        // JSON and nothing else — never admitted as a motor consequence the
+        // way MacControl and Browser are. Same seam, same call.
+        if let model = chromeReceiptMotorActionReadModel(result) {
+            await NativeCognitionRuntime.shared.observeMotorActionState(model)
+        }
         return result
+    }
+
+    /// The Chrome per-action receipt, in the shared motor vocabulary.
+    ///
+    /// `domainState` keeps the extension's exact word, because the phase
+    /// vocabulary has no "partially completed" and collapsing that into either
+    /// succeeded or failed would erase the one distinction the receipt exists
+    /// to make.
+    static func chromeReceiptMotorActionReadModel(_ result: JSONValue) -> MotorActionReadModel? {
+        guard case .object(let payload) = result,
+              case .object(let receipt)? = payload["receipt"],
+              case .string(let actionIdentity)? = receipt["id"],
+              !actionIdentity.isEmpty,
+              case .string(let outcome)? = receipt["outcome"] else { return nil }
+        // The phases are MacControl's own mapping, deliberately
+        // (`MacControlOperationStore.motorPhase`): refused is `.blocked`, and
+        // an unknown outcome is `.waitingExternal` — evidence is owed, the act
+        // is not finished. `.unknown` is NOT available here: the cognitive
+        // event factory returns nil for it, which would silently drop the very
+        // receipts this fix exists to admit.
+        let phase: MotorActionPhase
+        switch outcome {
+        case "succeeded": phase = .succeeded
+        case "refused": phase = .blocked
+        default: phase = .waitingExternal
+        }
+        let verification: MotorVerificationState
+        switch receipt["verification"] {
+        // 2026-09-06: `page_acknowledged` is the page saying it received the
+        // act, not anybody observing that it happened — the extension's own
+        // protocol keeps the two apart. A click on a control that ignored it
+        // acknowledges just as loudly, so this is evidence still owed
+        // (`.pending`), never verification satisfied.
+        case .string("page_acknowledged"): verification = .pending
+        case .string("not_verified"):
+            // 2026-09-06: `not_quiet` is a navigation that was still moving
+            // when the wait's deadline arrived — evidence still OWED, not a
+            // checked negative. `.pending`, so the turn reads it as unfinished
+            // and looks again rather than concluding the page did not settle.
+            verification = outcome == "not_quiet" ? .pending : .unverified
+        default: verification = .unknown
+        }
+        let expectedNextEvidence: String
+        switch receipt["retry"] {
+        case .string("never_automatic"):
+            expectedNextEvidence = "A human look at the page. This outcome is unknown and must "
+                + "never be retried automatically."
+        case .string("fresh_snapshot_then_remaining_text_only"):
+            expectedNextEvidence = "A fresh Chrome snapshot, then only the characters that did "
+                + "not land."
+        default:
+            expectedNextEvidence = "A fresh Chrome snapshot; node ids from the old one are stale."
+        }
+        var updatedAt: String?
+        if case .string(let completedAt)? = receipt["completedAt"] { updatedAt = completedAt }
+        return MotorActionReadModel(
+            domain: "chrome_control",
+            // Hashed, like every other domain's identity: the cognitive event
+            // factory only accepts a 64-char digest, and the raw receipt id is
+            // a UUID. Handing it over unhashed would have been dropped in
+            // silence — the same failure with a longer path.
+            actionIdentity: CausalTransitionEvidence.opaqueIdentity(actionIdentity),
+            phase: phase,
+            domainState: outcome,
+            verification: verification,
+            expectedNextEvidence: expectedNextEvidence,
+            updatedAt: updatedAt
+        )
     }
 
     private static func defaultDoctorStatusProvider() async throws -> JSONValue {
@@ -1819,6 +1968,25 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
         )
     }
 
+    /// Agent, 2026-09-06: a doctor detail was cut with a bare `prefix(600)`, so
+    /// Prompt Prefix Cache ended at "so the rate i" and Subconscious Vitals at
+    /// "so earlier turns" — mid-word, with nothing saying anything was missing.
+    /// Same 600-character cap; the cut lands on a word boundary and says so.
+    static func boundedDoctorDetail(_ detail: String, limit: Int = 600) -> String {
+        guard detail.count > limit else { return detail }
+        let ellipsis = "…"
+        let head = detail.prefix(limit - ellipsis.count)
+        // Only honour a boundary in the last part of the budget — one very long
+        // unbroken token must not shrink the detail to a few words.
+        if let boundary = head.lastIndex(where: { $0 == " " || $0.isNewline }),
+           head.distance(from: head.startIndex, to: boundary) > head.count / 2 {
+            let trimmed = head[..<boundary]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed + ellipsis }
+        }
+        return String(head) + ellipsis
+    }
+
     static func doctorStatusEnvelope(
         report: DoctorReport,
         activeProviderID: String?,
@@ -1829,7 +1997,7 @@ final class AppChatToolDispatcher: ToolDispatchClient, ActiveToolsStoreProviding
                 "id": .string(check.id),
                 "title": .string(check.title),
                 "status": .string(check.status),
-                "detail": .string(NativeAppSecretRedactor.redactText(String(check.detail.prefix(600)))),
+                "detail": .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(check.detail))),
                 "repair_available": .bool(check.repair?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false),
             ])
         }
@@ -2193,7 +2361,9 @@ func makeNativeAgentBridgeToolDispatchClient(
         trust: trust,
         verifiedSessionId: verifiedSessionId
     )
-    return ClaudeBridgeDenyDispatcher(inner: gated)
+    // 2026-09-06: canonicalize outside the deny guard as well — `tool.catalog`
+    // used to reach `tool_catalog` without the external-MCP name scrub.
+    return CanonicalToolNameDispatcher(inner: ClaudeBridgeDenyDispatcher(inner: gated))
 }
 
 private func makeNativeAgentAppChatOrchestrationClient(

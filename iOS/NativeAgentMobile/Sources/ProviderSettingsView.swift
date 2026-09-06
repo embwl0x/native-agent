@@ -38,6 +38,7 @@ enum MobileProviderSurfaceLabelPresentation: Equatable {
         "heartbeat": "Heartbeat",
         "diagnostics": "Diagnostics",
         "cognition_reflection": "Cognition Reflection",
+        "studio_wander": "Studio Wandering",
         "compaction": "Compaction",
         "self_improvement": "Self-Improvement",
     ]
@@ -142,6 +143,8 @@ struct ProviderSettingsView: View {
         "chat", "ios", "telegram", "slack", "desk", "workshop", "autonomy", "swarms",
         "dream", "rem", "training", "memory", "heartbeat", "diagnostics",
         "cognition_reflection", "compaction", "self_improvement",
+        // Added 2026-09-02 with MODEL_SURFACES (personality depth item 9).
+        "studio_wander",
     ]
 
     /// Exact ordered surfaces accepted by the signed Mac action router.

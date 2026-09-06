@@ -47,7 +47,14 @@ final class AppRemoteNotificationEvalTests: XCTestCase {
 
         XCTAssertEqual(recordedEventIDs, [eventID])
         XCTAssertEqual(acknowledgements, [eventID])
-        XCTAssertEqual(steps, ["record", "receipt", "drain", "inbox", "activity"])
+        // 2026-09-06 (86b9825e): the receipt moved BEHIND the recovery lanes.
+        // Its iCloud action write can wait the full 30 s while the background
+        // push must report at 25 s, so acknowledging first meant a missed reply
+        // was never recovered on the push that announced it. Drain/inbox/
+        // activity run first; the receipt takes the remaining budget. The
+        // throwing drain still must not suppress the lanes after it, and the
+        // receipt must still be sent exactly once.
+        XCTAssertEqual(steps, ["record", "drain", "inbox", "activity", "receipt"])
         XCTAssertEqual(outcome, .newData)
         XCTAssertEqual(outcome.backgroundFetchResult, .newData)
     }

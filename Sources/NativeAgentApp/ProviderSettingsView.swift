@@ -59,6 +59,8 @@ enum ProviderSettingsSurfaceLabel: Equatable, Sendable {
         "cognition_reflection": "Cognition Reflection",
         "compaction": "Compaction",
         "self_improvement": "Self-Improvement",
+        // Personality depth item 9 (2026-09-02): her own hour has its own row.
+        "studio_wander": "Studio Wandering",
     ]
 
     static func presentation(for rawSurface: String) -> Self {
@@ -168,21 +170,62 @@ struct ProviderSettingsView: View {
         }
     }
 
+    /// Providers whose catalogue is fetched rather than compiled in. Their
+    /// `models` list can be a two-entry offline fallback served when no live
+    /// catalogue has ever arrived, so its silence about a model is not
+    /// evidence of anything.
+    private static let dynamicCatalogProviders: Set<String> = ["openrouter", "moonshot"]
+
+    /// Whether a LIVE catalogue for this provider says the saved model is gone.
+    ///
+    /// 2026-09-06: the old test was "the choice list is non-empty", and
+    /// `modelsForProvider` substitutes the provider-neutral global catalogue
+    /// whenever a provider's own list is empty — so a dynamic provider with no
+    /// catalogue yet borrowed someone else's list and the saved model was
+    /// labelled Unavailable on it. Evidence now has to come from the provider
+    /// itself: OpenRouter's own live-backed cache (`.unknown` until one exists),
+    /// or a static provider's compiled-in list, which is the whole truth about
+    /// that provider. Moonshot has no live/fallback discriminator, so it never
+    /// convicts. Anything unproven shows the saved model plainly.
+    private func savedModelIsKnownAbsent(providerId: String, model: String) -> Bool {
+        if providerId == "openrouter" {
+            // User, 2026-09-06: this read the DEFAULT data root while the rest
+            // of the screen works off the model's scoped one, so under an
+            // override the verdict came from a catalog belonging to another
+            // root — including the "Unavailable" label on a saved model.
+            return OpenRouterModelCatalog.cachedAvailability(
+                of: model,
+                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            ) == .unavailable
+        }
+        guard !Self.dynamicCatalogProviders.contains(providerId) else { return false }
+        guard let provider = providers.first(where: { $0.provider_id == providerId }),
+              !provider.models.isEmpty else {
+            return false
+        }
+        return !provider.models.contains(where: { $0.id == model })
+    }
+
     /// Models offered for a surface, scoped to the provider selected for it.
     private func modelsForSurface(_ surface: String) -> [SurfaceModelChoice] {
         let pid = activeSurface[surface] ?? "codex"
         var choices = modelsForProvider(pid)
         let current = surfaceModel[surface] ?? ""
-        if pid == "openrouter", !current.isEmpty,
-           !choices.contains(where: { $0.id == current }),
-           OpenRouterModelCatalog.cachedAvailability(of: current) == .unavailable {
+        // 2026-09-06: this used to be an OpenRouter-only repair, so every other
+        // provider whose catalogue did not list the SAVED model rendered the
+        // first model in the list instead — a row that says one thing and
+        // routes to another, with nothing saved and no label. The saved
+        // selection is always shown; it is only CALLED unavailable on the
+        // evidence of a live catalogue for that provider.
+        if !current.isEmpty, !choices.contains(where: { $0.id == current }) {
+            let unavailable = savedModelIsKnownAbsent(providerId: pid, model: current)
             choices.insert(SurfaceModelChoice(
                 id: current,
-                name: "\(current) — Unavailable",
+                name: unavailable ? "\(current) — Unavailable" : current,
                 defaultReasoningEffort: surfaceReasoningEffort[surface] ?? "high",
                 supportedReasoningEfforts: [surfaceReasoningEffort[surface] ?? "high"],
                 supportsFast: false,
-                isUnavailable: true
+                isUnavailable: unavailable
             ), at: 0)
         }
         return choices
@@ -234,19 +277,17 @@ struct ProviderSettingsView: View {
     }
 
     var body: some View {
-        // PATCH-2026-06-06: 2-column layout — provider list + OAuth on the left
-        // (~360pt cap), per-surface picker on the right (flex). The picker is
-        // what the user uses daily; it stays visible while clicking around the
-        // OAuth/provider panels on the left.
-        HStack(alignment: .top, spacing: 16) {
+        // PATCH-2026-06-06: 2-column layout — the accounts and their sign-ins
+        // on the left (~360pt cap), what each surface uses on the right (flex).
+        // The right column is what a person uses daily; it stays visible while
+        // clicking around the sign-in cards on the left. The seam between the
+        // two is air, not a drawn rule.
+        HStack(alignment: .top, spacing: 32) {
             providerListColumn
                 .frame(maxWidth: 360)
 
-            Divider()
-
             perSurfacePickerColumn
         }
-        .padding()
         .sheet(item: $configureSheet) { provider in
             ProviderConfigSheet(provider: provider) {
                 configureSheet = nil
@@ -257,82 +298,92 @@ struct ProviderSettingsView: View {
         .task { await loadProviders() }
     }
 
-    /// Left column: header blurb + OAuth panels + Telegram + Providers list.
-    /// Everything that's not the per-surface picker.
+    /// Left column: what the lead sentence says, the sign-ins, and the list of
+    /// accounts. Everything that is not the per-surface picker.
     @ViewBuilder
     private var providerListColumn: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                NativePanel(title: "Models & Providers", systemImage: "cpu.fill") {
-                    Text("Choose which LLM provider powers each surface. Codex (ChatGPT OAuth) is the default — existing behavior is unchanged unless you override.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            VStack(alignment: .leading, spacing: 24) {
+                Text("Pick the account behind each surface. \(AgentVoice.live.subject) \(AgentVoice.live.verb("use")) ChatGPT unless you say otherwise.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                // A2.2 close-out (2026-07-24): title/copy said sign-in ran
-                // through Codex's device flow — stale since the 2026-07-05
-                // codex-free loopback cutover. The codex device flow remains
-                // the alternative path (its in-flight UI renders below).
-                NativePanel(title: "ChatGPT", systemImage: "person.crop.circle.badge.checkmark") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Sign in with your ChatGPT Plus/Pro account in your browser — no extra tools needed. The codex CLI device flow remains available as an alternative.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        OAuthSignInButton(provider: .chatgpt) {
-                            Task { await loadProviders() }
-                        }
-                        if let login = appModel.codexDeviceLogin {
-                            Divider()
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text("Open \(login.url ?? "https://auth.openai.com/codex/device")")
-                                    .font(.caption)
-                                Text("Code: \(login.code ?? "pending")")
-                                    .font(.system(.title3, design: .monospaced, weight: .semibold))
-                                if let home = login.codexHome, !home.isEmpty {
-                                    Text("CODEX_HOME: \(home)")
-                                        .font(NativeAgentFont.mono)
-                                        .foregroundStyle(.secondary)
+                ProviderSection(label: "Sign in") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        // A2.2 close-out (2026-07-24): title/copy said sign-in
+                        // ran through Codex's device flow — stale since the
+                        // 2026-07-05 codex-free loopback cutover. The codex
+                        // device flow remains the alternative path (its
+                        // in-flight UI renders below).
+                        ProviderCard {
+                            VStack(alignment: .leading, spacing: 12) {
+                                ProviderCardTitle(
+                                    title: "ChatGPT",
+                                    line: "Sign in with your ChatGPT Plus or Pro account in the browser. The codex command-line device flow is still there as an alternative."
+                                )
+                                OAuthSignInButton(provider: .chatgpt) {
+                                    Task { await loadProviders() }
                                 }
-                                HStack(spacing: 8) {
-                                    Button("Cancel", systemImage: "xmark.circle") {
-                                        Task { await appModel.cancelCodexDeviceLogin() }
+                                if let login = appModel.codexDeviceLogin {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("Open \(login.url ?? "https://auth.openai.com/codex/device")")
+                                            .font(ShellType.label)
+                                            .foregroundStyle(NativeAgentShell.text)
+                                        Text(login.code ?? "waiting")
+                                            .font(ProviderType.code)
+                                            .foregroundStyle(NativeAgentShell.text)
+                                        if let home = login.codexHome, !home.isEmpty {
+                                            Text(home)
+                                                .font(ProviderType.code)
+                                                .foregroundStyle(NativeAgentShell.secondary)
+                                        }
+                                        HStack(spacing: 8) {
+                                            Button("Cancel") {
+                                                Task { await appModel.cancelCodexDeviceLogin() }
+                                            }
+                                            Button("Clear") {
+                                                Task { await appModel.clearCodexDeviceLogin() }
+                                            }
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .font(ShellType.labelMedium)
                                     }
-                                    Button("Clear", systemImage: "eraser") {
-                                        Task { await appModel.clearCodexDeviceLogin() }
-                                    }
+                                    .textSelection(.enabled)
                                 }
                             }
-                            .font(.caption)
-                            .textSelection(.enabled)
                         }
-                    }
-                }
-                // PATCH-2026-05-07: anthropic-oauth-direct Sign-in panel — direct
-                // OAuth to Anthropic (no Claude Code CLI dependency). Same
-                // public client_id Claude Code CLI uses, so tokens stay
-                // compatible if you use both.
-                NativePanel(title: "Anthropic (OAuth direct)", systemImage: "brain.head.profile") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Two ways to authenticate with Anthropic. Setup-token is the path Anthropic recommends for third-party tools (NativeAgent counts as one); generate it at console.anthropic.com → Settings → OAuth.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        OAuthSignInButton(provider: .anthropic) {
-                            Task { await loadProviders() }
-                        }
-                        Divider()
-                        AnthropicSetupTokenInput {
-                            Task { await loadProviders() }
-                        }
-                    }
-                }
 
-                NativePanel(title: "xAI Grok (OAuth direct)", systemImage: "sparkles") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Sign in with xAI to use Grok models as a NativeAgent model provider. This is separate from the X connector; tokens stay in NativeAgent's provider store.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        OAuthSignInButton(provider: .xai) {
-                            Task { await loadProviders() }
+                        // PATCH-2026-05-07: anthropic-oauth-direct — direct
+                        // OAuth to Anthropic (no Claude Code CLI dependency).
+                        // Same public client_id Claude Code CLI uses, so tokens
+                        // stay compatible if you use both.
+                        ProviderCard {
+                            VStack(alignment: .leading, spacing: 12) {
+                                ProviderCardTitle(
+                                    title: "Anthropic",
+                                    line: "Two ways in. A setup token is the route Anthropic recommends for outside apps; make one at console.anthropic.com, under Settings then OAuth."
+                                )
+                                OAuthSignInButton(provider: .anthropic) {
+                                    Task { await loadProviders() }
+                                }
+                                AnthropicSetupTokenInput {
+                                    Task { await loadProviders() }
+                                }
+                            }
+                        }
+
+                        ProviderCard {
+                            VStack(alignment: .leading, spacing: 12) {
+                                ProviderCardTitle(
+                                    title: "xAI",
+                                    line: "Sign in with xAI to use Grok models. This is separate from the X connector; the token stays in this app's own store."
+                                )
+                                OAuthSignInButton(provider: .xai) {
+                                    Task { await loadProviders() }
+                                }
+                            }
                         }
                     }
                 }
@@ -341,75 +392,71 @@ struct ProviderSettingsView: View {
                 // panel duplicated the Telegram settings surface — two write
                 // paths to telegram/config.json that didn't refresh each other.
                 // Telegram settings own the config; this is now a pointer.
-                NativePanel(title: "Telegram Bot", systemImage: "paperplane.fill") {
-                    HStack {
-                        Text("Bot token, allowlist, and model live in Telegram settings.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Open Telegram Settings", systemImage: "arrow.right.circle") {
-                            let receipt = NativeAgentAppCoordinator.shared.request(.sidebar(.telegram))
-                            let presentation = ProviderTelegramSettingsButtonPresentation.presentation(for: receipt)
-                            statusText = presentation.statusText
+                ProviderSection(label: "Telegram") {
+                    ProviderCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ProviderCardTitle(
+                                title: "Telegram lives on its own page",
+                                line: "The bot token, who may write in, and the model it answers with are all on the Telegram page."
+                            )
+                            Button("Open Telegram") {
+                                let receipt = NativeAgentAppCoordinator.shared.request(.sidebar(.telegram))
+                                let presentation = ProviderTelegramSettingsButtonPresentation.presentation(for: receipt)
+                                statusText = presentation.statusText
+                            }
+                            .buttonStyle(.bordered)
+                            .font(ShellType.labelMedium)
                         }
                     }
                 }
 
-                NativePanel(title: "Providers", systemImage: "server.rack") {
-                    if isLoading {
-                        HStack {
-                            ProgressView()
-                            Text("Loading providers…").font(NativeAgentFont.label).foregroundStyle(.secondary)
-                        }
-                    } else if case let .unavailable(detail) = ProviderSettingsRefreshPresentation.resolve(
-                        providerCount: providers.count,
-                        loadError: providerLoadError
-                    ) {
-                        NativeEmptyState(
-                            title: "Providers unavailable",
-                            detail: detail,
-                            systemImage: "server.rack"
-                        )
-                        .frame(minHeight: 120)
-                    } else if providers.isEmpty {
-                        NativeEmptyState(
-                            title: "No Providers",
-                            detail: "Tap Refresh to load available providers.",
-                            systemImage: "server.rack"
-                        )
-                        .frame(minHeight: 120)
-                    } else {
-                        VStack(spacing: 0) {
+                ProviderSection(label: "Accounts") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if isLoading {
+                            ProviderCard {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Reading the accounts…")
+                                        .font(ShellType.label)
+                                        .foregroundStyle(NativeAgentShell.secondary)
+                                }
+                            }
+                        } else if case let .unavailable(detail) = ProviderSettingsRefreshPresentation.resolve(
+                            providerCount: providers.count,
+                            loadError: providerLoadError
+                        ) {
+                            ProviderCard {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ProviderCardTitle(
+                                        title: "The accounts could not be read",
+                                        line: detail
+                                    )
+                                }
+                            }
+                        } else if providers.isEmpty {
+                            ProviderCard {
+                                ProviderCardTitle(
+                                    title: "No accounts yet",
+                                    line: "Sign in above, or press Refresh to read what is already on this Mac."
+                                )
+                            }
+                        } else {
                             ForEach(providers.indices, id: \.self) { index in
                                 let provider = providers[index]
-                                ProviderRowView(provider: provider) {
-                                    configureSheet = provider
-                                }
-                                if index < providers.index(before: providers.endIndex) {
-                                    Divider()
-                                        .padding(.leading, 44)
+                                ProviderCard {
+                                    ProviderRowView(provider: provider) {
+                                        configureSheet = provider
+                                    }
                                 }
                             }
                         }
-                        .background(
-                            Color(nsColor: .controlBackgroundColor).opacity(0.45),
-                            in: RoundedRectangle(
-                                cornerRadius: NativeAgentRadius.control,
-                                style: .continuous
-                            )
-                        )
-                        .overlay {
-                            RoundedRectangle(
-                                cornerRadius: NativeAgentRadius.control,
-                                style: .continuous
-                            )
-                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.75)
-                        }
-                    }
-                    HStack {
-                        Button(isLoading ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise") {
+
+                        Button(isLoading ? "Refreshing…" : "Refresh") {
                             Task { await loadProviders(refreshCatalog: true) }
                         }
+                        .buttonStyle(.bordered)
+                        .font(ShellType.labelMedium)
                         .disabled(isLoading)
                         // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test
                     }
@@ -418,151 +465,172 @@ struct ProviderSettingsView: View {
                 // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/providers/self_test (results panel)
 
                 if let status = ProviderSettingsStatusTextPresentation.state(for: statusText) {
-                    Label(status.text, systemImage: status.systemImage)
-                        .font(.caption)
+                    Text(status.text)
+                        .font(ShellType.caption)
                         .foregroundStyle(statusColor(status.tone))
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                         .accessibilityLabel(status.text)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.bottom, 32)
         }
         // ui-taste-sweep 2026-06-07: was falling back to the bundle name.
         .navigationTitle("Providers")
     }
 
-    /// Right column: per-surface provider + model picker. Pinned so the user can
-    /// switch the chat model without scrolling past the OAuth panels.
+    /// Right column: which account and model each surface uses. Pinned so the
+    /// chat model can be changed without scrolling past the sign-in cards.
     @ViewBuilder
     private var perSurfacePickerColumn: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                NativePanel(title: "Active per Surface", systemImage: "square.3.layers.3d.top.filled") {
-                    if !rowSet.unsupportedStoredKeys.isEmpty {
-                        Label(
-                            "Saved provider settings need repair: " + rowSet.unsupportedStoredKeys.joined(separator: ", "),
-                            systemImage: "exclamationmark.triangle.fill"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                    }
-                    if !rowSet.retiredStoredKeys.isEmpty {
-                        Label(
-                            "Retired saved settings are ignored: " + rowSet.retiredStoredKeys.joined(separator: ", "),
-                            systemImage: "clock.arrow.circlepath"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                    }
-                    if pickerProviders.isEmpty {
-                        Text("Load providers first to configure per-surface overrides.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    } else {
-                        VStack(spacing: 0) {
-                            ForEach(surfaces, id: \.self) { surface in
-                                HStack(spacing: 8) {
-                                    Text(surfaceLabel(surface))
-                                        .frame(width: 112, alignment: .leading)
-                                        .font(.callout)
-                                    Picker("Provider", selection: Binding(
-                                        get: { activeSurface[surface] ?? "codex" },
-                                        set: { newVal in
-                                            requestSetActiveSurface(surface: surface, providerId: newVal)
-                                        }
-                                    )) {
-                                        ForEach(pickerProviders) { provider in
-                                            let ready = provider.auth_status.state == "ready"
-                                            Text(provider.display_name + (ready ? "" : " ⚠️"))
-                                                .tag(provider.provider_id)
-                                        }
+            VStack(alignment: .leading, spacing: 24) {
+                ProviderSection(label: "What each surface uses") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if !rowSet.unsupportedStoredKeys.isEmpty {
+                            ProviderNote(
+                                text: "Saved settings need repair: " + rowSet.unsupportedStoredKeys.joined(separator: ", "),
+                                color: NativeAgentShell.trouble
+                            )
+                        }
+                        if !rowSet.retiredStoredKeys.isEmpty {
+                            ProviderNote(
+                                text: "Retired saved settings are ignored: " + rowSet.retiredStoredKeys.joined(separator: ", "),
+                                color: NativeAgentShell.trouble
+                            )
+                        }
+                        if pickerProviders.isEmpty {
+                            ProviderCard {
+                                ProviderCardTitle(
+                                    title: "Nothing to choose from yet",
+                                    line: "Sign in to an account, then each surface can be pointed at one."
+                                )
+                            }
+                        } else {
+                            ProviderCard {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    ForEach(surfaces, id: \.self) { surface in
+                                        surfaceRow(surface)
                                     }
-                                    .pickerStyle(.menu)
-                                    .frame(width: 210)
-                                    .disabled(savingSurfaces.contains(surface))
-                                    .accessibilityLabel("\(surfaceLabel(surface)) provider")
-
-                                    // PATCH-2026-05-28 (per-surface model):
-                                    // model picker scoped to the provider chosen
-                                    // for THIS surface. Plain dropdown (no search)
-                                    // even for OpenRouter's long list.
-                                    let surfModels = modelsForSurface(surface)
-                                    Picker("Model", selection: Binding(
-                                        get: {
-                                            let cur = surfaceModel[surface] ?? ""
-                                            if surfModels.contains(where: { $0.id == cur }) { return cur }
-                                            return surfModels.first?.id ?? cur
-                                        },
-                                        set: { newVal in
-                                            requestSetSurfaceModel(surface: surface, model: newVal)
-                                        }
-                                    )) {
-                                        if surfModels.isEmpty {
-                                            Text("—").tag("")
-                                        } else {
-                                            ForEach(surfModels) { m in
-                                                Text(m.name).tag(m.id)
-                                            }
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .disabled(surfModels.isEmpty || savingSurfaceModels.contains(surface))
-                                    .accessibilityLabel("\(surfaceLabel(surface)) model")
-
-                                    let selectedChoice = selectedModelChoice(for: surface)
-                                    let supportedEfforts = selectedChoice?.supportedReasoningEfforts
-                                        ?? ["low", "medium", "high", "xhigh"]
-                                    Picker("Think", selection: Binding(
-                                        get: {
-                                            let current = surfaceReasoningEffort[surface]
-                                                ?? selectedChoice?.defaultReasoningEffort
-                                                ?? "high"
-                                            return supportedEfforts.contains(current)
-                                                ? current
-                                                : (supportedEfforts.first ?? "high")
-                                        },
-                                        set: { newVal in
-                                            requestSetSurfaceReasoning(surface: surface, effort: newVal)
-                                        }
-                                    )) {
-                                        ForEach(supportedEfforts, id: \.self) { effort in
-                                            Text(reasoningLabel(effort)).tag(effort)
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
-                                    .frame(width: ProviderSurfaceRowLayout.reasoningPickerWidth)
-                                    .disabled(selectedChoice?.isUnavailable == true
-                                        || supportedEfforts.isEmpty
-                                        || savingSurfaceModels.contains(surface))
-                                    .accessibilityLabel("\(surfaceLabel(surface)) reasoning effort")
-
-                                    Toggle("Fast", isOn: Binding(
-                                        get: { surfaceFastMode[surface] ?? false },
-                                        set: { enabled in
-                                            requestSetSurfaceFastMode(surface: surface, enabled: enabled)
-                                        }
-                                    ))
-                                    .toggleStyle(.switch)
-                                    .controlSize(.small)
-                                    .fixedSize(horizontal: true, vertical: false)
-                                    .frame(width: ProviderSurfaceRowLayout.fastToggleWidth)
-                                    .disabled(selectedChoice?.isUnavailable == true
-                                        || selectedChoice?.supportsFast != true
-                                        || savingSurfaceModels.contains(surface))
-                                    .accessibilityLabel("\(surfaceLabel(surface)) Fast mode")
-                                    .help(selectedChoice?.supportsFast == true
-                                        ? "Use the account-advertised priority service tier for this surface."
-                                        : "Fast is not advertised for this provider/model.")
-                                }
-                                .padding(.vertical, 3)
-                                if surface != surfaces.last {
-                                    Divider()
                                 }
                             }
                         }
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.bottom, 32)
         }
+    }
+
+    /// One surface: its name, the account behind it, the model, how hard it
+    /// thinks, and whether it runs on the priority tier.
+    @ViewBuilder
+    private func surfaceRow(_ surface: String) -> some View {
+        let surfModels = modelsForSurface(surface)
+        let selectedChoice = selectedModelChoice(for: surface)
+        let supportedEfforts = selectedChoice?.supportedReasoningEfforts
+            ?? ["low", "medium", "high", "xhigh"]
+        HStack(spacing: 8) {
+            Text(surfaceLabel(surface))
+                .font(ShellType.labelMedium)
+                .foregroundStyle(NativeAgentShell.text)
+                .frame(width: 112, alignment: .leading)
+
+            Picker("Provider", selection: Binding(
+                get: { activeSurface[surface] ?? "codex" },
+                set: { newVal in
+                    requestSetActiveSurface(surface: surface, providerId: newVal)
+                }
+            )) {
+                ForEach(pickerProviders) { provider in
+                    let ready = provider.auth_status.state == "ready"
+                    Text(provider.display_name + (ready ? "" : " — needs attention"))
+                        .tag(provider.provider_id)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .font(ShellType.label)
+            .frame(width: 210)
+            .disabled(savingSurfaces.contains(surface))
+            .accessibilityLabel("\(surfaceLabel(surface)) provider")
+
+            // PATCH-2026-05-28 (per-surface model): model picker scoped to the
+            // provider chosen for THIS surface. Plain dropdown (no search) even
+            // for OpenRouter's long list.
+            Picker("Model", selection: Binding(
+                get: {
+                    let cur = surfaceModel[surface] ?? ""
+                    if surfModels.contains(where: { $0.id == cur }) { return cur }
+                    return surfModels.first?.id ?? cur
+                },
+                set: { newVal in
+                    requestSetSurfaceModel(surface: surface, model: newVal)
+                }
+            )) {
+                if surfModels.isEmpty {
+                    Text("—").tag("")
+                } else {
+                    ForEach(surfModels) { m in
+                        Text(m.name).tag(m.id)
+                    }
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .font(ShellType.label)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .disabled(surfModels.isEmpty || savingSurfaceModels.contains(surface))
+            .accessibilityLabel("\(surfaceLabel(surface)) model")
+
+            Picker("Think", selection: Binding(
+                get: {
+                    let current = surfaceReasoningEffort[surface]
+                        ?? selectedChoice?.defaultReasoningEffort
+                        ?? "high"
+                    return supportedEfforts.contains(current)
+                        ? current
+                        : (supportedEfforts.first ?? "high")
+                },
+                set: { newVal in
+                    requestSetSurfaceReasoning(surface: surface, effort: newVal)
+                }
+            )) {
+                ForEach(supportedEfforts, id: \.self) { effort in
+                    Text(reasoningLabel(effort)).tag(effort)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .font(ShellType.label)
+            .frame(width: ProviderSurfaceRowLayout.reasoningPickerWidth)
+            .disabled(selectedChoice?.isUnavailable == true
+                || supportedEfforts.isEmpty
+                || savingSurfaceModels.contains(surface))
+            .accessibilityLabel("\(surfaceLabel(surface)) reasoning effort")
+
+            Toggle("Fast", isOn: Binding(
+                get: { surfaceFastMode[surface] ?? false },
+                set: { enabled in
+                    requestSetSurfaceFastMode(surface: surface, enabled: enabled)
+                }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .font(ShellType.label)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(width: ProviderSurfaceRowLayout.fastToggleWidth)
+            .disabled(selectedChoice?.isUnavailable == true
+                || selectedChoice?.supportsFast != true
+                || savingSurfaceModels.contains(surface))
+            .accessibilityLabel("\(surfaceLabel(surface)) Fast mode")
+            .help(selectedChoice?.supportsFast == true
+                ? "Use the account's priority service tier for this surface."
+                : "This account and model do not offer a priority tier.")
+        }
+        .frame(height: 48)
     }
 
     private func loadProviders(refreshCatalog: Bool = false) async {
@@ -602,9 +670,32 @@ struct ProviderSettingsView: View {
                     surfaceFastMode[surface] = false
                 }
             }
-            statusText = rowSet.unsupportedStoredKeys.isEmpty
+            // User, 2026-09-06: Refresh reloads the model catalog too, and a
+            // catalog read that never reached the provider was overwritten
+            // here with a flat "Providers loaded". The read says where its
+            // rows came from; so does this line.
+            let catalogNote: String? = {
+                guard refreshCatalog else { return nil }
+                switch snapshot.catalog?.catalogFreshness
+                    .flatMap(ModelCatalogFreshness.init(rawValue:)) {
+                case .staleAfterFailedRefresh:
+                    return "model catalog refresh failed, showing the cached list"
+                case .builtInAfterFailedRefresh:
+                    return "model catalog refresh failed, showing the built-in list"
+                case .cached:
+                    return "model catalog unchanged, showing the cached list"
+                case .builtIn:
+                    return "model catalog showing the built-in list"
+                case .liveIncomplete:
+                    return "model catalog refreshed; the provider's list may be partial"
+                case .live, .none:
+                    return nil
+                }
+            }()
+            let loadedText = rowSet.unsupportedStoredKeys.isEmpty
                 ? "Providers loaded at \(shortTime())"
                 : "Provider settings need repair before every saved surface can be configured."
+            statusText = catalogNote.map { "\(loadedText) — \($0)" } ?? loadedText
             providerLoadError = nil
         case let .failed(detail):
             providerLoadError = detail
@@ -614,11 +705,11 @@ struct ProviderSettingsView: View {
 
     private func statusColor(_ tone: ProviderSettingsStatusTextPresentation.Tone) -> Color {
         switch tone {
-        case .info: return .secondary
-        case .progress: return .secondary
-        case .success: return .green
-        case .warning: return .orange
-        case .failure: return .red
+        case .info, .progress: return NativeAgentShell.secondary
+        case .success: return NativeAgentShell.calm
+        // The shell palette carries one attention colour. A warning and a
+        // failure both wear it; the sentence says which it is.
+        case .warning, .failure: return NativeAgentShell.trouble
         }
     }
 
@@ -850,8 +941,8 @@ struct ProviderSettingsView: View {
 }
 
 // MARK: - Provider Row
-// Provider rows are plain grouped-list content because the parent NativePanel
-// already provides the containing surface.
+// A provider row carries no surface of its own: the card it sits in is the
+// surface.
 
 // internal (was private) so the onboarding provider-connect step can reuse the
 // SAME row + config sheet as the working Providers settings panel (User,
@@ -861,32 +952,35 @@ struct ProviderRowView: View {
     let onConfigure: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
+        HStack(alignment: .center, spacing: 12) {
             Image(systemName: providerIcon(provider.provider_id))
-                .font(.title3)
-                .foregroundStyle(.secondary)
-                .frame(width: 28)
+                .font(ShellType.body)
+                .foregroundStyle(NativeAgentShell.tertiary)
+                .frame(width: 24)
             VStack(alignment: .leading, spacing: 2) {
                 Text(provider.display_name)
-                    .font(NativeAgentFont.section)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                 Text(provider.auth_modes.joined(separator: " / "))
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(1)
             }
-            Spacer()
-            StatusBadge(
+            Spacer(minLength: 8)
+            ProviderStatusWord(
                 text: statusLabel(provider.auth_status.state),
-                status: statusBadgeKind(provider.auth_status.state)
+                kind: statusBadgeKind(provider.auth_status.state)
             )
-            Button("Configure", systemImage: "slider.horizontal.3") {
+            Button("Set up") {
                 onConfigure()
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            .font(ShellType.labelMedium)
         }
-        .padding(.horizontal, NativeAgentSpacing.sm)
-        .padding(.vertical, NativeAgentSpacing.sm)
+        .frame(height: 48)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func providerIcon(_ id: String) -> String {
@@ -905,10 +999,10 @@ struct ProviderRowView: View {
     private func statusLabel(_ state: String) -> String {
         switch state {
         case "ready":       return "Ready"
-        case "needs_key":   return "Needs key"
-        case "needs_oauth": return "Needs OAuth"
-        case "error":       return "Error"
-        default:            return state
+        case "needs_key":   return "Needs a key"
+        case "needs_oauth": return "Needs a sign-in"
+        case "error":       return "Not working"
+        default:            return "Not set up"
         }
     }
 
@@ -1128,208 +1222,212 @@ struct ProviderConfigSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text(provider.display_name)
-                        .font(.title2).bold()
+                        .font(ShellType.title)
+                        .foregroundStyle(NativeAgentShell.text)
                     // FIRSTRUN-2: an unverified save must not inherit the
                     // file-presence "ready" badge.
                     if let badge = verification.badge {
-                        StatusBadge(text: badge.text, status: badge.status)
+                        ProviderStatusWord(text: badge.text, kind: badge.status)
                     } else {
-                        StatusBadge(
-                            text: provider.auth_status.state,
-                            status: provider.auth_status.state == "ready" ? "ok" : "warn"
+                        ProviderStatusWord(
+                            text: provider.auth_status.state == "ready" ? "Ready" : "Not set up",
+                            kind: provider.auth_status.state == "ready" ? "ok" : "warn"
                         )
                     }
                 }
-                Spacer()
+                Spacer(minLength: 8)
                 Button("Done") { onDone() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.regular)
+                    .font(ShellType.labelMedium)
             }
-            .padding()
-
-            Divider()
+            .padding(20)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    // Auth mode
+                VStack(alignment: .leading, spacing: 24) {
                     if authModePickerState.supportedModes.isEmpty {
-                        NativePanel(title: "Authentication unavailable", systemImage: "exclamationmark.triangle") {
-                            Text("This provider did not advertise a supported authentication method. Refresh Providers or repair its configuration before saving.")
-                                .font(.callout)
-                                .foregroundStyle(.orange)
+                        ProviderSection(label: "How to sign in") {
+                            ProviderCard {
+                                ProviderCardTitle(
+                                    title: "No way in was offered",
+                                    line: "This account did not name a sign-in method. Refresh the accounts, or repair its configuration, before saving."
+                                )
+                            }
                         }
                     } else if authModePickerState.supportedModes.count > 1 {
-                        NativePanel(title: "Authentication Mode", systemImage: "key.fill") {
-                            Picker("Mode", selection: $authMode) {
-                                ForEach(authModePickerState.supportedModes, id: \.self) { mode in
-                                    Text(authModeLabel(mode)).tag(mode)
+                        ProviderSection(label: "How to sign in") {
+                            ProviderCard {
+                                Picker("Mode", selection: $authMode) {
+                                    ForEach(authModePickerState.supportedModes, id: \.self) { mode in
+                                        Text(authModeLabel(mode)).tag(mode)
+                                    }
                                 }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                                .fixedSize()
                             }
-                            .pickerStyle(.segmented)
                         }
                     }
 
                     if let repaired = authModePickerState.repairedSavedMode,
                        !authModePickerState.supportedModes.isEmpty {
-                        Label(
-                            "The saved authentication method ‘\(repaired)’ is no longer supported; using \(authModeLabel(authMode)).",
-                            systemImage: "exclamationmark.triangle.fill"
+                        ProviderNote(
+                            text: "The saved sign-in method is no longer offered, so \(authModeLabel(authMode)) is being used instead.",
+                            color: NativeAgentShell.trouble
                         )
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                        .accessibilityLabel("The saved sign-in method \(repaired) is no longer offered.")
                     }
 
                     // API Key input (shown when api_key mode or provider only supports api_key)
                     if authMode == "api_key" {
-                        NativePanel(title: "API Key", systemImage: "lock.fill") {
-                            SecureField("Paste API key here…", text: $apiKey)
-                                .textFieldStyle(.roundedBorder)
-                                .font(NativeAgentFont.mono)
-                            Text("Stored at ~/Library/Application Support/NativeAgent/providers/\(provider.provider_id).json with 0600 permissions. Never logged.")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                        ProviderSection(label: "Key") {
+                            ProviderCard {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    SecureField("Paste the key here", text: $apiKey)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(ProviderType.code)
+                                    ProviderNote(text: "The key is kept on this Mac only, readable by you alone, and is never written to a log.")
+                                }
+                            }
                         }
                     }
 
-                    // OAuth info
                     if authMode == "oauth" {
-                        NativePanel(title: "OAuth / Subscription", systemImage: "person.crop.circle.badge.checkmark") {
-                            if provider.provider_id == "anthropic" {
-                                Text("Use your Claude Pro/Max subscription via the Claude Code CLI instead of paying for API credits.")
-                                    .font(.callout)
-                                if let userInfo = provider.auth_status.user_info {
-                                    InfoPill(text: userInfo["version"] ?? "claude CLI", systemImage: "terminal")
-                                }
-                            } else if provider.provider_id == "anthropic_mcp" {
-                                AnthropicMCPStatusPanel(provider: provider, appModel: appModel)
-                            } else if provider.provider_id == "anthropic_oauth_direct" {
-                                AnthropicOAuthDirectPanel()
-                            } else if provider.provider_id == "xai_oauth_direct" {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("NativeAgent-owned xAI OAuth for Grok model access.")
-                                        .font(.callout)
-                                    OAuthSignInButton(provider: .xai) {
-                                        Task { await appModel.loadProvidersForChat() }
+                        ProviderSection(label: "Sign in") {
+                            ProviderCard {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    if provider.provider_id == "anthropic" {
+                                        Text("Use your Claude Pro or Max subscription through the Claude command-line tool instead of paying for credits.")
+                                            .font(ShellType.label)
+                                            .foregroundStyle(NativeAgentShell.text)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        if let userInfo = provider.auth_status.user_info {
+                                            ProviderNote(text: userInfo["version"] ?? "claude command-line tool")
+                                        }
+                                    } else if provider.provider_id == "anthropic_mcp" {
+                                        AnthropicMCPStatusPanel(provider: provider, appModel: appModel)
+                                    } else if provider.provider_id == "anthropic_oauth_direct" {
+                                        AnthropicOAuthDirectPanel()
+                                    } else if provider.provider_id == "xai_oauth_direct" {
+                                        Text("Sign in to xAI for Grok models.")
+                                            .font(ShellType.label)
+                                            .foregroundStyle(NativeAgentShell.text)
+                                        OAuthSignInButton(provider: .xai) {
+                                            Task { await appModel.loadProvidersForChat() }
+                                        }
                                     }
+                                    ProviderNote(text: provider.auth_status.detail)
                                 }
                             }
-                            Text(provider.auth_status.detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
                         }
                     }
 
-                    // Model selection
                     if !availableModels.isEmpty {
-                        NativePanel(title: "Default Model", systemImage: "cpu") {
-                            Picker("Model", selection: $selectedModel) {
-                                ForEach(availableModels) { model in
-                                    Text(model.name).tag(model.id)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            Text("This changes this provider’s fallback default. Surface model pins are configured separately in the provider table.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            if let message = modelPickerPresentation.message {
-                                Label(message, systemImage: "exclamationmark.triangle.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            if let model = availableModels.first(where: { $0.id == selectedModel }) {
-                                HStack(spacing: 8) {
-                                    capabilityPill("Streaming", ok: model.supports_streaming)
-                                    capabilityPill("Vision", ok: model.supports_vision)
-                                    capabilityPill("Tools", ok: model.supports_tools)
-                                    capabilityPill("JSON", ok: model.supports_json_mode)
+                        ProviderSection(label: "Model it falls back to") {
+                            ProviderCard {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Picker("Model", selection: $selectedModel) {
+                                        ForEach(availableModels) { model in
+                                            Text(model.name).tag(model.id)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    .labelsHidden()
+                                    .font(ShellType.label)
+                                    ProviderNote(text: "This is the model used by a surface that is assigned to this provider and has not pinned one of its own. Surface assignments and pins are set on the Providers page.")
+                                    if let message = modelPickerPresentation.message {
+                                        ProviderNote(text: message, color: NativeAgentShell.trouble)
+                                    }
+                                    if let model = availableModels.first(where: { $0.id == selectedModel }) {
+                                        HStack(spacing: 12) {
+                                            capabilityPill("Streaming", ok: model.supports_streaming)
+                                            capabilityPill("Vision", ok: model.supports_vision)
+                                            capabilityPill("Tools", ok: model.supports_tools)
+                                            capabilityPill("JSON", ok: model.supports_json_mode)
+                                        }
+                                    }
                                 }
                             }
                         }
                     } else if !selectedModel.isEmpty,
                               let message = modelPickerPresentation.message {
-                        NativePanel(title: "Default Model", systemImage: "cpu") {
-                            Label(message, systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .fixedSize(horizontal: false, vertical: true)
+                        ProviderSection(label: "Model it falls back to") {
+                            ProviderCard {
+                                ProviderNote(text: message, color: NativeAgentShell.trouble)
+                            }
                         }
                     }
 
-                    // Test result
                     if let result = testResult {
-                        NativePanel(
-                            title: "Connection Test",
-                            systemImage: result.status == "ok" ? "checkmark.circle.fill" : "xmark.circle.fill",
-                            tint: result.status == "ok" ? .green : .red
-                        ) {
-                            if result.tested {
-                                if let response = result.response {
-                                    Text("Response: \(response)").font(.callout)
+                        ProviderSection(label: "Connection test") {
+                            ProviderCard {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    if result.tested {
+                                        if let response = result.response {
+                                            Text(response)
+                                                .font(ShellType.label)
+                                                .foregroundStyle(NativeAgentShell.text)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                        }
+                                        if let error = result.error {
+                                            ProviderNote(text: error, color: NativeAgentShell.trouble)
+                                        }
+                                        if let model = result.model_used {
+                                            ProviderNote(text: model)
+                                        }
+                                    } else {
+                                        ProviderNote(text: result.detail ?? "The test did not run.")
+                                    }
                                 }
-                                if let error = result.error {
-                                    Text("Error: \(error)").font(.callout).foregroundStyle(.red)
-                                }
-                                if let model = result.model_used {
-                                    InfoPill(text: model, systemImage: "cpu")
-                                }
-                            } else {
-                                Text(result.detail ?? result.status)
-                                    .font(.callout)
-                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
 
                     if !statusText.isEmpty {
-                        Text(statusText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                        ProviderNote(text: statusText)
                     }
 
-                    // Actions
-                    HStack {
-                        Button(isSaving ? "Saving…" : "Save", systemImage: "checkmark.circle") {
+                    HStack(spacing: 8) {
+                        Button(isSaving ? "Saving…" : "Save") {
                             Task { await saveConfig() }
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(isSaving || modelPickerPresentation.needsReplacement || !authModePickerState.canSave)
 
-                        Button(isTesting ? "Testing…" : "Test Connection", systemImage: "network") {
+                        Button(isTesting ? "Testing…" : "Test the connection") {
                             Task { await runTest() }
                         }
                         .buttonStyle(.bordered)
                         .disabled(isTesting)
 
-                        Spacer()
+                        Spacer(minLength: 8)
 
-                        Button("Remove Credentials", systemImage: "trash", role: .destructive) {
+                        Button("Remove the key", role: .destructive) {
                             showRemoveCredentialsConfirm = true
                         }
                         .buttonStyle(.bordered)
-                        .foregroundStyle(.red)
                     }
+                    .font(ShellType.labelMedium)
                 }
-                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
             }
         }
         .frame(minWidth: 480, minHeight: 420)
         .confirmationDialog(
-            "Remove \(provider.display_name) credentials?",
+            "Remove the \(provider.display_name) key?",
             isPresented: $showRemoveCredentialsConfirm,
             titleVisibility: .visible
         ) {
-            Button("Remove Credentials", role: .destructive) {
+            Button("Remove the key", role: .destructive) {
                 Task { await clearConfig() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This disconnects the provider and removes its saved credential from this Mac. Surfaces using it may be unavailable until another provider is selected.")
+            Text("This disconnects the account and removes its saved key from this Mac. Surfaces using it stop working until another account is chosen.")
         }
     }
 
@@ -1374,15 +1472,40 @@ struct ProviderConfigSheet: View {
     private func runTest() async {
         isTesting = true
         testResult = nil
+        // User, 2026-09-06: test what the sheet is showing. A key typed here and
+        // not saved yet is the credential the person is asking about; testing
+        // the saved one instead let a bad draft read "Saved and tested" off the
+        // old key, and made a valid pasted key report "no api key configured"
+        // on a fresh install. A draft result never touches `verification` —
+        // that state describes the SAVED credential, and nothing was saved.
+        let draftKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let testsDraft = authMode == "api_key" && !draftKey.isEmpty
         do {
-            let result = try await appModel.testProvider(provider.provider_id)
+            let result = try await appModel.testProvider(
+                provider.provider_id,
+                apiKeyOverride: testsDraft ? draftKey : nil
+            )
             testResult = result
-            // FIRSTRUN-2: Test Connection is the only thing that can clear the
-            // saved-but-unverified state.
-            verification = .afterTest(result)
-            statusText = verification.statusText()
+            if testsDraft {
+                if result.tested && result.status == "ok" {
+                    statusText = "Tested the key typed here and it works. It is not saved yet — press Save to keep it."
+                } else if result.tested {
+                    statusText = "Tested the key typed here and it did not work. It is not saved."
+                } else {
+                    statusText = "This provider has no connection test, so the key typed here was not checked. Press Save to keep it."
+                }
+            } else {
+                // FIRSTRUN-2: Test Connection is the only thing that can clear
+                // the saved-but-unverified state.
+                verification = .afterTest(result)
+                statusText = verification.statusText(
+                    providerNote: "This tested the key saved on this Mac."
+                )
+            }
         } catch {
-            verification = .verificationFailed
+            if !testsDraft {
+                verification = .verificationFailed
+            }
             statusText = "Test error: \(error.localizedDescription)"
         }
         isTesting = false
@@ -1391,10 +1514,32 @@ struct ProviderConfigSheet: View {
     private func clearConfig() async {
         do {
             _ = try await appModel.clearProvider(provider.provider_id)
+            // User, 2026-09-06: for an OAuth provider the credential does not
+            // live in providers/<id>.json — ChatGPT's is in codex_home/auth.json
+            // and the others in their adapters' own token files — so removing
+            // the registry row left the account connected while the sheet said
+            // it had been disconnected. Go through the same path the OAuth
+            // "Sign out" button uses; it no-ops for non-OAuth providers.
+            _ = NativeOAuthFlow.clearTokens(
+                providerId: provider.provider_id,
+                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            )
             apiKey = ""
             verification = .afterClear()
             testResult = nil
-            statusText = "Credentials removed."
+            // The shared ~/.codex/auth.json belongs to the Codex CLI and is
+            // never deleted here, so say so rather than claiming a removal
+            // that did not happen (same wording the Sign out button uses).
+            // User, 2026-09-06: this asked `isSignedIn`, which reads the auth
+            // path chat will USE — and the removal just flipped CLI adoption to
+            // declined, so the normal case answered false and reported
+            // "Credentials removed" with the shared file still on disk. The
+            // disclosure now keys off the shared file itself.
+            statusText = NativeOAuthFlow.sharedCodexCLISessionRemains(
+                providerId: provider.provider_id
+            )
+                ? "Shared Codex auth is still signed in. Sign out from Codex to remove it."
+                : "Credentials removed."
             // S.5: propagate cleared credentials to the provider list so the
             // parent ProviderSettingsView and the chat brain bar reflect the
             // new auth_status (needs_key / needs_oauth) immediately.
@@ -1406,20 +1551,19 @@ struct ProviderConfigSheet: View {
 
     private func authModeLabel(_ mode: String) -> String {
         switch mode {
-        case "api_key": return "API Key"
-        case "oauth":   return "OAuth / Subscription"
-        default:        return mode
+        case "api_key": return "A key"
+        case "oauth":   return "A sign-in"
+        default:        return "Something else"
         }
     }
 
+    /// What the model can do, said in words. Calm when it can, quiet when it
+    /// cannot — no plate under either.
     @ViewBuilder
     private func capabilityPill(_ label: String, ok: Bool) -> some View {
         Text(label)
-            .font(.caption2)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(ok ? Color.green.opacity(0.18) : Color.secondary.opacity(0.12), in: Capsule())
-            .foregroundStyle(ok ? Color.green : Color.secondary)
+            .font(ShellType.caption)
+            .foregroundStyle(ok ? NativeAgentShell.calm : NativeAgentShell.tertiary)
     }
 }
 
@@ -1557,41 +1701,37 @@ private struct AnthropicMCPStatusPanel: View {
         VStack(alignment: .leading, spacing: 8) {
             if let headline = presentation.headline {
                 Text(headline)
-                    .font(.callout).bold()
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
             }
-            HStack(spacing: 8) {
-                StatusBadge(text: presentation.cliBadge, status: presentation.cliBadgeStatus)
+            HStack(spacing: 12) {
+                ProviderStatusWord(text: presentation.cliBadge, kind: presentation.cliBadgeStatus)
                 if let version = presentation.version {
-                    InfoPill(text: version, systemImage: "terminal")
+                    Text(version)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
                 if let mode = presentation.mode {
-                    InfoPill(
-                        text: mode,
-                        systemImage: mode == "MCP server"
-                            ? "antenna.radiowaves.left.and.right"
-                            : "arrow.clockwise"
-                    )
+                    Text(mode)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
                 if let processStatus = presentation.processStatus {
-                    StatusBadge(text: processStatus.label, status: processStatus.badgeStatus)
+                    ProviderStatusWord(text: processStatus.label, kind: processStatus.badgeStatus)
                 }
             }
             if let detail = presentation.detail {
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                ProviderNote(text: detail)
             }
-            HStack(spacing: 8) {
-                Button(isTesting ? "Testing…" : "Test Connection", systemImage: "network") {
-                    Task { await runPersistentTest() }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(isTesting)
+            Button(isTesting ? "Testing…" : "Test the connection") {
+                Task { await runPersistentTest() }
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .font(ShellType.labelMedium)
+            .disabled(isTesting)
             if !testResult.isEmpty {
-                Text(testResult).font(.caption).foregroundStyle(.secondary)
+                ProviderNote(text: testResult)
             }
         }
         .task(id: provider.auth_status.last_checked_at) {
@@ -1633,15 +1773,116 @@ struct AnthropicOAuthDirectPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(AnthropicOAuthDirectPanelPresentation.title)
-                .font(.callout).bold()
-            Text(AnthropicOAuthDirectPanelPresentation.detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
+            ProviderNote(text: AnthropicOAuthDirectPanelPresentation.detail)
             // Provider list rows are a snapshot. The canonical sign-in control
             // reads the same root it writes, so this panel cannot keep offering
             // Connect after the browser flow committed or claim authorization
             // from a stale provider-list response.
             OAuthSignInButton(provider: .anthropic)
+        }
+    }
+}
+
+// MARK: - Page kit
+//
+// The page's own small vocabulary: an eyebrow over a run, the card a group of
+// controls sits in, the card's own headline, one quiet line, and the one word
+// that says how an account stands.
+
+/// 13 monospaced, for a value that is a code. `ShellType` carries no
+/// monospaced face, so this derives one from the token size.
+private enum ProviderType {
+    static let code = Font.system(size: ShellType.labelSize, design: .monospaced)
+}
+
+private struct ProviderSection<Content: View>: View {
+    let label: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(label)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+            content
+        }
+    }
+}
+
+private struct ProviderCard<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(TodayPalette.cardFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+            )
+    }
+}
+
+private struct ProviderCardTitle: View {
+    let title: String
+    let line: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
+            Text(line)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ProviderNote: View {
+    let text: String
+    var color: Color = NativeAgentShell.secondary
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.caption)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+    }
+}
+
+/// How an account stands, in one word, in one of the two colours the shell
+/// palette carries for state. No plate: a coloured word on the card is enough.
+private struct ProviderStatusWord: View {
+    let text: String
+    /// "ok", "warn" or "error", as the presentation types already spell it.
+    let kind: String
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.captionSemibold)
+            .foregroundStyle(color)
+            .lineLimit(1)
+    }
+
+    private var color: Color {
+        switch kind {
+        case "ok": NativeAgentShell.calm
+        // The shell palette has one attention colour; a warning and a failure
+        // both wear it, and the word says which it is.
+        case "warn", "error": NativeAgentShell.trouble
+        default: NativeAgentShell.secondary
         }
     }
 }

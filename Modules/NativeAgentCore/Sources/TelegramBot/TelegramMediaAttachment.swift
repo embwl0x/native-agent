@@ -61,10 +61,34 @@ public actor TelegramMediaDownloader {
         self.session = session
     }
 
+    /// 2026-09-06: URLSession reports cooperative task cancellation as
+    /// NSURLError -999 (`URLError.cancelled`), not `CancellationError` — and
+    /// both `session.bytes` and the byte loop torn down by `body.task.cancel()`
+    /// surface it. The poll loop's photo branch releases the admitted claim on
+    /// `CancellationError` only, so an unnormalised -999 was read as an
+    /// ordinary download failure: the photo was consumed, the claim settled,
+    /// and the sender never got an answer. `TelegramBot+Client.longPoll`
+    /// normalises the same way.
     public func download(
         token: String,
         attachment: TelegramMediaAttachment,
         maxBytes: Int = 25 * 1024 * 1024
+    ) async throws -> TelegramMediaAttachment {
+        do {
+            return try await performDownload(
+                token: token,
+                attachment: attachment,
+                maxBytes: maxBytes
+            )
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
+        }
+    }
+
+    private func performDownload(
+        token: String,
+        attachment: TelegramMediaAttachment,
+        maxBytes: Int
     ) async throws -> TelegramMediaAttachment {
         // --- Stage 1: getFile ---
         let encodedToken = _tgPctEncode(token)

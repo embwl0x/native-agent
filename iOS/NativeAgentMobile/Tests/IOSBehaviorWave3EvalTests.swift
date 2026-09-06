@@ -13,6 +13,12 @@ import NativeAgentShared
 /// route; this suite proves the state a route is allowed to present.
 @MainActor
 final class IOSBehaviorWave3EvalTests: XCTestCase {
+    func testAstraIsAnExactPreferredModelWithoutChangingTheDefault() {
+        XCTAssertTrue(ChatView.preferredModelIDs.contains("gpt-6-astra"))
+        XCTAssertFalse(ChatView.preferredModelIDs.contains("gpt-6"))
+        XCTAssertEqual(ChatView.preferredModelIDs.first, "gpt-5.6-sol")
+    }
+
     private var savedApprovals: [ApprovalRequest] = []
     private var savedMemories: [MemoryRecord] = []
     private var savedProposals: [MemoryProposalRecord] = []

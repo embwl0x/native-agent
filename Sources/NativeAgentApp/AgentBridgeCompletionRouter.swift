@@ -672,6 +672,7 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
   enum DeliveryError: LocalizedError {
     case telegramNotConfigured
     case invalidTelegramDestination
+    case invalidTelegramThread(String)
     case missingSlackDestination
     case missingIOSSourceKey
     case slackRejected(String)
@@ -683,6 +684,8 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       case .telegramNotConfigured: return "Telegram is not enabled or has no bot token."
       case .invalidTelegramDestination:
         return "The originating Telegram chat id is missing or invalid."
+      case .invalidTelegramThread(let raw):
+        return "The originating Telegram topic id is not a number: \(raw)"
       case .missingSlackDestination: return "The originating Slack channel id is missing."
       case .missingIOSSourceKey: return "The originating iOS device route key is missing."
       case .slackRejected(let detail): return "Slack rejected the completion: \(detail)"
@@ -765,6 +768,8 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       return .rejected(reason: "telegram_not_configured", retryable: false)
     } catch DeliveryError.invalidTelegramDestination {
       return .rejected(reason: "invalid_telegram_destination", retryable: false)
+    } catch DeliveryError.invalidTelegramThread(let raw) {
+      return .rejected(reason: "invalid_telegram_thread:\(raw)", retryable: false)
     } catch DeliveryError.missingSlackDestination {
       return .rejected(reason: "missing_slack_destination", retryable: false)
     } catch DeliveryError.missingIOSSourceKey {
@@ -793,14 +798,31 @@ struct LiveAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       guard let rawChatId = route.destinationId, let chatId = Int(rawChatId) else {
         throw DeliveryError.invalidTelegramDestination
       }
+      // 2026-09-06: a completion answers in the forum topic its turn came
+      // from. The route already carries that thread (Slack uses the same field
+      // for thread_ts); without it the reply landed in General.
+      //
+      // 2026-09-06: a thread id that is present but not a number is a broken
+      // route, not an instruction to answer the whole chat. Converting it to
+      // nil published the topic's reply — approvals and tool output included —
+      // into the supergroup's General for everyone to read.
+      let rawThreadId = route.threadId?.trimmingCharacters(in: .whitespacesAndNewlines)
+      var threadId: Int?
+      if let rawThreadId, !rawThreadId.isEmpty {
+        guard let parsed = Int(rawThreadId) else {
+          throw DeliveryError.invalidTelegramThread(rawThreadId)
+        }
+        threadId = parsed
+      }
+      let destination = TelegramDestination(chatId: chatId, threadId: threadId)
       switch artifact.payload {
       case .text(let text):
-        try await TelegramPollLoop.defaultSendMessage(config.botToken, chatId, text)
+        try await TelegramPollLoop.defaultSendMessage(config.botToken, destination, text)
       case .attachment(let attachment):
         guard let path = attachment.path else { throw DeliveryError.emptyCompletion }
         try await TelegramPollLoop.defaultSendPhoto(
           config.botToken,
-          chatId,
+          destination,
           path,
           attachment.name
         )

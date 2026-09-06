@@ -3,6 +3,7 @@ import Testing
 import CognitiveSubstrate
 import NativeAgentShared
 import PersistenceCore
+@testable import WorkshopExecution
 @testable import NativeAgentApp
 
 private func livingOrganismSnapshot(
@@ -273,4 +274,104 @@ private func livingOrganismSnapshot(
     #expect(tired.behaviorLine.contains("lightweightOnly"))
     #expect(rested.posture != "Tired")
     #expect(rested.behaviorLine.contains("tools normal"))
+}
+
+// MARK: - one predicate, two surfaces (fable51 #6)
+
+/// The Desk headlined "Needs you · 10" while this panel said "does not need
+/// you", same minute, because each had its own predicate. Both now read Core's
+/// `OwnerAttentionPolicy`, so ONE fixture must produce ONE answer. This test
+/// runs the fixture through the real shaping functions of both surfaces —
+/// `DeskAttentionStrip.plan` and `LivingStatusSnapshot.make` — never a
+/// re-implementation of either.
+private func attentionFixtureItem(
+    _ handle: String,
+    status: DeskStatus,
+    waitingOn: String? = nil,
+    blockedReason: String? = nil
+) -> DeskItem {
+    DeskItem(
+        handle: handle,
+        alias: handle,
+        kind: .project,
+        status: status,
+        project: "p",
+        title: "t \(handle)",
+        openedAt: "2026-08-01T00:00:00.000000+00:00",
+        updatedAt: "2026-08-01T00:00:00.000000+00:00",
+        blockedReason: blockedReason,
+        waitingOn: waitingOn)
+}
+
+private func attentionFixtureApproval(_ id: String) -> WorkshopExecution.WorkshopExecutionRecord {
+    WorkshopExecutionRecord(
+        id: id,
+        title: "exec \(id)",
+        objective: "o",
+        createdAt: "2026-08-01T00:00:00.000000+00:00",
+        status: "blocked_on_approval",
+        plan: [],
+        stepsCompleted: [],
+        receiptsDir: "/tmp/r",
+        triggerSource: "manual",
+        trustRequired: "none",
+        expectedOutputs: [],
+        currentStepId: "",
+        updatedAt: "2026-08-01T00:00:00.000000+00:00",
+        result: .null,
+        rerunCount: 0)
+}
+
+@Test("Desk and Living Status answer 'does she need User?' identically")
+func deskAndLivingStatusShareOneNeedsUserPredicate() {
+    func answers(
+        items: [DeskItem],
+        approvals: [WorkshopExecution.WorkshopExecutionRecord]
+    ) -> (desk: DeskAttentionStrip.Plan, living: LivingStatusSnapshot) {
+        let plan = DeskAttentionStrip.plan(
+            approvals: approvals,
+            githubNeedsYou: [],
+            otherAttention: items,
+            githubBlocked: [],
+            showingAll: true)
+        let living = LivingStatusSnapshot.make(
+            organism: livingOrganismSnapshot(),
+            activeDeskCount: items.count,
+            blockedDeskCount: items.filter { $0.status == .blocked }.count,
+            ownerDecisionDeskCount: OwnerAttentionPolicy.ownerDecisionCount(in: items),
+            pendingApprovals: approvals.count,
+            requiredApprovals: approvals.count,
+            latestDream: nil)
+        return (plan, living)
+    }
+
+    // Blocked on things that are NOT User: CI, a sibling item, a verifier.
+    let blockedOnOthers = [
+        attentionFixtureItem("b1", status: .blocked, blockedReason: "waiting on CI"),
+        attentionFixtureItem("b2", status: .blocked, waitingOn: "codex"),
+        attentionFixtureItem("b3", status: .flag, waitingOn: "domain verification"),
+    ]
+    let blockedOnly = answers(items: blockedOnOthers, approvals: [])
+    #expect(blockedOnly.desk.totalItems == 3)
+    #expect(blockedOnly.desk.waitingOnYouItems == 0)
+    #expect(blockedOnly.desk.blockedItems == 3)
+    #expect(blockedOnly.living.needsText != "needs you")
+    #expect((blockedOnly.desk.waitingOnYouItems > 0)
+            == (blockedOnly.living.needsText == "needs you"))
+
+    // Same rows plus one that names the owner, plus one parked approval.
+    let withOwnerWork = blockedOnOthers + [
+        attentionFixtureItem("o1", status: .blocked, waitingOn: "owner"),
+    ]
+    let owed = answers(items: withOwnerWork, approvals: [attentionFixtureApproval("e0")])
+    #expect(owed.desk.totalItems == 5)   // 4 rows + the parked approval
+    #expect(owed.desk.waitingOnYouItems == 2)   // the owner row + the approval
+    #expect(owed.desk.blockedItems == 3)
+    #expect(owed.living.needsText == "needs you")
+    #expect((owed.desk.waitingOnYouItems > 0) == (owed.living.needsText == "needs you"))
+
+    // And the Desk's own row emphasis uses the same rule.
+    let lines = DeskAttentionStrip.lines(
+        approvals: [], githubNeedsYou: [], otherAttention: withOwnerWork, githubBlocked: [])
+    #expect(lines.filter(\.needsUserDirectly).count == 1)
 }

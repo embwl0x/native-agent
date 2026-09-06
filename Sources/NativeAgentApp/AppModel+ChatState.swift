@@ -69,6 +69,47 @@ extension AppModel {
         chatTurnLifecycleBySession[sessionId]
     }
 
+    /// Reload the resident mind after a profile repair, but never underneath a
+    /// running turn (User, 2026-09-06). The refresh stops and restarts Context
+    /// Flow and reloads cognition; doing that mid-turn changes the ground the
+    /// answer in flight is standing on. `activeChatTurnLifecycleIDsBySession`
+    /// is the app's existing record of which sessions own a live turn, so it
+    /// is the gate, and the turn's own close drains the deferral.
+    func refreshResidentMindAfterProfileRepair() async {
+        guard activeChatTurnLifecycleIDsBySession.isEmpty else {
+            residentRefreshPendingAfterActiveTurns = true
+            return
+        }
+        residentRefreshPendingAfterActiveTurns = false
+        await applyProfileRepairToResidentMind()
+    }
+
+    /// Runs a deferred resident refresh once the last live turn has closed.
+    func drainPendingResidentRefreshIfTurnsIdle() {
+        guard residentRefreshPendingAfterActiveTurns,
+              activeChatTurnLifecycleIDsBySession.isEmpty else { return }
+        residentRefreshPendingAfterActiveTurns = false
+        Task { await self.applyProfileRepairToResidentMind() }
+    }
+
+    /// Everything a completed profile repair changes about the live agent, in
+    /// one place so the gate above covers all of it (User, 2026-09-06: the
+    /// personality reload ran ahead of the gate and re-taught the name mid-turn
+    /// while the refresh it belongs with was still deferred).
+    ///
+    /// The repair rewrote the profile but left `personality` holding the
+    /// pre-repair one, and Chat reloads it only when it is nil — so
+    /// `agentDisplayName` (and AgentVoice) kept showing the fallback name until
+    /// a screen that loads the profile was visited. A failed read leaves the
+    /// previous value rather than blanking the header.
+    private func applyProfileRepairToResidentMind() async {
+        if let repaired = try? await client.getPersonality() {
+            personality = repaired
+            teachMemoryHygieneName()
+        }
+        await client.refreshResidentMindAfterOnboardingTransition()
+    }
+
     /// Opens the exact generation for one accepted Mac turn. This is the only
     /// constructor for active lifecycle authority; every later event must name
     /// the same session and turn id.
@@ -184,6 +225,7 @@ extension AppModel {
             chatTurnLifecycleBySession[sessionId] = state
         }
         activeChatTurnLifecycleIDsBySession.removeValue(forKey: sessionId)
+        drainPendingResidentRefreshIfTurnsIdle()
         return state
     }
 
@@ -196,6 +238,7 @@ extension AppModel {
         if chatTurnLifecycleBySession[sessionId]?.identity.turnId == turnId {
             chatTurnLifecycleBySession.removeValue(forKey: sessionId)
         }
+        drainPendingResidentRefreshIfTurnsIdle()
     }
 
     /// Moves a placeholder session's exact activity generation alongside the
@@ -475,6 +518,7 @@ extension AppModel {
         detachedChatContextReceiptRefreshStatus.removeValue(forKey: sessionId)
         queuedChatTurnsBySession.removeValue(forKey: sessionId)
         pausedChatQueueSessions.remove(sessionId)
+        chatQueuePauseReasons.removeValue(forKey: sessionId)
         // A Stop/Archive can reach pruning before its joined producer has
         // persisted terminal proof. Preserve that one exact authority until
         // normal task cleanup closes it; stale-session pruning will remove the
@@ -613,11 +657,16 @@ extension AppModel {
     func pinChatSessionForDetachedWindow(_ sessionId: String) {
         guard !sessionId.isEmpty else { return }
         var ids = MacPinnedChatSessionStore.load()
-        if !ids.contains(sessionId) {
+        let added = !ids.contains(sessionId)
+        if added {
             ids.append(sessionId)
         }
         guard (try? MacPinnedChatSessionStore.save(ids)) != nil else { return }
-        MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: false)
+        // 2026-09-06: a pin that ADDS a session asks for transcripts — the
+        // published transcript set is chosen from the pins as they were before
+        // this save, so publishing the new tab without them put an empty
+        // conversation on the phone until some unrelated edge republished.
+        MacSyncEngine.shared.requestChatSnapshotPublication(includeTranscripts: added)
     }
 
     /// Per-session message mutators. Used by `_sendChatBody` so optimistic
@@ -658,7 +707,15 @@ extension AppModel {
         guard var arr = chatMessagesBySession[sessionId],
               let idx = arr.firstIndex(where: { $0.id == messageId }) else { return }
         arr[idx].content = content
-        chatMessagesBySession[sessionId] = arr
+        // 2026-09-06: only a rewrite of the FINAL row may keep the message
+        // list's cached grouping (it patches that one row in place). An
+        // interior row — a streaming reply with a slash command's system
+        // message appended behind it — must invalidate the whole cache.
+        if idx == arr.count - 1 {
+            setChatMessagesTailOnly(arr, for: sessionId)
+        } else {
+            chatMessagesBySession[sessionId] = arr
+        }
     }
 
     func clearStreamingBubbleState(_ sessionId: String) {
@@ -717,7 +774,7 @@ extension AppModel {
     /// stop it or a lifecycle path clears it.
     var otherRunningChatSessionIDs: [String] {
         MacChatOtherSessionsProjection.otherRunning(
-            streamingSessionIDs: streamingSessions,
+            streamingSessionIDs: liveStreamingSessionIDs,
             activeSessionID: activeChatSessionId,
             canonicalSessionIDs: chatSessions.map(\.id)
         )
@@ -741,5 +798,173 @@ extension AppModel {
     func isChatQueuePaused(_ sessionId: String) -> Bool {
         pausedChatQueueSessions.contains(sessionId)
     }
+
+    /// Why the queue paused, when it paused because the next turn could not
+    /// start. Nil for a Stop-pause and for a queue that is running.
+    func chatQueuePauseReason(_ sessionId: String) -> String? {
+        guard isChatQueuePaused(sessionId) else { return nil }
+        guard let reason = chatQueuePauseReasons[sessionId]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty
+        else { return nil }
+        return reason
+    }
     // Fix 2: chat draft and pending attachments keyed by sessionId so they survive tab changes
+}
+
+// MARK: - Per-instance state that cannot live on AppModel
+//
+// Swift extensions cannot add stored properties, and `AppModel.swift` is not
+// this change's to edit. Both owners below are per-AppModel and strictly
+// non-observable, so reading them during a SwiftUI view update cannot
+// invalidate that update. Entries are pruned as soon as their owner dies.
+
+@MainActor
+private final class AppModelLiveState {
+    weak var owner: AppModel?
+    /// First instant each `streamingSessions` id was observed.
+    var streamingSeenAt: [String: Date] = [:]
+    /// Installed at most once by `installDefaultsBackedSettingsObserver()`.
+    var defaultsObserver: NSObjectProtocol?
+    /// Re-entrancy guard: every setter in the reloaded block writes back to
+    /// UserDefaults from its own `didSet`, which posts the very notification
+    /// that drove the reload.
+    var reloadingDefaults = false
+    init(owner: AppModel) { self.owner = owner }
+}
+
+@MainActor
+private var appModelLiveStates: [ObjectIdentifier: AppModelLiveState] = [:]
+
+@MainActor
+private func liveState(for model: AppModel) -> AppModelLiveState {
+    if appModelLiveStates.count > 1 {
+        for (key, dead) in appModelLiveStates where dead.owner == nil {
+            if let observer = dead.defaultsObserver {
+                NotificationCenter.default.removeObserver(observer)
+                dead.defaultsObserver = nil
+            }
+            appModelLiveStates.removeValue(forKey: key)
+        }
+    }
+    let key = ObjectIdentifier(model)
+    if let existing = appModelLiveStates[key], existing.owner === model { return existing }
+    let fresh = AppModelLiveState(owner: model)
+    appModelLiveStates[key] = fresh
+    return fresh
+}
+
+/// The provider stream guard's own hard wall ceiling. A turn cannot outlive
+/// it, so neither can a "running" marker for that turn. Resolved once.
+private enum MacChatStreamingMarkerCeiling {
+    static let seconds: TimeInterval = ProviderStreamGuardConfig.fromEnvironment().wallTimeout
+}
+
+@MainActor
+extension AppModel {
+
+    // MARK: - Streaming marker expiry
+
+    /// Seconds a `streamingSessions` marker may stand before it is treated as
+    /// a ghost. Zero (guard disabled) means never expire.
+    static var streamingMarkerCeilingSeconds: TimeInterval {
+        MacChatStreamingMarkerCeiling.seconds
+    }
+
+    /// `streamingSessions` filtered to markers young enough to still belong to
+    /// a live turn.
+    ///
+    /// `finishChatTurnRuntime` returns early when the generation no longer
+    /// matches — correctly, since clearing there would wipe a NEWER turn's
+    /// marker — so a turn that dies between the generation bump and its own
+    /// cleanup leaves its id in `streamingSessions` forever, and the "other
+    /// sessions running" banner never comes down. Ids are stamped on first
+    /// observation (the insert sites are in `AppModel+ChatActions.swift`,
+    /// outside this change) and un-stamped the moment they leave the set, so a
+    /// re-started session always starts a fresh clock. Live turns are
+    /// untouched: nothing legitimate outlives the provider guard's ceiling.
+    var liveStreamingSessionIDs: Set<String> {
+        let state = liveState(for: self)
+        let current = streamingSessions
+        if state.streamingSeenAt.count != current.count {
+            state.streamingSeenAt = state.streamingSeenAt.filter { current.contains($0.key) }
+        }
+        let ceiling = Self.streamingMarkerCeilingSeconds
+        let now = Date()
+        var live: Set<String> = []
+        for id in current {
+            let seenAt = state.streamingSeenAt[id] ?? now
+            state.streamingSeenAt[id] = seenAt
+            if ceiling <= 0 || now.timeIntervalSince(seenAt) <= ceiling { live.insert(id) }
+        }
+        return live
+    }
+
+    // MARK: - Defaults-backed settings, kept live
+
+    /// Installs the single `UserDefaults.didChangeNotification` observer that
+    /// keeps the defaults-backed settings block in sync with disk. Without it
+    /// a write from the Claude bridge or another process left the running app
+    /// stale until relaunch. Idempotent; safe to call from every entry point.
+    func installDefaultsBackedSettingsObserver() {
+        let state = liveState(for: self)
+        guard state.defaultsObserver == nil else { return }
+        state.defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: UserDefaults.standard,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.reloadDefaultsBackedSettings()
+            }
+        }
+    }
+
+    /// Re-reads exactly the block `AppModel.swift` reads once at construction
+    /// (`AppModel.swift:106-160` plus `chatProvider` at `:573`). Assignments
+    /// are value-guarded, and the whole pass is wrapped in a re-entrancy flag
+    /// so the UserDefaults write-back in each `didSet` cannot loop.
+    func reloadDefaultsBackedSettings() {
+        let state = liveState(for: self)
+        guard !state.reloadingDefaults else { return }
+        state.reloadingDefaults = true
+        defer { state.reloadingDefaults = false }
+
+        let defaults = UserDefaults.standard
+        func string(_ key: String, _ fallback: String) -> String {
+            defaults.string(forKey: key) ?? fallback
+        }
+
+        let searxng = string("searxngBaseURL", "")
+        if searxngBaseURL != searxng { searxngBaseURL = searxng }
+
+        let allowedChats = string("telegramAllowedChats", "")
+        if telegramAllowedChats != allowedChats { telegramAllowedChats = allowedChats }
+
+        let allowedUsers = string("telegramAllowedUsers", "")
+        if telegramAllowedUsers != allowedUsers { telegramAllowedUsers = allowedUsers }
+
+        let requireMention = defaults.object(forKey: "telegramRequireMention") as? Bool ?? true
+        if telegramRequireMention != requireMention { telegramRequireMention = requireMention }
+
+        let model = string("chatModel", nativeAgentPrimaryModel)
+        if chatModel != model { chatModel = model }
+
+        let effort = string("chatReasoningEffort", "high")
+        if chatReasoningEffort != effort { chatReasoningEffort = effort }
+
+        let fastMode = defaults.bool(forKey: "chatFastMode")
+        if chatFastMode != fastMode { chatFastMode = fastMode }
+
+        let fileAccess = string("chatFileAccess", "auto")
+        if chatFileAccess != fileAccess { chatFileAccess = fileAccess }
+
+        let tgModel = string("telegramModel", nativeAgentPrimaryModel)
+        if telegramModel != tgModel { telegramModel = tgModel }
+
+        let tgEffort = string("telegramReasoningEffort", "high")
+        if telegramReasoningEffort != tgEffort { telegramReasoningEffort = tgEffort }
+
+        let provider = string("chatProvider", "openai_oauth_direct")
+        if chatProvider != provider { chatProvider = provider }
+    }
 }

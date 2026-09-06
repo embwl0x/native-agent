@@ -1,14 +1,15 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import ProviderRouting
 
 extension TelegramPollLoop {
-    func startTypingHeartbeat(chatId: Int) async -> Task<Void, Never>? {
+    func startTypingHeartbeat(destination: TelegramDestination) async -> Task<Void, Never>? {
         do {
-            try await sendChatAction(token, chatId, "typing")
+            try await sendChatAction(token, destination, "typing")
         } catch {
             FileHandle.standardError.write(
-                Data("TelegramPollLoop: sendChatAction failed for chat \(chatId): \(Self._tgRedactToken(String(describing: error)))\n".utf8)
+                Data("TelegramPollLoop: sendChatAction failed for chat \(destination.chatId): \(Self._tgRedactToken(String(describing: error)))\n".utf8)
             )
         }
         guard typingRefreshNanoseconds > 0 else { return nil }
@@ -24,10 +25,10 @@ extension TelegramPollLoop {
                 }
                 guard !Task.isCancelled else { break }
                 do {
-                    try await sendChatAction(token, chatId, "typing")
+                    try await sendChatAction(token, destination, "typing")
                 } catch {
                     FileHandle.standardError.write(
-                        Data("TelegramPollLoop: sendChatAction refresh failed for chat \(chatId): \(Self._tgRedactToken(String(describing: error)))\n".utf8)
+                        Data("TelegramPollLoop: sendChatAction refresh failed for chat \(destination.chatId): \(Self._tgRedactToken(String(describing: error)))\n".utf8)
                     )
                 }
             }
@@ -35,7 +36,7 @@ extension TelegramPollLoop {
     }
 
     func makeTurnProgressCard(
-        chatId: Int,
+        destination: TelegramDestination,
         turnId: UUID,
         errorContext: String,
         update: TelegramUpdate?,
@@ -44,7 +45,7 @@ extension TelegramPollLoop {
     ) -> TelegramTurnProgressCardDriver {
         TelegramTurnProgressCardDriver(
             token: token,
-            chatId: chatId,
+            destination: destination,
             turnId: turnId,
             minimumEditInterval: turnCardMinimumEditIntervalSeconds,
             heartbeatNanoseconds: turnCardHeartbeatNanoseconds,
@@ -80,7 +81,7 @@ extension TelegramPollLoop {
     }
 
     func makeAssistantDelivery(
-        chatId: Int,
+        destination: TelegramDestination,
         turnId: UUID,
         errorContext: String,
         update: TelegramUpdate?,
@@ -89,14 +90,14 @@ extension TelegramPollLoop {
     ) -> TelegramAssistantDeliveryDriver {
         let ordinary = TelegramDraftStreamer(
             token: token,
-            chatId: chatId,
+            destination: destination,
             editIntervalSeconds: draftEditIntervalSeconds,
             sendReturningId: sendMessageReturningId,
             editMessage: editMessageText
         )
         return TelegramAssistantDeliveryDriver(
             token: token,
-            chatId: chatId,
+            destination: destination,
             turnId: turnId,
             ordinary: ordinary,
             sendOrdinary: sendMessage,
@@ -139,7 +140,7 @@ extension TelegramPollLoop {
 
     func deliverGeneratedImages(
         _ imagePaths: [String],
-        chatId: Int,
+        destination: TelegramDestination,
         errorContext: String,
         update: TelegramUpdate?,
         message: TelegramMessage?,
@@ -147,7 +148,7 @@ extension TelegramPollLoop {
     ) async -> TelegramAssistantDeliveryOutcome {
         for imagePath in imagePaths {
             do {
-                try await sendChatAction(token, chatId, "upload_photo")
+                try await sendChatAction(token, destination, "upload_photo")
             } catch {
                 // Native action is only a secondary status signal. Its failure
                 // does not change the photo's delivery truth.
@@ -156,7 +157,7 @@ extension TelegramPollLoop {
                 ))
             }
             do {
-                try await sendPhoto(token, chatId, imagePath, nil)
+                try await sendPhoto(token, destination, imagePath, nil)
             } catch {
                 let reason = TelegramTurnPresentationReducer.sanitized(String(describing: error))
                     ?? "generated media delivery failed"
@@ -239,14 +240,26 @@ extension TelegramPollLoop {
     }
 
     func runChatHandlerWithRetry(
-        chatId: Int,
+        destination: TelegramDestination,
         text: String,
         attachments: [TelegramMediaAttachment] = [],
         progress: @escaping TelegramChatProgressSink,
         replyTo: TelegramReplyContext? = nil,
         fromUserId: Int? = nil,
-        suppressUserAppend: Bool = false
+        suppressUserAppend: Bool = false,
+        sessionId: String? = nil
     ) async throws -> String {
+        // The retired model/effort/fast/persona commands, said in words.
+        // This is the single choke point every non-slash Telegram text turn
+        // passes through, so the words reach the preference writers without
+        // a round trip through the model. It fires only on an unambiguous
+        // whole-message request (and never when an image is attached);
+        // everything else falls straight through to the chat handler.
+        if attachments.isEmpty,
+           let spoken = await spokenPreferenceReply(destination: destination, text: text) {
+            return spoken
+        }
+
         let totalAttempts = max(1, chatRetryAttempts + 1)
         var lastError: Error?
         for attempt in 0..<totalAttempts {
@@ -255,7 +268,9 @@ extension TelegramPollLoop {
                 totalAttempts: totalAttempts,
                 replyTo: replyTo,
                 fromUserId: fromUserId,
-                suppressUserAppend: suppressUserAppend
+                suppressUserAppend: suppressUserAppend,
+                sessionId: sessionId,
+                threadId: destination.threadId
             )
             do {
                 // Prefer the attachment-aware handler when staged images exist
@@ -263,7 +278,7 @@ extension TelegramPollLoop {
                 // attachment handler is also used for plain text when it's the
                 // only handler wired.
                 if let attachmentChatHandler {
-                    return try await attachmentChatHandler(chatId, text, attachments, progress, context)
+                    return try await attachmentChatHandler(destination.chatId, text, attachments, progress, context)
                 }
                 // A staged image must NEVER silently fall through to a
                 // text-only handler — the model would answer the caption
@@ -273,16 +288,16 @@ extension TelegramPollLoop {
                     await emitAttachmentDroppedTrace(
                         kind: "image",
                         reason: "no attachment-capable chat handler wired",
-                        chatId: chatId, updateId: 0)
+                        chatId: destination.chatId, updateId: 0)
                     return "(I received your image but this bot configuration "
                         + "has no vision-capable handler wired — the image was "
                         + "not processed.)"
                 }
                 if let progressChatHandler {
-                    return try await progressChatHandler(chatId, text, progress, context)
+                    return try await progressChatHandler(destination.chatId, text, progress, context)
                 }
                 if let chatHandler {
-                    return try await chatHandler(chatId, text)
+                    return try await chatHandler(destination.chatId, text)
                 }
                 throw TelegramBotError.unavailable
             } catch {
@@ -356,32 +371,10 @@ extension TelegramPollLoop {
             return false
         }
 
-        let retryablePhrases = [
-            "llm: transient",
-            "connection refused",
-            "cannot connect",
-            "network connection was lost",
-            "code=-1001",
-            "timed out",
-            "upstream connect",
-            "disconnect/reset",
-            "transport failure",
-            "server status 5",
-            "status 502",
-            "status 503",
-            "status 504",
-            "status 529",
-            "rate limited",
-            "rate limit",
-            "rate_limit",
-            "too many requests",
-            "overloaded",
-            "overloaded_error",
-            "invalid response status 429",
-            "invalid response status 529",
-            "unavailable"
-        ]
-        return retryablePhrases.contains { description.contains($0) }
+        // The phrase list has ONE owner now (ProviderRecoveryPolicy, in
+        // ProviderRouting): the tool loop's in-place retry and this whole-turn
+        // ladder classify the same provider text, and two copies drift.
+        return ProviderRecoveryPolicy.matchesRetryablePhrase(description)
     }
 
     static func chatErrorNotice(for error: Error) -> String {

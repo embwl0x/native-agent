@@ -480,6 +480,30 @@ struct ToolByNameHermeticReadEvals {
         let root = try makeHermeticRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let dispatcher = makeDispatcher(root: root)
+
+        // 2026-09-06: 130f1553 put Settings > Memory > "Knowledge graph" in
+        // front of this tool, and the switch defaults OFF
+        // (MemoryV2+PolicyGate.swift:63-65). A hermetic root has no
+        // trust/policy.json, so the tool now refuses before it reads anything —
+        // and the refusal deliberately carries NO `results` key so a model can
+        // never read "off" as "searched, found nothing"
+        // (SwiftToolDispatcher+KnowledgeGraphTools.swift:25-32).
+        let refused = try await dispatcher.dispatch(
+            tool: "search_kg",
+            input: ["query": .string("toolbyname-eval-needle")],
+            surface: "chat"
+        )
+        guard let refusal = asObject(refused, tool: "search_kg") else { return }
+        #expect(refusal["status"] == .string("disabled"))
+        #expect(refusal["results"] == nil, "a refusal must never be readable as an empty search")
+
+        // With the switch on, the original contract still holds: an empty graph
+        // yields an explicit empty results array, not a missing key.
+        let trustDir = root.appendingPathComponent("trust", isDirectory: true)
+        try FileManager.default.createDirectory(at: trustDir, withIntermediateDirectories: true)
+        try Data(#"{"memoryPolicy":{"knowledge_graph_enabled":true}}"#.utf8)
+            .write(to: trustDir.appendingPathComponent("policy.json"))
+
         let result = try await dispatcher.dispatch(
             tool: "search_kg",
             input: ["query": .string("toolbyname-eval-needle")],

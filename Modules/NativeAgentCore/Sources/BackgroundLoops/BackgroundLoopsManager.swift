@@ -1012,8 +1012,30 @@ public actor BackgroundLoopsManager {
         else { return }
         physiologyDeadlines[loopId] = deadline
         let delay = min(deadline.timeIntervalSince(current), 365 * 24 * 60 * 60)
+        let wallClock = clock
         physiologyDeadlineTasks[loopId] = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
+            // 2026-09-06: this converted an ABSOLUTE deadline into ONE relative
+            // sleep at arming time and never looked at the wall clock again, so
+            // a clock correction, a manual time change or a time-zone move made
+            // afterwards left the sleep counting to an instant that no longer
+            // meant what it did when it was armed — late by the whole jump, and
+            // by a whole hour twice a year. It now sleeps in bounded slices and
+            // re-reads the wall clock between them.
+            //
+            // The loop is bounded BOTH ways on purpose: the wall clock ends it
+            // early when time jumped forward past the deadline, and the total
+            // slept time ends it after the originally armed delay regardless of
+            // what the clock says. So a clock that moves backwards (or an
+            // injected clock that does not move at all) fires at exactly the
+            // moment it fires today rather than sleeping forever — and the tick
+            // it fires re-arms against the new wall time on its way out.
+            var slept: TimeInterval = 0
+            while slept < delay, deadline.timeIntervalSince(wallClock()) > 0 {
+                let slice = min(delay - slept, Self.deadlineSliceSeconds)
+                try? await Task.sleep(for: .seconds(slice))
+                guard !Task.isCancelled else { return }
+                slept += slice
+            }
             guard !Task.isCancelled else { return }
             await self?.firePhysiologyDeadline(
                 loopId: loopId,
@@ -1022,6 +1044,10 @@ public actor BackgroundLoopsManager {
             )
         }
     }
+
+    /// Longest a deadline task sleeps before re-checking its absolute deadline
+    /// against the wall clock.
+    private static let deadlineSliceSeconds: TimeInterval = 300
 
     private func firePhysiologyDeadline(
         loopId: String,

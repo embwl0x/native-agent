@@ -24,10 +24,20 @@ import NativeAgentCore
 struct FeltVocabularyReachabilityTests {
     typealias S = CognitiveSubstrate.FeltSignals
 
-    /// The five words whose IDENTITY is agency or confidence. With the organism
-    /// off these stay out of reach ON PURPOSE, and that refusal is the feature.
+    /// The words whose IDENTITY is a dim only the organism can supply. With the
+    /// organism off these stay out of reach ON PURPOSE, and that refusal is the
+    /// feature.
+    ///
+    /// Five of them are agency or confidence. `late` joined them on 2026-09-02
+    /// (259a331a), which added `FeltDim.nightliness` as a SIXTH optional dim and
+    /// gave it exactly one source — `request.organismProjection?.diurnal?.nightliness`
+    /// in `feltFingerprintLine`. With the organism off there is no diurnal read,
+    /// so the dim is absent and `requires: [.nightliness, .fatigue]` excludes the
+    /// word, which is that commit's stated intent: "an install with no configured
+    /// clock does not know what time it feels like, and `late` must be unreachable
+    /// there rather than guessed from a timestamp."
     static let organismOnlyWords: Set<String> = [
-        "proud", "anxious", "embarrassed", "deflated", "discouraged",
+        "proud", "anxious", "embarrassed", "deflated", "discouraged", "late",
     ]
 
     /// Every word the table can produce, core families plus overlays.
@@ -42,6 +52,15 @@ struct FeltVocabularyReachabilityTests {
     /// of the sweep; the substrate cannot supply them.
     private func organismOffSweep() -> [S] {
         var out: [S] = []
+        // 2026-09-06: `clarity` gained a fourth grid point. `collected` was added
+        // to the table on 2026-09-01 (785d7c42, the mid-band words) gated on
+        // `clarity >= 0.55 && < 0.78`, and this sweep — written 2026-08-11, before
+        // the word existed — sampled clarity at 0.1/0.5/0.9 only, so it stepped
+        // straight over the band. The word IS reachable in production: 0.62 is the
+        // vector `SubconsciousFloorRegressionTests` D2 already pins it at, and a
+        // lived session reads it (`InnerStateReadTests` stamps "uneasy, curious,
+        // collected"). Widening the grid is what recovers it; nothing about the
+        // pin changed.
         let axis = [0.0, 0.2, 0.35, 0.5, 0.65, 0.8, 1.0]
         let valences = [-0.9, -0.6, -0.35, -0.1, 0.0, 0.1, 0.35, 0.6, 0.9]
         for valence in valences {
@@ -51,7 +70,7 @@ struct FeltVocabularyReachabilityTests {
                         for pressure in [0.0, 0.4, 0.8] {
                             for fatigue in [0.0, 0.45, 0.9] {
                                 for curiosity in [0.0, 0.5, 0.9] {
-                                    for clarity in [0.1, 0.5, 0.9] {
+                                    for clarity in [0.1, 0.5, 0.65, 0.9] {
                                         out.append(S(
                                             valence: valence, arousal: arousal, warmth: warmth,
                                             tension: tension, pressure: pressure,
@@ -129,6 +148,15 @@ struct FeltVocabularyReachabilityTests {
         #expect(discouraged?.contains("discouraged") == true
                 || discouraged?.contains("deflated") == true,
                 "got \(String(describing: discouraged))")
+
+        // 2026-09-06: `late` earns the same proof as the other five now that it
+        // is on the honestly-absent list. The organism's diurnal clock supplies
+        // `nightliness`, and the word comes straight back — so `requires` is
+        // still an honesty gate and not a permanent deletion.
+        let late = CognitiveSubstrate.feltFingerprint(S(
+            valence: -0.1, arousal: 0.2, warmth: 0.3, tension: 0.2, pressure: 0.2,
+            fatigue: 0.4, curiosity: 0.2, clarity: 0.4, nightliness: 0.85))
+        #expect(late?.contains("late") == true, "got \(String(describing: late))")
     }
 
     // MARK: - the intensity contract

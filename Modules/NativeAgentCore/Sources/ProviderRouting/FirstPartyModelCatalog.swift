@@ -7,8 +7,10 @@ import PersistenceCore
 ///
 /// Account-scoped ChatGPT/Codex discovery can override these fallbacks from
 /// its signed local cache. Anthropic entries were verified against the live
-/// Models API on 2026-07-10; OpenAI and xAI entries follow their current
-/// first-party model/capability documentation from the same date.
+/// Models API on 2026-09-01 (Fable 5.1 added; Opus 4.1 retired 2026-08-05);
+/// OpenAI entries were refreshed from official documentation and Codex
+/// app-server 0.153.2 metadata on 2026-09-04; xAI entries follow their current
+/// first-party model/capability documentation.
 public struct FirstPartyModelDescriptor: Sendable, Equatable {
     public let id: String
     public let name: String
@@ -20,6 +22,27 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
     public let defaultReasoningEffort: String
     public let supportedReasoningEfforts: [String]
     public let supportsFast: Bool
+    /// Accepts a `system`-role message INSIDE the messages array (Anthropic
+    /// mid-conversation system). Lets per-turn volatile context sit after the
+    /// cached transcript prefix instead of churning the front of it.
+    public let supportsMidConversationSystem: Bool
+    /// Additionally honours `clear_at: "next_user_message"` on such a message
+    /// (beta `mid-conversation-system-clear-at-2026-08-21`). Strictly narrower
+    /// than `supportsMidConversationSystem`.
+    public let supportsMidConversationSystemClearAt: Bool
+    /// Additionally honours `tool_addition` / `tool_removal` blocks on a
+    /// mid-conversation system message (beta
+    /// `mid-conversation-tool-changes-2026-07-01`), so the request's `tools`
+    /// array can stay byte-identical across turns while the OFFERED set moves
+    /// into the message body behind the cache breakpoint.
+    ///
+    /// Verified against the doc file (2026-09-02): available on exactly the
+    /// same models as mid-conversation system messages — Fable 5.1, Mythos
+    /// 5.1, Fable 5, Mythos 5, Opus 4.8 and Opus 5 — and NOT on Sonnet 5. It
+    /// stays a SEPARATE field from `supportsMidConversationSystem` because
+    /// they are separate betas and may diverge; like `…ClearAt` it can never
+    /// be claimed without the base capability.
+    public let supportsMidConversationToolChanges: Bool
 
     public init(
         id: String,
@@ -31,7 +54,10 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
         supportsJSONMode: Bool = false,
         defaultReasoningEffort: String,
         supportedReasoningEfforts: [String],
-        supportsFast: Bool = false
+        supportsFast: Bool = false,
+        supportsMidConversationSystem: Bool = false,
+        supportsMidConversationSystemClearAt: Bool = false,
+        supportsMidConversationToolChanges: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -43,6 +69,16 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
         self.defaultReasoningEffort = defaultReasoningEffort
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.supportsFast = supportsFast
+        self.supportsMidConversationSystem = supportsMidConversationSystem
+        // Clear_at is a strict refinement — a row can never claim it without
+        // the base capability.
+        self.supportsMidConversationSystemClearAt =
+            supportsMidConversationSystem && supportsMidConversationSystemClearAt
+        // Same refinement rule: the tool-change beta rides ON a
+        // mid-conversation system message, so a row cannot claim it without
+        // the base capability.
+        self.supportsMidConversationToolChanges =
+            supportsMidConversationSystem && supportsMidConversationToolChanges
     }
 
     public func providerJSON() -> [String: JSONValue] {
@@ -57,11 +93,17 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
             "default_reasoning_effort": .string(defaultReasoningEffort),
             "supported_reasoning_efforts": .array(supportedReasoningEfforts.map { .string($0) }),
             "supports_fast": .bool(supportsFast),
+            "supports_mid_conversation_system": .bool(supportsMidConversationSystem),
+            "supports_mid_conversation_system_clear_at": .bool(supportsMidConversationSystemClearAt),
+            "supports_mid_conversation_tool_changes": .bool(supportsMidConversationToolChanges),
         ]
     }
 }
 
 public enum FirstPartyModelCatalog {
+    public static let gpt6AstraModelID = "gpt-6-astra"
+    public static let publicGPT6AstraEfforts = ["low", "medium", "high", "xhigh", "max"]
+    public static let accountGPT6AstraEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
     public static let publicGPT56Efforts = ["none", "low", "medium", "high", "xhigh", "max"]
     public static let accountGPT56SolTerraEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
     public static let accountGPT56LunaEfforts = ["low", "medium", "high", "xhigh", "max"]
@@ -70,8 +112,9 @@ public enum FirstPartyModelCatalog {
     public static let claude46Efforts = ["low", "medium", "high", "max"]
     public static let grok45Efforts = ["low", "medium", "high"]
 
-    /// Public OpenAI API catalog. GPT-5.6 uses the public None-through-Max
-    /// contract; account-only Ultra is deliberately absent here.
+    /// Public OpenAI API catalog. Astra is intentionally not advertised here:
+    /// its tool calls require Responses, while this lane uses Chat Completions.
+    /// Account-backed Astra below already uses the Responses transport.
     public static let publicOpenAIModels: [FirstPartyModelDescriptor] = [
         .init(id: "gpt-5.6", name: "GPT-5.6 (Sol alias)", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
         .init(id: "gpt-5.6-sol", name: "GPT-5.6 Sol", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
@@ -88,6 +131,7 @@ public enum FirstPartyModelCatalog {
         .init(id: "gpt-5.6-sol", name: "GPT-5.6 Sol", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "low", supportedReasoningEfforts: accountGPT56SolTerraEfforts, supportsFast: true),
         .init(id: "gpt-5.6-terra", name: "GPT-5.6 Terra", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56SolTerraEfforts, supportsFast: true),
         .init(id: "gpt-5.6-luna", name: "GPT-5.6 Luna", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56LunaEfforts, supportsFast: true),
+        .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT6AstraEfforts, supportsFast: true),
         .init(id: "gpt-5.4", name: "GPT-5.4", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: standardOpenAIEfforts, supportsFast: true),
         .init(id: "gpt-5.4-mini", name: "GPT-5.4 mini", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: standardOpenAIEfforts, supportsFast: false),
     ]
@@ -96,13 +140,19 @@ public enum FirstPartyModelCatalog {
     /// pinned models. `none` means the model has no adjustable API effort
     /// parameter; it is not sent on the wire.
     public static let anthropicModels: [FirstPartyModelDescriptor] = [
-        .init(id: "claude-opus-4-8", name: "Claude Opus 4.8", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
+        .init(id: "claude-opus-4-8", name: "Claude Opus 4.8", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
+        // Fable 5.1 (added 2026-09-01, verified against the live catalog): 1M
+        // window, 128K output, thinking always on (adaptive; explicit
+        // disabled/budget_tokens 400), forced tool_choice any/tool 400, no
+        // prefill. Placed AFTER opus-4-8 so index 0 (the implicit provider
+        // default) does not change.
+        .init(id: "claude-fable-5-1", name: "Claude Fable 5.1", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationSystemClearAt: true, supportsMidConversationToolChanges: true),
         // Capability/window fields INHERITED verbatim from claude-opus-4-8 and
         // not independently verified for opus-5. Deliberately placed AFTER
         // opus-4-8: index 0 is the implicit provider default via
         // defaultModelForProvider, which must not change here.
-        .init(id: "claude-opus-5", name: "Claude Opus 5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
-        .init(id: "claude-fable-5", name: "Claude Fable 5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
+        .init(id: "claude-opus-5", name: "Claude Opus 5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
+        .init(id: "claude-fable-5", name: "Claude Fable 5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts, supportsMidConversationSystem: true, supportsMidConversationToolChanges: true),
         .init(id: "claude-sonnet-5", name: "Claude Sonnet 5", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
         .init(id: "claude-opus-4-7", name: "Claude Opus 4.7", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
         .init(id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: claude46Efforts),
@@ -110,7 +160,6 @@ public enum FirstPartyModelCatalog {
         .init(id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5", contextLength: 200_000, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high"]),
         .init(id: "claude-haiku-4-5", name: "Claude Haiku 4.5", contextLength: 200_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"]),
         .init(id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5", contextLength: 1_000_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"]),
-        .init(id: "claude-opus-4-1-20250805", name: "Claude Opus 4.1", contextLength: 200_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"]),
     ]
 
     /// xAI text models retained by NativeAgent plus the current Grok 4.5
@@ -210,6 +259,29 @@ public enum FirstPartyModelCatalog {
         let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return xAIModels.first { $0.id.lowercased() == id }
     }
+}
+
+/// Mid-conversation system support for the exact admitted model. Mirrors
+/// `ProviderRouting.verifiedContextLength`'s contract: an id this build has no
+/// evidence for answers FALSE, so a caller can never project history as a
+/// mid-conversation system message on an unverified model.
+public func supportsMidConversationSystem(forModel modelId: String) -> Bool {
+    FirstPartyModelCatalog.descriptor(for: modelId)?.supportsMidConversationSystem ?? false
+}
+
+/// Whether the model additionally honours `clear_at: "next_user_message"`.
+/// Unknown id → false.
+public func supportsMidConversationSystemClearAt(forModel modelId: String) -> Bool {
+    FirstPartyModelCatalog.descriptor(for: modelId)?
+        .supportsMidConversationSystemClearAt ?? false
+}
+
+/// Whether the model honours mid-conversation `tool_addition`/`tool_removal`.
+/// Unknown id → FALSE, so an unverified model falls back to today's
+/// changing-`tools`-array shape rather than emitting blocks it would 400 on.
+public func supportsMidConversationToolChanges(forModel modelId: String) -> Bool {
+    FirstPartyModelCatalog.descriptor(for: modelId)?
+        .supportsMidConversationToolChanges ?? false
 }
 
 /// Provider-specific request controls. A picker capability is not considered

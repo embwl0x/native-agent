@@ -3,6 +3,10 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
+/// Surfaces whose seeds are deliberately cheap because nobody waits on them
+/// (2026-09-06): a saved provider default never reaches them; only a pin does.
+let providerRoutingUnattendedSeedSurfaces: Set<String> = ["dream", "rem", "studio_wander"]
+
 // MARK: - Subsystem #14: ProviderRouting
 //
 // SwiftNative owns provider inspection/configuration from local app data.
@@ -307,9 +311,14 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
 /// `self_improvement` was added 2026-08-21: WeeklySelfImprovementLoop already
 /// called with that surface, but absent from this registry it silently fell
 /// through to the chat pin — unpinnable and invisible in Providers.
+/// `studio_wander` was added 2026-09-02 (personality depth item 9, "her hour"):
+/// the once-a-day wandering lane makes its own call, and whose model she thinks
+/// with when nobody is watching is a real choice — so it gets its own pickable
+/// row beside `dream` rather than inheriting chat's.
 public let MODEL_SURFACES: [String] = [
     "chat", "ios", "telegram", "slack", "desk", "workshop", "autonomy", "swarms", "dream", "rem", "training",
     "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction", "self_improvement",
+    "studio_wander",
 ]
 
 /// Persisted picker keys that deliberately no longer have a routed surface.
@@ -491,6 +500,23 @@ extension ProviderRoutingProtocol {
     /// "no pin" so they continue to fall back through their own paths.
     public func pinnedModelStringForSurface(_ surface: String) async -> String? {
         return nil
+    }
+
+    /// True when `surface` has a routing identity of its own: a model pin, or
+    /// a provider assigned to its Providers row (onboarding writes assignments
+    /// with no pin, so a pin-only test misses them).
+    ///
+    /// User, 2026-09-06: a surface with NEITHER must follow chat's model AND
+    /// chat's provider. Routing a blank surface on its own key hands dispatch a
+    /// surface with no `active.json` entry, and the adapter is then inferred
+    /// from the model prefix — so a bare `gpt-` id chat serves over the Codex
+    /// CLI or the OpenAI API would silently take ChatGPT OAuth instead.
+    public func surfaceHasOwnRouting(_ surface: String) async -> Bool {
+        if await pinnedModelStringForSurface(surface) != nil { return true }
+        let assigned = ProviderRoutingSurfaceLookup
+            .value(await activeProvidersForSurfaces(), surface)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return assigned?.isEmpty == false
     }
 }
 
@@ -1284,60 +1310,73 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return updated
     }
 
-    private func providerReadiness(id: String) -> (ready: Bool, state: String, detail: String) {
+    /// User, 2026-09-06: `cache` carries the routing snapshot's single locked
+    /// read of each `providers/<id>.json`. When it is nil (the live Provider
+    /// Settings listing, which is not resolving models alongside) each branch
+    /// reads its own file exactly as before.
+    private func providerReadiness(
+        id: String,
+        cache: ProviderConfigCache? = nil
+    ) -> (ready: Bool, state: String, detail: String) {
         let includeEnvironment = dataRoot.standardizedFileURL
             == PersistenceCore.defaultDataRoot().standardizedFileURL
+        /// API-key presence for `id`, reading the provider config from the
+        /// snapshot's read when there is one. Precedence stays the resolver's.
+        func keyReady(_ envVar: String) -> Bool {
+            if let read = cache?.reads[id] {
+                return LLMCredentialResolver.resolveAPIKey(
+                    envVar: envVar,
+                    providerConfigObject: read.object,
+                    dataRoot: dataRoot,
+                    includeEnvironment: includeEnvironment
+                ) != nil
+            }
+            return LLMCredentialResolver.resolveAPIKey(
+                envVar: envVar,
+                providerConfigFile: "\(id).json",
+                dataRoot: dataRoot,
+                includeEnvironment: includeEnvironment
+            ) != nil
+        }
         switch id {
         case "openai_oauth_direct", "codex":
+            // Reads codex_home/auth.json and the OAuth candidate paths, not
+            // `providers/<id>.json` — nothing in the model lane touches those,
+            // so there is no shared read to make.
             let result = Self.validateOpenAIOAuthDirect(dataRoot: dataRoot)
             return (result.0, "needs_oauth", result.1)
         case "anthropic_oauth_direct":
-            let result = Self.validateAnthropicOAuthDirect(providersDir: providersDir)
+            let result = Self.validateAnthropicOAuthDirect(
+                providersDir: providersDir,
+                preRead: cache?.reads[id]
+            )
             return (result.0, "needs_oauth", result.1)
         case "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
-            let result = Self.validateXAIOAuthDirect(providersDir: providersDir)
+            let result = Self.validateXAIOAuthDirect(
+                providersDir: providersDir,
+                preRead: cache?.reads[id]
+            )
             return (result.0, "needs_oauth", result.1)
         case "openai":
-            let ready = LLMCredentialResolver.resolveAPIKey(
-                envVar: "OPENAI_API_KEY",
-                providerConfigFile: "openai.json",
-                dataRoot: dataRoot,
-                includeEnvironment: includeEnvironment
-            ) != nil
+            let ready = keyReady("OPENAI_API_KEY")
             return (ready, "needs_key", ready ? "API key available" : "No OpenAI API key configured")
         case "anthropic":
-            let ready = LLMCredentialResolver.resolveAPIKey(
-                envVar: "ANTHROPIC_API_KEY",
-                providerConfigFile: "anthropic.json",
-                dataRoot: dataRoot,
-                includeEnvironment: includeEnvironment
-            ) != nil
+            let ready = keyReady("ANTHROPIC_API_KEY")
             return (ready, "needs_key", ready ? "API key available" : "No Anthropic API key configured")
         case "openrouter":
-            let ready = LLMCredentialResolver.resolveAPIKey(
-                envVar: "OPENROUTER_API_KEY",
-                providerConfigFile: "openrouter.json",
-                dataRoot: dataRoot,
-                includeEnvironment: includeEnvironment
-            ) != nil
+            let ready = keyReady("OPENROUTER_API_KEY")
             return (ready, "needs_key", ready ? "API key available" : "No OpenRouter API key configured")
         case "moonshot":
-            let ready = LLMCredentialResolver.resolveAPIKey(
-                envVar: "MOONSHOT_API_KEY",
-                providerConfigFile: "moonshot.json",
-                dataRoot: dataRoot,
-                includeEnvironment: includeEnvironment
-            ) != nil
+            let ready = keyReady("MOONSHOT_API_KEY")
             return (ready, "needs_key", ready ? "Moonshot API key available" : "No Moonshot API key configured")
         case "kimi-code":
-            let ready = LLMCredentialResolver.resolveAPIKey(
-                envVar: "KIMI_CODE_API_KEY",
-                providerConfigFile: "kimi-code.json",
-                dataRoot: dataRoot,
-                includeEnvironment: includeEnvironment
-            ) != nil
+            let ready = keyReady("KIMI_CODE_API_KEY")
             return (ready, "needs_key", ready ? "Kimi Code API key available" : "No Kimi Code API key configured")
         default:
+            if let read = cache?.reads[id] {
+                let ready = read.object != nil
+                return (ready, ready ? "ready" : "needs_credentials", ready ? "Provider config present" : "No provider config found")
+            }
             let path = providersDir.appendingPathComponent("\(id).json")
             let ready = (try? Data(contentsOf: path)).map { !$0.isEmpty } ?? false
             return (ready, ready ? "ready" : "needs_credentials", ready ? "Provider config present" : "No provider config found")
@@ -1457,10 +1496,14 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     /// commit paired with the provider from another.
     public func checkedRoutingSnapshot() async throws -> ProviderRoutingSnapshot {
         let pickerState = try await reconciledPickerState()
+        let configCache = providerConfigCache(
+            for: Set(Self.soleConnectedProbeIds).union(pickerState.active.values)
+        )
         return routingSnapshot(
             surfaces: pickerState.surfaces,
             activeProviders: pickerState.active,
-            soleConnectedProvider: soleConnectedProviderFamily()
+            soleConnectedProvider: soleConnectedProviderFamily(cache: configCache),
+            configCache: configCache
         )
     }
 
@@ -1490,10 +1533,15 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 "provider selection changed while being read; retry after recovery completes"
             )
         }
+        let canonicalActive = WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(active)
+        let configCache = providerConfigCache(
+            for: Set(Self.soleConnectedProbeIds).union(canonicalActive.values)
+        )
         return routingSnapshot(
             surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaces),
-            activeProviders: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(active),
-            soleConnectedProvider: soleConnectedProviderFamily()
+            activeProviders: canonicalActive,
+            soleConnectedProvider: soleConnectedProviderFamily(cache: configCache),
+            configCache: configCache
         )
     }
 
@@ -1512,14 +1560,17 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     /// `PRIMARY_MODEL` is a GPT id (`gpt-5.6-sol`), so without this an
     /// Anthropic-only install would default chat to OpenAI and fail the first
     /// turn with "not configured: openai".
-    func soleConnectedProviderFamily() -> String? {
-        let probes = [
-            "anthropic", "anthropic_oauth_direct",
-            "openai", "openai_oauth_direct", "codex",
-            "xai_oauth_direct", "moonshot", "openrouter",
-        ]
+    /// The provider ids the sole-connected probe walks. Named so the routing
+    /// snapshot can pre-read exactly these config files once.
+    static let soleConnectedProbeIds = [
+        "anthropic", "anthropic_oauth_direct",
+        "openai", "openai_oauth_direct", "codex",
+        "xai_oauth_direct", "moonshot", "openrouter",
+    ]
+
+    func soleConnectedProviderFamily(cache: ProviderConfigCache? = nil) -> String? {
         var families: Set<String> = []
-        for id in probes where providerReadiness(id: id).ready {
+        for id in Self.soleConnectedProbeIds where providerReadiness(id: id, cache: cache).ready {
             // Codex is the CLI transport for OpenAI models — group it with
             // the openai family so a codex-only install seeds to GPT.
             let family = id == "codex" ? "openai" : Self.normalizeProviderId(id)
@@ -1531,7 +1582,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     private func routingSnapshot(
         surfaces: [String: JSONValue],
         activeProviders: [String: String],
-        soleConnectedProvider: String? = nil
+        soleConnectedProvider: String? = nil,
+        configCache: ProviderConfigCache? = nil
     ) -> ProviderRoutingSnapshot {
         let surfacesFile = JSONValue.object(surfaces)
         let (surfaceModels, surfaceEfforts) = Self.parseSurfacesFile(surfacesFile)
@@ -1574,13 +1626,32 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             // Anthropic escape hatch. It follows the active chat voice until
             // the user explicitly pins a separate model in Providers.
             "cognition_reflection": chatModel,
+            // Her hour runs unattended, once a day, with nobody waiting on the
+            // result — the same shape as `dream`/`rem`, and it takes the same
+            // cheap seed rather than silently inheriting the chat pin and
+            // spending a frontier turn nobody asked for. This is a SEED, not a
+            // policy: `studio_wander` is a pickable Providers row precisely so
+            // User can decide the hour deserves better.
+            "studio_wander": "gpt-5.4-mini",
         ]
         let seedEffort: [String: String] = [
             "chat": chatEffort,
             "ios": chatEffort,
             "telegram": telegramEffort,
             "cognition_reflection": "high",
+            // Bounded on purpose: an unattended daily lane must not inherit a
+            // frontier effort by omission. Pinnable in Providers like the model.
+            "studio_wander": "low",
         ]
+
+        // User, 2026-09-06: one read per provider for the whole snapshot. Every
+        // surface used to re-read `providers/<id>.json` on its own, unlocked,
+        // so a `configureProvider` save landing mid-loop left one snapshot
+        // holding surfaces resolved against two different saved defaults.
+        let savedDefaults = savedProviderDefaults(
+            for: Set(activeProviders.values).union(soleConnectedProvider.map { [$0] } ?? []),
+            cache: configCache
+        )
 
         var out: [String: SurfacePreference] = [:]
         for surface in MODEL_SURFACES {
@@ -1597,9 +1668,27 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             let hasExplicitPick = Self.stringFrom(surfaceModels, key: surface) != nil
             let effectiveActiveProvider = activeProviders[surface]
                 ?? (hasExplicitPick ? nil : soleConnectedProvider)
-            let effectiveModel = providerCompatibleModel(
+            // User, 2026-09-06: the provider sheet's "Model it falls back to" is
+            // the model an unpinned surface on that provider uses, but the
+            // saved pick only ever reached a surface whose seed was
+            // family-INCOMPATIBLE with the assignment. An unpinned surface
+            // EXPLICITLY assigned to a provider now takes that provider's saved
+            // default whatever family the seed was in. A surface with no
+            // assignment keeps its seed — that is what makes the cheap
+            // dream/rem/studio_wander seeds hold.
+            // 2026-09-06: the unattended lanes keep their cheap seeds even when
+            // onboarding assigned them a provider (it assigns every surface);
+            // only a pin moves them. A saved provider default is for the
+            // surfaces a person is waiting on.
+            let savedProviderDefault: String? = (hasExplicitPick || providerRoutingUnattendedSeedSurfaces.contains(surface))
+                ? nil
+                : activeProviders[surface].flatMap { savedDefaults[$0]?.model }
+            let effectiveModel = savedProviderDefault.map {
+                Self.normalizeModelIdStatic($0, fallback: model)
+            } ?? providerCompatibleModel(
                 model,
-                activeProvider: effectiveActiveProvider
+                activeProvider: effectiveActiveProvider,
+                savedDefaults: savedDefaults
             )
             let effBase = seedEffort[surface] ?? chatEffort
             let pickedEffortRaw = Self.stringFrom(surfaceEfforts, key: surface) ?? effBase
@@ -1708,17 +1797,41 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
     private nonisolated func providerCompatibleModel(
         _ model: String,
-        activeProvider: String?
+        activeProvider: String?,
+        savedDefaults: [String: SavedProviderDefault]? = nil
     ) -> String {
         guard let activeProvider,
               let inferredProvider = inferProviderForModel(model),
               !Self.providerCanServeModel(activeProvider, inferredProvider: inferredProvider) else {
             return model
         }
-        return defaultModelForProvider(activeProvider) ?? model
+        return defaultModelForProvider(activeProvider, savedDefaults: savedDefaults) ?? model
     }
 
-    private nonisolated func defaultModelForProvider(_ providerId: String) -> String? {
+    private nonisolated func defaultModelForProvider(
+        _ providerId: String,
+        savedDefaults: [String: SavedProviderDefault]? = nil
+    ) -> String? {
+        // User, 2026-09-06: the provider sheet's "Model it falls back to" says
+        // it is "the model used when a surface has not pinned one of its own",
+        // and `configureProvider` persists it as `default_model` — but nothing
+        // read it back, so an unpinned surface silently took the first row of
+        // the catalog instead. The saved pick is the answer when there is one.
+        switch savedDefaults?[providerId] ?? configuredDefaultModel(providerId) {
+        case .model(let saved):
+            return saved
+        case .unreadable(let reason):
+            // User, 2026-09-06: corrupt authority is not "no selection". Falling
+            // through to the catalog seed here silently re-pointed the surface
+            // at a different model than the one the person picked. Say so and
+            // keep whatever model the caller already had.
+            FileHandle.standardError.write(Data(
+                "[provider-routing] keeping the current model: \(reason)\n".utf8
+            ))
+            return nil
+        case .absent:
+            break
+        }
         for model in modelsForProvider(providerId) {
             if case .string(let id)? = model["id"],
                !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1736,6 +1849,125 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         case "openrouter": return "anthropic/claude-sonnet-5"
         default: return nil
         }
+    }
+
+    /// What `providers/<id>.json` says about the provider's `default_model`.
+    /// User, 2026-09-06: "absent" and "corrupt" used to be the same answer
+    /// (nil), and nil sends the caller to the catalog seed — so a config file
+    /// that failed to parse silently MOVED the person's selected model to
+    /// whatever the catalog listed first. Corruption is now its own case and
+    /// means "keep the model you already have".
+    enum SavedProviderDefault {
+        case absent
+        case model(String)
+        case unreadable(String)
+
+        /// The saved pick, or nil for both absent and unreadable. Callers that
+        /// must distinguish the two switch on the case instead.
+        var model: String? {
+            if case .model(let id) = self { return id }
+            return nil
+        }
+    }
+
+    /// The `default_model` the person picked in the provider sheet, read from
+    /// `providers/<id>.json` (where `configureProvider` writes it).
+    ///
+    /// User, 2026-09-06: read under the SAME per-file lock `configureProvider`
+    /// writes under. The read was unlocked and happened once per surface, so a
+    /// save landing mid-snapshot resolved some surfaces against the old
+    /// default and the rest against the new one.
+    private nonisolated func configuredDefaultModel(
+        _ providerId: String,
+        cache: ProviderConfigCache? = nil
+    ) -> SavedProviderDefault {
+        let trimmedId = providerId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedId.isEmpty, !trimmedId.contains("/") else { return .absent }
+        let read = cache?.reads[trimmedId] ?? readProviderConfig(trimmedId)
+        if let reason = read.unreadable { return .unreadable(reason) }
+        guard let object = read.object else { return .absent }
+        for key in ["default_model", "defaultModel"] {
+            if let value = object[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return .model(trimmed) }
+            }
+        }
+        return .absent
+    }
+
+    /// One `providers/<id>.json`, read and parsed under the SAME per-file lock
+    /// `configureProvider` writes under. `object` nil with no `unreadable`
+    /// reason means the file simply is not there.
+    struct ProviderConfigRead {
+        var object: [String: Any]?
+        var unreadable: String?
+    }
+
+    /// Every `providers/<id>.json` one routing snapshot needs, each read
+    /// exactly once.
+    ///
+    /// User, 2026-09-06: the readiness probes behind `soleConnectedProviderFamily`
+    /// read these same files UNLOCKED, and ran BEFORE the locked `default_model`
+    /// reads — so a `configureProvider` save landing between the two produced a
+    /// single snapshot that decided which provider was connected from the old
+    /// bytes and what that provider defaults to from the new ones. Both lanes
+    /// now read from this, filled once, under the writer's lock.
+    struct ProviderConfigCache {
+        var reads: [String: ProviderConfigRead] = [:]
+    }
+
+    private nonisolated func readProviderConfig(_ providerId: String) -> ProviderConfigRead {
+        let trimmedId = providerId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedId.isEmpty, !trimmedId.contains("/") else { return ProviderConfigRead() }
+        let path = dataRoot
+            .appendingPathComponent("providers", isDirectory: true)
+            .appendingPathComponent("\(trimmedId).json")
+        guard FileManager.default.fileExists(atPath: path.path) else { return ProviderConfigRead() }
+        do {
+            return try CredentialFileLock.withLock(path) { () -> ProviderConfigRead in
+                guard let data = try? Data(contentsOf: path) else {
+                    return ProviderConfigRead(
+                        unreadable: "provider \(trimmedId) configuration could not be read"
+                    )
+                }
+                guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    return ProviderConfigRead(
+                        unreadable: "provider \(trimmedId) configuration is not a JSON object"
+                    )
+                }
+                return ProviderConfigRead(object: object)
+            }
+        } catch {
+            return ProviderConfigRead(
+                unreadable: "provider \(trimmedId) configuration is locked: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// Fill the per-snapshot cache. The set is the readiness probes plus every
+    /// provider a surface names, so neither lane has to read a file the other
+    /// already read.
+    nonisolated func providerConfigCache(for providerIds: Set<String>) -> ProviderConfigCache {
+        var cache = ProviderConfigCache()
+        for id in providerIds {
+            let trimmedId = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedId.isEmpty, !trimmedId.contains("/") else { continue }
+            cache.reads[trimmedId] = readProviderConfig(trimmedId)
+        }
+        return cache
+    }
+
+    /// Read each provider's saved config ONCE per routing snapshot, so every
+    /// surface in that snapshot resolves against the same bytes.
+    private nonisolated func savedProviderDefaults(
+        for providerIds: Set<String>,
+        cache: ProviderConfigCache? = nil
+    ) -> [String: SavedProviderDefault] {
+        var out: [String: SavedProviderDefault] = [:]
+        for id in providerIds {
+            out[id] = configuredDefaultModel(id, cache: cache)
+        }
+        return out
     }
 
     /// Bare GPT ids are shared by direct OpenAI transports and the Codex CLI.
@@ -1895,6 +2127,10 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         switch lowerModel {
         case let model where model.hasPrefix("kimi-") || model.hasPrefix("moonshot-"):
             supported = Set(MoonshotModelCatalog.supportedReasoningEfforts(for: model))
+        case FirstPartyModelCatalog.gpt6AstraModelID:
+            supported = providerID?.lowercased() == "openai"
+                ? Set(FirstPartyModelCatalog.publicGPT6AstraEfforts)
+                : Set(FirstPartyModelCatalog.accountGPT6AstraEfforts)
         case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":
             supported = providerID?.lowercased() == "openai"
                 ? Set(FirstPartyModelCatalog.publicGPT56Efforts)
@@ -2068,10 +2304,22 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         )
     }
 
-    private nonisolated static func validateAnthropicOAuthDirect(providersDir: URL) -> (Bool, String) {
+    /// `preRead` is the routing snapshot's single locked read of this file; nil
+    /// means read it here (the Provider Settings listing path).
+    private nonisolated static func validateAnthropicOAuthDirect(
+        providersDir: URL,
+        preRead: ProviderConfigRead? = nil
+    ) -> (Bool, String) {
         let path = providersDir.appendingPathComponent("anthropic_oauth_direct.json")
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let parsed: [String: Any]?
+        if let preRead {
+            parsed = preRead.object
+        } else if let data = try? Data(contentsOf: path) {
+            parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } else {
+            parsed = nil
+        }
+        guard let obj = parsed else {
             return (false, "anthropic_oauth_direct.json missing or malformed")
         }
         let topAccess = (obj["access_token"] as? String) ?? ""
@@ -2094,10 +2342,22 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return (true, "Signed in")
     }
 
-    private nonisolated static func validateXAIOAuthDirect(providersDir: URL) -> (Bool, String) {
+    /// `preRead` is the routing snapshot's single locked read of this file; nil
+    /// means read it here (the Provider Settings listing path).
+    private nonisolated static func validateXAIOAuthDirect(
+        providersDir: URL,
+        preRead: ProviderConfigRead? = nil
+    ) -> (Bool, String) {
         let path = providersDir.appendingPathComponent("xai_oauth_direct.json")
-        guard let data = try? Data(contentsOf: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let parsed: [String: Any]?
+        if let preRead {
+            parsed = preRead.object
+        } else if let data = try? Data(contentsOf: path) {
+            parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } else {
+            parsed = nil
+        }
+        guard let obj = parsed else {
             return (false, "xai_oauth_direct.json missing or malformed")
         }
         let access = ((obj["access_token"] as? String)
@@ -2232,9 +2492,12 @@ public func contextLength(forModel modelId: String) -> Int {
     case "gpt-5.4": return 128_000
     case "gpt-5.4-mini": return 128_000
     // Anthropic family
-    case "claude-fable-5": return 200_000
-    case "claude-opus-4-8": return 200_000
-    case "claude-opus-5": return 200_000
+    // Catalog lookup above normally answers these; keep the fallback honest
+    // (all 1M-window models per the live catalog, 2026-09-01).
+    case "claude-fable-5-1": return 1_000_000
+    case "claude-fable-5": return 1_000_000
+    case "claude-opus-4-8": return 1_000_000
+    case "claude-opus-5": return 1_000_000
     case "claude-sonnet-4-6": return 200_000
     case "claude-haiku-4-5": return 200_000
     // OpenRouter passthroughs (live rows 2026-08-07; the delisted

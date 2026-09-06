@@ -60,6 +60,16 @@ public enum LLMCallContext {
     /// test around the call → the row lands under the test's tmp root and the
     /// LIVE default `traces/events.jsonl` is never touched.
     @TaskLocal public static var traceDataRootOverride: URL?
+    /// Seconds the WHOLE turn has left when this provider call starts, bound
+    /// by the tool loops around each call.
+    ///
+    /// User, 2026-09-06: the per-call provider wall (600s) equalled the
+    /// interactive/Telegram turn window (600s), so one hung call spent the
+    /// entire budget and the reconnect ladder had nothing left to retry with.
+    /// The router shortens the wall to fit inside what is left, keeping a
+    /// reconnect reserve. Unbound → the configured wall stands unchanged.
+    @TaskLocal public static var remainingTurnSeconds: TimeInterval?
+
     /// Request-scoped lazy-tool allowance for predictive preloads.
     ///
     /// Explicit `tool_load` writes still live in `ActiveToolsStore` and persist
@@ -146,33 +156,43 @@ public protocol LLMCallLifecycleObserving: Sendable {
 /// Stable/dynamic split of an assembled system prompt (U1 step 2b/3b).
 ///
 /// INVARIANT: the combined system string handed to the LLM client MUST equal
-/// `combined` (i.e. `stable + "\n\n" + dynamic`, empty segments collapsing
-/// the separator) — the segments are a CACHING-layout hint only, never a
-/// content change. Adapters verify this via `reassembles(into:)` before
+/// `combined` (the non-empty segments joined by `"\n\n"` in stable →
+/// stableSuffix → dynamic order) — the segments are a CACHING-layout hint
+/// only, never a content change. Adapters verify this via `reassembles(into:)` before
 /// splitting and fall back to the single combined block on any mismatch.
 ///
 /// - `stable`: rarely changes turn-to-turn within a session — persona packet,
 ///   REM pins, and a session's current lazy tool contract/catalog. Safe to
 ///   cache_control; loading a different tool set intentionally rewrites it.
+/// - `stableSuffix`: appended AFTER `stable` and before `dynamic`. Text that
+///   is stable for the REST OF THE SESSION but was not known when `stable`
+///   was assembled (e.g. a session-scoped contract that a later turn adds).
+///   It rides INSIDE the cached prefix: the breakpoint moves to the end of
+///   the suffix, so `stable` stays a strict prefix of the cached mass and one
+///   breakpoint covers both. Empty by default → byte-identical to the
+///   two-segment shape.
 /// - `dynamic`: churns every turn — memory recall (keyed per user message)
 ///   + rendered session history and other per-turn extras. Must NOT carry a
 ///   cache breakpoint.
 public struct SystemPromptSegments: Sendable, Equatable {
     public let stable: String
+    public let stableSuffix: String
     public let dynamic: String
 
-    public init(stable: String, dynamic: String) {
+    public init(stable: String, stableSuffix: String = "", dynamic: String) {
         self.stable = stable
+        self.stableSuffix = stableSuffix
         self.dynamic = dynamic
     }
 
-    /// The canonical recombination: `stable + "\n\n" + dynamic`, with empty
-    /// segments collapsing the separator. This is the exact byte sequence
+    /// The canonical recombination: the non-empty segments joined by
+    /// `"\n\n"` in `stable` → `stableSuffix` → `dynamic` order, empty
+    /// segments collapsing their separator. This is the exact byte sequence
     /// the legacy combined `systemPrompt` must carry.
     public var combined: String {
-        if stable.isEmpty { return dynamic }
-        if dynamic.isEmpty { return stable }
-        return stable + "\n\n" + dynamic
+        [stable, stableSuffix, dynamic]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
     }
 
     /// True when these segments reassemble byte-for-byte into `system`.
@@ -181,6 +201,86 @@ public struct SystemPromptSegments: Sendable, Equatable {
     public func reassembles(into system: String) -> Bool {
         combined == system
     }
+}
+
+/// Which conversation-prefix wire shape the Anthropic adapters emit.
+///
+/// Lives here (NativeAgentCore) rather than in ProviderRouting so the history
+/// projection that BINDS it per turn and the adapters that READ it share one
+/// type without a module cycle.
+///
+/// - `v1Legacy`: the pre-2026-09 layout — identity block carries its own
+///   cache_control, the stable block carries a second one, conversation
+///   breakpoints only on tool-capable / within-turn-reuse calls, and the
+///   previous-request boundary derived from fixed `count - 3` arithmetic.
+///   Kept BYTE-IDENTICAL as the rollback arm.
+/// - `v2Prefix`: the cross-turn cached-transcript layout — identity is a
+///   strict prefix of `stable`, so it carries NO breakpoint of its own and
+///   one breakpoint at the end of the stable mass covers both; every turn is
+///   treated as a prefix-reuse turn.
+///
+/// TURN-BOUNDARY RULE: `effective` resolves the shape ONCE, at the history
+/// builder's seeding boundary, which then BINDS `override` to the shape it
+/// actually seeded and keeps it bound for the whole turn. Everything below
+/// that boundary — every provider adapter — reads `override` ONLY, and treats
+/// unbound as `.v1Legacy`. Re-deriving the shape from `effective` deeper down
+/// is a bug: a turn that seeded no replayed history seeds and binds
+/// `.v1Legacy`, and an adapter asking `effective` would answer `.v2Prefix`
+/// and emit a differently-shaped request than the one the builder built.
+///
+/// Resolution order for `effective`: task-local `override` (already bound, or
+/// bound by a test) → the `chatConversationPrefixShape` user default →
+/// `.v2Prefix` (production default).
+public enum ConversationPrefixShape: String, Sendable, Equatable, CaseIterable {
+    case v1Legacy
+    case v2Prefix
+
+    /// UserDefaults key. Accepts "v1Legacy"/"v2Prefix" and the bare "v1"/"v2".
+    public static let defaultsKey = "chatConversationPrefixShape"
+
+    /// Per-turn binding — the ONLY thing adapters may read (unbound →
+    /// `.v1Legacy` there). Unbound in `effective` → the user default, then
+    /// `.v2Prefix`.
+    @TaskLocal public static var override: ConversationPrefixShape?
+
+    /// Pure, injectable parser for the persisted value.
+    public static func parse(_ raw: String?) -> ConversationPrefixShape? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !raw.isEmpty else { return nil }
+        if raw.hasPrefix("v1") { return .v1Legacy }
+        if raw.hasPrefix("v2") { return .v2Prefix }
+        return nil
+    }
+
+    public static var effective: ConversationPrefixShape {
+        if let override { return override }
+        if let stored = parse(UserDefaults.standard.string(forKey: defaultsKey)) {
+            return stored
+        }
+        return .v2Prefix
+    }
+}
+
+/// Where the current turn begins inside the array handed to the adapter.
+///
+/// The adapters need ONE index to place the cross-turn cache breakpoint: the
+/// current turn's user message. Everything strictly before it is the prefix
+/// the next turn replays verbatim, so the last assistant message before it is
+/// the read the next turn is built on.
+///
+/// The seeding layer already computes this exactly (`Seed.currentUserIndex`).
+/// The adapter cannot re-derive it reliably: replayed history carries archived
+/// `system` blocks of its own, so "the last system message" is NOT a
+/// dependable marker for where the current turn starts — and when the turn's
+/// volatile block is empty, or the model has no mid-conversation system
+/// support, the seed emits no trailing system message at all. Binding this is
+/// how the adapter stops guessing.
+///
+/// Unbound → the adapter falls back to a conservative trailing-system-run
+/// scan and, when even that is ambiguous, places NO cross-turn marker rather
+/// than a wrong one.
+public enum ConversationPrefixBoundary {
+    @TaskLocal public static var currentUserIndex: Int?
 }
 
 // The single LLM call boundary used by ChatOrchestration, DreamREMCycle, and
@@ -271,11 +371,100 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
     /// arguments. Build with
     /// `try JSONSerialization.data(withJSONObject: schemaDict)`.
     public let parametersJSON: Data
+    /// Anthropic `defer_loading` (beta `mid-conversation-tool-changes-2026-07-01`).
+    ///
+    /// A tool declared with `defer_loading: true` is DECLARED in the request's
+    /// `tools` array — so it is part of the cached prefix and can be referenced
+    /// by name — but is NOT offered to the model until a `tool_addition` block
+    /// surfaces it. That is the whole point of the mid-conversation tool-change
+    /// lane: the array stays byte-identical turn to turn while the offered set
+    /// changes in the message body, behind the cache breakpoint.
+    ///
+    /// FALSE for every other lane and every other provider, so a request that
+    /// never sets it is byte-identical to the pre-2026-09 wire.
+    public let deferLoading: Bool
 
-    public init(name: String, description: String, parametersJSON: Data) {
+    public init(
+        name: String,
+        description: String,
+        parametersJSON: Data,
+        deferLoading: Bool = false
+    ) {
         self.name = name
         self.description = description
         self.parametersJSON = parametersJSON
+        self.deferLoading = deferLoading
+    }
+
+    /// The same schema with the deferred-loading flag set (or cleared).
+    public func deferringLoad(_ deferLoading: Bool = true) -> LLMToolSchema {
+        LLMToolSchema(
+            name: name,
+            description: description,
+            parametersJSON: parametersJSON,
+            deferLoading: deferLoading
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, description, parametersJSON, deferLoading
+    }
+
+    /// Hand-rolled so a persisted schema written before `deferLoading` existed
+    /// still decodes (absent → false) and a schema that does not defer encodes
+    /// byte-identically to the pre-flag shape.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.description = try container.decode(String.self, forKey: .description)
+        self.parametersJSON = try container.decode(Data.self, forKey: .parametersJSON)
+        self.deferLoading = try container.decodeIfPresent(Bool.self, forKey: .deferLoading) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encode(description, forKey: .description)
+        try container.encode(parametersJSON, forKey: .parametersJSON)
+        if deferLoading { try container.encode(true, forKey: .deferLoading) }
+    }
+}
+
+/// One Anthropic mid-conversation tool change (beta
+/// `mid-conversation-tool-changes-2026-07-01`).
+///
+/// A MESSAGE-LEVEL field rather than an `LLMContentBlock` case on purpose:
+/// every adapter in this repo switches exhaustively over `LLMContentBlock`, so
+/// a new case there would be a twelve-file edit across providers that can
+/// never carry one of these. Carried on `LLMMessage.toolChanges`, it is
+/// invisible to every encoder that does not opt in, and the ONE lane that
+/// emits it (the Anthropic api-key structured lane) reads it explicitly.
+///
+/// `name` is the PROVIDER-visible tool name — the name as it appears in the
+/// request's `tools` array. Referencing a name that is not declared there is a
+/// 400, so the producer validates against the array before building these.
+public struct LLMToolChange: Sendable, Equatable {
+    public enum Kind: String, Sendable, Equatable {
+        /// `{"type":"tool_addition","tool":{"type":"tool_reference","name":…}}`
+        case addition
+        /// `{"type":"tool_removal","tool":{"type":"tool_reference","name":…}}`
+        case removal
+    }
+
+    public let kind: Kind
+    public let name: String
+
+    public init(kind: Kind, name: String) {
+        self.kind = kind
+        self.name = name
+    }
+
+    public static func addition(_ name: String) -> LLMToolChange {
+        LLMToolChange(kind: .addition, name: name)
+    }
+
+    public static func removal(_ name: String) -> LLMToolChange {
+        LLMToolChange(kind: .removal, name: name)
     }
 }
 
@@ -350,22 +539,69 @@ public enum LLMContentBlock: Sendable, Equatable {
     case image(mediaType: String, base64: String, name: String?, byteSize: Int)
 }
 
-/// One conversation message. The role is "user", "assistant", or (rarely)
-/// "system" — but system prompts are passed separately via the `system:`
-/// arg, not as a message, to match both providers' canonical request shape.
+/// One conversation message. The TURN-LEVEL system prompt is still passed
+/// separately via the `system:` arg (both providers' canonical request
+/// shape). `.system` here is the MID-CONVERSATION variant: a system message
+/// positioned inside the message array, so per-turn volatile context can sit
+/// AFTER the cached transcript prefix instead of churning the front of it.
 public struct LLMMessage: Sendable, Equatable {
-    public enum Role: String, Sendable, Equatable { case user, assistant }
+    public enum Role: String, Sendable, Equatable { case user, assistant, system }
     public let role: Role
     public let content: [LLMContentBlock]
+    /// Anthropic `clear_at: "next_user_message"` — the provider drops this
+    /// message from the conversation once the next user message arrives, so a
+    /// turn-scoped instruction never becomes permanent transcript. VALID ONLY
+    /// ON `.system`: the initializer forces it to false for every other role,
+    /// so no encoder has to re-check the invariant. Requires the
+    /// `mid-conversation-system-clear-at-2026-08-21` beta, which the adapter
+    /// adds per-request exactly when a flagged message is present, and a model
+    /// whose catalog row says `supportsMidConversationSystemClearAt`.
+    public let turnScopedClearAtNextUserMessage: Bool
+    /// Anthropic `tool_addition` / `tool_removal` content blocks, carried as a
+    /// message-level field (see `LLMToolChange`). VALID ONLY ON `.system` AND
+    /// ONLY WHEN NOT TURN-SCOPED: a `clear_at` message is text-only and returns
+    /// a 400 if it carries a tool-change block, so the initializer clears the
+    /// list for every other shape and no encoder has to re-check the invariant.
+    /// Requires the `mid-conversation-tool-changes-2026-07-01` beta, which the
+    /// Anthropic adapters add per-request exactly when a message carries one,
+    /// and a model whose catalog row says `supportsMidConversationToolChanges`.
+    public let toolChanges: [LLMToolChange]
 
-    public init(role: Role, content: [LLMContentBlock]) {
+    public init(
+        role: Role,
+        content: [LLMContentBlock],
+        turnScopedClearAtNextUserMessage: Bool = false,
+        toolChanges: [LLMToolChange] = []
+    ) {
         self.role = role
         self.content = content
+        self.turnScopedClearAtNextUserMessage =
+            role == .system ? turnScopedClearAtNextUserMessage : false
+        self.toolChanges =
+            (role == .system && !self.turnScopedClearAtNextUserMessage) ? toolChanges : []
+    }
+
+    /// A mid-conversation system message that carries ONLY tool-change blocks.
+    /// Never turn-scoped (the API rejects that pairing).
+    public static func toolChanges(_ changes: [LLMToolChange]) -> LLMMessage {
+        LLMMessage(role: .system, content: [], toolChanges: changes)
     }
 
     /// Convenience: build a pure-text user message.
     public static func user(_ text: String) -> LLMMessage {
         LLMMessage(role: .user, content: [.text(text)])
+    }
+    /// Convenience: build a pure-text MID-CONVERSATION system message.
+    /// `clearAtNextUserMessage` marks it turn-scoped (see the flag's doc).
+    public static func system(
+        _ text: String,
+        clearAtNextUserMessage: Bool = false
+    ) -> LLMMessage {
+        LLMMessage(
+            role: .system,
+            content: [.text(text)],
+            turnScopedClearAtNextUserMessage: clearAtNextUserMessage
+        )
     }
     /// Convenience: build a pure-text assistant message.
     public static func assistantText(_ text: String) -> LLMMessage {
@@ -404,7 +640,12 @@ extension LLMClient {
         var parts: [String] = []
         var imageCount = 0
         for m in messages {
-            let prefix = m.role == .user ? "USER:" : "ASSISTANT:"
+            let prefix: String
+            switch m.role {
+            case .user: prefix = "USER:"
+            case .assistant: prefix = "ASSISTANT:"
+            case .system: prefix = "SYSTEM:"
+            }
             for block in m.content {
                 switch block {
                 case .text(let t):

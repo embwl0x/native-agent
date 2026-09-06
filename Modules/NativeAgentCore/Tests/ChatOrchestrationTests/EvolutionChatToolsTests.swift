@@ -28,6 +28,7 @@ struct EvolutionChatToolsTests {
         // counters are safe; @unchecked Sendable carries the contract.
         private(set) var proposeCalls = 0
         private(set) var statusCalls = 0
+        private(set) var withdrawCalls = 0
         private(set) var stageInstallCalls = 0
         /// MUST stay false — the bridge stages a card; it never installs.
         private(set) var installEverTriggered = false
@@ -49,6 +50,16 @@ struct EvolutionChatToolsTests {
                 "status": .string("ok"),
                 "count": .int(1),
                 "proposals": .array([.object(["id": .string("evo_fake_1")])]),
+            ])
+        }
+
+        func evolutionWithdraw(input: [String: JSONValue]) async throws -> JSONValue {
+            withdrawCalls += 1
+            return .object([
+                "status": .string("withdrawn"),
+                "id": input["id"] ?? .null,
+                "previous_status": .string(seededStatus),
+                "proposal_status": .string("denied"),
             ])
         }
 
@@ -119,6 +130,7 @@ struct EvolutionChatToolsTests {
         let names = Set(schemas.map { $0.name })
         #expect(!names.contains("evolution_propose"))
         #expect(!names.contains("evolution_status"))
+        #expect(!names.contains("evolution_withdraw"))
         #expect(!names.contains("self_install"))
     }
 
@@ -128,6 +140,7 @@ struct EvolutionChatToolsTests {
         let names = Set(schemas.map { $0.name })
         #expect(names.contains("evolution_propose"))
         #expect(names.contains("evolution_status"))
+        #expect(names.contains("evolution_withdraw"))
         #expect(names.contains("self_install"))
 
         // evolution_propose: title + evidence required, diff_text/expected_head optional.
@@ -157,11 +170,22 @@ struct EvolutionChatToolsTests {
             Issue.record("evolution_status schema malformed"); return
         }
         #expect(sreq == [])
+
+        // evolution_withdraw: id required, reason optional.
+        let withdraw = try #require(schemas.first { $0.name == "evolution_withdraw" })
+        let wParsed = try JSONValue.parse(withdraw.parametersJSON)
+        guard case .object(let wo) = wParsed,
+              case .object(let wprops)? = wo["properties"],
+              case .array(let wreq)? = wo["required"] else {
+            Issue.record("evolution_withdraw schema malformed"); return
+        }
+        #expect(wreq == [.string("id")])
+        #expect(wprops["reason"] != nil)
     }
 
     @Test func evolutionToolsAreFullMacGatedNames() {
         #expect(SwiftToolDispatcher.fullMacEvolutionToolNames
-            == ["evolution_propose", "evolution_status", "self_install"])
+            == ["evolution_propose", "evolution_status", "evolution_withdraw", "self_install"])
         // Not always-on core (privileged, lazy-loaded under Full Mac).
         for name in SwiftToolDispatcher.fullMacEvolutionToolNames {
             #expect(!SwiftToolDispatcher.alwaysOnCoreNames.contains(name))
@@ -213,7 +237,7 @@ struct EvolutionChatToolsTests {
 
     @Test func fileAccessNoneBlocksAllThree() async throws {
         let gated = FileAccessGatedDispatcher(inner: PermissiveInner(), fileAccess: "none")
-        for tool in ["evolution_propose", "evolution_status", "self_install"] {
+        for tool in ["evolution_propose", "evolution_status", "evolution_withdraw", "self_install"] {
             await #expect(throws: (any Error).self) {
                 _ = try await gated.dispatch(tool: tool, input: [:], surface: "chat")
             }
@@ -222,7 +246,7 @@ struct EvolutionChatToolsTests {
 
     @Test func fileAccessReadOnlyBlocksAllThree() async throws {
         let gated = FileAccessGatedDispatcher(inner: PermissiveInner(), fileAccess: "read_only")
-        for tool in ["evolution_propose", "evolution_status", "self_install"] {
+        for tool in ["evolution_propose", "evolution_status", "evolution_withdraw", "self_install"] {
             await #expect(throws: (any Error).self) {
                 _ = try await gated.dispatch(tool: tool, input: [:], surface: "chat")
             }
@@ -292,7 +316,7 @@ struct EvolutionChatToolsTests {
         try seedFullMac(root)
         // No evolutionBridge injected.
         let dispatcher = SwiftToolDispatcher(dataRoot: root)
-        for tool in ["evolution_propose", "evolution_status", "self_install"] {
+        for tool in ["evolution_propose", "evolution_status", "evolution_withdraw", "self_install"] {
             let result = try await dispatcher.dispatch(
                 tool: tool, input: ["proposal_id": .string("evo_x")], surface: "chat")
             guard case .object(let obj) = result else {

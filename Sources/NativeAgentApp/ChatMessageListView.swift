@@ -1,4 +1,5 @@
 import SwiftUI
+import ImageIO
 import AppKit
 import CoreGraphics
 import ScreenCaptureKit
@@ -19,11 +20,54 @@ import CloudKit
 
 // PATCH-2026-05-08: wave2-chat-ux — groups consecutive tool messages into collapsible stacks
 // B.6: MessageGrouper — shared grouping logic exposed as a static helper so the
-// ForEach can live directly in the outer LazyVStack (enabling proper lazy rendering).
+// ForEach can live directly in the outer transcript stack.
+/// The transcript's container: a plain `VStack`, always.
+///
+/// User, 2026-09-04: every main-thread pin since 2026-08-31 sampled the same:
+/// `NSRunLoop.flushObservers` → `NSHostingView.beginTransaction` → layout, and
+/// at the end of each update `LazyLayoutViewCache.signalPrefetch` →
+/// `NSHostingView.requestUpdate` → the next one, with no app code anywhere on
+/// the stack. macOS 26's LazyVStack prefetches row hierarchies past the
+/// viewport's edges and, in this tree, never settled. Bars made it happen in
+/// fifteen minutes; insets took nine hours. A VStack has no prefetch, and
+/// AttributeGraph memoizes unchanged rows, so a hundred-row thread costs the
+/// same per delta either way. Long threads are windowed by
+/// `ChatMessageListView.windowSize` instead of made lazy, so no thread ever
+/// re-enters the machinery that pinned; the trap in the plan of record catches
+/// a recurrence with a sample.
+struct ChatTranscriptStack<Content: View>: View {
+    let alignment: HorizontalAlignment
+    let spacing: CGFloat
+    let content: () -> Content
+
+    init(
+        alignment: HorizontalAlignment,
+        spacing: CGFloat,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.alignment = alignment
+        self.spacing = spacing
+        self.content = content
+    }
+
+    var body: some View {
+        VStack(alignment: alignment, spacing: spacing, content: content)
+    }
+}
+
 struct MessageGroup: Identifiable {
     var id: String
     var messages: [ChatMessage]
     var isToolGroup: Bool
+}
+
+enum ChatTranscriptWindow {
+    static func range(count: Int, start: Int? = nil) -> Range<Int> {
+        let count = max(0, count)
+        let size = ChatMessageListView.windowSize
+        let lower = min(max(0, start ?? (count - size)), max(0, count - size))
+        return lower..<min(count, lower + size)
+    }
 }
 
 enum ChatTranscriptPresentation {
@@ -130,8 +174,12 @@ enum ToolPillPresentation {
         return ok ? .succeeded : .failed
     }
 
+    /// ui-simplify 2026-09-02: an absent duration used to render the words
+    /// "unknown duration" beside every streamed tool call — a confession the
+    /// reader could do nothing with. A missing duration now says nothing at
+    /// all; the pill's outcome glyph still distinguishes pending from done.
     static func durationText(_ durationMs: Int?) -> String {
-        guard let durationMs else { return "unknown duration" }
+        guard let durationMs else { return "" }
         return "\(durationMs)ms"
     }
 }
@@ -311,6 +359,15 @@ private final class _MessageGroupCache: @unchecked Sendable {
     private struct Slot {
         var stableKey: StableKey
         var lastMessage: ChatMessage?
+        /// 2026-09-06: `AppModel.chatMessagesStructureVersion` as of the
+        /// compute. It replaces a total-content-byte count, which was both a
+        /// walk of every row per render AND collision-prone: an interior row
+        /// swapped for one of the same length, or changed only in its
+        /// metadata, matched the key, the tail and the byte count, and the
+        /// view kept stale groups. The version is bumped by every transcript
+        /// write except the streaming delta, which the fast path below patches
+        /// in place.
+        var structureVersion: UInt64
         var groups: [MessageGroup]
     }
     // chat-smoothness phase 1: one slot PER SESSION (FIFO-capped) — a detached
@@ -321,7 +378,11 @@ private final class _MessageGroupCache: @unchecked Sendable {
     private let slotCap = 8
     private let lock = NSLock()
     // S.3: sessionId included in cache key to prevent cross-session collisions
-    func groups(for messages: [ChatMessage], sessionId: String) -> [MessageGroup] {
+    func groups(
+        for messages: [ChatMessage],
+        sessionId: String,
+        structureVersion: UInt64
+    ) -> [MessageGroup] {
         // chat-smoothness phase 1: content.count lives OUTSIDE the stable key.
         // During streaming only the last bubble's content grows — the old
         // single key missed on EVERY delta tick, re-walking the whole list
@@ -342,26 +403,23 @@ private final class _MessageGroupCache: @unchecked Sendable {
         // content ever grows in place, and _compute's visibility rules
         // (e.g. hiding "[tool:" system rows) can change with CONTENT for other
         // roles — patching those could keep a row _compute would now hide.
-        if var slot = slots[sessionId], slot.stableKey == stableKey,
-           let last = messages.last, last.role == "assistant",
-           let lastGroup = slot.groups.last, !lastGroup.isToolGroup,
-           lastGroup.messages.count == 1, lastGroup.messages[0].id == last.id {
-            RenderAudit.bump("grouper.patch")
-            var patched = lastGroup
-            patched.messages[0] = last
-            slot.groups[slot.groups.count - 1] = patched
-            slot.lastMessage = last
-            slots[sessionId] = slot
-            return slot.groups
-        }
-        // Non-streaming re-renders still receive an exact tail comparison.
-        // This preserves equal-length content and metadata invalidation without
-        // a collision-prone hash. (Interior rows are immutable in the live
-        // transcript contract; wholesale reloads carry a different tail.)
-        if let slot = slots[sessionId],
+        if var slot = slots[sessionId],
            slot.stableKey == stableKey,
-           slot.lastMessage == messages.last {
-            return slot.groups
+           slot.structureVersion == structureVersion {
+            // The version proves every row but the last is the one this slot
+            // was computed from, so an unchanged tail means an unchanged list.
+            if slot.lastMessage == messages.last { return slot.groups }
+            if let last = messages.last, last.role == "assistant",
+               let lastGroup = slot.groups.last, !lastGroup.isToolGroup,
+               lastGroup.messages.count == 1, lastGroup.messages[0].id == last.id {
+                RenderAudit.bump("grouper.patch")
+                var patched = lastGroup
+                patched.messages[0] = last
+                slot.groups[slot.groups.count - 1] = patched
+                slot.lastMessage = last
+                slots[sessionId] = slot
+                return slot.groups
+            }
         }
         RenderAudit.bump("grouper.compute")
         let computed = MessageGrouper._compute(for: messages)
@@ -374,6 +432,7 @@ private final class _MessageGroupCache: @unchecked Sendable {
         slots[sessionId] = Slot(
             stableKey: stableKey,
             lastMessage: messages.last,
+            structureVersion: structureVersion,
             groups: computed
         )
         return computed
@@ -381,8 +440,16 @@ private final class _MessageGroupCache: @unchecked Sendable {
 }
 
 enum MessageGrouper {
-    static func groups(for messages: [ChatMessage], sessionId: String = "") -> [MessageGroup] {
-        return _MessageGroupCache.shared.groups(for: messages, sessionId: sessionId)
+    static func groups(
+        for messages: [ChatMessage],
+        sessionId: String = "",
+        structureVersion: UInt64
+    ) -> [MessageGroup] {
+        return _MessageGroupCache.shared.groups(
+            for: messages,
+            sessionId: sessionId,
+            structureVersion: structureVersion
+        )
     }
     static func _compute(for messages: [ChatMessage]) -> [MessageGroup] {
         var result: [MessageGroup] = []
@@ -428,10 +495,48 @@ struct ChatMessageListView: View {
     /// The current transcript-search result. Highlighting is projection-only;
     /// it never changes or filters canonical messages.
     var highlightedMessageID: String? = nil
+    /// False while the reader has scrolled up: an entrance nobody is looking at
+    /// is motion for nothing, and the "Latest" pill leads the eye instead.
+    var animatesArrival: Bool = true
+    var latestRequest: Int = 0
+    /// 2026-09-06: the grouper cache keys on the transcript's mutation
+    /// version, so the list needs the model, not just the rows it was handed.
+    @Environment(AppModel.self) private var appModel
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
+
+    /// Rows shown at once. User, 2026-09-04: the transcript is a plain VStack
+    /// (no LazyVStack, no prefetch loop), so every shown row is resident —
+    /// about 1.5 MB each with selectable text. A long thread shows its last
+    /// `windowSize` rows and one row above them that reveals the next page.
+    static let windowSize = 300
+    @State private var pageAnchorID: String?
+    @State private var pagedSearchID: String?
+    @State private var revealedSessionId = ""
+
+    /// Page by stable group identity, so appended replies do not move a reader
+    /// browsing history. A new search selection centers its own bounded page.
+    private func windowRange(for groups: [MessageGroup]) -> Range<Int> {
+        if let highlightedMessageID, highlightedMessageID != pagedSearchID || revealedSessionId != sessionId,
+           let hit = groups.firstIndex(where: { group in
+               group.messages.contains { $0.id == highlightedMessageID }
+           }) {
+            return ChatTranscriptWindow.range(count: groups.count, start: hit - Self.windowSize / 2)
+        }
+        let start = revealedSessionId == sessionId
+            ? groups.firstIndex(where: { $0.id == pageAnchorID }) : nil
+        return ChatTranscriptWindow.range(count: groups.count, start: start)
+    }
 
     var body: some View {
         let lastAssistantId = messages.last(where: { $0.role == "assistant" })?.id
-        let groups = MessageGrouper.groups(for: messages, sessionId: sessionId)
+        let allGroups = MessageGrouper.groups(
+            for: messages,
+            sessionId: sessionId,
+            structureVersion: appModel.chatMessagesStructureVersion
+        )
+        let range = windowRange(for: allGroups)
+        let hidden = range.lowerBound
+        let groups = Array(allGroups[range])
         // Same rule as the main window (ChatView): the live flip-box is the LAST
         // tool group while the session is still working and the reply text has
         // not started arriving yet.
@@ -440,20 +545,33 @@ struct ChatMessageListView: View {
             isStreaming: isStreaming,
             lastMessage: messages.last
         )
+        if hidden > 0 {
+            ChatEarlierMessagesRow(hidden: hidden) {
+                revealedSessionId = sessionId
+                pagedSearchID = highlightedMessageID
+                pageAnchorID = allGroups[max(0, range.lowerBound - Self.windowSize)].id
+            }
+        }
         ForEach(groups) { group in
             if group.isToolGroup {
                 if group.messages.count == 1 {
                     let msg = group.messages[0]
                     if msg.metadata?.isPendingApproval == true {
                         InlineApprovalCard(message: msg)
+                            .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
+                    } else if !classicShell {
+                        ShellToolRow(messages: [msg])
+                            .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
                     } else {
                         ToolPillView(message: msg)
+                            .transcriptLayoutProbe(rowID: msg.id, kind: .toolPill)
                     }
                 } else {
                     ToolCallGroup(
                         messages: group.messages,
                         isLive: liveToolGroupId != nil && group.id == liveToolGroupId
                     )
+                    .transcriptLayoutProbe(rowID: group.id, kind: .toolGroup)
                 }
             } else {
                 let msg = group.messages[0]
@@ -461,6 +579,7 @@ struct ChatMessageListView: View {
                     message: msg,
                     isLastAssistant: msg.role == "assistant" && msg.id == lastAssistantId
                 )
+                .transcriptLayoutProbe(rowID: msg.id, kind: .bubble)
                 .modifier(MacChatTranscriptSearchHighlight(
                     isHighlighted: msg.id == highlightedMessageID
                 ))
@@ -469,11 +588,56 @@ struct ChatMessageListView: View {
                 // (appendChatMessage) supplies a transaction; removals and
                 // wholesale replaces are .identity → instant (no animated
                 // teardown on the end-of-turn id swap or session switch).
-                .transition(.asymmetric(
-                    insertion: .opacity.combined(with: .offset(y: 8)),
-                    removal: .identity))
+                .transition(animatesArrival
+                    ? .asymmetric(
+                        insertion: .opacity.combined(with: .offset(y: 8)),
+                        removal: .identity)
+                    : .identity)
             }
         }
+        .onChange(of: latestRequest) { _, _ in
+            revealedSessionId = sessionId
+            pagedSearchID = highlightedMessageID
+            pageAnchorID = nil
+        }
+        if range.upperBound < allGroups.count {
+            HStack {
+                Button("Later messages") {
+                    revealedSessionId = sessionId
+                    pagedSearchID = highlightedMessageID
+                    pageAnchorID = allGroups[range.upperBound].id
+                }
+                Button("Latest") {
+                    revealedSessionId = sessionId
+                    pagedSearchID = highlightedMessageID
+                    pageAnchorID = nil
+                }
+            }
+            .buttonStyle(.plain)
+            .font(ShellType.label)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .padding(.vertical, 8)
+        }
+    }
+}
+
+/// The one row above a windowed transcript: how many rows are above the fold,
+/// and a click reveals the next page. Secondary label, no chrome.
+private struct ChatEarlierMessagesRow: View {
+    let hidden: Int
+    let reveal: () -> Void
+
+    var body: some View {
+        Button(action: reveal) {
+            Text("\(hidden) earlier \(hidden == 1 ? "message" : "messages")")
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Shows the next \(ChatMessageListView.windowSize) earlier messages")
     }
 }
 
@@ -501,6 +665,7 @@ private struct MacChatTranscriptSearchHighlight: ViewModifier {
 struct ToolPillView: View {
     var message: ChatMessage
     @State private var expanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var meta: ChatMessageMetadata? { message.metadata }
     private var toolName: String { meta?.toolName ?? "tool" }
@@ -534,7 +699,9 @@ struct ToolPillView: View {
         VStack(alignment: .leading, spacing: 0) {
             // Collapsed pill
             Button {
-                withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() }
+                withAnimation(NativeAgentMotion.respecting(
+                    .easeOut(duration: 0.15), reduceMotion: reduceMotion
+                )) { expanded.toggle() }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: icon)
@@ -550,10 +717,12 @@ struct ToolPillView: View {
                             .lineLimit(1)
                     }
                     Spacer(minLength: 4)
-                    // Duration badge
-                    Text(durationText)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                    // Duration badge — omitted entirely when unknown.
+                    if !durationText.isEmpty {
+                        Text(durationText)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
                     // A missing outcome is pending/unknown, never implicit success.
                     Image(systemName: outcome.icon)
                         .font(.caption2)
@@ -670,11 +839,157 @@ struct InlineApprovalCard: View {
     @State private var resolved = false
     @State private var resolvedDecision = ""
     @State private var resolveError: String? = nil
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
+    @State private var showingDraft = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var meta: ChatMessageMetadata? { message.metadata }
     private var approvalId: String { meta?.approvalId ?? "" }
 
+    /// The daemon's own view of this approval, so a card recreated by a
+    /// re-render cannot offer a second click on an already-resolved request.
+    private var externalDecision: String? {
+        appModel.approvals.first(where: { $0.id == approvalId })?.status.lowercased()
+    }
+
+    private var state: InlineApprovalPresentation.State {
+        InlineApprovalPresentation.state(
+            approvalID: approvalId,
+            locallyResolved: resolved,
+            localDecision: resolvedDecision,
+            externalStatus: externalDecision
+        )
+    }
+
     var body: some View {
+        if classicShell {
+            classicBody
+        } else {
+            shellBody
+        }
+    }
+
+    // MARK: - The shell card
+    //
+    // ui-simplify 2026-09-02 (Lane A): the same component, restyled. Teal is
+    // reserved for exactly this — she is waiting on you — so the border is the
+    // only teal on the page. The title is plain, the detail line carries the
+    // full recipient/address (never truncated: that is the thing being
+    // approved), and the draft opens in place rather than in a sheet.
+    private var shellBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "envelope")
+                    .foregroundStyle(NativeAgentShell.needsYou)
+                Text(ChatShellApprovalCopy.title(message.content))
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: 0)
+            }
+
+            let detail = ChatShellApprovalCopy.detail(message.content)
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
+            switch state {
+            case .resolved(let decision):
+                let approved = decision == "approved"
+                let rejected = decision == "denied" || decision == "rejected"
+                Text(approved ? "Done." : (rejected ? "Left alone." : "Resolved."))
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            case .pending:
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await resolve("approved") }
+                    } label: {
+                        Text(ChatShellApprovalCopy.approve(for: message.content))
+                            .font(ShellType.labelSemibold)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 9)
+                            .background(
+                                NativeAgentShell.needsYou,
+                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            )
+                            .foregroundStyle(Color(hex: 0x0B1013))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(resolving || approvalId.isEmpty)
+
+                    Button {
+                        Task { await resolve("denied") }
+                    } label: {
+                        Text(ChatShellApprovalCopy.decline)
+                            .font(ShellType.labelSemibold)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 9)
+                            .background(
+                                NativeAgentShell.softFill,
+                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            )
+                            .foregroundStyle(NativeAgentShell.text)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(resolving || approvalId.isEmpty)
+
+                    Button {
+                        withAnimation(NativeAgentMotion.respecting(
+                            .easeOut(duration: 0.15), reduceMotion: reduceMotion
+                        )) { showingDraft.toggle() }
+                    } label: {
+                        Text(showingDraft
+                            ? ChatShellApprovalCopy.hideDraft
+                            : ChatShellApprovalCopy.showDraft)
+                            .font(ShellType.label)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            case .unavailable:
+                Label("Approval details unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.trouble)
+            }
+
+            if showingDraft {
+                Text(message.content)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity)
+            }
+
+            if let resolveError {
+                Text(resolveError)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .lineLimit(3)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 16)
+        .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
+        .background(
+            NativeAgentShell.quietFill,
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(NativeAgentShell.needsYou.opacity(0.35), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("chat.shell.approval-card")
+    }
+
+    private var classicBody: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: "lock.shield.fill")
@@ -781,8 +1096,10 @@ struct ToolCallGroup: View {
     /// True only for the currently-streaming last group: show the live
     /// flip-through box. Otherwise collapse to an "N tools used" summary.
     var isLive: Bool = false
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
     @State private var toolsExpanded = false
     @State private var skillsExpanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // Skill use shows up as these tool calls — split them into their own
     // "N skills used" box, separate from regular tools. The checked catalog
@@ -807,6 +1124,11 @@ struct ToolCallGroup: View {
             fullList
         } else if isLive {
             liveBox
+        } else if !classicShell {
+            // ui-simplify 2026-09-02: one quiet row for the whole turn's tool
+            // traffic — tools and skills together — instead of two collapsed
+            // boxes of raw tool names.
+            ShellToolRow(messages: messages)
         } else {
             collapsedBox
         }
@@ -829,7 +1151,10 @@ struct ToolCallGroup: View {
             Spacer(minLength: 0)
         }
         .padding(.leading, 20)
-        .animation(.easeOut(duration: 0.22), value: messages.last?.id)
+        .animation(
+            NativeAgentMotion.respecting(.easeOut(duration: 0.22), reduceMotion: reduceMotion),
+            value: messages.last?.id
+        )
     }
 
     // When done: separate "N tools used" / "N skills used" boxes, each
@@ -852,7 +1177,9 @@ struct ToolCallGroup: View {
                             expanded: Binding<Bool>) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Button {
-                withAnimation(.easeOut(duration: 0.15)) { expanded.wrappedValue.toggle() }
+                withAnimation(NativeAgentMotion.respecting(
+                    .easeOut(duration: 0.15), reduceMotion: reduceMotion
+                )) { expanded.wrappedValue.toggle() }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: icon).font(.caption2).foregroundStyle(.secondary)
@@ -906,7 +1233,9 @@ struct SlashCommandMenu: View {
     }
 
     private var hardcodedCommands: [SlashCmd] {
-        ChatSlashCommandRegistry.visible(showDeveloperSurfaces: showDeveloperSurfaces).map {
+        ChatSlashCommandRegistry.visible(
+            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
+        ).map {
             SlashCmd(command: $0.command, description: $0.description, placeholder: $0.placeholder)
         }
     }
@@ -1109,10 +1438,37 @@ enum ChatLocalImageAttachmentLoader {
         try? Data(contentsOf: url)
     }
 
+    /// Longest side of a decoded transcript image, in pixels. The bubble shows
+    /// it in a 360 pt box, so 720 px is exactly 2× and sharp on every Mac
+    /// display; a 2560-wide screenshot decoded whole is 15 MB of pixels the
+    /// frame never shows. User, 2026-09-04: the transcript is a plain VStack
+    /// now, so every image row in a thread decodes at open; thirty screenshots
+    /// at 1440 px measured 141 MB of raster, at 720 px a quarter of that.
+    static let maxDecodedPixelSize = 720
+
     static func decode(_ data: Data, cacheKey: String?) -> NSImage? {
-        guard let image = NSImage(data: data) else { return nil }
+        guard let image = decodeBounded(data) ?? NSImage(data: data) else { return nil }
         if let key = cacheKey { ChatImageCache.store(image, forKey: key) }
         return image
+    }
+
+    /// Decodes through ImageIO at `maxDecodedPixelSize`, keeping the point size
+    /// the full image would have had so layout does not move. Returns nil when
+    /// ImageIO cannot read the bytes, and the caller falls back to `NSImage`.
+    private static func decodeBounded(_ data: Data) -> NSImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              let full = NSImage(data: data)
+        else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxDecodedPixelSize,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return nil }
+        return NSImage(cgImage: cg, size: full.size)
     }
 
     static func load(at url: URL) -> NSImage? {
@@ -1132,6 +1488,7 @@ struct MessageBubble: View {
 
     @State private var voiceOutput = VoiceOutputController.sharedMessagePlayback
     @Environment(AppModel.self) private var appModel
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
     @State private var showJSONSheet = false
     @State private var bubbleToast: String? = nil
     @State private var isHovered = false
@@ -1165,10 +1522,76 @@ struct MessageBubble: View {
     }
 
     private var userCorners: RectangleCornerRadii {
-        .init(topLeading: 8, bottomLeading: 8, bottomTrailing: 3, topTrailing: 8)
+        shellChrome
+            ? NativeAgentShellLayout.userBubbleCorners
+            : .init(topLeading: 8, bottomLeading: 8, bottomTrailing: 3, topTrailing: 8)
+    }
+
+    // ui-simplify 2026-09-02 (Lane A): her replies are prose, not chat
+    // furniture — plain text at 16pt on a 1.6 line height inside 600pt, with
+    // the user's own words in one soft bubble opposite. The classic bubble
+    // (accent fill, white text, 8pt corners) survives behind the kill switch.
+    private var shellChrome: Bool { !classicShell }
+
+    /// The bridge writes `[from: claude, via bridge] …` into the message body
+    /// so downstream consumers can see the route. That is plumbing: the room
+    /// shows the text and puts the route in a small tag above it. The
+    /// out-of-band provenance badge (MacChatMessageProvenance) is unchanged and
+    /// remains the trust signal — this tag is only the friendly restatement.
+    /// 2026-09-06: provenance, not syntax, decides. A quoted routing prefix in
+    /// a message the person typed used to buy the sender's seat and silence the
+    /// trust badge.
+    private var isBridgeRouted: Bool {
+        ChatShellConversationRow.isBridgeRouted(message.metadata?.origin)
+    }
+
+    private var bridgeTag: String? {
+        guard shellChrome, isUser, isBridgeRouted else { return nil }
+        return ChatShellConversationRow.bridgeAgentTag(message.content)
+    }
+
+    /// Agent, 2026-09-02: a bridge message is another AGENT talking. It
+    /// carries the user role only because that is the seat the runtime hands
+    /// an inbound turn — it was never User. Rendering it in the right-hand
+    /// bubble put Claude's and Codex's words in User's seat, so the room read
+    /// as though he had said them. User's seat is User's only.
+    private var isBridgeMessage: Bool { bridgeTag != nil }
+
+    /// Which side of the room this message sits on. Only the human's own
+    /// words take the right.
+    private var seatsRight: Bool { isUser && !isBridgeMessage }
+
+    /// A bridge message renders on the left and QUIETER than her replies:
+    /// smaller, secondary, and with no bubble behind it, so it reads as
+    /// traffic passing through the room rather than as either voice in it.
+    private var isQuietBridge: Bool { shellChrome && isBridgeMessage }
+
+    private var displayContent: String {
+        guard shellChrome, isBridgeRouted,
+              ChatShellConversationRow.hasBridgePrefix(message.content)
+        else {
+            return message.content
+        }
+        return ChatShellConversationRow.stripBridgePrefix(message.content)
     }
 
     var body: some View {
+        // Agent, 2026-09-02: a worker's completion envelope is a note to her,
+        // not a conversation for User. In the new shell it folds like tools.
+        // 2026-09-06: `isBridgeRouted` for the same reason as `bridgeTag` — a
+        // person who quotes a routing slip must not have their own message
+        // folded away into a worker receipt.
+        if shellChrome, isUser, isBridgeRouted, ChatShellEnvelope.isEnvelope(message.content) {
+            ShellEnvelopeRow(content: message.content)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+        } else {
+            bubbleBody
+        }
+    }
+
+    @ViewBuilder
+    private var bubbleBody: some View {
         let _ = RenderAudit.bump("bubble.body")
         // One immutable projection per bubble pass. These were four separate
         // computed-property reads, each of which partitioned the full
@@ -1177,13 +1600,21 @@ struct MessageBubble: View {
         let attachments = ChatAttachmentPresentation.partition(
             message.metadata?.attachments ?? []
         )
-        let hasVisibleContent = ChatTranscriptPresentation.hasVisibleText(message.content)
+        let hasVisibleContent = ChatTranscriptPresentation.hasVisibleText(displayContent)
         let timestamp = UserDisplayFormatters.chatTimestamp(message.createdAt)
         HStack(alignment: .bottom, spacing: NativeAgentSpacing.sm) {
-            if isUser { Spacer(minLength: 60) }
+            if seatsRight { Spacer(minLength: 60) }
 
-            VStack(alignment: isUser ? .trailing : .leading, spacing: NativeAgentSpacing.xs) {
-                if !isUser {
+            VStack(alignment: seatsRight ? .trailing : .leading, spacing: NativeAgentSpacing.xs) {
+                if let bridgeTag {
+                    // The one word that says who is speaking is not the
+                    // faintest thing on the page (Agent, 2026-09-02).
+                    Text(bridgeTag)
+                        .font(ShellType.labelSemibold)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .accessibilityLabel("From \(bridgeTag), through the bridge")
+                }
+                if !isUser, !shellChrome {
                     HStack(spacing: NativeAgentSpacing.xs) {
                     Text(displayRole)
                         .font(NativeAgentFont.label)
@@ -1202,7 +1633,7 @@ struct MessageBubble: View {
                 // so scrollback is readable as a trust boundary and not just as
                 // prose. The label set is closed (MacChatMessageProvenance) —
                 // no recorded string is ever interpolated into this view.
-                if isUser, let provenance = messageProvenance {
+                if isUser, bridgeTag == nil, let provenance = messageProvenance {
                     HStack(spacing: NativeAgentSpacing.xs) {
                         Image(systemName: provenance.symbol)
                         Text(provenance.label)
@@ -1214,7 +1645,7 @@ struct MessageBubble: View {
                 }
 
                 // Message content bubble
-                VStack(alignment: isUser ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
+                VStack(alignment: seatsRight ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
                     if hasVisibleContent {
                         renderedMessageText
                     } else if attachments.localImages.isEmpty && attachments.chips.isEmpty {
@@ -1227,25 +1658,47 @@ struct MessageBubble: View {
                         MessageAttachmentChipView(attachment: attachment)
                     }
                 }
-                    .font(NativeAgentFont.body)
+                    // User, 2026-09-03: her replies at 16 regular read soft
+                    // next to the 13 medium of a bridge note. Medium is what
+                    // stays crisp on glass; 15 keeps hers the larger voice.
+                    // User, 2026-09-03: "chonky lettering". The cause was
+                    // macOS font smoothing (stem darkening), which the app now
+                    // turns off for itself at launch, the way Chromium apps
+                    // draw; regular weight reads crisp without it.
+                    .font(shellChrome
+                        ? (isQuietBridge ? ShellType.label : ShellType.body)
+                        : NativeAgentFont.body)
                     .textSelection(.enabled)
-                    .lineSpacing(2)
-                    .frame(maxWidth: isUser ? 540 : NativeAgentLayout.maxReadableChatWidth, alignment: isUser ? .trailing : .leading)
-                    .padding(.horizontal, isUser ? NativeAgentSpacing.md : 0)
-                    .padding(.vertical, isUser ? NativeAgentSpacing.sm + 2 : NativeAgentSpacing.xs)
+                    .lineSpacing(shellChrome && !isUser
+                        ? NativeAgentShellLayout.replyLineSpacing
+                        : 2)
+                    .frame(
+                        maxWidth: shellChrome
+                            ? (seatsRight
+                                ? NativeAgentShellLayout.userBubbleMaxWidth
+                                : NativeAgentShellLayout.replyMaxWidth)
+                            : (isUser ? 540 : NativeAgentLayout.maxReadableChatWidth),
+                        alignment: seatsRight ? .trailing : .leading
+                    )
+                    .padding(.horizontal, seatsRight ? (shellChrome ? 16 : NativeAgentSpacing.md) : 0)
+                    .padding(.vertical, seatsRight ? (shellChrome ? 12 : NativeAgentSpacing.sm + 2) : NativeAgentSpacing.xs)
                     .background {
-                        if isUser {
+                        if seatsRight {
                             UnevenRoundedRectangle(cornerRadii: userCorners, style: .continuous)
-                                .fill(NativeAgentBrand.accentDeep)
+                                .fill(shellChrome
+                                    ? AnyShapeStyle(NativeAgentShell.softFill)
+                                    : AnyShapeStyle(NativeAgentBrand.accentDeep))
                         }
                     }
                     .overlay {
-                        if isUser {
+                        if isUser, !shellChrome {
                             UnevenRoundedRectangle(cornerRadii: userCorners, style: .continuous)
                                 .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.8)
                         }
                     }
-                    .foregroundStyle(isUser ? Color.white : Color.primary)
+                    .foregroundStyle(shellChrome
+                        ? (isQuietBridge ? NativeAgentShell.secondary : NativeAgentShell.text)
+                        : (isUser ? Color.white : Color.primary))
                     .contextMenu {
                         // PATCH-2026-06-06: chat-upgrades — message-level actions
                         Button {
@@ -1289,36 +1742,46 @@ struct MessageBubble: View {
                             Label("Show as JSON", systemImage: "curlybraces")
                         }
                     }
-                    .overlay(alignment: isUser ? .topTrailing : .topLeading) {
-                        BubbleHoverBar(
-                            message: message,
-                            isLastAssistant: isLastAssistant,
-                            onCopy: {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(message.content, forType: .string)
-                                showBubbleToast("Copied")
-                            },
-                            onRegenerate: {
-                                Task { await appModel.regenerateAssistantMessage(message) }
-                            },
-                            onReadAloud: {
-                                toggleReadAloud()
-                            },
-                            onFeedback: { rating in
-                                postFeedback(messageId: message.id, rating: rating)
-                            }
-                        )
-                        .padding(.horizontal, 8)
-                        .offset(y: -14)
+                    // The classic shell keeps the floating bar exactly where it
+                    // was. The new shell does NOT — see the strip below.
+                    .overlay(alignment: seatsRight ? .topTrailing : .topLeading) {
+                        if !shellChrome {
+                            hoverBar
+                                .padding(.horizontal, 8)
+                                .offset(y: -14)
+                                .opacity(isHovered ? 1 : 0)
+                                .scaleEffect(
+                                    isHovered ? 1 : 0.96,
+                                    anchor: seatsRight ? .topTrailing : .topLeading
+                                )
+                                .allowsHitTesting(isHovered)
+                                // This is a pointer-only duplicate of the
+                                // message's accessibility actions below.
+                                // Keeping an opacity-zero button row in the AX
+                                // tree creates phantom focus stops.
+                                .accessibilityHidden(true)
+                                .animation(NativeAgentMotion.snappy, value: isHovered)
+                        }
+                    }
+
+                // Agent, 2026-09-02, named twice: the floating bar overlapped
+                // the top of the bubble and landed ON the first line of the
+                // message next to it — copy, speaker and thumbs sitting over
+                // her words. It must never cover text, so in the new shell it
+                // has its own strip UNDER the message.
+                //
+                // The strip is reserved whether or not the pointer is here.
+                // That keeps hover LAYOUT-NEUTRAL (User, 2026-07-25): a row
+                // that appears on hover changes the bubble's height, and every
+                // scroll strategy shows that as a hop.
+                if shellChrome {
+                    hoverBar
+                        .frame(height: NativeAgentShellLayout.hoverBarStrip, alignment: .center)
                         .opacity(isHovered ? 1 : 0)
-                        .scaleEffect(isHovered ? 1 : 0.96, anchor: isUser ? .topTrailing : .topLeading)
                         .allowsHitTesting(isHovered)
-                        // This is a pointer-only duplicate of the message's
-                        // accessibility actions below. Keeping an opacity-zero
-                        // button row in the AX tree creates phantom focus stops.
                         .accessibilityHidden(true)
                         .animation(NativeAgentMotion.snappy, value: isHovered)
-                    }
+                }
 
                 if !isUser, isLastAssistant, messageNeedsRetry {
                     Button {
@@ -1339,9 +1802,16 @@ struct MessageBubble: View {
                 // layout permanently; the text overflow-draws into the
                 // inter-bubble gap (where the inserted row used to render) and
                 // only its opacity tracks hover.
+                // Agent, 2026-09-03: measured 1.86:1 on the light room —
+                // SwiftUI's hierarchical .tertiary over behind-window glass is
+                // not a colour, it is a fade, and it failed the 4.5:1 floor by
+                // a factor of 2.4. The shell's own tertiary token clears it in
+                // both appearances; 10pt (the HIG floor) is kept.
                 Text(timestamp)
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(.tertiary)
+                    .font(shellChrome ? ShellType.caption : NativeAgentFont.tag)
+                    .foregroundStyle(shellChrome
+                        ? AnyShapeStyle(NativeAgentShell.secondary)
+                        : AnyShapeStyle(HierarchicalShapeStyle.tertiary))
                     // Yield to bubbleToast below — both draw into the same
                     // gap, and the toast is the one the user just triggered.
                     .opacity(isHovered && bubbleToast == nil ? 1 : 0)
@@ -1357,15 +1827,24 @@ struct MessageBubble: View {
                 }
 
             }
-            .frame(maxWidth: NativeAgentLayout.maxReadableChatWidth, alignment: isUser ? .trailing : .leading)
+            .frame(
+                maxWidth: shellChrome
+                    ? NativeAgentShellLayout.roomColumn
+                    : NativeAgentLayout.maxReadableChatWidth,
+                alignment: seatsRight ? .trailing : .leading
+            )
             .sheet(isPresented: $showJSONSheet) { MessageJSONSheet(message: message) }
+            // User, 2026-09-02: the whole column, gaps included, is the hover
+            // region, so moving the pointer from the words down onto the bar
+            // keeps the bar; leaving the message anywhere drops it.
+            .contentShape(Rectangle())
             .onHover { hovering in
                 withAnimation(NativeAgentMotion.snappy) { isHovered = hovering }
             }
 
-            if !isUser { Spacer(minLength: 60) }
+            if !seatsRight { Spacer(minLength: 60) }
         }
-        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        .frame(maxWidth: .infinity, alignment: seatsRight ? .trailing : .leading)
         .animation(NativeAgentMotion.snappy, value: bubbleToast)
         .modifier(MessageBubbleAccessibilityActions(
             isUser: isUser,
@@ -1393,6 +1872,30 @@ struct MessageBubble: View {
                 showBubbleToast(msg)
             }
         }
+    }
+
+    /// The per-message actions. One construction, two placements: floating
+    /// over the bubble in the classic shell, in its own reserved strip under
+    /// the message in the new one.
+    private var hoverBar: some View {
+        BubbleHoverBar(
+            message: message,
+            isLastAssistant: isLastAssistant,
+            onCopy: {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(message.content, forType: .string)
+                showBubbleToast("Copied")
+            },
+            onRegenerate: {
+                Task { await appModel.regenerateAssistantMessage(message) }
+            },
+            onReadAloud: {
+                toggleReadAloud()
+            },
+            onFeedback: { rating in
+                postFeedback(messageId: message.id, rating: rating)
+            }
+        )
     }
 
     private func showBubbleToast(_ text: String) {
@@ -1442,12 +1945,12 @@ struct MessageBubble: View {
             // Streaming stays raw: the in-flight bubble changes on every
             // coalesce tick, so neither the block split nor the markdown parse
             // may run here. Rich content resolves once the turn settles.
-            Text(message.content)
+            Text(displayContent)
         } else {
             // 658.13: one pass over cached blocks. Prose keeps the existing
             // cached inline-markdown path; fenced code becomes a real code
             // block instead of the newline-collapsed mangle it used to be.
-            let blocks = ChatRichContentCache.blocks(message.content)
+            let blocks = ChatRichContentCache.blocks(displayContent)
             if blocks.count == 1, case .prose(let only) = blocks[0] {
                 // The overwhelmingly common case. Rendering it bare keeps the
                 // pre-658.13 view tree exactly as it was — no extra VStack and
@@ -1456,7 +1959,7 @@ struct MessageBubble: View {
                 // full-width child.
                 proseText(only)
             } else {
-                VStack(alignment: isUser ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
+                VStack(alignment: seatsRight ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
                     // Positional identity: `blocks` is recomputed atomically
                     // from one content string, and a message may legitimately
                     // repeat the same snippet twice.

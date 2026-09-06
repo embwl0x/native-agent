@@ -606,13 +606,18 @@ extension KnowledgeGraphStore {
                 let lastSeen: String? = {
                     if case .string(let s)? = e["last_seen"] { return s }; return nil
                 }()
-                let provenance: String? = {
-                    if case .string(let s)? = e["provenance"] { return s }; return nil
-                }()
+                // 2026-09-06: the import stamps its OWN provenance on every
+                // row instead of copying the JSON's. The canonical rebuild
+                // keeps a row only when a writer claims it, and an unstamped
+                // (or arbitrarily stamped) import is indistinguishable from the
+                // daemon-era residue the purge exists to delete — so the first
+                // rebuild after an import destroyed it. The original value is
+                // no longer a known column, so it rides along in metadata.
+                let provenance = SwiftNativeKnowledgeGraphIndexer.legacyImportProvenance
                 // Metadata bag — everything not modeled as a column.
                 let metaKnown: Set<String> = [
                     "id", "name", "type", "summary", "aliases", "mention_count",
-                    "first_seen", "last_seen", "provenance",
+                    "first_seen", "last_seen",
                 ]
                 var meta: [String: JSONValue] = [:]
                 for (k, v) in e where !metaKnown.contains(k) { meta[k] = v }
@@ -644,11 +649,10 @@ extension KnowledgeGraphStore {
                     if case .double(let d)? = e["mention_count"] { return Int64(d) }
                     return 0
                 }()
-                let provenance: String? = {
-                    if case .string(let s)? = e["provenance"] { return s }; return nil
-                }()
+                // Same stamp as the entities above, for the same reason.
+                let provenance = SwiftNativeKnowledgeGraphIndexer.legacyImportProvenance
                 let edgeKnown: Set<String> = [
-                    "from", "to", "type", "weight", "mention_count", "provenance",
+                    "from", "to", "type", "weight", "mention_count",
                 ]
                 var meta: [String: JSONValue] = [:]
                 for (k, v) in e where !edgeKnown.contains(k) { meta[k] = v }

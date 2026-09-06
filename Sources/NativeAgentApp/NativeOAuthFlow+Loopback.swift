@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Network
+import PersistenceCore
 
 // MARK: - Loopback OAuth (ChatGPT / OpenAI)
 //
@@ -32,7 +33,9 @@ extension NativeOAuthFlow {
     private static let loopbackMaxRequestBytes = 64 * 1024
 
     @MainActor
-    static func startOpenAILoopbackFlow() async -> OAuthFlowResult {
+    static func startOpenAILoopbackFlow(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> OAuthFlowResult {
         let config = ProviderOAuthConfig.openai
         let redirectURI = "http://localhost:\(openAILoopbackPort)\(openAILoopbackPath)"
 
@@ -83,7 +86,7 @@ extension NativeOAuthFlow {
         }
 
         do {
-            try config.persistTokens(tokens)
+            try config.persistTokens(tokens, dataRoot)
         } catch {
             return OAuthFlowResult(ok: false,
                 error: "Could not write token file: \(error.localizedDescription)")

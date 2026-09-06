@@ -35,7 +35,7 @@ extension TelegramPollLoop {
 
         switch parsed.definition.handler {
         case .stop:
-            let outcome = await requestLiveTurnStop(chatId: message.chatId)
+            let outcome = await requestLiveTurnStop(destination: message.destination)
             switch outcome {
             case .confirmed:
                 await recordReceipt(
@@ -43,7 +43,7 @@ extension TelegramPollLoop {
                     update: update,
                     message: message,
                     text: text,
-                    reply: "Telegram turn canceled"
+                    reply: "Stopped."
                 )
             case .outcomeUnknown:
                 await recordReceipt(
@@ -51,11 +51,11 @@ extension TelegramPollLoop {
                     update: update,
                     message: message,
                     text: text,
-                    reply: "Telegram turn cancellation could not be confirmed"
+                    reply: "I asked it to stop but could not confirm it did — check the Mac app if it keeps going."
                 )
             case .notRunning:
                 await sendCommandReply(
-                    "No Telegram turn is running for this chat.",
+                    "Nothing is running right now.",
                     kind: "slash_reply",
                     update: update,
                     message: message,
@@ -76,16 +76,16 @@ extension TelegramPollLoop {
             return false
 
         case .status:
-            if await refreshLiveTurnCard(chatId: message.chatId) {
+            if await refreshLiveTurnCard(destination: message.destination) {
                 await recordReceipt(
                     kind: "slash_status_card_refresh",
                     update: update,
                     message: message,
                     text: text,
-                    reply: "Telegram work card refreshed"
+                    reply: "Refreshed the card above."
                 )
             } else {
-                let reply = await buildStatusReply(chatId: message.chatId)
+                let reply = await buildStatusReply(destination: message.destination)
                 await sendCommandReply(reply, kind: "slash_reply", update: update, message: message, text: text)
             }
             return false
@@ -225,7 +225,7 @@ extension TelegramPollLoop {
         do {
             try await sendMessageWithReplyMarkup(
                 token,
-                message.chatId,
+                message.destination,
                 TelegramModelSelectionUI.providerText(menu: menu),
                 TelegramModelSelectionUI.providerReplyMarkup(menu: menu)
             )
@@ -254,7 +254,7 @@ extension TelegramPollLoop {
             let outcome = try await bot.dispatchSwiftSlashCommandDetailed(
                 parsed.definition.name,
                 args: parsed.args,
-                chatId: message.chatId,
+                destination: message.destination,
                 fromUserId: message.fromUserId,
                 chatType: message.chatType
             )
@@ -314,7 +314,7 @@ extension TelegramPollLoop {
         let requested = args.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         do {
             let status = try await TelegramSessionStore(dataRoot: dataRoot)
-                .bindSession(chatId: message.chatId, requestedSessionId: requested)
+                .bindSession(destination: message.destination, requestedSessionId: requested)
             let reply = """
             Resumed Telegram session: \(status.sessionId)
             Persona: \(status.persona)
@@ -340,7 +340,7 @@ extension TelegramPollLoop {
     ) async -> Bool {
         guard chatHandler != nil || progressChatHandler != nil || attachmentChatHandler != nil else {
             await sendCommandReply(
-                "Chat handling is not wired on this Telegram surface.",
+                "I can't run anything here right now — chat isn't wired up on this surface.",
                 kind: "retry_unavailable",
                 update: update,
                 message: message,
@@ -348,19 +348,37 @@ extension TelegramPollLoop {
             )
             return false
         }
-        guard let last = await turnCoordinator.lastUserMessage(chatId: message.chatId) else {
-            await sendCommandReply(
-                "No Telegram user message is available to retry.",
-                kind: "retry_unavailable",
-                update: update,
-                message: message,
-                text: text
-            )
-            return false
-        }
-
         let updateInbox = TelegramUpdateInbox(offsetURL: offsetURL)
+        // 2026-09-06: a queued /retry pins the text it resolved to on its
+        // durable claim. Restart recovery replays that claim through this
+        // handler with an empty in-memory last-message map, so without the
+        // pinned text the sender's queued retry answered "nothing to retry"
+        // and the claim settled — the request was gone.
+        let retryText: String
+        if let pinned = await updateInbox.resolvedRetryText(updateId: update.updateId) {
+            retryText = pinned
+        } else if let last = await turnCoordinator.lastUserMessage(destination: message.destination) {
+            retryText = last.text
+        } else {
+            await sendCommandReply(
+                "There's nothing of yours to retry yet.",
+                kind: "retry_unavailable",
+                update: update,
+                message: message,
+                text: text
+            )
+            return false
+        }
         let retryOperation: @Sendable (UUID) async -> Void = { turnId in
+            // 2026-09-06: the same silent-loss window the chat lane had —
+            // `.completed` was written after the transition, before the retry
+            // turn ran, so a crash left a claim recovery never reopens. It
+            // settles after the reply has been handed off instead. The
+            // in-flight mark keeps the every-tick recovery pass off a live
+            // turn, and it is taken BEFORE the claim enters `.processing`: a
+            // tick landing in the gap saw a `.processing` claim with no owner
+            // and quarantined the running retry as outcome-unknown.
+            await turnCoordinator.beginUpdateProcessing(update.updateId)
             do {
                 let processing = try await updateInbox.transition(
                     updateId: update.updateId,
@@ -368,6 +386,7 @@ extension TelegramPollLoop {
                     to: .processing
                 )
                 guard processing.phase == .processing else {
+                    await turnCoordinator.endUpdateProcessing(update.updateId)
                     await recordError(
                         context: "retry_update_start",
                         error: "durable retry claim was \(processing.phase.rawValue)",
@@ -377,22 +396,8 @@ extension TelegramPollLoop {
                     )
                     return
                 }
-                let completed = try await updateInbox.transition(
-                    updateId: update.updateId,
-                    from: [.processing],
-                    to: .completed
-                )
-                guard completed.phase == .completed else {
-                    await recordError(
-                        context: "retry_update_start",
-                        error: "durable retry claim could not settle",
-                        update: update,
-                        message: message,
-                        text: text
-                    )
-                    return
-                }
             } catch {
+                await turnCoordinator.endUpdateProcessing(update.updateId)
                 await recordError(
                     context: "retry_update_start",
                     error: String(describing: error),
@@ -407,21 +412,37 @@ extension TelegramPollLoop {
                 update: update,
                 message: message,
                 commandText: text,
-                retryText: last.text
+                retryText: retryText
             )
+            do {
+                _ = try await updateInbox.transition(
+                    updateId: update.updateId,
+                    from: [.processing],
+                    to: .completed
+                )
+            } catch {
+                await recordError(
+                    context: "retry_update_complete",
+                    error: String(describing: error),
+                    update: update,
+                    message: message,
+                    text: text
+                )
+            }
+            await turnCoordinator.endUpdateProcessing(update.updateId)
         }
 
         if await turnCoordinator.startTrackedTurn(
-            chatId: message.chatId,
-            text: last.text,
+            destination: message.destination,
+            text: retryText,
             operation: retryOperation
         ) != nil {
             return true
         }
 
-        guard await turnCoordinator.canEnqueue(chatId: message.chatId) else {
+        guard await turnCoordinator.canEnqueue(destination: message.destination) else {
             await sendCommandReply(
-                "A Telegram turn is already running for this chat. Use /stop before retrying.",
+                "I'm still working on the last one — send /stop first.",
                 kind: "retry_busy",
                 update: update,
                 message: message,
@@ -431,14 +452,18 @@ extension TelegramPollLoop {
         }
 
         do {
+            // The resolved text is part of the queue write itself: a crash
+            // between two writes used to leave a queued retry with no pinned
+            // text, which is the very state recovery cannot resolve.
             let queued = try await updateInbox.transition(
                 updateId: update.updateId,
                 from: [.processing],
-                to: .queued
+                to: .queued,
+                resolvedRetryText: retryText
             )
-            guard queued.phase == .queued else {
+            guard queued.phase == .queued, queued.resolvedRetryText == retryText else {
                 await sendCommandReply(
-                    "The retry could not be queued safely. Try again after the current turn finishes.",
+                    "I couldn't line that retry up safely. Try again once I've finished this one.",
                     kind: "retry_busy",
                     update: update,
                     message: message,
@@ -457,12 +482,12 @@ extension TelegramPollLoop {
             return false
         }
 
-        let preview = String(last.text.replacingOccurrences(of: "\n", with: " ").prefix(120))
+        let preview = String(retryText.replacingOccurrences(of: "\n", with: " ").prefix(120))
         var acknowledgementMessageId: Int?
         do {
             let sentMessageId = try await sendMessageWithReplyMarkupReturningId(
                 token,
-                message.chatId,
+                message.destination,
                 "Queued retry · \(preview)",
                 TelegramQueuedTurnControlCallback.replyMarkup(updateId: update.updateId)
             )
@@ -490,8 +515,8 @@ extension TelegramPollLoop {
 
         let queued = await turnCoordinator.enqueueTrackedTurn(
             updateId: update.updateId,
-            chatId: message.chatId,
-            text: last.text,
+            destination: message.destination,
+            text: retryText,
             acknowledgementMessageId: acknowledgementMessageId,
             operation: retryOperation,
             onStart: { messageId in
@@ -524,7 +549,7 @@ extension TelegramPollLoop {
         retryText: String
     ) async {
         let card = makeTurnProgressCard(
-            chatId: message.chatId,
+            destination: message.destination,
             turnId: turnId,
             errorContext: "retry_turn_card",
             update: update,
@@ -533,14 +558,14 @@ extension TelegramPollLoop {
         )
         guard await turnCoordinator.attachCard(
             card,
-            chatId: message.chatId,
+            destination: message.destination,
             turnId: turnId
         ) else { return }
         await card.start()
         await card.transition(.working(action: nil))
-        await card.transition(.retrying(action: "Retrying the last message"))
+        await card.transition(.retrying(action: "Taking another run at your last message"))
         let delivery = makeAssistantDelivery(
-            chatId: message.chatId,
+            destination: message.destination,
             turnId: turnId,
             errorContext: "retry_assistant_delivery",
             update: update,
@@ -548,7 +573,7 @@ extension TelegramPollLoop {
             text: commandText
         )
         do {
-            let typingTask = await startTypingHeartbeat(chatId: message.chatId)
+            let typingTask = await startTypingHeartbeat(destination: message.destination)
             defer { typingTask?.cancel() }
             let progress = makeProgressSink(delivery: delivery, card: card)
             let generatedImages = TelegramGeneratedImageCollector()
@@ -557,7 +582,7 @@ extension TelegramPollLoop {
                 await progress(event)
             }
             let reply = try await runChatHandlerWithRetry(
-                chatId: message.chatId,
+                destination: message.destination,
                 text: retryText,
                 attachments: [],
                 progress: capturingProgress,
@@ -573,7 +598,7 @@ extension TelegramPollLoop {
                     let imagePaths = await generatedImages.snapshot()
                     switch await deliverGeneratedImages(
                         imagePaths,
-                        chatId: message.chatId,
+                        destination: message.destination,
                         errorContext: "send_generated_image",
                         update: update,
                         message: message,
@@ -581,29 +606,29 @@ extension TelegramPollLoop {
                     ) {
                     case .delivered:
                         await recordReceipt(kind: "retry_reply", update: update, message: message, text: commandText, reply: reply)
-                        await card.transition(.completed(summary: "Reply delivered"))
+                        await card.transition(.completed(summary: nil))
                     case .failed(let reason):
                         await card.transition(.failed(
-                            reason: "Reply text delivered, but generated media failed: \(reason)"
+                            reason: "I sent the reply, but the images did not go through: \(reason)"
                         ))
                     case .outcomeUnknown(let reason):
                         await card.transition(.outcomeUnknown(
-                            reason: "Reply text delivered; generated media delivery could not be confirmed: \(reason)"
+                            reason: "I sent the reply; I could not confirm the images went through: \(reason)"
                         ))
                     }
                 case .failed(let reason):
                     await recordError(context: "send_retry_reply", error: reason, update: update, message: message, text: commandText)
-                    await card.transition(.failed(reason: "Reply delivery failed: \(reason)"))
+                    await card.transition(.failed(reason: "I could not send the reply: \(reason)"))
                 case .outcomeUnknown(let reason):
                     await recordError(context: "send_retry_reply_outcome_unknown", error: reason, update: update, message: message, text: commandText)
                     await card.transition(.outcomeUnknown(
-                        reason: "Reply delivery could not be confirmed: \(reason)"
+                        reason: "I could not confirm the reply reached you: \(reason)"
                     ))
                 }
             } else {
-                let notice = "(the retry came back empty - check the Mac error log)"
+                let notice = "(the retry came back empty — check the Mac error log)"
                 await recordError(context: "empty_retry", error: "chat handler returned empty output", update: update, message: message, text: commandText)
-                await card.transition(.failed(reason: "The retry came back empty"))
+                await card.transition(.failed(reason: "the retry came back empty"))
                 await deliverDraftOrSendNotice(
                     notice,
                     delivery: delivery,
@@ -615,7 +640,7 @@ extension TelegramPollLoop {
                 )
             }
         } catch is CancellationError {
-            let notice = "(Telegram turn stopped.)"
+            let notice = "(Stopped.)"
             await card.transition(.canceled(reason: "Stopped by user"))
             if await delivery.abortDelivering(notice: notice) {
                 await recordReceipt(kind: "stopped_notice", update: update, message: message, text: commandText, reply: notice)
@@ -631,13 +656,13 @@ extension TelegramPollLoop {
                 message: message,
                 text: commandText
             )
-            await card.transition(.failed(reason: String(describing: error)))
+            await card.transition(.failed(reason: Self.chatErrorNotice(for: error)))
             let notice = Self.chatErrorNotice(for: error)
             if await delivery.abortDelivering(notice: notice) {
                 await recordReceipt(kind: "error_notice", update: update, message: message, text: commandText, reply: notice)
             } else {
                 do {
-                    try await sendMessage(token, message.chatId, notice)
+                    try await sendMessage(token, message.destination, notice)
                     await recordReceipt(kind: "error_notice", update: update, message: message, text: commandText, reply: notice)
                 } catch {
                     await recordError(context: "send_error_notice", error: String(describing: error), update: update, message: message, text: commandText)
@@ -646,61 +671,60 @@ extension TelegramPollLoop {
         }
     }
 
-    private func buildStatusReply(chatId: Int) async -> String {
-        var lines: [String] = []
-        do {
-            let status = try await bot.getStatus()
-            let seen = status.lastSeenAt ?? "never"
-            lines.append("Telegram: enabled=\(status.enabled ?? false) tokenConfigured=\(status.tokenConfigured ?? false) lastSeenAt=\(seen)")
-            lines.append("Runtime: enabled=\(status.enabled ?? false) poller=\(status.pollerEnabled ?? false) token=\(status.tokenConfigured ?? false)")
-            lines.append("Last seen: \(seen)")
-            if let lastError = status.lastError, !lastError.isEmpty {
-                lines.append("Last error: \(Self._tgRedactToken(lastError))")
-            }
-        } catch {
-            lines.append("Runtime: unavailable (\(Self._tgRedactToken(String(describing: error))))")
-        }
+    /// One human sentence: what she's doing, which model in plain words,
+    /// and whether anything is waiting on User. No flags, no session ids, no
+    /// poller internals — those live in receipts and the Mac app, which is
+    /// where someone debugging the surface actually looks.
+    func buildStatusReply(destination: TelegramDestination) async -> String {
+        let turn = await turnCoordinator.snapshot(destination: destination)
+        let phase = await turnCoordinator.activeCard(destination: destination)?.snapshot().state.phase
+        let waitingOnUser = phase == .blocked
 
-        do {
-            let outcome = try await bot.dispatchSwiftSlashCommandDetailed(
-                "model",
-                args: [],
-                chatId: chatId
-            )
-            if let model = outcome.reply?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !model.isEmpty {
-                lines.append("Model: \(Self._tgRedactToken(model.replacingOccurrences(of: "\n", with: " | ")))")
-            } else {
-                lines.append("Model: not configured")
-            }
-        } catch {
-            lines.append("Model: unavailable")
-        }
-
-        do {
-            let session = try await TelegramSessionStore(dataRoot: dataRoot).status(chatId: chatId)
-            lines.append(Self._tgRedactToken(
-                "Session: \(session.sessionId) (\(session.messageCount) message(s), persona \(session.persona))"
-            ))
-        } catch {
-            lines.append("Session: unavailable")
-        }
-
-        let turn = await turnCoordinator.snapshot(chatId: chatId)
-        if turn.isRunning {
-            lines.append("Task: running since \(turn.startedAt ?? "unknown")")
+        var sentence: String
+        if waitingOnUser {
+            sentence = "I'm waiting on an approval from you"
+        } else if turn.isRunning {
             if let preview = turn.promptPreview, !preview.isEmpty {
-                lines.append("Task prompt: \(Self._tgRedactToken(preview))")
+                sentence = "I'm working on \u{201C}\(Self.statusPreview(preview))\u{201D}"
+            } else {
+                sentence = "I'm working on something for you"
             }
         } else {
-            lines.append("Task: idle")
+            sentence = "I'm idle"
         }
-        if let last = turn.lastUserMessagePreview, !last.isEmpty {
-            lines.append("Last user message: \(Self._tgRedactToken(last))")
+
+        if let model = await bot.telegramPlainModelPhrase() {
+            sentence += ", on \(model)"
         }
-        return lines.joined(separator: "\n")
+        sentence += "."
+
+        if !waitingOnUser {
+            sentence += " Nothing is waiting on you."
+        }
+        return sentence
     }
 
+    /// A short, single-line, token-redacted echo of what she's working on.
+    static func statusPreview(_ raw: String) -> String {
+        let flattened = _tgRedactToken(raw)
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if flattened.count <= 60 { return flattened }
+        return String(flattened.prefix(60)).trimmingCharacters(in: .whitespaces) + "\u{2026}"
+    }
+
+    /// The reply send is AWAITED by its command.
+    ///
+    /// 2026-09-06: this send goes through the per-chat wire lane, which waits
+    /// out that chat's flood cooldown before it returns, so running it inline
+    /// on the poll loop let one chat told to be quiet for 30s stall the whole
+    /// poller. Detaching only the SEND fixed that and broke something worse:
+    /// the command returned before its reply had left, so `/restart` armed
+    /// termination and the durable claim was completed while the message was
+    /// still on the wire — a reply lost with no claim left to replay it. The
+    /// whole command now runs off the poll loop instead
+    /// (`runSlashCommandDetached`), so the poller stays free AND everything
+    /// a command does after its reply happens after the reply is actually out.
     private func sendCommandReply(
         _ reply: String,
         kind: String,
@@ -709,7 +733,7 @@ extension TelegramPollLoop {
         text: String
     ) async {
         do {
-            try await sendMessage(token, message.chatId, reply)
+            try await sendMessage(token, message.destination, reply)
             await recordReceipt(kind: kind, update: update, message: message, text: text, reply: reply)
         } catch {
             FileHandle.standardError.write(
@@ -717,5 +741,140 @@ extension TelegramPollLoop {
             )
             await recordError(context: "send_command_reply", error: String(describing: error), update: update, message: message, text: text)
         }
+    }
+
+    /// Run one slash command in its own task, and settle its durable claim only
+    /// once the command (reply included) has finished.
+    ///
+    /// 2026-09-06: the poll loop no longer waits for a command — a chat in a
+    /// flood cooldown holds up nothing but itself — and the claim it would have
+    /// completed on the command's behalf travels with the command, the same way
+    /// a tracked turn carries its own. A crash mid-command therefore leaves the
+    /// claim replayable instead of marked done with nothing sent.
+    func runSlashCommandDetached(
+        update: TelegramUpdate,
+        message: TelegramMessage,
+        text: String
+    ) {
+        let loop = self
+        Task {
+            let transferred = await loop.handleSlashCommand(
+                update: update,
+                message: message,
+                text: text
+            )
+            // `true` means a tracked turn took the claim; that turn settles it.
+            guard !transferred else { return }
+            do {
+                _ = try await TelegramUpdateInbox(offsetURL: loop.offsetURL).transition(
+                    updateId: update.updateId,
+                    from: [.processing, .queued],
+                    to: .completed
+                )
+            } catch {
+                await loop.recordError(
+                    context: "update_inbox_complete",
+                    error: String(describing: error),
+                    update: update,
+                    message: message,
+                    text: text
+                )
+            }
+            await loop.turnCoordinator.endUpdateProcessing(update.updateId)
+        }
+    }
+}
+
+// MARK: - Preferences asked for in words
+
+extension TelegramPollLoop {
+    /// The retired /model, /think, /fast and /persona spellings, reachable by
+    /// saying what you want. Every branch dispatches the SAME command name
+    /// and args the slash spelling used, so there is exactly one writer per
+    /// preference. Returns nil when the message isn't a preference change —
+    /// which is almost always — and the turn runs normally.
+    func spokenPreferenceReply(destination: TelegramDestination, text: String) async -> String? {
+        guard let intent = TelegramSpokenPreference.parse(
+            text: Self.spokenPreferenceSource(text)
+        ) else { return nil }
+
+        switch intent {
+        case .whichModel:
+            guard let model = await bot.telegramPlainModelPhrase() else { return nil }
+            return "I'm on \(model)."
+
+        case .model(let query):
+            // A spoken model name only counts once it resolves against the
+            // live menu; an unmatched phrase is ordinary conversation and
+            // must never silently rewrite routing.
+            guard let menu = await bot.telegramModelMenuForSurface("telegram"),
+                  let match = TelegramSpokenPreference.resolveModel(query: query, in: menu)
+            else { return nil }
+            guard let reply = await dispatchSpokenPreference(
+                "model",
+                args: [match.providerId, match.modelId],
+                destination: destination
+            ) else { return nil }
+            if reply.hasPrefix("Failed") { return reply }
+            return "Switched to \(match.label) on \(match.providerLabel)."
+
+        case .effort(let effort):
+            guard let capabilities = await bot.telegramModelCapabilitiesForSurface(),
+                  let level = effort.resolved(supported: capabilities.reasoningEfforts)
+            else {
+                return "This model doesn't have a thinking dial I can turn."
+            }
+            guard let reply = await dispatchSpokenPreference(
+                "think", args: [level], destination: destination
+            ) else { return nil }
+            if reply.hasPrefix("Failed") { return reply }
+            return "Thinking at \(level) from here on."
+
+        case .fast(let on):
+            guard let capabilities = await bot.telegramModelCapabilitiesForSurface(),
+                  capabilities.supportsFast
+            else {
+                return "This model doesn't have a fast lane."
+            }
+            guard let reply = await dispatchSpokenPreference(
+                "fast", args: [on ? "on" : "off"], destination: destination
+            ) else { return nil }
+            if reply.hasPrefix("Failed") { return reply }
+            return on ? "Running fast from here on." : "Back to normal speed."
+
+        case .persona(let name):
+            guard let reply = await dispatchSpokenPreference(
+                "persona",
+                args: name.split(separator: " ").map(String.init),
+                destination: destination
+            ) else { return nil }
+            if reply.hasPrefix("Failed") { return reply }
+            return "I'm \(name) here now."
+        }
+    }
+
+    private func dispatchSpokenPreference(
+        _ command: String,
+        args: [String],
+        destination: TelegramDestination
+    ) async -> String? {
+        do {
+            let outcome = try await bot.dispatchSwiftSlashCommandDetailed(
+                command, args: args, destination: destination
+            )
+            outcome.afterReplySent?()
+            return outcome.reply
+        } catch {
+            return "Failed to change that: \(Self._tgRedactToken(error.localizedDescription))"
+        }
+    }
+
+    /// Voice notes arrive wrapped in a transcript envelope; a spoken
+    /// preference should work the same whether it was typed or said.
+    static func spokenPreferenceSource(_ text: String) -> String {
+        let marker = "Transcript: "
+        guard text.hasPrefix("[Telegram voice message]"),
+              let range = text.range(of: marker) else { return text }
+        return String(text[range.upperBound...])
     }
 }

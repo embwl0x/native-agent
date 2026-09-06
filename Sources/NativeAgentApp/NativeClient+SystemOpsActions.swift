@@ -91,7 +91,19 @@ extension NativeClient {
         async let search = searchDoctorCoverageCheck()
         async let tools = toolsDoctorCoverageCheck()
         async let autonomy = autonomyDoctorCoverageCheck()
-        return await [providers, telegram, search, tools, autonomy]
+        // FIX-4 (2026-09-01): DoctorLoopHealth's verdicts had no route into
+        // `doctorReport.checks`, so the toolbar pill could not see them. This
+        // is the same read-only evaluation the Doctor loops section renders,
+        // rolled into one row — and it rides the live-coverage lane, so
+        // `refreshLiveDoctorCoverage()` keeps it current too.
+        async let loops = backgroundLoopsDoctorCoverageCheck()
+        return await [providers, telegram, search, tools, autonomy, loops]
+    }
+
+    private func backgroundLoopsDoctorCoverageCheck() async -> DoctorCheck {
+        await DoctorLoopHealth.doctorCheck(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
     }
 
     private func providerDoctorCoverageCheck() async -> DoctorCheck {
@@ -303,24 +315,56 @@ extension NativeClient {
                 repair: "Open Settings and enter a valid HTTP(S) SearXNG URL."
             )
         }
+        // FIX-5c (2026-09-01): this row is a URL-SYNTAX check wearing the name
+        // "Search". Doctor makes no request here (runDoctor's live coverage is
+        // local reads only), so a configured endpoint that is down, wrong, or
+        // unreachable renders exactly like a working one. Green is reserved
+        // for what was actually verified; an unprobed endpoint reads as
+        // unverified, not healthy.
         return DoctorCheck(
-            id: "live.search", title: "Search", status: "ok",
-            detail: "SearXNG is configured with a valid HTTP(S) URL shape; Doctor did not make a network request.", repair: nil
+            id: "live.search", title: "Search", status: "warn",
+            detail: "SearXNG is configured and its URL is a valid HTTP(S) shape — syntax only, no request made."
+                + " Doctor cannot tell you whether the endpoint answers.",
+            repair: "Run a search from chat to prove the endpoint, or clear the SearXNG URL if it is no longer used."
         )
     }
 
+    /// FIX-5c (2026-09-01): every non-throwing path returned "ok", so a
+    /// registry holding QUARANTINED tools reported the same green as a clean
+    /// one. Two changes, both honesty: the detail now states the row's actual
+    /// scope on every path (the registry file was read; no tool was invoked),
+    /// and a quarantined tool is a finding. `proposed` is deliberately NOT a
+    /// finding — an unapproved proposal is the self-building lane working.
     static func toolsDoctorCoverageCheck(_ tools: [ToolRecord]) -> DoctorCheck {
+        let quarantined = tools.filter { ($0.status ?? "active").lowercased() == "quarantined" }
         let active = tools.filter { ($0.status ?? "active").lowercased() == "active" }.count
+        let scope = " Registry read only: Doctor invoked no tool, so this says nothing about whether one runs."
         // Taste pass 2026-07-24: this registry holds SELF-BUILT (promoted)
         // tools only — built-in chat tools never appear here, so an empty
         // registry is the normal state and "0 active, 0 total" read like the
         // agent had no tools at all.
-        let detail = tools.isEmpty
-            ? "Self-built tool registry is readable; no promoted tools yet. Built-in tools don't live here."
-            : "Self-built tool registry is readable (\(active) active, \(tools.count) total)."
+        if tools.isEmpty {
+            return DoctorCheck(
+                id: "live.tools", title: "Tool Registry", status: "ok",
+                detail: "Self-built tool registry is readable; no promoted tools yet."
+                    + " Built-in tools don't live here." + scope,
+                repair: nil
+            )
+        }
+        let census = "Self-built tool registry is readable (\(active) active, \(tools.count) total)."
+        if !quarantined.isEmpty {
+            let named = quarantined.prefix(3).map(\.name).joined(separator: ", ")
+            let more = quarantined.count > 3 ? ", …" : ""
+            return DoctorCheck(
+                id: "live.tools", title: "Tool Registry", status: "warn",
+                detail: census + " \(quarantined.count) quarantined: \(named)\(more)." + scope,
+                repair: "Open Tools and restore or remove the quarantined tools."
+            )
+        }
         return DoctorCheck(
             id: "live.tools", title: "Tool Registry", status: "ok",
-            detail: detail, repair: nil
+            detail: census + scope,
+            repair: nil
         )
     }
 

@@ -4,12 +4,18 @@ import NativeAgentShared
 
 extension ChatView {
     func send() {
+        guard !isSubmittingSend else { return }
         guard !isCapturing else {
             showToast("Screen capture is still in progress")
             return
         }
         let attachments = pendingAttachments
         let message = text
+        // 2026-09-06: the snapshot's own edit time, captured BEFORE the box is
+        // cleared (clearing `text` stamps a fresh one). The send-clear carries
+        // it so sending older text here cannot delete a newer unsent edit made
+        // in a detached panel on the same conversation.
+        let messageEditedAt = draftEditedAt
         let composerSessionId = appModel.activeChatSessionId
         // PATCH-2026-05-08: review-fix-B If the user typed a /command and hit
         // send (instead of clicking from the popover), dispatch it instead of
@@ -30,9 +36,12 @@ extension ChatView {
             supportsDispatch: true
         ) {
         case .dispatch(let commandLine):
+            // 2026-09-06: this used to drop the pending attachments on the
+            // floor. A slash command sends nothing, so it consumes nothing —
+            // and cancelling the /clear confirmation left the attachments
+            // already gone. Picking the same command from the popover never
+            // came through here, so mouse and Return also disagreed.
             handleSlashCommand(commandLine)
-            // handleSlashCommand clears `text` itself; clear pending attachments too
-            pendingAttachments = []
             return
         case .unsupportedHere(let command):
             // Unreachable with supportsDispatch: true; kept exhaustive so a new
@@ -42,7 +51,9 @@ extension ChatView {
         case .sendAsMessage:
             break
         }
+        isSubmittingSend = true
         Task { @MainActor in
+            defer { isSubmittingSend = false }
             let acceptance = await appModel.startActiveChatTurn(
                 message,
                 attachments: attachments,
@@ -61,8 +72,19 @@ extension ChatView {
                 text = ""
                 // H5: the composer's draft is view-local @State now, so clearing
                 // `text` does not clear the persisted copy automatically.
-                appModel.commitChatDraft("", sessionId: acceptedSessionId)
+                appModel.clearChatDraftAfterSend(
+                    message,
+                    sessionId: acceptedSessionId,
+                    editedAt: messageEditedAt
+                )
+                draftAdoptedText = ""
                 pendingAttachments = []
+                // 2026-09-06: the composer's words have been sent, but the
+                // recognizer's transcript is cumulative and its pre-dictation
+                // base still pointed at them — the next update wrote the whole
+                // already-sent phrase back into the empty box.
+                endDictation()
+                transcriptLatestRequest &+= 1
                 scrollCoordinator.forceFollow()
             case .rejected(let failureMessage):
                 showToast(failureMessage)
@@ -78,9 +100,13 @@ extension ChatView {
             .filter { !$0.isEmpty }
         let cmd = parts.first?.lowercased() ?? ""
         let arg = parts.dropFirst().joined(separator: " ")
-        text = ""
-        appModel.commitChatDraft("", sessionId: appModel.activeChatSessionId)
-        let showDeveloperSurfaces = UserDefaults.standard.bool(forKey: "showDeveloperSurfaces")
+        // 2026-09-06: the composer is cleared at the END, on the paths that
+        // actually consume the command. Clearing here wiped what the person
+        // typed before the arguments were even checked, so `/think bogus`
+        // answered "choose a supported level" with an empty box to retype in.
+        let showDeveloperSurfaces = NativeAgentShellPreference.developerSurfacesShown(
+            UserDefaults.standard.bool(forKey: "showDeveloperSurfaces")
+        )
         let builtIn = ChatSlashCommandRegistry.descriptor(named: cmd)
         if builtIn?.developerOnly == true, !showDeveloperSurfaces {
             showToast("Unknown command /\(cmd). Type /help for the list.")
@@ -189,27 +215,45 @@ extension ChatView {
         case nil:
             // PATCH-Phase7b: if cmd matches a known, available capability tool → dispatch it.
             if let cap = capabilitiesStore.tools.first(where: { $0.name == cmd }), cap.availableNow {
+                // 2026-09-06: the command belongs to the conversation it was
+                // typed into. The task below suspends, so reading the active
+                // session inside it filed the placeholder and the receipt
+                // wherever the person had moved to by then.
+                let commandSessionId = appModel.activeChatSessionId
                 Task {
-                    await dispatchSlashCommandTool(cap: cap, freeText: arg)
+                    await dispatchSlashCommandTool(
+                        cap: cap,
+                        freeText: arg,
+                        sessionId: commandSessionId
+                    )
                 }
             } else if capabilitiesStore.tools.contains(where: { $0.name == cmd }) {
                 // Tool exists but isn't available (blocked / needs approval / wrong provider).
                 showToast("/\(cmd) is not available now — check tool status in /tools")
+                return
             } else {
                 showToast("Unknown command /\(cmd). Type /help for the list.")
+                return
             }
         }
+        // The command was taken. Only now does the composer lose its text.
+        text = ""
+        appModel.commitChatDraft("", sessionId: appModel.activeChatSessionId)
+        draftAdoptedText = ""
     }
 
     // PATCH-Phase7b: resolve arg plan and dispatch the tool, rendering the receipt inline.
     @MainActor
-    func dispatchSlashCommandTool(cap: ToolCapability, freeText: String) async {
-        let plan = capabilitiesStore.planDispatch(toolName: cap.name, freeText: freeText)
+    func dispatchSlashCommandTool(cap: ToolCapability, freeText: String, sessionId: String) async {
+        var plan = capabilitiesStore.planDispatch(toolName: cap.name, freeText: freeText)
             ?? DispatchArgPlan(tool: cap, mode: .zeroArgs, prefilled: [:])
+        // Carried through the form sheet so a submission made after a session
+        // switch still lands where the command was typed (2026-09-06).
+        plan.sessionId = sessionId
 
         switch plan.mode {
         case .zeroArgs:
-            await runDispatchAndRenderReceipt(tool: cap.name, input: [:])
+            await runDispatchAndRenderReceipt(tool: cap.name, input: [:], sessionId: sessionId)
 
         case .singleStringArg(let field):
             let trimmed = freeText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -218,7 +262,11 @@ extension ChatView {
                 currentDispatchPlan = plan
                 showToolInputForm = true
             } else {
-                await runDispatchAndRenderReceipt(tool: cap.name, input: [field: trimmed])
+                await runDispatchAndRenderReceipt(
+                    tool: cap.name,
+                    input: [field: trimmed],
+                    sessionId: sessionId
+                )
             }
 
         case .formNeeded:
@@ -231,60 +279,86 @@ extension ChatView {
     // `inputJSON` is the pre-serialized JSON Data so we don't pass [String: Any] across
     // the actor boundary (Swift 6 Sendability).
     @MainActor
-    func runDispatchAndRenderReceipt(tool: String, input: [String: Any]) async {
-        let sessionId: String? = appModel.activeChatSessionId.isEmpty ? nil : appModel.activeChatSessionId
+    func runDispatchAndRenderReceipt(tool: String, input: [String: Any], sessionId targetSessionId: String) async {
+        let sessionId: String? = targetSessionId.isEmpty ? nil : targetSessionId
         // Serialize input on the MainActor before we cross the concurrency boundary.
         let inputSnapshot = input
         let inputForDisplay = input  // kept for receipt rendering on MainActor
         // Optimistic pending message so the user sees immediate feedback.
         let pendingContent = "⏳ Dispatching **\(tool)**…"
         let pending = ChatMessage(role: "system", content: pendingContent)
-        appModel.chatMessages.append(pending)
+        appendDispatchMessage(pending, to: targetSessionId)
 
         // Serialize the dict to Data here (on MainActor) so the nonisolated dispatchTool
         // method receives Sendable types only.
         guard let bodyData = try? JSONSerialization.data(withJSONObject: inputSnapshot) else {
-            appModel.chatMessages.removeAll { $0.id == pending.id }
-            appModel.chatMessages.append(ChatMessage(role: "system",
-                content: "❌ **\(tool)** dispatch failed: could not serialize input"))
+            replaceDispatchPlaceholder(
+                pending.id,
+                with: ChatMessage(role: "system",
+                    content: "❌ **\(tool)** dispatch failed: could not serialize input"),
+                in: targetSessionId
+            )
             return
         }
 
         do {
             let result = try await appModel.dispatchToolData(tool: tool, inputData: bodyData, sessionId: sessionId)
-            // Remove the pending placeholder.
-            appModel.chatMessages.removeAll { $0.id == pending.id }
-            // Render the receipt.
+            // Render the receipt where the command was typed.
             let receipt = buildReceiptMessage(result: result, tool: tool, input: inputForDisplay)
-            appModel.chatMessages.append(receipt)
+            replaceDispatchPlaceholder(pending.id, with: receipt, in: targetSessionId)
         } catch {
-            appModel.chatMessages.removeAll { $0.id == pending.id }
             let errMsg = ChatMessage(role: "system", content:
                 "❌ **\(tool)** dispatch failed: \(error.localizedDescription)"
             )
-            appModel.chatMessages.append(errMsg)
+            replaceDispatchPlaceholder(pending.id, with: errMsg, in: targetSessionId)
         }
+    }
+
+    // 2026-09-06: a dispatch that finishes after the person opens another
+    // conversation used to land there — `appModel.chatMessages` writes
+    // whichever session is active NOW, so the receipt went to the wrong
+    // transcript and the placeholder stayed behind in the right one. Both
+    // helpers name the session the command was typed into.
+    @MainActor
+    func appendDispatchMessage(_ message: ChatMessage, to sessionId: String) {
+        var messages = appModel.chatMessages(for: sessionId)
+        messages.append(message)
+        appModel.setChatMessages(messages, for: sessionId)
+    }
+
+    @MainActor
+    func replaceDispatchPlaceholder(
+        _ placeholderId: String,
+        with message: ChatMessage,
+        in sessionId: String
+    ) {
+        var messages = appModel.chatMessages(for: sessionId)
+        messages.removeAll { $0.id == placeholderId }
+        messages.append(message)
+        appModel.setChatMessages(messages, for: sessionId)
     }
 
     // Sendable-safe dispatch that accepts the ToolInputForm's already validated,
     // JSON-shaped data before crossing the Task actor boundary.
     @MainActor
-    func runDispatchAndRenderReceiptData(tool: String, inputData: Data) async {
-        let sessionId: String? = appModel.activeChatSessionId.isEmpty ? nil : appModel.activeChatSessionId
+    func runDispatchAndRenderReceiptData(tool: String, inputData: Data, sessionId targetSessionId: String) async {
+        let sessionId: String? = targetSessionId.isEmpty ? nil : targetSessionId
         let pendingContent = "⏳ Dispatching **\(tool)**…"
         let pending = ChatMessage(role: "system", content: pendingContent)
-        appModel.chatMessages.append(pending)
+        appendDispatchMessage(pending, to: targetSessionId)
         do {
             let result = try await appModel.dispatchToolData(tool: tool, inputData: inputData, sessionId: sessionId)
-            appModel.chatMessages.removeAll { $0.id == pending.id }
             // Re-hydrate for display only — failure is non-fatal (fall back to empty input).
             let inputForDisplay = (try? JSONSerialization.jsonObject(with: inputData) as? [String: Any]) ?? [:]
             let receipt = buildReceiptMessage(result: result, tool: tool, input: inputForDisplay)
-            appModel.chatMessages.append(receipt)
+            replaceDispatchPlaceholder(pending.id, with: receipt, in: targetSessionId)
         } catch {
-            appModel.chatMessages.removeAll { $0.id == pending.id }
-            appModel.chatMessages.append(ChatMessage(role: "system",
-                content: "❌ **\(tool)** dispatch failed: \(error.localizedDescription)"))
+            replaceDispatchPlaceholder(
+                pending.id,
+                with: ChatMessage(role: "system",
+                    content: "❌ **\(tool)** dispatch failed: \(error.localizedDescription)"),
+                in: targetSessionId
+            )
         }
     }
 

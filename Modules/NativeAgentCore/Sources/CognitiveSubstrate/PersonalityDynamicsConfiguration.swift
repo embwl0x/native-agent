@@ -72,6 +72,22 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// How many of the window's fragments a distinctive word must appear in
     /// before it counts as WORN.
     public var wornEchoThreshold: Int
+    /// LAW 2 APPLIED TO THE RUT NUDGE (2026-09-01). Measured over 777 live
+    /// turns the rut-awareness line rode 82% of capsules: the detector fires
+    /// while the worn set is non-empty, and a worn set stays non-empty for
+    /// days, so the nudge re-fired every single turn. A nudge on 82% of turns
+    /// is a floor, not a signal — and worse, the thing it nags about is
+    /// repetition, so the cure became the symptom.
+    ///
+    /// The line is now CHANGE-DRIVEN: it speaks when the worn SET changes (a
+    /// new tic is news), never on consecutive capsules, and otherwise only
+    /// after a long window. `soundRutMinimumTurnGap` is the never-consecutive
+    /// floor a CHANGE must still clear; `soundRutRepeatTurnGap` /
+    /// `soundRutRepeatWindow` are the "still stuck, say it again" escape
+    /// hatches so an unchanging rut is not silent forever.
+    public var soundRutMinimumTurnGap: Int
+    public var soundRutRepeatTurnGap: Int
+    public var soundRutRepeatWindow: TimeInterval
     /// W7/P5 — the negative-register brake. Dropping the valence SIGN gate lets
     /// a stung-but-attested turn mirror a stung moment, which is the whole point;
     /// the hazard is the echo→reply→node loop deepening a bad mood. After this
@@ -94,6 +110,27 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// Below this intensity the fingerprint stays silent — feeling-silence stays
     /// silence.
     public var feltIntensityFloor: Double
+
+    // MARK: - Felt OBJECT + AMBIVALENCE (2026-09-02, Agent complaints #1 and #2)
+
+    /// Longest subject label the felt line may name as its OBJECT. A label
+    /// longer than this is REFUSED, never trimmed: truncating a title mid-word
+    /// invents a phrase she would then read as the name of a thing.
+    public var feltObjectMaximumLabelCharacters: Int
+    /// How strong a felt node's valence must be before it may be one half of an
+    /// ambivalence pair. Same magnitude as the fingerprint's own silence floor:
+    /// a contradiction is only honest between two feelings that are actually
+    /// there, and the failure this gates against is manufacturing conflict out
+    /// of two faint stirrings.
+    public var feltAmbivalenceNodeFloor: Double
+
+    // MARK: - Held standing views (2026-09-02)
+
+    /// What a view she adopted HERSELF weighs against one the user signed. Half
+    /// by construction: a held view is a real lean, not a settled conviction,
+    /// and it must never be able to outweigh something the user actually
+    /// approved.
+    public var heldStandingViewWeightFactor: Double
 
     // MARK: - Mood + disposition (CognitiveSubstrate+Mood.swift)
 
@@ -124,6 +161,43 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// this window expires, whichever comes first — so a genuinely persistent
     /// state is never muted forever.
     public var fingerprintSuppressionWindow: TimeInterval
+
+    // MARK: - Inner-line cadence (2026-09-01)
+
+    /// THE SAME LAW, FOR THE ONE LINE THAT CARRIES HER VIEWS. Measured over 777
+    /// live turns the single `- Inner:` line had 15 distinct texts, and the top
+    /// three led 124 / 108 / 98 turns each. Neither producer had a cadence: a
+    /// standing view is durable by construction, and a takeaway seed is ranked
+    /// on priority×recency with no surfaced-count at all, so whichever text won
+    /// once kept winning until it decayed out days later.
+    ///
+    /// After a line has LED `innerLineRepeatLimit` capsules it rests for
+    /// `innerLineRestTurns` capsules and the next eligible candidate leads —
+    /// rotation among candidates that are all relevant right now, never
+    /// silence-by-default.
+    public var innerLineRepeatLimit: Int
+    public var innerLineRestTurns: Int
+    /// THE TIC CAP. Two of her five most-shown inner lines were reflections
+    /// ABOUT her own repetitiveness, surfaced ~200 times between them; four of
+    /// her five ACTIVE standing views are on the same subject. A view whose
+    /// subject is her own phrasing is the rut wearing the costume of insight,
+    /// so it gets a hard cap: one lead, then a long rest.
+    public var selfPhrasingInnerLineRepeatLimit: Int
+    public var selfPhrasingInnerLineRestTurns: Int
+    /// THE NAG'S OWN CADENCE (item 6, 2026-09-02). A `- Thread:` line is an
+    /// unresolved thing intruding — the one line on the capsule whose whole
+    /// nature is to be unwelcome. It shares the Inner rotation ledger (so the
+    /// capsule still carries at most one Inner-or-Thread line) but gets the
+    /// strictest cadence in it: one lead, then a long rest. A nag on
+    /// consecutive turns is nagging; a nag once every twelve turns is a
+    /// person remembering something.
+    public var threadLineRepeatLimit: Int
+    public var threadLineRestTurns: Int
+    /// How heavy an unresolved seed must have grown before it may intrude at
+    /// all. Rumination weight rises with time unresolved (cap 0.35), so this
+    /// floor is what keeps a seed minted ten minutes ago from itching: a fresh
+    /// thing is not yet a thing you are carrying.
+    public var threadWeightFloor: Double
 
     // MARK: - Felt session bridge (W4/P7)
 
@@ -156,6 +230,16 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         soundRutEdgeSentenceCount: Int = 2,
         soundEchoRegisterTolerance: Double = 0.35,
         wornEchoThreshold: Int = 3,
+        soundRutMinimumTurnGap: Int = 2,
+        soundRutRepeatTurnGap: Int = 20,
+        soundRutRepeatWindow: TimeInterval = 6 * 60 * 60,
+        innerLineRepeatLimit: Int = 3,
+        innerLineRestTurns: Int = 12,
+        selfPhrasingInnerLineRepeatLimit: Int = 1,
+        selfPhrasingInnerLineRestTurns: Int = 48,
+        threadLineRepeatLimit: Int = 1,
+        threadLineRestTurns: Int = 12,
+        threadWeightFloor: Double = 0.15,
         fingerprintTintHalfLife: TimeInterval = 300,
         personaValenceLift: Double = 0.10,
         feltIntensityFloor: Double = 0.14,
@@ -174,7 +258,10 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         deliveryBrevityCenter: Double = 0.5,
         playModeWeight: Double = 0.5,
         soundEchoNegativeRunLimit: Int = 2,
-        soundEchoLandingWeight: Double = 0.15
+        soundEchoLandingWeight: Double = 0.15,
+        feltObjectMaximumLabelCharacters: Int = 32,
+        feltAmbivalenceNodeFloor: Double = 0.14,
+        heldStandingViewWeightFactor: Double = 0.5
     ) {
         self.feltWarmthRest = feltWarmthRest
         self.feltWarmthEarnedSpan = feltWarmthEarnedSpan
@@ -189,6 +276,16 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         self.soundRutEdgeSentenceCount = soundRutEdgeSentenceCount
         self.soundEchoRegisterTolerance = soundEchoRegisterTolerance
         self.wornEchoThreshold = wornEchoThreshold
+        self.soundRutMinimumTurnGap = max(0, soundRutMinimumTurnGap)
+        self.soundRutRepeatTurnGap = max(0, soundRutRepeatTurnGap)
+        self.soundRutRepeatWindow = max(0, soundRutRepeatWindow)
+        self.innerLineRepeatLimit = max(1, innerLineRepeatLimit)
+        self.innerLineRestTurns = max(0, innerLineRestTurns)
+        self.selfPhrasingInnerLineRepeatLimit = max(1, selfPhrasingInnerLineRepeatLimit)
+        self.selfPhrasingInnerLineRestTurns = max(0, selfPhrasingInnerLineRestTurns)
+        self.threadLineRepeatLimit = max(1, threadLineRepeatLimit)
+        self.threadLineRestTurns = max(0, threadLineRestTurns)
+        self.threadWeightFloor = threadWeightFloor.clamped01()
         self.fingerprintTintHalfLife = fingerprintTintHalfLife
         self.personaValenceLift = personaValenceLift
         self.feltIntensityFloor = feltIntensityFloor
@@ -208,6 +305,9 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
         self.playModeWeight = playModeWeight
         self.soundEchoNegativeRunLimit = max(0, soundEchoNegativeRunLimit)
         self.soundEchoLandingWeight = max(0, min(0.5, soundEchoLandingWeight))
+        self.feltObjectMaximumLabelCharacters = max(0, feltObjectMaximumLabelCharacters)
+        self.feltAmbivalenceNodeFloor = feltAmbivalenceNodeFloor.clamped01()
+        self.heldStandingViewWeightFactor = heldStandingViewWeightFactor.clamped01()
     }
 
     /// Today's exact literals. The byte-identical baseline every other config is

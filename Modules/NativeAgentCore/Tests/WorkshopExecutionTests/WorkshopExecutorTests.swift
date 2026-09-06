@@ -829,9 +829,12 @@ struct WorkshopExecutorClaimSuite {
         }
         let a = makeExec()
         let b = makeExec()
-        async let ra: Void = a.drainOnce()
-        async let rb: Void = b.drainOnce()
-        _ = await (ra, rb)
+        async let ra: Int = a.drainOnce()
+        async let rb: Int = b.drainOnce()
+        // Exactly one of the two racing drains claims the execution, so the two
+        // drain counts sum to one.
+        let (ranA, ranB) = await (ra, rb)
+        #expect(ranA + ranB == 1)
 
         let events = try await timelineSignature(root: root, id: id)
         // Exactly ONE claim → exactly one `started`, one step run, one completed.
@@ -1353,7 +1356,7 @@ struct WorkshopExecutorCancelSuite {
         let cancelStarted = DispatchTime.now().uptimeNanoseconds
         _ = try await runner.cancel(executionId: id)
         // Drain must return promptly (watcher cancels the in-flight task).
-        await drain.value
+        _ = await drain.value
         let cancelElapsed = DispatchTime.now().uptimeNanoseconds - cancelStarted
 
         let (cancelledCount, _) = await stepCancelled.snapshot()
@@ -1539,7 +1542,7 @@ struct WorkshopExecutorCancelCASSuite {
         }
         let runner = SwiftNativeWorkshopRunner(executorAvailable: true, root: root)
         _ = try await runner.cancel(executionId: id)
-        await drain.value
+        _ = await drain.value
 
         // The closure DID run to completion (no prompt preemption)…
         let (finished, _) = await stepFinished.snapshot()
@@ -1959,7 +1962,7 @@ struct WorkshopExecutorPassCancellationSuite {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         firstPass.cancel()
-        await firstPass.value
+        _ = await firstPass.value
 
         let interrupted = await readWorkshopExecution(root: root, id: id)
         #expect(interrupted?.status == "queued")

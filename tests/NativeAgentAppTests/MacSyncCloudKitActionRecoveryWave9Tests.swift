@@ -50,6 +50,18 @@ struct MacSyncCloudKitActionRecoveryWave9Tests {
             .appendingPathComponent("cloudkit-action-recovery-\(UUID().uuidString)", isDirectory: true)
         let responses = root.appendingPathComponent("responses", isDirectory: true)
         try FileManager.default.createDirectory(at: responses, withIntermediateDirectories: true)
+        // 2026-09-06: the transaction ledger directory now has to exist.
+        // 514deaa8 ("CloudKit action lane: the reservation is checked") made
+        // writeTransaction return whether the row actually landed on disk, and
+        // the lane refuses to dispatch when the "running" reservation does not
+        // land — that reservation is the only thing standing between a lost
+        // response and a second run of a non-idempotent action. The fixture
+        // never created this directory; the write used to be fire-and-forget so
+        // its failure was invisible, and now it correctly aborts the action
+        // before it executes. Creating the directory restores the scenario the
+        // test is actually about (a durable root that works).
+        let transactions = root.appendingPathComponent("transactions", isDirectory: true)
+        try FileManager.default.createDirectory(at: transactions, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
         let messageID = UUID().uuidString
@@ -70,7 +82,7 @@ struct MacSyncCloudKitActionRecoveryWave9Tests {
         let engine = MacSyncEngine(stateDataRootOverride: root)
 
         engine.responsesDir = responses
-        engine.transactionDir = root.appendingPathComponent("transactions", isDirectory: true)
+        engine.transactionDir = transactions
         engine._pairingSecret = secret
         engine.pairingSecretRotationInProgress = false
         engine.cloudKitActionStateRootOverride = root

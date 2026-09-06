@@ -1,6 +1,12 @@
 import Foundation
 
 public enum MemoryCandidateQuality {
+    /// The reason string the mid-thought fragment gate emits. Named because
+    /// hygiene has to be able to single this one rule out: it archived
+    /// "user's dyslexia is a bitch sometimes" (use_count 477) on 2026-08-24,
+    /// and the usage-protection veto keys off exactly this reason.
+    public static let midThoughtFragmentReason = "mid-thought fragment is not durable memory"
+
     public static func rejectionReason(text: String, source: String? = nil, kind: String? = nil) -> String? {
         let normalized = normalize(text)
         guard !normalized.isEmpty else { return "empty memory candidate" }
@@ -14,7 +20,7 @@ public enum MemoryCandidateQuality {
             return "incomplete semantic fragment is not durable memory"
         }
         if isIncompleteThought(normalized, source: source) {
-            return "mid-thought fragment is not durable memory"
+            return midThoughtFragmentReason
         }
         if isConversationalVapor(normalized, kind: kind) {
             return "low-quality conversational fragment is not durable memory"

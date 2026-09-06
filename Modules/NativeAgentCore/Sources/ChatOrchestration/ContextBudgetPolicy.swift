@@ -106,6 +106,25 @@ public enum ContextBudgetPolicy {
     static let wideRecallRowLimit = 12
     static let wideRecallWindowTokens = 200_000
 
+    // MARK: - Packet atom rendering (NORTHSTAR clause 6: reach, not weight)
+
+    /// Above this body length a packet atom is rendered as a LEAD plus a
+    /// `context_expand` pointer instead of its full body. Measured 2026-09-01:
+    /// atoms rendered uncapped (`- [kind] <full body>`), corrections averaging
+    /// 830 chars and reaching 2 KB, memories 470. 400 keeps the ordinary atom
+    /// whole (it is the rule, and the rule is short) while a story-length one
+    /// becomes one pull away rather than permanent prompt mass.
+    ///
+    /// Window-independent on purpose: this is not a budget that a bigger model
+    /// should spend harder, it is the shape of what an atom SAYS. The packet's
+    /// aggregate character budget (`packetChars`) is the window-scaled knob.
+    static let packetAtomExpandThresholdChars = 400
+
+    /// Lead length used when an atom carries no `summary`: the first
+    /// sentence(s) up to this many characters, cut at a sentence boundary.
+    /// Strictly below the threshold so truncating always shortens.
+    static let packetAtomLeadChars = 240
+
     // MARK: - Floors (today's literals, verbatim)
 
     /// The pre-policy budget table. Every value here shipped before this file

@@ -57,7 +57,12 @@ enum NativeAgentPaths {
     /// public-release bundle may use, and the root the blank-slate quarantine
     /// operates on.
     static var applicationSupportDataRoot: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        // The query is documented to return the standard directory, but it is
+        // a query: an empty result must fall back to the same path, not trap.
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support", isDirectory: true)
+        return base
             .appendingPathComponent("NativeAgent", isDirectory: true)
             .standardizedFileURL
     }

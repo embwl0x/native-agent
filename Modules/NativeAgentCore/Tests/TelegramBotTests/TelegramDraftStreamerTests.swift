@@ -46,7 +46,9 @@ private func makeStreamer(
 ) -> TelegramDraftStreamer {
     TelegramDraftStreamer(
         token: "tok",
-        chatId: 7,
+        // 2026-09-06: sends moved from a bare chatId to TelegramDestination
+        // (chat + forum topic thread) in 9cb3ab08.
+        destination: .chat(7),
         editIntervalSeconds: interval,
         sendReturningId: { _, _, text in try await spy.send(text) },
         editMessage: { _, _, id, text in try await spy.edit(id, text) }

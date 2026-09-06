@@ -233,10 +233,16 @@ struct NamespacedModelUnconfiguredOpenRouterTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let providers = root.appendingPathComponent("providers", isDirectory: true)
         try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
+        // 2026-09-06 (630c7507): a cache carrying no `complete` stamp is
+        // `.unknown`, not evidence of absence — only a cache whose source
+        // response held the whole list may reject a pin. The test's premise is
+        // a FRESH COMPLETE catalogue that excludes the pinned model, so the
+        // fixture says so.
         let cache: [String: Any] = [
             "schema_version": 1,
             "updated_at": ISO8601DateFormatter().string(from: Date()),
             "source": OpenRouterModelCatalog.endpoint.absoluteString,
+            "complete": true,
             "models": [[
                 "id": "anthropic/claude-sonnet-5",
                 "name": "Claude Sonnet 5",

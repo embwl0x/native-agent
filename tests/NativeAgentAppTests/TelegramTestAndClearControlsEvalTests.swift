@@ -113,7 +113,13 @@ struct TelegramTestAndClearControlsEvalTests {
         }
         let dialog = String(view[start.lowerBound...].prefix(900))
         #expect(dialog.contains("isPresented: $showClearLogsConfirm"))
-        #expect(dialog.contains("Button(\"Clear Logs\", role: .destructive)"))
+        // 2026-09-06: label only — 89b0f712 ("Advanced reach pages on the page
+        // kit: Providers, Telegram, iPhone, Connectors", 2026-09-03) rebuilt
+        // TelegramView on the page kit and moved its buttons to sentence case,
+        // so the destructive button is now `Button("Clear logs", ...)`
+        // (TelegramView.swift:269). The gate itself is unchanged: the
+        // destructive role still hangs off the confirmation dialog.
+        #expect(dialog.contains("Button(\"Clear logs\", role: .destructive)"))
         #expect(dialog.contains("await appModel.clearTelegramLogs()"))
         #expect(dialog.contains("Button(\"Cancel\", role: .cancel)"))
         #expect(dialog.contains("permanently removes recent replies, blocked-message records, errors, and diagnostic logs"))

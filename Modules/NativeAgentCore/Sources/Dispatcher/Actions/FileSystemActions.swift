@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import MacControl
 import PersistenceCore
 #if canImport(Darwin)
@@ -153,6 +154,19 @@ public struct ConnectorActionContext: Sendable {
 }
 
 // MARK: - Path resolution + sandbox
+
+/// 2026-09-06: ONE public entry point for the sensitive-subtree predicate, so
+/// callers outside this module apply the exact fence the Full Mac file tools
+/// apply. Turning Full Mac OFF selects the basic reader in
+/// `SwiftToolDispatcher`, which resolved `data/secrets` / `data/providers` /
+/// `data/trust` through the repo sandbox (`data` is an allowed top level) and
+/// opened them directly — the Full Mac reader rejects exactly those.
+public func connectorPathIsSensitiveData(_ path: URL, dataRoot: URL) -> Bool {
+    FileSystemActions.isSensitiveDataPath(
+        path,
+        ConnectorActionContext(repoRoot: "", dataRoot: dataRoot.path)
+    )
+}
 
 enum FileSystemActions {
 
@@ -373,6 +387,7 @@ enum FileSystemActions {
         if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found") }
         if isDir.boolValue { return errResult("Not a file: \(resolved.path)", code: "file_not_found") }
 
+        if let image = LocalToolImage.readAuthorizedFile(resolved) { return image }
         guard let window = try? readFileWindow(
             path: resolved, maxBytes: maxBytes, useCompactDefault: !hasExplicitMaxBytes
         ) else {
@@ -839,12 +854,20 @@ enum FileSystemActions {
         let args: [String]
         // Patterns are regex data, never CLI options (e.g. searching --help
         // must not execute the engine's help command and report it as matches).
+        // 2026-09-06: the sensitive-path filter below parses
+        // `absolute-path:line:text`, so the output SHAPE is part of the fence.
+        // `--no-config` stops an inherited RIPGREP_CONFIG_PATH from rewriting
+        // it (or the search), and `--with-filename` / `-H` keep the filename on
+        // every line even when the search path is a single file.
         if let rg = rgPath {
             launch = rg
-            args = ["--no-heading", "--line-number", "-m", String(maxResults), "-e", pattern, "--", searchPath.path]
+            args = [
+                "--no-config", "--with-filename", "--no-heading", "--line-number",
+                "-m", String(maxResults), "-e", pattern, "--", searchPath.path,
+            ]
         } else if let grepBin = resolveExecutable("grep") {
             launch = grepBin
-            args = ["-rnE", "--include=*", "-m", String(maxResults), "-e", pattern, "--", searchPath.path]
+            args = ["-rHnE", "--include=*", "-m", String(maxResults), "-e", pattern, "--", searchPath.path]
         } else {
             // Python would raise FileNotFoundError from subprocess.run → caught by
             // the broad `except Exception` → generic error (no error_code).
@@ -860,9 +883,33 @@ enum FileSystemActions {
             return errResult(stderr.isEmpty ? "grep error" : stderr, code: "grep_error")
         }
         let rawOutput = run.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 2026-09-06: the root check above is not a fence for a RECURSIVE
+        // search — `isSensitiveDataPath` is false for the data root itself, so
+        // grepping the data root walked straight into data/secrets,
+        // data/oauth, data/providers and data/trust and returned the matching
+        // LINES. rg/grep emit `path:line:text`, so drop every match whose file
+        // is under a sensitive sub-tree, by the same predicate.
+        //
+        // The filter fails CLOSED (2026-09-06): a line whose leading field is
+        // not an absolute path is a line whose file this fence cannot identify,
+        // so it is dropped rather than admitted. With --with-filename/-H forced
+        // above, every real match line carries one.
+        //
+        // 2026-09-06: splitting on the FIRST colon read a filename that
+        // contains one as a shorter path — `/data/foo:secret.bin:1:text` was
+        // judged as `/data/foo` and admitted, leaking the sensitive file's
+        // matching line. A colon is legal in a filename and the shape is
+        // genuinely ambiguous, so judge EVERY reading of it: the real path is
+        // always the prefix of some `:<digits>:` separator, and any line where
+        // one of those readings is sensitive is dropped.
+        let admitted = splitLines(rawOutput).filter { line in
+            let candidates = grepMatchPathCandidates(line)
+            guard !candidates.isEmpty else { return false }
+            return !candidates.contains { isSensitiveDataPath(URL(fileURLWithPath: $0), ctx) }
+        }
         // Python: raw_output.splitlines()[:max_results]. Use the guarded
         // sliceCount (negatives already errored at the subprocess above).
-        let lines = Array(splitLines(rawOutput).prefix(sliceCount))
+        let lines = Array(admitted.prefix(sliceCount))
         let output = truncate(lines.joined(separator: "\n"))
         return .object([
             "ok": .bool(true),
@@ -871,6 +918,31 @@ enum FileSystemActions {
             "matches": .int(Int64(lines.count)),
             "output": .string(output),
         ])
+    }
+
+    /// Every path a `path:line:text` match line could name, in left-to-right
+    /// order: the prefix in front of each `:<digits>:` separator. A filename
+    /// may itself contain a colon, and the matched TEXT may contain
+    /// `:<digits>:` too, so no single reading is authoritative — but the real
+    /// path is always one of these, which is what lets the sensitive-path
+    /// fence judge them all. Empty (⇒ the line is dropped) when the line does
+    /// not start at an absolute path or carries no such separator at all.
+    static func grepMatchPathCandidates(_ line: String) -> [String] {
+        guard line.hasPrefix("/") else { return [] }
+        let chars = Array(line)
+        var candidates: [String] = []
+        var i = 1
+        while i < chars.count {
+            if chars[i] == ":" {
+                var j = i + 1
+                while j < chars.count, chars[j].isASCII, chars[j].isNumber { j += 1 }
+                if j > i + 1, j < chars.count, chars[j] == ":" {
+                    candidates.append(String(chars[0..<i]))
+                }
+            }
+            i += 1
+        }
+        return candidates
     }
 
     // MARK: - git_status
@@ -948,7 +1020,10 @@ enum FileSystemActions {
             return false
         }()
         let pathFilter = stringField(input, "path")
-        var args = ["diff"]
+        // 2026-09-06: `--no-ext-diff` / `--no-textconv` are the per-command
+        // half of the exec fence; the global `-c` overrides in runGit are the
+        // other half.
+        var args = ["diff", "--no-ext-diff", "--no-textconv"]
         if staged { args.append("--staged") }
         if !pathFilter.isEmpty { args.append(contentsOf: ["--", pathFilter]) }
 
@@ -1127,6 +1202,117 @@ enum FileSystemActions {
     /// missing → "git not found" / git_unavailable; timeout → git_unavailable;
     /// exit code outside `okStatuses` → git_unavailable (preferring stderr, with
     /// the "not a git repository" message passed through verbatim).
+    /// Every command routed through `runGit` is a READ (git_status, git_diff,
+    /// git_log, repo_dirty_summary — the four tools in
+    /// SwiftToolDispatcher.fullMacReadOnlyFileToolNames). `git status` and
+    /// `git diff` nevertheless take an OPTIONAL lock on `.git/index` to write
+    /// back a refreshed stat cache, which is a shared-file write two concurrent
+    /// readers can contend on. `GIT_OPTIONAL_LOCKS=0` is git's own switch for
+    /// read-only callers: it skips that refresh write entirely (the reported
+    /// status is unchanged), so these tools mutate nothing in the repository
+    /// and may safely run beside each other — which is what
+    /// ParallelToolDispatch's read carve-out relies on.
+    static let gitReadOnlyEnvironmentOverrides: [String: String] = [
+        "GIT_OPTIONAL_LOCKS": "0",
+        // 2026-09-06: these four tools are READ tools, but git happily runs
+        // commands the repository (or the inherited environment) names —
+        // `GIT_EXTERNAL_DIFF`, a pager, an SSH command, a system-config hook.
+        // A cloned or attacker-supplied checkout could therefore execute
+        // arbitrary code from `git_diff` / `git_status`, OUTSIDE the builder
+        // sandbox (runProcess applies none). Pin the environment closed;
+        // `gitReadOnlyConfigOverrideArgs` closes the config-file half.
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        // 2026-09-06: git shells out (aliases, `git status` sub-processes) and
+        // resolves helpers through PATH, so the child gets the system PATH, not
+        // whatever the app inherited.
+        "PATH": gitSanitizedSearchPath,
+    ]
+
+    /// The ONLY PATH a read-tier git child sees, and the only directories
+    /// `gitExecutablePath` will resolve the binary from.
+    static let gitSanitizedSearchPath = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+    /// Resolve `git` WITHOUT consulting the inherited PATH (2026-09-06): a
+    /// PATH the app inherited from a launching shell could name any binary
+    /// `git`, and these four tools run it unsandboxed. Fixed location first,
+    /// then the Xcode toolchain via `xcrun`, which is itself at a fixed path.
+    static func gitExecutablePath() -> String? {
+        if FileManager.default.isExecutableFile(atPath: "/usr/bin/git") {
+            return "/usr/bin/git"
+        }
+        let xcrun = "/usr/bin/xcrun"
+        guard FileManager.default.isExecutableFile(atPath: xcrun) else { return nil }
+        // 2026-09-06: xcrun picks its toolchain from the environment it is
+        // handed — DEVELOPER_DIR and TOOLCHAINS name the directory it searches
+        // — so inheriting the app's environment let whatever launched the app
+        // choose the `git` these unsandboxed read tools execute, and any
+        // absolute path xcrun printed was accepted. Hand it PATH alone, and
+        // take the answer only when it lands in a developer-tools install.
+        let run = runProcess(
+            xcrun, ["--find", "git"], timeout: 10,
+            environment: ["PATH": gitSanitizedSearchPath]
+        )
+        guard run.launched, !run.timedOut, run.status == 0 else { return nil }
+        let found = run.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isDeveloperToolchainPath(found),
+              FileManager.default.isExecutableFile(atPath: found) else { return nil }
+        return found
+    }
+
+    /// The only locations a toolchain binary may be taken from: Xcode's own
+    /// bundle in /Applications, or the developer-tools tree (which is where
+    /// the Command Line Tools install and every `xcode-select` root live).
+    /// Both are root-owned; anywhere else is a path a user or an inherited
+    /// environment could have arranged.
+    static func isDeveloperToolchainPath(_ path: String) -> Bool {
+        guard path.hasPrefix("/") else { return false }
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        if standardized.hasPrefix("/Library/Developer/") { return true }
+        let parts = standardized.split(separator: "/", omittingEmptySubsequences: true)
+        guard parts.count > 2, parts[0] == "Applications" else { return false }
+        let bundle = String(parts[1])
+        return bundle.hasPrefix("Xcode") && bundle.hasSuffix(".app")
+    }
+
+    /// Environment variables that name a command for git to execute. Removed
+    /// outright (an empty value is not always the same as unset).
+    static let gitReadOnlyEnvironmentRemovals: [String] = [
+        "GIT_EXTERNAL_DIFF",
+        "GIT_PAGER",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ]
+
+    /// Global `-c` overrides prepended to every read-tier git invocation. The
+    /// exec-capable knobs a repository's own `.git/config` / `.gitattributes`
+    /// can set: an external diff driver, a textconv filter, an fsmonitor hook
+    /// (`git status` runs it), the hooks directory, and the pager.
+    static let gitReadOnlyConfigOverrideArgs: [String] = [
+        "--no-pager",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.pager=cat",
+        "-c", "core.sshCommand=",
+        "-c", "diff.external=",
+        "-c", "protocol.ext.allow=never",
+    ]
+
+    /// The inherited environment with the read-only overrides applied. Built by
+    /// merging (not replacing) because `Process.environment` is wholesale.
+    static var gitReadOnlyEnvironment: [String: String] {
+        var env = ProcessInfo.processInfo.environment
+            .merging(gitReadOnlyEnvironmentOverrides) { _, override in override }
+        for key in gitReadOnlyEnvironmentRemovals { env.removeValue(forKey: key) }
+        return env
+    }
+
     static func runGit(
         _ args: [String],
         cwd: URL,
@@ -1135,10 +1321,12 @@ enum FileSystemActions {
         okStatuses: [Int32] = [0],
         treatNotAGitRepoSpecially: Bool = true
     ) -> GitRun {
-        guard let git = which("git") else {
+        guard let git = gitExecutablePath() else {
             return .failure(errResult("git not found", code: "git_unavailable"))
         }
-        let run = runProcess(git, args, cwd: cwd, timeout: timeout)
+        let run = runProcess(git, gitReadOnlyConfigOverrideArgs + args,
+                             cwd: cwd, timeout: timeout,
+                             environment: gitReadOnlyEnvironment)
         if run.timedOut {
             return .failure(errResult("\(label) timed out", code: "git_unavailable"))
         }
@@ -1355,13 +1543,24 @@ struct ProcessRunResult {
     var stderr: String
 }
 
-func runProcess(_ launchPath: String, _ args: [String], cwd: URL? = nil, timeout: TimeInterval) -> ProcessRunResult {
+func runProcess(
+    _ launchPath: String,
+    _ args: [String],
+    cwd: URL? = nil,
+    timeout: TimeInterval,
+    environment: [String: String]? = nil
+) -> ProcessRunResult {
     guard FileManager.default.isExecutableFile(atPath: launchPath) else {
         return ProcessRunResult(launched: false, timedOut: false, status: -1, stdout: "", stderr: "")
     }
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: launchPath)
     proc.arguments = args
+    // nil ⇒ inherit this process's environment (Foundation's default, and every
+    // pre-existing caller's behavior). A non-nil dictionary REPLACES the child's
+    // environment wholesale, so callers must build it by merging onto the
+    // inherited one rather than passing overrides alone.
+    if let environment { proc.environment = environment }
     if let cwd { proc.currentDirectoryURL = cwd }
     let outPipe = Pipe()
     let errPipe = Pipe()

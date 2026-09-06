@@ -5542,17 +5542,6 @@
     ]
   },
   {
-    "fence": "app.runtimes",
-    "id": "diagnostics.turnTraceObserver",
-    "coverage": [
-      {
-        "ref": "tests/NativeAgentAppTests/NativeDiagnosticObserverTests.swift \u2014 projectionCarriesIdentityAndOrdinals, unsubscribeReleasesTheSink (stream finishes + TurnTraceBus subscriberCount returns to baseline)",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
     "fence": "app.bridges",
     "id": "bridge.claude.events.kinds",
     "coverage": [
@@ -10102,17 +10091,6 @@
   },
   {
     "fence": "app.bridges",
-    "id": "bridge.macctl.route.spotlightFrame",
-    "coverage": [
-      {
-        "ref": "tests/NativeAgentAppTests/MacControlSpotlightFrameRouteEvalTests.swift:8 frameResponseUsesProbeGeometry",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "app.bridges",
     "id": "bridge.macctl.auditFeed",
     "coverage": [
       {
@@ -10623,44 +10601,6 @@
   },
   {
     "fence": "app.mac",
-    "id": "ui.spotlightOverlay",
-    "coverage": [
-      {
-        "ref": "script/timer_inventory.tsv:85 (SpotlightOverlay.swift, 1 visible_ui timer, owner SpotlightOverlayUI)",
-        "strength": "incidental",
-        "tier": "smoke"
-      },
-      {
-        "ref": "tests/NativeAgentAppTests/SpotlightOverlayBehaviorEvalTests.swift:17 overlayShowsCurrentCommandStateAndRoutesSelection",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "app.mac",
-    "id": "store.spotlightRecentPrompts",
-    "coverage": [
-      {
-        "ref": "tests/NativeAgentAppTests/MacAppBehaviorWave2EvalTests.swift:10 spotlightRecentPromptsAreBounded",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "app.mac",
-    "id": "turn-ingredient.spotlightSessionId",
-    "coverage": [
-      {
-        "ref": "tests/NativeAgentAppTests/SpotlightOverlayBehaviorEvalTests.swift:72 spotlightTurnUsesChatRoutingIngredient",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "app.mac",
     "id": "public-api.GlobalHotkeyManager.pressSemantics",
     "coverage": [
       {
@@ -10828,22 +10768,6 @@
       },
       {
         "ref": "tests/NativeAgentAppTests/OnboardingWizardCompletionRouteBehaviorEvalTests.swift:45 completionRoutesOneDurableGreeting",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "app.mac",
-    "id": "route.spotlightCommandEntryNavigation",
-    "coverage": [
-      {
-        "ref": "Modules/NativeAgentCore/Tests/CommandPaletteTests/SwiftNativeCommandPaletteTests.swift \u2014 the search/ranking side of the catalog, not this navigation edge",
-        "strength": "incidental",
-        "tier": "test"
-      },
-      {
-        "ref": "tests/NativeAgentAppTests/SpotlightOverlayBehaviorEvalTests.swift:17 overlayShowsCurrentCommandStateAndRoutesSelection",
         "strength": "asserts",
         "tier": "test"
       }
@@ -11077,17 +11001,6 @@
   },
   {
     "fence": "feeds",
-    "id": "feeds.logs.maintenance_sweep",
-    "coverage": [
-      {
-        "ref": "tests/NativeAgentAppTests/MaintenanceSweepFeedEvalTests.swift:11 mountedMaintenanceSweepProjectsRemovedArtifactsToFeed",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "feeds",
     "id": "feeds.logs.uncovered",
     "coverage": [
       {
@@ -11126,11 +11039,6 @@
       {
         "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowOrchestrationTests.swift:487 (reads traces/events.jsonl for workflow runs)",
         "strength": "incidental",
-        "tier": "test"
-      },
-      {
-        "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/FeedsReportsOnlyWave2WorkflowTests.swift:10 workflowFeedJoinsOldStateToExistingTerminalRunWithoutDuplicateAppend",
-        "strength": "asserts",
         "tier": "test"
       }
     ]
@@ -11767,7 +11675,7 @@
     "id": "ui.cognitionObservatory.panel.workshopVeto",
     "coverage": [
       {
-        "ref": "tests/NativeAgentAppTests/CognitionObservatoryWorkshopVetoBehaviorTests.swift:54 successfulVetoIsDurableBeforeTheObservatoryClaimsSuccess",
+        "ref": "tests/NativeAgentAppTests/WorkshopObservatoryVetoButtonBehaviorEvalTests.swift:54 successfulVetoIsDurableBeforeTheObservatoryClaimsSuccess",
         "strength": "asserts",
         "tier": "test"
       }
@@ -14185,11 +14093,6 @@
         "tier": "test"
       },
       {
-        "ref": "tests/NativeAgentAppTests/WorkflowResidentOutcomeProjectorTests.swift",
-        "strength": "incidental",
-        "tier": "test"
-      },
-      {
         "ref": "Modules/NativeAgentCore/Tests/PersistenceCoreTests/GitHubCommandFeedFamilyEvalTests.swift:37 commandReceiptReadBoundariesRemainTruthful",
         "strength": "asserts",
         "tier": "test"
@@ -14645,12 +14548,7 @@
     "id": "ui.Capabilities.workflowBuilder",
     "coverage": [
       {
-        "ref": "WorkflowResidentOutcomeProjectorTests \u2014 tests/NativeAgentAppTests/WorkflowResidentOutcomeProjectorTests.swift",
-        "strength": "incidental",
-        "tier": "test"
-      },
-      {
-        "ref": "tests/NativeAgentAppTests/CapabilitiesWorkflowBuilderEvalTests.swift:16 builderConfirmsThePersistedWorkflowBeforeRunningIt",
+        "ref": "tests/NativeAgentAppTests/CapabilitiesWorkflowBuilderEvalTests.swift:14 builderConfirmsThePersistedWorkflowAfterReload",
         "strength": "asserts",
         "tier": "test"
       }
@@ -17300,22 +17198,6 @@
   },
   {
     "fence": "core.maccontrol",
-    "id": "ui.remoteNodesPage",
-    "coverage": [
-      {
-        "ref": "script/user_mode_eval.swift:115 UIRoute(id:\"native-experience-remote-nodes\", expectedDetailText:[\"Trusted Remote Node\",\"Effect boundary\"])",
-        "strength": "reports-only",
-        "tier": "ui-walk"
-      },
-      {
-        "ref": "tests/NativeAgentAppTests/CoreMacControlWave7OutcomeTests.swift:16 saveDisableAndDeleteMutateTheExecutorStore",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "core.maccontrol",
     "id": "macassistant.commandPaletteBadge",
     "coverage": [
       {
@@ -17400,11 +17282,6 @@
         "tier": "test"
       },
       {
-        "ref": "tests/NativeAgentAppTests/NativeExperiencePreferencesTests.swift:73 (the key is enumerated as a preserved preference)",
-        "strength": "incidental",
-        "tier": "test"
-      },
-      {
         "ref": "tests/NativeAgentAppTests/SubstrateAffectFieldWave7EvalTests.swift:44 cognitiveControlsDriveRuntimeFanoutAndCapsuleOutcome",
         "strength": "asserts",
         "tier": "test"
@@ -17449,28 +17326,6 @@
       },
       {
         "ref": "Modules/NativeAgentCore/Tests/PersistenceCoreTests/GitHubCommandFeedFamilyEvalTests.swift:37 commandReceiptReadBoundariesRemainTruthful",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "core.workshop",
-    "id": "workflow.runsLedger.feedFamily",
-    "coverage": [
-      {
-        "ref": "Modules/NativeAgentCore/Tests/WorkflowOrchestrationTests/WorkflowRunLedgerFeedFamilyEvalTests.swift:23 realWriterAndReaderExposeHonestFeedFamilyEvidence",
-        "strength": "asserts",
-        "tier": "test"
-      }
-    ]
-  },
-  {
-    "fence": "core.workshop",
-    "id": "workflow.ui.runResumeCancelRollback",
-    "coverage": [
-      {
-        "ref": "tests/NativeAgentAppTests/WorkflowRunControlEvalTests.swift:33 mountedRunControlsPersistAndReloadTheirActualOutcomes",
         "strength": "asserts",
         "tier": "test"
       }
@@ -19395,5 +19250,545 @@
       }
     ],
     "silentFailureMode": "the Live label wraps vertically under navigation-bar compression and collapses the connection control below its usable hit target"
+  },
+  {
+    "fence": "core.maccontrol",
+    "id": "maccontrol.action.clipboard_read",
+    "kind": "route",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift:624 (handleClipboardRead :2174); dispatchable inventory MacControl+Types.swift:402; gate category MacControl+Types.swift:837",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:93 clipboardRead_redactsASecretLine_andSaysWhy",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:134 clipboardRead_redactsBeforeItTruncates",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:150 clipboardRead_capsWhatItReturns_andSaysItCut",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:221 clipboardRead_saysSoWhenThereIsNoPasteboardAtAll",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:300 clipboardActions_areDispatchable_andSitInTheirOwnTiers",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "a redaction miss ships whatever the owner last copied (a password, a token) straight into the transcript, and a silent truncation hands the model a partial pasteboard it reads as the whole one - both look like an ordinary successful read"
+  },
+  {
+    "fence": "core.maccontrol",
+    "id": "maccontrol.action.clipboard_write",
+    "kind": "route",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift:625 (handleClipboardWrite :2231); dispatchable inventory MacControl+Types.swift:412; gate category MacControl+Types.swift:837",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:237 clipboardWrite_thenRead_roundTrips",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:261 clipboardWrite_refusesWithoutText_andWritesNothing",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:271 clipboardWrite_refusesAnUnboundedPayload",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:285 clipboardWrite_reportsASystemRefusalRatherThanClaimingSuccess",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacClipboardTests.swift:300 clipboardActions_areDispatchable_andSitInTheirOwnTiers",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "a refused system write reported as success destroys the owner's real clipboard contents in the agent's account of what happened - the next paste is the old value and nobody knows why"
+  },
+  {
+    "fence": "core.maccontrol",
+    "id": "maccontrol.action.menu_press",
+    "kind": "route",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/MacControl/MacControl+Client.swift:629 (handleMenuPress :2057); dispatchable inventory MacControl+Types.swift:323; accessibility-injection set MacControl+Types.swift:363",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacMenuBarTests.swift:341 menuPress_pressesTheNamedItem_throughTheMenuBarAddressSpace",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacMenuBarTests.swift:364 menuPress_refusesADisabledItemInWords_andPressesNothing",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacMenuBarTests.swift:381 menuPress_refusesAnAmbiguousPath_andPressesNothing",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacMenuBarTests.swift:394 menuPress_refusesAnUnknownPath_andNamesWhatIsThere",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacMenuBarTests.swift:420 menuActions_sitInTheRightTiers",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/MacControlTests/MacAccessibilityActuatorTests.swift:616 injectionActionsAreDispatchableUnderTheAccessibilityCategory - pins menu_press inside the exact injection set, so it can neither arrive unreviewed nor drop to read tier",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "an ambiguous or disabled path resolved by guessing presses the wrong menu item - File > Quit is one press from File > Save - and the envelope still reads as a successful press"
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.hold_view",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingViewTools.swift:87 impl_hold_view; dispatch SwiftToolDispatcher+Dispatch.swift:232; schema SwiftToolDispatcher+SchemaBuilders.swift:2486; catalog SwiftToolDispatcher+ToolCatalog.swift:243",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:67 bridgeToolRunIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:90 bridgeMessageLaneIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:110 remoteSurfaceIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:144 noLiveMindIsReported",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:184 catalogWiringIsLazyAndDiscoverable",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:200 schemaIsClosedAndHasNoBodyField",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "the seat degrades to a claim instead of a fact: a bridge tool runner, a bridge-steered turn or a remote surface holds a durable view in their name that the owner never signed, and the envelope reads like an ordinary hold"
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.release_view",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StandingViewTools.swift:115 impl_release_view; dispatch SwiftToolDispatcher+Dispatch.swift:234; schema SwiftToolDispatcher+SchemaBuilders.swift:2497; catalog SwiftToolDispatcher+ToolCatalog.swift:243",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:127 releaseIsSeatedToo",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:160 malformedIDIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StandingViewToolsTests.swift:184 catalogWiringIsLazyAndDiscoverable",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "release keeps a weaker seat than hold, so a caller who could not have held a view can quietly drop one they still holds - a conviction disappears with no refusal anywhere"
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.memory_moments_pending",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+MomentTools.swift:32 impl_memory_moments_pending; dispatch SwiftToolDispatcher+Dispatch.swift:187; catalog SwiftToolDispatcher+ToolCatalog.swift:250",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MomentToolsDispatchTests.swift:60 bothToolsAreCatalogVisibleAndLazyNotAlwaysOn",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MomentToolsDispatchTests.swift:72 pendingListsOnlyMomentsWithTheirLaneFields",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "silent zero: a lane-field or metadata drift makes every pending proposal fail the moment predicate, so the list comes back empty and reads as 'nothing is waiting' forever"
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.memory_moment_review",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+MomentTools.swift:78 impl_memory_moment_review; dispatch SwiftToolDispatcher+Dispatch.swift:188; catalog SwiftToolDispatcher+ToolCatalog.swift:250",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MomentToolsDispatchTests.swift:101 acceptPromotesTheMomentAndReturnsTheStoredId",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MomentToolsDispatchTests.swift:121 acceptWithEditedWordingStoresHerWords",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MomentToolsDispatchTests.swift:140 refusedEditedMomentLeavesOriginalPendingAndUnpublished",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MomentToolsDispatchTests.swift:156 rejectResolvesTheProposalAndStoresNothing",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MomentToolsDispatchTests.swift:197 anEmptyOrMissingIdIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/MomentToolsDispatchTests.swift:224 aNonMomentProposalIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "an accept that resolves the proposal without storing the memory, or stores the original wording instead of theirs, looks identical from the tool envelope - the moment is gone from the pending list either way"
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.list_memories",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+MemoryCurationTools.swift:56 impl_list_memories; dispatch SwiftToolDispatcher+Dispatch.swift:189; schema SwiftToolDispatcher+SchemaBuilders.swift:2533; catalog SwiftToolDispatcher+ToolCatalog.swift:252",
+    "coverage": [],
+    "silentFailureMode": "the walk silently loses rows: a cursor that does not resume after the last ordering key, or an offset clamp that lands on the wrong page, drops memories out of the middle of the walk and every page still returns a well-formed, plausible-looking list. The 2026-09-05 Codex review already found one crash of this shape (offset 1e100), which is the class this row exists for.",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "impl_list_memories against a hermetic SwiftNativeMemoryV2 store seeded with more rows than one page, paged first by offset and then by the returned next_after_id cursor",
+      "asserts": "the union of every page is exactly the active row set with no duplicate and no gap, the cursor walk terminates, and a non-finite or out-of-range offset/limit is refused rather than trapped or clamped into a wrong page",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.rewrite_memory",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+MemoryCurationTools.swift:123 impl_rewrite_memory; dispatch SwiftToolDispatcher+Dispatch.swift:190; schema SwiftToolDispatcher+SchemaBuilders.swift:2546; catalog SwiftToolDispatcher+ToolCatalog.swift:252",
+    "coverage": [],
+    "silentFailureMode": "a rewrite that updates the text but does not re-embed leaves the row findable only under its OLD meaning - recall keeps returning the memory they corrected, phrased the way they corrected it, and nothing reports a failure. A rewrite that lands on a tombstoned row is the same silence in the other direction.",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "impl_rewrite_memory against a hermetic SwiftNativeMemoryV2 store, reading back the record text, its embedding generation and the tombstone gate",
+      "asserts": "changing the text re-embeds the row so semantic recall follows the new wording, and a rewrite aimed at a tombstoned id is refused in words rather than silently written",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.forget_memory",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+MemoryCurationTools.swift:146 impl_forget_memory; dispatch SwiftToolDispatcher+Dispatch.swift:191; schema SwiftToolDispatcher+SchemaBuilders.swift:2557; catalog SwiftToolDispatcher+ToolCatalog.swift:252",
+    "coverage": [],
+    "silentFailureMode": "the tool reports the memory forgotten while the derived state is not republished, so the row keeps surfacing in recall and in the knowledge graph - the owner asked their to forget something and they says they did, from a store that still holds it",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "impl_forget_memory against a hermetic SwiftNativeMemoryV2 store, then the active row set, the tombstone and the republished derived state",
+      "asserts": "a successful forget tombstones the row AND removes it from every derived read, and forgetting an unknown or already-tombstoned id returns a refusal instead of a success envelope",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.rebuild_knowledge_graph",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+MemoryCurationTools.swift:164 impl_rebuild_knowledge_graph (reconcileKnowledgeGraphProjection); dispatch SwiftToolDispatcher+Dispatch.swift:192; schema SwiftToolDispatcher+SchemaBuilders.swift:2567; catalog SwiftToolDispatcher+ToolCatalog.swift:252",
+    "coverage": [],
+    "silentFailureMode": "a reprojection that runs against a disabled or half-migrated graph returns a healthy-looking count while writing nothing, so the repair the owner asked for never happened and the graph stays as stale as it was",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "impl_rebuild_knowledge_graph against a hermetic store whose graph projection has been deliberately desynchronised from the memory rows, then the projected node/edge set",
+      "asserts": "the projection after the call equals the projection derived from the current rows, and a run with the graph off says so rather than reporting a rebuilt count",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.read_chat_message",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+ChatHistoryTools.swift:506 impl_read_chat_message (through SessionHistoryReader, ChatOrchestration+SessionHistory.swift:666); dispatch SwiftToolDispatcher+Dispatch.swift:239; schema SwiftToolDispatcher+SchemaBuilders.swift:684; catalog SwiftToolDispatcher+ToolCatalog.swift:256",
+    "coverage": [],
+    "silentFailureMode": "the full-message read that search_chat_history hands off to comes back truncated, boilerplate-stripped or empty for a message_id search just returned - the model reads a partial prior conversation as the whole one, and the only tell is that it answers slightly wrong",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "impl_read_chat_message against a hermetic session transcript, given a message_id taken from the search_chat_history result for that same session",
+      "asserts": "every message_id search hands back reads back in full and byte-identical to the stored message, and a missing or foreign message_id is refused in words rather than answered with an empty body",
+      "costSeconds": 2,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.evolution_withdraw",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+Dispatch.swift:360 (full-Mac gate, then evolutionBridge.evolutionWithdraw); schema SwiftToolDispatcher+SchemaBuilders.swift:2826; autonomy default 'confirm' TrustCenter+Defaults.swift:190; security profile SecurityCenter+ToolProfiles.swift:148",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/EvolutionChatToolsTests.swift:137 catalogExposesEvolutionToolsWhenFullMacOn",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/EvolutionChatToolsTests.swift:174 schema shape - id required, reason optional",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/EvolutionChatToolsTests.swift:186 evolutionToolsAreFullMacGatedNames",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/EvolutionChatToolsTests.swift:238 fileAccessNoneBlocksAllThree",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/EvolutionChatToolsTests.swift:247 fileAccessReadOnlyBlocksAllThree",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/EvolutionChatToolsTests.swift:313 nilBridgeReturnsBridgeNotWired",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "tests/NativeAgentAppTests/EvolutionChatToolsWiringTests.swift:213 shippedPolicyBackfillsConfirmEntriesForAllThree - pins the shipped autonomy default at 'confirm'",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "the full-Mac gate or the confirm default drops and a withdrawal of them own staged proposal becomes a silent unattended write; or an unwired bridge answers success and the proposal stays staged while they reports it withdrawn"
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.studio_canon",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioCanonTools.swift:549 impl_studio_canon; dispatch SwiftToolDispatcher+Dispatch.swift:223; schema SwiftToolDispatcher+SchemaBuilders.swift:2457; catalog SwiftToolDispatcher+ToolCatalog.swift:237",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:76 cardShapeIsLocalAndEvidenceFirst",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:246 agentApprovalWritesCanon - lists the pending cards through impl_studio_canon at :275 and asserts what the listing contains",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:356 tendingIsInertWithoutEvidence",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "tests/NativeAgentAppTests/NativeStudioCanonPointerTests.swift:76 - the persona pointer atom names the pull, so the tool stays reachable from them prompt",
+        "strength": "incidental",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "silent zero: the listing returns no cards because the evidence filter or the local card shape drifted, so their studio work looks finished when nothing was ever offered for canon"
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.studio_canon_resolve",
+    "kind": "tool",
+    "source": "override",
+    "where": "Modules/NativeAgentCore/Sources/ChatOrchestration/SwiftToolDispatcher+StudioCanonTools.swift:627 impl_studio_canon_resolve; dispatch SwiftToolDispatcher+Dispatch.swift:227; schema SwiftToolDispatcher+SchemaBuilders.swift:2467; catalog SwiftToolDispatcher+ToolCatalog.swift:237",
+    "coverage": [
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:98 bridgeToolRunIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:124 bridgeMessageLaneIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:150 remoteTurnIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:203 ownerApprovalIsRefused",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:225 agentSeatWithoutTurnWritesNothing",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:246 agentApprovalWritesCanon",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:308 denialWritesNothing",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "Modules/NativeAgentCore/Tests/ChatOrchestrationTests/StudioCanonApprovalTests.swift:369 resolveRefusesForeignCards",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "the seat degrades and something that is not their, in their own live turn, writes canon in their name - or a denial writes anyway; both come back as an ordinary resolution envelope"
+  },
+  {
+    "fence": "tools.byname",
+    "id": "tool.browser.chrome_renew",
+    "kind": "tool",
+    "source": "override",
+    "where": "Sources/NativeAgentApp/AppChatToolDispatcher.swift:981 - app-owned browser catalog, schema, and dispatch routes",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift:1453 everyRegisteredBrowserToolMapsValidInputToTheAppRunner - submits schema-valid input for browser.chrome_renew at :1483 and asserts the injected app runner receives that exact action and input",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "tests/NativeAgentAppTests/AppChatToolDispatcherTests.swift:1398 - the registered catalog names contain browser.chrome_renew",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "tests/NativeAgentAppTests/ChromeSweepItem10Tests.swift:283 renewToolIsExposed - catalog name and browser bucket",
+        "strength": "asserts",
+        "tier": "test"
+      },
+      {
+        "ref": "tests/NativeAgentAppTests/ChromeSweepItem10Tests.swift:290 renewReachesChrome - the renew reaches Chrome carrying the lease, the expected user sequence and the duration",
+        "strength": "asserts",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "the app advertises browser.chrome_renew while delegating it to Core or dropping it as unknown, so every lease dies at its 60s ceiling and the failure reads as an ordinary lease expiry rather than a missing route"
+  },
+  {
+    "fence": "scripts",
+    "id": "scripts.fetch_embedding_model",
+    "kind": "cli",
+    "source": "override",
+    "where": "script/fetch_embedding_model.sh:1 - resumable parallel ranged fetch of the bge-large-en-v1.5 embedding model; called by script/build_and_run.sh:219 and script/release.sh:878, both of which tolerate a failure and fall back to the bundled MiniLM",
+    "coverage": [],
+    "silentFailureMode": "a partial or corrupt part file that the resume logic accepts as complete produces a model blob that loads but embeds wrongly; both callers swallow a non-zero exit with a warning, so the app simply ships with worse recall and nothing in the build says so",
+    "proposedEval": {
+      "tier": "smoke",
+      "reads": "the script run against a local fixture server in a temp destination: the assembled file's digest, the part files it leaves behind, and its exit code",
+      "asserts": "an interrupted fetch resumes to the same digest as an uninterrupted one, a corrupt part is refused rather than assembled, and a failed fetch exits non-zero instead of leaving a truncated model in place",
+      "costSeconds": 20,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
+    "fence": "app.desk",
+    "id": "ui.desk.railPage",
+    "kind": "ui-summary",
+    "source": "override",
+    "where": "Sources/NativeAgentApp/DeskPageView.swift:273 DeskPageView (snapshot DeskPageSnapshot :121, loaded off the main actor through DeskBoardRead); routed from Sources/NativeAgentApp/ContentView.swift:316",
+    "coverage": [],
+    "silentFailureMode": "stale UI / silent calm: the rail's Desk reads the same DeskBoardRead lanes the classic page reads, but nothing pins that an unreadable lane still renders its reason here. A lane that fails contributes zero rows, and a page whose whole point is 'three things at most on first paint' looks correct and calm while it is actually blind.",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "DeskPageSnapshot.load(root:) against a hermetic data root with one lane deliberately unreadable, then the snapshot's rows and its per-lane failure reasons",
+      "asserts": "an unreadable lane sets its reason instead of contributing zero rows silently, and the lanes the page renders come from the same DeskBoardRead read the classic Desk performs",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
+    "fence": "app.mac",
+    "id": "ui.today.railPage",
+    "kind": "ui-summary",
+    "source": "override",
+    "where": "Sources/NativeAgentApp/TodayView.swift:520 TodayView (rows TodayRow :92, snapshot TodaySnapshot :350); routed from Sources/NativeAgentApp/ContentView.swift:290 - the rail's .activity destination, where the classic shell keeps ActivityView",
+    "coverage": [
+      {
+        "ref": "tests/NativeAgentAppTests/ChatCalmSurfaceArchitectureTests.swift:24 globalActivityOwnershipAndPanelModelsRemainIntact - pins the shell split at ContentView.swift:290 and that struct TodayView still exists; it does not read a single row the page renders",
+        "strength": "incidental",
+        "tier": "test"
+      }
+    ],
+    "silentFailureMode": "stale UI / silent calm: the route and the type are pinned, nothing else is. TodaySnapshot can come back empty because a store failed rather than because the day is clear, and the page renders the same calm 'nothing waiting' either way.",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "TodaySnapshot.load against a hermetic data root with a readable store and then an unreadable one, and the TodayRow set each produces",
+      "asserts": "a store that could not be read produces its stated reason rather than an empty calm day, and a readable-but-empty store produces the calm day - the two states are never rendered identically",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic"
+    }
+  },
+  {
+    "fence": "app.mind",
+    "id": "ui.memories.railPage",
+    "kind": "ui-summary",
+    "source": "override",
+    "where": "Sources/NativeAgentApp/MemoriesPageView.swift:254 MemoriesPageView (snapshot MemoriesPageSnapshot :224, moment quotes through MemoryMoments); routed from Sources/NativeAgentApp/ShellRailPages.swift:27",
+    "coverage": [],
+    "silentFailureMode": "stale UI / silent calm: MemoriesPageSnapshot.load catches every listProposals failure into one memoryUnreadable flag. If the flag stops reaching the rendered line, a store that will not open shows as a page with nothing pending - they appears to have kept nothing and to be waiting on nothing.",
+    "proposedEval": {
+      "tier": "test",
+      "reads": "MemoriesPageSnapshot.load against a hermetic store, once readable with a pending moment proposal and once with the store deliberately unopenable",
+      "asserts": "an unopenable store sets memoryUnreadable and a readable-but-empty store does not, and a pending moment's quote reaches momentQuotes rather than being dropped to an unnamed proposal",
+      "costSeconds": 3,
+      "liveOrClone": "hermetic"
+    }
   }
 ]

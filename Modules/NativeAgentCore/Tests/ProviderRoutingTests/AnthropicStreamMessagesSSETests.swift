@@ -520,12 +520,16 @@ private func sseTextStream(deltas: [String]) -> String {
         }
         let adapter = makeAdapter(telemetryRoot: makeTmpRoot())
         let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        let stream = AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
-            LLMCallContext.$systemSegments.withValue(segments) {
-                adapter.streamMessages(
-                    messages: [.user("hi")], system: Self.segCombined,
-                    model: "claude-opus-4-8", tools: nil
-                )
+        // LEGACY ARM PIN: production defaults to v2Prefix now; this test is
+        // the byte-identity guard for the v1 layout it describes.
+        let stream = ConversationPrefixShape.$override.withValue(.v1Legacy) {
+            AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
+                LLMCallContext.$systemSegments.withValue(segments) {
+                    adapter.streamMessages(
+                        messages: [.user("hi")], system: Self.segCombined,
+                        model: "claude-opus-4-8", tools: nil
+                    )
+                }
             }
         }
         for try await _ in stream {}
@@ -546,7 +550,9 @@ private func sseTextStream(deltas: [String]) -> String {
 
     @Test func messagesBody_textCompatibilityRetainsPreviousAndCurrentRequestBoundaries() {
         let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        let body = AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
+        // LEGACY ARM PIN — the `count - 3` boundary arithmetic is v1 only.
+        let body = ConversationPrefixShape.$override.withValue(.v1Legacy) {
+            AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(true) {
             LLMCallContext.$systemSegments.withValue(segments) {
                 AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
                     messages: [
@@ -560,6 +566,7 @@ private func sseTextStream(deltas: [String]) -> String {
                     tools: nil,
                     stream: true
                 )
+            }
             }
         }
         let messages = body["messages"] as? [[String: Any]] ?? []
@@ -586,11 +593,15 @@ private func sseTextStream(deltas: [String]) -> String {
         }
         let adapter = makeAdapter(telemetryRoot: makeTmpRoot())
         let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        let stream = LLMCallContext.$systemSegments.withValue(segments) {
-            adapter.streamMessages(
-                messages: [.user("hi")], system: Self.segCombined,
-                model: "claude-opus-4-8", tools: makeTools()
-            )
+        // LEGACY ARM PIN — v2 drops the identity breakpoint (see the v2
+        // sibling test below).
+        let stream = ConversationPrefixShape.$override.withValue(.v1Legacy) {
+            LLMCallContext.$systemSegments.withValue(segments) {
+                adapter.streamMessages(
+                    messages: [.user("hi")], system: Self.segCombined,
+                    model: "claude-opus-4-8", tools: makeTools()
+                )
+            }
         }
         for try await _ in stream {}
         let body = try lastRequestBody()
@@ -883,17 +894,57 @@ private func sseTextStream(deltas: [String]) -> String {
     // Calls the shared builder directly: both transports are already pinned
     // body-deep-equal to it, so the matrix covers completeMessages AND
     // streamMessages at once.
+    /// EXTENDED (v2, 2026-09-01) with the prefix-shape AND conversation-shape
+    /// dimensions: the budget must hold across
+    /// convo × shape × hint × tools × segmented × compat. v2 spends its freed
+    /// identity slot on the previous-turn boundary, so the ceiling is
+    /// unchanged at 4 — including on the SEEDED order
+    /// (… assistant(N-1), user(N), system LAST) and on a within-turn round
+    /// that has appended past that trailing system message.
     @Test func makeMessagesRequestBody_breakpointBudgetMatrix_neverExceedsFour() throws {
         let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
+        // (name, messages, v2 marker count, v1 `count - 3` retain lands on a
+        // markable non-system message)
+        //   oneShot: no system message → v2 current only; count < 3 so the v1
+        //     retain can never fire.
+        //   seeded:  v2 previous(assistant N-1) + current; v1 `count - 3` is
+        //     the assistant at index 1 → a second v1 marker when it fires.
+        //   round2:  same v2 pair; v1 `count - 3` is the SYSTEM message at
+        //     index 3 → skipped, so v1 keeps a single marker.
+        // The 4th field is the seeding layer's bound current-user index.
+        // `round2` has appended past its trailing system run, so the fallback
+        // anchor is gone there and only the binding keeps the cross-turn
+        // marker — exactly the production contract.
+        let convos: [(String, [LLMMessage], Int, Bool, Int?)] = [
+            ("oneShot", [.user("hi")], 1, false, nil),
+            ("seeded", [
+                .user("a"), .assistantText("b"), .user("c"),
+                .system("volatile", clearAtNextUserMessage: true),
+            ], 2, true, nil),
+            ("round2", [
+                .user("a"), .assistantText("b"), .user("c"),
+                .system("volatile", clearAtNextUserMessage: true),
+                LLMMessage(role: .assistant, content: [
+                    .toolUse(id: "t1", name: "tool_a", inputJSON: Data("{}".utf8)),
+                ]),
+                LLMMessage(role: .user, content: [
+                    .toolResult(toolUseId: "t1", content: "r", isError: false),
+                ]),
+            ], 2, false, 2),
+        ]
+        for (convoName, convo, v2MessageMarkers, v1RetainMarks, boundUserIndex) in convos {
+        for shape in ConversationPrefixShape.allCases {
         for hint in [false, true] {
             for withTools in [false, true] {
                 for segmented in [false, true] {
                     for compat in [false, true] {
-                        let body = AnthropicOAuthDirectAdapter.GrownPromptCompat.$compatOverride.withValue(compat) {
+                        let body = ConversationPrefixBoundary.$currentUserIndex.withValue(boundUserIndex) {
+                            ConversationPrefixShape.$override.withValue(shape) {
+                            AnthropicOAuthDirectAdapter.GrownPromptCompat.$compatOverride.withValue(compat) {
                             AnthropicOAuthDirectAdapter.MessagesCacheHint.$withinTurnReuse.withValue(hint) {
                                 LLMCallContext.$systemSegments.withValue(segmented ? segments : nil) {
                                     AnthropicOAuthDirectAdapter.makeMessagesRequestBody(
-                                        messages: [.user("hi")],
+                                        messages: convo,
                                         system: segmented ? Self.segCombined : "sys",
                                         coercedModel: "claude-opus-4-8",
                                         maxTokens: 1024,
@@ -902,38 +953,81 @@ private func sseTextStream(deltas: [String]) -> String {
                                     )
                                 }
                             }
+                            }
+                            }
                         }
                         let counts = breakpointCounts(body)
                         let total = counts.system + counts.tools + counts.messages
                         let cell: Testing.Comment =
-                            "hint=\(hint) tools=\(withTools) segmented=\(segmented) compat=\(compat) counts=\(counts)"
+                            "convo=\(convoName) shape=\(shape) hint=\(hint) tools=\(withTools) segmented=\(segmented) compat=\(compat) counts=\(counts)"
 
-                        // Automatic conversation breakpoint: the contract above.
+                        // The v2 SYSTEM shape needs valid segments AND the
+                        // compat lever off; otherwise the legacy arm ships.
+                        let usesPrefix = shape == .v2Prefix && segmented && !compat
+
+                        // Automatic conversation breakpoint: the contract
+                        // above, plus v2's unconditional prefix-reuse grant.
                         // (The last message here always carries a non-empty
                         // text block, so it is trailing-eligible.)
-                        let expectTrailing = (withTools || hint) && !compat
-                        #expect(counts.messages == (expectTrailing ? 1 : 0), cell)
+                        let expectTrailing = (usesPrefix || withTools || hint) && !compat
+                        // v1 marks only the last message (plus its `count - 3`
+                        // retain, which this fixture set never triggers);
+                        // v2 marks current + previous-turn where one exists.
+                        let v1Retain = !withTools && hint && v1RetainMarks
+                        let expectedMessages = expectTrailing
+                            ? (usesPrefix ? v2MessageMarkers : (v1Retain ? 2 : 1))
+                            : 0
+                        #expect(counts.messages == expectedMessages, cell)
+                        // ORDERING RULE: Anthropic requires longer-TTL entries
+                        // to appear before shorter ones across the whole
+                        // tools → system → messages render order. No cell may
+                        // put a 1h marker behind a 5m one.
+                        var seenShort = false
+                        for marker in AnthropicOAuthDirectAdapter.cacheMarkers(in: body) {
+                            #expect(!(seenShort && marker.ttl == "1h"), cell)
+                            if marker.ttl == "5m" { seenShort = true }
+                        }
+                        // INVARIANT: never a marker on a system message.
+                        let systemMarked = (body["messages"] as? [[String: Any]] ?? [])
+                            .contains { msg in
+                                msg["role"] as? String == "system"
+                                    && ((msg["content"] as? [[String: Any]]) ?? [])
+                                        .contains { $0["cache_control"] != nil }
+                            }
+                        #expect(!systemMarked, cell)
                         // Tools block: last-definition breakpoint iff sent.
                         #expect(counts.tools == (withTools ? 1 : 0), cell)
-                        // System: identity + (segmented: stable-end, plus
+                        // System: v2 → the single stable-end breakpoint
+                        // (identity is a strict prefix, dynamic uncached).
+                        // v1 → identity + (segmented: stable-end, plus
                         // dynamic-end ONLY under compat+tools — when the
                         // trailing breakpoint ships it subsumes lane (a);
                         // unsegmented: the combined sys block).
-                        let expectedSystem = segmented
-                            ? 2 + ((withTools && compat) ? 1 : 0)
-                            : 2
+                        let expectedSystem = usesPrefix
+                            ? 1
+                            : (segmented ? 2 + ((withTools && compat) ? 1 : 0) : 2)
                         #expect(counts.system == expectedSystem, cell)
-                        // The hint can NEVER push any combination to 5.
+                        // No combination — old or new shape — reaches 5.
                         #expect(total <= 4, cell)
                         // Budget pin for the item-9 text-compat shape:
                         // no-tools + hint → identity + stable-end +
                         // trailing = 3 ≤ 4.
-                        if hint && !withTools && segmented && !compat {
+                        if convoName == "oneShot",
+                           shape == .v1Legacy, hint, !withTools, segmented, !compat {
                             #expect(total == 3, cell)
+                        }
+                        // v2: stable-end + message markers (+ last tool).
+                        if usesPrefix {
+                            #expect(
+                                total == 1 + v2MessageMarkers + (withTools ? 1 : 0),
+                                cell
+                            )
                         }
                     }
                 }
             }
+        }
+        }
         }
     }
 

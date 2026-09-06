@@ -1250,9 +1250,9 @@ func turnEngine_schemaSeed_scopesContextExpansionWithoutRepeatingCatalogWalk() a
     #expect(tools.namesCalls == 1)
     #expect(tools.schemasCalls == 0)
 
-    // No ContextFlow packet means context_expand is ineligible. Filtering that
-    // one packet-scoped schema must not throw away the rest of the eager
-    // catalog and repeat its registry/MCP walk.
+    // context_expand is ALWAYS advertised now (2026-09-01). A supplied schema
+    // is kept as-is, and the reuse must not throw away the rest of the eager
+    // catalog or repeat its registry/MCP walk.
     let contextExpand = LLMToolSchema(
         name: "context_expand",
         description: "Scoped expansion",
@@ -1265,7 +1265,7 @@ func turnEngine_schemaSeed_scopesContextExpansionWithoutRepeatingCatalogWalk() a
         imageBlocks: [],
         toolSchemaCatalogSeed: TurnToolSchemaCatalogSeed(schemas: [contextExpand, seeded])
     )
-    #expect(scoped.toolSchemas == [seeded])
+    #expect(scoped.toolSchemas == [contextExpand, seeded])
     #expect(tools.namesCalls == 2)
     #expect(tools.schemasCalls == 0)
 
@@ -1274,11 +1274,11 @@ func turnEngine_schemaSeed_scopesContextExpansionWithoutRepeatingCatalogWalk() a
         description: "Read",
         parametersJSON: Data(#"{"type":"object"}"#.utf8)
     )
+    // Seeded without context_expand: the canonical schema is inserted right
+    // after read_file, unconditionally.
     let preload = TurnToolSchemaCatalogSeed(schemas: [readFile, seeded])
-    #expect(preload.schemas(contextExpandEligible: false) == [readFile, seeded])
-    let expanded = preload.schemas(contextExpandEligible: true)
-    #expect(expanded.map(\.name) == ["read_file", "context_expand", "seeded"])
-    #expect(expanded[1] == TurnToolSchemaCatalogSeed.canonicalContextExpandSchema)
+    #expect(preload.schemas.map(\.name) == ["read_file", "context_expand", "seeded"])
+    #expect(preload.schemas[1] == TurnToolSchemaCatalogSeed.canonicalContextExpandSchema)
 }
 
 @Test

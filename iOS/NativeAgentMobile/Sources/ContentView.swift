@@ -190,6 +190,7 @@ struct ContentView: View {
         case "memories", "memory": return .memories
         case "desk": return .desk
         case "skills": return .more
+        case "workshop", "missions": return .more
         case "more", "settings", "advanced": return .more
         case "mac_integration", "macintegration", "mac-integration": return .more
         case "activity", "approvals", "inbox": return .activity

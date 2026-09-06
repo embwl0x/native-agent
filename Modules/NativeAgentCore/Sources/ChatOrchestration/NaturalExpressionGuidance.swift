@@ -408,7 +408,10 @@ extension SwiftNativeTurnEngine {
             systemSegments: context.systemSegments,
             imageBlocks: context.imageBlocks,
             fluidContextTurn: context.fluidContextTurn,
-            naturalExpressionCue: cue
+            naturalExpressionCue: cue,
+            historyMessages: context.historyMessages,
+            turnVolatileBlock: context.turnVolatileBlock,
+            historyWindowReceipt: context.historyWindowReceipt
         )
     }
 }

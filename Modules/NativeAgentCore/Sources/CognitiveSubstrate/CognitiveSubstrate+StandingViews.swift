@@ -12,6 +12,31 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// The result of a standing-view lifecycle transition (2026-09-06): the view as
+/// it now stands, plus the persistence failure if the transition never reached
+/// the store. `nil` failure means the write landed (or persistence is off, which
+/// is not a failure). A UI that reports a transition as saved must consult this
+/// — the in-memory dict alone cannot tell the difference.
+public struct StandingViewTransition: Sendable {
+    public var view: CognitiveStandingView?
+    public var persistenceFailure: String?
+    /// 2026-09-06: true when the verb's OWN write landed and something else in
+    /// the same transition did not — a hold that persisted but could not
+    /// release the held view it displaced. The caller says what actually
+    /// happened instead of claiming the whole change never reached the store.
+    public var persistenceFailureIsPartial: Bool
+
+    public init(
+        view: CognitiveStandingView?,
+        persistenceFailure: String? = nil,
+        persistenceFailureIsPartial: Bool = false
+    ) {
+        self.view = view
+        self.persistenceFailure = persistenceFailure
+        self.persistenceFailureIsPartial = persistenceFailureIsPartial
+    }
+}
+
 extension CognitiveStandingView {
     /// Persisted payload. Status lives in BOTH the payload (source of truth for restore,
     /// mirroring the schema/identity proposals) and the artifact `status` column — kept in
@@ -59,6 +84,10 @@ extension CognitiveSubstrate {
     /// A proposed view left unresolved longer than this retires on the maintenance sweep
     /// (no zombie proposals).
     static let standingViewProposalMaxAge: TimeInterval = 14 * 24 * 60 * 60
+    /// At most this many HELD views — the tier she adopts herself. Its own cap,
+    /// not a share of the active one: a view the user signed must never be
+    /// crowded out by one she adopted, and the two sets are LRU'd separately.
+    static let maximumHeldStandingViews = 5
 
     // MARK: - Formation (called from the reflection parse branch)
 
@@ -158,14 +187,31 @@ extension CognitiveSubstrate {
     /// 2026-07-02). Retired views DELETE their artifact (timeline keeps the history).
     @discardableResult
     public func resolveStandingView(id: UUID, approved: Bool) async -> CognitiveStandingView? {
+        await resolveStandingViewChecked(id: id, approved: approved).view
+    }
+
+    /// `resolveStandingView`, reporting whether the transition reached the
+    /// store (2026-09-06). The in-memory commit deliberately stays BEFORE the
+    /// write — the cap invariant above depends on it, and
+    /// `repairStandingViewCapIfNeeded` heals a half-written store on restore —
+    /// but a swallowed `try?` also meant an approval whose artifact never
+    /// landed came back as `.proposed` after a restart while the click had
+    /// reported success. The write's failure now travels to the caller.
+    @discardableResult
+    public func resolveStandingViewChecked(
+        id: UUID,
+        approved: Bool
+    ) async -> StandingViewTransition {
         // Maintenance may be atomically retiring this exact proposal while
         // suspended in SQLite. Preserve call order: an explicit review waits
         // for that bounded transition instead of observing its provisional
         // in-memory status and silently becoming a no-op if the commit fails.
         // R-F3: parks on the shared continuation gate rather than spinning.
         await waitForMaintenanceTransition()
-        guard configuration.enabled, var view = standingViews[id] else { return nil }
-        guard view.status == .proposed else { return view }
+        guard configuration.enabled, var view = standingViews[id] else {
+            return StandingViewTransition(view: nil)
+        }
+        guard view.status == .proposed else { return StandingViewTransition(view: view) }
         let now = dependencies.now()
         view.status = approved ? .active : .retired
         view.updatedAt = now
@@ -175,10 +221,15 @@ extension CognitiveSubstrate {
         let demoted = approved ? demoteOverflowActiveStandingViews(at: now, protecting: id) : []
         markDirty(at: now)
 
-        if approved {
-            await persistStandingView(view)
-        } else {
-            await deleteArtifactRecord(id: view.id)
+        var persistenceFailure: String?
+        do {
+            if approved {
+                try await persistStandingViewChecked(view)
+            } else {
+                try await deleteArtifactRecordChecked(id: view.id)
+            }
+        } catch {
+            persistenceFailure = "\(error)"
         }
         _ = await recordTimelineEvent(
             kind: .proposalResolution,
@@ -189,7 +240,17 @@ extension CognitiveSubstrate {
             externalEvidenceIds: []
         )
         for retired in demoted {
-            await deleteArtifactRecord(id: retired.id)
+            // 2026-09-06: the cap demotions are part of THIS transition. A
+            // demotion whose delete never reached the store leaves that view
+            // active on disk, so the next restore comes back over the cap while
+            // the click reported a clean save. Reported like the primary write;
+            // the first failure is the one carried.
+            do {
+                try await deleteArtifactRecordChecked(id: retired.id)
+            } catch {
+                persistenceFailure = persistenceFailure
+                    ?? "cap demotion of \(retired.id.uuidString) not saved: \(error)"
+            }
             _ = await recordTimelineEvent(
                 kind: .proposalResolution,
                 title: "Standing view retired (cap)",
@@ -209,7 +270,237 @@ extension CognitiveSubstrate {
         if approved {
             await integrateDisposition(tone: standingViewDispositionTone(for: view), at: now)
         }
-        return standingViews[id]
+        return StandingViewTransition(
+            view: standingViews[id], persistenceFailure: persistenceFailure)
+    }
+
+    // MARK: - Retirement by the user (2026-09-02)
+
+    /// RETIRE A VIEW SHE IS ALREADY LEANING ON. Agent, 2026-09-02: three of her
+    /// five active views were three drafts of one phrasing view, and there was
+    /// no way to say so — `resolveStandingView` only transitions `.proposed`,
+    /// so the ONLY route out of `.active` was LRU demotion by a sixth approval.
+    /// A worldview you can enter but not leave is not a worldview, it is a
+    /// ratchet, and the one organ that was supposed to break the phrasing loop
+    /// was itself stuck inside it.
+    ///
+    /// Deliberately NOT `resolveStandingView(approved: false)`: a rejection is
+    /// a verdict on a PROPOSAL, and reusing it here would make "she proposed
+    /// this and I said no" and "I lived with this for a month and I am done
+    /// with it" the same row in the timeline. They are different facts about
+    /// her development, and the timeline is the record of that.
+    ///
+    /// Applies to `.active` and `.held` alike — the user never had to sign a
+    /// held view, and may still retire one. Idempotent: retiring an
+    /// already-retired view (or a `.proposed` one, which belongs to the resolve
+    /// route) is a no-op that returns the view unchanged. Lived concerns need
+    /// no re-minting call: `livedAppraisalConcerns()` derives them from the
+    /// leaning set on every read, so dropping the status IS the re-mint.
+    @discardableResult
+    public func retireStandingView(id: UUID) async -> CognitiveStandingView? {
+        await retireStandingViewChecked(id: id).view
+    }
+
+    /// `retireStandingView`, reporting whether the artifact delete reached the
+    /// store (2026-09-06) — same reason as `resolveStandingViewChecked`: a
+    /// retirement that only happened in memory came back on the next restore
+    /// after the click had already said it was done.
+    @discardableResult
+    public func retireStandingViewChecked(id: UUID) async -> StandingViewTransition {
+        await waitForMaintenanceTransition()
+        guard configuration.enabled, var view = standingViews[id] else {
+            return StandingViewTransition(view: nil)
+        }
+        guard view.isLeaning else { return StandingViewTransition(view: view) }
+        let now = dependencies.now()
+        let wasHeld = view.status == .held
+        view.status = .retired
+        view.updatedAt = now
+        standingViews[id] = view
+        markDirty(at: now)
+        // Same shape as the cap-demotion path: the artifact goes, the timeline
+        // keeps the history.
+        var persistenceFailure: String?
+        do {
+            try await deleteArtifactRecordChecked(id: view.id)
+        } catch {
+            persistenceFailure = "\(error)"
+        }
+        await recordReceipt(
+            kind: wasHeld ? "standing_view.released" : "standing_view.retired",
+            payload: .object([
+                "id": .string(view.id.uuidString),
+                "reason": .string("chosen"),
+                "body": .string(bounded(view.body, maxCharacters: 300)),
+            ]))
+        _ = await recordTimelineEvent(
+            kind: .proposalResolution,
+            title: "Standing view retired (chosen)",
+            summary: "retired (chosen): \(view.body)",
+            artifactId: view.id,
+            lineageId: view.lineageId,
+            externalEvidenceIds: []
+        )
+        return StandingViewTransition(
+            view: standingViews[id], persistenceFailure: persistenceFailure)
+    }
+
+    // MARK: - The HELD tier (User, 2026-09-02: "she should be able to have some views of her own")
+
+    /// ADOPT A VIEW HERSELF. No signature, a weaker lean, retirable by the user
+    /// who never signed it.
+    ///
+    /// THE SEAT IS THE WHOLE SAFETY ARGUMENT. `seat` is the same
+    /// `StudioCanonTurnProvenance` the canon lane already uses, and the point of
+    /// taking it as a parameter rather than deriving it here is that this module
+    /// CANNOT derive it: the discriminators live in the chat tool loop's
+    /// task-locals. A caller that is not inside her own live local turn cannot
+    /// produce a complete one — `StudioCanonSeatGate.liveTurnProvenance` returns
+    /// `.notALiveTurn` for the bridge tool runner, every approval executor,
+    /// every replay and every background pass, and `.bridgeLane` for a turn
+    /// Claude is steering. So "she adopted this" stays a fact about where the
+    /// call came from rather than a claim the caller makes.
+    ///
+    /// An incomplete seat is REFUSED (nil), never downgraded to a proposal: a
+    /// silent fallback would let an unseated path mint views forever.
+    @discardableResult
+    public func holdStandingView(
+        id: UUID,
+        seat: StudioCanonTurnProvenance
+    ) async -> CognitiveStandingView? {
+        await holdStandingViewChecked(id: id, seat: seat).view
+    }
+
+    /// `holdStandingView`, reporting whether the transition reached the store
+    /// (2026-09-06) — the same reason as the resolve/release seams: the hold
+    /// persisted through the unchecked `persistStandingView`, so a view whose
+    /// artifact never landed reported as held and came back `.proposed` after a
+    /// restart. The in-memory commit and the cap math deliberately stay BEFORE
+    /// the write, exactly as the active path does it.
+    @discardableResult
+    public func holdStandingViewChecked(
+        id: UUID,
+        seat: StudioCanonTurnProvenance
+    ) async -> StandingViewTransition {
+        await waitForMaintenanceTransition()
+        guard configuration.enabled, seat.isComplete, var view = standingViews[id] else {
+            return StandingViewTransition(view: nil)
+        }
+        // Only a PROPOSED view can be held. An active view is already stronger
+        // than held (holding it would be a demotion nobody asked for) and a
+        // retired one is over.
+        guard view.status == .proposed else { return StandingViewTransition(view: view) }
+        let now = dependencies.now()
+        view.status = .held
+        view.updatedAt = now
+        standingViews[id] = view
+        // Cap math before any await, exactly as the active path does it.
+        let released = releaseOverflowHeldStandingViews(at: now, protecting: id)
+        markDirty(at: now)
+        var persistenceFailure: String?
+        var persistenceFailureIsPartial = false
+        do {
+            try await persistStandingViewChecked(view)
+        } catch {
+            persistenceFailure = "\(error)"
+        }
+        await recordReceipt(
+            kind: "standing_view.held",
+            payload: .object([
+                "id": .string(view.id.uuidString),
+                "surface": .string(bounded(seat.surface, maxCharacters: 40)),
+                "turnId": .string(bounded(seat.turnID, maxCharacters: 120)),
+                "body": .string(bounded(view.body, maxCharacters: 300)),
+            ]))
+        _ = await recordTimelineEvent(
+            kind: .proposalResolution,
+            title: "Standing view held",
+            summary: "held (self-adopted): \(view.body)",
+            artifactId: view.id,
+            lineageId: view.lineageId,
+            externalEvidenceIds: []
+        )
+        for old in released {
+            // 2026-09-06: the cap releases are part of THIS transition, like the
+            // active path's demotions — a release whose delete never reached the
+            // store leaves that view held on disk while the call reported a
+            // clean save. The first failure is the one carried.
+            do {
+                try await deleteArtifactRecordChecked(id: old.id)
+            } catch {
+                if persistenceFailure == nil {
+                    // The hold itself landed; this is the displaced view that
+                    // could not be let go, and it stays held in the store.
+                    persistenceFailure = "cap release of \(old.id.uuidString) not saved: \(error)"
+                    persistenceFailureIsPartial = true
+                }
+            }
+            await recordReceipt(
+                kind: "standing_view.released",
+                payload: .object([
+                    "id": .string(old.id.uuidString),
+                    "reason": .string("capacity"),
+                    "body": .string(bounded(old.body, maxCharacters: 300)),
+                ]))
+            _ = await recordTimelineEvent(
+                kind: .proposalResolution,
+                title: "Standing view released (cap)",
+                summary: "released (capacity): \(old.body)",
+                artifactId: old.id,
+                lineageId: old.lineageId,
+                externalEvidenceIds: []
+            )
+        }
+        // NO DISPOSITION NUDGE. The active path nudges because the user SETTLING
+        // a view is a considered outcome; a view she adopts on her own settles
+        // nothing yet, and letting it move the slow layer would give her a
+        // self-serve lever on her own mood — the exact self-appraisal ratchet
+        // design law 3 killed in two other layers.
+        return StandingViewTransition(
+            view: standingViews[id],
+            persistenceFailure: persistenceFailure,
+            persistenceFailureIsPartial: persistenceFailureIsPartial)
+    }
+
+    /// She lets one of her own views go. Same transition the user's retire makes,
+    /// distinguished only by the receipt already written there — a held view's
+    /// retirement IS a release whoever asked for it.
+    ///
+    /// Reports whether the artifact delete reached the store (2026-09-06):
+    /// release was the one lifecycle verb still routed through the unchecked
+    /// retire, so a released view whose delete never landed said it was let go
+    /// and then came back on the next restore.
+    @discardableResult
+    public func releaseStandingViewChecked(
+        id: UUID,
+        seat: StudioCanonTurnProvenance
+    ) async -> StandingViewTransition {
+        guard seat.isComplete, standingViews[id]?.status == .held else {
+            return StandingViewTransition(view: standingViews[id])
+        }
+        return await retireStandingViewChecked(id: id)
+    }
+
+    /// SYNCHRONOUS cap math for the held tier — LRU by `updatedAt`, never
+    /// touching `protecting`. Mirrors `demoteOverflowActiveStandingViews`; kept
+    /// separate so an overflowing held set can never evict a signed active view.
+    private func releaseOverflowHeldStandingViews(at now: Date, protecting: UUID) -> [CognitiveStandingView] {
+        let held = standingViews.values
+            .filter { $0.status == .held && $0.id != protecting }
+            .sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt < rhs.updatedAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+        let total = held.count + 1
+        guard total > Self.maximumHeldStandingViews else { return [] }
+        var released: [CognitiveStandingView] = []
+        for var view in held.prefix(total - Self.maximumHeldStandingViews) {
+            view.status = .retired
+            view.updatedAt = now
+            standingViews[view.id] = view
+            released.append(view)
+        }
+        return released
     }
 
     /// −1 / 0 / +1: the felt SIGN of the mood a view was formed under, inert inside the
@@ -249,29 +540,68 @@ extension CognitiveSubstrate {
     /// Defensive repair after restore: if a half-persisted approval ever left more than the
     /// cap ACTIVE in the store, demote the overflow (LRU) and heal the store by deleting
     /// their artifacts. No-op in the normal case (gpt-5.5 review, 2026-07-02).
+    ///
+    /// 2026-09-06: it now covers the HELD tier too. A hold persists the newly
+    /// held view first and only then deletes the views it displaced, so a
+    /// partial failure there leaves cap+1 held on disk — and this repair, which
+    /// filtered `.active` only, walked past them on every launch.
     func repairStandingViewCapIfNeeded() async {
         let now = dependencies.now()
-        let active = standingViews.values
-            .filter { $0.status == .active }
+        await repairStandingViewCapIfNeeded(
+            status: .active, cap: Self.maximumActiveStandingViews, at: now)
+        await repairStandingViewCapIfNeeded(
+            status: .held, cap: Self.maximumHeldStandingViews, at: now)
+    }
+
+    private func repairStandingViewCapIfNeeded(
+        status: CognitiveStandingView.Status,
+        cap: Int,
+        at now: Date
+    ) async {
+        let overCap = standingViews.values
+            .filter { $0.status == status }
             .sorted { lhs, rhs in
                 if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt < rhs.updatedAt }
                 return lhs.id.uuidString < rhs.id.uuidString
             }
-        guard active.count > Self.maximumActiveStandingViews else { return }
-        let overflow = active.count - Self.maximumActiveStandingViews
+        guard overCap.count > cap else { return }
+        let overflow = overCap.count - cap
         var demoted: [CognitiveStandingView] = []
-        for var view in active.prefix(overflow) {
+        for var view in overCap.prefix(overflow) {
             view.status = .retired
             view.updatedAt = now
             standingViews[view.id] = view
             demoted.append(view)
         }
         for retired in demoted {
-            await deleteArtifactRecord(id: retired.id)
+            // 2026-09-06: this repair ran through the swallowing delete, so a
+            // store that cannot accept deletes healed nothing and silently
+            // re-demoted the same views on every launch. The failure is logged
+            // once per launch (the repair itself stays best-effort — there is
+            // no caller to report to on the restore path).
+            do {
+                try await deleteArtifactRecordChecked(id: retired.id)
+            } catch {
+                if !didLogStandingViewCapRepairFailure {
+                    didLogStandingViewCapRepairFailure = true
+                    NSLog(
+                        "[cognition] standing view cap repair could not delete artifact %@ (%@): %@ "
+                            + "— the overflow stays in the store and will be "
+                            + "re-demoted on the next launch.",
+                        retired.id.uuidString,
+                        status.rawValue,
+                        "\(error)"
+                    )
+                }
+            }
             _ = await recordTimelineEvent(
                 kind: .proposalResolution,
-                title: "Standing view retired (cap)",
-                summary: "retired (capacity): \(retired.body)",
+                title: status == .held
+                    ? "Standing view released (cap)"
+                    : "Standing view retired (cap)",
+                summary: status == .held
+                    ? "released (capacity): \(retired.body)"
+                    : "retired (capacity): \(retired.body)",
                 artifactId: retired.id,
                 lineageId: retired.lineageId,
                 externalEvidenceIds: []
@@ -307,8 +637,11 @@ extension CognitiveSubstrate {
     /// rereads live views or affect.
     func standingViewCapsuleCandidates() -> [CognitiveStandingViewCapsuleCandidate] {
         let concerns = appraisalConcerns()
+        // Both leaning tiers. `isHeld` rides the candidate so the frozen render
+        // can keep held views strictly under the signed ones without rereading
+        // live view state.
         return standingViews.values
-            .filter({ $0.status == .active })
+            .filter({ $0.isLeaning })
             .sorted(by: { lhs, rhs in
                 if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
                 return lhs.id.uuidString < rhs.id.uuidString
@@ -334,7 +667,8 @@ extension CognitiveSubstrate {
                     id: view.id,
                     line: "- Inner: \(text)",
                     concernKeywords: Array(Set(effective)).sorted(),
-                    updatedAt: view.updatedAt
+                    updatedAt: view.updatedAt,
+                    isHeld: view.status == .held
                 )
             }
     }
@@ -349,12 +683,47 @@ extension CognitiveSubstrate {
         candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil,
         relevanceEnabled: Bool? = nil
     ) -> String? {
+        activeStandingViewInnerLines(
+            relevantTo: userMessage,
+            candidates: frozenCandidates,
+            relevanceEnabled: relevanceEnabled
+        ).first
+    }
+
+    /// EVERY view that is relevant to this turn, best match first.
+    ///
+    /// The capsule used to receive exactly one line from here, so the Inner
+    /// line's rotation had nothing to rotate BETWEEN while a standing view was
+    /// relevant: the top-ranked view led, rested, and the turn fell through to a
+    /// takeaway even though a second, equally on-topic view was sitting right
+    /// there. Ranked-all lets rotation move across her actual worldview before
+    /// it reaches for a transient seed. Ordering is unchanged for the head of
+    /// the list, so a single-candidate install is byte-identical.
+    func activeStandingViewInnerLines(
+        relevantTo userMessage: String,
+        candidates frozenCandidates: [CognitiveStandingViewCapsuleCandidate]? = nil,
+        relevanceEnabled: Bool? = nil
+    ) -> [String] {
         let candidates = frozenCandidates ?? standingViewCapsuleCandidates()
-        guard let newest = candidates.first else { return nil }
+        guard !candidates.isEmpty else { return [] }
         let enabled = relevanceEnabled ?? configuration.standingViewCapsuleRelevanceEnabled
-        guard enabled else { return newest.line }
-        guard !userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return Self.bestRelevantCandidate(in: candidates, for: userMessage)?.line
+        // TIERED, ALWAYS. Signed views first, held views after — including on
+        // the canary-off path, where relevance is not consulted at all.
+        let signed = candidates.filter { !$0.isHeld }
+        let held = candidates.filter(\.isHeld)
+        guard enabled else { return (signed + held).map(\.line) }
+        guard !userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        // Each tier is scored WITHIN ITSELF and the lists are concatenated, so a
+        // held view can never outrank a signed one however well it matches the
+        // message. (Scoring the two sets together and re-sorting by tier
+        // afterwards would let the held set's vocabulary move the idf of the
+        // signed set's terms — the tier would change the signed ranking, which
+        // is exactly what "ranked below" must not mean.)
+        let rankedSigned = Self.relevantCandidates(in: signed, for: userMessage).map(\.line)
+        let rankedHeld = held.isEmpty
+            ? []
+            : Self.relevantCandidates(in: held, for: userMessage).map(\.line)
+        return rankedSigned + rankedHeld
     }
 
     // MARK: - Relevance (BM25)
@@ -384,13 +753,24 @@ extension CognitiveSubstrate {
         in candidates: [CognitiveStandingViewCapsuleCandidate],
         for userMessage: String
     ) -> CognitiveStandingViewCapsuleCandidate? {
+        relevantCandidates(in: candidates, for: userMessage).first
+    }
+
+    /// Every candidate clearing the relevance floor, best score first. Ties keep
+    /// the INCOMING order (newest-first), which is what `bestRelevantCandidate`
+    /// has always done — so the head of this list is bit-for-bit the answer that
+    /// function used to compute on its own.
+    static func relevantCandidates(
+        in candidates: [CognitiveStandingViewCapsuleCandidate],
+        for userMessage: String
+    ) -> [CognitiveStandingViewCapsuleCandidate] {
         let queryTerms = appraisalConcernTerms(in: userMessage)
-        guard !queryTerms.isEmpty else { return nil }
+        guard !queryTerms.isEmpty else { return [] }
         let documents = candidates.map { Set($0.concernKeywords) }
         let total = documents.count
-        guard total > 0 else { return nil }
+        guard total > 0 else { return [] }
         let averageLength = Double(documents.reduce(0) { $0 + $1.count }) / Double(total)
-        guard averageLength > 0 else { return nil }
+        guard averageLength > 0 else { return [] }
 
         // Term-level, not free substring: "carrying" still reaches a view
         // about "carry", but "simple" can no longer be found inside an
@@ -428,11 +808,11 @@ extension CognitiveSubstrate {
         // addition is not associative, and an unordered sum could shift the
         // last bits between runs and flip a candidate sitting on the floor.
         let queryMass = queryTerms.reduce(0.0) { $0 + (idfByTerm[$1] ?? 0) }
-        guard queryMass > 0 else { return nil }
+        guard queryMass > 0 else { return [] }
 
         let k1 = standingViewRelevanceK1
         let b = standingViewRelevanceB
-        var best: (candidate: CognitiveStandingViewCapsuleCandidate, score: Double)?
+        var scored: [(candidate: CognitiveStandingViewCapsuleCandidate, score: Double, order: Int)] = []
         for (index, candidate) in candidates.enumerated() {
             let matched = queryTerms.filter { document(index, covers: $0) }
             guard !matched.isEmpty else { continue }
@@ -442,9 +822,16 @@ extension CognitiveSubstrate {
             let lengthFactor = (1 + k1) / (k1 * lengthNorm + 1)
             let score = min(1.0, matched.reduce(0) { $0 + (idfByTerm[$1] ?? 0) } * lengthFactor / queryMass)
             guard score >= standingViewRelevanceFloor else { continue }
-            if best == nil || score > best!.score { best = (candidate, score) }
+            scored.append((candidate, score, index))
         }
-        return best?.candidate
+        // Decorated sort: Swift's `sorted` is not stable, and tie order is
+        // load-bearing here (newest-first was the historical answer).
+        return scored
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                return lhs.order < rhs.order
+            }
+            .map(\.candidate)
     }
 
     /// Compatibility read for non-turn diagnostics. It intentionally retains
@@ -470,7 +857,14 @@ extension CognitiveSubstrate {
     /// proposals). Score is clamped to [0,1] by the store, so the (possibly negative) mood
     /// valence is floored — it is telemetry only; prune orders artifacts by updated_at.
     func persistStandingView(_ view: CognitiveStandingView) async {
-        await persistArtifact(
+        try? await persistStandingViewChecked(view)
+    }
+
+    /// The same write, surfacing its failure for the lifecycle seams whose
+    /// caller needs to know the transition did not reach the store
+    /// (2026-09-06).
+    func persistStandingViewChecked(_ view: CognitiveStandingView) async throws {
+        try await persistArtifactChecked(
             kind: "standing_view",
             id: view.id,
             status: view.status.rawValue,

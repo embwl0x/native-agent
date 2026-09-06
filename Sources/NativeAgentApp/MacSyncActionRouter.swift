@@ -126,8 +126,18 @@ struct MacSyncActionRouter {
     /// A phone delivery acknowledgement becomes organism evidence only after
     /// its canonical receipt is durable. The injected seams keep the ordering
     /// contract directly testable without touching the live data root.
+    ///
+    /// `senderIsAuthenticatedIOSPeer` is the router's only source of direction
+    /// when the payload omits one. Every phone shipped before 2026-09-01 sent
+    /// `eventId`+`channel` and nothing else, so this lane rejected 100% of its
+    /// receipts as `invalid_direction`. An HMAC-verified inbox action can only
+    /// have come from the paired iPhone, and the only delivery it can confirm
+    /// is the Mac→iOS one, so that is what the absent field means. A direction
+    /// that IS present is still taken literally — a wrong one is a real error,
+    /// never something to guess past.
     static func notificationReceiptResponse(
         payload: [String: String],
+        senderIsAuthenticatedIOSPeer: Bool,
         confirm: (String, String, String) async -> Bool,
         receive: (String, String) async -> Void
     ) async -> [String: String] {
@@ -141,8 +151,11 @@ struct MacSyncActionRouter {
                 "message": "Notification receipt requires a canonical eventId.",
             ]
         }
-        let direction = (payload["direction"] ?? payload["receiptDirection"] ?? "")
+        var direction = (payload["direction"] ?? payload["receiptDirection"] ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        if direction.isEmpty, senderIsAuthenticatedIOSPeer {
+            direction = "mac_to_ios"
+        }
         guard direction == "mac_to_ios" || direction == "ios_to_mac" else {
             return [
                 "status": "error",
@@ -175,7 +188,17 @@ struct MacSyncActionRouter {
         ]
     }
 
-    var cancelChatTask: (String) -> Bool
+    var cancelChatTask: (String, [String]) -> MacSyncEngine.MacSyncChatCancelOutcome
+
+    /// The runs a cancelChat action names, if any. An empty result means the
+    /// caller did not name one and the session's current turn is the target.
+    static func cancelChatRunIDs(from payload: [String: String]) -> [String] {
+        let raw = payload["runId"] ?? payload["run_id"] ?? ""
+        return raw
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
 
     func dispatch(_ action: InboxAction) async -> [String: String] {
         let payload = action.payload
@@ -277,7 +300,11 @@ struct MacSyncActionRouter {
                 guard !executionId.isEmpty, !stepId.isEmpty, stepId != "pending" else {
                     return ["status": "error", "error": "missing_real_step_id"]
                 }
-                _ = try await api.approveStep(executionId: executionId, stepId: stepId)
+                _ = try await api.approveStep(
+                    executionId: executionId,
+                    stepId: stepId,
+                    provenance: .signedIOS(clientID: action.clientId, decidedBy: "ios_signed_operator")
+                )
                 return ["status": "ok"]
 
             case "rejectStep":
@@ -287,7 +314,11 @@ struct MacSyncActionRouter {
                 guard !executionId.isEmpty, !stepId.isEmpty, stepId != "pending" else {
                     return observed(["status": "error", "error": "missing_real_step_id"])
                 }
-                _ = try await api.rejectStep(executionId: executionId, stepId: stepId, reason: "Rejected from iCloud")
+                _ = try await api.rejectStep(
+                    executionId: executionId,
+                    stepId: stepId,
+                    provenance: .signedIOS(clientID: action.clientId, decidedBy: "ios_signed_operator")
+                )
                 return observed(["status": "ok"])
 
             case "approveMemoryProposal":
@@ -472,6 +503,11 @@ struct MacSyncActionRouter {
             case "recordNotificationReceipt":
                 return observed(await Self.notificationReceiptResponse(
                     payload: payload,
+                    // `dispatch` is reached only from MacSyncEngine+Inbox after
+                    // the action's HMAC and timestamp validated, on both the
+                    // Drive and CloudKit lanes — so the sender IS the paired
+                    // iPhone.
+                    senderIsAuthenticatedIOSPeer: true,
                     confirm: { direction, eventID, channel in
                         await iCloudBridge.confirmChatDeliveryReceipt(
                             direction: direction,
@@ -505,13 +541,35 @@ struct MacSyncActionRouter {
                             "message": "cancelChat rejected an invalid sessionId.",
                         ])
                     }
-                    let taskCancelled = cancelChatTask(safeSessionId)
-                    _ = try await api.cancelChatSession(sessionId: safeSessionId)
+                    // 2026-09-06: a Stop may name the run it is stopping.
+                    // When it does and a DIFFERENT run holds the session, the
+                    // stopped turn is already over: cancel nothing and write
+                    // no cancel marker, or the phone's next message dies in
+                    // place of the turn the user actually stopped.
+                    let runIDs = Self.cancelChatRunIDs(from: payload)
+                    let cancelOutcome = cancelChatTask(safeSessionId, runIDs)
+                    // 2026-09-06: the session-wide cancelled.flag belongs only
+                    // to a Stop that named no run. A scoped Stop that found no
+                    // task is held against its run id instead: turn acceptance
+                    // deletes this flag before the stream starts, so writing it
+                    // during the handoff cancelled nothing and left an unscoped
+                    // marker that could kill the NEXT turn instead.
+                    // 2026-09-06: a scoped Stop never writes it either, even
+                    // when it did cancel the task. The write is asynchronous
+                    // and session-wide: if the stopped run finishes and the
+                    // next one starts before it lands, the marker kills the
+                    // wrong turn. Cancelling the named task is the whole
+                    // action.
+                    if runIDs.isEmpty, cancelOutcome == .cancelled || cancelOutcome == .noActiveTask {
+                        _ = try await api.cancelChatSession(sessionId: safeSessionId)
+                    }
+                    let held = cancelOutcome == .stopRecorded || cancelOutcome == .runMismatch
                     return observed([
                         "status": "ok",
                         "ok": "true",
                         "sessionId": safeSessionId,
-                        "taskCancelled": taskCancelled ? "true" : "false",
+                        "taskCancelled": cancelOutcome == .cancelled ? "true" : "false",
+                        "stopPending": held ? "true" : "false",
                     ])
                 }
                 return observed([

@@ -61,6 +61,8 @@ struct NeedSignalFingerprintTests {
         availableGenerationID: Int64? = 7,
         characterBudget: Int = 6_000,
         mandatoryCharacterBudget: Int? = 4_000,
+        packetAtomExpandThresholdChars: Int = 400,
+        memoryAtomRowLimit: Int? = 12,
         now: Date = Date(timeIntervalSince1970: 10_000),
         timeBucketSeconds: Int = 60,
         explicitConflicts: [ContextConflictDefinition] = [
@@ -110,6 +112,8 @@ struct NeedSignalFingerprintTests {
             availableGenerationID: availableGenerationID,
             characterBudget: characterBudget,
             mandatoryCharacterBudget: mandatoryCharacterBudget,
+            packetAtomExpandThresholdChars: packetAtomExpandThresholdChars,
+            memoryAtomRowLimit: memoryAtomRowLimit,
             now: now,
             timeBucketSeconds: timeBucketSeconds,
             explicitConflicts: explicitConflicts,
@@ -171,6 +175,15 @@ struct NeedSignalFingerprintTests {
             ("availableGenerationID", signal(availableGenerationID: 8)),
             ("characterBudget", signal(characterBudget: 6_001)),
             ("mandatoryCharacterBudget", signal(mandatoryCharacterBudget: 4_001)),
+            // Both knobs change what the packet CONTAINS — the truncation
+            // pointer set and the memory row count — so two turns that differ
+            // only here are two different selections and must not share a
+            // receipt id.
+            (
+                "packetAtomExpandThresholdChars",
+                signal(packetAtomExpandThresholdChars: 401)
+            ),
+            ("memoryAtomRowLimit", signal(memoryAtomRowLimit: nil)),
             // The bucket is derived from `now`, which is how a real turn moves
             // it; the field itself is what lands in the digest.
             ("selectionTimeBucket", signal(now: Date(timeIntervalSince1970: 20_000))),

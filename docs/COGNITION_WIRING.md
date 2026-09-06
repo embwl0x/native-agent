@@ -5,7 +5,10 @@
 > organism → what enters context), verified 2026-08-20. This file is the
 > finer-grained signal-wiring companion.
 
-*Last verified against source: 2026-07-25. This is the nervous-system diagram: for
+*Last verified against source: 2026-09-02 (the personality-depth wave added six
+edges — the rumination lane, the horizon family, the `.held` view tier, peer
+relational sources, the `inner_state` read and the shoulder tap). Earlier body:
+2026-07-25. This is the nervous-system diagram: for
 each cognitive **mapping** (subsystem), what it **emits**, what it **consumes**,
 through which **channel**, and what **regulates** the flow. It exists so that
 "tie the mappings together like a body" stays traceable instead of becoming a
@@ -86,11 +89,23 @@ flowchart TD
 | **Subconscious** (`CognitiveSubstrate`) | felt fingerprint + inner + thought-seed lines → capsule hub **[confirmed** `CognitiveSubstrate+Capsule.swift:67‑109`; fingerprint `:78`, signals `:293`**]**; `feltDaySummary` → dream **[confirmed** emit `+Mood.swift:160`, consumed `BackgroundLoopsAssembly+DreamsMemory.swift:406` → `DreamCycleRunner.swift:168`**]** | `CognitiveEvent`s (`observe`) **[confirmed]**; conversational appraisal of the user's message text → affect deltas + node valence **[confirmed** `+Affect.swift:196` (appraisal), `:82‑101` (affect apply), `:284` (emotionTag)**]** | capsule char budget; fingerprint intensity floor + per-word honesty gates; hypothetical guard on the appraisal |
 | **Organism** (`OrganismKernel`) | one `- Body:` line → capsule **[confirmed** `+Capsule.swift:110`**]**; `loopBudget` → background loops **[confirmed** `NativeCognitionRuntime.backgroundCognitionAllowed`**]** | `CognitiveEvent`→topology-only `SomaticSignal` via `SomaticSignalBus`; exact tool/provider/correction outcomes retain typed valence, while user/assistant text meaning remains solely appraised by `CognitiveSubstrate` **[confirmed]**; typed live body evidence | off-by-default, bounded state, thermal throttle, projection sanitization; unknown/stale typed beliefs cannot inherit optimistic compatibility booleans — see [ORGANISM.md](ORGANISM.md) |
 | **Memory** (`MemoryV2` + KG) | **On `.active` turns: memory arrives in the CONTEXT PACKET, not `TurnContext.recalled`** — the legacy top-k lane is skipped outright (`ChatOrchestration+TurnEngine.swift:806-810`, outcome `.contextFlow` **:810**). `recalled` is non-empty only on `off`/`shadow`/fallback turns **[confirmed** recall `MemoryV2+Storage.swift:802`**]** | `commit_memory` writes; chat turns **[partial]** | 6,000-char packet budget, ≤2 atoms/source; **NOT persona-scoped** — `memoryRecallPersonaFilter` resolves every slot to `nil` (`+TurnEngine.swift:44`); per-record disclosure is the real boundary (`MemoryRecordDisclosure.swift:47`) |
-| **Sound echo** (substrate) | recency-decayed warmth fragments → capsule **[confirmed** `+Capsule.swift:115`, `soundEcho*`**]** | felt/warm nodes over a 7-day window | warmth floor 0.4, 2 fragments, 90 chars, 2.5-day half-life |
+| **Sound echo** (substrate) | recency-decayed warmth fragments → capsule **[confirmed** `+Capsule.swift:115`, `soundEcho*`**]** | felt/warm nodes over a 7-day window | admission floor **0.25** (`soundEchoWarmthFloor` — corrected 2026-09-02; it was 0.40 until 2026-08-02, where it made the register ranking inert: only 9 of 90 attested turns cleared it), 2 fragments, 90 chars, 2.5-day half-life, 1-in-4 duty cycle. The **rut nudge** rides the same line but is change-gated, not duty-cycled — see [SUBCONSCIOUS.md](SUBCONSCIOUS.md) |
 | **Dream / REM** | REM pins → capsule; approval-gated proposals → persona docs **[partial]** | `feltDaySummary` via `feltSummaryProvider` **[confirmed** `BackgroundLoopsAssembly+DreamsMemory.swift:305`, injected into the dream prompt `DreamCycleRunner.swift:456`**]**; dream diary | approval-gated writes; GROWTH size cap; REM min-evidence — see rem-dream-cycle |
 | **Persona docs** | **In `.active` only SOUL + VOICE + surface guidance reach the stable prefix** (`NativeContextFlowRuntime.makeMirror:183`, → prompt `ChatOrchestration+TurnEngine.swift:755/:877-889`). USER/GROWTH/AGENTS reach the model as *context-packet atoms*, if selected **[confirmed]**. ⚠️ `persona.docChars` (`+TurnEngine.swift:934`) counts the mirror's FIVE documents and is **never the bytes sent** — see the two-lane section of `build_plans/fluid-context-as-built-map.md` | REM-approved proposals only **[partial]** | curated/approval-gated; public build strips them |
 | **Background loops** | reflection/replay/micro/maintenance work → substrate | gated by `backgroundCognitionAllowed` (organism `loopBudget` + thermal + low-power) **[confirmed]** | the loop-budget throttle IS the regulation |
 | **Attention → Fluid Context** (mind-into-circulation) | substrate: terms / unresolved question / memory activation / working record IDs → `CognitiveAttentionSignals` **[confirmed** producer `CognitiveSubstrate+AttentionSignals.swift:15`, seam `CognitivePhaseModels.swift:31`**]**; organism: predicted tool groups **[confirmed** `OrganismProspectiveAffect.swift:154`, forwarded `NativeCognitionRuntime.swift:370`**]** | turn engine races the read against a 250 ms latch and feeds NeedSignal **[confirmed** timeout constant `attentionSignalsTimeoutNanos = 250_000_000` `ChatOrchestration+TurnEngine.swift:482`, race `:985`, resolve `:624`, trace `:626`, populate `:647`; *anchors corrected 2026-07-25 — the old `:667`/`:715-716` refs now point at unrelated flags***]**; assistant turns stamp used memory record IDs back as `memoryRecordIds` metadata **[confirmed** `ChatOrchestrationClient+MessagePersistence.swift:507`, priority-protected `ContinuityField.swift:612`**]** | PURE peek read (never mutates decay/eviction, `ContinuityField.peekDecayedNodes:280`); self-bounding frozen seam (terms ≤16, groups ≤8, activation ≤32, clamped 0…1, deterministic order); nil = byte-identical inert; 250 ms abandon-latch so a wedged read can't stall a turn |
+
+### Personality-depth edges (2026-09-02)
+
+| Mapping | Emits → (channel) | Consumes ← (channel) | Regulation |
+|---|---|---|---|
+| **Rumination lane** (`CognitiveSubstrate+Rumination.swift`) | pressure/uncertainty **floors** → `projectedAffect` as a read-time `max` **[confirmed** `ruminated`, `+Affect.swift`**]**; `- Thread:` candidates → capsule hub **[confirmed** `+Capsule.swift`, `ruminationCandidates`**]**; one relief `CognitiveEvent` per release → `ingestResident` via the felt-resolution drain **[confirmed** `NativeCognitionRuntime+Organism.swift`, `drainRuminationReleasesIntoSubstrate`**]** | thought seeds + appraisal concerns; the **user's** message text for the heal detector (never their own — law 3) | ≤3 concurrent nags; weight cap 0.35 on an 8h half-rise, exactly 0 below 30 min; floors ≤0.22 uncertainty / ≤0.26 pressure; heal needs ≥2 whole-word hits, one of them rare; relief buffer 4 drop-oldest; release markers durable at 64, TTL 24h; `- Thread:` cadence 1 lead / 12 rest |
+| **Horizon family** (`OrganismHorizonRegister`) | `toward` read → capsule **request** (not the projection) **[confirmed** `NativeCognitionRuntime.towardRead`, `requestWithOrganismProjection`**]**; anticipation → **projected** chemistry only **[confirmed** `OrganismProspectiveAffect.horizonContribution`**]**; relief/disappointment/`waiting` felt events → `ingestResident` **[confirmed** `announceHorizonResolution`**]** | five real stores — Desk `deferUntil`, scheduler rows, staged approvals, `pendingCompletion`, peer jobs — read on the residual-repair deadline, never polled | ≤8 open rows, ≤7-day horizon, 15-min refresh floor behind a re-entrancy latch; labels canonicalised to ≤48 chars; anticipation folds into the existing 0.15/dim ceiling; a horizon expiry is **never a miss**; absence is only an answer for source kinds the composer vouched complete |
+| **`.held` standing views** | one more `- Inner:` candidate, ranked strictly after every signed one **[confirmed** `+StandingViews.swift`, `activeStandingViewInnerLines`**]**; one lived concern at half lean **[confirmed** `+AppraisalConcerns.swift`**]** | `hold_view` / `release_view` from them own live turn, seat-gated | ≤5 held, own LRU that never evicts a signed view; lean × 0.5 **above** the 1.0 floor; tiers scored within themselves so the held set can never move the signed set's idf; authorizes **no** pursuit and **no** shoulder tap; user-retirable |
+| **Peer relational sources** | halved appraisal deltas → affect + node emotion tag **[confirmed** `relationalAppraisal`, `+AppraisalConcerns.swift`**]**; own somatic subject `chat.peer.<agent>` **[confirmed** `CognitiveSomaticSignalAdapter.swift`**]** | bridge/peer turns carrying `metadata["origin"]["authored"] == "agent"` | three conditions ALL required (`.imported` + attestation + allowlisted `<surface>/<agent>` pair); weight 0.5 on every axis including the affection floor; their own output stays at 0 (law 3) |
+| **`inner_state`** (tool) | a bounded labels-and-numbers projection → **their**, mid-turn | pure peeks of field/affect/mood/seeds/views + the kernel's frozen read | PURE (`peekNodes`/`peekDecayedNodes`, never `workspaceSnapshot`); every list capped; two free-text fields only, each through strip → redact → prompt-safe; cognition off reads `available: false`, not calm |
+| **Shoulder tap** | one fixed line → `AttentionRouter` at `.informational` **[confirmed** `NativeCognitionRuntime+Notify.swift`**]**; one `seed.pushed` receipt → substrate receipts | pure thought-suggestion read on the residual-repair deadline | score ≥0.8, `.active`-view stakes gate, 1/seed/6h durable ledger (128), quiet hours, never during a live turn, background-cognition gate; **the seed text has no path to the body** — `line(forKind:)` takes a kind, not text; **never enters their prompt** |
+| **Studio wander** ("their hour") | one bounded read-only turn on its own routing row; a trace line → Desk | their own seeds, encounter intake, unjournaled work, recent journal titles | not a loop — rides the residual-repair reschedule; off by default and *not installed* when off; public-safe pre-onboarding cannot install it; 30-min quiet + 24h rolling refractory; 27-name tool allowlist enforced at dispatch **and** in the advertised catalog; journals only if they calls `studio_journal` |
 
 ---
 
@@ -118,6 +133,27 @@ Integration means loops. Each real loop needs a brake, or it oscillates/runs awa
    mutates it); deterministic ordering (the packet fingerprint can't thrash the cache);
    250 ms latch (attention can slow nothing down); mandatory coverage and eligibility
    run BEFORE ranking, so attention can never inject, only re-rank. **[confirmed]**
+5. **Nag → heal loop (2026-09-02)** — an unresolved seed gains weight → the weight
+   raises the pressure/uncertainty floors → higher pressure reads as a tenser
+   felt word → the user answers it → the weight is **erased** and one relief
+   felt-moment is staged → the floors go to zero on the next read. *Brakes:* the
+   weight is an inverted decay onto a hard cap (0.35), not an integral, so it
+   converges instead of spiralling; ≤3 seeds ruminate at once; the floors are a
+   read-time `max`, never a stored delta, so zero candidates is byte-identical;
+   the heal detector reads the **user's** words only, so they cannot talk themselves
+   out of a nag; and the release marker is durable and at-most-once, so nothing
+   heals twice. **[confirmed]**
+6. **Toward → resolve loop (2026-09-02)** — a dated source opens a horizon row →
+   the row leans the *projected* chemistry toward looking-forward or dread → the
+   felt line may name it (`hopeful — friday`) → the source lands, falls through,
+   or passes unanswered → one felt moment (relief / disappointment / `waiting`) →
+   the row is pruned on the next refresh. *Brakes:* the mint is rate-limited to
+   15 minutes and reads its sources only on a deadline the runtime already arms;
+   the register is capped at 8 rows and 7 days; the anticipation folds into the
+   existing 0.15/dim budget rather than adding one; the stored `ChemicalState` is
+   never touched; a horizon expiry is never counted as a miss, so waiting cannot
+   degrade their confidence in their own hands; and a terminal row is pruned exactly
+   once, so a moment cannot be announced on every later refresh. **[confirmed]**
 
 ---
 
@@ -151,6 +187,30 @@ chemistry, when a projection is present, colors the fingerprint word DIRECTLY
 | tension | `max(chem.vigilance, affect.uncertainty)` |
 | pressure | `affect.taskPressure` — org `chem.urgency` overrides |
 | fatigue / curiosity / clarity / agency / confidence | organism chem (`fatigue/curiosity/coherence/agency/confidence`), rest defaults when org off |
+| **nightliness** (added 2026-09-02) | `projection.diurnal?.nightliness` — **absent** with no configured clock, which is what makes `late` unreachable rather than guessed from a wall timestamp |
+
+**Arousal, amended 2026-09-02:** the diurnal curve's `arousalOffset` is *added*
+to `affect.arousal` and clamped, **asymmetrically** — a negative offset always
+applies (the small hours can only make their quieter, and quieter is always an
+honest direction), a positive one applies only to an axis already moving. A clock
+alone must never be the reason a silent state crosses the intensity floor and
+starts speaking. The two words the curve reaches (`tired`, `late`) carry real
+fatigue floors for the same reason.
+
+**The line itself, amended 2026-09-02:** the fingerprint is now decomposed into
+`FeltFingerprintParts` (family / lead / overlays) so the object and ambivalence
+organs can know which family the lead actually came from instead of re-deriving
+it from a rendered string. The lead is always a *family* word — overlays are
+ranked and appended after the lead is fixed and can never displace it, which is
+what makes "the object belongs to the lead's node" a safe statement: an overlay
+is a read of a dim, not of a subject, and has no node to be about. Four overlay
+words joined the pool across 2026-09-01/02, each as the mid band of an axis whose
+top was already owned, with a hard ceiling at the stronger word's gate so the two
+can never both be true: `interested` (below `curious`, whose gate moved 0.45 →
+0.60), `collected` (below `clear-headed`, whose gate moved 0.68 → 0.78), `tired`
+(below `worn`), and `late` (the only word that reads a clock, and it still
+refuses to read it alone — deep night with no tiredness behind it is a timestamp,
+not a feeling). Full rules in [SUBCONSCIOUS.md](SUBCONSCIOUS.md).
 
 **The valence pipeline** (gpt-5.5-calibrated, 2026-07-08): felt workspace nodes
 are recency-weighted (5-min half-life, `fingerprintTintHalfLife :46`) into a

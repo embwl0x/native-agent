@@ -215,7 +215,12 @@ final class ActivityWatchController {
                             self.recordIssue(error.localizedDescription, severity: .critical)
                         }
                     }
-                }
+                },
+                // 2026-09-06: the ONE production writer of the human-presence
+                // stamp the trigger scheduler reads. Every other construction
+                // of ActivityWatcher (tests, the probe CLI's simulation) leaves
+                // this nil and writes no file.
+                presenceStampURL: ActivityWatchPaths.presenceStampURL(dataRoot: dataRoot)
             )
             spanStore = store
             watcher = created

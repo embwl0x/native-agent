@@ -63,7 +63,44 @@ public struct CheckResult: Sendable, Codable, Equatable {
 public protocol DoctorCheck: Sendable {
     var id: String { get }
     var title: String { get }
+    /// May an UNATTENDED sweep run this check and count its verdict?
+    ///
+    /// 2026-09-02, live incident: two new diagnostic rows graded a rolling
+    /// history window, went red on PRE-FIX history, and the heartbeat pushed
+    /// "Doctor has 2 failing checks" to User's phone at 3am. The rows were
+    /// right and the notification was still wrong — they are for a person
+    /// LOOKING at Doctor, not for a robot deciding to wake someone.
+    ///
+    /// `false` means: an unattended sweep must skip the row entirely — not run
+    /// it, not count it in "N failing", not derive health from it. It stays
+    /// fully visible in the Doctor UI, which is the only place it was ever
+    /// meant to be read. Defaults to `true`, so every existing check keeps its
+    /// current behavior and a new check must OPT OUT deliberately.
+    var heartbeatEligible: Bool { get }
     func run() async -> CheckResult
+}
+
+public extension DoctorCheck {
+    var heartbeatEligible: Bool { true }
+}
+
+/// Which check ids an unattended sweep must leave alone.
+///
+/// Derived from the real default check list rather than restated, so the flag
+/// on the check and the set the heartbeat filters by CANNOT drift apart. A
+/// reader that only has a persisted `doctor/latest.json` (the heartbeat, the
+/// self-heal hook) has no check instances to ask, so it asks this.
+public enum DoctorHeartbeatPolicy {
+    public static let ineligibleCheckIDs: Set<String> = Set(
+        SwiftNativeDoctorChecks.defaultChecks
+            .filter { !$0.heartbeatEligible }
+            .map(\.id)
+    )
+
+    /// True when an unattended sweep may judge this id.
+    public static func isEligible(_ id: String) -> Bool {
+        !ineligibleCheckIDs.contains(id)
+    }
 }
 
 /// Optional extension point for checks that can safely repair app-owned state
@@ -83,6 +120,14 @@ public extension RepairingDoctorCheck {
 
 /// SwiftNative impl never throws (the actor catches everything and reflects
 /// it as `status: "fail"`).
+///
+/// FIX-5b (2026-09-01): `checkLLM` BUYS NOTHING. No implementation has ever
+/// read it — this module deliberately makes no provider call (see the file
+/// header), so there is no LLM check for the flag to switch on. It survives
+/// only as an argument label on nine existing call sites; the user-facing
+/// claim it used to back (`chat-drive doctor --check-llm true`) is gone.
+/// Passing `true` does not probe a provider. Do not add new callers that
+/// pass it, and do not read it as permission to make a network call.
 public protocol DoctorChecksProtocol: Sendable {
     func runAll(repair: Bool, checkLLM: Bool) async throws -> [CheckResult]
     func runCheck(id: String, repair: Bool) async throws -> CheckResult?
@@ -436,6 +481,36 @@ public struct PersonaEngineCheck: RepairingDoctorCheck {
                     detail: "Persona compiler failed: SOUL.md is absent from \(rootPath)",
                     repair: "Run Repair Safe Issues to normalize the personality profile."
                 )
+            }
+            // User, 2026-09-06: a completed onboarding whose profile.json has
+            // gone missing or unreadable is a REPAIR condition, not a fresh
+            // install. Everything downstream substitutes a default profile
+            // silently — the agent is renamed and the configured identity is
+            // gone with no error anywhere. Anchored on the `.onboarded`
+            // sentinel so a machine that never onboarded stays ok. Deliberately
+            // NOT auto-repaired: nothing here may invent a name.
+            let dataRoot = await engine.dataRootURL
+            if FileManager.default.fileExists(
+                atPath: dataRoot.appendingPathComponent(".onboarded").path
+            ) {
+                let profileURL = dataRoot
+                    .appendingPathComponent("memory", isDirectory: true)
+                    .appendingPathComponent("profile.json")
+                var profileIsReadable = false
+                if let data = try? Data(contentsOf: profileURL),
+                   let object = try? JSONSerialization.jsonObject(with: data),
+                   object is [String: Any] {
+                    profileIsReadable = true
+                }
+                if !profileIsReadable {
+                    return CheckResult(
+                        id: id,
+                        title: title,
+                        status: "fail",
+                        detail: "Onboarding completed on this Mac but \(profileURL.path) is missing or unreadable, so the configured agent and user names are gone and a default profile is being used in their place.",
+                        repair: "Restore memory/profile.json from a backup, or set the names again in Settings. Repair will not write this file — it must not invent a name."
+                    )
+                }
             }
             return CheckResult(
                 id: id,
@@ -1168,7 +1243,9 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
 /// needing provider access or an LLM. Repair mode is intentionally conservative:
 /// it creates missing app-owned directories/default JSON, backs up malformed
 /// files before rewriting, and stops only the retired external-runtime process.
-/// `checkLLM` is accepted for API compatibility but remains unused here.
+/// `checkLLM` is accepted for source compatibility with existing call sites
+/// and is IGNORED — it has never selected any behavior (see FIX-5b on
+/// `DoctorChecksProtocol`).
 /// 2026-07-12 (User's broken-panel incident): the memory stack panel showed
 /// "Core ML MiniLM BROKEN" while Doctor reported all-green — Doctor never
 /// probed the embedder. This check ACTUALLY LOADS the bundled MiniLM through
@@ -1178,12 +1255,24 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
 /// and re-probe; the pristine .mlpackage in the app bundle recompiles fresh.
 public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
     public let id: String = "coreml_embedder"
-    public let title: String = "Core ML Embedder (MiniLM)"
+
+    /// Agent, 2026-09-06: this row said "MiniLM loads" whatever was actually
+    /// running. Since 2026-09-05 the runtime prefers an installed extras model
+    /// (`CoreMLEmbeddingProvider.installedExtrasModel`), so the row was naming
+    /// a model the store had not been embedded with. Title and detail now name
+    /// the model the runtime RESOLVES, and the detail says separately whether
+    /// the bundled MiniLM floor is still there.
+    public var title: String { "Core ML Embedder (\(Self.resolvedModelID))" }
+
+    private static var resolvedModelID: String {
+        CoreMLEmbeddingProvider.installedExtrasModel(root: defaultDataRoot())?.modelID
+            ?? CoreMLEmbeddingProvider.bundledModelID
+    }
 
     public init() {}
 
     public func run(repair: Bool) async -> CheckResult {
-        guard CoreMLEmbeddingProvider.bundledResourcesAvailable() else {
+        guard CoreMLEmbeddingProvider.bundledResourcesAvailable(extrasRoot: defaultDataRoot()) else {
             return CheckResult(
                 id: id, title: title, status: "fail",
                 // A2.4: dropped a stale "script/install_minilm.sh" pointer —
@@ -1194,7 +1283,7 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
             )
         }
         if repair {
-            CoreMLEmbeddingProvider.wipeBundledCompileCache()
+            CoreMLEmbeddingProvider.wipeBundledCompileCache(extrasRoot: defaultDataRoot())
             let after = await probe()
             return CheckResult(
                 id: id, title: title, status: after.status, detail: after.detail,
@@ -1205,18 +1294,25 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
     }
 
     private func probe() async -> CheckResult {
+        // The floor is reported separately from the resolved model: an extras
+        // install that shadows a missing MiniLM is a different situation from
+        // one that sits on top of it.
+        let floor = CoreMLEmbeddingProvider.bundledFloorResourcesAvailable()
+            ? "Bundled MiniLM floor is present."
+            : "Bundled MiniLM floor is MISSING from the app bundle."
         do {
             // Full real-path probe: compile-cache resolution + MLModel load +
-            // WordPiece vocab. Same code the runtime's first embed() runs.
-            _ = try CoreMLEmbeddingProvider.bundled()
+            // WordPiece vocab. Same code the runtime's first embed() runs — so
+            // this loads whatever the runtime resolves, extras model included.
+            let provider = try CoreMLEmbeddingProvider.bundled(extrasRoot: defaultDataRoot())
             return CheckResult(
                 id: id, title: title, status: "ok",
-                detail: "MiniLM loads: model compiles/loads from cache and the WordPiece vocab parses."
+                detail: "\(provider.modelId), \(provider.dimensions)-d, loads: model compiles/loads from cache and the WordPiece vocab parses. \(floor)"
             )
         } catch {
             return CheckResult(
                 id: id, title: title, status: "fail",
-                detail: "MiniLM failed to load: \(String(describing: error)). Semantic recall is degraded until this is repaired.",
+                detail: "\(Self.resolvedModelID) failed to load: \(String(describing: error)). Semantic recall is degraded until this is repaired. \(floor)",
                 repair: nil
             )
         }
@@ -1327,6 +1423,13 @@ public struct OpLogHealthCheck: DoctorCheck {
 /// reads `expires_at`, the file name, and whether a nonempty refresh credential
 /// is present. Credential material is never copied into the result, so a Doctor
 /// report can never carry it.
+///
+/// FIX-5a (2026-09-01): because the refresh is never probed, "a refresh token
+/// is on file" is evidence about a string, not about recovery. An expired
+/// access token therefore WARNS whether or not a refresh token sits beside it,
+/// and every credential Doctor could not judge (unparseable, or carrying no
+/// `expires_at`) is named as unchecked AND warns — an unjudged credential
+/// behind a green row is the same silence, one level up.
 public struct OAuthTokenExpiryCheck: DoctorCheck {
     public let id: String = "oauth_token_expiry"
     public let title: String = "OAuth Token Expiry"
@@ -1392,6 +1495,7 @@ public struct OAuthTokenExpiryCheck: DoctorCheck {
         var refreshableExpired: [String] = []
         var checked = 0
         var unreadable: [String] = []
+        var noExpiry: [String] = []
 
         for (label, url) in Self.credentialFiles(root: root) {
             guard FileManager.default.fileExists(atPath: url.path) else { continue }
@@ -1399,7 +1503,13 @@ public struct OAuthTokenExpiryCheck: DoctorCheck {
                 unreadable.append(label)
                 continue
             }
-            guard let expiry = Self.parseExpiry(object["expires_at"]) else { continue }
+            guard let expiry = Self.parseExpiry(object["expires_at"]) else {
+                // FIX-5a: a credential with no `expires_at` was NOT checked.
+                // Skipping it silently made "\(checked) credentials … none is
+                // expired" read as coverage it never had.
+                noExpiry.append(label)
+                continue
+            }
             checked += 1
             let stamp = ISO8601DateFormatter().string(from: expiry)
             let refreshToken: String? = {
@@ -1412,7 +1522,7 @@ public struct OAuthTokenExpiryCheck: DoctorCheck {
             if expiry <= now {
                 let days = Int(now.timeIntervalSince(expiry) / 86_400)
                 if canRefresh {
-                    refreshableExpired.append("\(label) access expired \(days)d ago; refresh is available")
+                    refreshableExpired.append("\(label) access expired \(days)d ago; refresh untested")
                 } else {
                     expired.append("\(label) expired \(stamp) (\(days)d ago)")
                 }
@@ -1425,39 +1535,99 @@ public struct OAuthTokenExpiryCheck: DoctorCheck {
 
         let repair = "Re-authorize the named integration from Settings → Connectors / Providers. "
             + "Doctor never touches credential files: it reads `expires_at` only."
+
+        // FIX-5a: every unchecked file is named, on every path. An unparseable
+        // credential and one with no `expires_at` are both "Doctor knows
+        // nothing about this one", which is not the same as healthy.
+        var unchecked = ""
+        if !unreadable.isEmpty {
+            unchecked += " Unchecked (unparseable): \(unreadable.joined(separator: ", "))."
+        }
+        if !noExpiry.isEmpty {
+            unchecked += " Unchecked (no expires_at, so Doctor cannot judge them):"
+                + " \(noExpiry.joined(separator: ", "))."
+        }
+
+        var findings: [String] = []
         if !expired.isEmpty {
+            findings.append("Expired OAuth credential(s): \(expired.joined(separator: "; ")).")
+        }
+        // FIX-5a: this used to fall through to `ok` with "refresh is
+        // available" — a claim inferred from a nonempty refresh_token string
+        // that Doctor has never probed. An expired access token is a real
+        // finding until something actually refreshes it.
+        if !refreshableExpired.isEmpty {
+            findings.append(
+                "Expired OAuth access token(s) with a refresh token on file:"
+                    + " \(refreshableExpired.joined(separator: "; "))."
+                    + " Doctor never attempts a refresh, so recovery is unproven."
+            )
+        }
+        if !findings.isEmpty {
+            if !expiringSoon.isEmpty {
+                findings.append("Expiring soon: \(expiringSoon.joined(separator: "; ")).")
+            }
             return CheckResult(
                 id: id, title: title, status: "warn",
-                detail: "Expired OAuth credential(s): \(expired.joined(separator: "; "))."
-                    + (expiringSoon.isEmpty ? "" : " Expiring soon: \(expiringSoon.joined(separator: "; "))."),
+                detail: findings.joined(separator: " ") + unchecked,
                 repair: repair
             )
         }
         if !expiringSoon.isEmpty {
             return CheckResult(
                 id: id, title: title, status: "warn",
-                detail: "OAuth credential(s) expiring within 7 days: \(expiringSoon.joined(separator: "; ")).",
+                detail: "OAuth credential(s) expiring within 7 days: \(expiringSoon.joined(separator: "; "))."
+                    + unchecked,
                 repair: repair
             )
         }
-        var detail = "\(checked) OAuth credential(s) carry an expiry and none is expired."
-        if !refreshableExpired.isEmpty {
-            detail = "OAuth access token expiry is recoverable: \(refreshableExpired.joined(separator: "; "))."
+        // FIX-5a (gpt review 2026-09-01): naming the unchecked files was only
+        // half the fix — returning "ok" alongside them still hid an unjudged
+        // credential behind green, which is the exact silence this check
+        // exists to break. Doctor knowing nothing about a credential is a
+        // finding about Doctor's coverage, so it warns and says which ones.
+        if !unchecked.isEmpty {
+            let count = unreadable.count + noExpiry.count
+            return CheckResult(
+                id: id, title: title, status: "warn",
+                detail: "\(checked) OAuth credential(s) carry an expiry and none is expired,"
+                    + " but \(count) could not be judged at all." + unchecked,
+                repair: "Confirm each unchecked credential from Settings → Connectors / Providers."
+                    + " A credential Doctor cannot read an expiry from is unverified, not healthy."
+            )
         }
-        if !unreadable.isEmpty {
-            detail += " Unparseable credential file(s) skipped: \(unreadable.joined(separator: ", "))."
-        }
-        return CheckResult(id: id, title: title, status: "ok", detail: detail)
+        return CheckResult(
+            id: id, title: title, status: "ok",
+            detail: "\(checked) OAuth credential(s) carry an expiry and none is expired."
+        )
     }
 }
 
 public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
     private let checks: [DoctorCheck]
 
-    public init(checks: [DoctorCheck] = [
+    /// The production check list. Exposed as a named value (rather than an
+    /// inline default argument) so `DoctorHeartbeatPolicy` can DERIVE the
+    /// unattended-sweep exclusions from the same array the app runs, instead
+    /// of keeping a second hand-maintained list beside it.
+    public static let defaultChecks: [DoctorCheck] = [
         StorageCheck(),
         RuntimeJSONStoresCheck(),
         ChatSessionsCheck(),
+        // One-thread-many-surfaces Phase 0: hot session count, 24h mints BY
+        // MINT SITE, and the source-flapping detector. Read-only.
+        SessionIdentityCheck(),
+        // 2026-09-02: two per-turn health rows over the turn-trace feed, so a
+        // regression in either can no longer be invisible. Both are read-only,
+        // bounded (tailed day files), and run ONLY inside a Doctor pass —
+        // never on a turn, a timer, or the cognition runtime. Both are
+        // `heartbeatEligible == false`: they are for a person reading Doctor,
+        // never for an unattended sweep that can wake User.
+        //   * PromptPrefixHealthCheck — cross-turn prefix cache reuse.
+        //   * SubconsciousVitalsCheck — capsule attachment and felt/Inner/Sound
+        //     variety, plus the organism's own chemistry.
+        PromptPrefixHealthCheck(),
+        SubconsciousVitalsCheck(),
         ChatMessagesIntegrityCheck(),
         PersonaEngineCheck(),
         MemoryStoreCheck(),
@@ -1465,7 +1635,9 @@ public actor SwiftNativeDoctorChecks: DoctorChecksProtocol {
         ICloudBridgeStateCheck(),
         OpLogHealthCheck(),
         OAuthTokenExpiryCheck(),
-    ]) {
+    ]
+
+    public init(checks: [DoctorCheck] = SwiftNativeDoctorChecks.defaultChecks) {
         self.checks = checks
     }
 

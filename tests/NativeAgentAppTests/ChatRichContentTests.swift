@@ -246,7 +246,12 @@ struct ChatRichContentTests {
                 "Code-block rendering must live only in the shared row.")
 
         let row = try AppSourceScraping.appSource("ChatMessageListView.swift")
-        #expect(row.contains("ChatRichContentCache.blocks(message.content)"))
+        // 2026-09-06: 3ccfb925 ("The new shell: five places, one room, one
+        // status dot") added `displayContent`, which strips a bridge routing
+        // prefix off `message.content` before anything renders. The block
+        // split now runs over that projection — the same one the streaming
+        // fast path shows — so the pin follows it rather than the raw field.
+        #expect(row.contains("ChatRichContentCache.blocks(displayContent)"))
         #expect(row.contains("ChatCodeBlockView(language: language, code: code)"))
     }
 

@@ -59,6 +59,32 @@ struct FeltDreamsTests {
             emotionalValence: valence, emotionalArousal: arousal, emotionalWarmth: warmth)
     }
 
+    /// A felt node shaped exactly like the one the studio seam mints
+    /// (CognitiveSubstrate+StudioEvents.swift): `.conversationFocus` from an
+    /// `assistantTurnCompleted`, subject type "studio_entry" with the entry id
+    /// and the work title as its label, and the entry id in metadata too.
+    private func studioNode(
+        entryID: String,
+        title: String?,
+        summary: String,
+        valence: Double,
+        arousal: Double,
+        warmth: Double,
+        createdAt: Date,
+        lastActivatedAt: Date,
+        kind: CognitiveNodeKind = .conversationFocus,
+        subjectType: String = "studio_entry"
+    ) -> CognitiveNode {
+        CognitiveNode(
+            id: UUID(), kind: kind,
+            subjectReference: CognitiveSubjectReference(type: subjectType, id: entryID, label: title),
+            activation: 0.9, salience: 0.9, confidence: 0.8, sourceClass: .selfReported,
+            createdAt: createdAt, lastActivatedAt: lastActivatedAt,
+            decayHalfLife: 10_000, summary: summary,
+            metadata: ["studioEntryId": .string(entryID), "turnKind": .string("live")],
+            emotionalValence: valence, emotionalArousal: arousal, emotionalWarmth: warmth)
+    }
+
     private func substrate(
         with nodes: [CognitiveNode], clock: Clock, label: String, affectEnabled: Bool = true
     ) async throws -> CognitiveSubstrate {
@@ -120,6 +146,119 @@ struct FeltDreamsTests {
         // The band count still integrates over all felt nodes (a count carries
         // no content) — 4 felt moments here.
         #expect(summary.contains("4 felt moments"), "band count should cover all felt nodes: \(summary)")
+    }
+
+    // MARK: - (1b) studio journal entries are NAMED, by pointer (Agent, 2026-09-01)
+
+    /// A day shaped by the studio must SAY so: the entry is named by its work
+    /// title and cited by id in the dream's `(studio entry <id>)` form, so the
+    /// band's provenance is not misattributed to whatever conversation was near.
+    @Test func studioEntryIsNamedByTitleAndCitedByID() async throws {
+        let now = Date(timeIntervalSince1970: 1_400_000)
+        let clock = Clock(now)
+        let s = try await substrate(
+            with: [
+                studioNode(
+                    entryID: "entry-42", title: "Blue Nude II",
+                    summary: "Journal entry on Blue Nude II — stance formed.",
+                    valence: 0.7, arousal: 0.4, warmth: 0.3,
+                    createdAt: now, lastActivatedAt: now),
+            ],
+            clock: clock, label: "studio-named")
+        let summary = try #require(await s.feltDaySummary(at: clock.now()))
+        #expect(summary.contains("Blue Nude II"), "the work title should name the line: \(summary)")
+        #expect(summary.contains("(studio entry entry-42)"),
+                "the entry id should be cited the dream's way: \(summary)")
+        #expect(summary.contains("1 felt moment"), "the band still counts the entry: \(summary)")
+    }
+
+    /// The exposure rule stands for CONTENT: the entry's own text — which the
+    /// seam's node summary is free to carry — must never ride the named line.
+    @Test func studioEntryResponseTextIsNeverNamed() async throws {
+        let now = Date(timeIntervalSince1970: 1_410_000)
+        let clock = Clock(now)
+        let s = try await substrate(
+            with: [
+                studioNode(
+                    entryID: "entry-77", title: "Woman with a Hat",
+                    summary: "RESPONSE-TEXT-SHE-WROTE about the sitter's face",
+                    valence: 0.8, arousal: 0.4, warmth: 0.3,
+                    createdAt: now, lastActivatedAt: now),
+            ],
+            clock: clock, label: "studio-no-content")
+        let summary = try #require(await s.feltDaySummary(at: clock.now()))
+        #expect(!summary.contains("RESPONSE-TEXT-SHE-WROTE"),
+                "the entry's own text must never be named: \(summary)")
+        #expect(summary.contains("Woman with a Hat (studio entry entry-77)"),
+                "the pointer — title + id — is what gets named: \(summary)")
+    }
+
+    /// No title on the node → the id alone is a complete pointer.
+    @Test func titlelessStudioEntryCitesTheIDAlone() async throws {
+        let now = Date(timeIntervalSince1970: 1_420_000)
+        let clock = Clock(now)
+        let s = try await substrate(
+            with: [
+                studioNode(
+                    entryID: "entry-99", title: nil,
+                    summary: "Journal entry — stance open.",
+                    valence: -0.6, arousal: 0.4, warmth: 0.1,
+                    createdAt: now, lastActivatedAt: now),
+            ],
+            clock: clock, label: "studio-untitled")
+        let summary = try #require(await s.feltDaySummary(at: clock.now()))
+        let bullet = try #require(summary.split(separator: "\n").first { $0.hasPrefix("- ") })
+        #expect(bullet.hasSuffix("(studio entry entry-99)"), "id-only citation expected: \(bullet)")
+        #expect(!bullet.contains("stance open"), "the summary text must not be named: \(bullet)")
+    }
+
+    /// Carrying the metadata key is not a way in: a felt TOOL node stays unnamed
+    /// even when it claims a studio entry id, because it is not a studio subject.
+    @Test func toolNodeClaimingAStudioEntryIDIsStillNeverNamed() async throws {
+        let now = Date(timeIntervalSince1970: 1_430_000)
+        let clock = Clock(now)
+        let s = try await substrate(
+            with: [
+                node(summary: "a warm exchange about the roadmap", valence: 0.3, arousal: 0.1, warmth: 0.5,
+                     createdAt: now, lastActivatedAt: now),
+                studioNode(
+                    entryID: "entry-forged", title: "FORGED-LABEL",
+                    summary: "SECRET-TOOL-OUTPUT sk-deadbeef",
+                    valence: 0.9, arousal: 0.9, warmth: 0.9,
+                    createdAt: now, lastActivatedAt: now,
+                    kind: .toolObservation, subjectType: "tool"),
+            ],
+            clock: clock, label: "studio-forged")
+        let summary = try #require(await s.feltDaySummary(at: clock.now()))
+        #expect(!summary.contains("SECRET-TOOL-OUTPUT"), "tool summary leaked: \(summary)")
+        #expect(!summary.contains("FORGED-LABEL"), "tool label leaked: \(summary)")
+        #expect(!summary.contains("entry-forged"), "forged citation leaked: \(summary)")
+        #expect(summary.contains("roadmap"), "the conversation memory should still be named: \(summary)")
+    }
+
+    /// The cap and the ordering are untouched: 6 felt nodes still name 4, and the
+    /// strongest-felt studio entry sorts ahead of weaker conversation memories.
+    @Test func studioEntriesKeepTheCapAndTheRanking() async throws {
+        let now = Date(timeIntervalSince1970: 1_440_000)
+        let clock = Clock(now)
+        var nodes: [CognitiveNode] = []
+        for idx in 0..<5 {
+            nodes.append(node(summary: "felt-node-\(idx)", valence: 0.4, arousal: 0.1, warmth: 0.5,
+                              createdAt: now, lastActivatedAt: now))
+        }
+        nodes.append(studioNode(
+            entryID: "entry-1", title: "The Dance",
+            summary: "Journal entry on The Dance — stance formed.",
+            valence: 0.9, arousal: 0.5, warmth: 0.3,
+            createdAt: now, lastActivatedAt: now))
+        let s = try await substrate(with: nodes, clock: clock, label: "studio-cap")
+        let summary = try #require(await s.feltDaySummary(at: clock.now()))
+        let bullets = summary.split(separator: "\n").filter { $0.hasPrefix("- ") }
+        #expect(bullets.count == 4, "the named-line cap must hold: \(bullets.count)")
+        #expect(bullets.first?.contains("(studio entry entry-1)") == true,
+                "the strongest-felt node still ranks first: \(summary)")
+        #expect(summary.contains("6 felt moments"), "the band counts every felt node: \(summary)")
+        #expect(summary.count <= 600, "summary must stay bounded ≤600 chars: \(summary.count)")
     }
 
     /// A felt LOW day reads with the heavy-band language and the stung direction.

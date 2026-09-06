@@ -45,8 +45,13 @@ struct ReflectionRoutingReadinessTests {
         try Data(#"{"api_key":"test-only"}"#.utf8)
             .write(to: providers.appendingPathComponent("openrouter.json"))
         let updatedAt = ISO8601DateFormatter().string(from: Date())
+        // 2026-09-06: fddfdc24 made the completeness verdict durable. A cache
+        // with no `complete` stamp may have been written from a truncated page,
+        // so a missing id there is no longer evidence of absence — it answers
+        // .unknown and the pin stands. Only a cache stamped complete can
+        // convict a retired model, which is exactly what this test is about.
         let cache = """
-        {"schema_version":1,"updated_at":"\(updatedAt)","source":"https://openrouter.ai/api/v1/models?output_modalities=text","models":[{"id":"vendor/current","name":"Current","context_length":128000}]}
+        {"schema_version":1,"updated_at":"\(updatedAt)","complete":true,"source":"https://openrouter.ai/api/v1/models?output_modalities=text","models":[{"id":"vendor/current","name":"Current","context_length":128000}]}
         """
         try Data(cache.utf8)
             .write(to: providers.appendingPathComponent("openrouter-models-cache.json"))

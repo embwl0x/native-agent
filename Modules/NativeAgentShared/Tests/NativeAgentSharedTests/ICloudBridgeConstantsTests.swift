@@ -572,7 +572,15 @@ struct MobileSnapshotGroupManifestTests {
         }
         // 24 → 23 on 2026-08-28: command_palette.json retired (E8 audit) —
         // Mac writer deleted, retired-file sweep in place, no iOS reader.
-        #expect(owner.count == 23, "manifest size changed — confirm every consumer was updated (was 23)")
+        // 23 → 24 on 2026-09-01: snapshot_staleness.json added (sweep item 2) —
+        // the per-group staleness marker the phone badges Memory and Knowledge
+        // Graph with.
+        // 24 → 25 on 2026-09-06: chat_anchor.json added in 7df7a4cd (Fable 5.1
+        // sweep wave 2) — the conversation anchor pin. Mac writer:
+        // MacSyncEngine+Snapshots.swift write(anchor, to: "chat_anchor.json");
+        // iOS readers: iCloudSyncEngine+Snapshots.swift loads it as
+        // ConversationAnchorPin. Both ends present, so the partition holds.
+        #expect(owner.count == 25, "manifest size changed — confirm every consumer was updated (was 25)")
         // groups(containingAny:) must resolve each filename to exactly its owner.
         for (name, group) in owner {
             #expect(NAMobileSnapshotGroup.groups(containingAny: [name]) == [group])

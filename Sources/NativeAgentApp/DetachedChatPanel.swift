@@ -54,7 +54,9 @@ enum DetachedChatFramePlacement {
     }
 }
 
-/// NSPanel subclass mirroring SpotlightOverlay's key-window override.
+/// NSPanel subclass with a key-window override (the pattern the retired
+/// Spotlight overlay used, kept here because a floating panel that cannot
+/// become key takes no keystrokes).
 /// Detached chat panels are normal app windows (not non-activating HUDs),
 /// so they take key/main focus — but using NSPanel keeps them out of the
 /// Dock and window menu.
@@ -106,6 +108,15 @@ protocol DetachedChatPanelHandle: AnyObject {
     func center()
     func show()
     func close()
+    /// 2026-09-06: the window's titlebar was written once, at construction, so
+    /// renaming a conversation left every open panel showing the old name (and
+    /// a panel opened before its session's first auto-title kept "New Chat").
+    /// Defaulted to a no-op so a handle that owns no titlebar ignores it.
+    func setTitle(_ title: String)
+}
+
+extension DetachedChatPanelHandle {
+    func setTitle(_ title: String) {}
 }
 
 @MainActor
@@ -157,6 +168,11 @@ private final class LiveDetachedChatPanelHandle: NSObject, DetachedChatPanelHand
     var appearance: NSAppearance? {
         get { panel.appearance }
         set { panel.appearance = newValue }
+    }
+
+    func setTitle(_ title: String) {
+        guard !title.isEmpty, panel.title != title else { return }
+        panel.title = title
     }
 
     func center() {
@@ -220,9 +236,8 @@ final class DetachedChatWindowController {
             ?? DarkModePreferenceObserver(object: defaults)
     }
 
-    /// Inject the AppModel after it constructs (mirrors SpotlightOverlay's
-    /// attach pattern — the controller is a singleton that predates the
-    /// AppModel, so the reference comes in via this hook).
+    /// Inject the AppModel after it constructs: the controller is a singleton
+    /// that predates the AppModel, so the reference comes in via this hook.
     func attach(appModel: AppModel) {
         self.appModel = appModel
         observeAppearancePreference()
@@ -238,12 +253,10 @@ final class DetachedChatWindowController {
     /// small reader injectable lets a hermetic evaluation prove that an open
     /// detached panel follows the same authority as the main SwiftUI window.
     static func preferredAppearance(defaults: UserDefaults = .standard) -> NSAppearance? {
-        // `bool(forKey:)` coerces arbitrary legacy values, including strings.
-        // Treat anything except a real persisted Bool(true) as system
-        // appearance so malformed preferences never force unexpected chrome.
-        guard let preferDark = defaults.object(forKey: "nativeagent.darkMode") as? Bool,
-              preferDark
-        else { return nil }
+        // User, 2026-09-06: dark is the default. Only an explicit persisted
+        // Bool(false) hands the panel to the system appearance.
+        let preferDark = (defaults.object(forKey: "nativeagent.darkMode") as? Bool) ?? true
+        guard preferDark else { return nil }
         return NSAppearance(named: .darkAqua)
     }
 
@@ -355,6 +368,13 @@ final class DetachedChatWindowController {
         pinSession(appModel, sessionId)
         addToPersist(sessionId)
         panel.show()
+    }
+
+    /// Follow a conversation's title into its open panel's titlebar, if any.
+    /// Called by the hosted view whenever the session's display title changes
+    /// (2026-09-06).
+    func updateTitle(sessionId: String, title: String) {
+        panels[sessionId]?.setTitle(title)
     }
 
     /// Close the panel for `sessionId` if open. The windowWillClose

@@ -38,6 +38,13 @@ final class ChatStore: ObservableObject {
         let schemaVersion: Int
         let sessionID: String?
         let messages: [ChatMessage]
+        /// 2026-09-06: the newest Mac transcript version these rows were
+        /// reconciled against. It rides WITH the rows because it only means
+        /// anything about them: an empty transcript is allowed to wipe this
+        /// cache exactly when it is newer than this. Held only in memory, a
+        /// relaunch forgot it and the next stale empty snapshot wiped a
+        /// rebuilt chat. nil for envelopes written before this field existed.
+        var appliedTranscriptGeneration: Int? = nil
     }
 
     @Published var messages: [ChatMessage] = [] {
@@ -86,7 +93,21 @@ final class ChatStore: ObservableObject {
             defaults.set(data, forKey: queuedSendsKey)
         }
     }
-    @Published var pausedQueueSessionKeys: Set<String> = []
+    @Published var pausedQueueSessionKeys: Set<String> = [] {
+        didSet { persistPausedQueueSessionKeys() }
+    }
+    /// 2026-09-06: the pause set was in-memory while the queue it pauses is
+    /// persisted, so a relaunch drained (and sent) messages the user had
+    /// explicitly stopped. Persist it alongside the queue.
+    private let pausedQueueSessionKeysKey = "NativeAgentMobile.chatPausedQueueSessions.v1"
+
+    private func persistPausedQueueSessionKeys() {
+        if pausedQueueSessionKeys.isEmpty {
+            defaults.removeObject(forKey: pausedQueueSessionKeysKey)
+            return
+        }
+        defaults.set(Array(pausedQueueSessionKeys), forKey: pausedQueueSessionKeysKey)
+    }
     // PATCH-2026-05-30: incremental text streaming over iCloud.
     // The Mac side writes batched text_delta BridgeMessages every ~1.5s during
     // a chat turn so iOS users see Agent "typing" in real time instead of a
@@ -152,6 +173,12 @@ final class ChatStore: ObservableObject {
            let queueData = defaults.data(forKey: queuedSendsKey),
            let restoredQueue = try? JSONDecoder().decode([QueuedChatSend].self, from: queueData) {
             queuedSends = Array(restoredQueue.suffix(maxPersistedQueuedSends))
+        }
+        // 2026-09-06: restore the pause set with the queue. Without it a
+        // relaunch resumed a queue the user had stopped.
+        if restoreQueuedSends,
+           let restoredPaused = defaults.array(forKey: pausedQueueSessionKeysKey) as? [String] {
+            pausedQueueSessionKeys = Set(restoredPaused)
         }
         if let savedMain, defaults.string(forKey: Self.mainSessionIDKey) == nil {
             defaults.set(savedMain, forKey: Self.mainSessionIDKey)
@@ -230,7 +257,8 @@ final class ChatStore: ObservableObject {
                 errorBanner = "The cached transcript for this chat was unreadable. Refreshing from the Mac."
                 return []
             }
-            return normalizedCachedMessages(saved)
+            noteCachedTranscriptGeneration(saved.generation, for: cleanSessionID)
+            return normalizedCachedMessages(saved.messages)
         }
 
         // The old global key has no session identity. It is safe only for an
@@ -242,30 +270,43 @@ final class ChatStore: ObservableObject {
                 expectedSessionID: cleanSessionID,
                 permitsLegacyArray: false
               ) else { return [] }
-        let normalized = normalizedCachedMessages(saved)
+        noteCachedTranscriptGeneration(saved.generation, for: cleanSessionID)
+        let normalized = normalizedCachedMessages(saved.messages)
         if let envelope = try? JSONEncoder().encode(CachedTranscript(
             schemaVersion: 2,
             sessionID: cleanSessionID,
-            messages: normalized
+            messages: normalized,
+            appliedTranscriptGeneration: saved.generation
         )) {
             defaults.set(envelope, forKey: exactKey)
         }
         return normalized
     }
 
+    /// 2026-09-06: restore the persisted clear-watermark for a session as its
+    /// cache is read back. Without this the in-memory watermark starts empty
+    /// every launch, and the first stale empty snapshot to arrive is treated as
+    /// newer than everything — which is how a rebuilt transcript got wiped.
+    private func noteCachedTranscriptGeneration(_ generation: Int?, for sessionID: String?) {
+        guard let sessionID, let generation else { return }
+        if let applied = appliedTranscriptGenerations[sessionID], generation <= applied { return }
+        appliedTranscriptGenerations[sessionID] = generation
+    }
+
     private func decodeCachedTranscript(
         _ data: Data,
         expectedSessionID: String?,
         permitsLegacyArray: Bool
-    ) -> [ChatMessage]? {
+    ) -> (messages: [ChatMessage], generation: Int?)? {
         let decoder = JSONDecoder()
         if let envelope = try? decoder.decode(CachedTranscript.self, from: data),
            envelope.schemaVersion == 2,
            Self.cleanSessionID(envelope.sessionID) == expectedSessionID {
-            return envelope.messages
+            return (envelope.messages, envelope.appliedTranscriptGeneration)
         }
         guard permitsLegacyArray else { return nil }
-        return try? decoder.decode([ChatMessage].self, from: data)
+        guard let legacy = try? decoder.decode([ChatMessage].self, from: data) else { return nil }
+        return (legacy, nil)
     }
 
     private func normalizedCachedMessages(_ saved: [ChatMessage]) -> [ChatMessage] {
@@ -280,11 +321,24 @@ final class ChatStore: ObservableObject {
     /// VoiceOutputController can speak it without the store importing AVFoundation.
     var onReply: ((String) -> Void)?
 
+    /// 2026-09-06: fired once per real session change, from the store's own
+    /// switch path. Dictation belongs to the conversation it was started in, and
+    /// ending it at each switch call site kept missing one — New Chat, a
+    /// removed pin, the conversation anchor. The surface that owns the
+    /// microphone subscribes; the store stays free of AVFoundation.
+    var onSessionChange: (() -> Void)?
+
     // N5 fix (R18): track placeholder indices by pending message ID so iCloud
     // replies can update the correct bubble when they arrive asynchronously.
     // MacBridgeClient is iCloud-only: sendMessage returns the sent message's ID; the reply arrives
     // via observeICloudReplies, which looks up and updates the placeholder here.
     var pendingICloudPlaceholders: [String: UUID] = [:]
+    /// 2026-09-06: the correlation ids of sends that have left the composer but
+    /// whose transport call has not returned yet. The phone mints the id before
+    /// the await, so a Stop pressed during the initial handoff can name the run
+    /// it is stopping instead of arriving unscoped — an unscoped Stop makes the
+    /// Mac cancel whatever holds the session, which may be somebody else's turn.
+    var inFlightSendIDs: Set<String> = []
     // Phase 14e-iCloud: per-message timeout tasks. Each entry maps a pending
     // message ID to the cancellable Task that will fire if no reply arrives.
     var pendingTimeouts: [String: Task<Void, Never>] = [:]
@@ -305,6 +359,29 @@ final class ChatStore: ObservableObject {
     var canceledPendingIds: Set<String> = []
     var timedOutPendingIds: [String: UUID] = [:]
     var resolvedICloudReplyIds: Set<String> = []
+    /// 2026-09-06: the message ids of the newest Mac transcript snapshot this
+    /// session has adopted. A bridge-resolved reply keeps the phone's
+    /// placeholder UUID forever (finishPlaceholder), so only these ids name a
+    /// row the Mac can actually find — regenerate replaces exactly one
+    /// persisted row by id and throws when the id names none.
+    var macPublishedMessageIDs: Set<UUID> = []
+    /// 2026-09-06: assistant ids removed locally for a regenerate. They are
+    /// deliberately absent until the Mac's replacement lands, which is exactly
+    /// the shape `newestMacAssistantReply`'s fallback reads as "the awaited
+    /// reply" — a stale snapshot would otherwise complete the regeneration
+    /// with the answer being replaced.
+    var regeneratedAwayAssistantIDs: Set<UUID> = []
+    /// 2026-09-06: the newest Mac transcript version applied per session. An
+    /// EMPTY published transcript is authority to clear the visible chat, so it
+    /// must be provably newer than what is on screen — two overlapping snapshot
+    /// reads can finish out of order, and the older one must not be allowed to
+    /// wipe a live transcript. Seeded from the persisted cache envelope on
+    /// load, so the watermark survives a relaunch.
+    var appliedTranscriptGenerations: [String: Int] = [:]
+    /// 2026-09-06: the store the visible chat is bound to, so the notification
+    /// delegate can tell a reply the user is already reading from one worth
+    /// alerting about. Nil whenever no chat surface is on screen.
+    static weak var visibleStore: ChatStore?
 
     static let resolvedPreserveWindowSeconds: TimeInterval = 15 * 60
     static let snapshotTruncationMarker = "[truncated for iPhone snapshot]"

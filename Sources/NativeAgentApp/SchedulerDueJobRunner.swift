@@ -103,6 +103,15 @@ actor SchedulerDueJobRunner {
     /// receipt. Activity evidence is not best-effort: if it cannot be written,
     /// subsequent scheduled effects stop rather than becoming unaccountable.
     var activityFeedError: String?
+    /// Consecutive failures to put a restart-reconciliation notice on record,
+    /// keyed by occurrence key. 2026-09-06: an unwritable notice used to abort
+    /// the whole pass, and since selection claims only the earliest due row the
+    /// next pass re-detected the same preserved claim and every later job
+    /// starved. The occurrence is deferred to the next pass instead, and after
+    /// `maxUnknownNoticeAttempts` the claim is released anyway so one broken
+    /// inbox cannot hold a job forever.
+    var unknownNoticeFailures: [String: Int] = [:]
+    static let maxUnknownNoticeAttempts = 3
     var running = false
     /// Bodies that crossed their caller-facing deadline but have not actually
     /// exited yet. A new scheduler pass must not overlap them.
@@ -219,13 +228,18 @@ actor SchedulerDueJobRunner {
         }
 
         var completedNames: [String] = []
+        // 2026-09-06: rows this pass cannot make progress on — a recovered
+        // claim whose notice would not write, or whose release failed. They are
+        // excluded from selection so the pass keeps reaching the other due jobs
+        // instead of re-detecting the same stuck row on every iteration.
+        var deferredJobIds: Set<String> = []
         // Claim exactly one occurrence immediately before its effect. Claiming
         // a whole batch would make later untouched rows look ambiguous if the
         // process crashed while executing the first row.
         for _ in 0..<max(1, maxJobs) {
             let claimed: ClaimedDueJobs
             do {
-                claimed = try await claimDueJobs(now: now, maxJobs: 1)
+                claimed = try await claimDueJobs(now: now, maxJobs: 1, excludingJobIds: deferredJobIds)
             } catch {
                 do {
                     try await appendActivity(
@@ -243,8 +257,40 @@ actor SchedulerDueJobRunner {
             // A durable claim left by a prior process means the effect may
             // have happened. Never blindly replay it.
             for recovery in claimed.recoveredUnknown {
-                guard await recordUnknownOccurrence(recovery) else {
-                    return completedNames
+                if await recordUnknownOccurrence(recovery) {
+                    unknownNoticeFailures.removeValue(forKey: recovery.occurrenceKey)
+                } else {
+                    // 2026-09-06: the notice did not write, so nothing is
+                    // released — but this pass is not over. Defer the row and
+                    // keep running the other due jobs. Once the same occurrence
+                    // has failed maxUnknownNoticeAttempts times, release the
+                    // claim anyway with a stderr line so an unwritable inbox
+                    // cannot pin a job's schedule indefinitely.
+                    let failures = (unknownNoticeFailures[recovery.occurrenceKey] ?? 0) + 1
+                    unknownNoticeFailures[recovery.occurrenceKey] = failures
+                    guard failures >= Self.maxUnknownNoticeAttempts else {
+                        deferredJobIds.insert(recovery.jobId)
+                        continue
+                    }
+                    FileHandle.standardError.write(Data(
+                        ("SchedulerDueJobRunner: releasing scheduler occurrence \(recovery.occurrenceKey) "
+                            + "on job \(recovery.jobId) after \(failures) failed reconciliation-notice "
+                            + "writes; the unknown outcome is recorded on the job row only.\n").utf8))
+                    unknownNoticeFailures.removeValue(forKey: recovery.occurrenceKey)
+                }
+                // The notice is on record (or has been given up on), so the
+                // claim may now be released and the job advanced. Doing it in
+                // the other order meant a failed notice write lost the
+                // reconciliation entirely.
+                do {
+                    try await settleUnknownOccurrence(recovery, now: now)
+                } catch {
+                    if activityFeedError == nil {
+                        activityFeedError = "Scheduler reconciliation could not release occurrence "
+                            + "\(recovery.occurrenceKey): \(error.localizedDescription)"
+                    }
+                    deferredJobIds.insert(recovery.jobId)
+                    continue
                 }
             }
             guard let job = claimed.jobs.first else {

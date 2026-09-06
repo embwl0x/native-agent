@@ -1233,17 +1233,29 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 return reference.addingTimeInterval(60)
             case "idle":
                 guard let minutes = Self.intField(cfg.config, "idle_minutes"), minutes > 0,
-                      let lastActivity = TriggerContentBuilder.lastActivityInstant(root: root)
+                      let lastActivity = TriggerContentBuilder.lastActivityInstant(
+                        root: root, reference: reference
+                      )
                 else { return nil }
                 let scheduled = lastActivity.addingTimeInterval(TimeInterval(minutes) * 60)
-                if let start = Self.intField(cfg.config, "quiet_start_hour"),
-                   let end = Self.intField(cfg.config, "quiet_end_hour"),
-                   Self.inQuietHours(scheduled, startHour: start, endHour: end) {
+                let crossing: Date
+                if scheduled > reference {
+                    crossing = scheduled
+                } else if let lastFired, lastFired >= scheduled {
                     return nil
+                } else {
+                    crossing = reference.addingTimeInterval(60)
                 }
-                if scheduled > reference { return scheduled }
-                if let lastFired, lastFired >= scheduled { return nil }
-                return reference.addingTimeInterval(60)
+                // 2026-09-06: quiet hours now gate DELIVERY, so the projection
+                // gates the crossing rather than the episode instant. A crossing
+                // inside quiet hours becomes the moment quiet hours end — the
+                // dueness check would refuse it until then, and a 60-second
+                // recovery crossing would otherwise re-wake the loop all night.
+                guard let start = Self.intField(cfg.config, "quiet_start_hour"),
+                      let end = Self.intField(cfg.config, "quiet_end_hour"),
+                      Self.inQuietHours(crossing, startHour: start, endHour: end)
+                else { return crossing }
+                return Self.quietHoursEnd(after: crossing, endHour: end)
             default:
                 return nil
             }
@@ -1267,9 +1279,14 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     ///
     ///   - `idle` — LIT (2026-07-09). The activity signal the old note said was
     ///     missing now exists: `max(updatedAt)` over `<root>/chat/sessions.json`
-    ///     (`TriggerContentBuilder.lastActivityInstant`). Eligible when
-    ///     `lastActivity + idle_minutes` has passed and that instant does NOT
-    ///     fall inside the configured quiet hours. Returning the EPISODE INSTANT
+    ///     and — 2026-09-06 — the human-presence stamp
+    ///     `<root>/activity_watch/last_input.json`, whichever is LATER, so an
+    ///     idle check-in waits for the person to leave the Mac and not merely
+    ///     for the chat to go quiet (`TriggerContentBuilder.lastActivityInstant`;
+    ///     an absent or stale stamp falls back to chat quiet alone). Eligible when
+    ///     `lastActivity + idle_minutes` has passed and NOW is not inside the
+    ///     configured quiet hours (2026-09-06: quiet hours gate delivery, not
+    ///     the instant the idle window opened). Returning the EPISODE INSTANT
     ///     (not now()) is what makes `claimIfDue` re-arm for free: it stamps
     ///     `last_fired_at = scheduled` and refuses to refire while
     ///     `last >= scheduled`, so one fire per idle episode — and a new user
@@ -1332,17 +1349,27 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 return nil
             }
             // No persisted activity signal ⇒ idleness is unknowable ⇒ stay dark.
-            guard let last = TriggerContentBuilder.lastActivityInstant(root: root) else {
+            // `current` is hoisted above the read because the presence stamp's
+            // staleness is judged against this same instant.
+            let current = now()
+            guard let last = TriggerContentBuilder.lastActivityInstant(
+                root: root, reference: current
+            ) else {
                 return nil
             }
             let scheduled = last.addingTimeInterval(TimeInterval(minutes) * 60)
-            guard now() >= scheduled else { return nil }
-            // Quiet hours suppress the EPISODE, not the tick: an episode whose
-            // instant lands at 02:00 never fires, and never accumulates either
-            // (the claim isn't stamped, so a later episode is still eligible).
+            guard current >= scheduled else { return nil }
+            // Quiet hours suppress DELIVERY, and delivery happens now — not at
+            // the instant the idle window opened (2026-09-06). Testing the
+            // scheduled instant got it wrong in both directions: an episode that
+            // came due at 22:50 fired at 03:00 because 22:50 is not quiet, and
+            // one that came due at 23:10 stayed suppressed at 09:00 because
+            // 23:10 is. Nothing accumulates either way: a suppressed tick stamps
+            // no claim, so the same episode is still eligible when quiet hours
+            // end.
             if let start = Self.intField(cfg.config, "quiet_start_hour"),
                let end = Self.intField(cfg.config, "quiet_end_hour"),
-               Self.inQuietHours(scheduled, startHour: start, endHour: end) {
+               Self.inQuietHours(current, startHour: start, endHour: end) {
                 return nil
             }
             return scheduled
@@ -1355,6 +1382,26 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// endHour` (the default 23→08). Out-of-range or equal bounds mean "no
     /// quiet hours configured" rather than "always quiet" — a misconfiguration
     /// must not silence a trigger forever.
+    /// The next local `endHour:00` strictly after `date` — the first instant a
+    /// quiet-hours-suppressed episode can be delivered. Only meaningful when
+    /// `inQuietHours` already said yes, which is also what proves the bounds
+    /// are in range.
+    static func quietHoursEnd(after date: Date, endHour: Int) -> Date? {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone.current
+        var components = DateComponents()
+        components.hour = endHour
+        components.minute = 0
+        components.second = 0
+        return cal.nextDate(
+            after: date,
+            matching: components,
+            matchingPolicy: .nextTime,
+            repeatedTimePolicy: .first,
+            direction: .forward
+        )
+    }
+
     static func inQuietHours(_ date: Date, startHour: Int, endHour: Int) -> Bool {
         guard (0...23).contains(startHour), (0...23).contains(endHour),
               startHour != endHour else { return false }

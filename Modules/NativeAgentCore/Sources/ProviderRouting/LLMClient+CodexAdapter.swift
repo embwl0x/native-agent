@@ -285,7 +285,12 @@ public final class CodexAdapter: LLMAdapter {
         self.processEnvironmentOverride = processEnvironmentOverride ?? Self.augmentedProcessEnvironment()
     }
 
-    static func augmentedProcessEnvironment(
+    /// Public so a caller that must inject its own environment (a bound
+    /// CODEX_HOME, a secondary runtime's root) can build ON TOP of the PATH
+    /// repair rather than replacing it — an injected environment skips the
+    /// augmentation below, and a GUI-launched app's PATH cannot find `codex`
+    /// (User, 2026-09-06).
+    public static func augmentedProcessEnvironment(
         base: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
         var environment = base
@@ -308,16 +313,12 @@ public final class CodexAdapter: LLMAdapter {
     }
 
     public func complete(prompt: String, system: String?, model: String) async throws -> String {
-        var args = Self.arguments(model: model)
-        if let sys = system, !sys.isEmpty {
-            // codex CLI accepts --system on its prompt-mode invocation.
-            args.append(contentsOf: ["--system", sys])
-        }
+        let args = Self.arguments(model: model)
         let terminator = CodexTerminator()
         let invocation = CodexProcessInvocation(
             executable: codexBin,
             arguments: args,
-            stdin: prompt,
+            stdin: Self.composedPrompt(system: system, prompt: prompt),
             timeout: timeout,
             terminator: terminator,
             environment: processEnvironmentOverride
@@ -374,25 +375,55 @@ public final class CodexAdapter: LLMAdapter {
     static func classifyCodexFailure(exitCode: Int32, stdout: String, stderr: String) -> LLMError {
         let hay = (stderr + "\n" + stdout).lowercased()
         let detail = boundedCodexTail(stderr.isEmpty ? stdout : stderr)
+        // User, 2026-09-06: a bare "401" / "403" / "429" ANYWHERE in the CLI's
+        // output used to be auth or rate-limit evidence, so a stderr dump that
+        // merely contained those three digits — a token count, a port, a
+        // session id, a path, a duration — told the user to sign in again on a
+        // turn that had failed for an unrelated reason. A status code now
+        // counts only where it can only mean an HTTP status (the recovery
+        // ladder's own anchored extraction), and the prose signatures match
+        // whole phrases instead of raw substrings.
+        if let status = ProviderRecoveryPolicy.httpStatusCode(inDescription: hay) {
+            if status == 401 || status == 403 {
+                return .authRejected(provider: "codex", detail: detail.isEmpty ? nil : detail)
+            }
+            if ProviderRecoveryPolicy.isRecoverableStatus(status) {
+                return .transient(
+                    message: "codex: \(detail.isEmpty ? "HTTP \(status)" : detail)")
+            }
+        }
         let authSignatures = [
             "not logged in", "please log in", "log in with", "login required",
-            "please run codex login", "codex login", "unauthorized", "401",
+            "please run codex login", "codex login", "unauthorized",
             "authentication", "auth error", "token expired", "expired token",
             "invalid api key", "invalid token", "no api key", "missing api key",
-            "re-authenticate", "reauthenticate", "sign in", "forbidden", "403",
+            "re-authenticate", "reauthenticate", "sign in", "forbidden",
         ]
-        if authSignatures.contains(where: { hay.contains($0) }) {
+        if authSignatures.contains(where: { containsWholePhrase($0, in: hay) }) {
             return .authRejected(provider: "codex", detail: detail.isEmpty ? nil : detail)
         }
         let rateSignatures = [
-            "rate limit", "rate_limit", "429", "too many requests", "overloaded",
-            "temporarily unavailable", "status 503", "status 502", "status 504",
-            "try again later",
+            "rate limit", "rate_limit", "too many requests", "overloaded",
+            "temporarily unavailable", "try again later",
         ]
-        if rateSignatures.contains(where: { hay.contains($0) }) {
+        if rateSignatures.contains(where: { containsWholePhrase($0, in: hay) }) {
             return .transient(message: "codex: \(detail.isEmpty ? "rate limited" : detail)")
         }
         return .underlying(message: detail.isEmpty ? "codex exited \(exitCode)" : detail)
+    }
+
+    /// Whole-phrase containment on an already-lowercased haystack: the phrase
+    /// must sit on alphanumeric boundaries, so "sign in" cannot fire inside
+    /// "design internals" and "auth error" cannot fire inside a longer word.
+    static func containsWholePhrase(_ phrase: String, in haystack: String) -> Bool {
+        let escaped = NSRegularExpression.escapedPattern(for: phrase)
+        guard let regex = try? NSRegularExpression(
+            pattern: "(?<![a-z0-9])\(escaped)(?![a-z0-9])"
+        ) else {
+            return haystack.contains(phrase)
+        }
+        let range = NSRange(haystack.startIndex..<haystack.endIndex, in: haystack)
+        return regex.firstMatch(in: haystack, range: range) != nil
     }
 
     /// Bounded tail of CLI failure text (last `max` chars, trimmed). Keeps the
@@ -416,15 +447,12 @@ public final class CodexAdapter: LLMAdapter {
         system: String?,
         model: String
     ) -> AsyncThrowingStream<String, Error> {
-        var args = Self.arguments(model: model)
-        if let sys = system, !sys.isEmpty {
-            args.append(contentsOf: ["--system", sys])
-        }
+        let args = Self.arguments(model: model)
         let terminator = CodexTerminator()
         let invocation = CodexProcessInvocation(
             executable: codexBin,
             arguments: args,
-            stdin: prompt,
+            stdin: Self.composedPrompt(system: system, prompt: prompt),
             timeout: timeout,
             terminator: terminator,
             environment: processEnvironmentOverride
@@ -465,8 +493,17 @@ public final class CodexAdapter: LLMAdapter {
         }
     }
 
+    /// User, 2026-09-06: `exec` is the non-interactive subcommand. Without it
+    /// these args launched the interactive TUI, which never reads a piped
+    /// prompt and never exits — every codex turn hung until the timeout.
+    /// `--skip-git-repo-check` is required because this adapter passes no
+    /// `-C` and the app's cwd is "/" once launchd/Sparkle has execve'd it;
+    /// `codex exec` otherwise refuses with "Not inside a trusted directory".
+    /// `--color never` keeps ANSI escapes out of the streamed stdout. Verified
+    /// against codex v0.153.2 (`codex exec --help`); its stdout carries only
+    /// the agent's final message, all banners go to stderr.
     private static func arguments(model: String) -> [String] {
-        var args: [String] = []
+        var args: [String] = ["exec", "--color", "never", "--skip-git-repo-check"]
         if let effort = OpenAIExecutionControls.reasoningEffort(
             model: model,
             requested: LLMCallContext.reasoningEffort,
@@ -483,6 +520,17 @@ public final class CodexAdapter: LLMAdapter {
         }
         args.append(contentsOf: ["-m", model])
         return args
+    }
+
+    /// User, 2026-09-06: the codex CLI has no `--system` flag on any surface
+    /// (`codex --help` / `codex exec --help`, v0.153.2), so appending one made
+    /// the process exit on an unrecognised argument and the system prompt was
+    /// silently lost besides. Fold it into the prompt that goes over stdin.
+    static func composedPrompt(system: String?, prompt: String) -> String {
+        guard let system,
+              !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return prompt }
+        return system + "\n\n" + prompt
     }
 
     /// Real-Process streaming runner. Spawns `codex` with the given args, pipes
@@ -725,14 +773,33 @@ public final class CodexAdapter: LLMAdapter {
                 }
             }
 
-            @Sendable func readAll(_ pipe: Pipe) -> Data {
-                var collected = Data()
-                while true {
-                    let chunk = pipe.fileHandleForReading.availableData
-                    if chunk.isEmpty { break }
-                    collected.append(chunk)
-                }
-                return collected
+            // User, 2026-09-06: drain stdout/stderr CONCURRENTLY from before
+            // run(), the way the streaming runner already does. Reading them
+            // only inside the terminationHandler deadlocked on the child's own
+            // pipes: `codex` writing more than the 64 KiB pipe buffer blocked
+            // in write(), so it never exited, so the handler that would have
+            // drained it never ran — the turn hung until the timeout and then
+            // returned truncated output.
+            let stdoutBuf = LockBox(Data())
+            let stderrBuf = LockBox(Data())
+            let stdoutReader = NonblockingPipeReader(
+                fileDescriptor: outPipe.fileHandleForReading.fileDescriptor
+            ) { data in stdoutBuf.mutate { $0.append(data) } }
+            let stderrReader = NonblockingPipeReader(
+                fileDescriptor: errPipe.fileHandleForReading.fileDescriptor
+            ) { data in stderrBuf.mutate { $0.append(data) } }
+            stdoutReader.start()
+            stderrReader.start()
+
+            @Sendable func collectedResult(exitCode: Int32, timedOut: Bool) -> CodexProcessResult {
+                stdoutReader.stopAndWait()
+                stderrReader.stopAndWait()
+                return CodexProcessResult(
+                    exitCode: exitCode,
+                    stdout: String(data: stdoutBuf.get(), encoding: .utf8) ?? "",
+                    stderr: String(data: stderrBuf.get(), encoding: .utf8) ?? "",
+                    timedOut: timedOut
+                )
             }
 
             // Late-bound timeout slot — the DispatchWorkItem is created after
@@ -748,21 +815,27 @@ public final class CodexAdapter: LLMAdapter {
             // consumer hangs forever waiting on cont.resume).
             proc.terminationHandler = { p in
                 timeoutSlot.get()?.cancel()
-                let out = readAll(outPipe)
-                let err = readAll(errPipe)
-                finish {
-                    .success(CodexProcessResult(
-                        exitCode: p.terminationStatus,
-                        stdout: String(data: out, encoding: .utf8) ?? "",
-                        stderr: String(data: err, encoding: .utf8) ?? "",
-                        timedOut: false
-                    ))
-                }
+                let result = collectedResult(exitCode: p.terminationStatus, timedOut: false)
+                try? outPipe.fileHandleForReading.close()
+                try? errPipe.fileHandleForReading.close()
+                finish { .success(result) }
             }
 
             do {
                 try proc.run()
+                // Drop the parent's copies of the child ends so the readers
+                // actually see EOF when the child exits (same as the
+                // streaming runner).
+                try? inPipe.fileHandleForReading.close()
+                try? outPipe.fileHandleForWriting.close()
+                try? errPipe.fileHandleForWriting.close()
             } catch {
+                stdoutReader.stopAndWait()
+                stderrReader.stopAndWait()
+                try? inPipe.fileHandleForReading.close()
+                try? inPipe.fileHandleForWriting.close()
+                try? outPipe.fileHandleForWriting.close()
+                try? errPipe.fileHandleForWriting.close()
                 finish { .failure(error) }
                 return
             }
@@ -777,42 +850,53 @@ public final class CodexAdapter: LLMAdapter {
                 }
             }
 
-            // Write stdin then close so codex sees EOF.
-            if let data = inv.stdin.data(using: .utf8) {
-                try? inPipe.fileHandleForWriting.write(contentsOf: data)
-            }
-            try? inPipe.fileHandleForWriting.close()
-
             // Timeout enforcer — late-bound and published into timeoutSlot so
             // the pre-run() terminationHandler can cancel it on clean exit.
-            // Fast-exit guard: skip scheduling if the handler already resumed.
-            if resumed.get() { return }
-            let timeoutWork = DispatchWorkItem {
-                if proc.isRunning {
-                    proc.terminate()
-                    let out = readAll(outPipe)
-                    let err = readAll(errPipe)
-                    finish {
-                        .success(CodexProcessResult(
-                            exitCode: -1,
-                            stdout: String(data: out, encoding: .utf8) ?? "",
-                            stderr: String(data: err, encoding: .utf8) ?? "",
-                            timedOut: true
-                        ))
+            // Fast-exit guards: skip scheduling if the handler already resumed.
+            //
+            // User, 2026-09-06: armed BEFORE the stdin write is handed off. The
+            // write blocks once the prompt exceeds the pipe buffer, and it is
+            // the timeout that terminates the child and unblocks it — so the
+            // blocking work must never be in flight while the thing that
+            // rescues it is still unscheduled. Both run on the global pool,
+            // and dispatching the blocking side first is how a saturated pool
+            // ends up with writers waiting on a timeout that has no thread to
+            // run on.
+            func armTimeout() {
+                if resumed.get() { return }
+                let timeoutWork = DispatchWorkItem {
+                    if proc.isRunning {
+                        proc.terminate()
+                        let result = collectedResult(exitCode: -1, timedOut: true)
+                        finish { .success(result) }
                     }
                 }
+                if resumed.get() {
+                    timeoutWork.cancel()
+                    return
+                }
+                timeoutSlot.mutate { $0 = timeoutWork }
+                if resumed.get() {
+                    timeoutSlot.mutate { $0 = nil }
+                    timeoutWork.cancel()
+                    return
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + inv.timeout, execute: timeoutWork)
             }
-            if resumed.get() {
-                timeoutWork.cancel()
-                return
+            armTimeout()
+
+            // User, 2026-09-06: write stdin OFF this thread. A prompt larger
+            // than the pipe buffer blocks here until the child reads it, and
+            // the timeout was scheduled only after the write returned — so the
+            // one case that needs the timeout was the one case that never got
+            // one. The write runs on its own queue, after the timeout above is
+            // installed.
+            DispatchQueue.global(qos: .userInitiated).async {
+                if let data = inv.stdin.data(using: .utf8) {
+                    try? inPipe.fileHandleForWriting.write(contentsOf: data)
+                }
+                try? inPipe.fileHandleForWriting.close()
             }
-            timeoutSlot.mutate { $0 = timeoutWork }
-            if resumed.get() {
-                timeoutSlot.mutate { $0 = nil }
-                timeoutWork.cancel()
-                return
-            }
-            DispatchQueue.global().asyncAfter(deadline: .now() + inv.timeout, execute: timeoutWork)
         }
     }
 }

@@ -57,6 +57,19 @@ struct ChatQueuedTurnsView: View {
                     .font(.system(size: 10, weight: .bold, design: .rounded))
                     .foregroundStyle(.secondary)
 
+                // 2026-09-06: a queued turn that failed to start paused the
+                // queue and said nothing. The rejection's own words go here.
+                if let reason = appModel.chatQueuePauseReason(sessionId) {
+                    Text(reason)
+                        .font(NativeAgentFont.tag)
+                        .foregroundStyle(NativeAgentTheme.fail)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(1)
+                        .help(reason)
+                        .accessibilityLabel("Queue paused: \(reason)")
+                }
+
                 Text(next.preview)
                     .font(NativeAgentFont.tag)
                     .lineLimit(1)

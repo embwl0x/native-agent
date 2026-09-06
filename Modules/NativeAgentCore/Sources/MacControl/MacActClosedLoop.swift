@@ -280,6 +280,68 @@ public enum MacActClosedLoop {
     /// Whether `type` has any business on this element.
     public static func canType(role: String) -> Bool { typeableRoles.contains(role) }
 
+    // MARK: - Secure keyboard entry (sweep item 8)
+
+    /// A named refusal for a synthesized-input site: the machine-readable
+    /// reason plus the sentence the caller is owed. Same shape and same job as
+    /// `KeyWindowRefusal` — this is the second thing that eats keystrokes.
+    public struct SecureInputRefusal: Equatable, Sendable {
+        public let reason: String
+        public let note: String
+        public init(reason: String, note: String) {
+            self.reason = reason
+            self.note = note
+        }
+    }
+
+    /// Roles that hold a SECRET. `AXSecureTextField` stays in `typeableRoles`
+    /// deliberately: the answer to "type into a password field" is not the
+    /// generic `verb_not_supported_on_element` shrug the non-editable roles
+    /// get, it is a refusal that says what the element is and why I stopped.
+    public static let secureFieldRoles: Set<String> = ["AXSecureTextField"]
+
+    public static func isSecureField(role: String) -> Bool {
+        secureFieldRoles.contains(role)
+    }
+
+    public static let secureFieldReason = "secure_field_target"
+    public static let secureInputReason = "secure_input_active"
+
+    /// `type` aimed at a password field. A deliberate boundary, not a
+    /// mechanism failure: even where AXSetValue would carry it, filling
+    /// someone's password box is not an act I take on my own.
+    public static func secureFieldRefusal(role: String) -> SecureInputRefusal? {
+        guard isSecureField(role: role) else { return nil }
+        return SecureInputRefusal(
+            reason: secureFieldReason,
+            note: "That field is a password field (\(role)) — a secure text field. I do not type "
+                + "into one: macOS turns on secure keyboard entry for it, so my keystrokes would "
+                + "be swallowed anyway, and filling a credential box is yours to do, not mine. "
+                + "Type it yourself and tell me when to carry on."
+        )
+    }
+
+    /// Secure keyboard entry is ON somewhere on this Mac (a focused password
+    /// field, `sudo` in Terminal, 1Password's own window). While it is on the
+    /// window server does not deliver synthesized keystrokes to ANY app — the
+    /// characters simply never arrive, and the closed loop then reports "the
+    /// fresh screen did not visibly change" without ever naming the cause.
+    ///
+    /// `active` is measured, never assumed: false ⇒ no refusal, so this cannot
+    /// become a standing block on typing.
+    public static func secureInputRefusal(active: Bool) -> SecureInputRefusal? {
+        guard active else { return nil }
+        return SecureInputRefusal(
+            reason: secureInputReason,
+            note: "Something on this Mac has secure keyboard entry on — my typing would go "
+                + "nowhere. macOS routes keystrokes past every synthetic source while that is "
+                + "true, so I did not post anything rather than posting into a void and calling "
+                + "the unchanged screen a mystery. It is usually a focused password field, a "
+                + "`sudo` prompt in Terminal, or a password manager window. Dismiss or unfocus "
+                + "that, and ask me again."
+        )
+    }
+
     /// Labels a modal's dismiss button is allowed to carry, lowercased.
     /// Ordered: the least destructive answer first, so a sheet offering both
     /// "Cancel" and "OK" is cancelled rather than confirmed.

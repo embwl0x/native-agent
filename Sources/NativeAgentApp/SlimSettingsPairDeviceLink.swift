@@ -6,10 +6,17 @@ import Foundation
 enum SlimSettingsNavigationDestination: Hashable, Sendable {
     case pairDevice
     case telegram
+    /// ui-simplify 2026-09-02 (Lane A): the setup pages and the old Advanced
+    /// tree moved off the sidebar and behind ONE door in Settings. The route
+    /// carries the same `SidebarItem` the sidebar used, so a page has exactly
+    /// one identity whether it is reached from here, from ⌘K, or from a deep
+    /// link — and the destination renders the same view it always did.
+    case advanced(SidebarItem)
 
     enum Content: Hashable, Sendable {
         case macPairing
         case telegramSettings
+        case advancedPage(SidebarItem)
     }
 
     var content: Content {
@@ -18,6 +25,8 @@ enum SlimSettingsNavigationDestination: Hashable, Sendable {
             .macPairing
         case .telegram:
             .telegramSettings
+        case .advanced(let item):
+            .advancedPage(item)
         }
     }
 }

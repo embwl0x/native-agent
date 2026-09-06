@@ -275,8 +275,32 @@ extension NativeClient {
         let current = try await persistence.withFileLock(path) {
             await persistence.readJSON(path, defaultValue: .array([]))
         }
+        // Fable 5.1 item 49 — health DECAYS. The overlay below derives "ok" from
+        // credential PRESENCE (a token file, a saved config), which proves a
+        // sign-in once completed, not that the integration works now. This
+        // layer asks the connector-action receipt ledger whether a real,
+        // non-dry-run call has succeeded lately and downgrades an unproven
+        // green to "unverified" — a clock, never a probe. Only rows the overlay
+        // stamped as credential-proved are eligible: a local readiness claim
+        // (Telegram's configured bot, EventKit's granted calendar permission)
+        // has no receipt stream that could ever refresh it, so decaying it
+        // would swap one lie for another. It is applied HERE,
+        // on the list read that feeds both the Connectors view and the phone
+        // projection, and deliberately NOT on the mutation path's readiness
+        // gate (NativeClient+RegistryMutations), which asks a different
+        // question: may this connector be enabled at all.
+        let proof = ConnectorProofLedger.lastSuccessByConnector(root: root)
+        let decayNow = Date()
         let rows = connectorRows(from: current)
             .map { connectorRowWithRuntimeOverlay($0, root: root) }
+            .map { row -> [String: JSONValue] in
+                let family = ConnectorProofLedger.canonicalID(connectorString(row["id"]) ?? "")
+                return ConnectorHealthDecay.apply(
+                    to: row,
+                    lastSuccessAt: proof[family],
+                    now: decayNow
+                )
+            }
         let data = try JSONValue.array(rows.map { .object($0) }).serializedData(pretty: false)
         return try decodeLossyArray(data, context: "getConnectors(swift registry)")
     }
@@ -383,6 +407,11 @@ extension NativeClient {
         }
         var out = row
         out["id"] = .string(id)
+        // Health decay eligibility is DERIVED here, never carried in from the
+        // registry file: a hand-edited row must not be able to claim (or
+        // disclaim) credential proof. Cleared first, stamped below only on the
+        // branches whose green comes from a token/credential being present.
+        out.removeValue(forKey: ConnectorHealthDecay.proofSourceKey)
         if connectorString(out["name"])?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
             out["name"] = .string(defaultConnectorName(id))
         }
@@ -393,6 +422,10 @@ extension NativeClient {
             out["description"] = .string("")
         }
 
+        // NO credential-proof stamp below: Telegram's green is a LOCAL
+        // readiness claim (a configured bot the poll loop owns), and it never
+        // emits a connector-action receipt, so decay could only ever downgrade
+        // it and never restore it. Same for the EventKit calendar branch.
         if id == "telegram" {
             if let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root), !cfg.botToken.isEmpty {
                 out["enabled"] = .bool(cfg.enabled)
@@ -480,6 +513,7 @@ extension NativeClient {
             if metadataExists {
                 out["authState"] = .string("connected")
                 out["healthStatus"] = .string("ok")
+                markCredentialProof(&out)
             } else {
                 out["enabled"] = .bool(false)
                 out["authState"] = .string("not_connected")
@@ -496,6 +530,7 @@ extension NativeClient {
                 out["enabled"] = .bool(true)
                 out["authState"] = .string("connected")
                 out["healthStatus"] = .string("ok")
+                markCredentialProof(&out)
             } else {
                 out["enabled"] = .bool(false)
                 out["authState"] = .string("not_connected")
@@ -519,6 +554,7 @@ extension NativeClient {
                 out["enabled"] = .bool(true)
                 out["authState"] = .string("connected")
                 out["healthStatus"] = .string("ok")
+                markCredentialProof(&out)
                 return out
             }
             let existingAuth = connectorString(out["authState"])?.lowercased()
@@ -553,6 +589,7 @@ extension NativeClient {
                 // promote regardless of a stale needs_probe / unverified flag.
                 out["authState"] = .string("connected")
                 out["healthStatus"] = .string("ok")
+                markCredentialProof(&out)
             } else {
                 // No token: honor the honest-disconnected freeze if set.
                 if existingAuth == "connected_unverified" || existingHealth == "needs_probe" {
@@ -574,6 +611,14 @@ extension NativeClient {
             applySlackRuntimeStateFeed(to: &out, root: root)
         }
         return out
+    }
+
+    /// Stamp the decay-eligibility bit on a row whose green was just derived
+    /// from a token/credential being present on disk. `ConnectorHealthDecay`
+    /// decays exactly these rows and leaves every other green alone.
+    private static func markCredentialProof(_ row: inout [String: JSONValue]) {
+        row[ConnectorHealthDecay.proofSourceKey] =
+            .string(ConnectorHealthDecay.credentialProofSource)
     }
 
     /// Keep credential readiness and Socket Mode evidence separate. Slack can
@@ -614,15 +659,15 @@ extension NativeClient {
             if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
                recovery.hasQuarantinedEvidence {
                 row["runtimeStatus"] = .string("recovery_quarantined")
-                row["runtimeDetail"] = .string("A damaged Slack delivery journal was moved aside (.stale-<ts>) and a fresh one started; intake is running again. Accepted-but-undelivered replies may only exist in that file — ask Agent to inspect it before any manual retry.")
+                row["runtimeDetail"] = .string("A damaged Slack delivery journal was moved aside (.stale-<ts>) and a fresh one started; intake is running again. Accepted-but-undelivered replies may only exist in that file — ask \(AgentVoice.live.subject) to inspect it before any manual retry.")
             } else if let recovery = try SlackInboundDeliveryJournal.recoverySummary(dataRoot: root),
                       recovery.pendingCount > 0 {
                 if recovery.isAtCapacity {
                     row["runtimeStatus"] = .string("intake_paused")
-                    row["runtimeDetail"] = .string("\(recovery.pendingCount) pending replies; new message intake is paused. \(recovery.unknownCount) need recovery. Ask Agent to inspect Slack delivery recovery before any manual retry; nothing is automatically discarded or resent.")
+                    row["runtimeDetail"] = .string("\(recovery.pendingCount) pending replies; new message intake is paused. \(recovery.unknownCount) need recovery. Ask \(AgentVoice.live.subject) to inspect Slack delivery recovery before any manual retry; nothing is automatically discarded or resent.")
                 } else if recovery.unknownCount > 0 {
                     row["runtimeStatus"] = .string("recovery_required")
-                    row["runtimeDetail"] = .string("\(recovery.unknownCount) replies have an unknown outcome (\(recovery.pendingCount) pending). Ask Agent to inspect Slack delivery recovery before any manual retry; automatic resend is paused.")
+                    row["runtimeDetail"] = .string("\(recovery.unknownCount) replies have an unknown outcome (\(recovery.pendingCount) pending). Ask \(AgentVoice.live.subject) to inspect Slack delivery recovery before any manual retry; automatic resend is paused.")
                 } else {
                     let detail = connectorString(row["runtimeDetail"]) ?? ""
                     row["runtimeDetail"] = .string("\(detail) \(recovery.pendingCount) accepted replies are pending delivery.")
@@ -630,7 +675,7 @@ extension NativeClient {
             }
         } catch {
             row["runtimeStatus"] = .string("recovery_unavailable")
-            row["runtimeDetail"] = .string("Slack delivery recovery state cannot be read safely. New message intake may be paused; ask Agent to inspect it before retrying.")
+            row["runtimeDetail"] = .string("Slack delivery recovery state cannot be read safely. New message intake may be paused; ask \(AgentVoice.live.subject) to inspect it before retrying.")
         }
     }
 

@@ -1,11 +1,26 @@
 # Canonical data paths — Path C
 
-Single source of truth for every on-disk file the Swift-native runtime reads or
-writes. Every resolver in `Modules/NativeAgentCore/Sources/` and
-`Sources/NativeAgentApp/` MUST land on a path in the CANONICAL table below; the
-LEGACY table lists retired paths that must not be read or recreated at runtime.
+**Scope, honestly stated (revised 2026-09-01, sweep item 21).** This document
+used to open with "single source of truth for every on-disk file the Swift-native
+runtime reads or writes" and then list fourteen paths. The live data root holds
+96 visible top-level entries; 89 of them are named by a Swift path resolver.
+Nothing enforced the claim — no test, no lint, no Doctor check — so it was an
+aspiration written in the present tense.
 
-## CANONICAL
+What this document actually is:
+
+1. **CANONICAL STORES** — the paths where a *choice of location* is load-bearing
+   (a store that was migrated, split, or that has a tempting wrong sibling).
+   A resolver that lands somewhere else for one of these subsystems is a bug.
+2. **TOP-LEVEL MAP** — every top-level name under `<dataRoot>`, marked live or
+   residue, so a reader can tell a working store from a fossil without grepping.
+3. **LEGACY** — retired paths that must not be read or recreated at runtime.
+
+It is **not** enforced, and until something enforces it, it must not be cited as
+proof that a path is the only one in use. Ground-truth a path claim against
+`Sources/` and `Modules/NativeAgentCore/Sources/`.
+
+## CANONICAL STORES
 
 | Path                                 | Rationale                                                                                              |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------ |
@@ -23,6 +38,55 @@ LEGACY table lists retired paths that must not be read or recreated at runtime.
 | `<dataRoot>/cognition/organism_state.json` | Bounded optional Organism Kernel continuity.                                                     |
 | `<dataRoot>/workshop/`               | Desk/Workshop execution state, triggers, migrations, and unified receipts.                             |
 | `<dataRoot>/turn_traces/<day>.jsonl` | Bounded authoritative per-turn inspection ledger.                                                      |
+| `<dataRoot>/runs/runs.json`          | The run ledger `RunLedger` owns. **Not** `runs.jsonl` — that sibling has never had a writer or a reader; see LEGACY. |
+| `<dataRoot>/work_journal/latest.json` | The whole Codex work-journal feed. The `codex_daily.jsonl` sibling append was retired 2026-09-01; see LEGACY. |
+
+## TOP-LEVEL MAP
+
+Every name directly under `<dataRoot>`, as of 2026-09-01. "Live" means at least
+one Swift path resolver in `Sources/` or `Modules/NativeAgentCore/Sources/`
+names it; it does **not** claim the subsystem is healthy or that the feed has a
+consumer. Re-derive this list rather than trusting it after a big change.
+
+**Live (89)** — named by a Swift path resolver.
+`activity`, `activity_watch`, `archive`, `backups`, `browser_ipc.json`,
+`browser_ipc_token`, `builder_audit`, `capabilities`, `catalog`, `chat`,
+`codex_home`, `cognition`, `cognition.sqlite`, `config`, `connectors`,
+`context`, `crash_reports`, `cutover`, `desk`, `disabled`, `doctor`,
+`dream_diary`, `embeddings`, `evals`, `evolution`, `extras`, `from_codex`,
+`from_claude`, `generated_images`, `graphs`, `harness`, `heartbeat`, `icloud`,
+`icloud_pairing_secret.bin`, `improvements`, `inbox`, `living_fabric`, `llm`,
+`logs`, `mac_control`, `mac_control_audit.jsonl`,
+`mac_control_bridge_audit.jsonl`, `macctl_bridge.json`, `mcp`, `memory`,
+`mobile`, `mobile_push`, `mobile_snapshot_cache`, `native_power`,
+`nativeagent-codex-login.command`, `nextgen`, `notifications`, `notify`,
+`oauth_tokens`, `onboarding`, `orchestration`, `personal_os`, `production`,
+`providers`, `release`, `rem_pins.json`, `rem_proposals.jsonl`, `research`,
+`restart_audit`, `rich_ui`, `routing`, `runs`, `scheduler`, `scratch`,
+`secrets`, `security`, `self_improvement`, `self_worktrees`, `skills`, `slack`,
+`studio`, `swarms`, `telegram`, `telemetry`, `tools`, `traces`,
+`training_journal`, `triggers`, `trust`, `turn_traces`, `user_prefs.json`,
+`work_journal`, `workflows`, `workshop`.
+
+Being on that list does NOT mean the subsystem is healthy, that the store is
+bounded, or that its feed has a consumer. Several live names are retired
+subsystems whose paths still resolve (`disabled`, `living_fabric`, `nextgen`,
+`cutover`), which is exactly the shadow-tree hazard this map exists to expose.
+
+**Lock sidecars (2).** `icloud_pairing_secret.bin.lock`,
+`rem_proposals.jsonl.lock` — created by `withFileLock`, not stores.
+
+**Residue (5)** — no Swift path resolver names these. Nothing reads or writes
+them; they are left over from retired subsystems or external tooling.
+`calibration`, `consolidation_last_run.txt`, `oauth_apps`, `public_sync`,
+`watched`.
+
+`extras/hf_cache` (nested residue) is additionally tripwired: the daily
+disk-hygiene scan reports it at any size
+(`DataRootDiskHygiene.residueRelativePrefixes`). It held 87 MB of HuggingFace
+MiniLM cache that was exempt from every size tier on the claim that deleting it
+"would only force a re-download" — false since the CoreML cutover, which moved
+the live embedder to `Bundle.module/minilm.mlpackage`.
 
 ## LEGACY (backup-only, never read at runtime)
 
@@ -32,3 +96,7 @@ LEGACY table lists retired paths that must not be read or recreated at runtime.
 | `<dataRoot>/memory/USER.md`                   | `<personaRoot>/USER.md`              | Old persona-root fallback. Resolvers no longer fall back here.            |
 | `<dataRoot>/persona/Agent/USER.md`            | `<personaRoot>/USER.md`              | Retired split MemoryV2 projection. USER belongs with the rest of Agent's persona docs. |
 | `<dataRoot>/config/config.json` `["telegram"]`| `telegram/config.json`               | Migrated once on first `loadFromDisk`; never read after the copy.         |
+| `<dataRoot>/runs/runs.jsonl`                  | `runs/runs.json`                     | Never had a writer OR a reader — an orphan filename one letter off the live ledger. A 4 MB fossil, last touched 2026-06-01, deleted 2026-09-01. Its `data-bounds.md` retention row was likewise fictional and is gone. |
+| `<dataRoot>/work_journal/codex_daily.jsonl`   | `work_journal/latest.json`           | Write-only: the writer appended the full 11.2 KB snapshot uncapped, and the only consumer read the sibling `latest.json` written on the next line. Append retired 2026-09-01; existing rows stay as history. |
+| `<dataRoot>/mobile_push/receipts.jsonl`       | the returned `SwiftNativeAPNSReceipt` | Write-only: 1,550 rows of APNs delivery evidence no production code read back. Append retired 2026-09-01; the receipt is returned to the caller, where every live decision about a send is made. |
+| `<dataRoot>/logs/delivery_envelope_telemetry.jsonl` | in-memory `lastDeliveryEnvelopeTelemetryRow` | Write-only: 471 rows measuring a staged decision nothing consumed. Append retired 2026-09-01; the envelope computation and its staged-ship contract are unchanged. |

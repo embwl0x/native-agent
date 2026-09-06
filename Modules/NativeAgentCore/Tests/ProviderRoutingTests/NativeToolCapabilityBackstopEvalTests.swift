@@ -82,19 +82,28 @@ struct NativeToolCapabilityBackstopEvalTests {
     }
 
     /// Cross-seam agreement: the model backstop and the provider predicate are
-    /// two answers to the same question. Every catalog id the backstop admits
-    /// must belong to a provider the provider-predicate also admits, and the
-    /// provider predicate must admit exactly one provider spelling family.
+    /// two answers to the same question. The backstop stays kimi-only BY
+    /// DESIGN even though the provider predicate now also admits the Anthropic
+    /// API-KEY id (2026-09-01, sweep item 34) — a `claude-*` model id is served
+    /// by BOTH Claude transports, so only a resolved PROVIDER id can tell the
+    /// api-key path from the OAuth subscription path.
     @Test func modelBackstop_agreesWithProviderPredicate() {
         #expect(NativeToolCapability.providerSupportsNativeTools("kimi-code"))
         #expect(NativeToolCapability.providerSupportsNativeTools("kimi_code"))
         #expect(NativeToolCapability.providerSupportsNativeTools("  KIMI-CODE "))
-        for other in ["moonshot", "anthropic", "anthropic_oauth_direct", "openai", "codex", "openrouter", "xai_oauth_direct"] {
+        // The api-key Anthropic path: the documented public Messages API,
+        // where tools[] is the published contract.
+        #expect(NativeToolCapability.providerSupportsNativeTools("anthropic"))
+        // …and the subscription connection, which must never see tools[].
+        for other in ["moonshot", "anthropic_oauth_direct", "anthropic-oauth-direct", "anthropic_mcp", "openai", "codex", "openrouter", "xai_oauth_direct"] {
             #expect(
                 !NativeToolCapability.providerSupportsNativeTools(other),
                 "provider '\(other)' must never be handed a provider-native tools[] array"
             )
         }
         #expect(!NativeToolCapability.providerSupportsNativeTools(nil))
+        // The backstop must NOT admit Claude model ids: it cannot see which
+        // transport is bound, so admitting one would turn an OAuth turn native.
+        #expect(!NativeToolCapability.modelImpliesNativeToolProvider("claude-fable-5-1"))
     }
 }

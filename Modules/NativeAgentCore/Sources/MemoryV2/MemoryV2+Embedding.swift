@@ -188,6 +188,30 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     public static let allowedModelExtensions: Set<String> = ["mlpackage", "mlmodelc", "mlmodel"]
     private static let bundledEpochLock = NSLock()
     nonisolated(unsafe) private static var cachedDefaultBundledEpoch: MemoryEmbeddingEpoch?
+    nonisolated(unsafe) private static var cachedExtrasEpoch: (fingerprint: String, epoch: MemoryEmbeddingEpoch)?
+
+    /// Cheap change detector for an installed extras model: every file under
+    /// the package plus the manifest and vocab, as relative path, size and
+    /// modification time.
+    private static func extrasFingerprint(_ installed: InstalledExtrasModel) -> String {
+        let fm = FileManager.default
+        func stamp(_ url: URL, relativeTo base: URL) -> String {
+            let attrs = (try? fm.attributesOfItem(atPath: url.path)) ?? [:]
+            let size = (attrs[.size] as? NSNumber)?.int64Value ?? -1
+            let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+            let rel = url.path.hasPrefix(base.path) ? String(url.path.dropFirst(base.path.count)) : url.path
+            return "\(rel)|\(size)|\(mtime)"
+        }
+        var lines: [String] = [stamp(installed.vocabURL, relativeTo: installed.modelURL.deletingLastPathComponent()),
+                               stamp(installed.modelURL.deletingLastPathComponent().appendingPathComponent("embedding.json"),
+                                     relativeTo: installed.modelURL.deletingLastPathComponent())]
+        if let e = fm.enumerator(at: installed.modelURL, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]) {
+            for case let file as URL in e { lines.append(stamp(file, relativeTo: installed.modelURL)) }
+        } else {
+            lines.append(stamp(installed.modelURL, relativeTo: installed.modelURL))
+        }
+        return installed.modelURL.path + "\n" + lines.sorted().joined(separator: "\n")
+    }
 
     public let dimensions: Int
     public let modelId: String
@@ -196,6 +220,13 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     private let modelLoaded: Bool
     private let tokenizer: WordPieceTokenizer?
     private let maxSeqLength: Int
+    /// The sentence-embedding model shipped in the MemoryV2 resource bundle as
+    /// `minilm.mlpackage` (+ `minilm_vocab.txt`). The resource slot keeps its
+    /// historical name because `config/embeddings.json::backend` values and
+    /// the extras path reference it; the model inside is named here, and this
+    /// id is part of the embedding epoch, so changing the file and this string
+    /// together is what moves every stored vector to the new space.
+    public static let bundledModelID = "all-MiniLM-L6-v2"
     #if canImport(CoreML) && !os(Linux)
     private let mlModel: MLModel?
     #endif
@@ -228,7 +259,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         modelURL: URL,
         vocabURL: URL? = nil,
         dimensions: Int = 384,
-        modelId: String = "all-MiniLM-L6-v2",
+        modelId: String = CoreMLEmbeddingProvider.bundledModelID,
         maxSeqLength: Int = 128,
         lowMemory: Bool = false
     ) throws {
@@ -553,8 +584,18 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     /// `Bundle.module`, which is the MemoryV2 target's resource bundle).
     public static func bundled(
         _ bundle: Bundle? = nil,
+        extrasRoot: URL? = nil,
         lowMemory: Bool = false
     ) throws -> CoreMLEmbeddingProvider {
+        if let installed = installedExtrasModel(root: extrasRoot) {
+            return try CoreMLEmbeddingProvider(
+                modelURL: installed.modelURL,
+                vocabURL: installed.vocabURL,
+                dimensions: installed.dimensions,
+                modelId: installed.modelID,
+                lowMemory: lowMemory
+            )
+        }
         let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
         guard let url = resolved.url(forResource: "minilm", withExtension: "mlpackage") else {
             throw EmbeddingError.modelNotFound(path: "Bundle.module/minilm.mlpackage")
@@ -563,7 +604,96 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return try CoreMLEmbeddingProvider(modelURL: url, vocabURL: vocab, lowMemory: lowMemory)
     }
 
-    public static func bundledEmbeddingEpoch(_ bundle: Bundle? = nil) throws -> MemoryEmbeddingEpoch {
+    /// A larger embedding model installed under `<dataRoot>/extras/coreml/`,
+    /// described by `embedding.json` beside it:
+    ///
+    ///     {"model": "embedding.mlpackage", "vocab": "vocab.txt",
+    ///      "model_id": "bge-large-en-v1.5", "dimensions": 1024}
+    ///
+    /// User, 2026-09-05: the bundled MiniLM is the floor for every install;
+    /// meaning-based memory is opt-in, so a several-hundred-megabyte model
+    /// lives in extras, never in the app bundle or the repository. When it is
+    /// present it wins over the bundled model; its id and dimensions are part
+    /// of the embedding epoch, so the launch warmup re-embeds the store.
+    public struct InstalledExtrasModel: Sendable, Equatable {
+        public let modelURL: URL
+        public let vocabURL: URL
+        public let modelID: String
+        public let dimensions: Int
+    }
+
+    public static func installedExtrasModel(root: URL?) -> InstalledExtrasModel? {
+        // Three tiers: what the user installed under the data root, then the
+        // large model a release DMG ships inside the app
+        // (Contents/Resources/embedding/, staged by script/build_and_run.sh and
+        // script/release.sh from extras/embedding/ in the checkout), then the
+        // bundled MiniLM floor that every source build has.
+        if let root,
+           let installed = extrasModel(inDirectory: root
+               .appendingPathComponent("extras", isDirectory: true)
+               .appendingPathComponent("coreml", isDirectory: true)) {
+            return installed
+        }
+        if let resources = Bundle.main.resourceURL,
+           let shipped = extrasModel(inDirectory: resources.appendingPathComponent("embedding", isDirectory: true)) {
+            return shipped
+        }
+        return nil
+    }
+
+    private static func extrasModel(inDirectory dir: URL) -> InstalledExtrasModel? {
+        let manifest = dir.appendingPathComponent("embedding.json")
+        guard let data = try? Data(contentsOf: manifest),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let model = object["model"] as? String, !model.isEmpty,
+              let vocab = object["vocab"] as? String, !vocab.isEmpty,
+              let modelID = object["model_id"] as? String, !modelID.isEmpty,
+              let dimensions = object["dimensions"] as? Int, dimensions > 0,
+              !model.contains("/"), !vocab.contains("/")
+        else { return nil }
+        let modelURL = dir.appendingPathComponent(model)
+        let vocabURL = dir.appendingPathComponent(vocab)
+        guard allowedModelExtensions.contains(modelURL.pathExtension.lowercased()),
+              FileManager.default.fileExists(atPath: modelURL.path),
+              FileManager.default.fileExists(atPath: vocabURL.path)
+        else { return nil }
+        // Both files must resolve inside the extras directory, symlinks included.
+        let base = dir.resolvingSymlinksInPath().path + "/"
+        guard modelURL.resolvingSymlinksInPath().path.hasPrefix(base),
+              vocabURL.resolvingSymlinksInPath().path.hasPrefix(base)
+        else { return nil }
+        return InstalledExtrasModel(modelURL: modelURL, vocabURL: vocabURL, modelID: modelID, dimensions: dimensions)
+    }
+
+    public static func bundledEmbeddingEpoch(
+        _ bundle: Bundle? = nil,
+        extrasRoot: URL? = nil
+    ) throws -> MemoryEmbeddingEpoch {
+        if let installed = installedExtrasModel(root: extrasRoot) {
+            // Hashing a large package is not free; remember it per package
+            // and recompute only when any file in it, the manifest, or the
+            // vocab changes (relative path + size + mtime, recursively — a
+            // directory's own mtime does not move when a child is rewritten).
+            let fingerprint = extrasFingerprint(installed)
+            bundledEpochLock.lock()
+            if let cached = cachedExtrasEpoch, cached.fingerprint == fingerprint {
+                bundledEpochLock.unlock()
+                return cached.epoch
+            }
+            bundledEpochLock.unlock()
+            let resolvedEpoch = try epoch(
+                modelURL: installed.modelURL,
+                vocabURL: installed.vocabURL,
+                dimensions: installed.dimensions,
+                modelID: installed.modelID,
+                maximumSequenceLength: 128,
+                modelArtifactDigest: try modelArtifactDigest(modelURL: installed.modelURL)
+            )
+            bundledEpochLock.lock()
+            cachedExtrasEpoch = (fingerprint, resolvedEpoch)
+            bundledEpochLock.unlock()
+            return resolvedEpoch
+        }
         if bundle == nil {
             bundledEpochLock.lock()
             let cached = cachedDefaultBundledEpoch
@@ -578,7 +708,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             modelURL: url,
             vocabURL: resolved.url(forResource: "minilm_vocab", withExtension: "txt"),
             dimensions: 384,
-            modelID: "all-MiniLM-L6-v2",
+            modelID: bundledModelID,
             maximumSequenceLength: 128,
             modelArtifactDigest: try modelArtifactDigest(modelURL: url)
         )
@@ -597,8 +727,11 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     /// Wipe the compile cache for the BUNDLED model (Doctor repair action).
     /// Resolves the same bundle bundled() would, so callers outside this
     /// module never need the private bundle-fallback plumbing.
-    public static func wipeBundledCompileCache(_ bundle: Bundle? = nil) {
+    public static func wipeBundledCompileCache(_ bundle: Bundle? = nil, extrasRoot: URL? = nil) {
         #if canImport(CoreML) && !os(Linux)
+        if let installed = installedExtrasModel(root: extrasRoot) {
+            wipeCompileCache(packageURL: installed.modelURL)
+        }
         let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
         if let pkg = resolved.url(forResource: "minilm", withExtension: "mlpackage") {
             wipeCompileCache(packageURL: pkg)
@@ -609,7 +742,15 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     /// Cheap bundle-resource probe used by Settings/status. This intentionally
     /// does not compile or load the CoreML model, so merely opening Settings
     /// cannot pull the model into memory.
-    public static func bundledResourcesAvailable(_ bundle: Bundle? = nil) -> Bool {
+    public static func bundledResourcesAvailable(_ bundle: Bundle? = nil, extrasRoot: URL? = nil) -> Bool {
+        if installedExtrasModel(root: extrasRoot) != nil { return true }
+        return bundledFloorResourcesAvailable(bundle)
+    }
+
+    /// The shipped MiniLM floor ONLY, ignoring any installed extras model.
+    /// Doctor reports both, so "the embedder loads" can never hide which model
+    /// actually loaded (Agent, 2026-09-06).
+    public static func bundledFloorResourcesAvailable(_ bundle: Bundle? = nil) -> Bool {
         let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
         return resolved.url(forResource: "minilm", withExtension: "mlpackage") != nil
             && resolved.url(forResource: "minilm_vocab", withExtension: "txt") != nil

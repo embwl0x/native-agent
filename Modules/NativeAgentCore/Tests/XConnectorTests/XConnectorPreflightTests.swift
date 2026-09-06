@@ -112,8 +112,10 @@ struct XConnectorQueryContractTests {
     func readQueriesClampPageSizeAndPassPaginationThrough() throws {
         let clampedHigh = XConnectorActions.timelineQuery(input: ["max": .int(5_000)])
         #expect(fields(clampedHigh, "max_results") == "100")
+        // /2/users/:id/tweets refuses max_results below 5, so the floor is 5 —
+        // clamping to 1 only bought a 400 from the provider.
         let clampedLow = XConnectorActions.userTweetsQuery(input: ["max": .int(0)])
-        #expect(fields(clampedLow, "max_results") == "1")
+        #expect(fields(clampedLow, "max_results") == "5")
 
         let paged = XConnectorActions.userTweetsQuery(input: [
             "next_token": .string("cursor-1"),

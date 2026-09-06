@@ -934,6 +934,14 @@ private enum ProviderSurfaceCommitTestFailure: Error {
         // with no picker row. Unpinned it seeds to chat's pick (same rule as
         // `memory`/`heartbeat`/`diagnostics`).
         "self_improvement": ("claude-opus-4-7", "high"),
+        // `studio_wander` was added 2026-09-02 (personality depth item 9, "her
+        // hour"). Unlike the surfaces above it does NOT follow the chat pin: an
+        // unattended daily lane inheriting a frontier model and a frontier
+        // effort by omission is a cost nobody chose, so it takes the same cheap
+        // seed `dream`/`rem` take, with a bounded effort. Both are pinnable in
+        // Providers — that row exists precisely so User can decide the hour
+        // deserves better.
+        "studio_wander": ("gpt-5.4-mini", "low"),
     ]
     #expect(Set(swiftPrefs.keys) == Set(expected.keys))
     for (surface, entry) in expected {

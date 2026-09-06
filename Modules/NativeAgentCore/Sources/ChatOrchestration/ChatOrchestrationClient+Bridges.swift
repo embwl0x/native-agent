@@ -51,6 +51,11 @@ public protocol EvolutionToolBridge: Sendable {
     func evolutionPropose(input: [String: JSONValue]) async throws -> JSONValue
     /// Read a single proposal or list in-flight proposals. Read-only.
     func evolutionStatus(input: [String: JSONValue]) async throws -> JSONValue
+    /// Withdraw one of the agent's OWN proposals (source=chat) to the terminal
+    /// denied state. Write, but strictly de-escalating: it cancels a pending
+    /// self-change, never applies one. Refuses terminal records, records with a
+    /// candidate run in flight, and anything the agent did not file itself.
+    func evolutionWithdraw(input: [String: JSONValue]) async throws -> JSONValue
     /// Validate a candidate_green proposal and STAGE its self_evolution.apply
     /// approval card (idempotent). Never installs — a human still approves.
     func evolutionStageInstall(input: [String: JSONValue]) async throws -> JSONValue

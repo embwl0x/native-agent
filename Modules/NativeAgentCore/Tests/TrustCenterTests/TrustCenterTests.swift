@@ -950,6 +950,7 @@ private func bundle(default d: String, overrides: [String: JSONValue]) -> [Strin
     let b = bundle(default: "supervised", overrides: overrides)
     #expect(tc.autonomyForTool("evolution_propose", policy: b) == "confirm")
     #expect(tc.autonomyForTool("evolution_status", policy: b) == "confirm")
+    #expect(tc.autonomyForTool("evolution_withdraw", policy: b) == "confirm")
     #expect(tc.autonomyForTool("self_install", policy: b) == "confirm")
     // And the shipped default dict literally carries them.
     #expect(SwiftNativeTrustCenter.workshopExecutionsDefaultToolAutonomy["self_install"] == .string("confirm"))

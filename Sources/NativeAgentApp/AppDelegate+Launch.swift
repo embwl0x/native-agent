@@ -88,6 +88,15 @@ extension AppDelegate {
             object: nil
         )
         Task.detached(priority: .utility) {
+            // 2026-09-06: the invalidation sink belongs to the app, not to
+            // Context Flow. It used to be installed inside the Context Flow
+            // startup, so with Context Flow off nothing was subscribed and a
+            // GROWTH.md edit left retracted REM pins live until the next weekly
+            // cycle. Install it here, before the runtime starts; Context Flow
+            // then subscribes its coordinator to it.
+            await DerivedStateInvalidationCenter.shared.install(
+                DerivedPersonaPinInvalidationSink(dataRoot: NativeAgentPaths.dataRoot)
+            )
             await NativeContextFlowRuntime.shared.start()
         }
 
@@ -257,6 +266,10 @@ extension AppDelegate {
             await syncSkillPointerIndex()
             await reconcileMemoryEmbeddingEpochAtLaunch()
         }
+        // The transcript-aging lane defers through the same body throttle as
+        // every other background-cognition lane. Installing the gate is a
+        // synchronous closure store — no bring-up, nothing to wedge.
+        ChatConsolidationGateInstall.install()
         Task.detached(priority: .utility) {
             await NativeCognitionRuntime.shared.bootstrap()
         }
@@ -266,9 +279,10 @@ extension AppDelegate {
                 let report = try await ChatSessionIndexReconciler(
                     dataRoot: NativeAgentPaths.dataRoot
                 ).reconcile()
-                if report.sessionsRecovered > 0 || report.corruptTranscripts > 0 {
+                if report.sessionsRecovered > 0 || report.corruptTranscripts > 0
+                    || report.staleRowsRepaired > 0 {
                     logger.info(
-                        "Chat reconciliation: recovered=\(report.sessionsRecovered, privacy: .public) corrupt=\(report.corruptTranscripts, privacy: .public) examined=\(report.transcriptsExamined, privacy: .public)"
+                        "Chat reconciliation: recovered=\(report.sessionsRecovered, privacy: .public) repaired=\(report.staleRowsRepaired, privacy: .public) corrupt=\(report.corruptTranscripts, privacy: .public) examined=\(report.transcriptsExamined, privacy: .public)"
                     )
                 }
             } catch {
@@ -317,7 +331,21 @@ extension AppDelegate {
         Task.detached(priority: .utility) {
             await AdaptiveMemoryPromoter.shared.configure(
                 memory: SwiftNativeMemoryV2.shared,
-                extractor: SemanticAdaptiveFactExtractor()
+                extractor: SemanticAdaptiveFactExtractor(),
+                // The moments lane (2026-09-02): a SECOND pass over the same
+                // turn, asking what happened between them rather than what is
+                // true about him. User, 2026-09-05: on the agent's real mind
+                // (the Providers "Memory" row, else the chat pick), on-device
+                // only as the fallback. There is no regex conformer, by design.
+                momentExtractor: MindMomentExtractor(),
+                // Setup ▸ "Moments she keeps". The module never reads
+                // UserDefaults; the switch reaches it as this closure, read
+                // fresh on every turn so flipping it takes effect at once.
+                momentsEnabled: { MomentsLaneSetting.isEnabled() },
+                // Settings ▸ "Memories that recur become facts". Same shape as
+                // the moments switch: read fresh on every turn, so flipping it
+                // takes effect at once.
+                adaptivePromotionEnabled: { MemoryPolicyGate.adaptivePromotionEnabled() }
             )
         }
         Task.detached(priority: .utility) {

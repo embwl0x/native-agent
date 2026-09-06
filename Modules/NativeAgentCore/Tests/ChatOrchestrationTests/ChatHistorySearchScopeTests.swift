@@ -291,3 +291,91 @@ private func writeEvidenceSearchSession(_ root: URL, rows: [[String: JSONValue]]
     // Phrase/multi-token match in the current session: short-circuit intact.
     #expect(resp["phase"] == .string("current_session"))
 }
+
+// MARK: - previous_session (the other half of the /new carry-over anchor)
+
+/// The anchor names the previous session in prose; this scope is how she
+/// opens it. Both resolve through ONE definition (`PriorChatSession`), so the
+/// anchor never has to carry a UUID and the tool can never land somewhere the
+/// anchor did not describe — including, on Telegram after /new, the codex
+/// bridge run that happens to be the newest row in the index.
+@Test func previous_session_scope_resolves_the_same_surface_scoped_session() async throws {
+    let root = try makeSearchRoot("previous-session")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let currentTG = "11111111-1111-4111-8111-111111111111"
+    let priorTG = "22222222-2222-4222-8222-222222222222"
+    let priorMac = "44444444-4444-4444-8444-444444444444"
+    let bridgeTG = "55555555-5555-4555-8555-555555555555"
+
+    func row(_ id: String, _ title: String, _ created: String, _ updated: String,
+             _ source: String, _ key: String) -> String {
+        #"{"id":"\#(id)","title":"\#(title)","source":"\#(source)","#
+            + #""sourceKey":"\#(key)","createdAt":"\#(created)","updatedAt":"\#(updated)"}"#
+    }
+    // The current row is created AFTER every candidate's last activity; the
+    // Mac row and the bridge row are both MORE RECENT than the genuine prior.
+    let sessions = "[\n" + [
+        row(priorTG, "Genuine prior", "2026-06-09T18:00:00Z", "2026-06-09T20:00:00Z",
+            "telegram", "telegram:139"),
+        row(currentTG, "Current", "2026-06-10T09:00:00Z", "2026-06-10T09:00:00Z",
+            "telegram", "telegram:139"),
+        row(priorMac, "Mac window", "2026-06-10T07:00:00Z", "2026-06-10T08:00:00Z",
+            "app", "app"),
+        row(bridgeTG, "[from: codex, via bridge] check", "2026-06-10T08:00:00Z",
+            "2026-06-10T08:30:00Z", "telegram", "telegram:139"),
+    ].joined(separator: ",\n") + "\n]"
+    try Data(sessions.utf8).write(to: root.appendingPathComponent("chat/sessions.json"))
+
+    try writeSession(root, id: priorTG, lines: ["anchor pin decision", "shipped the resolver"])
+    try writeSession(root, id: priorMac, lines: ["mac only content"])
+    try writeSession(root, id: bridgeTG, lines: ["bridge machine output"])
+    try writeSession(root, id: currentTG, lines: ["brand new"])
+
+    // No query at all: "pull my last session back" is a whole-session request.
+    let bare = try await previousSessionSearch(root, query: nil, currentSessionId: currentTG)
+    #expect(bare["phase"] == .string("previous_session"))
+    #expect(bare["previous_session_id"] == .string(priorTG))
+    guard case .array(let bareHits)? = bare["hits"] else {
+        Issue.record("missing hits"); return
+    }
+    #expect(bareHits.count == 2)
+    for case .object(let hit) in bareHits {
+        #expect(hit["session_id"] == .string(priorTG))
+    }
+
+    // With a query + continuity mode: same session, neighbors attached, the
+    // ≤4-hits shape unchanged.
+    let scoped = try await previousSessionSearch(
+        root, query: "resolver", currentSessionId: currentTG, mode: "continuity")
+    #expect(scoped["previous_session_id"] == .string(priorTG))
+    guard case .array(let scopedHits)? = scoped["hits"], case .object(let top)? = scopedHits.first else {
+        Issue.record("missing continuity hit"); return
+    }
+    #expect(scopedHits.count <= 4)
+    #expect(top["session_id"] == .string(priorTG))
+    #expect(top["surrounding_messages"] != nil)
+
+    // No current session id → nothing to scope against; it says so rather
+    // than falling back to a global scan.
+    let unscoped = try await previousSessionSearch(root, query: "anchor", currentSessionId: nil)
+    #expect(unscoped["phase"] == .string("previous_session_unavailable"))
+    #expect(unscoped["hit_count"] == .int(0))
+    #expect(unscoped["fallback_skipped"] == .string("all_sessions"))
+}
+
+private func previousSessionSearch(
+    _ root: URL, query: String?, currentSessionId: String?, mode: String? = nil
+) async throws -> [String: JSONValue] {
+    let dispatcher = SwiftToolDispatcher(dataRoot: root)
+    var input: [String: JSONValue] = ["scope": .string("previous_session")]
+    if let query { input["query"] = .string(query) }
+    if let currentSessionId { input["current_session_id"] = .string(currentSessionId) }
+    if let mode { input["mode"] = .string(mode) }
+    let result = try await dispatcher.impl_search_chat_history(
+        input: input, invokedAs: "session_search")
+    guard case .object(let obj) = result else {
+        Issue.record("non-object response"); return [:]
+    }
+    return obj
+}

@@ -43,12 +43,34 @@ enum MacChatTranscriptSearch {
         let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard role != "tool" else { return nil }
         guard !(role == "system" && message.content.hasPrefix("[tool:")) else { return nil }
-        guard !message.content.isEmpty else { return nil }
+        let visible = visibleText(of: message)
+        guard !visible.isEmpty else { return nil }
         return MacChatTranscriptSearchDocument(
             messageID: message.id,
             ordinal: ordinal,
-            content: message.content
+            content: visible
         )
+    }
+
+    /// 2026-09-06: search used to index the RAW row, so a hit inside a
+    /// completion envelope's routing slip selected a row whose slip the room
+    /// never renders — the transcript folds a bridge receipt into
+    /// `ShellEnvelopeRow`, and even "Show" reveals only the extracted reply.
+    /// The index now carries the substantive text, which is a subset of what
+    /// both the new shell and the classic bubble display, so a match is always
+    /// reachable. The bridge-routed fences match the renderer's exactly (see
+    /// `ChatShellConversationRow.isBridgeRouted`).
+    static func visibleText(of message: ChatMessage) -> String {
+        let content = message.content
+        guard ChatShellConversationRow.isBridgeRouted(message.metadata?.origin) else {
+            return content
+        }
+        let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if role == "user", ChatShellEnvelope.isEnvelope(content) {
+            return ChatShellEnvelope.reply(content)
+        }
+        guard ChatShellConversationRow.hasBridgePrefix(content) else { return content }
+        return ChatShellConversationRow.stripBridgePrefix(content)
     }
 
     static func boundedInput(_ raw: String) -> String {

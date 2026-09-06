@@ -26,7 +26,17 @@ struct CognitionObservatoryLoopActivityEvalTests {
         // Bootstrap itself records lifecycle restoration. It proves the store
         // is available, but it is not evidence that a background loop ran.
         #expect(receipts.contains { $0.kind == "lifecycle.restore" })
-        #expect(receipts.filter { !$0.kind.hasPrefix("lifecycle.") }.isEmpty)
+        // 2026-09-06: 7df7a4cd wired the pressure-dream trigger into the
+        // residual-repair pass bootstrap already runs, and it books ONE receipt
+        // the first time the decision changes — here "belowThreshold", a
+        // decision NOT to dream (NativeCognitionRuntime+PressureDream.swift:84).
+        // That is still not evidence a background loop ran, it is just no longer
+        // lifecycle-prefixed, so it is admitted BY NAME: any other non-lifecycle
+        // receipt on a quiet bootstrap would mean a loop actually ran.
+        let loopEvidence = receipts.filter {
+            !$0.kind.hasPrefix("lifecycle.") && $0.kind != "dream.pressure_not_due"
+        }
+        #expect(loopEvidence.isEmpty)
         #expect(CognitionLoopActivityPresentation.receiptCount(for: detail.receiptRead) == receipts.count)
         #expect(CognitionLoopActivityPresentation.collapsedHint(for: detail.receiptRead)?
             .hasPrefix("\(receipts[0].kind) · ") == true)

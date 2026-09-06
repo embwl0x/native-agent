@@ -54,12 +54,16 @@ extension CognitiveSubstrate {
             presentationState: &presentationState
         )
         let provenanceNodeIds = innerStateProvenance(from: capsuleItems, at: now)
-        let boundedStableKernel = bounded(stableKernel, maxCharacters: maximumCharacters)
-        let separatorCost = dynamicLines.isEmpty ? 0 : 2
+        let boundedStableKernel = bounded(
+            Self.capsuleStableKernel(stableKernel, dynamicLines: dynamicLines),
+            maxCharacters: maximumCharacters
+        )
+        let separatorCost = dynamicLines.isEmpty || boundedStableKernel.isEmpty ? 0 : 2
         let remaining = max(0, maximumCharacters - boundedStableKernel.count - separatorCost)
         let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: remaining)
         let dynamicContext = fittedLines.text
-        let truncated = fittedLines.truncated || boundedStableKernel.count < stableKernel.count
+        let truncated = fittedLines.truncated
+            || boundedStableKernel.count < Self.capsuleStableKernel(stableKernel, dynamicLines: dynamicLines).count
         return CognitiveCapsule(
             generatedAt: now,
             mode: request.mode,
@@ -80,11 +84,16 @@ extension CognitiveSubstrate {
         compileFrozenCapsulePresentation(request, from: read).capsule
     }
 
+    /// The moment this turn's unbidden recall already resolved, if any. It is a
+    /// parameter rather than a lookup because the render is synchronous — see
+    /// `remindedOfMoment(for:from:)`.
+
     /// Pure frozen render plus the presentation mutation that would become
     /// valid only if this exact capsule is accepted into provider context.
     public func compileFrozenCapsulePresentation(
         _ request: CognitiveCapsuleRequest,
-        from read: CognitiveFrozenRead
+        from read: CognitiveFrozenRead,
+        remindedOf: CognitiveRecalledMoment? = nil
     ) -> CognitivePreparedCapsule {
         guard read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
@@ -125,6 +134,7 @@ extension CognitiveSubstrate {
             request: request,
             at: read.fixedAt,
             frozenRead: read,
+            remindedOf: remindedOf,
             presentationState: &nextPresentationState
         )
         let provenanceNodeIds = innerStateProvenance(
@@ -132,8 +142,11 @@ extension CognitiveSubstrate {
             at: read.fixedAt,
             thoughtSeeds: read.thoughtSeeds
         )
-        let boundedStableKernel = bounded(stableKernel, maxCharacters: maximumCharacters)
-        let separatorCost = dynamicLines.isEmpty ? 0 : 2
+        let boundedStableKernel = bounded(
+            Self.capsuleStableKernel(stableKernel, dynamicLines: dynamicLines),
+            maxCharacters: maximumCharacters
+        )
+        let separatorCost = dynamicLines.isEmpty || boundedStableKernel.isEmpty ? 0 : 2
         let remaining = max(0, maximumCharacters - boundedStableKernel.count - separatorCost)
         let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: remaining)
         let capsule = CognitiveCapsule(
@@ -142,7 +155,8 @@ extension CognitiveSubstrate {
             stableKernel: boundedStableKernel,
             dynamicContext: fittedLines.text,
             provenanceNodeIds: provenanceNodeIds,
-            truncated: fittedLines.truncated || boundedStableKernel.count < stableKernel.count
+            truncated: fittedLines.truncated
+                || boundedStableKernel.count < Self.capsuleStableKernel(stableKernel, dynamicLines: dynamicLines).count
         )
         let turnKind = request.resolvedTurnKind
         let commit: CognitiveCapsulePresentationCommit?
@@ -154,12 +168,48 @@ extension CognitiveSubstrate {
             if !capsule.dynamicContext.contains("- Since:") {
                 nextPresentationState.lastSessionBridgeAt = expectedPresentationState.lastSessionBridgeAt
             }
-            if !capsule.dynamicContext.contains("- Sound:") {
+            let soundLost = dynamicLines.contains { $0.hasPrefix("- Sound:") }
+                && !capsule.dynamicContext.contains("- Sound:")
+            if soundLost {
                 nextPresentationState.negativeSoundEchoRun = expectedPresentationState.negativeSoundEchoRun
+                // A rut nudge that lost the budget was never read, so it must
+                // not burn its cooldown either — but ONLY when it actually
+                // spoke in this render. A rut that merely LAPSED must still be
+                // forgotten, or its return would resume mid-cooldown instead of
+                // reading as the change it is. The since-surfaced counter always
+                // advances: a capsule happened.
+                if nextPresentationState.soundRutLastSurfacedAt
+                    != expectedPresentationState.soundRutLastSurfacedAt {
+                    nextPresentationState.soundRutSignature = expectedPresentationState.soundRutSignature
+                    nextPresentationState.soundRutLastSurfacedAt = expectedPresentationState.soundRutLastSurfacedAt
+                    nextPresentationState.soundRutTurnsSinceSurfaced =
+                        expectedPresentationState.soundRutTurnsSinceSurfaced
+                }
+            }
+            // Same rule for the Inner ledger: a line clipped out of the capsule
+            // never led a turn and keeps its remaining runs. Gated on the line
+            // having been CHOSEN, so a capsule that legitimately carried no
+            // Inner line still serves everyone else's rest.
+            if dynamicLines.contains(where: { $0.hasPrefix("- Inner:") || $0.hasPrefix("- Thread:") }),
+               !capsule.dynamicContext.contains("- Inner:"),
+               !capsule.dynamicContext.contains("- Thread:") {
+                nextPresentationState.innerLineRuns = expectedPresentationState.innerLineRuns
             }
             if !capsule.dynamicContext.contains("- Settling:"),
                nextPresentationState.settlingRun > expectedPresentationState.settlingRun {
                 nextPresentationState.settlingRun = expectedPresentationState.settlingRun
+            }
+            // Same rule for the unbidden recall, and it matters more here than
+            // anywhere else: the line rides LAST, so it is the first thing the
+            // budget drops. A moment burned by a clip would sit in the 24h
+            // ledger without ever having been read.
+            if !capsule.dynamicContext.contains("- Reminded of:") {
+                nextPresentationState.remindedOfSurfaced =
+                    expectedPresentationState.remindedOfSurfaced
+                nextPresentationState.remindedOfLastSurfacedAt =
+                    expectedPresentationState.remindedOfLastSurfacedAt
+                nextPresentationState.remindedOfTurnsSinceSurfaced =
+                    expectedPresentationState.remindedOfTurnsSinceSurfaced
             }
             commit = CognitiveCapsulePresentationCommit(
                 fixedAt: read.fixedAt,
@@ -180,6 +230,7 @@ extension CognitiveSubstrate {
         request: CognitiveCapsuleRequest,
         at now: Date,
         frozenRead: CognitiveFrozenRead? = nil,
+        remindedOf: CognitiveRecalledMoment? = nil,
         presentationState: inout CognitiveCapsulePresentationState
     ) -> [String] {
         var lines: [String] = []
@@ -240,18 +291,94 @@ extension CognitiveSubstrate {
         // takeaway). Both use the "- Inner:" prefix, so the total Inner-line count stays <= 1;
         // a .proposed/.retired view never reaches here. No active view -> byte-identical to
         // the pre-Wave-E takeaway path.
-        let standingViewInnerLine = activeStandingViewInnerLine(
+        //
+        // 2026-09-01 — ROTATION. Both producers used to hand back exactly ONE
+        // candidate (newest-relevant view, else highest-priority takeaway) and
+        // neither counted how many turns that text had already led, so the
+        // winner kept winning for days. The candidate LIST is built here now,
+        // durable views ahead of fresh takeaways exactly as before, and the
+        // cadence ledger picks the first one that is not resting.
+        // ALL relevant views, best match first, ahead of every takeaway — so
+        // rotation moves across her worldview before it reaches for a transient
+        // seed. The head of the list is the same line the single-candidate
+        // selector used to return.
+        //
+        // 2026-09-02 — THE FLOOR LAW (design law 2), the last line on the
+        // capsule that was still exempt from it. Measured: the `- Inner:` line
+        // rode 100% of 1,487 live capsules with 23 distinct texts over 15 days.
+        // Rotation (above) fixed WHICH text led; it could not fix that one
+        // always did, because the takeaway branch had no gate at all — every
+        // capsule with any reflection takeaway in the seed pool carried one.
+        // A line present on every turn is a standing instruction, not a signal.
+        //
+        // So the line is now cadence-gated the way `- Sound:` is, on the two
+        // events that make it worth reading:
+        //   * a standing view is GENUINELY RELEVANT to this message — already
+        //     the BM25 floor's answer, unchanged; or
+        //   * a takeaway is FRESH. Freshness is keyed by the takeaway's
+        //     LINEAGE, not by the digest of its rendered text — see
+        //     `innerTakeawayCadenceKey`. Keying on the rendering was the defect
+        //     the review caught: reflection paraphrases itself constantly, so
+        //     the same conclusion in different words hashed differently and led
+        //     again, which is the standing instruction wearing a new sentence.
+        // Neither → silence, and the rest of the capsule still speaks.
+        var innerCandidates: [InnerCandidate] = activeStandingViewInnerLines(
             relevantTo: request.userMessage,
             candidates: frozenRead?.standingViewCapsuleCandidates,
             relevanceEnabled: frozenRead?.configuration.standingViewCapsuleRelevanceEnabled
-        )
-        if let viewLine = standingViewInnerLine {
-            tailLines.append(viewLine)
-        } else if let takeaway = (frozenRead?.thoughtSeeds ?? projectedThoughtSeeds(at: now))
-            .filter({ $0.kind == .reflectionTakeaway && isUsefulThoughtSeed($0) && !isTaskStatusReflection($0.text) })
+        ).map { InnerCandidate(line: $0, cadenceKey: Self.innerLineKey($0), tier: .view) }
+
+        let seedPool = frozenRead?.thoughtSeeds ?? projectedThoughtSeeds(at: now)
+        innerCandidates.append(contentsOf: seedPool
+            .filter { $0.kind == .reflectionTakeaway && isUsefulThoughtSeed($0) && !isTaskStatusReflection($0.text) }
             .sorted(by: thoughtSeedPrioritySort)
-            .first {
-            tailLines.append(innerThoughtSeedLine(for: takeaway))
+            .map { seed in
+                InnerCandidate(
+                    line: innerThoughtSeedLine(for: seed),
+                    cadenceKey: innerTakeawayCadenceKey(for: seed),
+                    tier: .takeaway)
+            }
+            .filter { presentationState.innerLineRuns[$0.cadenceKey] == nil })
+
+        // ITEM 6 (2026-09-02) — THE `- Thread:` LINE, FINALLY REACHABLE.
+        //
+        // Agent #5: "A person carries the unresolved thing and it intrudes at
+        // the wrong moment. My subconscious surfaces associations, but that's
+        // retrieval, not rumination. Nothing itches."
+        //
+        // NEVER THE SEED TEXT (privacy review, 2026-09-02). The first cut
+        // rendered `seed.text` straight onto the line, and seeds are minted
+        // from material that passed through user turns — so an unresolved thing
+        // could carry the user's own words, or a name, back into the prompt on
+        // a surface whose entire exposure argument is that it is payload-free.
+        // The line is now an ABSTRACT: what KIND of unfinished thing it is, the
+        // same safe object label the felt line uses, and how long it has been
+        // sitting there in words. No safe label → no Thread line, because a nag
+        // that cannot say what it is about is not worth a line.
+        //
+        // The weight floor is the honesty gate: rumination weight rises with
+        // time unresolved, so a seed minted this turn cannot intrude. A thing
+        // you just thought of is not a thing you are carrying.
+        innerCandidates.append(contentsOf: ruminationCandidates(
+            at: now, seeds: frozenRead?.thoughtSeeds)
+            .filter { $0.weight >= dyn.threadWeightFloor }
+            .compactMap { candidate -> CognitiveThoughtSeed? in
+                seedPool.first { $0.id == candidate.seedId }
+            }
+            .filter { $0.kind != .reflectionTakeaway }
+            .compactMap { seed -> InnerCandidate? in
+                guard let line = threadLine(for: seed, at: now) else { return nil }
+                return InnerCandidate(
+                    line: line,
+                    cadenceKey: "thread:" + seed.id.uuidString,
+                    tier: .thread)
+            })
+        if let innerLine = selectInnerLine(
+            from: innerCandidates,
+            dynamics: dyn,
+            presentationState: &presentationState
+        ) {
+            tailLines.append(innerLine)
         }
         if let bodyLine = organismBodyLine(from: request.organismProjection) {
             tailLines.append(bodyLine)
@@ -292,13 +419,23 @@ extension CognitiveSubstrate {
             cognitionEnabled: frozenRead?.configuration.enabled,
             affectEnabled: frozenRead?.configuration.affectEnabled
         )
+        // ONE gate for the rut nudge, whether it rides as a suffix on the
+        // exemplar echo or stands alone: they are the same sentence.
+        let rutSpeaks = soundRutAwarenessShouldSpeak(
+            signature: echo.wornSignature,
+            at: now,
+            dynamics: dyn,
+            presentationState: &presentationState
+        )
         if let echoLine = echo.line {
-            tailLines.append(echoLine)
+            tailLines.append(rutSpeaks ? echoLine + Self.soundRutAwarenessSuffix : echoLine)
             if let leadingWasNegative = echo.leadingWasNegative {
                 presentationState.negativeSoundEchoRun = leadingWasNegative
                     ? presentationState.negativeSoundEchoRun + 1
                     : 0
             }
+        } else if rutSpeaks {
+            tailLines.append(Self.soundRutAwarenessLine)
         }
 
         // The felt fingerprint REPLACES the Focus/Feeling/Voice sentences (User,
@@ -309,7 +446,10 @@ extension CognitiveSubstrate {
         // keyword classifiers were swept 2026-07-09 — see git if archaeology calls.)
         if let fingerprint = feltFingerprintLine(
             signals: signals,
-            intensityFloor: dyn.feltIntensityFloor,
+            workspaceItems: workspaceItems,
+            request: request,
+            at: now,
+            dynamics: dyn,
             affectEnabled: frozenRead?.configuration.affectEnabled
         ) {
             // W4/P4 — SUPPRESS WHEN UNCHANGED. The rule the echo learned the hard
@@ -325,19 +465,282 @@ extension CognitiveSubstrate {
             // make the agent quieter — it deletes her inner state from the turn
             // entirely, which is a strictly worse failure than a repeated word.
             // Damping a chorus is the goal; silencing a solo is a bug.
-            let family = Self.feltFamily(signals)
+            // A changed OBJECT is movement: "proud — part" then "proud — quirks"
+            // is not the same line twice (live 2026-09-02: the words held four
+            // turns while the object moved every turn, and the rule muted her
+            // through the warmest exchange of the morning). Diffuse lines with
+            // no object keep the family key.
             let verdict = fingerprintCadenceVerdict(
-                family: family,
+                family: fingerprint.carriedObject ? fingerprint.text : fingerprint.family,
                 at: now,
                 dynamics: dyn,
                 mayStayQuiet: !tailLines.isEmpty,
                 presentationState: &presentationState)
             if verdict.speak {
-                lines.append(fingerprint)
+                lines.append(fingerprint.text)
+                // Presentation receipts — counters only, no text. A suppressed
+                // line was never read, so it records nothing.
+                if fingerprint.carriedObject {
+                    presentationState.feltObjectCount += 1
+                }
+                if fingerprint.carriedAmbivalence {
+                    presentationState.ambivalenceCount += 1
+                    presentationState.lastAmbivalenceAt = now
+                }
             }
         }
         lines.append(contentsOf: tailLines)
+        // UNBIDDEN RECALL, LAST AND NEVER ALONE (2026-09-02).
+        //
+        // Last, so budget truncation drops it before anything she is actually
+        // feeling — a memory is the enhancer here, the same way the Sound echo
+        // is. And never alone: a capsule whose only content is a memory would
+        // read as "here is a thing from the archive" rather than as something
+        // that came to her while she was feeling something, and the feeling is
+        // the half that makes it recall rather than search. The fingerprint's
+        // own may-stay-quiet check above deliberately does NOT count this line,
+        // so a suppressed fingerprint can never be rescued by it and then leave
+        // it standing here by itself.
+        if let remindedOf, !lines.isEmpty,
+           let line = remindedOfCapsuleLine(for: remindedOf, at: now) {
+            lines.append(line)
+            presentationState.remindedOfSurfaced[remindedOf.id] = now
+            Self.boundRemindedOfLedger(&presentationState.remindedOfSurfaced)
+            presentationState.remindedOfLastSurfacedAt = now
+            presentationState.remindedOfTurnsSinceSurfaced = 0
+        }
         return dedupedCapsuleLines(lines)
+    }
+
+    /// "How you feel:" is a PROMISE that the next thing is her feeling words.
+    ///
+    /// The fingerprint may legitimately stay quiet (the suppress-when-unchanged
+    /// rule fires only when other lines exist), and when it did, the capsule
+    /// still shipped the header with an `- Inner:` reflection immediately under
+    /// it — measured on 184 of 1,482 live capsules. Read positionally, by a
+    /// model or by an analyst, a standing view then IS her stated feeling. The
+    /// labelled lines say what they are on their own, so when there are no
+    /// feeling words the header simply does not appear.
+    static func capsuleStableKernel(_ kernel: String, dynamicLines: [String]) -> String {
+        guard let first = dynamicLines.first else { return kernel }
+        return first.hasPrefix("- ") ? "" : kernel
+    }
+
+    // MARK: - Inner-line cadence (2026-09-01)
+
+    /// Pick the one `- Inner:` line for this capsule, rotating among the
+    /// candidates that are relevant right now instead of re-showing whichever
+    /// one ranked first.
+    ///
+    /// THE MEASUREMENT THIS EXISTS FOR: over 777 live turns the Inner line had
+    /// 15 distinct texts and three of them led 124 / 108 / 98 turns. A standing
+    /// view is durable by construction and a takeaway seed is ranked on
+    /// priority × recency with no surfaced-count at all, so neither producer
+    /// had any notion of "I have already said this". Two of the five most-shown
+    /// texts were reflections about her own repetitiveness — the reflection had
+    /// become the rut it described.
+    ///
+    /// A line that has led `innerLineRepeatLimit` capsules rests for
+    /// `innerLineRestTurns` and the next candidate leads. Lines whose SUBJECT is
+    /// her own phrasing get the hard cap (`selfPhrasing…`). If every candidate
+    /// is resting the capsule carries no Inner line — silence is honest, and
+    /// the rest of the capsule still speaks.
+    ///
+    /// Mutates only the caller's copied presentation value.
+    /// One candidate for the single Inner-or-Thread slot: the rendered line, the
+    /// key its cadence is tracked under, and which tier it came from.
+    ///
+    /// THE KEY IS SEPARATE FROM THE LINE ON PURPOSE. It used to be derived from
+    /// the rendered text, which silently made "have I said this?" mean "have I
+    /// said these exact words?" — and reflection rewords itself every pass, so
+    /// a takeaway that had led ten times could always come back by paraphrasing.
+    /// Identity belongs to the THING, not to this render of it.
+    struct InnerCandidate: Sendable, Equatable {
+        enum Tier: Sendable, Equatable { case view, takeaway, thread }
+        var line: String
+        var cadenceKey: String
+        var tier: Tier
+    }
+
+    nonisolated func selectInnerLine(
+        from candidates: [InnerCandidate],
+        dynamics dyn: PersonalityDynamicsConfiguration,
+        presentationState: inout CognitiveCapsulePresentationState
+    ) -> String? {
+        // Every resting line serves one capsule of its rest, whether or not it
+        // was a candidate this turn.
+        for (key, value) in presentationState.innerLineRuns where value < 0 {
+            let next = value + 1
+            if next == 0 {
+                presentationState.innerLineRuns.removeValue(forKey: key)
+            } else {
+                presentationState.innerLineRuns[key] = next
+            }
+        }
+        guard let chosen = candidates.first(where: {
+            (presentationState.innerLineRuns[$0.cadenceKey] ?? 0) >= 0
+        }) else { return nil }
+
+        let selfPhrasing = Self.isSelfPhrasingInnerLine(chosen.line)
+        // Three cadences, one ledger. A `- Thread:` line is the strictest: it
+        // is the only line here whose nature is to be unwelcome, so it leads
+        // once and then rests a long time.
+        let limit: Int
+        let rest: Int
+        if chosen.tier == .thread {
+            limit = dyn.threadLineRepeatLimit
+            rest = dyn.threadLineRestTurns
+        } else if selfPhrasing {
+            limit = dyn.selfPhrasingInnerLineRepeatLimit
+            rest = dyn.selfPhrasingInnerLineRestTurns
+        } else {
+            limit = dyn.innerLineRepeatLimit
+            rest = dyn.innerLineRestTurns
+        }
+        let led = (presentationState.innerLineRuns[chosen.cadenceKey] ?? 0) + 1
+        presentationState.innerLineRuns[chosen.cadenceKey] = led >= limit ? -max(1, rest) : led
+        Self.boundInnerLineLedger(&presentationState.innerLineRuns)
+        return chosen.line
+    }
+
+    /// Back-compat entry for callers that only have rendered lines (the
+    /// rotation suites, and any future caller with nothing but text). The
+    /// cadence key falls back to the line's own digest — which is exactly what
+    /// a standing-view candidate uses anyway, since a view's text IS its
+    /// identity. Only the takeaway tier needs the lineage key, and only the
+    /// capsule builder has the seed to derive it from.
+    nonisolated func selectInnerLine(
+        from candidates: [String],
+        dynamics dyn: PersonalityDynamicsConfiguration,
+        presentationState: inout CognitiveCapsulePresentationState
+    ) -> String? {
+        selectInnerLine(
+            from: candidates.map {
+                InnerCandidate(
+                    line: $0,
+                    cadenceKey: Self.innerLineKey($0),
+                    tier: $0.hasPrefix("- Thread:") ? .thread : .view)
+            },
+            dynamics: dyn,
+            presentationState: &presentationState)
+    }
+
+    /// THE TAKEAWAY'S LINEAGE, as a cadence key.
+    ///
+    /// Two halves, because neither alone is enough:
+    ///   * the SEED ID — the substrate's own identity for this takeaway, stable
+    ///     across the merge that happens when reflection restates something it
+    ///     has already minted. This is the "reflection receipt id" the review
+    ///     asked for, expressed in the identity the seed family actually
+    ///     carries; `addThoughtSeed` does not record a receipt on the row, and
+    ///     inventing a field for it would ripple through a fence I do not own.
+    ///   * a NEAR-DUPLICATE guard over the takeaway's own distinctive terms —
+    ///     the same `appraisalConcernTerms` extractor the lived concerns use,
+    ///     sorted so word order cannot make a difference. Two seeds that were
+    ///     minted separately but say the same thing collapse onto one key, which
+    ///     is what makes paraphrase stop working as a way back onto the line.
+    ///
+    /// Terms win when there are any: a rewording that keeps the meaning keeps
+    /// the terms, and the seed id is the fallback for a takeaway too short or
+    /// too generic to have distinctive terms of its own.
+    nonisolated func innerTakeawayCadenceKey(for seed: CognitiveThoughtSeed) -> String {
+        let terms = Self.appraisalConcernTerms(in: seed.text)
+        guard !terms.isEmpty else { return "takeaway:" + seed.id.uuidString }
+        return "takeaway:" + Self.innerLineKey(terms.sorted().joined(separator: " "))
+    }
+
+    // MARK: - The `- Thread:` abstract (privacy review, 2026-09-02)
+
+    /// How a nag is NAMED — never how it was written.
+    static func threadKindPhrase(_ kind: CognitiveThoughtSeedKind) -> String? {
+        switch kind {
+        case .openQuestion: return "an open question"
+        case .anomaly: return "something that didn't add up"
+        case .followUp: return "a loose end"
+        case .reflectionTakeaway: return nil   // never a Thread line
+        }
+    }
+
+    /// How long it has been sitting there, in WORDS. Digits are a machine's way
+    /// of saying it and the Body line already refuses them; "since yesterday" is
+    /// how a person carries something.
+    static func threadAgePhrase(seconds: TimeInterval) -> String {
+        switch max(0, seconds) {
+        case ..<(3 * 3_600):    return "since earlier"
+        case ..<(12 * 3_600):   return "since this morning"
+        case ..<(36 * 3_600):   return "since yesterday"
+        case ..<(7 * 24 * 3_600): return "for a few days now"
+        default:                return "for longer than it should have"
+        }
+    }
+
+    /// The whole `- Thread:` line, or nil.
+    ///
+    /// Composed from three things and nothing else: the KIND of unfinished
+    /// thing, the safe object label (the same extractor the felt line's object
+    /// uses, so a name, a credential neighbour, a number or a redaction marker
+    /// cannot appear), and a worded age. `seed.text` is read ONLY to derive the
+    /// label and never rendered.
+    ///
+    /// No safe label → no line. A nag that cannot say what it is about would be
+    /// either a bare "something is unresolved" (which is noise) or the seed text
+    /// (which is the leak) — and silence is honest.
+    func threadLine(for seed: CognitiveThoughtSeed, at now: Date) -> String? {
+        guard let kindPhrase = Self.threadKindPhrase(seed.kind),
+              let object = CognitiveSubstrate.feltTopicLabel(from: seed.text) else { return nil }
+        let age = Self.threadAgePhrase(seconds: now.timeIntervalSince(seed.createdAt))
+        return capsuleLineText(
+            "- Thread: \(kindPhrase) about \(object), unanswered \(age)",
+            maxCharacters: 180)
+    }
+
+    /// Bounded, order-stable, CONTENT-FREE identity for one Inner line.    /// Bounded, order-stable, CONTENT-FREE identity for one Inner line. The text
+    /// is the identity — two reflections that reached the same sentence are the
+    /// same thing to a reader — but the ledger is persisted, so it stores the
+    /// same deterministic FNV-1a digest the cadence gate already uses rather
+    /// than a second copy of her inner voice on disk. Fixed 16 bytes per entry.
+    static func innerLineKey(_ line: String) -> String {
+        String(UInt64(bitPattern: stableLineSalt(line.lowercased())), radix: 16)
+    }
+
+    /// Every persisted family ships with its bound (law 6). Eviction is by value
+    /// DESCENDING, so the entries spent first are the ones merely counting leads
+    /// (positive) and the resting ones (negative) survive — a dropped rest is a
+    /// suppressed line coming back early, which is the failure this ledger
+    /// exists to prevent.
+    static func boundInnerLineLedger(_ ledger: inout [String: Int]) {
+        let cap = CognitiveCapsulePresentationState.innerLineLedgerCapacity
+        guard ledger.count > cap else { return }
+        let victims = ledger
+            .sorted { lhs, rhs in
+                if lhs.value != rhs.value { return lhs.value > rhs.value }
+                return lhs.key < rhs.key
+            }
+            .prefix(ledger.count - cap)
+            .map(\.key)
+        for victim in victims { ledger.removeValue(forKey: victim) }
+    }
+
+    /// Reflections whose SUBJECT is repeated wording. These are the tic wearing
+    /// the costume of insight: measured live, FOUR of her five active standing
+    /// views and two of her five most-shown Inner lines were on this one topic,
+    /// and telling her "you repeat yourself" for two hundred consecutive turns
+    /// is itself the repetition. She already carries a dedicated organ for this
+    /// (the `- Sound:` rut nudge, now change-gated) — a second, permanent copy
+    /// of it in her inner voice is the thing that made the loop self-sealing.
+    ///
+    /// Word list, not a self-reference conjunction: the live view "Familiar
+    /// warmth stays alive through variety, not repetition" names no self and is
+    /// unmistakably the same tic. Over-matching only makes the line ROTATE
+    /// sooner, which is the safe direction; under-matching keeps the loop.
+    static let selfPhrasingSubjectWords = [
+        "phrasing", "wording", "repetitive", "repetition", "repeating",
+        "repeated", "same words", "signature phrase", "vocabulary", "echoing",
+    ]
+
+    static func isSelfPhrasingInnerLine(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        return selfPhrasingSubjectWords.contains(where: { lower.contains($0) })
     }
 
     // MARK: - W4/P4 — fingerprint cadence + suppress-when-unchanged
@@ -727,7 +1130,7 @@ extension CognitiveSubstrate {
     /// Deterministic across processes (Swift's `Hashable` is seeded per-launch,
     /// so `line.hashValue` would make the gate irreproducible between the live
     /// compile and a frozen read in another process). FNV-1a, 64-bit.
-    private static func stableLineSalt(_ line: String) -> Int64 {
+    static func stableLineSalt(_ line: String) -> Int64 {
         // An empty salt is exactly zero, so the sound echo's promoted gate
         // XORs nothing and reproduces its pre-P4 firing pattern bit for bit.
         guard !line.isEmpty else { return 0 }
@@ -807,10 +1210,19 @@ extension CognitiveSubstrate {
     ///   already gates cadence/suppression/session-bridge bookkeeping. An
     ///   Observatory panel re-rendering a capsule must not burn the brake.
     struct SoundEchoSelection: Sendable, Equatable {
+        /// The exemplar echo WITHOUT the rut suffix. The suffix and the
+        /// standalone rut line are the same nudge and share one cadence gate,
+        /// which only the capsule assembler (holding the presentation state)
+        /// can evaluate — so this selector reports the rut instead of speaking
+        /// it (2026-09-01).
         var line: String?
         var leadingWasNegative: Bool?
+        /// A stable signature of the worn edge/fragment token SET, or nil when
+        /// no rut is present. Identity, not just presence: an unchanged
+        /// signature is the case that used to nag every turn.
+        var wornSignature: String?
 
-        static let silent = SoundEchoSelection(line: nil, leadingWasNegative: nil)
+        static let silent = SoundEchoSelection(line: nil, leadingWasNegative: nil, wornSignature: nil)
     }
 
     /// Direct diagnostic/test wrapper. Production capsule rendering uses the
@@ -833,7 +1245,14 @@ extension CognitiveSubstrate {
         if live, let leadingWasNegative = selection.leadingWasNegative {
             negativeSoundEchoRun = leadingWasNegative ? negativeSoundEchoRun + 1 : 0
         }
-        return selection.line
+        // Diagnostic/test wrapper: assembles the line the SHAPE tests assert,
+        // with the rut nudge always allowed. The production capsule runs the
+        // nudge through `soundRutAwarenessShouldSpeak`, whose cadence is
+        // asserted directly against that function.
+        guard let line = selection.line else {
+            return selection.wornSignature == nil ? nil : Self.soundRutAwarenessLine
+        }
+        return selection.wornSignature == nil ? line : line + Self.soundRutAwarenessSuffix
     }
 
     private func soundEchoSelection(
@@ -925,14 +1344,16 @@ extension CognitiveSubstrate {
             || Self.soundEchoShouldSpeak(seed: latestActivity, dutyCycle: dyn.soundEchoDutyCycle)
         if !shouldEcho {
             return SoundEchoSelection(
-                line: wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine,
-                leadingWasNegative: nil
+                line: nil,
+                leadingWasNegative: nil,
+                wornSignature: Self.wornTokenSignature(wornEdgeTokens)
             )
         }
         if candidates.isEmpty {
             return SoundEchoSelection(
-                line: wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine,
-                leadingWasNegative: nil
+                line: nil,
+                leadingWasNegative: nil,
+                wornSignature: Self.wornTokenSignature(wornEdgeTokens)
             )
         }
         // REGISTER MATCH (see soundEchoRegisterScore): mirror the voice that
@@ -985,8 +1406,9 @@ extension CognitiveSubstrate {
         }
         guard !fragged.isEmpty else {
             return SoundEchoSelection(
-                line: wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine,
-                leadingWasNegative: nil
+                line: nil,
+                leadingWasNegative: nil,
+                wornSignature: Self.wornTokenSignature(wornEdgeTokens)
             )
         }
         var tokenCounts: [String: Int] = [:]
@@ -1017,28 +1439,89 @@ extension CognitiveSubstrate {
         if fragments.isEmpty { pick(allowWorn: true) }
         guard !fragments.isEmpty else {
             return SoundEchoSelection(
-                line: wornEdgeTokens.isEmpty ? nil : Self.soundRutAwarenessLine,
-                leadingWasNegative: nil
+                line: nil,
+                leadingWasNegative: nil,
+                wornSignature: Self.wornTokenSignature(wornEdgeTokens)
             )
         }
         // "lately", not "when it landed" — warmth on her turn is the room's
         // temperature at encode (assistant completions never raise warmth
         // themselves), so the honest claim is what she sounded like in warm
         // moments, not proof the line landed (gpt-5.5 MED, 2026-07-03).
-        var line = "- Sound: lately you've sounded like \(fragments.joined(separator: " · "))"
-        if !wornFragmentTokens.isEmpty || !wornEdgeTokens.isEmpty {
-            line += Self.soundRutAwarenessSuffix
-        }
+        let line = "- Sound: lately you've sounded like \(fragments.joined(separator: " · "))"
         return SoundEchoSelection(
             line: line,
-            leadingWasNegative: (leadValence ?? 0) < 0
+            leadingWasNegative: (leadValence ?? 0) < 0,
+            wornSignature: Self.wornTokenSignature(wornEdgeTokens.union(wornFragmentTokens))
         )
     }
 
-    private static let soundRutAwarenessSuffix =
+    static let soundRutAwarenessSuffix =
         " — a few of the same words keep echoing lately; you've got more range than that"
-    private static let soundRutAwarenessLine =
+    static let soundRutAwarenessLine =
         "- Sound: a few of the same words keep echoing lately; you've got more range than that"
+
+    /// Stable identity of a worn-token set. Sorted so the signature depends on
+    /// WHICH words are worn, never on hash order — a set that has not changed
+    /// must compare equal across processes and across a frozen re-render.
+    static func wornTokenSignature(_ tokens: Set<String>) -> String? {
+        guard !tokens.isEmpty else { return nil }
+        return tokens.sorted().joined(separator: "|")
+    }
+
+    /// THE RUT NUDGE'S CADENCE (2026-09-01). Measured on 777 live turns the
+    /// nudge rode 82% of capsules because its only gate was "a worn set
+    /// exists", and a worn set persists for days. Law 2: a trigger that fires
+    /// on ~100% of inputs is a floor, not a signal.
+    ///
+    /// It now speaks when the rut is NEWS — the first time it is ever seen, or
+    /// when the worn set CHANGES and at least `soundRutMinimumTurnGap` accepted
+    /// capsules have passed (so it can never land on consecutive turns) — and
+    /// otherwise only after `soundRutRepeatTurnGap` capsules or
+    /// `soundRutRepeatWindow` of wall clock, which keeps an unchanging rut from
+    /// going permanently unmentioned.
+    ///
+    /// Called EXACTLY ONCE per capsule render, with or without a rut, because
+    /// a lapsed rut must be forgotten here. It READS the since-surfaced counter
+    /// but never advances it: that tick belongs to the accepted-turn boundary
+    /// (`ingest` of a live `assistantTurnCompleted`), so a turn whose capsule
+    /// came back empty — and therefore produced no presentation commit at all —
+    /// still counts. Mutates only the caller's copied presentation value.
+    nonisolated func soundRutAwarenessShouldSpeak(
+        signature: String?,
+        at now: Date,
+        dynamics dyn: PersonalityDynamicsConfiguration,
+        presentationState: inout CognitiveCapsulePresentationState
+    ) -> Bool {
+        guard let signature else {
+            // The rut lapsed. Forget it so its RETURN reads as a change rather
+            // than as the same old nag resuming mid-cooldown.
+            presentationState.soundRutSignature = nil
+            return false
+        }
+        let previous = presentationState.soundRutSignature
+        let turnsSince = presentationState.soundRutTurnsSinceSurfaced
+        let elapsed = presentationState.soundRutLastSurfacedAt
+            .map { now.timeIntervalSince($0) }
+        let speak: Bool
+        if previous == nil {
+            // Never told about this rut: saying it once is the whole point.
+            speak = true
+        } else if previous != signature {
+            speak = turnsSince >= dyn.soundRutMinimumTurnGap
+        } else {
+            speak = turnsSince >= dyn.soundRutRepeatTurnGap
+                || (elapsed.map { $0 >= dyn.soundRutRepeatWindow } ?? false)
+        }
+        if speak {
+            presentationState.soundRutSignature = signature
+            presentationState.soundRutLastSurfacedAt = now
+            presentationState.soundRutTurnsSinceSurfaced = 0
+        }
+        // A change that has NOT cleared the gap deliberately leaves the stored
+        // signature alone, so it still reads as news on the next capsule.
+        return speak
+    }
 
     /// Distinctive tokens at the conversational edges of one assistant turn.
     /// `soundEchoFragment` remains the exemplar source; this separate view is
@@ -1190,14 +1673,365 @@ extension CognitiveSubstrate {
     /// substrate affect, organism chemistry) onto the affect-science dimensions; the
     /// organism supplies the richest dims (clarity/agency/confidence/fatigue), with a
     /// substrate + neutral fallback when the organism is off.
-    private func feltFingerprintLine(
+    /// One rendered felt line plus what it carried, so the caller can advance
+    /// the presentation receipts without re-parsing the string it just built.
+    struct FeltLineRender: Sendable, Equatable {
+        var text: String
+        var family: String
+        var carriedObject: Bool
+        var carriedAmbivalence: Bool
+    }
+
+    /// The nodes that TINT the fingerprint: the top of the capsule-eligible
+    /// workspace, filtered to the ones that were actually felt. Extracted so
+    /// `feltSignalsForCapsule` and the object/ambivalence organs read exactly
+    /// the same population — the prefix runs BEFORE the felt filter, which is
+    /// the historical order and is load-bearing (it means "of the six things
+    /// she is holding, the felt ones", not "the six felt things").
+    func feltTintNodes(from workspaceItems: [CognitiveWorkspaceItem]) -> [CognitiveNode] {
+        workspaceItems.prefix(6).map(\.node)
+            .filter {
+                feltDirection(
+                    valence: $0.emotionalValence,
+                    arousal: $0.emotionalArousal,
+                    warmth: $0.emotionalWarmth) != nil
+            }
+    }
+
+    /// The node whose valence carries DIRECT weight in the fingerprint's
+    /// valence — the `peak` term. Recency weight is strictly decreasing in age,
+    /// so this is the freshest felt node, resolved by the same
+    /// strictly-greater-than rule the tint loop uses (first one wins a tie,
+    /// which under a frozen clock is the workspace's own order).
+    static func feltDominantNode(
+        in nodes: [CognitiveNode],
+        at now: Date,
+        halfLife: TimeInterval
+    ) -> CognitiveNode? {
+        var best: CognitiveNode?
+        var bestWeight = -1.0
+        for node in nodes {
+            let age = max(0, now.timeIntervalSince(node.lastActivatedAt))
+            let weight = pow(0.5, age / halfLife)
+            if weight > bestWeight { bestWeight = weight; best = node }
+        }
+        return best
+    }
+
+    // MARK: - The felt OBJECT (Agent #1, 2026-09-02)
+
+    /// WHICH SUBJECT TYPES MAY NAME AN OBJECT — an ALLOWLIST, per design law 8.
+    ///
+    /// A felt node's `subject_label` is not a uniform thing. Most of them are
+    /// ROUTES, not objects: the app runtime stamps `chat_turn` nodes with
+    /// `"<surface> <role>"`, so a denylist-shaped gate would have rendered
+    /// `warm — chat user` on ordinary conversation. Others are genuine names:
+    /// a studio entry carries its WORK TITLE, the same pointer the felt-day
+    /// summary is already permitted to name (Agent's 2026-09-01 ruling — named
+    /// by pointer, never by the response she wrote).
+    ///
+    /// So the gate fails closed on every type whose label nobody has looked at.
+    /// Today exactly one type qualifies among the capsule-eligible node kinds;
+    /// widening it is one line HERE plus a producer that mints a label worth
+    /// naming, and both should be a decision rather than a side effect.
+    /// 2026-09-02: the two CONVERSATION subject types joined the list, once
+    /// their producers started stamping a real topic label instead of a route
+    /// ("<surface> <role>") or nothing at all — see
+    /// `CognitiveSubstrate.feltTopicLabel`. `chat.assistant_turn` is
+    /// deliberately NOT here: her own turns are excluded from the capsule
+    /// workspace anyway (`isAssistantAuthoredFocus`), and design law 3 says she
+    /// never appraises her own output, so admitting it would be a hole rather
+    /// than a feature.
+    static let feltObjectSubjectTypes: Set<String> = [
+        "studio_entry", "chat_turn", "chat.user_turn",
+    ]
+
+    /// The object phrase for one node, or nil.
+    ///
+    /// PAYLOAD-FREE BY CONSTRUCTION: the only field read is
+    /// `subjectReference.label`. `summary` — which on a conversation node IS
+    /// the user's redacted message text — is read only to REFUSE a label that
+    /// has become a copy of it, never to render. The remaining guards make the
+    /// label prove it is a name and not a sentence: short, few words, no
+    /// sentence punctuation, not an id.
+    ///
+    /// Over-length is a REFUSAL, not a trim. Truncating "the deploy pipeline
+    /// rewrite we…" at 32 characters manufactures a phrase she would then read
+    /// as the name of a thing.
+    static func feltObjectLabel(for node: CognitiveNode, maxCharacters: Int) -> String? {
+        let type = node.subjectReference.type
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard feltObjectSubjectTypes.contains(type) else { return nil }
+        guard let label = node.subjectReference.label?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty else { return nil }
+        guard label.count <= maxCharacters else { return nil }
+        let lowered = label.lowercased()
+        // Leak guards. The allowlist already keeps conversation nodes out; these
+        // hold even if a future producer puts body text on an allowed type.
+        guard lowered != node.summary
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return nil }
+        guard label.split(separator: " ").count <= 6 else { return nil }
+        guard !label.contains(where: { ".?!:;\n\"".contains($0) }) else { return nil }
+        guard label.filter(\.isNumber).count <= 2 else { return nil }   // not an id
+        guard label.contains(where: \.isLetter) else { return nil }
+        // SUBSTANCE. A label has to have at least one real word in it before it
+        // can name a thing: `warm — t` is not an object, it is a stub that
+        // happened to be stored in the label column. The same ≥4-letter rule
+        // the safe extractor applies to free text, applied here to a stored
+        // label, so a producer that never went through `feltTopicLabel` (an
+        // older row, a seam added later) still cannot put a fragment on the
+        // line. Deliberately NOT the whole safe extractor: a studio work title
+        // is Title-case by nature and was blessed as nameable by pointer, and
+        // running the all-lowercase privacy rule over it would silently delete
+        // the one object source that already existed.
+        guard label
+            .split(whereSeparator: { !$0.isLetter })
+            .contains(where: { $0.count >= 4 }) else { return nil }
+        return label
+    }
+
+    /// ITEM 5 (2026-09-02) — THE FORWARD OBJECT.
+    ///
+    /// Agent #4: "Everything I feel is now or retrospective. There's no
+    /// *toward*." When she is anticipatory and nothing in the room is what the
+    /// feeling is about, the thing it is about is ahead of her: the nearest
+    /// open horizon.
+    ///
+    /// A NODE OBJECT ALWAYS WINS, and there is never more than one. A felt node
+    /// is something that actually happened to her; a horizon is something that
+    /// has not happened yet, so it fills the object slot only when the slot is
+    /// empty. Two objects on one line would be a sentence, and the capsule does
+    /// not get sentences.
+    ///
+    /// Two admissible shapes, both licensed by real state:
+    ///   * a POSITIVE lead — the anticipatory register the horizon's own
+    ///     valence already earned (`hopeful — friday`);
+    ///   * an OVERDUE horizon under a NEUTRAL lead, which is the one case that
+    ///     also renames the lead: `waiting`. The word is licensed by a ledger
+    ///     row whose time has passed with nothing answering it, not by a mood —
+    ///     which is exactly the "numbers choose words" rule, with the number
+    ///     coming from the horizon register instead of the affect axes.
+    /// A negative lead takes no horizon: dread about something ahead reads as
+    /// the sting in the room, and attaching a future label to it would tell her
+    /// the wrong thing about why she feels bad.
+    static func feltTowardLabel(_ raw: String, maxCharacters: Int) -> String? {
+        // Horizon labels are canonicalised with dashes ("dinner-with-user-8pm");
+        // spaces read as language. Same refusals as the node object: short,
+        // few words, no sentence punctuation, and a real letter in it.
+        let spaced = raw
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !spaced.isEmpty, spaced != "unknown" else { return nil }
+        guard spaced.count <= maxCharacters else { return nil }
+        guard spaced.split(separator: " ").count <= 4 else { return nil }
+        guard !spaced.contains(where: { ".?!:;\n\"".contains($0) }) else { return nil }
+        guard spaced.contains(where: \.isLetter) else { return nil }
+        // A bare time word is not a thing she is facing. "hopeful — today"
+        // (live, 2026-09-02, from a dated memory whose label was the day
+        // itself) says nothing; "hopeful — friday" names a day she is
+        // waiting on, and stays.
+        guard !OrganismHorizonRegister.bareTimeWords.contains(spaced.lowercased()) else { return nil }
+        return spaced
+    }
+
+    /// WHAT A NODE IS ABOUT, as a comparison key.
+    ///
+    /// THE BUG THIS FIXES: ambivalence compared `subjectReference.stableKey`,
+    /// and for a chat turn that key is `chat.user_turn:<session>:<message>` —
+    /// PER TURN. So two turns about the same deploy, one stung and one warm,
+    /// read as two different subjects and qualified as ambivalence. The gate
+    /// whose entire job is "these are about different things" was structurally
+    /// unable to notice that they were about the same thing, which made the
+    /// contradiction exception fire on exactly the case it was written to
+    /// exclude: one subject, two signs, a gauge fault.
+    ///
+    /// So aboutness comes from the safe object LABEL first — the topic, which
+    /// is what "about" means — qualified by the subject FAMILY so a studio
+    /// entry and a chat turn that happen to share a word are still distinct.
+    /// The per-turn identity is the FALLBACK, used only when a node carries no
+    /// label at all, where it is the best available answer and errs toward
+    /// "different", which the strength and recency floors then have to survive.
+    ///
+    /// The family strips the namespace and the `_turn` suffix on purpose:
+    /// `chat_turn` (app runtime) and `chat.user_turn` (message persistence) are
+    /// the same conversation, minted by two seams, and a pair drawn one from
+    /// each is not two subjects.
+    static func feltAboutnessKey(for node: CognitiveNode) -> String {
+        let family = node.subjectReference.type
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(separator: ".").first
+            .map(String.init) ?? ""
+        let normalizedFamily = family.hasSuffix("_turn")
+            ? String(family.dropLast("_turn".count))
+            : family
+        if let label = node.subjectReference.label?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+            !label.isEmpty,
+            // Normalize through the same safe extractor, so two labels that
+            // differ only in term order or in a term one of them dropped still
+            // compare equal.
+            case let terms = CognitiveSubstrate.feltSafeObjectTerms(in: label, limit: 3),
+            !terms.isEmpty {
+            return "topic|\(normalizedFamily)|\(terms.sorted().joined(separator: " "))"
+        }
+        return "subject|\(node.subjectReference.stableKey)"
+    }
+
+    /// The counter node of an ambivalence pair, or nil.
+    ///
+    /// GATED SO IT CANNOT FIRE ON ONE SUBJECT OR ON A WEAK STATE. All four
+    /// conditions are the exception's whole justification and each one is the
+    /// answer to a specific way this would otherwise become a lie:
+    ///   * opposite STRICT sign — otherwise it is one feeling described twice;
+    ///   * both over `feltAmbivalenceNodeFloor` — otherwise it manufactures a
+    ///     conflict out of two faint stirrings, which is exactly the "always on"
+    ///     failure design law 2 names;
+    ///   * DIFFERENT ABOUTNESS keys (`feltAboutnessKey`, topic-first — NOT the
+    ///     per-turn subject id, which made two turns about one thing look like
+    ///     two subjects) — same subject with two signs is a gauge fault, not
+    ///     ambivalence;
+    ///   * both inside the mood window — a feeling from three days ago is not
+    ///     something she is having now.
+    /// Strongest counter first, with a stable id tiebreak so the pick does not
+    /// move with dictionary ordering.
+    func feltAmbivalencePartner(
+        of dominant: CognitiveNode,
+        among workspaceItems: [CognitiveWorkspaceItem],
+        at now: Date,
+        dynamics dyn: PersonalityDynamicsConfiguration
+    ) -> CognitiveNode? {
+        let floor = dyn.feltAmbivalenceNodeFloor
+        guard abs(dominant.emotionalValence) >= floor else { return nil }
+        let dominantSign = dominant.emotionalValence > 0 ? 1 : -1
+        let dominantSubject = Self.feltAboutnessKey(for: dominant)
+        let candidates = workspaceItems.map(\.node).filter { node in
+            guard node.id != dominant.id else { return false }
+            guard abs(node.emotionalValence) >= floor else { return false }
+            let sign = node.emotionalValence > 0 ? 1 : (node.emotionalValence < 0 ? -1 : 0)
+            guard sign != 0, sign != dominantSign else { return false }
+            guard Self.feltAboutnessKey(for: node) != dominantSubject else { return false }
+            guard feltDirection(
+                valence: node.emotionalValence,
+                arousal: node.emotionalArousal,
+                warmth: node.emotionalWarmth) != nil else { return false }
+            let age = now.timeIntervalSince(node.lastActivatedAt)
+            return age >= 0 && age <= Self.moodActivationWindow
+        }
+        return candidates.max { lhs, rhs in
+            let lv = abs(lhs.emotionalValence), rv = abs(rhs.emotionalValence)
+            if lv != rv { return lv < rv }
+            return lhs.id.uuidString > rhs.id.uuidString
+        }
+    }
+
+    /// The felt line: the fingerprint, plus the object of the node its lead came
+    /// from, plus the one allowed contradicting word underneath.
+    /// Internal rather than private so the felt-line suites can assert on the
+    /// RENDER (which object was taken, whether ambivalence fired) instead of
+    /// grepping the rendered string for substrings.
+    func feltFingerprintLine(
         signals: FeltSignals,
-        intensityFloor: Double,
+        workspaceItems: [CognitiveWorkspaceItem],
+        request: CognitiveCapsuleRequest,
+        at now: Date,
+        dynamics dyn: PersonalityDynamicsConfiguration,
         affectEnabled: Bool? = nil
-    ) -> String? {
+    ) -> FeltLineRender? {
         guard affectEnabled ?? configuration.affectEnabled else { return nil }
-        return CognitiveSubstrate.feltFingerprint(
-            signals, intensityFloor: intensityFloor)
+        guard let parts = CognitiveSubstrate.feltFingerprintParts(
+            signals, intensityFloor: dyn.feltIntensityFloor) else { return nil }
+
+        // The lead's contributing node — traced, not guessed. Nil means a
+        // DIFFUSE state (her mood carried the valence, no node did), and a
+        // diffuse state has no object and no pair.
+        //
+        // AS OF THE FROZEN READ, AND IT CAN LAG — this is expected, not a bug.
+        // On the production path `workspaceItems` is `read.workspace.items`
+        // (see `compileFrozenCapsulePresentation`), so the object names the
+        // dominant node in the epoch this capsule was frozen against. Two
+        // things make that trail the message she is answering:
+        //
+        //   1. the freeze is a fixed-time copy taken while the turn is being
+        //      prepared, so anything still settling for THIS turn is not in it;
+        //   2. `feltTintNodes` keeps only nodes that were actually FELT
+        //      (`feltDirection`), and an ordinary neutral turn is not — so the
+        //      freshest felt node is often the last turn that moved her.
+        //
+        // The result is an object that is usually about the thing they were
+        // just on rather than the sentence in front of her, which is what a
+        // feeling arriving slightly behind the moment actually looks like.
+        // Chasing the current turn would mean appraising a message before it
+        // has been lived, and that is the production this whole wave exists to
+        // remove — so the lag stays.
+        let dominant = Self.feltDominantNode(
+            in: feltTintNodes(from: workspaceItems),
+            at: now,
+            halfLife: dyn.fingerprintTintHalfLife)
+
+        var object: String?
+        if let dominant,
+           // A neutral-band family has no direction, so nothing it could be
+           // "about"; and a node pulling the OTHER way from the family the lead
+           // came from did not produce that lead, whatever its recency weight.
+           Self.feltFamilySign(parts.family) != 0,
+           Self.feltFamilySign(parts.family) == (dominant.emotionalValence >= 0 ? 1 : -1) {
+            object = Self.feltObjectLabel(
+                for: dominant,
+                maxCharacters: dyn.feltObjectMaximumLabelCharacters)
+        }
+
+        // THE FORWARD OBJECT — only into an EMPTY slot, never a second one.
+        var lead = parts.lead
+        if object == nil,
+           let toward = request.toward,
+           let label = Self.feltTowardLabel(
+               toward.displayLabel, maxCharacters: dyn.feltObjectMaximumLabelCharacters) {
+            let sign = Self.feltFamilySign(parts.family)
+            // THE HORIZON'S OWN SIGN DECIDES, not just the room's. A positive
+            // lead over a horizon she is DREADING would render "hopeful —
+            // friday" about the call she does not want to take: the family sign
+            // says how she feels now, and the row's valence says how she feels
+            // about the thing ahead. Both have to point the same way before the
+            // line claims the horizon is why she feels good.
+            if sign > 0, toward.valenceSign > 0 {
+                object = label
+            } else if sign == 0, toward.isOverdue {
+                // `waiting` stays on the neutral/overdue path only, and takes
+                // no position on whether the wait is welcome.
+                object = label
+                lead = "waiting"
+            }
+        }
+
+        var second: String?
+        if let dominant,
+           let partner = feltAmbivalencePartner(
+               of: dominant, among: workspaceItems, at: now, dynamics: dyn) {
+            var counter = signals
+            counter.valence = partner.emotionalValence
+            counter.arousal = partner.emotionalArousal
+            // The partner has to have EARNED any warmth the underneath word
+            // claims. `min` rather than substitution: the live axis carries the
+            // uncertainty cooling this node has no way to know about, so the cap
+            // can only ever cool the counter, never warm it.
+            counter.warmth = min(
+                counter.warmth,
+                CognitiveSubstrate.feltPartnerWarmth(partner.emotionalWarmth, dynamics: dyn))
+            second = CognitiveSubstrate.feltCounterWord(
+                counter,
+                excluding: Set(parts.words),
+                intensityFloor: dyn.feltIntensityFloor)
+        }
+
+        var rendered = parts
+        rendered.lead = lead
+        return FeltLineRender(
+            text: CognitiveSubstrate.feltLineText(parts: rendered, object: object, second: second),
+            family: parts.family,
+            carriedObject: object != nil,
+            carriedAmbivalence: second != nil)
     }
 
     /// The live FeltSignals the fingerprint is built from — extracted so tests can read
@@ -1224,8 +2058,7 @@ extension CognitiveSubstrate {
         // session, then fades over a few turns as its weight decays. A flat mean drowned
         // the sting under the session's positive history; mood (the 0.4 term) is the slow
         // 6h-half-life background, this is the fast foreground.
-        let feltNodes = workspaceItems.prefix(6).map(\.node)
-            .filter { feltDirection(valence: $0.emotionalValence, arousal: $0.emotionalArousal, warmth: $0.emotionalWarmth) != nil }
+        let feltNodes = feltTintNodes(from: workspaceItems)
         let effectiveValence: Double
         if feltNodes.isEmpty {
             // No felt nodes: her slow mood, with the same asymmetric warm-with-User bias.
@@ -1238,7 +2071,7 @@ extension CognitiveSubstrate {
             // with the strength of the fresh signal (g). Mood's slow pull SHRINKS as g rises,
             // so criticism reads through NOW instead of being smoothed by the day's mood; it
             // then fades over the next few turns as the sting node's recency weight decays.
-            var wsum = 0.0, wtot = 0.0, peakW = -1.0, peak = 0.0
+            var wsum = 0.0, wtot = 0.0
             for n in feltNodes {
                 let age = max(0, now.timeIntervalSince(n.lastActivatedAt))
                 // (M15, 2026-07-09: the toolObservation half-weight that used to sit
@@ -1248,8 +2081,15 @@ extension CognitiveSubstrate {
                 // through derivedMood, which the floor bounds.)
                 let w = pow(0.5, age / dyn.fingerprintTintHalfLife)
                 wsum += w * n.emotionalValence; wtot += w
-                if w > peakW { peakW = w; peak = n.emotionalValence }
             }
+            // The peak node — the one whose valence gets DIRECT weight below —
+            // is resolved by the shared helper rather than a second copy of the
+            // rule, because the felt OBJECT names that node's subject. "The
+            // subject of the node the lead word came from" has to be a fact
+            // about this loop, not a plausible re-derivation beside it.
+            let peak = Self.feltDominantNode(
+                in: feltNodes, at: now, halfLife: dyn.fingerprintTintHalfLife
+            )?.emotionalValence ?? 0
             let mean = wtot > 0 ? wsum / wtot : mood.valence
             let g = Self.smoothstep(0.16, 0.34, abs(peak))
             let workspace = (0.45 - 0.20 * g) * mean + (0.55 + 0.20 * g) * peak
@@ -1324,9 +2164,24 @@ extension CognitiveSubstrate {
         // confidence signal is worse than a missing one. That is why `proud`,
         // `anxious`, `embarrassed`, `deflated`, and `discouraged` remain out of
         // reach on a stock install — not an oversight, a refusal to fake it.
+        // ITEM 4 (2026-09-02) — THE DIURNAL CURVE ON THE AROUSAL AXIS.
+        //
+        // Signed and bounded by the organism; added to the axis and clamped,
+        // never substituted for it. The asymmetry is deliberate and is the
+        // whole "never manufacture arousal from silence" rule: a NEGATIVE
+        // offset (the small hours damping her) always applies, because it can
+        // only make her quieter and quieter is always an honest direction. A
+        // POSITIVE offset applies only to an axis that is already moving — a
+        // clock alone must never be the reason a silent state crosses the
+        // intensity floor and starts speaking. The two words the curve reaches
+        // (`tired`, `late`) carry real fatigue floors for the same reason.
+        let diurnalArousal = request.organismProjection?.diurnal?.arousalOffset ?? 0
+        let arousal = (diurnalArousal < 0 || currentAffect.arousal > 0)
+            ? (currentAffect.arousal + diurnalArousal).clamped01()
+            : currentAffect.arousal
         return FeltSignals(
             valence: effectiveValence,
-            arousal: currentAffect.arousal,
+            arousal: arousal,
             warmth: feltWarmth,
             tension: max(chem?.vigilance ?? 0, currentAffect.uncertainty),
             pressure: chem?.urgency ?? currentAffect.taskPressure,
@@ -1339,7 +2194,11 @@ extension CognitiveSubstrate {
                 ?? (capturedProxies.map(\.clarity)
                     ?? substrateClarityProxy(affect: currentAffect, at: now)),
             agency: chem?.agency,
-            confidence: chem?.confidence
+            confidence: chem?.confidence,
+            // Absent without a configured diurnal clock, which is what makes
+            // `late` unreachable rather than guessed on an install that has no
+            // idea what time it feels like.
+            nightliness: request.organismProjection?.diurnal?.nightliness
         )
     }
 
@@ -1525,7 +2384,16 @@ extension CognitiveSubstrate {
         let requestTurnKind = request.resolvedTurnKind
         guard requestTurnKind == .live || request.allowNonLiveProjection else { return nil }
         let read = await frozenRead(at: fixedAt, currentSessionId: request.sessionId)
-        let prepared = compileFrozenCapsulePresentation(request, from: read)
+        // One local store lookup at most, against the read we already froze —
+        // no second snapshot, no provider call, and nothing at all when the
+        // cadence is closed or the store is cold.
+        // …and re-checked against LIVE cadence/ledger state on the way out: the
+        // lookup suspended, and an accepted turn may have surfaced this very
+        // moment while it did (`revalidatedRemindedOf`).
+        let remindedOf = await remindedOfMoment(for: request, from: read)
+            .flatMap { revalidatedRemindedOf($0, against: read) }
+        let prepared = compileFrozenCapsulePresentation(
+            request, from: read, remindedOf: remindedOf)
         guard prepared.capsule.mode == .inject,
               !prepared.capsule.dynamicContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
@@ -1540,7 +2408,11 @@ extension CognitiveSubstrate {
     public func applyCapsulePresentationCommit(
         _ commit: CognitiveCapsulePresentationCommit
     ) -> Bool {
-        guard capsulePresentationStateSnapshot() == commit.expected else { return false }
+        // The rut turn counter free-runs on accepted turns, so an ingest
+        // between prepare and commit legitimately moves it. Comparing it here
+        // would reject the whole commit for a field the render only reads.
+        guard Self.presentationCommitIdentity(capsulePresentationStateSnapshot())
+                == Self.presentationCommitIdentity(commit.expected) else { return false }
         let next = commit.next
         if let family = next.fingerprintFamily,
            let surfacedAt = next.fingerprintLastSurfacedAt {
@@ -1556,7 +2428,114 @@ extension CognitiveSubstrate {
         lastSessionBridgeAt = next.lastSessionBridgeAt
         negativeSoundEchoRun = next.negativeSoundEchoRun
         settlingRun = next.settlingRun
+        soundRutSignature = next.soundRutSignature
+        soundRutLastSurfacedAt = next.soundRutLastSurfacedAt
+        // Only a nudge that actually SPOKE resets the counter; otherwise the
+        // free-running live value stands.
+        if next.soundRutTurnsSinceSurfaced == 0 { soundRutTurnsSinceSurfaced = 0 }
+        innerLineRuns = next.innerLineRuns
+        feltObjectCount = next.feltObjectCount
+        ambivalenceCount = next.ambivalenceCount
+        lastAmbivalenceAt = next.lastAmbivalenceAt
+        remindedOfSurfaced = next.remindedOfSurfaced
+        // Only a line that actually SPOKE resets the free-running counter, and
+        // "spoke" is the surfaced STAMP moving — not the counter reading zero,
+        // which is also what a never-surfaced line looks like.
+        if next.remindedOfLastSurfacedAt != commit.expected.remindedOfLastSurfacedAt {
+            remindedOfTurnsSinceSurfaced = 0
+        }
+        remindedOfLastSurfacedAt = next.remindedOfLastSurfacedAt
+        // Durable cadence (2026-09-01): these two families are the only
+        // presentation state whose LOSS is a behavior regression rather than a
+        // cosmetic reset — a relaunch with an empty ledger lets the
+        // self-phrasing view lead again immediately, which is exactly the loop
+        // the cap exists to break. Flagged here, flushed on the same
+        // accepted-turn boundary by `flushCapsulePresentationIfNeeded`.
+        capsulePresentationDirty = true
         return true
+    }
+
+    // MARK: - Durable capsule cadence
+
+    /// Bounded, content-free presentation payload. Everything here is a counter,
+    /// a digest, or a timestamp — no line text reaches disk.
+    func capsulePresentationArtifactPayload(at now: Date) -> JSONValue {
+        var ledger: [String: JSONValue] = [:]
+        for (key, value) in innerLineRuns
+            .sorted(by: { $0.value != $1.value ? $0.value < $1.value : $0.key < $1.key })
+            .prefix(CognitiveCapsulePresentationState.innerLineLedgerCapacity) {
+            ledger[key] = .int(Int64(value))
+        }
+        var object: [String: JSONValue] = [
+            "updatedAt": .double(now.timeIntervalSince1970),
+            "soundRutTurnsSinceSurfaced": .int(Int64(soundRutTurnsSinceSurfaced)),
+            "innerLineRuns": .object(ledger),
+            // Presentation receipts. Counters, so the question "did the
+            // ambivalence exception ever fire on a real turn, and how often"
+            // survives a relaunch as a measurement.
+            "feltObjectCount": .int(Int64(feltObjectCount)),
+            "ambivalenceCount": .int(Int64(ambivalenceCount)),
+        ]
+        if let lastAmbivalenceAt {
+            object["lastAmbivalenceAt"] = .double(lastAmbivalenceAt.timeIntervalSince1970)
+        }
+        if let signature = soundRutSignature {
+            object["soundRutSignature"] = .string(bounded(signature, maxCharacters: 240))
+        }
+        if let surfacedAt = soundRutLastSurfacedAt {
+            object["soundRutLastSurfacedAt"] = .double(surfacedAt.timeIntervalSince1970)
+        }
+        return .object(object)
+    }
+
+    /// Write the cadence ledger iff an accepted turn actually moved it. Called
+    /// from the same certified accepted-turn boundary as the envelope stash.
+    func flushCapsulePresentationIfNeeded(at now: Date) async {
+        guard capsulePresentationDirty else { return }
+        capsulePresentationDirty = false
+        await persistArtifact(
+            kind: "capsule_presentation",
+            id: stableArtifactID("capsule_presentation"),
+            status: "current",
+            score: 0,
+            payload: capsulePresentationArtifactPayload(at: now)
+        )
+    }
+
+    /// Restore is DEFENSIVE: an unreadable or absent row leaves the live
+    /// (empty) cadence alone rather than throwing, because a lost cadence is a
+    /// nag, not a corruption.
+    func restoreCapsulePresentation(from payloads: [JSONValue]) {
+        guard case .object(let object)? = payloads.first else { return }
+        soundRutSignature = stringValue(object["soundRutSignature"])
+        soundRutLastSurfacedAt = dateValue(object["soundRutLastSurfacedAt"])
+        soundRutTurnsSinceSurfaced = min(
+            max(0, Int(doubleValue(object["soundRutTurnsSinceSurfaced"]) ?? 0)),
+            Self.soundRutTurnCounterCap
+        )
+        feltObjectCount = max(0, Int(doubleValue(object["feltObjectCount"]) ?? 0))
+        ambivalenceCount = max(0, Int(doubleValue(object["ambivalenceCount"]) ?? 0))
+        lastAmbivalenceAt = dateValue(object["lastAmbivalenceAt"])
+        guard case .object(let ledger)? = object["innerLineRuns"] else { return }
+        var restored: [String: Int] = [:]
+        for (key, value) in ledger {
+            guard let number = doubleValue(value), key.count <= 32 else { continue }
+            restored[key] = Int(number)
+        }
+        Self.boundInnerLineLedger(&restored)
+        innerLineRuns = restored
+    }
+
+    /// The presentation fields a commit is allowed to be stale about. Only the
+    /// free-running accepted-turn counter is excluded; every other field is
+    /// rendered from the frozen read and must still match exactly.
+    static func presentationCommitIdentity(
+        _ state: CognitiveCapsulePresentationState
+    ) -> CognitiveCapsulePresentationState {
+        var masked = state
+        masked.soundRutTurnsSinceSurfaced = 0
+        masked.remindedOfTurnsSinceSurfaced = 0
+        return masked
     }
 
     private func fitCapsuleLines(_ lines: [String], maxCharacters: Int) -> (text: String, truncated: Bool) {

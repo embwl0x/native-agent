@@ -108,30 +108,54 @@ struct InlineApprovalPreviewCard: View {
         errorText = nil
         let id = approval.id
         Task {
-            do {
-                let resolvedApproval = try await appModel.resolveApproval(id: id, decision: decision)
-                let toast = ApprovalDecisionToastPresentation.toast(
-                    for: resolvedApproval,
-                    requestedID: id
-                )
-                await MainActor.run {
-                    ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
-                    if toast.kind == .error { errorText = toast.text }
-                }
-                // Refresh the approvals list + health card so the inline
-                // preview disappears once the decision lands.
-                if let refreshed = try? await appModel.getApprovals() {
-                    await MainActor.run { appModel.approvals = refreshed }
-                }
-                await appModel.loadHealthCard()
-            } catch {
-                let toast = ApprovalDecisionToastPresentation.unavailable(error)
-                await MainActor.run {
-                    errorText = toast.text
-                    ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
-                }
+            let failure = await ApprovalDecisionAction.resolve(
+                id: id,
+                decision: decision,
+                appModel: appModel
+            )
+            await MainActor.run {
+                errorText = failure
+                isDeciding = false
             }
-            await MainActor.run { isDeciding = false }
+        }
+    }
+}
+
+/// The ONE approve/deny path. Resolve, toast, refresh the approvals list and
+/// the health card — in that order, with the same toast vocabulary — so every
+/// surface that offers the buttons (classic Activity's inline card, Today's
+/// "Waiting for you" card) produces an identical outcome. Returns the error
+/// text to show beside the buttons, or nil when the decision landed.
+enum ApprovalDecisionAction {
+    static func resolve(
+        id: String,
+        decision: String,
+        appModel: AppModel
+    ) async -> String? {
+        do {
+            let resolvedApproval = try await appModel.resolveApproval(id: id, decision: decision)
+            let toast = ApprovalDecisionToastPresentation.toast(
+                for: resolvedApproval,
+                requestedID: id
+            )
+            var failure: String?
+            await MainActor.run {
+                ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
+                if toast.kind == .error { failure = toast.text }
+            }
+            // Refresh the approvals list + health card so the row disappears
+            // once the decision lands.
+            if let refreshed = try? await appModel.getApprovals() {
+                await MainActor.run { appModel.approvals = refreshed }
+            }
+            await appModel.loadHealthCard()
+            return failure
+        } catch {
+            let toast = ApprovalDecisionToastPresentation.unavailable(error)
+            await MainActor.run {
+                ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
+            }
+            return toast.text
         }
     }
 }

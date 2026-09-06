@@ -28,6 +28,13 @@ public struct ApprovalRecord: Sendable, Equatable {
     public var payload: JSONValue        // arbitrary JSON dict
     public var payloadPreview: String
     public var createdAt: String         // ISO-8601
+    /// User, 2026-09-06: when this still-pending request was last ASKED FOR.
+    /// A repeated identical request reuses this row instead of piling up
+    /// duplicates, so `createdAt` alone stopped describing the moment the
+    /// person is being asked — a chat card that fences on the turn it belongs
+    /// to hid a live question raised again in a later turn. Nil on rows that
+    /// were only ever asked once.
+    public var lastRequestedAt: String?  // ISO-8601 or nil
     public var resolvedAt: String?       // ISO-8601 or nil
     public var decision: String?         // "approved" | "denied" | "canceled" | nil
     public var decidedBy: String?        // durable human/system decision attribution
@@ -47,6 +54,7 @@ public struct ApprovalRecord: Sendable, Equatable {
         payload: JSONValue,
         payloadPreview: String,
         createdAt: String,
+        lastRequestedAt: String? = nil,
         resolvedAt: String? = nil,
         decision: String? = nil,
         decidedBy: String? = nil,
@@ -65,6 +73,7 @@ public struct ApprovalRecord: Sendable, Equatable {
         self.payload = payload
         self.payloadPreview = payloadPreview
         self.createdAt = createdAt
+        self.lastRequestedAt = lastRequestedAt
         self.resolvedAt = resolvedAt
         self.decision = decision
         self.decidedBy = decidedBy
@@ -107,6 +116,7 @@ extension ApprovalRecord {
         self.payload = obj["payload"] ?? .object([:])
         self.payloadPreview = str("payloadPreview")
         self.createdAt = str("createdAt")
+        self.lastRequestedAt = optStr("lastRequestedAt")
         self.resolvedAt = optStr("resolvedAt")
         self.decision = optStr("decision")
         self.decidedBy = optStr("decidedBy")
@@ -150,6 +160,9 @@ extension ApprovalRecord {
             "remoteResolvable": .bool(remoteResolvable),
             "localOnly": .bool(localOnly),
         ]
+        if let lastRequestedAt {
+            obj["lastRequestedAt"] = .string(lastRequestedAt)
+        }
         obj["resolvedAt"] = resolvedAt.map(JSONValue.string) ?? .null
         obj["decision"] = decision.map(JSONValue.string) ?? .null
         if let decidedBy {
@@ -295,6 +308,10 @@ public enum ApprovalInboxError: Error, Equatable {
     case unavailable(underlying: String)
     /// The decision origin is not permitted to resolve this exact row.
     case resolutionNotAuthorized(id: String, reason: String)
+    /// 2026-09-06: the store is at its row cap and every row in it is still
+    /// pending, so there is no terminal history left to evict. Creating
+    /// anyway would have to delete a decision User has not made yet.
+    case queueFull(pending: Int, cap: Int)
 }
 
 // MARK: - Protocol
@@ -391,6 +408,11 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         "improvement.revert",
         "autonomy.promote",
         "self_evolution.apply",
+        // The procedural lane's skill proposal (MemoryV2's
+        // `ProceduralSkillProposal.approvalAction`). Approving one writes a
+        // skill body that recall then surfaces — decided at the machine, never
+        // widened by a caller-supplied authority flag.
+        "skill.proposal",
         SwiftNativeApprovalInbox.procedureReviewApprovalAction,
         SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
     ]
@@ -464,6 +486,64 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         return record
     }
 
+    /// User, 2026-09-06: match-or-create for a request that can be asked more
+    /// than once. `list` then `create` was two trips to the file with the lock
+    /// released in between, so two callers (or one caller re-asking while the
+    /// first write was in flight) both saw no match and both created a row —
+    /// the duplicate the dedup exists to prevent. Matching and creating now
+    /// happen in ONE locked pass. A matched pending row has its
+    /// `lastRequestedAt` stamped, so a surface can tell when the person was
+    /// last asked rather than only when the row was born.
+    ///
+    /// `matchesPending` is asked only about rows that are still pending, and
+    /// gets the row's payload. Returns the row and whether it was created.
+    @discardableResult
+    public func createOrTouchPending(
+        _ body: JSONValue,
+        matchesPending: @escaping @Sendable (JSONValue) -> Bool
+    ) async throws -> (record: ApprovalRecord, created: Bool) {
+        let outcome = try await runSerialized { [persistence, approvalsPath, clock] in
+            try await Self._createOrTouchPendingImpl(
+                body: body,
+                matchesPending: matchesPending,
+                persistence: persistence,
+                approvalsPath: approvalsPath,
+                now: clock()
+            )
+        }
+        if outcome.created {
+            ApprovalLifecycleBus.fire(.init(phase: .requested, record: outcome.record))
+        }
+        return outcome
+    }
+
+    private static func _createOrTouchPendingImpl(
+        body: JSONValue,
+        matchesPending: @Sendable (JSONValue) -> Bool,
+        persistence: any PersistenceCoreProtocol,
+        approvalsPath: URL,
+        now: Date
+    ) async throws -> (record: ApprovalRecord, created: Bool) {
+      return try await persistence.withFileLock(approvalsPath) {
+        var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
+        let stamp = Self.isoTimestamp(now)
+        for (idx, item) in items.enumerated() {
+            guard case .object(var obj) = item else { continue }
+            guard case .string("pending") = obj["status"] ?? .null else { continue }
+            guard matchesPending(obj["payload"] ?? .object([:])) else { continue }
+            obj["lastRequestedAt"] = .string(stamp)
+            guard let touched = ApprovalRecord(json: .object(obj)) else { continue }
+            items[idx] = .object(obj)
+            try await persistence.writeJSON(.array(items), to: approvalsPath)
+            return (touched, false)
+        }
+        let approval = try Self.makeApprovalRecord(body: body, now: now)
+        items.insert(approval.toJSON(), at: 0)
+        try await persistence.writeJSON(.array(Array(items.prefix(300))), to: approvalsPath)
+        return (approval, true)
+      }
+    }
+
     /// Reentrancy-safe mutation gate: each mutating call wraps its work
     /// in a Task and chains the next call behind the prior Task's value.
     /// Because the read→mutate→write happens INSIDE the spawned Task and
@@ -503,13 +583,11 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         return record
     }
 
-    private static func _createImpl(
-        body: JSONValue,
-        persistence: any PersistenceCoreProtocol,
-        approvalsPath: URL,
-        now: Date
-    ) async throws -> ApprovalRecord {
-      return try await persistence.withFileLock(approvalsPath) {
+    /// User, 2026-09-06: the record's construction — id, clamped strings, and
+    /// the authority flags — lifted out of `_createImpl` unchanged so the
+    /// match-or-create path builds a row through EXACTLY this logic instead of
+    /// a second copy of it. Pure: no file IO, no lock.
+    private static func makeApprovalRecord(body: JSONValue, now: Date) throws -> ApprovalRecord {
         let bodyObj: [String: JSONValue]
         if case .object(let obj) = body {
             bodyObj = obj
@@ -595,9 +673,28 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             localOnly: localOnly
         )
 
+        return approval
+    }
+
+    private static func _createImpl(
+        body: JSONValue,
+        persistence: any PersistenceCoreProtocol,
+        approvalsPath: URL,
+        now: Date
+    ) async throws -> ApprovalRecord {
+      let approval = try Self.makeApprovalRecord(body: body, now: now)
+      return try await persistence.withFileLock(approvalsPath) {
         var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
         items.insert(approval.toJSON(), at: 0)
-        try await persistence.writeJSON(.array(Array(items.prefix(300))), to: approvalsPath)
+        // 2026-09-06: the cap used to be `items.prefix(300)` — a positional
+        // truncation that dropped the OLDEST rows whatever their status, so
+        // creating approval 301 deleted approval 1 even while it was still
+        // pending and waiting on User. The cap now evicts terminal history
+        // (oldest first) and never a pending row; a store whose whole cap is
+        // pending work refuses the create instead of silently discarding a
+        // decision nobody made.
+        items = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap)
+        try await persistence.writeJSON(.array(items), to: approvalsPath)
         return approval
       }
     }
@@ -728,13 +825,54 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         return items.compactMap(ApprovalRecord.init(json:))
     }
 
+    /// The most rows `requests.json` keeps. Terminal rows above it are the
+    /// store's own history and are evictable; pending rows above it are not.
+    static let storedApprovalCap = 300
+
+    /// The statuses a row can be in once it is no longer waiting on anyone.
+    static let terminalApprovalStatuses: Set<String> = [
+        "resolved", "denied", "canceled", "orphaned",
+    ]
+
+    /// 2026-09-06: trim `items` (newest-first) to `cap` by dropping TERMINAL
+    /// rows, oldest first. A pending row is never evicted — it is a decision
+    /// User has not made yet, and deleting it loses the request outright.
+    /// Throws `.queueFull` when there is no terminal row left to drop.
+    nonisolated static func cappedEvictingTerminalRows(
+        _ items: [JSONValue],
+        cap: Int
+    ) throws -> [JSONValue] {
+        var overflow = items.count - cap
+        guard overflow > 0 else { return items }
+        var dropped = Set<Int>()
+        // The array is newest-first, so the oldest candidates are at the end.
+        for index in stride(from: items.count - 1, through: 0, by: -1) {
+            guard overflow > 0 else { break }
+            guard case .object(let object) = items[index],
+                  case .string(let status)? = object["status"],
+                  terminalApprovalStatuses.contains(status) else { continue }
+            dropped.insert(index)
+            overflow -= 1
+        }
+        guard overflow == 0 else {
+            throw ApprovalInboxError.queueFull(pending: items.count - dropped.count, cap: cap)
+        }
+        return items.enumerated()
+            .filter { !dropped.contains($0.offset) }
+            .map(\.element)
+    }
+
     /// Strict authoritative-store read used by every approval read/mutation.
     /// A missing file is the one legitimate empty queue. Once the file exists,
     /// unreadable bytes, malformed JSON, the wrong top-level shape, or even one
     /// malformed row make the whole queue unavailable. In particular, mutation
     /// callers must never turn damaged state into `[]` and overwrite pending
     /// approvals with a newly created record.
-    nonisolated static func loadApprovalRowsChecked(at path: URL) throws -> [JSONValue] {
+    /// 2026-09-06: `public` so the one app-side route that still merges rows
+    /// into this file (the legacy approvals migration in the Workshop step
+    /// route) reads it through the owner's own check instead of flattening a
+    /// damaged store to `[]` and overwriting it.
+    public nonisolated static func loadApprovalRowsChecked(at path: URL) throws -> [JSONValue] {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: path.path) else { return [] }
 
@@ -760,6 +898,15 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 "approval store is not a JSON array"
             )
         }
+        try validateApprovalRows(items)
+        return items
+    }
+
+    /// 2026-09-06: the row-shape half of `loadApprovalRowsChecked`, extracted so
+    /// a caller that MERGES rows into this file can prove the merged array is
+    /// still readable before it writes — a merge that lands a row this check
+    /// rejects takes the whole queue offline for every reader.
+    public nonisolated static func validateApprovalRows(_ items: [JSONValue]) throws {
         var ids = Set<String>()
         for (index, item) in items.enumerated() {
             guard case .object(let object) = item,
@@ -844,7 +991,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 }
             }
         }
-        return items
     }
 
     private nonisolated static func validateResolutionAuthority(
@@ -960,6 +1106,83 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             return String(zulu.dropLast()) + "+00:00"
         }
         return zulu
+    }
+
+    /// One-time merge of any rows still at the pre-R5 `<root>/approvals/
+    /// requests.json` into the canonical `<root>/workflows/approvals/
+    /// requests.json`, then rename the legacy file so a later boot skips it.
+    /// Canonical wins on id-conflict.
+    ///
+    /// 2026-09-06: run BY THE OWNER. This merge used to read the canonical file
+    /// and write the merged array from `NativeClient`, outside both the actor's
+    /// mutation chain and the file lock every other writer takes — so a create
+    /// or resolve landing in the same moment was overwritten wholesale by the
+    /// migration's stale copy. It now runs on the same serialized, locked path
+    /// as `create`/`resolve`, so the read and the write see one state.
+    public func mergeLegacyApprovalRows() async throws {
+        let legacyPath = root
+            .appendingPathComponent("approvals", isDirectory: true)
+            .appendingPathComponent("requests.json")
+        guard FileManager.default.fileExists(atPath: legacyPath.path) else { return }
+        try await runSerialized { [persistence, approvalsPath] in
+            try await persistence.withFileLock(approvalsPath) {
+                try Self.mergeLegacyRowsLocked(
+                    legacyPath: legacyPath,
+                    canonicalPath: approvalsPath
+                )
+            }
+        }
+    }
+
+    /// The merge itself. Caller holds the approvals lock.
+    private nonisolated static func mergeLegacyRowsLocked(
+        legacyPath: URL,
+        canonicalPath: URL
+    ) throws {
+        let legacyRows: [JSONValue] = {
+            guard let data = try? Data(contentsOf: legacyPath),
+                  let parsed = try? JSONValue.parse(data),
+                  case .array(let rows) = parsed else { return [] }
+            return rows
+        }()
+        if !legacyRows.isEmpty {
+            // A throwing read IS the damaged-store signal: nothing below
+            // writes over a store this call could not read.
+            var merged = try Self.loadApprovalRowsChecked(at: canonicalPath)
+            func rowKey(_ value: JSONValue) -> String? {
+                guard case .object(let object) = value else { return nil }
+                let execution: String? = {
+                    if case .string(let s) = object["executionId"] ?? object["execution_id"]
+                        ?? object["missionId"] ?? object["mission_id"] ?? .null { return s }
+                    return nil
+                }()
+                let step: String? = {
+                    if case .string(let s) = object["stepId"] ?? object["step_id"]
+                        ?? object["id"] ?? .null { return s }
+                    return nil
+                }()
+                guard let execution, let step else { return nil }
+                return "\(execution)#\(step)"
+            }
+            let existing = Set(merged.compactMap(rowKey))
+            var appended = false
+            for row in legacyRows where rowKey(row).map({ !existing.contains($0) }) == true {
+                merged.append(row)
+                appended = true
+            }
+            if appended {
+                // Refuse the merge outright rather than write a store the
+                // canonical reader will reject.
+                try Self.validateApprovalRows(merged)
+                let data = try JSONValue.array(merged).serialize(pretty: false)
+                try Data(data.utf8).write(to: canonicalPath, options: [.atomic])
+            }
+        }
+        let migratedPath = legacyPath
+            .deletingLastPathComponent()
+            .appendingPathComponent("requests.json.migrated")
+        try? FileManager.default.removeItem(at: migratedPath)
+        try? FileManager.default.moveItem(at: legacyPath, to: migratedPath)
     }
 
     // MARK: - Data root resolution (delegated to PersistenceCore)

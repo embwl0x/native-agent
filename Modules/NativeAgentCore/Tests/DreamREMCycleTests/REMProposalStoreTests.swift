@@ -29,6 +29,22 @@ private func makeProposal(
     )
 }
 
+/// 2026-09-06: 4c631d6d made pin emission reconcile approved rows against the
+/// live document — a pin survives only while its lesson is still an entry
+/// paragraph in the doc it was approved into, and an absent doc (51f1dc75)
+/// retires every pin. `PersistenceCore.defaultPersonaRoot(dataRoot:)` finds
+/// that doc at `<dataRoot>/persona` once a SOUL.md marks it a real persona
+/// root, so a test that expects a pin has to seed the lesson there.
+private func seedPersonaGrowth(_ dataRoot: URL, lessons: [String]) throws {
+    let persona = dataRoot.appendingPathComponent("persona", isDirectory: true)
+    try FileManager.default.createDirectory(at: persona, withIntermediateDirectories: true)
+    try "# SOUL\n".write(
+        to: persona.appendingPathComponent("SOUL.md"), atomically: true, encoding: .utf8)
+    let body = "# GROWTH.md\n\n" + lessons.map { $0 + "\n" }.joined(separator: "\n")
+    try body.write(
+        to: persona.appendingPathComponent("GROWTH.md"), atomically: true, encoding: .utf8)
+}
+
 private func readRows(_ dataRoot: URL) throws -> [[String: Any]] {
     let url = dataRoot.appendingPathComponent("rem_proposals.jsonl")
     guard FileManager.default.fileExists(atPath: url.path) else { return [] }
@@ -79,6 +95,42 @@ func REMProposalStore_appendPending_writes_pending_rows_and_dedupes_by_id() asyn
     #expect(rows.allSatisfy { ($0["status"] as? String) == "pending" })
     // Bare target names are normalized to the doc FILENAME.
     #expect(rows.allSatisfy { ($0["targetDoc"] as? String) == "GROWTH.md" })
+}
+
+/// fable51 #11: the GROWTH.md fence holds, but the drop is no longer silent.
+/// A SOUL-targeted proposal must come back COUNTED and NAMED so the REM
+/// receipt can say which persona doc the pass tried to reach.
+@Test
+func REMProposalStore_appendPending_counts_and_names_dropped_targets() async throws {
+    let root = tempStoreRoot()
+    let store = REMProposalStore(dataRoot: root)
+    let receipt = try await store.appendPendingWithReceipt([
+        makeProposal(id: "g1"),
+        makeProposal(id: "s1", targetDoc: "SOUL"),
+        makeProposal(id: "s2", targetDoc: "SOUL.md"),
+        makeProposal(id: "v1", targetDoc: "VOICE"),
+    ])
+
+    #expect(receipt.appended == 1)
+    #expect(receipt.droppedCount == 3)
+    // Named by normalized doc filename, not lumped into one anonymous number.
+    #expect(receipt.droppedByTarget == ["SOUL.md": 2, "VOICE.md": 1])
+
+    // ONE line, naming the targets and saying why.
+    let line = try #require(receipt.droppedLogLine)
+    #expect(line.contains("SOUL.md=2"))
+    #expect(line.contains("VOICE.md=1"))
+    #expect(line.contains("GROWTH.md"))
+
+    // The fence itself is unchanged: only the GROWTH row is on disk.
+    let rows = try readRows(root)
+    #expect(rows.count == 1)
+    #expect((rows[0]["targetDoc"] as? String) == "GROWTH.md")
+
+    // A clean pass stays quiet.
+    let clean = try await store.appendPendingWithReceipt([makeProposal(id: "g2")])
+    #expect(clean.droppedCount == 0)
+    #expect(clean.droppedLogLine == nil)
 }
 
 // MARK: - Legacy import (requirement d)
@@ -226,6 +278,7 @@ func REMProposalStore_nonGrowthLegacyRows_do_not_stage_or_approve_but_can_deny()
 @Test
 func REMProposalStore_applyApproval_flips_status_and_pin_appears() async throws {
     let root = tempStoreRoot()
+    try seedPersonaGrowth(root, lessons: ["steady cadence"])
     let store = REMProposalStore(dataRoot: root)
     try await store.appendPending([
         makeProposal(id: "a1", targetDoc: "GROWTH.md", text: "steady cadence"),

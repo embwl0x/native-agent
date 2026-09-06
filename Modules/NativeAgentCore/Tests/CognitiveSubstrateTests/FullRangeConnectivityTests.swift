@@ -219,3 +219,56 @@ struct FullRangeConnectivityTests {
         #expect(!felt.contains { $0 < -0.1 }, "no phantom negatives on a good day: \(felt.sorted())")
     }
 }
+
+// 2026-09-01 — RANGE IS NOT ONLY REACHABILITY. The suite above proves the deep
+// registers can be reached; the live distribution proved that reachable is not
+// the same as reached. Across 3,858 felt words in 15 days, "curious" (973) and
+// "clear-headed" (932) took ~50% of the whole word mass and rode ~70% of the
+// lines, while the entire negative register shared ~5%. Two overlays had become
+// a floor: their gates sat below where the (separately pinned) chemistry rests,
+// so "over the gate" was the normal condition rather than a notable one.
+extension FullRangeConnectivityTests {
+
+    @Test func noSingleOverlayOwnsTheFingerprintAcrossTheDimensionRange()  {
+        // Sweep the two axes that produced the floor, at a fixed mid-range
+        // family, and count how much of the vocabulary mass each word takes.
+        var counts: [String: Int] = [:]
+        var lines = 0
+        for clarityStep in 0...10 {
+            for curiosityStep in 0...10 {
+                let words = CognitiveSubstrate.feltFingerprint(CognitiveSubstrate.FeltSignals(
+                    valence: 0.1, arousal: 0.4, warmth: 0.3, tension: 0.15, pressure: 0.3,
+                    fatigue: 0.1,
+                    curiosity: Double(curiosityStep) / 10,
+                    clarity: Double(clarityStep) / 10,
+                    agency: 0.5, confidence: 0.5))
+                guard let words else { continue }
+                lines += 1
+                for word in words.components(separatedBy: ", ") {
+                    counts[word, default: 0] += 1
+                }
+            }
+        }
+        #expect(lines > 0)
+        for word in ["curious", "clear-headed"] {
+            let share = Double(counts[word] ?? 0) / Double(lines)
+            #expect(share <= 0.55,
+                    "\(word) rode \(Int(share * 100))% of the swept range — that is a floor, not a signal")
+        }
+        // …and the widened middle actually carries something.
+        #expect((counts["collected"] ?? 0) > 0)
+        #expect((counts["interested"] ?? 0) > 0)
+    }
+
+    @Test func aSaturatedBodyCannotHideAValenceDip() {
+        // The live failure mode: chemistry pinned at the ceiling, so every line
+        // ended "…, curious, clear-headed" regardless of what had just happened.
+        let stung = CognitiveSubstrate.feltFingerprint(CognitiveSubstrate.FeltSignals(
+            valence: -0.5, arousal: 0.62, warmth: 0.12, tension: 0.6, pressure: 0.6,
+            fatigue: 0.2, curiosity: 0.95, clarity: 0.95, agency: 0.6, confidence: 0.5))
+        let words = stung ?? ""
+        #expect(!words.isEmpty, "a real sting must not fall silent")
+        #expect(!words.hasPrefix("curious"), "the body's saturation led the line instead of the sting: \(words)")
+        #expect(!words.hasPrefix("clear-headed"), "the body's saturation led the line instead of the sting: \(words)")
+    }
+}

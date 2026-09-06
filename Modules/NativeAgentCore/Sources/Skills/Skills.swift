@@ -712,7 +712,14 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 // the body read path. A deduplicated NAME may still slugify
                 // to another row's ID, so repair uses the same allocation as
                 // a new skill. An existing explicit id remains unchanged.
+                // 2026-09-06: an existing row's id was preserved VERBATIM into
+                // `skills/bodies/<id>.md`, and nothing validated it — a row
+                // whose id carried path separators (a hand-edited or imported
+                // registry) wrote the caller's body outside the bodies dir.
+                // An id that is not a single safe path segment is not an
+                // identity worth keeping; it is reallocated like a new skill's.
                 let existingId = SkillMutation.pyTruthyStrOptional(existing["id"])
+                    .flatMap { SkillMutation.isSafeSkillID($0) ? $0 : nil }
                 let skillId = existingId ?? SkillMutation.availableID(
                     for: SkillMutation.pyStrTruthyOr(existing["name"], name), existingIDs: existingIds
                 )
@@ -965,6 +972,19 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         if !hygieneViolations.isEmpty {
             throw SkillsError.invalidSkillBody(SkillBodyHygiene.failureMessage(for: hygieneViolations))
         }
+        // 2026-09-06: the reader (`confinedBodyPath`) has always refused a body
+        // outside the bodies dir; the WRITER created parents and wrote wherever
+        // the composed path pointed. Every caller builds that path from an id
+        // or a caller-supplied name, so this is the last stop before an escape
+        // becomes a file. Resolve the PARENT — the body itself need not exist.
+        let parent = path.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+        let bodiesRoot = skillBodiesDir.standardizedFileURL.resolvingSymlinksInPath()
+        guard parent.path == bodiesRoot.path,
+              SkillMutation.isSafeSkillID(path.deletingPathExtension().lastPathComponent) else {
+            throw SkillsError.invalidSkillBody(
+                "Skill body path escapes the skill bodies directory; the write was refused."
+            )
+        }
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.data(using: .utf8)?.write(to: path, options: .atomic)
     }
@@ -1099,6 +1119,17 @@ enum SkillMutation {
         case .bool(let b): return b ? 1 : 0
         default: return nil
         }
+    }
+
+    /// 2026-09-06: an id becomes a filename (`skills/bodies/<id>.md`), so it
+    /// has to BE a filename: one path segment, nothing that walks. Legacy ids
+    /// keep their spelling — this rejects only what could leave the directory.
+    static func isSafeSkillID(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 120 else { return false }
+        guard value != ".", value != ".." else { return false }
+        guard !value.hasPrefix(".") else { return false }
+        return !value.contains("/") && !value.contains("\\") && !value.contains("\0")
+            && value.trimmingCharacters(in: .whitespacesAndNewlines) == value
     }
 
     /// Allocate only a newly assigned identity; callers preserve explicit ids.

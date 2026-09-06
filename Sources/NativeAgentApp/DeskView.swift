@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import BackgroundLoops
 import PersistenceCore
 import WorkshopExecution
 
@@ -15,11 +16,65 @@ import WorkshopExecution
 // — make it into sections"). Directed executions are one lane on the Desk, so
 // this surface tells its story top-to-bottom by urgency and ownership:
 //   1. Live Activity     — recent `.now` ops only; absent when quiet
-//   2. Waiting on you    — approval-blocked executions + blocked/flagged items
+//   2. Waiting on you    — what is HIS to clear (approvals, rows whose
+//      waitingOn names him, GitHub items routed to him), labelled apart from
+//      the merely-blocked rows below it (Core's OwnerAttentionPolicy)
 //   3. In progress       — delegation families + directed executions
 //   4. Her pursuits      — origin=agent self-pursuits, in her own words
 //   5. The board         — User/system items, family-grouped as before
 //   6. Recently finished — terminal items + recent terminal executions
+
+/// HER HOUR, on the Desk — personality-depth item 9.
+///
+/// One line, at the bottom, saying what she did with the hour that was hers. It
+/// is a TRACE, not a task: it has no action, no count, no badge, and it never
+/// becomes a row User has to clear. The lane writes no desk ops (Agent's veto —
+/// her aesthetic life is not board work), so this reads the lane's own bounded
+/// file directly and renders its newest entry.
+///
+/// ABSENT when the lane is not installed. Not "off", not a placeholder, not a
+/// zero — absent, exactly the way the lane itself is absent when the switch is
+/// off. A Desk that shows "Her hour: disabled" would be advertising a feature at
+/// a man who turned it off.
+enum DeskHerHourPresentation {
+    enum State: Sendable, Equatable {
+        case absent
+        /// Her own closing line, plus how long ago. Nothing else: no verdict,
+        /// no outcome adjective we chose, no progress.
+        case line(text: String, symbol: String)
+    }
+
+    /// The whole rule. Pure, so the Desk's claim about her hour is testable
+    /// without a running app or an installed lane.
+    static func state(
+        installed: Bool,
+        entry: StudioWanderLane.TraceEntry?,
+        now: Date
+    ) -> State {
+        guard installed, let entry else { return .absent }
+        let words = entry.line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty else { return .absent }
+        let when = DeskRelativeTimePresentation.text(forISO: entry.at, now: now)
+        return .line(text: "\(bounded(words)) · \(when)", symbol: symbol(entry.outcome))
+    }
+
+    /// Icons, not labels. The three endings are equal in standing — a decline is
+    /// not a lesser outcome — so none of them gets a word here that ranks it.
+    static func symbol(_ outcome: StudioWanderLane.Outcome) -> String {
+        switch outcome {
+        case .chose: return "eye"
+        case .declined: return "moon.zzz"
+        case .noArtifact: return "eye.slash"
+        }
+    }
+
+    static let maximumCharacters = 160
+
+    private static func bounded(_ value: String) -> String {
+        guard value.count > maximumCharacters else { return value }
+        return String(value.prefix(maximumCharacters - 1)) + "…"
+    }
+}
 
 /// A lane's read outcome — the honesty primitive this surface borrows from
 /// `WorkshopReceiptsState` (WorkshopObservatoryPanel.swift:237). `.rows([])`
@@ -364,7 +419,10 @@ enum DeskAttentionStrip {
                     ? "\(item.title)\(item.blockedReason.map { " — \($0)" } ?? "")"
                     : "\(item.title)\(item.waitingOn.map { " — waiting on \($0)" } ?? "")",
                 shape: .primary,
-                needsUserDirectly: false))
+                // ONE predicate (Core's OwnerAttentionPolicy): a row whose
+                // waitingOn names User is his to clear and is emphasized as
+                // such; a row blocked on CI or a sibling item is not.
+                needsUserDirectly: OwnerAttentionPolicy.waitsOnOwner(item)))
         }
         // Taste pass 2026-07-24: GitHub-blocked items all carry the same stamped
         // blockedReason — repeated per row it turned the strip into wallpaper.
@@ -442,8 +500,16 @@ enum DeskAttentionStrip {
         let visible: [DeskAttentionLine]
         /// Every waiting item, hidden or not. Roll-up header is chrome, excluded.
         let totalItems: Int
+        /// Of `totalItems`, the ones actually waiting on USER — the number the
+        /// "Waiting on you" label is allowed to carry (Core's
+        /// `OwnerAttentionPolicy`). The rest are blocked on something else.
+        let waitingOnYouItems: Int
         let hiddenItems: Int
         let hiddenNeedsUser: Int
+
+        /// Blocked on someone/something that is not User. Shown with its own
+        /// label so the strip never charges these to him.
+        var blockedItems: Int { max(0, totalItems - waitingOnYouItems) }
 
         var isEmpty: Bool { visible.isEmpty }
         func revealLabel(showingAll: Bool) -> String {
@@ -468,29 +534,18 @@ enum DeskAttentionStrip {
             limit: showingAll ? nil : visibleLineCap)
         let totalItems = approvals.count + githubNeedsYou.count
             + otherAttention.count + githubBlocked.count
-        let needsUserTotal = approvals.count + githubNeedsYou.count
+        let needsUserTotal = OwnerAttentionPolicy.waitingOnOwnerCount(
+            approvalsWaiting: approvals.count,
+            ownerDecisionItems: OwnerAttentionPolicy.ownerDecisionCount(in: otherAttention)
+                + OwnerAttentionPolicy.ownerDecisionCount(in: githubBlocked),
+            externalOwnerItems: githubNeedsYou.count)
         return Plan(
             visible: visible,
             totalItems: totalItems,
+            waitingOnYouItems: needsUserTotal,
             hiddenItems: totalItems - itemCount(visible),
             hiddenNeedsUser: needsUserTotal - visible.filter(\.needsUserDirectly).count)
     }
-}
-
-private struct DeskViewSnapshot: Sendable {
-    let deskState: DeskState?
-    let deskError: String?
-    let executions: DeskLaneState<WorkshopExecution.WorkshopExecutionRecord>
-    let githubItems: DeskLaneState<GitHubCommandItem>
-    /// ONE DeskSequencing.compute() per load — never per row. The derivation
-    /// walks the whole blocked-on graph plus every parent chain, so calling it
-    /// from a row builder would re-run that walk on every SwiftUI diff pass.
-    /// It's pure and Sendable, so it rides along in the background snapshot.
-    let plan: DeskSequencing.Plan
-    /// handle → alias, built from the SAME state the plan came from. The UI
-    /// shows operator aliases ("2.1") and never internal handles — same
-    /// invariant DeskProjection holds.
-    let aliasByHandle: [String: String]
 }
 
 /// One owner for GitHub command classification and the sections that render
@@ -638,11 +693,19 @@ struct DeskView: View {
     @State private var nagConfig = DeskNagConfig()
     @State private var actionFlight = DeskActionFlight()
     @State private var actionNotice: DeskActionNotice?
+    /// Item 36 — Veto moved out of the developer gate onto the pursuits row.
+    @State private var vetoingPursuitHandles: Set<String> = []
+    @State private var vetoHandler = WorkshopObservatoryVetoHandler(
+        dataRoot: PersistenceCore.defaultDataRoot())
     @FocusState private var benchFocused: Bool
     /// Triage-counter navigation (desk-triage-makeover W1): a tapped counter
     /// names its section anchor here; the ScrollViewReader in `body` performs
     /// the scroll — same one-rule pattern as `selectedHandle`.
     @State private var scrollTarget: String?
+    /// Item 9 — her hour, read on Desk appear/refresh only (inside `load()`),
+    /// never on a timer and never per turn. `.absent` until a load has said
+    /// otherwise, so the line cannot flash in before it is known.
+    @State private var herHour: DeskHerHourPresentation.State = .absent
 
     /// The mutation seam. Same dispatcher, same `impl_desk_*` functions, same
     /// ledger as the chat tools — see DeskQuickActions.swift.
@@ -661,7 +724,7 @@ struct DeskView: View {
     /// The palette's pool is every live Desk item plus waiting GitHub watcher
     /// row, not `selectionOrder` — search exists precisely to reach rows that
     /// are collapsed out of sight, and `select(_:)` opens their family before
-    /// scrolling. Scoping it to what is already on screen would make ⌘K useless
+    /// scrolling. Scoping it to what is already on screen would make ⌘⇧K useless
     /// for exactly the items it is most needed for.
     private var paletteRows: [DeskPaletteRow] {
         activeItems.map(DeskPaletteRow.init(item:))
@@ -801,11 +864,15 @@ struct DeskView: View {
         .navigationTitle("Desk")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
+                // ⌘K belongs to the ONE global command palette (Navigate ▸
+                // Command Palette…). Desk's item palette had been silently
+                // overriding it from this screen — two different sheets behind
+                // one chord — so the Desk-local one moved to ⌘⇧K (User, 2026-09-01).
                 Button { showingPalette = true } label: { Image(systemName: "command") }
-                    .help("Find or act on a desk item (\u{2318}K)")
+                    .help("Find or act on a desk item (\u{2318}\u{21E7}K)")
                     .accessibilityLabel("Find or act on a Desk item")
                     .accessibilityHint("Opens Desk commands and search")
-                    .keyboardShortcut("k", modifiers: .command)
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { Task { await refreshFromToolbar() } } label: { Image(systemName: "arrow.clockwise") }
@@ -883,6 +950,7 @@ struct DeskView: View {
                     boardSection
                     finishedSection
                 }
+                herHourLine
                 // B2.6 (g): debug disclosures (agent projection + raw all-items
                 // table) moved to Diagnostics ▸ Cognition (DeskDebugPanels).
                 // This surface keeps zero debug chrome.
@@ -892,7 +960,7 @@ struct DeskView: View {
         }
         // Keyboard-first mutation — the whole point of this wave. EVERY binding
         // here also has a mouse affordance (the selection bar's buttons, the
-        // row taps, the ⌘K toolbar button), so nothing is keyboard-only.
+        // row taps, the ⌘⇧K toolbar button), so nothing is keyboard-only.
         //
         // The letter keys are guarded on `noteFieldFocused`: with the note field
         // open, "c" is a character User is typing, not a close.
@@ -920,12 +988,16 @@ struct DeskView: View {
         }
         .onKeyPress(keys: [KeyEquivalent("k")], phases: .down) { press in
             // Click-through 2026-08-06: with the bench .focusable holding key
-            // focus, the toolbar button's .keyboardShortcut("k", .command)
-            // never fired — the focused view swallows the key equivalent. The
-            // palette must open from the keyboard (that IS the feature), so
-            // handle it here too; the toolbar shortcut stays for when focus
-            // is elsewhere.
-            guard press.modifiers.contains(.command) else { return .ignored }
+            // focus, the toolbar button's .keyboardShortcut never fired — the
+            // focused view swallows the key equivalent. The palette must open
+            // from the keyboard (that IS the feature), so handle it here too;
+            // the toolbar shortcut stays for when focus is elsewhere.
+            //
+            // 2026-09-01: both halves require SHIFT now. A bare ⌘K here used
+            // to swallow the global command palette for anyone standing on
+            // Desk, which is the whole reason there were ever two ⌘Ks.
+            guard press.modifiers.contains(.command),
+                  press.modifiers.contains(.shift) else { return .ignored }
             showingPalette = true
             return .handled
         }
@@ -1326,9 +1398,22 @@ struct DeskView: View {
     // its section. Counts come from the SAME slices the sections render from —
     // a counter may never disagree with the list below it.
 
-    private var needsYouCount: Int? {
+    /// "Waiting on you" is the narrow, honest count: approvals parked at a
+    /// consent boundary, Desk rows whose `waitingOn` names User, and GitHub
+    /// items routed to him. One predicate, owned by Core's
+    /// `OwnerAttentionPolicy`, shared with Living Status — the two surfaces
+    /// used to answer "does she need me?" differently on the same screen.
+    private var waitingOnYouCount: Int? {
         guard let githubCount = githubNeedsUserCount.value else { return nil }
-        return approvalExecutions.count + attentionItems.count + githubCount
+        return OwnerAttentionPolicy.waitingOnOwnerCount(
+            approvalsWaiting: approvalExecutions.count,
+            ownerDecisionItems: OwnerAttentionPolicy.ownerDecisionCount(in: attentionItems),
+            externalOwnerItems: githubCount)
+    }
+
+    /// The other half of the same strip: real, visible, and NOT his to clear.
+    private var blockedNotOnYouCount: Int {
+        attentionItems.count - OwnerAttentionPolicy.ownerDecisionCount(in: attentionItems)
     }
 
     private static let staleThresholdDays = DeskItemPresentation.staleThresholdDays
@@ -1350,6 +1435,37 @@ struct DeskView: View {
         watchItems.filter {
             $0.status != .blocked && $0.status != .flag
                 && (ageDays($0) ?? 0) >= Self.staleThresholdDays
+        }
+    }
+
+    // MARK: Her hour — a trace, never a task
+
+    /// Deliberately the quietest thing on this surface: bottom of the board,
+    /// caption weight, no count, no action, no badge. User glances at it or he
+    /// does not; nothing about it waits on him, and nothing about it nags her.
+    @ViewBuilder
+    private var herHourLine: some View {
+        switch herHour {
+        case .absent:
+            // Zero-height. The lane is not installed, or the agent has not had an
+            // hour yet — neither is a state worth a row of chrome.
+            EmptyView()
+        case .line(let text, let symbol):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: symbol)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Text("\(AgentVoice.live.possessive) hour")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                Text(text)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 4)
         }
     }
 
@@ -1444,9 +1560,11 @@ struct DeskView: View {
 
     private var countersStrip: some View {
         HStack(spacing: 10) {
-            triageCounter("Needs you", count: needsYouCount, tint: .red,
+            triageCounter("Waiting on you", count: waitingOnYouCount, tint: .red,
                           symbol: "hand.raised", target: "sec-attention",
                           unavailableReason: githubNeedsUserCount.unavailableReason)
+            triageCounter("Blocked", count: blockedNotOnYouCount, tint: .orange,
+                          symbol: "stop.circle", target: "sec-attention")
             triageCounter("In progress", count: inProgressExecutionCount.value, tint: .blue,
                           symbol: "hammer", target: "sec-bench",
                           unavailableReason: inProgressExecutionCount.unavailableReason)
@@ -1609,9 +1727,26 @@ struct DeskView: View {
         if !strip.isEmpty {
             // The count is on the header, always — so the strip states how much
             // is waiting even in the frame where most of it is collapsed.
-            sectionHeader("Waiting on you", count: strip.totalItems, systemImage: "hand.raised")
-                .id("sec-attention")
+            // A section titled "Waiting on you" over rows that are blocked on
+            // CI is the lie this strip used to tell. When nothing here is his,
+            // the header says so instead (Core's OwnerAttentionPolicy).
+            if strip.waitingOnYouItems > 0 {
+                sectionHeader("Waiting on you", count: strip.waitingOnYouItems,
+                              systemImage: "hand.raised")
+                    .id("sec-attention")
+            } else {
+                sectionHeader("Blocked", count: strip.blockedItems,
+                              systemImage: "stop.circle")
+                    .id("sec-attention")
+            }
             VStack(alignment: .leading, spacing: 6) {
+                // The strip lists BOTH kinds; the label refuses to charge the
+                // blocked half to User.
+                if strip.waitingOnYouItems > 0 && strip.blockedItems > 0 {
+                    Text(DeskSectionHeaderPresentation.label("Blocked", count: strip.blockedItems)
+                         + " — waiting on something else, not on you")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 ForEach(strip.visible) { line in
                     attentionRow(line)
                 }
@@ -2035,6 +2170,7 @@ struct DeskView: View {
                             .font(.caption).foregroundStyle(.tertiary)
                     }
                 }
+                pursuitOwnerRow(item)
             }
             .padding(.vertical, 10).padding(.horizontal, 12)
             .background(Color.purple.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
@@ -2056,6 +2192,68 @@ struct DeskView: View {
             pursuitPayloadUnreadableCard(item)
         case .notPursuit:
             EmptyView()
+        }
+    }
+
+    /// Score, budget, her recorded reason, and Veto — the owner's authority
+    /// over a pursuit the agent opened for herself. This used to live only in
+    /// the developer-gated Cognition Observatory beside a duplicate of this
+    /// very list; item 36 moved it here and deleted the duplicate. The store
+    /// mutation behind the button is unchanged.
+    @ViewBuilder
+    private func pursuitOwnerRow(_ item: DeskItem) -> some View {
+        let rationale = DeskPursuitVetoRationale.row(for: item, now: deskPresentationNow)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            if let score = DeskPursuitVetoRationale.scoreLabel(rationale?.score) {
+                Text(score)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            if let budget = DeskPursuitVetoRationale.budgetLabel(rationale?.budget) {
+                Text(budget)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 4)
+            Button("Veto", systemImage: "xmark.circle") {
+                pursuitVetoControl.trigger(item.handle)
+            }
+            .font(.caption)
+            .buttonStyle(.borderless)
+            .foregroundStyle(.red)
+            .disabled(pursuitVetoControl.isDisabled(item.handle))
+            .help(DeskPursuitVetoControl.help)
+            .accessibilityIdentifier("desk.pursuit.veto.\(item.handle)")
+        }
+        if let reason = DeskPursuitVetoRationale.reasonLabel(rationale?.latestChoiceRationale) {
+            Text("chose: \(reason)")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(2).truncationMode(.tail)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var pursuitVetoControl: DeskPursuitVetoControl {
+        DeskPursuitVetoControl(pendingHandles: vetoingPursuitHandles) { handle in
+            beginVetoPursuit(handle)
+        }
+    }
+
+    /// One durable veto per handle in flight; the handler's actor keeps a
+    /// repeat click from launching a second store write, and the settled
+    /// outcome decides whether a refresh is worth doing.
+    private func beginVetoPursuit(_ handle: String) {
+        guard !vetoingPursuitHandles.contains(handle) else { return }
+        vetoingPursuitHandles.insert(handle)
+        let handler = vetoHandler
+        Task { @MainActor in
+            let outcome = await handler.veto(handle)
+            vetoingPursuitHandles.remove(handle)
+            actionNotice = DeskPursuitVetoNotice.receipt(for: outcome)
+            if WorkshopObservatoryVetoPresentation.shouldRefresh(after: outcome) {
+                _ = await load()
+            }
         }
     }
 
@@ -2494,48 +2692,22 @@ struct DeskView: View {
         // error — because a partial publish is the same stomp in slow motion.
         let token = loadGate.begin()
         DeskLiveReloader.shared.traceEvent("load begin token=\(token)")
+        // ONE read, shared with DeskPageView (DeskBoardRead.swift). The classic
+        // page is the one that renders the sequencing plan and the alias map,
+        // so it — and only it — asks for them.
         let snapshot = await Task.detached(priority: .userInitiated) {
-            let deskState: DeskState?
-            let deskError: String?
-            do {
-                deskState = try await SwiftNativeDeskStore(dataRoot: root).liveState()
-                deskError = nil
-            } catch {
-                deskState = nil
-                deskError = DeskItemPresentation.loadFailure(error)
-            }
-            // Execution and GitHub reads stay independent: one broken lane never
-            // blanks the other live Workshop projections. But "lenient" used to
-            // mean "silent" — a corrupt store returned [] and the surface said
-            // "Quiet right now". Each lane now reports rows OR a reason.
-            let runner = SwiftNativeWorkshopRunner(root: root)
-            let records = await runner.listAll()
-            let executions = DeskLaneState.classify(
-                rows: records,
-                probe: Self.probeExecutionRecords(runner.executionRecordsRoot),
-                noun: "execution record(s)")
-            let githubItems: DeskLaneState<GitHubCommandItem>
-            do {
-                githubItems = .rows(try await GitHubCommandStore(dataRoot: root).liveState().items)
-            } catch {
-                githubItems = .failed(error)
-            }
-            let plan = deskState.map { DeskSequencing.compute($0, now: Date()) } ?? DeskSequencing.Plan()
-            var aliases: [String: String] = [:]
-            for item in deskState?.items ?? [] { aliases[item.handle] = item.alias }
-            return DeskViewSnapshot(
-                deskState: deskState,
-                deskError: deskError,
-                executions: executions,
-                githubItems: githubItems,
-                plan: plan,
-                aliasByHandle: aliases
-            )
+            await DeskBoardRead.load(root: root, includeSequencing: true)
         }.value
         DeskLiveReloader.shared.traceEvent("load snapshot done token=\(token) cancelled=\(Task.isCancelled) accepts=\(loadGate.accepts(token))")
         guard !Task.isCancelled, loadGate.accepts(token) else { return false }
         let presentationNow = Date()
         deskPresentationNow = presentationNow
+        // Item 9 — her hour. Read HERE and nowhere else: this runs on Desk
+        // appear and on refresh, so the line costs one small JSON read when User
+        // is actually looking at the board. No timer, no reloader deadline, no
+        // per-turn cost, and no desk op — the lane writes none (Agent's veto).
+        // Not installed → `.absent`, and the file is never opened.
+        herHour = await Self.readHerHour(dataRoot: root, now: presentationNow)
         if let state = snapshot.deskState {
             items = state.items
             deskItemsLane = .rows(state.items)
@@ -2553,7 +2725,7 @@ struct DeskView: View {
             deskGeneratedTs = nil
         }
         executionsLane = snapshot.executions
-        githubLane = snapshot.githubItems
+        githubLane = snapshot.github
         // Set on ANY accepted publish, error included: a completed load that
         // failed still "reported" (the error banner owns the surface), and the
         // empty-state gate already excludes loadError/lane-unavailable.
@@ -2567,6 +2739,28 @@ struct DeskView: View {
             now: presentationNow)
         DeskLiveReloader.shared.scheduleRefresh(at: activity.nextRefreshAt)
         return true
+    }
+
+    /// The lane's own bounded state file, newest entry only.
+    ///
+    /// Installation is checked FIRST, so an uninstalled lane means the Desk
+    /// never touches `studio/wander/wander.json` — the same "not installed, not
+    /// silently skipped" discipline the lane itself keeps.
+    private static func readHerHour(
+        dataRoot: URL,
+        now: Date
+    ) async -> DeskHerHourPresentation.State {
+        guard await NativeCognitionRuntime.studioWanderIsInstalled(dataRoot: dataRoot) else {
+            return .absent
+        }
+        let state: StudioWanderLane.State
+        do { state = try await StudioWanderLane.loadState(dataRoot: dataRoot) }
+        catch { return .line(text: "Her hour’s saved state is unavailable.", symbol: "exclamationmark.triangle") }
+        return DeskHerHourPresentation.state(
+            installed: true,
+            entry: state.trace.last,
+            now: now
+        )
     }
 
     @MainActor private func refreshFromToolbar() async {

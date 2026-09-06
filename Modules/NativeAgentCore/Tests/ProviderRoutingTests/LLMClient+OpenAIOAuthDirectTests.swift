@@ -966,7 +966,7 @@ private func stubSession() -> URLSession {
         // an exhausted OAuth state must PROPAGATE the error instead of
         // letting the api-key adapter (which would 401 too with null
         // OPENAI_API_KEY) come in and mask it as a generic notConfigured.
-        final class ExhaustedOAuth: LLMAdapter, @unchecked Sendable {
+        final class ExhaustedOAuth: LLMAdapter, SignedInOAuthDouble, @unchecked Sendable {
             let providerId = "openai_oauth_direct"
             func complete(prompt: String, system: String?, model: String) async throws -> String {
                 throw LLMError.authRejected(
@@ -1256,7 +1256,7 @@ private func stubSession() -> URLSession {
         // OAuth adapter throws notConfigured -> the selected OAuth provider is
         // broken/missing auth. Surface that directly; do not silently swap to
         // the API-key OpenAIAdapter spy.
-        final class ThrowingOAuthAdapter: LLMAdapter, @unchecked Sendable {
+        final class ThrowingOAuthAdapter: LLMAdapter, SignedInOAuthDouble, @unchecked Sendable {
             let providerId = "openai_oauth_direct"
             func complete(prompt: String, system: String?, model: String) async throws -> String {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -1281,7 +1281,7 @@ private func stubSession() -> URLSession {
     }
 
     @Test func swiftNativeLLMClient_gpt_model_propagates_non_notConfigured_oauth_errors() async throws {
-        final class TransientOAuthAdapter: LLMAdapter, @unchecked Sendable {
+        final class TransientOAuthAdapter: LLMAdapter, SignedInOAuthDouble, @unchecked Sendable {
             let providerId = "openai_oauth_direct"
             func complete(prompt: String, system: String?, model: String) async throws -> String {
                 throw LLMError.transient(message: "rate limit")
@@ -1312,7 +1312,7 @@ private func stubSession() -> URLSession {
     @Test func swiftNativeLLMClient_gpt_stream_surfaces_oauth_notConfigured_without_apikey_swap() async throws {
         // OAuth adapter throws .notConfigured BEFORE any chunk → openAIStream
         // must surface it, NOT silently fall through to the api-key stream.
-        final class ThrowingOAuthAdapter: LLMAdapter, @unchecked Sendable {
+        final class ThrowingOAuthAdapter: LLMAdapter, SignedInOAuthDouble, @unchecked Sendable {
             let providerId = "openai_oauth_direct"
             func complete(prompt: String, system: String?, model: String) async throws -> String {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -1342,7 +1342,7 @@ private func stubSession() -> URLSession {
     }
 
     @Test func swiftNativeLLMClient_claude_stream_surfaces_oauth_notConfigured_without_apikey_swap() async throws {
-        final class ThrowingAnthropicOAuthAdapter: LLMAdapter, @unchecked Sendable {
+        final class ThrowingAnthropicOAuthAdapter: LLMAdapter, SignedInOAuthDouble, @unchecked Sendable {
             let providerId = "anthropic_oauth_direct"
             func complete(prompt: String, system: String?, model: String) async throws -> String {
                 throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
@@ -1663,8 +1663,24 @@ private struct MockRouter2: ProviderRoutingProtocol {
     }
 }
 
-private final class SpyAdapter2: LLMAdapter, @unchecked Sendable {
+/// 2026-09-06 (2de2f5a0, "OAuth chosen only with a credential"): resolution
+/// picks an `*_oauth_direct` provider only when the adapter reports a stored
+/// credential — `oauthCredentialPresent` asks `OAuthCredentialPresence`, and an
+/// adapter that cannot answer reports ABSENT and keeps the api-key branch, "the
+/// same shape as no adapter at all". A double standing in for a SIGNED-IN OAuth
+/// provider therefore has to say so, or the routing under test never happens.
+private protocol SignedInOAuthDouble: OAuthCredentialPresence {}
+extension SignedInOAuthDouble {
+    var hasStoredOAuthCredential: Bool { true }
+}
+
+private final class SpyAdapter2: LLMAdapter, OAuthCredentialPresence, @unchecked Sendable {
     let providerId: String
+    /// 2026-09-06 (2de2f5a0): an `*_oauth_direct` provider is only chosen when
+    /// its adapter reports a stored credential. A spy standing in for a
+    /// signed-in OAuth adapter says yes; one standing in for the api-key
+    /// adapter is never asked.
+    var hasStoredOAuthCredential: Bool { providerId.hasSuffix("_oauth_direct") }
     var lastPrompt: String?
     var lastSystem: String?
     var lastModel: String?

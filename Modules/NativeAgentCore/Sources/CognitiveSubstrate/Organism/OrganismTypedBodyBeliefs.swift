@@ -674,6 +674,71 @@ public struct ApprovalPathReading: Codable, Sendable, Equatable {
 
 // MARK: - Lossless posture decisions
 
+/// Item 47 (2026-09-01) — the rule that used to live only on the provider path,
+/// made general.
+///
+/// `ProviderPathBeliefProjector` has always refused to hand an optimistic
+/// compatibility Boolean to an `.uncertain` or `.stale` projection: unknown is
+/// not good news, and a reading of the past is not a reading of now. Every OTHER
+/// typed body read collapsed to its CATEGORY before posture saw it, and the
+/// category is a label over the numerics rather than the numerics themselves. So
+/// ~31 KB of estimate/uncertainty/freshness/evidence reduced to a Boolean that
+/// said "fine" for a tool path that was merely CONFIGURED and never exercised,
+/// and for a phone delivery receipt that arrived two days ago.
+///
+/// This is that same refusal, lifted out of the provider path and applied to
+/// every read: a typed belief may license an optimistic posture only when it is
+/// BOTH confident and current. It can only ever move posture toward caution, so
+/// no read that was cautious becomes optimistic here.
+public enum BodyBeliefOptimism {
+    /// The three thresholds are DELIBERATELY the provider projector's own
+    /// (`ProviderPathBeliefProjector.project` / `categorize`), not new numbers.
+    /// That is what makes this the general case of an existing rule rather than
+    /// a second, differently-tuned rule beside it: a `ProviderPathBeliefProjection`
+    /// in state `.healthy` satisfies all three by construction, so the provider
+    /// path's behaviour is unchanged to the bit.
+
+    /// Past this the read disagrees with itself or rests on too little support.
+    public static let maximumOptimisticUncertainty = 0.55
+    /// Below this the newest evidence has decayed past meaning — the projector's
+    /// `.stale` cutoff.
+    public static let minimumOptimisticFreshness = 0.05
+    /// Below this the read is not actually saying the good thing. It is the bar
+    /// that separates `.healthy` from `.uncertain` upstream, and here it is what
+    /// stops a tool path that is merely CONFIGURED (estimate 0.6 — real evidence
+    /// that a config file exists, no evidence that a tool ever ran) from reading
+    /// as capability. Same refusal `providersAvailable` already meets: mere
+    /// configuration never becomes health.
+    public static let minimumOptimisticEstimate = 0.65
+
+    public static func licenses(
+        estimate: Double,
+        uncertainty: Double,
+        freshness: Double
+    ) -> Bool {
+        guard estimate.isFinite, uncertainty.isFinite, freshness.isFinite else { return false }
+        return estimate > minimumOptimisticEstimate
+            && uncertainty <= maximumOptimisticUncertainty
+            && freshness >= minimumOptimisticFreshness
+    }
+
+    public static func licenses(_ metrics: BodyBeliefMetrics) -> Bool {
+        licenses(
+            estimate: metrics.estimate,
+            uncertainty: metrics.uncertainty,
+            freshness: metrics.freshness
+        )
+    }
+
+    public static func licenses(_ projection: ProviderPathBeliefProjection) -> Bool {
+        licenses(
+            estimate: projection.estimate,
+            uncertainty: projection.uncertainty,
+            freshness: projection.freshness
+        )
+    }
+}
+
 public extension BodySchema {
     /// Decision helpers consume typed evidence when it exists. Compatibility
     /// booleans remain available for old readers and persistence, but an
@@ -682,9 +747,17 @@ public extension BodySchema {
     var providerPathRequiresCaution: Bool {
         guard providersAvailable else { return true }
         guard let belief = providerPathBelief else { return !providersHealthy }
-        return belief.state != .healthy
+        guard belief.state == .healthy else { return true }
+        return !BodyBeliefOptimism.licenses(belief)
     }
 
+    /// Caution is reserved for evidence that something is WRONG — unavailable
+    /// hands, or a read that cannot say. Deliberately NOT widened to unproven or
+    /// stale reads (review fix 4): a merely configured tool path, or a live
+    /// receipt that aged out over a quiet weekend, is UNKNOWN, and turning every
+    /// quiet Monday and every fresh install into a global `careful` posture
+    /// would be the body crying wolf. Unknown withholds confidence; it does not
+    /// manufacture alarm. See `toolPathIsUnprovenOrStale` for where it lands.
     var toolPathRequiresCaution: Bool {
         guard let reading = toolCapabilityReading else { return !toolHandsAvailable }
         switch reading.category {
@@ -695,11 +768,30 @@ public extension BodySchema {
         }
     }
 
+    /// TRUE when the tool read says the optimistic thing by category but cannot
+    /// back it with confident, current evidence — configured but never
+    /// exercised (estimate 0.6, uncertainty 0.5), or a live capability receipt
+    /// decayed past its stale horizon.
+    ///
+    /// This is the honest middle the collapsed Bool had no room for. It does not
+    /// raise caution; it withholds the OPTIMISTIC move — `preferKnownPath`, the
+    /// strategy that says "lean on the path you know works" — because she does
+    /// not currently know that it works.
+    var toolPathIsUnprovenOrStale: Bool {
+        guard let reading = toolCapabilityReading else { return false }
+        switch reading.category {
+        case .available, .configured:
+            return !BodyBeliefOptimism.licenses(reading.metrics)
+        case .unavailable, .unknown:
+            return true
+        }
+    }
+
     var memoryRequiresCurrentContext: Bool {
         guard let reading = memoryIntegrityReading else { return !memoryHealthy }
         switch reading.category {
         case .healthy:
-            return false
+            return !BodyBeliefOptimism.licenses(reading.metrics)
         case .degraded, .unavailable, .unknown:
             return true
         }
@@ -707,18 +799,30 @@ public extension BodySchema {
 
     var approvalRequiresPause: Bool {
         guard let reading = approvalPathReading else { return !approvalChannelsOpen }
-        return reading.category != .open
+        guard reading.category == .open else { return true }
+        return !BodyBeliefOptimism.licenses(reading.metrics)
     }
 
     var notificationRequiresReceipt: Bool {
         guard let belief = notificationDeliveryBelief else { return !notificationPathHealthy }
         switch belief.category {
-        case .unconfigured, .deviceReceived, .displayed, .userSeen:
+        case .unconfigured:
+            // Exact configuration truth, not a belief: with no transport there
+            // is no delivery whose receipt could be missing. Deliberately NOT
+            // subject to the freshness floor — an absent transport does not go
+            // stale, and inventing a receipt requirement for a phone she cannot
+            // reach would be posture theater.
             return false
+        case .deviceReceived, .displayed, .userSeen:
+            // A receipt is evidence about the notification it acknowledged, and
+            // it ages. Past the 36h stale horizon this read describes a
+            // delivery that already happened, not the next one.
+            return !BodyBeliefOptimism.licenses(belief.metrics)
         case .configured, .transportAccepted, .failed, .unknown:
             return true
         }
     }
+
 }
 
 public struct ResourcePressureReading: Codable, Sendable, Equatable {

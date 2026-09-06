@@ -62,9 +62,42 @@ actor ChatRenameMutationGate {
     }
 }
 
+/// Whether the human has explicitly picked a chat session since this launch.
+///
+/// THE RULE: the main window defaults to the conversation anchor — the remote
+/// conversation User is currently in, on whichever surface — but it must NEVER
+/// take him off a session he chose himself. Same protection iOS already gives
+/// itself in `shouldReturnToMainSession`: a snapshot arriving mid-thought does
+/// not get to move the screen.
+///
+/// Process-scoped rather than persisted, and that is the point. "This launch"
+/// is the window in which his choice is still current; a choice from last week
+/// should not outrank the conversation he is having right now.
+@MainActor
+enum MacChatSelectionIntent {
+    private(set) static var userChoseThisLaunch = false
+
+    /// Called wherever the human's own intent selects a session — picking one
+    /// in the sidebar, or creating a new one.
+    static func noteUserChoice() { userChoseThisLaunch = true }
+
+    /// Test seam. Production never calls this; a launch has exactly one start.
+    static func resetForTesting() { userChoseThisLaunch = false }
+}
+
+extension Notification.Name {
+    /// See `AppModel.flushLiveChatDrafts()`. Posted before a chat surface
+    /// reads a stored draft; every mounted composer commits its live text.
+    static let chatFlushLiveDrafts = Notification.Name("nativeagent.chat.flushLiveDrafts")
+}
+
 @MainActor
 extension AppModel {
     func loadChatState() async {
+        // Idempotent; the earliest post-construction entry point AppModel owns.
+        // Keeps the UserDefaults-backed settings block live so a bridge or
+        // out-of-process write is picked up without a relaunch.
+        installDefaultsBackedSettingsObserver()
         await loadChatState(api: client)
     }
 
@@ -94,6 +127,10 @@ extension AppModel {
         chatDrafts = chatDrafts.filter { activeIds.contains($0.key) }
         chatPendingAttachments = chatPendingAttachments.filter { activeIds.contains($0.key) }
         chatDraftLastTouched = chatDraftLastTouched.filter { activeIds.contains($0.key) }
+        // The edit stamp outlives an empty draft on purpose — it is what stops
+        // an older composer from re-filing text a newer one just cleared — so
+        // it is pruned by session lifetime only (2026-09-06).
+        chatDraftLastEdited = chatDraftLastEdited.filter { activeIds.contains($0.key) }
         // PATCH-2026-05-08: review-fix-r5 Collect empty keys first then remove
         // (was mutating dict while iterating it).
         let emptyKeys = chatDrafts.compactMap { $0.value.isEmpty ? $0.key : nil }
@@ -175,6 +212,17 @@ extension AppModel {
             await loadChatState(api: api)
             if chatStateLoadFailed { failedEndpoints.append("chat messages") }
             compiledPersonality = fresh("personality", try? await api.getCompiledPersonality(surface: "chat"))
+            // The chat header, composer placeholder, and turn cards all read
+            // `agentDisplayName`, which resolves from `personality?.name`
+            // first. That profile was only ever loaded by the Memory and
+            // Personality screens, so a fresh launch straight into chat
+            // labelled the agent with the app's fallback name until one of
+            // those screens had been visited. Load it once here; the name is
+            // the profile's, never a literal.
+            if personality == nil {
+                personality = fresh("personality profile", try? await api.getPersonality()) ?? personality
+                teachMemoryHygieneName()
+            }
         case .legacyWorkshop:
             // 2026-06-06 sidebar-fix v3: removed the approvals side-effect
             // refresh. It was causing the sidebar to scroll on Executions click:
@@ -223,6 +271,7 @@ extension AppModel {
             graphEntities = fresh("graph entities", graphRows) ?? graphEntities
             graphStatus = fresh("graph status", graphStatusRow) ?? graphStatus
             personality = fresh("personality", personalityRow) ?? personality
+            teachMemoryHygieneName()
             trustPolicy = fresh("trust policy", trustRow) ?? trustPolicy
         case .settingsHub, .settings, .connectors, .providers, .telegram, .inboxPolicy, .macIntegration:
             async let nextConfig = try? api.getConfig()
@@ -275,7 +324,6 @@ extension AppModel {
             async let nextCapabilitySummary = try? api.getCapabilities()
             async let nextApprovals = try? api.getApprovals()
             async let nextWorkflows = try? api.getWorkflows()
-            async let nextWorkflowRuns = try? api.getWorkflowRuns()
             async let nextMCPServers = try? api.getMCPServers()
             // The compact MCP Builder is mounted in Capabilities too. Its
             // server controls render live session and consent evidence, so
@@ -309,7 +357,6 @@ extension AppModel {
                 capabilityRow,
                 approvalRows,
                 workflowRows,
-                workflowRunRows,
                 mcpRows,
                 mcpSessionRows,
                 mcpConsentRows,
@@ -336,7 +383,6 @@ extension AppModel {
                 nextCapabilitySummary,
                 nextApprovals,
                 nextWorkflows,
-                nextWorkflowRuns,
                 nextMCPServers,
                 nextMCPSessions,
                 nextMCPConsent,
@@ -363,7 +409,6 @@ extension AppModel {
             capabilitySummary = fresh("capability summary", capabilityRow) ?? capabilitySummary
             approvals = fresh("approvals", approvalRows) ?? approvals
             workflows = fresh("workflows", workflowRows) ?? workflows
-            workflowRuns = fresh("workflow runs", workflowRunRows) ?? workflowRuns
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
             mcpSessions = fresh("mcp sessions", mcpSessionRows) ?? mcpSessions
             mcpConsent = fresh("mcp consent", mcpConsentRows) ?? mcpConsent
@@ -465,6 +510,7 @@ extension AppModel {
                 nextGrowth
             )
             personality = fresh("personality", personalityRow) ?? personality
+            teachMemoryHygieneName()
             if let docsResponse = fresh("personality docs", docsResponse) {
                 personalityDocs = docsResponse.docs
             }
@@ -777,20 +823,66 @@ extension AppModel {
     //   starter, suggestion chip) and bumps the generation so the composer
     //   pulls it. Rare by construction — never on the keystroke path.
 
+    /// 2026-09-06: the main composer and every detached panel hold their
+    /// in-progress text in view-local `@State` (H5), so `chatDrafts` lags what
+    /// is actually on screen. A surface about to ADOPT a draft posts this
+    /// first; the notification is delivered synchronously, so every live
+    /// composer has written its text through by the time the read happens.
+    /// Without it, opening a detached panel on the conversation the main
+    /// window is being typed into showed the last commit, not the typing.
     @MainActor
-    func commitChatDraft(_ text: String, sessionId: String) {
-        guard !sessionId.isEmpty else { return }
+    func flushLiveChatDrafts() {
+        NotificationCenter.default.post(name: .chatFlushLiveDrafts, object: nil)
+    }
+
+    /// `editedAt` is when the committing composer's text was last typed. The
+    /// flush broadcast makes every dirty composer write inside one
+    /// notification with no order between them, so the newest edit wins and an
+    /// older one is dropped rather than overwriting it (2026-09-06). Callers
+    /// acting on a fresh user action (a send that clears the box) leave it at
+    /// the default and are treated as the newest write.
+    /// 2026-09-06: returns whether the write actually landed. A commit rejected
+    /// as older than the stored draft used to be reported as success, so the
+    /// panel marked its unsent text committed and dropped it on close.
+    @MainActor
+    @discardableResult
+    func commitChatDraft(_ text: String, sessionId: String, editedAt: Date = Date()) -> Bool {
+        guard !sessionId.isEmpty else { return false }
+        if let lastEdited = chatDraftLastEdited[sessionId], editedAt < lastEdited { return false }
+        chatDraftLastEdited[sessionId] = editedAt
         if text.isEmpty {
             // Mirrors pruneChatDrafts' empty-draft rule: an empty draft is an
             // absent draft, and leaving the key behind would keep a dead
             // session pinned in the 50-entry LRU.
             chatDrafts.removeValue(forKey: sessionId)
             chatDraftLastTouched.removeValue(forKey: sessionId)
-            return
+            return true
         }
-        guard chatDrafts[sessionId] != text else { return }
+        guard chatDrafts[sessionId] != text else { return true }
         chatDrafts[sessionId] = text
         touchChatDraft(sessionId: sessionId)
+        return true
+    }
+
+    /// Clear the draft a composer just SENT.
+    ///
+    /// 2026-09-06: this used to be `commitChatDraft("")` with a fresh
+    /// timestamp, so sending older text from one window outranked — and
+    /// deleted — a newer, still-unsent edit made in another window on the same
+    /// conversation. A send speaks only for the snapshot it sent: when the
+    /// stored draft is that snapshot it goes away without claiming a new edit
+    /// time (so the other composer's later commit still wins), and when the
+    /// stored draft is something else the clear must win on the sent
+    /// snapshot's own edit time or not at all.
+    @MainActor
+    func clearChatDraftAfterSend(_ sent: String, sessionId: String, editedAt: Date) {
+        guard !sessionId.isEmpty else { return }
+        if chatDrafts[sessionId] == sent {
+            chatDrafts.removeValue(forKey: sessionId)
+            chatDraftLastTouched.removeValue(forKey: sessionId)
+            return
+        }
+        commitChatDraft("", sessionId: sessionId, editedAt: editedAt)
     }
 
     @MainActor
@@ -903,6 +995,20 @@ extension AppModel {
             let fetchedSessions = try await api.getChatSessions()
             chatSessionIndexRefreshFailed = false
             chatSessions = fetchedSessions
+            // Default to the conversation anchor — but only until the human
+            // picks something. `shouldAdoptAnchor` owns that rule and also
+            // refuses an anchor that names no live session, so a stale pin can
+            // never blank the window. Surface-agnostic: nothing here knows or
+            // cares which adapter published the anchor.
+            if ConversationAnchor.shouldAdoptAnchor(
+                anchorSessionId: ConversationAnchor.currentSessionId(),
+                currentSelection: activeChatSessionId,
+                userChoseThisLaunch: MacChatSelectionIntent.userChoseThisLaunch,
+                liveSessionIds: Set(chatSessions.filter { $0.archived != true }.map(\.id))
+            ), let anchorId = ConversationAnchor.currentSessionId() {
+                activeChatSessionId = anchorId
+                persistActiveChatSessionID(activeChatSessionId)
+            }
             if activeChatSessionId.isEmpty || !chatSessions.contains(where: { $0.id == activeChatSessionId }) {
                 if !activeAtStart.isEmpty,
                    (activeChatSessionId != activeAtStart || chatSelectionGeneration != selectionGenerationAtStart) {
@@ -1122,6 +1228,10 @@ extension AppModel {
     ) async {
         let requestedId = session.id
         guard !requestedId.isEmpty else { return }
+        // The human has picked a session. From here on this launch the main
+        // window stops defaulting to the conversation anchor — never yank
+        // someone off a session they chose.
+        MacChatSelectionIntent.noteUserChoice()
         chatSelectionGeneration += 1
         let generation = chatSelectionGeneration
         let hasCachedTranscript = chatMessagesBySession[requestedId] != nil
@@ -1208,6 +1318,7 @@ extension AppModel {
     func newChatSession() async {
         do {
             let session = try await client.createChatSession(title: "New Chat", sourceKey: "app", forceNew: true)
+            MacChatSelectionIntent.noteUserChoice()
             chatSelectionGeneration += 1
             activeChatSessionId = session.id
             persistActiveChatSessionID(activeChatSessionId)
@@ -1218,8 +1329,12 @@ extension AppModel {
             // for sessions the list no longer reports — mirrors the stale-draft
             // prune above, same low-frequency hook.
             pruneStaleSessionChatState(knownSessionIds: Set(chatSessions.map(\.id)))
-            chatMessages = []
-            latestContextReceipt = nil
+            // 2026-09-06: clear the session this call CREATED, by id. The
+            // session-list read above suspends, and the human can pick another
+            // conversation while it is in flight — the active-session
+            // accessors would then blank whatever they landed on.
+            setChatMessages([], for: session.id)
+            setLatestContextReceipt(nil, for: session.id)
             statusText = "New chat session ready"
             publishChatSnapshot()
         } catch {

@@ -59,6 +59,11 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @SceneStorage("selection") private var selectionRaw = SidebarItem.chat.rawValue
     @SceneStorage("skillsToolsSection") private var skillsToolsSectionRaw = SkillsToolsSection.skills.rawValue
+    // ui-simplify 2026-09-02 (lane C): the classic shell drills into the
+    // moment/memory review from ActivityView's own NavigationStack. Behind the
+    // rail there is no such stack — Memories is its own place — so the same
+    // `.activity(.memoryProposals)` route selects Memories and says which tab.
+    @SceneStorage("memoryTab") private var memoryTabRaw = MemoryViewTab.active.rawValue
     @AppStorage(SidebarAdvancedDisclosurePresentation.preferenceKey) private var showAdvanced = false
     // B2.2: developer/internal surfaces (Turn Inspector, MCP, Cognition, …)
     // render only when this UI-visibility preference is on. Fresh installs
@@ -66,6 +71,9 @@ struct ContentView: View {
     // Surfaced as one toggle in Settings; NOT coupled to Trust's developerMode.
     @AppStorage(SidebarAdvancedDisclosurePresentation.developerSurfacesPreferenceKey) private var showDeveloperSurfaces = false
     @AppStorage("nativeagent.showTour") private var showTour = false
+    // ui-simplify 2026-09-02: the kill switch. ON restores the previous
+    // List sidebar + nine primaries, unchanged.
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
     @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
     @State private var didCheckFirstRunOnboarding = false
     @State private var showFirstRunOnboarding = false
@@ -74,6 +82,12 @@ struct ContentView: View {
     /// A route to Desk must reset its local DeskHub mode even when Desk is
     /// already selected (for example, when the user is viewing Schedule).
     @State private var deskRootRouteVersion = 0
+    /// Same for Settings: its NavigationStack keeps its pages across visits
+    /// (the detail `.id` is the sidebar item, so re-selecting Settings does not
+    /// remount it), which left a visitor standing two pages deep on a fresh
+    /// click. Bumped on every route to Settings; it is SetupView's `.id`, so a
+    /// bump remounts the stack at its root.
+    @State private var settingsRootRouteVersion = 0
     // B2.3 follow-up: Desk's New Task sheet is presented HERE, not in
     // DeskHubView — a sheet attached to NavigationSplitView detail content
     // presents only once per app run on macOS (the bridge never releases the
@@ -90,7 +104,13 @@ struct ContentView: View {
             // land on its canonical home — otherwise no sidebar row shows
             // selected and refreshForSidebarItem hits a stale branch
             // (gpt-5.5 review MED, 2026-07-03 dead-weight sweep).
-            (SidebarItem(rawValue: selectionRaw) ?? .chat).normalized
+            let item = (SidebarItem(rawValue: selectionRaw) ?? .chat).normalized
+            // User, 2026-09-04: a saved selection naming a page that is a tab
+            // now (Knowledge graph, MCP, Dreams, Telegram, Mac integration)
+            // reads as its rail page, so the rail shows a row and the page
+            // has its frame.
+            if !classicShell, let home = SidebarItem.shellHome(for: item) { return home.parent }
+            return item
         } set: {
             selectSidebarItem($0.normalized)
         }
@@ -130,7 +150,7 @@ struct ContentView: View {
     private var advancedItems: [SidebarItem] {
         SidebarAdvancedDisclosurePresentation.visibleRows(
             isExpanded: showAdvanced,
-            developerSurfacesEnabled: showDeveloperSurfaces
+            developerSurfacesEnabled: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
         )
     }
 
@@ -143,7 +163,37 @@ struct ContentView: View {
         // scalar) actually cut root re-evaluations.
         RenderAudit.bump("contentview.body")
         return ZStack {
-            NavigationSplitView {
+            ShellFrame(classic: classicShell) {
+                // ui-simplify 2026-09-02 (Lane A): the rail. Five places with
+                // their words under them, at a fixed 84pt. The classic List
+                // sidebar is preserved unchanged behind the `uiClassicShell`
+                // kill switch.
+                Group {
+                if !classicShell {
+                    // The rail's 84pt comes from its own .frame(width:) —
+                    // navigationSplitViewColumnWidth was left behind when the
+                    // shell moved out of NavigationSplitView and did nothing
+                    // inside an HStack but mislead the next reader.
+                    // The rail carries the same queue the classic sidebar
+                    // badges from — otherwise a pending approval is invisible
+                    // until he happens to open Today. One dot, no number.
+                    ShellSidebarRail(
+                        selection: selection,
+                        needsYou: Set(
+                            SidebarItem.shellPrimaryItems
+                                // Agent, 2026-09-02: a rail dot is a promise about the
+                                // page under it. Today's dot reads what Today's waiting
+                                // card reads: pending approvals and memories to review.
+                                .filter { item in
+                                    item.normalized == .activity
+                                        ? (appModel.approvals.contains { $0.status.lowercased() == "pending" }
+                                            || appModel.todayWaitingMemories > 0)
+                                        : sidebarBadgeCount(for: item) > 0
+                                }
+                                .map(\.normalized)
+                        )
+                    )
+                } else {
                 // S.5: when onboarding overlay is shown, hide the nav content from accessibility
                 // (OnboardingTourOverlay already carries .isModal; this prevents VoiceOver reaching behind it)
                 // 2026-06-06 sidebar-fix v6: restored to the standard
@@ -192,6 +242,9 @@ struct ContentView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                }
+                }
+                // Both shells share the title and the badge refresh below.
                 .navigationTitle("NativeAgent")
                 // Keep the Activity badge honest without pulling the full
                 // Activity surface while another tab is open. The full
@@ -232,18 +285,60 @@ struct ContentView: View {
                     switch selection.wrappedValue.normalized {
                     // ── Primary ───────────────────────────────────────────────
                     case .chat: ChatView()
-                    case .activity: ActivityView()
-                    case .memories: MemoryView()
+                    // ui-simplify 2026-09-02: Today and Setup sit behind the
+                    // rail's words; the classic shell keeps its old pages.
+                    case .activity: if classicShell { ActivityView() } else { TodayView() }
+                    // ui-simplify 2026-09-03 (lane M): the new shell's Memories
+                    // is one centred column in her voice; the classic shell
+                    // keeps the status card and its three tabs untouched.
+                    case .memories:
+                        if classicShell {
+                            MemoryView(initialTab: MemoryViewTab(rawValue: memoryTabRaw) ?? .active)
+                                // MemoryView copies initialTab into @State
+                                // once; a route arriving while Memories is
+                                // already mounted must remount so the Pending
+                                // tab actually shows.
+                                .id(memoryTabRaw)
+                        } else {
+                            // Memories and the knowledge graph as tabs; a
+                            // moment-review request lands on the Memories tab
+                            // (applyActivitySection writes the tab first).
+                            MemoriesRailPage()
+                        }
                     case .skills: SkillsToolsView(selection: skillsToolsSection)
-                    case .desk: DeskHubView(rootRouteVersion: deskRootRouteVersion)
-                    case .personality: PersonalityView()
-                    case .connectors: ConnectorsView()
-                    case .trust: TrustCenterView()
-                    case .providers: ProviderSettingsView()
+                    // ui-simplify 2026-09-02 (lane D): the new shell's Desk is
+                    // one centred column in her voice; the classic shell keeps
+                    // the segmented hub untouched.
+                    case .desk:
+                        if classicShell {
+                            DeskHubView(rootRouteVersion: deskRootRouteVersion)
+                        } else {
+                            DeskPageView(rootRouteVersion: deskRootRouteVersion)
+                        }
+                    // User, 2026-09-04: on the rail, with tabs. The classic
+                    // shell keeps the bare pages.
+                    case .personality: if classicShell { PersonalityView() } else { PersonalityRailPage() }
+                    case .connectors: if classicShell { ConnectorsView() } else { ConnectorsRailPage() }
+                    case .trust: if classicShell { TrustCenterView() } else { TrustRailPage() }
+                    case .providers:
+                        if classicShell { ProviderSettingsView() }
+                        else { ShellRailPage(title: "Providers", wide: true) { ProviderSettingsView() } }
                     case .macIntegration: MacIntegrationView()
-                    case .settings: SlimSettingsView()
+                    case .settings:
+                        if classicShell {
+                            SlimSettingsView()
+                        } else {
+                            // A route to Settings is a route to its ROOT, and
+                            // the stack inside SetupView owns its own path —
+                            // nothing can unwind it from out here. `.id` does
+                            // it the only way an unbound stack allows: a fresh
+                            // SetupView, standing on Settings.
+                            SetupView().id(settingsRootRouteVersion)
+                        }
                     // ── Advanced / routed child surfaces ──────────────────────
-                    case .capabilities: CapabilitiesView()
+                    case .capabilities:
+                        if classicShell { CapabilitiesView() }
+                        else { ShellRailPage(title: "Capabilities") { CapabilitiesView() } }
                     case .knowledge: KnowledgeGraphView()
                     case .dreams: DreamsView()
                     // B2.4/B2.6 (fence-B handoff): the Observatory's surviving
@@ -257,9 +352,11 @@ struct ContentView: View {
                     // contract for all route-only surfaces.
                     case .cognition: DiagnosticsView(initialMode: .cognition)
                     case .inspector: DiagnosticsView(initialMode: .inspector)
-                    case .diagnostics: DiagnosticsView()
+                    case .diagnostics: if classicShell { DiagnosticsView() } else { DiagnosticsRailPage() }
                     case .telegram: TelegramView()
-                    case .inboxPolicy: InboxSettingsView()
+                    case .inboxPolicy:
+                        if classicShell { InboxSettingsView() }
+                        else { ShellRailPage(title: "Notifications") { InboxSettingsView() } }
                     case .mcp: MCPHubView()
                     // ── Legacy aliases (unreachable post-normalize, kept exhaustive) ───
                     // .autoImprovement → .activity and .panels → .diagnostics
@@ -308,8 +405,16 @@ struct ContentView: View {
                 }
             }
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    HealthPill()
+                // ui-simplify 2026-09-02: the "N warnings" pill is the first
+                // thing a stranger used to read — before they had said hello.
+                // It moved to Diagnostics (Settings ▸ Advanced ▸ Diagnostics),
+                // where someone is actually looking for it. The chat header's
+                // one status dot carries the felt state now. Nothing was
+                // deleted; the classic shell still shows it here.
+                if classicShell {
+                    ToolbarItem(placement: .primaryAction) {
+                        HealthPill()
+                    }
                 }
             }
             // S.5: hide NavigationSplitView from VoiceOver while onboarding overlay is active
@@ -334,7 +439,10 @@ struct ContentView: View {
         .overlay(alignment: .bottom) {
             SystemToastBar(center: appModel.systemToasts)
         }
-        .animation(.easeInOut(duration: 0.35), value: showTour)
+        .animation(
+            NativeAgentMotion.respecting(.easeInOut(duration: 0.35), reduceMotion: reduceMotion),
+            value: showTour
+        )
         .onChange(of: tourReplayCoordinator.requestID) { _, requestID in
             presentTourReplayIfNeeded(requestID: requestID)
         }
@@ -343,6 +451,15 @@ struct ContentView: View {
             if selectionRaw == SidebarItem.tools.rawValue {
                 skillsToolsSectionRaw = SkillsToolsSection.tools.rawValue
                 selectionRaw = SidebarItem.skills.rawValue
+            }
+            // User, 2026-09-04: a saved selection naming a page that is a tab
+            // now opens its rail page ON that tab, the same path a route takes.
+            if !classicShell, let saved = SidebarItem(rawValue: selectionRaw),
+               let home = SidebarItem.shellHome(for: saved) {
+                let tab = (home.parent == .diagnostics && home.tab == "skills"
+                    && skillsToolsSectionRaw == SkillsToolsSection.tools.rawValue) ? "tools" : home.tab
+                UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(home.parent))
+                selectionRaw = home.parent.rawValue
             }
             guard navigationMountID == nil else { return }
             navigationMountID = NativeAgentAppCoordinator.shared.mountMainScene { destination in
@@ -471,7 +588,14 @@ struct ContentView: View {
             if Task.isCancelled { return }
             do {
                 let start = try await appModel.startOnboarding()
-                if start.pendingRecovery == true || start.resetRequired == true {
+                // User, 2026-09-06: `profileRepairRequired` also opens the
+                // wizard. It arrives WITH `hasExisting` true (the persona docs
+                // and sentinel are real), so it has to be checked before the
+                // `hasExisting` early return below or the repair lane is
+                // unreachable and only Doctor ever names the condition.
+                if start.pendingRecovery == true
+                    || start.resetRequired == true
+                    || start.profileRepairRequired == true {
                     selectionRaw = SidebarItem.chat.rawValue
                     showTour = false
                     showFirstRunOnboarding = true
@@ -543,14 +667,30 @@ struct ContentView: View {
             if target.isAdvanced {
                 showAdvanced = true
             }
+            // A route names the page, not the tab: land on the page's first
+            // tab (the multimodal notice must open Trust, not Mac integration).
+            if !classicShell, let first = SidebarItem.shellFirstTab(for: target) {
+                UserDefaults.standard.set(first, forKey: ShellRailTab.storageKey(target))
+            }
             selectSidebarItem(target)
         }
     }
 
     private func selectSidebarItem(_ target: SidebarItem) {
+        // User, 2026-09-04: a former Advanced page that is a tab now opens its
+        // rail page on that tab. The tab key is written before the selection
+        // so the page mounts already on it.
+        if !classicShell, let home = SidebarItem.shellHome(for: target) {
+            UserDefaults.standard.set(home.tab, forKey: ShellRailTab.storageKey(home.parent))
+            selectionRaw = home.parent.rawValue
+            return
+        }
         deskRootRouteVersion = DeskRootRoutePresentation.nextRootRouteVersion(
             current: deskRootRouteVersion,
             destination: target)
+        if target.normalized == .settings {
+            settingsRootRouteVersion &+= 1
+        }
         selectionRaw = target.normalized.rawValue
     }
 
@@ -563,6 +703,17 @@ struct ContentView: View {
     }
 
     private func applyActivitySection(_ section: ActivitySection) {
+        // Behind the rail, Activity IS Today and it has no NavigationStack to
+        // push onto. The memory/moment review lives on the Memories place's
+        // Pending tab, so route there instead of stranding the request.
+        if !classicShell, section == .memoryProposals {
+            appModel.pendingActivitySectionRaw = nil
+            memoryTabRaw = MemoryViewTab.pending.rawValue
+            // The waiting card is on the Memories tab, not the graph.
+            UserDefaults.standard.set("memories", forKey: ShellRailTab.storageKey(.memories))
+            selectionRaw = SidebarItem.memories.rawValue
+            return
+        }
         appModel.pendingActivitySectionRaw = section.rawValue
         selectionRaw = SidebarItem.activity.rawValue
         NotificationCenter.default.post(
@@ -579,6 +730,16 @@ struct ContentView: View {
 
     private func applySkillsToolsSection(_ section: SkillsToolsSection) {
         skillsToolsSectionRaw = section.rawValue
+        // User, 2026-09-04: Skills and Tools are two tabs of Diagnostics in
+        // the new shell.
+        if !classicShell {
+            UserDefaults.standard.set(
+                section == .tools ? "tools" : "skills",
+                forKey: ShellRailTab.storageKey(.diagnostics)
+            )
+            selectionRaw = SidebarItem.diagnostics.rawValue
+            return
+        }
         selectionRaw = SidebarItem.skills.rawValue
     }
 }

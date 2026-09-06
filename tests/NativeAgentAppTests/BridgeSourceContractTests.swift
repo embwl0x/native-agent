@@ -106,7 +106,15 @@ struct BridgeSourceContractTests {
             "message_in",
             "message_out",
             "message_failed",
-            "message_timeout",
+            // 2026-09-06: was "message_timeout". fd7f4a31 ("Bridge deadline no
+            // longer cancels the turn") changed what the 600 s work latch
+            // MEANS: it used to cancel the work task — which is the turn — and
+            // reported that kill as message_timeout; it now answers the HTTP
+            // caller 202 still_working and lets the turn run to its own end.
+            // Renaming the kind alongside the behaviour is deliberate: a
+            // consumer still filtering on message_timeout SHOULD go dark
+            // rather than keep reporting a turn as killed when it is alive.
+            "message_deadline_released",
             "message_enqueue_failed",
             "message_enqueued",
             "message_enqueue_timeout",
@@ -463,7 +471,10 @@ struct BridgeSourceContractTests {
         let liveRoot = try index(of: "guard usesLiveAppDataRoot(dataRoot)", in: notify)
         let xctest = try index(of: "XCTestConfigurationFilePath", in: notify)
         let killSwitch = try index(of: "NATIVE_AGENT_DISABLE_INBOX_PUSH", in: notify)
-        let send = try index(of: "sendNotificationToPairedDevices", in: notify)
+        // Item 26 (2026-09-01): the send is now `AttentionRouter.shared.route`
+        // — one exit for all thirteen push sites. The gate-order contract is
+        // unchanged: every filter still sits BEFORE whatever leaves the machine.
+        let send = try index(of: "AttentionRouter.shared.route(", in: notify)
 
         #expect(severity < send)
         #expect(liveRoot < send)

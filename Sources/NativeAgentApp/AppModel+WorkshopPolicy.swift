@@ -124,6 +124,24 @@ extension AppModel {
         }
     }
 
+    /// Pause / resume one scheduled job from the Scheduler screen (item 36).
+    /// The row's state is not repainted from the click — it is repainted from
+    /// the job the writer actually persisted, so a refused write can never
+    /// leave the switch sitting in a position the store never accepted.
+    @MainActor
+    func setSchedulerJobEnabled(id: String, enabled: Bool) async -> SchedulerJobToggleOutcome {
+        do {
+            let job = try await client.setSchedulerJobEnabled(id: id, enabled: enabled)
+            await refreshSchedulerJobs()
+            return .verified(job)
+        } catch {
+            // Re-read regardless: the switch must show the store's truth, not
+            // the click's optimism.
+            await refreshSchedulerJobs()
+            return .failed(error.localizedDescription)
+        }
+    }
+
     @MainActor
     func createDreamJob() async -> NightlyReflectionJobOutcome {
         do {

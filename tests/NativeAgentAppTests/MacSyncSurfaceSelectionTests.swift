@@ -16,6 +16,7 @@ struct MacSyncSurfaceSelectionTests {
                 "direction": "mac_to_ios",
                 "channel": "ios",
             ],
+            senderIsAuthenticatedIOSPeer: true,
             confirm: { _, _, _ in events.append("confirmed"); return true },
             receive: { _, _ in events.append("felt") }
         )
@@ -29,12 +30,55 @@ struct MacSyncSurfaceSelectionTests {
                 "direction": "mac_to_ios",
                 "channel": "ios",
             ],
+            senderIsAuthenticatedIOSPeer: true,
             confirm: { _, _, _ in events.append("confirm_failed"); return false },
             receive: { _, _ in events.append("felt") }
         )
         #expect(failed["ok"] == "false")
         #expect(failed["code"] == "receipt_persistence_failed")
         #expect(events == ["confirm_failed"])
+    }
+
+    /// Sweep 2026-09-01 item 1: every phone build before this one sent
+    /// `eventId`+`channel` with no `direction`, so the whole delivery-receipt
+    /// lane answered `invalid_direction` and `confirmedByPeer` was unreachable.
+    @Test("a directionless receipt from the authenticated phone confirms a Mac→iOS delivery")
+    @MainActor
+    func directionlessReceiptFromAuthenticatedPhoneIsMacToIOS() async {
+        let eventID = String(repeating: "b", count: 64)
+        var confirmedDirection: String?
+        var received = false
+        let response = await MacSyncActionRouter.notificationReceiptResponse(
+            payload: ["eventId": eventID, "channel": "apns"],
+            senderIsAuthenticatedIOSPeer: true,
+            confirm: { direction, _, _ in confirmedDirection = direction; return true },
+            receive: { _, _ in received = true }
+        )
+        #expect(response["ok"] == "true")
+        #expect(response["direction"] == "mac_to_ios")
+        #expect(confirmedDirection == "mac_to_ios")
+        #expect(received, "an inferred mac_to_ios receipt must still feed the delivery prediction")
+    }
+
+    @Test("direction is inferred only for an authenticated peer, and never guessed past a wrong one")
+    @MainActor
+    func directionIsNeverInventedForAnUnauthenticatedOrWrongSender() async {
+        let eventID = String(repeating: "c", count: 64)
+        let unauthenticated = await MacSyncActionRouter.notificationReceiptResponse(
+            payload: ["eventId": eventID, "channel": "apns"],
+            senderIsAuthenticatedIOSPeer: false,
+            confirm: { _, _, _ in Issue.record("unverified sender reached the receipt store"); return true },
+            receive: { _, _ in }
+        )
+        #expect(unauthenticated["code"] == "invalid_direction")
+
+        let bogus = await MacSyncActionRouter.notificationReceiptResponse(
+            payload: ["eventId": eventID, "direction": "sideways", "channel": "apns"],
+            senderIsAuthenticatedIOSPeer: true,
+            confirm: { _, _, _ in Issue.record("a stated-but-invalid direction was overwritten"); return true },
+            receive: { _, _ in }
+        )
+        #expect(bogus["code"] == "invalid_direction")
     }
 
     @Test

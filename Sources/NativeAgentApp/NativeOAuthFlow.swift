@@ -32,8 +32,11 @@ enum NativeOAuthFlow {
         providerId: String,
         dataRoot: URL? = nil
     ) async -> OAuthFlowResult {
+        // User, 2026-09-06: the xAI and ChatGPT flows dropped the selected root
+        // here and persisted under the default one.
+        let root = dataRoot ?? PersistenceCore.defaultDataRoot()
         if normalizedOAuthProviderId(providerId) == "xai_oauth_direct" {
-            return await startXAIOAuthFlow()
+            return await startXAIOAuthFlow(dataRoot: root)
         }
 
         // ChatGPT/OpenAI (2026-07-05, User): codex-free direct sign-in. OpenAI's
@@ -41,7 +44,7 @@ enum NativeOAuthFlow {
         // so it can't use the ASWebAuthenticationSession path below — it runs a
         // native local-listener flow (:1455) instead. See NativeOAuthFlow+Loopback.
         if providerId == "openai_oauth_direct" {
-            return await startOpenAILoopbackFlow()
+            return await startOpenAILoopbackFlow(dataRoot: root)
         }
 
         let config: ProviderOAuthConfig
@@ -123,12 +126,9 @@ enum NativeOAuthFlow {
         // Persist tokens to disk in the shape the read-side adapters expect.
         do {
             if providerId == "anthropic_oauth_direct" {
-                try persistAnthropicOAuthTokens(
-                    tokens,
-                    dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
-                )
+                try persistAnthropicOAuthTokens(tokens, dataRoot: root)
             } else {
-                try config.persistTokens(tokens)
+                try config.persistTokens(tokens, root)
             }
         } catch {
             return OAuthFlowResult(ok: false,

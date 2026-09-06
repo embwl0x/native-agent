@@ -186,7 +186,7 @@ public struct CommandPaletteContext: Sendable, Equatable {
     }
 
     /// Zero-state baseline used by callers that have NO live SwiftNative
-    /// context at all (e.g. before runtime is wired at SpotlightOverlay /
+    /// context at all (e.g. before runtime is wired at the palette /
     /// MacSyncEngine). Everything neutral: statuses "ready", counts 0,
     /// persona name "NativeAgent", enableAutonomy false (→ operating-map
     /// renders "attention", matching Python's missing-policy baseline at

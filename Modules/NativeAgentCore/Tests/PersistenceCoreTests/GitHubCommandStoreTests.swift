@@ -58,7 +58,7 @@ struct GitHubCommandStoreTests {
         return receipt
     }
 
-    @Test("unchanged live state reuses one replay and an append invalidates it")
+    @Test("unchanged live state reuses one replay and a write republishes it")
     func liveStateReplayMemo() async throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
         // An isolated memo: the shared one is process-global with 8 LRU slots,
@@ -86,7 +86,12 @@ struct GitHubCommandStoreTests {
         let changed = try await store.liveState()
         let invalidated = await memo._testStats(key: key)
         #expect(changed.item("example/widgets#42")?.state == .waitingUpstream(.review))
-        #expect(invalidated.misses - cached.misses == 1)
+        // observe() commits and PUBLISHES the state it just reduced, so the
+        // read after a write is a hit on the NEW state rather than a forced
+        // second replay of the same feed. What must never happen — a hit on
+        // the pre-write state — is what the assertion above pins.
+        #expect(invalidated.misses - cached.misses == 0)
+        #expect(invalidated.hits - cached.hits == 1)
     }
 
     @Test("batch observation primes its committed live state")
@@ -848,4 +853,188 @@ struct GitHubCommandStoreTests {
         #expect(state.allItemsAreInExactlyOneState)
         #expect(GitHubCommandStateName.allCases.reduce(0) { $0 + state.count(in: $1) } == 5)
     }
+
+    // MARK: - No-information observations
+
+    private func opCount(_ root: URL) -> Int {
+        let ops = root.appendingPathComponent("workshop/github_command/ops.jsonl")
+        guard let text = try? String(contentsOf: ops, encoding: .utf8) else { return 0 }
+        return text.split(separator: "\n").count
+    }
+
+    @Test("a byte-identical re-observation writes no op and wakes nobody")
+    func identicalReObservationIsNotWritten() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let bus = StoreChangeBus()
+        let counter = ObserveFilterEventCounter()
+        let stream = bus.changes()
+        let collector = Task { for await _ in stream { await counter.record() } }
+        defer { collector.cancel() }
+        let store = GitHubCommandStore(dataRoot: root, changeBus: bus)
+        let quiet = observation(version: "quiet-1")
+
+        let first = try await store.observe([quiet])
+        #expect(first.count == 1)
+        #expect(opCount(root) == 1)
+        let stamped = try #require(first.first?.updatedAt)
+
+        // Three more polls that read exactly the same GitHub. Nothing is
+        // appended, the state projection is not rewritten, and updatedAt does
+        // not drift — it stamps the last real change, not the last poll.
+        for _ in 0..<3 {
+            let repeated = try await store.observe([quiet])
+            #expect(repeated.first?.state == first.first?.state)
+            #expect(repeated.first?.updatedAt == stamped)
+        }
+        #expect(opCount(root) == 1)
+        #expect(try await GitHubCommandStore(dataRoot: root).liveState().items.count == 1)
+        // Exactly one wake for the one write. The tracking loop watches this
+        // op log, so an emit per no-change poll fed the refresh back to itself.
+        #expect(await eventuallyEquals(1) { await counter.count })
+        #expect(await counter.count == 1)
+    }
+
+    @Test("a real change is still written")
+    func realChangeIsWritten() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = GitHubCommandStore(dataRoot: root)
+        _ = try await store.observe([observation(version: "quiet-1")])
+        _ = try await store.observe([observation(version: "quiet-1")])
+        #expect(opCount(root) == 1)
+
+        // A new actionable event on the same item routes it to needs_codex.
+        let routed = try await store.observe([
+            observation(version: "review-1", signals: [.changesRequested]),
+        ])
+        #expect(routed.first?.state == .needsCodex)
+        #expect(opCount(root) == 2)
+
+        // A quiet re-read after the change is again information-free.
+        _ = try await store.observe([observation(version: "review-1", signals: [.changesRequested])])
+        #expect(opCount(root) == 2)
+
+        // A mixed batch writes only the observation that moved.
+        let mixed = try await store.observe([
+            observation(version: "review-1", signals: [.changesRequested]),
+            observation(repo: "other/widgets", number: 7, version: "new"),
+        ])
+        #expect(mixed.count == 2)
+        #expect(opCount(root) == 3)
+    }
+
+    @Test("codex_working still ages to callback_overdue on an identical re-observation")
+    func agingSurvivesTheNoInformationFilter() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = GitHubCommandStore(dataRoot: root)
+        let review = observation(version: "review-9", signals: [.changesRequested])
+        let item = try await store.observe([review]).first!
+        let intent = try #require(try await store.prepareDispatch(itemId: item.itemId))
+        let staleReceipt = GitHubCommandDispatchReceipt(
+            eventKey: intent.eventKey,
+            dispatchId: intent.dispatchId,
+            messageId: intent.dispatchId,
+            queuedAt: DeskClock.nowISO(Date().addingTimeInterval(-7 * 60 * 60))
+        )
+        #expect(try await store.recordDispatchSuccess(itemId: item.itemId, receipt: staleReceipt).state == .codexWorking)
+        let beforeAging = opCount(root)
+
+        // The observation is byte-identical to the one already stored: the
+        // ONLY thing that moved is the wall clock. Aging is inside route, so
+        // the dry run sees the transition and the op is written anyway.
+        let aged = try await store.observe([review]).first
+        #expect(aged?.state == .attention(.callbackOverdue))
+        #expect(opCount(root) == beforeAging + 1)
+        #expect(try await GitHubCommandStore(dataRoot: root).liveState()
+            .item(item.itemId)?.state == .attention(.callbackOverdue))
+
+        // Once aged, the same observation is information-free again.
+        _ = try await store.observe([review])
+        #expect(opCount(root) == beforeAging + 1)
+    }
+
+    @Test("a no-change tick still retires a terminal item whose window has closed")
+    func quietTickAdvancesTerminalRetirement() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        // Retention compressed from 30 days to a quarter second; the mechanism
+        // under test is the feed clock, not the constant. The window is wide
+        // enough to outlast one batch's own millisecond-spaced stamps and
+        // narrow enough that the wait below clears it several times over.
+        let store = GitHubCommandStore(
+            dataRoot: root, changeBus: StoreChangeBus(), terminalItemRetentionSeconds: 0.25
+        )
+        let closed = observation(repo: "example/widgets", number: 42, version: "closed-1", open: false)
+        let quiet = observation(repo: "other/widgets", number: 7, version: "quiet-1")
+        _ = try await store.observe([closed, quiet])
+        #expect(try await store.liveState().item("example/widgets#42")?.state == .resolved)
+        #expect(opCount(root) == 2)
+
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        // Nothing upstream moved, so both observations are information-free —
+        // but the resolved item's retention window has closed, and retirement
+        // only runs when the feed's own time advances. The tick admits exactly
+        // one operation (never the due item's own, which would reset its
+        // window) and the item is retired.
+        _ = try await store.observe([closed, quiet])
+        #expect(opCount(root) == 3)
+        let state = try await store.liveState()
+        #expect(state.item("example/widgets#42") == nil)
+        #expect(state.items.count == 1)
+
+        // With nothing left to retire, quiet is quiet again.
+        _ = try await store.observe([quiet])
+        #expect(opCount(root) == 3)
+    }
+
+    @Test("the notification version keeps coming from the observation, not the write stamp")
+    func freshnessConsumerReadsTheObservation() async throws {
+        let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
+        let store = GitHubCommandStore(dataRoot: root)
+        let blocked = observation(
+            version: "decide-1",
+            decision: GitHubCommandBlocker(detail: "Direction needed.", owner: "Repository owner")
+        )
+        let item = try await store.observe([blocked]).first!
+        #expect(item.state == .needsUser)
+        let claim = try #require(try await store.claimNotification(itemId: item.itemId))
+
+        // Quiet re-polls do not mint a new dedup key, so User is not paged
+        // again — the key is versioned by observedVersion, never by updatedAt.
+        _ = try await store.observe([blocked])
+        _ = try await store.observe([blocked])
+        #expect(try await store.claimNotification(itemId: item.itemId) == nil)
+        // One observation + one notification claim. The two quiet re-polls
+        // in between added nothing.
+        #expect(opCount(root) == 2)
+
+        // A genuinely newer reading advances the stamp AND the version.
+        let moved = try await store.observe([
+            observation(
+                version: "decide-2",
+                decision: GitHubCommandBlocker(detail: "Direction still needed.", owner: "Repository owner")
+            ),
+        ]).first
+        #expect(moved?.updatedAt != item.updatedAt)
+        #expect(moved?.observation?.observedVersion == "observed-decide-2")
+        let reclaim = try #require(try await store.claimNotification(itemId: item.itemId))
+        #expect(reclaim.dedupKey != claim.dedupKey)
+    }
+}
+
+private actor ObserveFilterEventCounter {
+    private(set) var count = 0
+    func record() { count += 1 }
+}
+
+private func eventuallyEquals(
+    _ expected: Int,
+    timeout: TimeInterval = 2,
+    _ value: @Sendable () async -> Int
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if await value() == expected { return true }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+    }
+    return await value() == expected
 }

@@ -48,7 +48,8 @@ When the status says **Running**, NativeAgent has enabled the bounded cognitive
 capsule, background settlement, reflection budget, and Organism together. A
 **Partially enabled** warning means setup, provider health, or a safety gate is
 holding at least one lane off. To inspect the exact state, turn on **Settings →
-Show Developer Surfaces**, then open **Diagnostics → Cognition**. Developer
+Show Developer Surfaces**, then open **Settings → Advanced → Diagnostics →
+Cognition**. Developer
 Surfaces changes UI visibility only; **Trust → Developer Mode** is a separate,
 security-sensitive execution setting that requires an app restart.
 
@@ -81,23 +82,34 @@ write canonical user facts, approve actions, or bypass TrustCenter.
 
 ## Main Mac pages
 
-| Page | Use it for |
+The rail on the left is five places. Everything else is setup, and setup lives
+behind one door in **Settings ▸ Advanced**.
+
+| Place | Use it for |
 |---|---|
-| **Chat** | Conversations, attachments, screen context, voice, provider/model controls, pinned sessions, detached windows, stop, send-next, and steering. |
-| **Activity** | Notifications, approvals, proposals, recent work, and items waiting for the user. Optionally, Journey presents learning, context receipts, workspaces, schedules, and capability readiness from their existing owners. |
+| **Chat** | Conversations, attachments, screen context, voice, pinned sessions, detached windows, stop, send-next, and steering. Their name and one status dot sit at the top; the dot says, in plain words, what they are allowed to do — and turns teal only when they are waiting on a decision. |
+| **Today** | Notifications, approvals, proposals, recent work, and items waiting for the user. (This is the Activity surface; every `sidebar:activity` route is unchanged.) |
 | **Memories** | Search, review, edit, pin, delete, consolidate, and inspect durable MemoryV2 facts. |
 | **Desk** | Line up large projects, dependencies, bridge work, schedules, research, agent pursuits, approvals, progress, verification, and outcomes. |
-| **Skills & Tools** | Switch between reusable procedures and the current trust-aware tool catalog. Skills guide behavior; tools perform gated actions. |
-| **Providers** | Connect accounts and set provider, model, Think, and Fast choices per surface. |
-| **Trust** | Select autonomy, Full Mac windows, Developer Mode, Desk execution permissions, and protected action policy. |
-| **Mac Integration** | Request macOS consent and control read/write access for individual Mac capabilities. |
-| **Settings** | Pair mobile devices, configure Telegram, appearance, shortcut, chat compaction, embeddings, Subconscious, updates, help, and the presentation-only Journey switch. Return to Classic hides Journey without changing Fluid Context, the subconscious, memory, tools, trust, or schedules. |
+| **Settings** | Pair mobile devices, configure Telegram, appearance, global shortcut, chat compaction, updates, help — and the **Advanced** door that holds every setup and internal page. |
 
-The **Advanced** disclosure always includes **Personality** and **Connectors**.
-With **Show Developer Surfaces** enabled it also exposes **Capabilities**,
-**Knowledge Graph**, **Dreams**, **Diagnostics**, **Inbox Policy**, and **MCP**.
-These pages inspect or configure the same runtime; they do not create extra
-agents or alternate stores.
+**Settings ▸ Advanced** always includes **Skills & Tools**, **Providers**,
+**Trust**, **Mac Integration**, **Personality**, and **Connectors**. With **Show
+Developer Surfaces** enabled it also exposes **Capabilities**, **Knowledge
+Graph**, **Dreams**, **Diagnostics**, **Inbox Policy**, and **MCP**. Below the
+page list, the same disclosure holds the semantic-memory embeddings and the
+Subconscious background loops. These pages inspect or configure the same
+runtime; they do not create extra agents or alternate stores, and each one is
+the exact page it always was.
+
+The system-health pill (the "N warnings" readout) and the session token meter
+live in **Diagnostics**, not in the chat window. Chat carries one status dot
+instead of two competing warning surfaces.
+
+Every page is still reachable by **Command-K** and by its existing deep link,
+whether or not it appears on the rail. **Settings ▸ Appearance ▸ Use the classic
+sidebar** (preference `uiClassicShell`) restores the previous nine-tab sidebar,
+session list, and chat layout unchanged.
 
 ## Memory, personality, and context
 
@@ -216,7 +228,7 @@ available to run provider turns and tools. See
 ## Telegram, Slack, and local bridges
 
 - Configure Telegram in **Settings → Telegram** and other services in
-  **Advanced → Connectors**.
+  **Settings → Advanced → Connectors**.
 - Each surface has a scoped session but uses the same persona, memory, Fluid
   Context, provider policy, tools, trust gates, and receipts.
 - Local Codex and Claude Code clients must read the authenticated bridge

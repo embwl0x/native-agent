@@ -18,7 +18,15 @@
     }, { capture: true, passive: true });
   }
 
-  new MutationObserver(() => {
+  const MUTATION_SCOPE = { subtree: true, childList: true, attributes: true, characterData: true };
+  // 2026-09-06: a MutationObserver on `document` does not see inside an open
+  // shadow root, but the snapshot walker does — so a component that swapped its
+  // own button out left every node id looking fresh. Each root the walker
+  // entered is observed too.
+  // Strong, on purpose: a MutationObserver already holds every node it observes
+  // strongly, so a WeakSet only hid the roots from us — it never let one go.
+  const observedShadowRoots = new Set();
+  const domObserver = new MutationObserver(() => {
     domGeneration += 1;
     const invalidatedSnapshotIds = [...snapshots.keys()];
     snapshots.clear();
@@ -30,7 +38,48 @@
         }).catch(() => {});
       }
     }
-  }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+  });
+  domObserver.observe(document, MUTATION_SCOPE);
+
+  function observeShadowRoots(roots) {
+    for (const root of roots) {
+      if (!root || observedShadowRoots.has(root)) continue;
+      observedShadowRoots.add(root);
+      try {
+        domObserver.observe(root, MUTATION_SCOPE);
+      } catch {
+        // A root that cannot be observed simply keeps the old behaviour for
+        // its subtree; it must never cost the caller the whole snapshot.
+        observedShadowRoots.delete(root);
+      }
+    }
+  }
+
+  // 2026-09-06: a MutationObserver cannot drop one of its targets, so every
+  // shadow root the walker ever entered stayed observed — and alive — for the
+  // life of the page, long after its host left the document. Each snapshot
+  // rebuilds the observation set from the roots still attached. Records queued
+  // before the rebuild describe a DOM the snapshot about to be taken already
+  // reflects, so losing them costs nothing.
+  function pruneObservedShadowRoots() {
+    let stale = false;
+    for (const root of observedShadowRoots) {
+      if (root.host?.isConnected !== true) {
+        observedShadowRoots.delete(root);
+        stale = true;
+      }
+    }
+    if (!stale) return;
+    domObserver.disconnect();
+    domObserver.observe(document, MUTATION_SCOPE);
+    for (const root of observedShadowRoots) {
+      try {
+        domObserver.observe(root, MUTATION_SCOPE);
+      } catch {
+        observedShadowRoots.delete(root);
+      }
+    }
+  }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message?.type?.startsWith("nativeagent.page.")) return false;
@@ -99,10 +148,13 @@
     const snapshotId = crypto.randomUUID();
     const elementByNodeId = new Map();
     const actionNodeIds = new Map();
+    const identityByNodeId = new Map();
     const nodeIdByElement = new Map();
     const nodes = [];
     const truncationReasons = [];
     const walk = composedElementWalk(document.body);
+    pruneObservedShadowRoots();
+    observeShadowRoots(walk.shadowRoots);
     const candidates = walk.elements;
     let aggregateNodeText = 0;
     if (walk.truncated) truncationReasons.push("walk_limit");
@@ -127,6 +179,10 @@
       const nodeId = `n${nodes.length + 1}`;
       nodeIdByElement.set(element, nodeId);
       elementByNodeId.set(nodeId, element);
+      // 2026-09-06: what this id claimed to be, so an action can refuse a node
+      // that is now something else. A shadow-root swap keeps the same element
+      // object and connection while the label and role move on.
+      identityByNodeId.set(nodeId, nodeIdentity(element, name));
       const rect = element.getBoundingClientRect();
       const role = element.getAttribute("role") ?? implicitRole(element);
       const actions = [];
@@ -205,13 +261,18 @@
       },
     };
     snapshots.clear();
-    snapshots.set(snapshotId, { leaseId: message.leaseId, domGeneration, elementByNodeId, actionNodeIds });
+    snapshots.set(snapshotId, {
+      leaseId: message.leaseId, domGeneration, elementByNodeId, actionNodeIds, identityByNodeId,
+    });
     return snapshot;
   }
 
   function clickNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "click");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
+    // 2026-09-06: clicking a disabled control is a no-op the page never sees,
+    // and it used to come back as clicked: true — a refusal reported as done.
+    requireEnabledNode(element, "click");
     element.click();
     return { snapshotId: message.snapshotId, nodeId: message.nodeId, clicked: true };
   }
@@ -219,6 +280,10 @@
   function fillNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "fill");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
+    // 2026-09-06: a mutation is refused by a disabled control the same way a
+    // click is. Only `clickNode`/`keypressNode` asked, so a fill into a control
+    // inside a `<fieldset disabled>` came back reported as done.
+    requireEnabledNode(element, "fill");
     focusWithoutActivation(element);
     const contentEditable = element.isContentEditable;
     try {
@@ -240,6 +305,8 @@
 
   async function typeIntoNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "type");
+    // 2026-09-06: see fillNode — inherited disabled state is a refusal here too.
+    requireEnabledNode(element, "type");
     const snapshot = requireSnapshot(message.snapshotId);
     const identity = editableIdentity(element);
     const parent = composedParent(element);
@@ -250,6 +317,7 @@
     let typedCount = 0;
     let nextUTF16Offset = 0;
     let appendInFlight = false;
+    const valueBefore = readEditableValue(element);
     function currentStopReason() {
       if (run.stopReason) return run.stopReason;
       if (!Number.isFinite(leaseExpiresAt) || message.leaseId !== snapshot.leaseId) return "lease_unavailable";
@@ -293,7 +361,41 @@
     } finally {
       typingRuns.delete(run);
     }
-    const completed = typedCount === characters.length && run.stopReason === null;
+    // 2026-09-06: read the field back rather than trusting the loop's count.
+    // A sanitising input (number, date, time, week, month) or a page that
+    // reformats on input can keep less — or something other — than what was
+    // appended, and reporting the attempt as the outcome sent the caller on
+    // with a field it believes it filled. A mismatch is a partial result.
+    let valueAfter = null;
+    let enteredText = null;
+    let valueRetained = true;
+    // 2026-09-06: what was ENTERED is the difference between the readback and
+    // the value the field held before the loop. When the old value is not a
+    // prefix of the new one the page rewrote what was already there — a date
+    // input reformatting "12/2026" into "05/2026" — and reporting the whole
+    // readback as entered counted pre-existing, reformatted content as typed
+    // text, which the caller then read as a partial success. That case is now
+    // its own outcome, carrying both values, and nothing is claimed as typed.
+    let valueRewritten = false;
+    try {
+      valueAfter = readEditableValue(element);
+      valueRewritten = !valueAfter.startsWith(valueBefore);
+      enteredText = valueRewritten ? null : valueAfter.slice(valueBefore.length);
+      valueRetained = valueAfter === valueBefore + characters.slice(0, typedCount).join("");
+      // Same policy as `safeValue`: never echo a secret back, even though the
+      // type action is only ever advertised on non-password editables.
+      if (isPasswordField(element)) {
+        enteredText = null;
+        valueAfter = null;
+      }
+    } catch {
+      valueRetained = false;
+    }
+    if (!valueRetained && run.stopReason === null) {
+      run.stopReason = valueRewritten ? "value_rewritten" : "value_not_retained";
+    }
+    const completed = typedCount === characters.length && valueRetained
+      && !valueRewritten && run.stopReason === null;
     return {
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
@@ -305,6 +407,19 @@
       characterUnit: "unicode_code_point",
       nextCharacterIndex: typedCount,
       nextUTF16Offset,
+      valueRetained,
+      valueRewritten,
+      // Only on a rewrite, and only where echoing is allowed: the caller needs
+      // to see what the field turned its text into to decide what to do next.
+      valueBefore: valueRewritten && valueAfter !== null ? bounded(valueBefore, 500) : null,
+      valueAfter: valueRewritten && valueAfter !== null ? bounded(valueAfter, 500) : null,
+      enteredText: enteredText === null ? null : bounded(enteredText, 500),
+      // A rewrite entered nothing the caller asked for. Reporting 0 rather than
+      // null matters: null means "this page agent predates the readback" and
+      // sends the app back to the attempted count.
+      enteredCharacterCount: valueRewritten
+        ? 0
+        : enteredText === null ? null : Array.from(enteredText).length,
       elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
       stopReason: completed ? null : run.stopReason,
     };
@@ -320,6 +435,8 @@
   function selectNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "select");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
+    // 2026-09-06: see fillNode — inherited disabled state is a refusal here too.
+    requireEnabledNode(element, "select");
     const requested = new Set(message.values);
     const options = Array.from(element.options ?? []);
     const knownValues = new Set(options.map((option) => String(option.value)));
@@ -356,6 +473,11 @@
   function keypressNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "keypress");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
+    // 2026-09-06: a keypress is an activation route too — Enter clicks a button
+    // or submits a form, Space clicks a checkable. A disabled control receives
+    // no key events in a browser, so dispatching them here manufactured an
+    // effect the page would never have produced.
+    requireEnabledNode(element, "keypress");
     const spec = parseKeySpec(message.key);
     focusWithoutActivation(element);
     const downAccepted = dispatchKeyboardEvent(element, "keydown", spec);
@@ -373,6 +495,8 @@
   function setCheckedNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "set_checked");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
+    // 2026-09-06: see fillNode — inherited disabled state is a refusal here too.
+    requireEnabledNode(element, "set_checked");
     const role = element.getAttribute("role") ?? implicitRole(element);
     const before = checkedState(element);
     if (before !== message.checked) {
@@ -400,6 +524,7 @@
   function doubleClickNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "double_click");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
+    requireEnabledNode(element, "double click");
     element.click();
     element.click();
     if (typeof MouseEvent === "function") {
@@ -440,7 +565,12 @@
   function scrollPage(message) {
     let target = window;
     if (message.targetNodeId) {
-      target = requireSnapshotNode(message.snapshotId, message.targetNodeId);
+      // 2026-09-06: a targeted scroll used to take the raw snapshot node,
+      // skipping both the advertised-action check and the identity re-check
+      // every other act goes through — so it could scroll a container the
+      // caller never saw. `scroll` is an advertised action; go through the
+      // same door.
+      target = requireActionableSnapshotNode(message.snapshotId, message.targetNodeId, "scroll");
     }
     target.scrollBy({ left: message.deltaX, top: message.deltaY, behavior: "auto" });
     return {
@@ -459,12 +589,48 @@
     return element;
   }
 
+  function nodeIdentity(element, name) {
+    const role = element.getAttribute("role") ?? implicitRole(element);
+    return `${element.tagName.toLowerCase()}\u0000${role}\u0000${name}`;
+  }
+
+  function currentNodeIdentity(element) {
+    const text = bounded(normalizedText(element.innerText ?? element.textContent ?? ""), 1_000);
+    return nodeIdentity(element, bounded(accessibleName(element, text), 500));
+  }
+
   function requireActionableSnapshotNode(snapshotId, nodeId, action) {
     const snapshot = requireSnapshot(snapshotId);
     if (!snapshot.actionNodeIds.get(action)?.has(nodeId)) {
       throw pageError("node_not_actionable", `The snapshot node did not advertise a ${action} action.`);
     }
-    return requireSnapshotNode(snapshotId, nodeId);
+    const element = requireSnapshotNode(snapshotId, nodeId);
+    // 2026-09-06: membership and connection are not identity. Inside an open
+    // shadow root a component can relabel the very element this id names
+    // without the document observer ever firing, so the act would land on a
+    // control the caller never saw.
+    const expected = snapshot.identityByNodeId?.get(nodeId);
+    if (expected !== undefined && currentNodeIdentity(element) !== expected) {
+      throw pageError("node_identity_changed", "The snapshot node is no longer the control it described.");
+    }
+    return element;
+  }
+
+  function requireEnabledNode(element, action) {
+    // 2026-09-06: `element.disabled` reflects the node's OWN attribute only, so
+    // a control inside a `<fieldset disabled>` read as enabled and the act was
+    // dispatched into a page that never sees it. `:disabled` is the inherited
+    // state the browser itself uses.
+    let inheritedDisabled = false;
+    try {
+      inheritedDisabled = typeof element.matches === "function" && element.matches(":disabled");
+    } catch {
+      inheritedDisabled = false;
+    }
+    if (inheritedDisabled || element.disabled === true
+      || element.getAttribute("aria-disabled") === "true") {
+      throw pageError("node_disabled", `The snapshot node is disabled, so the ${action} would do nothing.`);
+    }
   }
 
   function requireSnapshot(snapshotId) {
@@ -580,6 +746,15 @@
     try { element.focus({ preventScroll: true }); } catch { element.focus(); }
   }
 
+  // 2026-09-06: what the field ACTUALLY holds. Typing counted the characters it
+  // attempted, and the setter has no readback — so on an input the browser
+  // sanitises (number, date, time, week, month) every appended character was
+  // discarded while the result still said typed: true with the full count.
+  function readEditableValue(element) {
+    if (element.isContentEditable) return String(element.textContent ?? "");
+    return String(element.value ?? "");
+  }
+
   function replaceEditableValue(element, value) {
     if (element.isContentEditable) {
       element.textContent = value;
@@ -649,6 +824,10 @@
     if (spec.key === "Enter") {
       const tag = element.tagName.toLowerCase();
       if (["button", "a", "summary"].includes(tag)) element.click();
+      // 2026-09-06: an unmodified Enter in a multi-line field is a newline, not
+      // a submit. Dispatching requestSubmit for any element inside a form sent
+      // half-written text the moment a newline was typed.
+      else if (tag === "textarea" && !spec.ctrlKey && !spec.metaKey) insertIntoEditable(element, "\n");
       else if (element.form && typeof element.form.requestSubmit === "function") element.form.requestSubmit();
       return;
     }
@@ -679,6 +858,20 @@
     focusWithoutActivation(focusable[next]);
   }
 
+  function insertIntoEditable(element, text) {
+    if (!("value" in element)) return;
+    const current = String(element.value ?? "");
+    const hasSelection = typeof element.selectionStart === "number" && typeof element.selectionEnd === "number";
+    const start = hasSelection ? element.selectionStart : current.length;
+    const end = hasSelection ? element.selectionEnd : current.length;
+    setNativeValue(element, `${current.slice(0, start)}${text}${current.slice(end)}`);
+    if (hasSelection && typeof element.setSelectionRange === "function") {
+      const caret = start + text.length;
+      element.setSelectionRange(caret, caret);
+    }
+    dispatchEditableEvent(element, "input", text);
+  }
+
   function deleteFromEditable(element, backward) {
     if (!("value" in element) || typeof element.selectionStart !== "number" || typeof element.selectionEnd !== "number") return;
     let start = element.selectionStart;
@@ -706,19 +899,21 @@
   }
 
   function composedElementWalk(root, maximum = 5_000) {
-    if (!root) return { elements: [], truncated: false };
+    if (!root) return { elements: [], truncated: false, shadowRoots: [] };
     const result = [];
+    const shadowRoots = [];
     const stack = Array.from(root.children ?? []).reverse();
     while (stack.length > 0 && result.length < maximum) {
       const element = stack.pop();
       result.push(element);
+      if (element.shadowRoot) shadowRoots.push(element.shadowRoot);
       const descendants = [
         ...Array.from(element.shadowRoot?.children ?? []),
         ...Array.from(element.children ?? []),
       ];
       for (let index = descendants.length - 1; index >= 0; index -= 1) stack.push(descendants[index]);
     }
-    return { elements: result, truncated: stack.length > 0 };
+    return { elements: result, truncated: stack.length > 0, shadowRoots };
   }
 
   function composedParent(element) {

@@ -105,6 +105,15 @@ public enum CognitiveSomaticSignalAdapter {
         case .organismResolutionFelt:
             return "organism"
         case .userMessageReceived, .assistantTurnCompleted:
+            // Item 8 (2026-09-02): a peer's turn is not User's turn, and the body
+            // should not record it under the same organ. The agent name comes
+            // from the out-of-band origin record the persistence seam wrote —
+            // never from the message text, which can claim anything. User's turns
+            // keep "chat"/"chat.<surface>" byte-for-byte.
+            if case .peer(let agent) = CognitiveSubstrate.relationalSource(for: event),
+               let safePeer = safeSourceComponent(agent) {
+                return "chat.peer.\(safePeer)"
+            }
             if let surface = safeSourceComponent(stringValue(event.metadata["surface"])) {
                 return "chat.\(surface)"
             }
@@ -207,6 +216,23 @@ public enum CognitiveSomaticSignalAdapter {
         "motorActionIdentity",
         "verification",
         "trustRisk",
+        // Item 46 (2026-09-01): the two keys the semantic prediction lane
+        // rides. The appraisal owner (CognitiveSubstrate) stamps them on the
+        // cognitive event; the organism cannot derive either one, because it
+        // holds no standing views and runs no appraisal. Absent keys mean no
+        // expectation was formed — the common case, and byte-identical to the
+        // behaviour before this lane existed.
+        OrganismSemanticExpectation.mintMetadataKey,
+        OrganismSemanticExpectation.reactionMetadataKey,
+        // Item 8 (2026-09-02) deliberately adds NOTHING here. The peer
+        // distinction it needs is read off the cognitive event directly in
+        // `sourceOrgan(for:)` above and lands in the signal's `sourceOrgan`
+        // FIELD, which is outside the metadata key budget. Forwarding `origin`
+        // as a thirteenth key would have been the obvious move and the wrong
+        // one: `OrganismMetadataBounds.maximumKeys` is 12 and a live chat turn
+        // already fills it, so the alphabetical cut would have silently evicted
+        // somebody else's forwarded key on exactly the bridge turns this cares
+        // about.
     ]
 
     private static func stringValue(_ value: JSONValue?) -> String? {
@@ -214,15 +240,15 @@ public enum CognitiveSomaticSignalAdapter {
         return string.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func safeSourceComponent(_ value: String?) -> String? {
+    /// Internal rather than private so the shared-secret-filter pins can assert
+    /// this site answers the same way the other two do.
+    static func safeSourceComponent(_ value: String?) -> String? {
         guard let value, !value.isEmpty else { return nil }
-        let lower = value.lowercased()
-        guard !lower.contains("bearer "),
-              !lower.contains("sk-"),
-              !lower.contains("xoxb-"),
-              !lower.contains("xapp-") else {
-            return nil
-        }
+        // One shared secret filter (`JSONValueBounding`), so a source component
+        // and a metadata value can never disagree about what a credential is.
+        // The private copy this replaces matched `sk-` unanchored, which threw
+        // away every ordinary `desk-…` / `task-…` component.
+        guard !JSONValueBounding.containsSecretLikeValue(value) else { return nil }
         return String(value.prefix(60))
     }
 }

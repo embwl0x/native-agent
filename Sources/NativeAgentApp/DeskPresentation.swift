@@ -618,6 +618,89 @@ enum DeskPursuitSectionPresentation {
     }
 }
 
+/// The owner's Veto control on a Desk pursuit row (Fable 5.1 sweep item 36).
+///
+/// Veto is owner authority over something the agent opened for herself, so it
+/// belongs on the row User already reads — not behind the developer gate in
+/// Diagnostics ▸ Cognition ▸ Desk, where it used to live beside a second copy
+/// of this same pursuit list. The store-side mutation is unchanged
+/// (`WorkshopObservatoryVetoHandler` → `SwiftNativeDeskStore.vetoPursuit`);
+/// only the surface moved.
+///
+/// The action closure is required at construction — the same rule the mounted
+/// observatory button held: an enabled Veto control can never silently discard
+/// an owner decision because an embedding route forgot to wire it.
+struct DeskPursuitVetoControl {
+    /// Handles whose veto is awaiting its durable outcome.
+    let pendingHandles: Set<String>
+    let onVeto: (String) -> Void
+
+    static let help = "Close this pursuit (canceled) with a user-vetoed note."
+
+    func isDisabled(_ handle: String) -> Bool {
+        WorkshopObservatoryVetoPresentation.buttonIsDisabled(
+            handle: handle, pendingHandles: pendingHandles)
+    }
+
+    func trigger(_ handle: String) {
+        onVeto(handle)
+    }
+}
+
+/// What the Desk says after a veto settles. Every outcome gets a line — a
+/// refused write must never look like a completed one.
+enum DeskPursuitVetoNotice {
+    static func receipt(for outcome: WorkshopObservatoryVetoHandler.Outcome) -> DeskActionNotice {
+        switch outcome {
+        case .completed:
+            return DeskActionNotice(text: "Pursuit vetoed and closed.", isError: false)
+        case .alreadyVetoed:
+            return DeskActionNotice(text: "Pursuit was already vetoed.", isError: false)
+        case .inFlight:
+            return DeskActionNotice(text: "That veto is still being written.", isError: false)
+        case .failed(let detail):
+            return DeskActionNotice(text: "Veto failed: \(detail)", isError: true)
+        }
+    }
+}
+
+/// Score, budget and the recorded reason a pursuit row carries next to its
+/// Veto control — the facts an owner needs to veto on. Folded by the SAME pure
+/// projection the observatory used (`WorkshopPursuitRow.from`), so moving the
+/// control did not fork the numbers behind it.
+enum DeskPursuitVetoRationale {
+    static func row(for item: DeskItem, now: Date) -> WorkshopPursuitRow? {
+        guard item.pursuit != nil else { return nil }
+        return WorkshopPursuitRow.from(item: item, now: now)
+    }
+
+    /// "score 1.83" — nil when the pursuit payload gave no score, so the row
+    /// says nothing rather than showing a misleading 0.
+    static func scoreLabel(_ score: WorkshopScoreView?) -> String? {
+        guard let score else { return nil }
+        return "score \(String(format: "%.2f", score.total))"
+    }
+
+    /// "2/3 sessions · 1/2 today" — the two hard caps the pursuit lives under.
+    static func budgetLabel(_ budget: WorkshopBudget?) -> String? {
+        guard let budget else { return nil }
+        return "\(budget.sessionsUsed)/\(budget.maxSessions) sessions · "
+            + "\(budget.todayCount)/\(budget.perDayCap) today"
+    }
+
+    /// Her most recent recorded "chose: …" rationale, stripped of the marker.
+    static func reasonLabel(_ rationale: String?) -> String? {
+        guard let rationale else { return nil }
+        let trimmed = rationale
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = trimmed.hasPrefix(WorkshopPursuitRow.choiceMarker)
+            ? String(trimmed.dropFirst(WorkshopPursuitRow.choiceMarker.count))
+            : trimmed
+        let cleaned = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : cleaned
+    }
+}
+
 /// Human vocabulary for the GitHub Watcher state pill. Persisted enum names
 /// are machine identifiers and must never become a visible fallback label.
 enum DeskGitHubStatePillPresentation {

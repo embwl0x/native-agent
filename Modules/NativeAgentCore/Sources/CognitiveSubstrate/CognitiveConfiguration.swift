@@ -23,7 +23,18 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     public var maximumCapsuleCharacters: Int
     public var maximumWorkspaceItems: Int
     public var maximumThoughtSeeds: Int
+    /// HARD cost ceiling on reflection calls in a ROLLING 24h window — the
+    /// spend fence, NOT the trigger. Admission is unresolved load
+    /// (`reflectionLoadThreshold`); this only says how much a hard day may
+    /// ever spend. The name is historical: the ledger is still the reflection
+    /// receipts, but the window rolls instead of resetting at midnight.
     public var dailyReflectionCallBudget: Int
+    /// Admission threshold for a SPONTANEOUS reflection: unresolved load
+    /// (thought-seed backlog x interruption score x disposition drift, read as
+    /// a 0...1 geometric mean) must reach this before an unattended call is
+    /// admitted. A quiet day never reaches it and spends nothing. A reflection
+    /// a person asked for is not gated by it — only by the ceiling.
+    public var reflectionLoadThreshold: Double
     public var reflectionSurface: String
     public var reflectionModel: String
     public var reflectionProvider: String
@@ -50,6 +61,7 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         maximumWorkspaceItems: Int = 12,
         maximumThoughtSeeds: Int = 128,
         dailyReflectionCallBudget: Int = 0,
+        reflectionLoadThreshold: Double = 0.35,
         reflectionSurface: String = "cognition_reflection",
         reflectionModel: String = "claude-opus-4-8",
         reflectionProvider: String = "anthropic_oauth_direct",
@@ -75,6 +87,7 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.maximumWorkspaceItems = max(1, maximumWorkspaceItems)
         self.maximumThoughtSeeds = max(0, maximumThoughtSeeds)
         self.dailyReflectionCallBudget = max(0, dailyReflectionCallBudget)
+        self.reflectionLoadThreshold = reflectionLoadThreshold.clamped01()
         self.reflectionSurface = Self.cleaned(reflectionSurface, fallback: "cognition_reflection")
         self.reflectionModel = Self.cleaned(reflectionModel, fallback: "claude-opus-4-8")
         self.reflectionProvider = Self.cleaned(reflectionProvider, fallback: "anthropic_oauth_direct")

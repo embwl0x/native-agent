@@ -878,11 +878,27 @@ public actor SwiftNativeSecurityCenter {
             return OriginAssessment(trusted: true, reason: "local app surface", isRemote: false)
         }
         if surface == "telegram" {
-            let chatId = origin.chatId
-                ?? Self.telegramChatId(fromSessionId: origin.sessionId)
+            // PARSE SITE 1 of 5, DELETED (one-thread-many-surfaces plan §1.2).
+            // This used to fall back to `telegramChatId(fromSessionId:)` —
+            // reading `telegram:<chatId>` out of the session id string and
+            // treating the result as a VERIFIED identity in a TRUST decision.
+            //
+            // It was already unsound. `chat/sessions.json` carries rows whose
+            // ids are `telegram:codex-probe` and
+            // `telegram:codex-tool-catalog-probe` with `source: "app"`; the
+            // parse yielded "codex-probe" as a chat identity for those. It
+            // failed closed only because that string happens to be in nobody's
+            // allowlist. A storage key is not evidence, and anything that can
+            // choose a session id could choose that evidence.
+            //
+            // Identity now comes from the transport, bound on the envelope, or
+            // the origin fails closed WITH A REASON — never silently.
             let allowed = await telegramSecurityAllowlist()
-            if let reason = allowed.matches(chatId: chatId, userId: origin.userId) {
+            if let reason = allowed.matches(chatId: origin.chatId, userId: origin.userId) {
                 return OriginAssessment(trusted: true, reason: reason, isRemote: true)
+            }
+            if let unverified = Self.unverifiedRemoteIdentityAssessment(origin, surface: "Telegram") {
+                return unverified
             }
             if allowed.isEmpty {
                 return OriginAssessment(trusted: false, reason: "telegram allowlist not configured for security proof", isRemote: true)
@@ -897,10 +913,12 @@ public actor SwiftNativeSecurityCenter {
             // access on a forged proof. Trust now roots in an explicit
             // allowlist, mirroring telegram. (The forged binding is removed at
             // the handler; no caller may reintroduce it.)
-            let chatId = origin.chatId
             let allowed = await slackSecurityAllowlist()
-            if let reason = allowed.matches(chatId: chatId, userId: origin.userId) {
+            if let reason = allowed.matches(chatId: origin.chatId, userId: origin.userId) {
                 return OriginAssessment(trusted: true, reason: reason, isRemote: true)
+            }
+            if let unverified = Self.unverifiedRemoteIdentityAssessment(origin, surface: "Slack") {
+                return unverified
             }
             if allowed.isEmpty {
                 return OriginAssessment(trusted: false, reason: "slack allowlist not configured for security proof", isRemote: true)
@@ -925,7 +943,46 @@ public actor SwiftNativeSecurityCenter {
                 isRemote: true
             )
         }
+        if let unverified = Self.unverifiedRemoteIdentityAssessment(
+            origin,
+            surface: surfaceProfile.id
+        ) {
+            return unverified
+        }
         return OriginAssessment(trusted: false, reason: "remote origin has no trust root", isRemote: true)
+    }
+
+    /// FAIL CLOSED, OUT LOUD (plan §7 Phase 1; sweep item 9 — outcome-unknown
+    /// becomes speech).
+    ///
+    /// Deleting the session-id parses makes explicit identity binding
+    /// MANDATORY rather than best-effort. A remote transport that binds
+    /// neither a chat identity nor a user identity is not "an origin that
+    /// missed the allowlist" — it is an origin nobody checked. Those two
+    /// facts deserve different sentences, because only one of them is a bug in
+    /// the adapter.
+    ///
+    /// Surface-generic on purpose: a surface connected next year gets this
+    /// refusal for free, in its own name, with no edit here.
+    ///
+    /// Returns nil when identity WAS bound, leaving the caller's allowlist
+    /// verdict to stand.
+    static func unverifiedRemoteIdentityAssessment(
+        _ origin: SecurityOriginContext,
+        surface: String
+    ) -> OriginAssessment? {
+        func bound(_ value: String?) -> Bool {
+            guard let value else { return false }
+            return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !bound(origin.chatId), !bound(origin.userId) else { return nil }
+        return OriginAssessment(
+            trusted: false,
+            reason: "\(surface) turn arrived with no verified chat or user identity — "
+                + "its transport bound none, so there is nothing to check against the "
+                + "allowlist. Treating it as untrusted.",
+            isRemote: true
+        )
     }
 
     private func trustedOriginCount() async -> Int {

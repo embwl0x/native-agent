@@ -23,10 +23,9 @@ public enum TelegramTranscriptTermCorrection {
         ("kodex", "Codex"),
         ("kodak", "Codex"),
         ("codex", "Codex"),
-        // Agent. "Isla" is a real name and stays out of the table.
-        ("ayla", "Agent"),
-        ("ayalla", "Agent"),
-        ("agent", "Agent"),
+        // The agent's own name is not shipped here: it is whatever the user
+        // configured, and its manglings live in
+        // <dataRoot>/config/transcript_terms.json (see `installTerms`).
         // GitHub. NOTE: "get help" is deliberately ABSENT even though one real
         // transcript produced it ("look at my get help") — "get help" is
         // ordinary English ("get help from codex") and correcting it would
@@ -70,13 +69,13 @@ public enum TelegramTranscriptTermCorrection {
     /// Apply the table to a transcript. Longer phrases run first so a
     /// multi-word mangling ("git hub") is consumed before any single-word
     /// entry can bite a piece of it.
-    public static func correct(_ transcript: String) -> Result {
+    public static func correct(_ transcript: String, extra: [(heard: String, canonical: String)] = []) -> Result {
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return Result(text: transcript, correctedCount: 0, original: transcript)
         }
         var text = transcript
         var corrected = 0
-        let ordered = table.sorted { $0.heard.count > $1.heard.count }
+        let ordered = (table + extra).sorted { $0.heard.count > $1.heard.count }
         for entry in ordered {
             guard let regex = boundaryRegex(for: entry.heard) else { continue }
             let range = NSRange(text.startIndex..., in: text)
@@ -95,6 +94,34 @@ public enum TelegramTranscriptTermCorrection {
         }
         return Result(text: text, correctedCount: corrected, original: transcript)
     }
+
+    /// Per-install corrections, typically the agent's own name as the
+    /// transcriber mishears it: `<dataRoot>/config/transcript_terms.json`,
+    /// `{"terms": [{"heard": "ayla", "canonical": "Agent"}]}`. Cached by file
+    /// modification date; a missing or malformed file contributes nothing.
+    public static func installTerms(dataRoot: URL) -> [(heard: String, canonical: String)] {
+        let url = dataRoot.appendingPathComponent("config", isDirectory: true).appendingPathComponent("transcript_terms.json")
+        let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
+        return installTermsLock.withLock {
+            if let cached = installTermsCache, cached.path == url.path, cached.modified == modified { return cached.terms }
+            var terms: [(heard: String, canonical: String)] = []
+            if let data = try? Data(contentsOf: url),
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let rows = object["terms"] as? [[String: Any]] {
+                for row in rows {
+                    guard let heard = (row["heard"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          let canonical = (row["canonical"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !heard.isEmpty, !canonical.isEmpty, heard.count <= 40, canonical.count <= 40
+                    else { continue }
+                    terms.append((heard, canonical))
+                }
+            }
+            installTermsCache = (url.path, modified, terms)
+            return terms
+        }
+    }
+    private static let installTermsLock = NSLock()
+    nonisolated(unsafe) private static var installTermsCache: (path: String, modified: Date?, terms: [(heard: String, canonical: String)])?
 
     private static func boundaryRegex(for heard: String) -> NSRegularExpression? {
         let escaped = NSRegularExpression.escapedPattern(for: heard)

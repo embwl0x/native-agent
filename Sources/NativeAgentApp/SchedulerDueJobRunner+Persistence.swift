@@ -323,12 +323,20 @@ extension SchedulerDueJobRunner {
             if let itemId, !itemId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 userInfo["itemId"] = itemId
             }
-            try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+            // Item 26: overnight cycle deliveries (dream/REM) are news, not a
+            // request — informational, so they land on the phone once and the
+            // inbox card is the receipt. Payload unchanged.
+            let outcome = try await AttentionRouter.shared.route(
+                eventId: "scheduler_cycle:\(userInfo["itemId"] ?? jobId)",
+                importance: .informational,
                 title: title,
                 body: body,
                 userInfo: userInfo
             )
-            delivered.append(.string("push"))
+            // Report what actually happened: a suppressed repeat is not a
+            // delivery, and saying it was would be the lying signal this sweep
+            // exists to remove.
+            delivered.append(.string(outcome.suppressed ? "push_already_delivered" : "push"))
         } catch {
             errors.append(.string("push: \(error.localizedDescription)"))
         }

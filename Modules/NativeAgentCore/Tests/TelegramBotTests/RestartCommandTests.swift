@@ -224,9 +224,13 @@ struct TelegramRestartCommandTests {
         #expect(text.contains("not wired in this build"))
     }
 
-    @Test func command_registry_advertises_owner_gated_restart() {
-        let restart = TelegramCommandRegistry.commands.first { $0.command == "restart" }
-        #expect(restart != nil)
-        #expect(restart?.description.contains("owner only") == true)
+    /// /restart is owner-gated plumbing: it stays dispatchable but is no
+    /// longer advertised in the command menu User sees.
+    @Test func command_registry_keeps_restart_dispatchable_but_unadvertised() {
+        #expect(!TelegramCommandRegistry.commands.contains { $0.command == "restart" })
+        let definition = TelegramCommandRegistry.definition(for: "restart")
+        #expect(definition != nil)
+        #expect(definition?.showInMenu == false)
+        #expect(definition?.summary.contains("owner only") == true)
     }
 }

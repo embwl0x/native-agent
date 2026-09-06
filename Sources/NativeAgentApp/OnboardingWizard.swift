@@ -12,6 +12,7 @@ struct OnboardingStartResponse: Codable {
     var abilityOverview: [OnboardingAbility]?
     var pendingRecovery: Bool?
     var resetRequired: Bool?
+    var profileRepairRequired: Bool?
 
     enum CodingKeys: String, CodingKey {
         case ready
@@ -21,6 +22,7 @@ struct OnboardingStartResponse: Codable {
         case abilityOverview = "ability_overview"
         case pendingRecovery = "pending_recovery"
         case resetRequired = "reset_required"
+        case profileRepairRequired = "profile_repair_required"
     }
 }
 
@@ -78,6 +80,11 @@ final class OnboardingWizardState {
         case building = 3
         case done = 4
         case error = 5
+        /// User, 2026-09-06: memory/profile.json is missing on an install that
+        /// really did onboard. Deliberately numbered ABOVE `.building` so it
+        /// inherits the "no progress dots, no shared nav bar" gates — this is a
+        /// one-field repair, not step 1 of 3 — and carries its own action.
+        case profileRepair = 6
     }
 
     /// Number of user-facing steps before the build spinner — drives the
@@ -133,6 +140,19 @@ final class OnboardingWizardState {
     /// would see the now-committed docs and dismiss the wizard as complete).
     var scaffoldRepairFailed = false
 
+    /// True when this wizard was opened ONLY to rewrite a missing
+    /// memory/profile.json (User, 2026-09-06). The persona documents already
+    /// exist and are untouched, so the completion screen must not claim a fresh
+    /// install, and the one-time first-run welcome must not be re-armed.
+    var profileRepairOnly = false
+
+    /// True after a repair was refused because the durable state moved under
+    /// it (User, 2026-09-06). The step then offers a re-read instead of only a
+    /// Save that would be refused the same way — the sheet is
+    /// `interactiveDismissDisabled`, so "close and reopen" was not an option
+    /// the person actually had.
+    var profileRepairRecheckOffered = false
+
     // Name placeholder rotation
     private let nameSuggestions = ["Aria", "Max", "Ada", "Soren", "Clio", "Zev", "Noa"]
     var namePlaceholder: String { nameSuggestions[abs(Int(Date().timeIntervalSince1970) / 3) % nameSuggestions.count] }
@@ -148,7 +168,7 @@ final class OnboardingWizardState {
             // `.provider` is intentionally always-continuable — connecting is
             // strongly suggested but skippable.
             return true
-        case .building, .done, .error:
+        case .building, .done, .error, .profileRepair:
             return false
         }
     }
@@ -211,6 +231,12 @@ struct OnboardingWizard: View {
                     case .confirm:    ConfirmStep(state: state)
                     case .building:   BuildingStep()
                     case .done:       DoneStep(state: state, onComplete: onComplete)
+                    case .profileRepair:
+                        ProfileRepairStep(
+                            state: state,
+                            onSave: { Task { await submitProfileRepair() } },
+                            onRecheck: { Task { await loadOnboardingState() } }
+                        )
                     case .error:      ErrorStep(state: state, onRetry: {
                         // A scaffold-repair failure is NOT an onboarding-state
                         // problem: the transaction already committed, so
@@ -302,6 +328,29 @@ struct OnboardingWizard: View {
             }
             return
         }
+        // User, 2026-09-06: an install that really did onboard but lost
+        // memory/profile.json. `hasExisting` is true, so this used to fall
+        // straight through to `onComplete()` and the wizard closed over a
+        // default profile — the configured names silently gone. Reset is the
+        // wrong remedy (it would back out good persona documents over one
+        // missing file), so this state gets its own two-field repair lane.
+        if resp.profileRepairRequired == true {
+            // User, 2026-09-06: blank the fields only on FIRST entry. A re-read
+            // from inside the lane (the refusal recheck below) must not throw
+            // away the names the person just typed.
+            if !state.profileRepairOnly {
+                state.agentName = ""
+                state.userName = ""
+            }
+            state.profileRepairOnly = true
+            state.pendingRecoveryNeedsReset = false
+            state.buildFailed = false
+            state.errorMessage = nil
+            withAnimation { state.step = .profileRepair }
+            return
+        }
+        state.profileRepairRecheckOffered = false
+        state.profileRepairOnly = false
         if resp.resetRequired == true {
             state.pendingRecoveryNeedsReset = true
             state.errorMessage = "Incomplete persona documents were found. Reset will back them up before onboarding starts again."
@@ -358,9 +407,81 @@ struct OnboardingWizard: View {
                 state.step = .confirm
             case .confirm:
                 Task { await submitOnboarding() }
-            case .building, .done, .error:
+            case .building, .done, .error, .profileRepair:
                 break
             }
+        }
+    }
+
+    /// Writes ONLY memory/profile.json from the two re-entered names, then
+    /// joins the normal completion path. Failures stay on this step with the
+    /// fields intact — the user's next move is to correct a name and try again,
+    /// not to be handed a reset button that would destroy the persona docs.
+    private func submitProfileRepair() async {
+        state.isLoading = true
+        state.errorMessage = nil
+        do {
+            let resp = try await appModel.repairOnboardingProfile(
+                agentName: state.trimmedAgentName,
+                personaType: state.personaType,
+                userName: state.trimmedUserName
+            )
+            state.isLoading = false
+            guard resp.ok else {
+                let message = Self.profileRepairFailureMessage(error: resp.error, detail: resp.detail)
+                // User, 2026-09-06: these two refusals mean the durable state
+                // changed under the sheet — the profile appeared, or a pending
+                // onboarding must finish first. The copy told the person to
+                // close and reopen, but the sheet is interactiveDismissDisabled
+                // and the step offered only Save, so they were stuck. Re-read
+                // the start state instead: it completes the wizard when the
+                // profile is now there, and otherwise leaves a Check again.
+                if resp.error == "profile_already_present" || resp.error == "onboarding_in_progress" {
+                    await loadOnboardingState()
+                    if state.step == .profileRepair {
+                        state.profileRepairRecheckOffered = true
+                        state.errorMessage = message
+                    }
+                    return
+                }
+                state.errorMessage = message
+                return
+            }
+            state.profileRepairRecheckOffered = false
+            state.agentName = state.trimmedAgentName
+            state.userName = state.trimmedUserName
+            // User, 2026-09-06: the repair lane ends here, on its own. It must
+            // NOT borrow the shared `.building` step — that copy says the four
+            // persona documents are being written, and a repair writes exactly
+            // one file and never touches them — and it must not run
+            // `finishSuccessfulOnboarding`, whose Doctor scaffold repair
+            // reaches into unrelated stores on an install that has been in use
+            // for months. The one file is already committed and verified.
+            withAnimation { state.step = .done }
+        } catch {
+            state.isLoading = false
+            state.errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Backend codes are not user-facing copy. Copy names the agent by the
+    /// entered name or "the agent" — never a pronoun.
+    static func profileRepairFailureMessage(error: String?, detail: String?) -> String {
+        switch error {
+        case "missing_agent_name":
+            return "Enter a name for the agent before saving."
+        case "missing_user_name":
+            return "Enter your name before saving."
+        case "profile_already_present":
+            return "A profile file is already there, so nothing was overwritten. Check again to pick up the current state."
+        case "profile_repair_not_required":
+            return "No completed onboarding was found on this Mac, so there is no profile to repair."
+        case "onboarding_in_progress":
+            return "An interrupted onboarding is still pending. Check again to finish it first."
+        case .some(let code) where detail == nil || detail?.isEmpty == true:
+            return "Saving the names failed (\(code))."
+        default:
+            return detail ?? error ?? "Saving the names failed."
         }
     }
 
@@ -451,7 +572,11 @@ struct OnboardingWizard: View {
             return
         }
         state.scaffoldRepairFailed = false
-        appModel.markFirstRunWelcomePending()
+        // A profile repair is not a first run — arming the one-time welcome
+        // would greet a user who has been using this install for months.
+        if !state.profileRepairOnly {
+            appModel.markFirstRunWelcomePending()
+        }
         withAnimation { state.step = .done }
     }
 
@@ -789,11 +914,21 @@ private struct DoneStep: View {
                     )
             }
             GradientText(
-                text: "\(state.agentName) is ready.",
+                text: state.profileRepairOnly
+                    ? "\(state.agentName) is back."
+                    : "\(state.agentName) is ready.",
                 colors: [NativeAgentBrand.accentDeep, NativeAgentBrand.accent, NativeAgentBrand.accentCool],
                 font: .system(.largeTitle, design: .rounded, weight: .bold)
             )
-            if state.providerConnected {
+            if state.profileRepairOnly {
+                // A repair changed one file. It says nothing about providers,
+                // so it must not nag about connecting one.
+                Text("The names are saved again. Nothing else on this Mac was changed.")
+                    .font(NativeAgentFont.title)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if state.providerConnected {
                 Text("Say hello in Chat.")
                     .font(NativeAgentFont.title)
                     .foregroundStyle(.secondary)
@@ -811,6 +946,88 @@ private struct DoneStep: View {
             .controlSize(.large)
         }
         .multilineTextAlignment(.center)
+    }
+}
+
+// MARK: - Profile repair step (User, 2026-09-06)
+
+/// Reached only from `profile_repair_required`: this Mac finished onboarding —
+/// SOUL.md and/or the `.onboarded` sentinel are on disk — but
+/// `memory/profile.json` is gone, so the configured agent name and user name
+/// went with it and every reader downstream falls back to a default profile.
+///
+/// Nothing may invent those names, so the wizard asks for them. This step
+/// rewrites that one file and touches nothing else; the existing persona
+/// documents are the identity of record and are left exactly as they are.
+private struct ProfileRepairStep: View {
+    @Bindable var state: OnboardingWizardState
+    let onSave: () -> Void
+    let onRecheck: () -> Void
+
+    private var canSave: Bool {
+        !state.trimmedAgentName.isEmpty && !state.trimmedUserName.isEmpty && !state.isLoading
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
+                    Label("Names missing", systemImage: "person.text.rectangle")
+                        .font(NativeAgentFont.label)
+                        .foregroundStyle(.orange)
+                    Text("Enter the names again to finish setting this Mac back up.")
+                        .font(NativeAgentFont.display)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Setup finished on this Mac, but the file holding your name and the agent's name is gone, so a default is being used instead. Nothing here can guess them. The existing personality documents are kept exactly as they are — only the names file is rewritten.")
+                        .font(NativeAgentFont.body)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                NativePanel {
+                    VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Your name")
+                                .font(NativeAgentFont.label)
+                                .foregroundStyle(.secondary)
+                            TextField("Your name", text: $state.userName)
+                                .font(NativeAgentFont.body)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Agent name")
+                                .font(NativeAgentFont.label)
+                                .foregroundStyle(.secondary)
+                            TextField(state.namePlaceholder, text: $state.agentName)
+                                .font(NativeAgentFont.body)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                }
+
+                if let message = state.errorMessage {
+                    Text(message)
+                        .font(NativeAgentFont.body)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack {
+                    Spacer()
+                    if state.profileRepairRecheckOffered {
+                        Button("Check again") { onRecheck() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+                            .disabled(state.isLoading)
+                    }
+                    Button(state.isLoading ? "Saving\u{2026}" : "Save names") { onSave() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .disabled(!canSave)
+                }
+            }
+            .padding(.vertical, 4)
+        }
     }
 }
 

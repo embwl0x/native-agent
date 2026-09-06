@@ -2,6 +2,60 @@ import Testing
 import NativeAgentCore
 @testable import ProviderRouting
 
+@Test func astraReasoningControlsRespectAccountAndPublicTransports() {
+    for transport in [OpenAIExecutionControls.Transport.chatGPTOAuth, .codexCLI] {
+        #expect(OpenAIExecutionControls.reasoningEffort(model: "gpt-6-astra", requested: "ultra", transport: transport) == "ultra")
+        #expect(OpenAIExecutionControls.reasoningEffort(model: "gpt-6-astra", requested: "none", transport: transport) == nil)
+        #expect(OpenAIExecutionControls.serviceTier(model: "gpt-6-astra", requested: "fast", transport: transport) == "priority")
+    }
+    #expect(OpenAIExecutionControls.reasoningEffort(model: "gpt-6-astra", requested: "ultra") == nil)
+    #expect(OpenAIExecutionControls.reasoningEffort(model: "gpt-6-astra", requested: "max") == "max")
+    var body: [String: Any] = [:]
+    LLMCallContext.$reasoningEffort.withValue("medium") {
+        OpenAIExecutionControls.applyResponsesControls(to: &body, model: "gpt-6-astra", transport: .chatGPTOAuth)
+    }
+    #expect((body["reasoning"] as? [String: String])?["effort"] == "medium")
+    #expect(body["service_tier"] == nil)
+    #expect(OpenAIExecutionControls.wireReasoningEffort(model: "gpt-6-astra", requested: "ultra", transport: .codexCLI) == "ultra")
+}
+
+@Test func astraUsesExactPublicAndCodexReasoningContracts() {
+    #expect(OpenAIExecutionControls.supportedReasoningEfforts(
+        model: "gpt-6-astra",
+        transport: .publicAPI
+    ) == ["low", "medium", "high", "xhigh", "max"])
+    #expect(OpenAIExecutionControls.reasoningEffort(
+        model: "gpt-6-astra",
+        requested: "none",
+        transport: .publicAPI
+    ) == nil)
+    #expect(OpenAIExecutionControls.reasoningEffort(
+        model: "gpt-6-astra",
+        requested: "ultra",
+        transport: .codexCLI
+    ) == "ultra")
+    #expect(OpenAIExecutionControls.wireReasoningEffort(
+        model: "gpt-6-astra",
+        requested: "ultra",
+        transport: .chatGPTOAuth
+    ) == "xhigh")
+
+    var body: [String: Any] = [:]
+    LLMCallContext.$reasoningEffort.withValue("max") {
+        LLMCallContext.$serviceTier.withValue("priority") {
+            OpenAIExecutionControls.applyResponsesControls(to: &body, model: "gpt-6-astra")
+        }
+    }
+    #expect((body["reasoning"] as? [String: String])?["effort"] == "max")
+    #expect(body["service_tier"] as? String == "priority")
+}
+
+@Test func codexBridgeModelCatalogUsesExactCurrentIDs() {
+    #expect(OpenAIExecutionControls.codexBridgeModelIDs == [
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
+    ])
+}
+
 @Test func publicGPT56SolRejectsCodexUltraButEmitsMaxAndPriorityTier() {
     var body: [String: Any] = [:]
     LLMCallContext.$reasoningEffort.withValue("ultra") {

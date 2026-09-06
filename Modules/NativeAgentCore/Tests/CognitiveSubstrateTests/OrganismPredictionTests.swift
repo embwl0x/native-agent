@@ -226,8 +226,17 @@ private func predictionSignal(
 }
 
 @Test func canonicalToolActionsSettleByExactIdentityAndCancellationIsNeutral() async throws {
-    let kernel = OrganismKernel(configuration: .enabled)
     let date = Date(timeIntervalSince1970: 3_000)
+    // FROZEN INGEST CLOCK. "Cancellation is neutral" is a claim about the
+    // SIGNAL, and byte-equality can only test that claim if no wall time passes
+    // between the two reads: the homeostatic settle is budgeted per elapsed
+    // hour, so on a live clock the microseconds spent between two ingests buy a
+    // real (machine-speed-dependent) relaxation of every axis. Frozen, the
+    // settle share is zero and the only thing left that could move chemistry is
+    // the cancel itself — which must move nothing.
+    let kernel = OrganismKernel(
+        configuration: .enabled,
+        dependencies: OrganismDependencies(now: { date }))
     let source = "tool.workshop"
     let actionA: [String: JSONValue] = ["predictionCorrelationId": .string("action-a")]
     let actionB: [String: JSONValue] = ["predictionCorrelationId": .string("action-b")]
@@ -264,6 +273,7 @@ private func predictionSignal(
     let settled = await kernel.snapshot()
     #expect(settled.predictionSummary.pendingCount == 0)
     #expect(settled.predictionSummary.violatedCount == 0)
+    // Neutral: a cancel is neither credit nor alarm — chemistry is untouched.
     #expect(settled.chemicalState == chemistryBeforeCancel)
     #expect(settled.bodySchema.toolHandsAvailable)
 }

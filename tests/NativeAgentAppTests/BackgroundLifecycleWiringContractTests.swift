@@ -185,7 +185,10 @@ struct BackgroundLifecycleWiringContractTests {
         #expect(execution.contains("case .rem:"))
         #expect(execution.contains("executeREM(job: job)"))
         let dream = try AppSourceScraping.appSource("NativeClient+DreamActions.swift")
-        #expect(dream.contains("func runRem()"))
+        // 2026-09-06: 045615fb gave the entry point a `force` parameter so the
+        // scheduled Sunday pass can respect the weekly claim (force:false)
+        // while "Run REM now" still forces. The owner is the same function.
+        #expect(dream.contains("func runRem(force: Bool = true)"))
         #expect(dream.contains("BackgroundLoopsAssembly.makeREMProposalStager(dataRoot: root)"),
                 "the surviving REM owner must keep staging proposals as approvals")
     }

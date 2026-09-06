@@ -87,7 +87,10 @@ extension NativeClient {
                 priority: 100 + index
             )
         }
-        let openRouterCatalogModels = await OpenRouterModelCatalog.models(dataRoot: dataRoot, refresh: refresh)
+        let openRouterRead = await OpenRouterModelCatalog.modelsWithFreshness(
+            dataRoot: dataRoot, refresh: refresh
+        )
+        let openRouterCatalogModels = openRouterRead.models
             .enumerated()
             .map { index, model in
                 ModelCatalogItem(
@@ -143,10 +146,29 @@ extension NativeClient {
             // flags. Account-backed GPT rows intentionally win duplicate ids
             // in this provider-neutral fallback; provider-scoped pickers use
             // listProviders() and retain their exact transport contract.
+            merged.catalogFreshness = openRouterRead.freshness.rawValue
             let discoveredIDs = Set(
                 (codexSelectableModels + firstPartyModels + openRouterCatalogModels).map(\.id)
             )
             merged.models.removeAll { discoveredIDs.contains($0.id) }
+            // User, 2026-09-06: a legacy models.json row was only ever removed
+            // when the SAME id came back in the new list, so a model OpenRouter
+            // had dropped stayed selectable forever and picking it failed at
+            // dispatch. A read that actually reached OpenRouter is authoritative
+            // for OpenRouter's own rows — the namespaced `vendor/model` form,
+            // which is exactly how LLMClient+Real routes an id to OpenRouter —
+            // so those rows are replaced wholesale. A cached or failed read
+            // prunes nothing: it has no standing to delete anything. User,
+            // 2026-09-06: `.live` now also means the envelope claimed no
+            // further page — a partial one is served and cached but labelled
+            // `liveIncomplete`, so it adds rows and never deletes the ones it
+            // did not mention.
+            if openRouterRead.freshness.isLive {
+                let liveOpenRouterIDs = Set(openRouterCatalogModels.map(\.id))
+                merged.models.removeAll {
+                    $0.id.contains("/") && !liveOpenRouterIDs.contains($0.id)
+                }
+            }
             var seen = Set(merged.models.map(\.id))
             for model in codexSelectableModels where seen.insert(model.id).inserted {
                 merged.models.append(model)
@@ -206,7 +228,8 @@ extension NativeClient {
             models: baseline,
             reasoningEfforts: efforts,
             current: canonicalCurrent,
-            updatedAt: nil
+            updatedAt: nil,
+            catalogFreshness: openRouterRead.freshness.rawValue
         )
     }
 
@@ -660,7 +683,9 @@ extension NativeClient {
                 var row = original
                 if let title { row["title"] = .string(title) }
                 if let archived { row["archived"] = .bool(archived) }
-                row["updatedAt"] = .string(nowIso)
+                // A rename is not a conversation event: the row's time is
+                // when someone last spoke, so only an archive flip bumps it.
+                if archived != nil { row["updatedAt"] = .string(nowIso) }
                 sessions[idx] = row
                 found = try JSONValue.object(row).serializedData(pretty: false)
                 break

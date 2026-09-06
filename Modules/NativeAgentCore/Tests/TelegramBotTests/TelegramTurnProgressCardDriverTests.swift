@@ -101,7 +101,7 @@ private func makeTurnCardDriver(
 ) -> TelegramTurnProgressCardDriver {
     TelegramTurnProgressCardDriver(
         token: "test-token",
-        chatId: 77,
+        destination: .chat(77),
         turnId: UUID(uuidString: "00000000-0000-0000-0000-000000000077")!,
         minimumEditInterval: minimumEditInterval,
         heartbeatNanoseconds: heartbeatNanoseconds,
@@ -133,10 +133,10 @@ struct TelegramTurnProgressCardDriverTests {
 
         let captured = await transport.snapshot()
         #expect(captured.sends.count == 1)
-        #expect(captured.sends[0].hasPrefix("Acknowledged ·"))
+        #expect(captured.sends[0].hasPrefix("Got your message, starting now."))
         #expect(captured.edits.count == 3)
         #expect(captured.edits.allSatisfy { $0.0 == 4242 })
-        #expect(captured.edits.last?.1.hasPrefix("Completed ·") == true)
+        #expect(captured.edits.last?.1 == "Done.")
     }
 
     @Test func meaningfulProgressCoalescesUntilThrottleBoundary() async {
@@ -159,8 +159,8 @@ struct TelegramTurnProgressCardDriverTests {
         #expect(await driver.heartbeat())
         let edits = await transport.snapshot().edits
         #expect(edits.count == 1)
-        #expect(edits[0].1.contains("Using tool"))
         #expect(edits[0].1.contains("Reading file"))
+        #expect(!edits[0].1.contains("Using tool"))
     }
 
     @Test func automaticHeartbeatRefreshesElapsedAndDerivedStallThenStopsAtTerminal() async {
@@ -184,8 +184,7 @@ struct TelegramTurnProgressCardDriverTests {
 
         while await transport.snapshot().edits.isEmpty { await Task.yield() }
         let heartbeatText = await transport.snapshot().edits.last?.1 ?? ""
-        #expect(heartbeatText.hasPrefix("Stalled · elapsed 1m 35s"))
-        #expect(heartbeatText.contains("moved 1m 35s ago"))
+        #expect(heartbeatText == "Still on it, but it's been quiet: Waiting on provider (1m 35s so far)")
 
         clock.set(101)
         await driver.transition(.completed(summary: "Reply delivered"))

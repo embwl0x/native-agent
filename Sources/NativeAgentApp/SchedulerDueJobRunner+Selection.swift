@@ -51,7 +51,16 @@ extension SchedulerDueJobRunner {
     /// executes. A claim surviving process restart is an ambiguous outcome,
     /// not permission to repeat a notification, connector action, Desk task,
     /// or other non-idempotent effect.
-    func claimDueJobs(now: Date, maxJobs: Int) async throws -> ClaimedDueJobs {
+    /// - Parameter excludingJobIds: rows the caller has already handled and
+    ///   cannot make progress on during this pass (2026-09-06: a recovered
+    ///   claim whose reconciliation notice could not be written). Selection
+    ///   claims one earliest-due row at a time, so without this the same row
+    ///   would be re-detected every iteration and later due jobs would starve.
+    func claimDueJobs(
+        now: Date,
+        maxJobs: Int,
+        excludingJobIds: Set<String> = []
+    ) async throws -> ClaimedDueJobs {
         try await persistence.withFileLock(jobsPath) { () async throws -> ClaimedDueJobs in
             var rows = try Self.readJobRowsChecked(at: jobsPath)
             let selected = Self.dueJobs(
@@ -61,7 +70,8 @@ extension SchedulerDueJobRunner {
                 // legacy parameter for source compatibility, but make it
                 // impossible for a future caller to preclaim an untouched
                 // batch that would become falsely ambiguous after a crash.
-                maxJobs: min(max(0, maxJobs), 1)
+                maxJobs: min(max(0, maxJobs), 1),
+                excludingJobIds: excludingJobIds
             )
             guard !selected.isEmpty else { return ClaimedDueJobs(jobs: [], recoveredUnknown: []) }
 
@@ -85,33 +95,19 @@ extension SchedulerDueJobRunner {
                     if decodedPriorKey == nil {
                         detail = "A prior scheduler occurrence claim was malformed. Its external effect "
                             + "may have happened, so NativeAgent preserved the claim and did not repeat it."
-                        object["lastInvalidOccurrenceClaim"] = activeValue
                     } else {
                         detail = "A prior scheduler pass ended after claiming occurrence \(priorKey). "
                             + "Its external effect may have happened, so NativeAgent did not repeat it."
                     }
-                    object["lastRunAt"] = .string(Self.iso(now))
-                    object["lastRunStatus"] = .string("unknown")
-                    object["lastRunDetail"] = .string(detail)
-                    object["lastRunError"] = .string(detail)
-                    object["lastUnknownOccurrenceKey"] = .string(priorKey)
-                    object.removeValue(forKey: "activeOccurrence")
-                    if SchedulerJobRuntime.bool(object["oneShot"], default: false) {
-                        object["enabled"] = .bool(false)
-                        object["disabledReason"] = .string("unknown outcome after restart; review before retry")
-                    } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(
-                        for: .object(object), now: { now }
-                    ) {
-                        Self.stampNextRun(&object, epoch: next)
-                    } else {
-                        object["enabled"] = .bool(false)
-                        object["disabledReason"] = .string("unknown outcome and next run could not be computed")
-                    }
-                    // Unknown means "do not automatically replay." Any prior
-                    // retry floor/counter would contradict that settlement and
-                    // could re-arm the same occurrence through catch-up logic.
-                    Self.clearRetryState(&object)
-                    rows[index] = .object(object)
+                    // DETECTION ONLY (2026-09-06). The row is left exactly as
+                    // found — claim intact, next run unmoved — until the caller
+                    // has the reconciliation notice durably on record and calls
+                    // `settleUnknownOccurrence`. Clearing it here gave the
+                    // notice a ONE-ATTEMPT window: the claim and the old
+                    // schedule were already gone, so a failed notice write left
+                    // nothing for a later pass to find and reconcile. Either
+                    // way this job is not claimed on this pass, so nothing can
+                    // be replayed by waiting.
                     recovered.append(OccurrenceRecovery(
                         jobId: job.id,
                         jobName: job.name,
@@ -131,15 +127,65 @@ extension SchedulerDueJobRunner {
                 rows[index] = .object(object)
                 claimed.append(job)
             }
-            try await persistence.writeJSON(.array(rows), to: jobsPath)
+            // 2026-09-06: detection is read-only, so a scan that only recovered
+            // stale claims changed no row. Rewriting jobs.json anyway rewrote
+            // canonical state for nothing and gave a read-only pass a write's
+            // failure surface.
+            if !claimed.isEmpty {
+                try await persistence.writeJSON(.array(rows), to: jobsPath)
+            }
             return ClaimedDueJobs(jobs: claimed, recoveredUnknown: recovered)
+        }
+    }
+
+    /// Release a recovered stale claim and advance the job — ONLY once its
+    /// reconciliation notice is on record. Re-reads the row under the lock and
+    /// does nothing if the claim is already gone, so a retry after a partial
+    /// pass is harmless.
+    func settleUnknownOccurrence(_ recovery: OccurrenceRecovery, now: Date) async throws {
+        try await persistence.withFileLock(jobsPath) { () async throws -> Void in
+            var rows = try Self.readJobRowsChecked(at: jobsPath)
+            guard let index = rows.firstIndex(where: { row in
+                guard case .object(let object) = row else { return false }
+                return SchedulerJobRuntime.string(object["id"]) == recovery.jobId
+            }), case .object(var object) = rows[index],
+                let activeValue = object["activeOccurrence"] else { return }
+            var decodedPriorKey: String?
+            if case .object(let active) = activeValue {
+                decodedPriorKey = SchedulerJobRuntime.string(active["key"])
+            }
+            if decodedPriorKey == nil { object["lastInvalidOccurrenceClaim"] = activeValue }
+            object["lastRunAt"] = .string(Self.iso(now))
+            object["lastRunStatus"] = .string("unknown")
+            object["lastRunDetail"] = .string(recovery.detail)
+            object["lastRunError"] = .string(recovery.detail)
+            object["lastUnknownOccurrenceKey"] = .string(recovery.occurrenceKey)
+            object.removeValue(forKey: "activeOccurrence")
+            if SchedulerJobRuntime.bool(object["oneShot"], default: false) {
+                object["enabled"] = .bool(false)
+                object["disabledReason"] = .string("unknown outcome after restart; review before retry")
+            } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(
+                for: .object(object), now: { now }
+            ) {
+                Self.stampNextRun(&object, epoch: next)
+            } else {
+                object["enabled"] = .bool(false)
+                object["disabledReason"] = .string("unknown outcome and next run could not be computed")
+            }
+            // Unknown means "do not automatically replay." Any prior retry
+            // floor/counter would contradict that settlement and could re-arm
+            // the same occurrence through catch-up logic.
+            Self.clearRetryState(&object)
+            rows[index] = .object(object)
+            try await persistence.writeJSON(.array(rows), to: jobsPath)
         }
     }
 
     private static func dueJobs(
         in rows: [JSONValue],
         nowEpoch: Double,
-        maxJobs: Int
+        maxJobs: Int,
+        excludingJobIds: Set<String> = []
     ) -> [DueJob] {
         // The cap is applied AFTER an earliest-due-first sort. Walking file
         // order and breaking at `maxJobs` meant a row late in jobs.json could
@@ -157,6 +203,9 @@ extension SchedulerDueJobRunner {
             // stable occurrence claim or be settled safely. Job creation owns
             // IDs; malformed legacy rows remain untouched for repair.
             guard let id = SchedulerJobRuntime.string(obj["id"]), !id.isEmpty else { continue }
+            // Excluded BEFORE the cap, so a deferred row cannot consume the
+            // one-at-a-time claim slot that a later due job needs.
+            guard !excludingJobIds.contains(id) else { continue }
             let name = SchedulerJobRuntime.string(obj["name"]) ?? id
             let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
             let payload: [String: JSONValue]

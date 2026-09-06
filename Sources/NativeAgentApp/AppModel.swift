@@ -202,6 +202,10 @@ final class AppModel {
     }
 
     var telegramTokenConfigured = false
+    /// Memories waiting for review, as Today last counted them; the rail's dot
+    /// on Today reads this and the pending approvals, the same two the page's
+    /// waiting card reads, so the two can never disagree.
+    var todayWaitingMemories = 0
     var telegramEnabled = false
     var isSavingTelegram = false
     /// The Telegram settings surface owns this receipt. `statusText` remains
@@ -243,7 +247,32 @@ final class AppModel {
     // per-session dicts. The ONLY two fields still in the singleton are
     // `chatMessages` and `latestContextReceipt` — dict-ifying them
     // completes the per-session migration without inventing a new VM type.
-    var chatMessagesBySession: [String: [ChatMessage]] = [:]
+    // 2026-09-06: the transcript's mutation counter. The message-list grouper
+    // used to detect "same list" with count + tail row + total content bytes;
+    // an interior row replaced with the same byte count, or changed only in
+    // its metadata, passed all three and the view kept stale groups. Every
+    // write to the transcript now goes through the computed
+    // `chatMessagesBySession` below, so the counter cannot be forgotten by a
+    // new writer. `chatMessagesStructureVersion` is the cache key: it skips
+    // the streaming delta, which rewrites only the final row and which the
+    // list patches in place rather than re-walking the whole transcript.
+    private var chatMessagesStorage: [String: [ChatMessage]] = [:]
+    @ObservationIgnored private var chatMessagesTailOnlyWrite = false
+    private(set) var chatMessagesStructureVersion: UInt64 = 0
+    var chatMessagesBySession: [String: [ChatMessage]] {
+        get { chatMessagesStorage }
+        set {
+            chatMessagesStorage = newValue
+            if !chatMessagesTailOnlyWrite { chatMessagesStructureVersion &+= 1 }
+            chatMessagesTailOnlyWrite = false
+        }
+    }
+    /// Write `messages` knowing that only the FINAL row differs from what is
+    /// there now. The one caller is the streaming delta (2026-09-06).
+    func setChatMessagesTailOnly(_ messages: [ChatMessage], for sessionId: String) {
+        chatMessagesTailOnlyWrite = true
+        chatMessagesBySession[sessionId] = messages
+    }
     var latestContextReceiptBySession: [String: ContextReceipt] = [:]
 
     var chatMessages: [ChatMessage] {
@@ -351,6 +380,18 @@ final class AppModel {
     var dataRootOverride: URL?
     var memories: [MemoryRecord] = []
     var personality: PersonalityProfile?
+
+    /// Memory hygiene learns the name she goes by, so a fact "about Agent" is
+    /// kept out of the user's profile whatever the persona is called. Called
+    /// wherever the profile is assigned; a `didSet` on an @Observable stored
+    /// property took the chat room down (2026-09-02), so it is explicit.
+    func teachMemoryHygieneName() {
+        let name = personality?.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !name.isEmpty { AdaptiveCandidateHygiene.insertAssistantName(name) }
+        // Every sentence about the agent, wherever it is built, speaks in
+        // the persona's name and the chosen pronoun.
+        AgentVoice.live = AgentVoice.current(name: agentDisplayName)
+    }
     var personalityDocs: [PersonalityDoc] = []
     var skills: [SkillRecord] = []
     var tools: [ToolRecord] = []
@@ -373,7 +414,6 @@ final class AppModel {
     var routePlan: IntentRoutePlan?
     var routePresentation: IntentRoutePresentation = .idle
     var workflows: [WorkflowRecord] = []
-    var workflowRuns: [WorkflowRun] = []
     // Render-cost audit F13: `didSet` keeps `pendingActivityCount` derived from
     // EVERY mutation path, not just the badge refresh — see the invariant note
     // on `recomputePendingActivityCount()`.
@@ -386,6 +426,11 @@ final class AppModel {
     /// Retains the one resolver task so direct callers (chat cards included)
     /// join an active decision instead of re-entering NativeClient's executor.
     var approvalResolutionTasks: [String: Task<ApprovalRequest, Error>] = [:]
+    /// The decision each in-flight resolution is carrying. 2026-09-06: joining
+    /// by id alone handed the FIRST decision's result back to a second caller
+    /// who asked for the opposite one, so a Deny pressed over a running Approve
+    /// silently reported "approved".
+    var approvalResolutionDecisions: [String: String] = [:]
     /// Last compact-Capabilities approval action outcome. This is a UI receipt
     /// only; ApprovalInbox remains the terminal-decision authority.
     var capabilitiesApprovalInboxOutcome: CapabilitiesApprovalInboxResolution?
@@ -611,6 +656,11 @@ final class AppModel {
     @ObservationIgnored var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading =
         MacChatTurnTranscriptProofReader()
     @ObservationIgnored var chatTurnLifecycleRepairCompleted = false
+    /// User, 2026-09-06: a profile repair that landed while a turn was running.
+    /// The resident refresh stops and restarts Context Flow and reloads
+    /// cognition, so it waits for the last active turn to close rather than
+    /// pulling the ground out from under a turn in flight.
+    @ObservationIgnored var residentRefreshPendingAfterActiveTurns = false
     /// User-authored turns waiting behind the active turn, keyed by canonical
     /// session id. They stay outside the transcript/provider path until they
     /// become active, so queued text cannot race or duplicate the running turn.
@@ -618,6 +668,11 @@ final class AppModel {
     /// A manual Stop pauses automatic queue drain for that session. Natural
     /// completion drains immediately; Steer explicitly unpauses and promotes.
     var pausedChatQueueSessions: Set<String> = []
+    /// 2026-09-06: why the queue paused, when it paused because a queued turn
+    /// FAILED to start. The drain used to discard the typed rejection's
+    /// message, so the strip read "Paused" and the person was never told what
+    /// went wrong. Absent for an ordinary Stop-pause, which needs no reason.
+    var chatQueuePauseReasons: [String: String] = [:]
     /// Hermetic queue-drain seam. Production leaves this nil and starts the
     /// real chat turn; tests can prove FIFO/promotion without touching a
     /// provider, transcript, or the user's runtime root.
@@ -715,6 +770,12 @@ final class AppModel {
     var chatPendingAttachments: [String: [MultimodalAttachment]] = [:]
     // S.1: LRU tracking so we can cap chatDrafts at 50 entries
     var chatDraftLastTouched: [String: Date] = [:]
+    /// 2026-09-06: when the text currently stored for a session was last
+    /// TYPED, as opposed to when it was written through. `flushLiveChatDrafts`
+    /// asks every live composer to commit inside one notification and observer
+    /// order is arbitrary, so without this an older detached-panel edit could
+    /// land on top of newer main-window typing. Nothing renders from it.
+    @ObservationIgnored var chatDraftLastEdited: [String: Date] = [:]
 
     // H5 (2026-07-09): the composer no longer writes `chatDrafts` on every
     // keystroke — it keeps the in-progress text in view-local @State and

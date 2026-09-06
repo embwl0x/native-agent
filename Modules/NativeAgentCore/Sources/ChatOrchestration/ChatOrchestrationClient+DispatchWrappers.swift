@@ -14,6 +14,75 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 
+// MARK: - Dotted-alias canonicalization (outermost)
+
+/// 2026-09-06: the dispatcher's dotted-alias canonicalizer (`save.skill` →
+/// `save_skill`) ran INSIDE `SwiftToolDispatcher.dispatch`, i.e. after every
+/// gate had already judged the spelling the caller supplied. So `save.skill`
+/// matched neither `FileAccessGatedDispatcher`'s blocklist nor a Trust Center
+/// override keyed on `save_skill`, and `tool.catalog` slipped past the bridge
+/// guard's meta-result scrub — while Core still executed `save_skill` /
+/// `tool_catalog`. Canonicalize ONCE, outside every gate, so each gate judges
+/// the name that will actually execute. Idempotent: the inner dispatcher's own
+/// canonicalization then finds nothing left to rewrite.
+public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked Sendable {
+    private let inner: any ToolDispatchClient
+
+    public init(inner: any ToolDispatchClient) {
+        self.inner = inner
+    }
+
+    /// The exact rule `SwiftToolDispatcher.dispatch` applies downstream:
+    /// dotted, non-`mcp__`, not itself a catalog name, and the underscored
+    /// spelling IS a catalog name. Unknown names stay unknown.
+    public static func canonical(_ name: String) -> String {
+        SwiftToolDispatcher.canonicalToolName(name) { candidate in
+            SwiftToolDispatcher.dottedAliasCanonicalToolNames.contains(candidate)
+        }
+    }
+
+    public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let canonical = Self.canonical(tool)
+        // 2026-09-06: canonicalizing before the gates threw away the spelling
+        // the caller used, and the Trust Center matches override/block keys
+        // against the name it is given — so a user's `"save.skill": "blocked"`
+        // stopped applying. Carry the raw spelling down the chain so the policy
+        // gates can judge both and keep the stricter answer. Bound even when
+        // nothing was rewritten (as nil) so a nested dispatch cannot inherit a
+        // stale alias.
+        //
+        // 2026-09-06: except when the alias already describes THIS dispatch.
+        // The bridge wraps a gated client that begins with a canonicalizer of
+        // its own, so the inner one is handed the canonical name, rewrites
+        // nothing, and used to bind nil — erasing the raw spelling the outer
+        // wrapper captured before the gates in between could read it. An
+        // inherited alias whose canonical name is exactly the name we were
+        // handed is this call's own alias; carry it through. Anything else is
+        // a stale alias from an enclosing dispatch and still clears.
+        let alias: GatedToolNameAlias?
+        if canonical != tool {
+            alias = GatedToolNameAlias(raw: tool, canonical: canonical)
+        } else if let inherited = GatedToolNameContext.alias,
+                  inherited.canonical.trimmingCharacters(in: .whitespaces)
+                      == canonical.trimmingCharacters(in: .whitespaces) {
+            alias = inherited
+        } else {
+            alias = nil
+        }
+        return try await GatedToolNameContext.$alias.withValue(alias) {
+            try await inner.dispatch(tool: canonical, input: input, surface: surface)
+        }
+    }
+
+    public func listAvailableTools() async throws -> [String] {
+        try await inner.listAvailableTools()
+    }
+
+    public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
+        try await inner.listAvailableToolSchemas()
+    }
+}
+
 // MARK: - File-access wrapping dispatcher
 
 /// Wraps a ToolDispatchClient and rejects calls to a hard-coded set of
@@ -71,10 +140,10 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // the Full-Mac block, fileAccess=none keeps it unreachable.
         "restart_app", "install_app",
         // evolution chat tools (2026-06-11, U2b) — defense in depth. The
-        // propose/install tools mutate the EvolutionProposalStore + stage an
-        // install card; even the read-only status tool stays denied here so
-        // fileAccess=none keeps the whole evolution surface unreachable.
-        "evolution_propose", "evolution_status", "self_install",
+        // propose/withdraw/install tools mutate the EvolutionProposalStore +
+        // stage an install card; even the read-only status tool stays denied
+        // here so fileAccess=none keeps the whole evolution surface unreachable.
+        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
         // 2026-07-31 audit fix: the Full-Mac file/git read tools
         // (SwiftToolDispatcher.fullMacFileToolNames + the git group) matched
         // neither blockedExact nor any blockedPrefix, so fileAccess=none was
@@ -120,7 +189,7 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // evolution chat tools (2026-06-11, U2b) — even in read_only mode the
         // proposal-store mutators and the install-card stager stay denied.
         // status is read-only but listed for parity / catalog-drift defense.
-        "evolution_propose", "evolution_status", "self_install",
+        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
         // USER YOLO 2026-08-12: mac_focus_app / mac_quit_app freed too.
         // (was: "mac_focus_app", "mac_quit_app",)
         // W1b/W3.5 — mac_ax_status / mac_ax_tree / mac_ax_find / mac_view are
@@ -176,14 +245,43 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         return false
     }
 
+    /// User, 2026-09-06: `read` with an explicit `path` OPENS A FILE OFF DISK,
+    /// and the name-only blocklists missed it — `"read."` is a namespace
+    /// prefix, and bare `read` is in neither exact set — so fileAccess=none
+    /// was defeated by the one tool whose name is a bare verb. With NO path it
+    /// reads the front window through accessibility, which is not file access
+    /// and stays reachable; only the pathful call is refused, and only in the
+    /// mode that means "no files at all".
+    private func isPathfulReadUnderNoFileAccess(
+        tool: String, input: [String: JSONValue]
+    ) -> Bool {
+        guard mode == .none, tool.lowercased() == "read" else { return false }
+        guard case .string(let path)? = input["path"] else { return false }
+        return !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if isPathfulReadUnderNoFileAccess(tool: tool, input: input) {
+            throw AutonomyGateError.toolDenied(
+                reason: "fileAccess=none blocks \(tool) with an explicit path; "
+                    + "call it with no path to read what is on screen"
+            )
+        }
         if isBlocked(tool) {
             // Name the ACTUAL mode — this gate also fires for read_only, and
             // the old hardcoded "fileAccess=none" string lied in that case.
             let modeName = mode == .readOnly ? "read_only" : "none"
             throw AutonomyGateError.toolDenied(reason: "fileAccess=\(modeName) blocks \(tool)")
         }
-        return try await inner.dispatch(tool: tool, input: input, surface: surface)
+        // User, 2026-09-06: refusing the pathful `read` above is only half of
+        // it — the PATHLESS one asks the front window for its `AXDocument` and
+        // opens THAT file, a path this gate never sees because it does not
+        // exist yet when the gate runs. Carry the mode down so the Mac read
+        // organ can decline an inferred path under `none` and read the window's
+        // AX text instead. Nothing below reads it in the other two modes.
+        return try await MacControlTurnFileAccess.$deniesFileReads.withValue(mode == .none) {
+            try await inner.dispatch(tool: tool, input: input, surface: surface)
+        }
     }
 
     func listAvailableTools() async throws -> [String] {
@@ -247,6 +345,15 @@ public enum ChatToolSessionContext {
         }
     }
 
+    /// The per-turn envelope. See `TurnEnvelope` below — this is the ONE
+    /// value a new surface adapter fills in, and every field below is its
+    /// projection. Bound by the transport around its `chat()` call.
+    ///
+    /// Nil for turns whose surface predates the envelope; the individual
+    /// task-locals below remain the authority in that case, so an adapter can
+    /// migrate without a flag day.
+    @TaskLocal public static var envelope: TurnEnvelope?
+
     @TaskLocal public static var verifiedSessionId: String?
 
     /// The transport-verified remote chat identifier (e.g. Telegram chatId),
@@ -279,6 +386,182 @@ public enum ChatToolSessionContext {
     /// than trying to rediscover a Telegram chat, Slack thread, or iOS device
     /// from mutable current-surface state at completion time.
     @TaskLocal public static var replyRoute: ReplyRoute?
+}
+
+
+// MARK: - TurnEnvelope (the per-turn surface contract)
+
+/// EVERYTHING one turn's surface identity consists of, in one value.
+///
+/// # How to add a surface
+///
+/// NativeAgent is built so a new messaging surface — Signal, WhatsApp, a
+/// device, anything — can be connected later. This type is the contract that
+/// makes that a small job. A new adapter does exactly three things and touches
+/// nothing outside itself:
+///
+/// 1. **Bind identity.** Build a `TurnEnvelope` naming its `surface` and the
+///    identifiers its transport ACTUALLY VERIFIED — `verifiedChatId` (the
+///    conversation) and/or `verifiedUserId` (the person) — and bind it around
+///    its `chat()` call with `ChatToolSessionContext.$envelope.withValue(_:)`.
+///    Whatever the transport could not verify stays nil. Nil is honest and
+///    fails closed; a guess is neither.
+/// 2. **Provide a delivery route.** Fill `deliveryRoute` so a completion that
+///    lands after the originating loop has moved on still knows where to go.
+///    `replyRoute` is this envelope's delivery projection, so every existing
+///    `ChatToolSessionContext.replyRoute` consumer keeps working unchanged.
+/// 3. **Publish an anchor**, if the surface is a direct conversation with the
+///    human rather than a shared room — see `ConversationAnchor` in
+///    PersistenceCore. That is a one-line call and it is surface-agnostic:
+///    the Mac and the phone consume the anchor without knowing which surface
+///    published it.
+///
+/// There is no fourth step. In particular an adapter must NOT encode identity
+/// into the session id and expect a gate to parse it back out. Five sites used
+/// to do that (plan §1.2); all five are deleted. The session id is a storage
+/// key — path-safe, opaque, and evidence of nothing.
+///
+/// # Two invariants this type exists to hold
+///
+/// **A tool call's authority comes from the CURRENT turn's envelope, never
+/// from any envelope in history.** History rows are prose plus provenance
+/// labels; they grant nothing. A Mac-authored (local, trusted) turn can sit
+/// three rows above a remote allowlist-gated turn in the same transcript, and
+/// the remote turn is still assessed alone.
+///
+/// **Surface never widens.** `isRemote` is derived from the surface profile
+/// and can be ADDED to an unknown surface but never SUBTRACTED from a
+/// known-remote one. That rule is enforced generically in
+/// `SecurityCenter.assessOrigin` against `ConversationSurfaceProfile`, so it
+/// covers a surface added tomorrow exactly as it covers the ones here today.
+public struct TurnEnvelope: Sendable, Equatable {
+    /// The immutable return route for work that finishes after the
+    /// originating turn has ended. Kept as its own value because it is the
+    /// half of the envelope that must be DURABLE on the message row.
+    public typealias DeliveryRoute = ChatToolSessionContext.ReplyRoute
+
+    /// Raw surface name, as the adapter calls itself ("telegram", "slack",
+    /// "signal", "chat"). Normalization to a canonical profile happens at the
+    /// trust boundary, not here — this field records what the adapter said.
+    public let surface: String
+    /// Bridge lane, when the turn arrived through an agent bridge
+    /// ("claude", "codex"). Generalizes the existing `metadata.origin.agent`.
+    public let agent: String?
+    /// The conversation identifier the TRANSPORT verified. Nil when the
+    /// transport has no such notion (a local window) or could not verify one.
+    public let verifiedChatId: String?
+    /// The person identifier the TRANSPORT verified. Nil as above.
+    public let verifiedUserId: String?
+    /// True when the inbound transport has already verified provenance for
+    /// this turn by its own scheme (a signed request, a preauthenticated
+    /// socket). Nil means "no such scheme", which is not the same as false.
+    public let commandSignatureVerified: Bool?
+    /// Where this turn's reply goes, and nowhere else.
+    public let deliveryRoute: DeliveryRoute?
+    /// Explicit remoteness for a surface the profile does not know yet. It can
+    /// only ADD remoteness — see the widening invariant above.
+    public let declaredRemote: Bool?
+
+    public init(
+        surface: String,
+        agent: String? = nil,
+        verifiedChatId: String? = nil,
+        verifiedUserId: String? = nil,
+        commandSignatureVerified: Bool? = nil,
+        deliveryRoute: DeliveryRoute? = nil,
+        declaredRemote: Bool? = nil
+    ) {
+        self.surface = surface
+        self.agent = agent
+        self.verifiedChatId = Self.cleaned(verifiedChatId)
+        self.verifiedUserId = Self.cleaned(verifiedUserId)
+        self.commandSignatureVerified = commandSignatureVerified
+        self.deliveryRoute = deliveryRoute
+        self.declaredRemote = declaredRemote
+    }
+
+    /// The delivery projection. `ReplyRoute` predates the envelope and has
+    /// many consumers; keeping it as a projection rather than replacing it is
+    /// what lets Phase 1 land without touching them.
+    ///
+    /// Falls back to a route carrying just the surface so a caller that bound
+    /// an envelope but no explicit route still gets an honest surface tag.
+    public var replyRoute: DeliveryRoute {
+        deliveryRoute ?? DeliveryRoute(surface: surface)
+    }
+
+    /// The durable shape written to `metadata.envelope` on every message row.
+    ///
+    /// `trusted` is NOT included and must never be: a persisted trust verdict
+    /// would be exactly the "authority from history" this type forbids. The
+    /// row records WHO and WHERE, and the gate re-decides every turn.
+    public func persistedMetadata() -> JSONValue {
+        var object: [String: JSONValue] = ["surface": .string(surface)]
+        func put(_ key: String, _ value: String?) {
+            guard let value, !value.isEmpty else { return }
+            object[key] = .string(value)
+        }
+        put("agent", Self.cleaned(agent))
+        put("chatId", verifiedChatId)
+        put("userId", verifiedUserId)
+        put("destinationId", Self.cleaned(deliveryRoute?.destinationId))
+        put("threadId", Self.cleaned(deliveryRoute?.threadId))
+        put("sourceKey", Self.cleaned(deliveryRoute?.sourceKey))
+        put("replyTo", Self.cleaned(deliveryRoute?.replyTo))
+        put("correlationId", Self.cleaned(deliveryRoute?.correlationId))
+        return .object(object)
+    }
+
+    /// Rebuild an envelope from a persisted row. Provenance only — the result
+    /// is a LABEL for a reader, never an authorization for a tool call.
+    public static func fromPersistedMetadata(_ value: JSONValue?) -> TurnEnvelope? {
+        guard case .object(let object)? = value else { return nil }
+        func read(_ key: String) -> String? {
+            guard case .string(let string)? = object[key] else { return nil }
+            return cleaned(string)
+        }
+        guard let surface = read("surface") else { return nil }
+        let route = ChatToolSessionContext.ReplyRoute(
+            surface: surface,
+            destinationId: read("destinationId"),
+            threadId: read("threadId"),
+            sourceKey: read("sourceKey"),
+            replyTo: read("replyTo"),
+            correlationId: read("correlationId")
+        )
+        return TurnEnvelope(
+            surface: surface,
+            agent: read("agent"),
+            verifiedChatId: read("chatId"),
+            verifiedUserId: read("userId"),
+            deliveryRoute: route
+        )
+    }
+
+    /// Assemble the envelope for the turn in flight.
+    ///
+    /// Prefers an explicitly bound envelope; otherwise composes one from the
+    /// individual `ChatToolSessionContext` task-locals the pre-envelope
+    /// adapters already bind. That fallback is what makes Phase 1 additive:
+    /// nothing has to migrate on the same day.
+    public static func current(surface: String) -> TurnEnvelope {
+        if let bound = ChatToolSessionContext.envelope {
+            return bound
+        }
+        return TurnEnvelope(
+            surface: surface,
+            verifiedChatId: ChatToolSessionContext.verifiedChatId,
+            verifiedUserId: ChatToolSessionContext.verifiedUserId,
+            commandSignatureVerified: ChatToolSessionContext.commandSignatureVerified,
+            deliveryRoute: ChatToolSessionContext.replyRoute
+        )
+    }
+
+    private static func cleaned(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
 }
 
 /// Exact, single-dispatch evidence that a human already approved the persisted
@@ -330,8 +613,13 @@ public struct ApprovedChatToolReplay: Sendable, Equatable {
         input: [String: JSONValue],
         verifiedSessionID: String?
     ) -> Bool {
+        // 2026-09-06: the executor builds this from the PERSISTED tool name
+        // (`save.skill`), and the outer canonicalizer rewrites the dispatched
+        // name (`save_skill`) before this comparison — a pre-upgrade dotted
+        // approval was consumed and then rejected. Compare canonical names.
         !approvalID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && self.tool == tool
+            && CanonicalToolNameDispatcher.canonical(self.tool)
+                == CanonicalToolNameDispatcher.canonical(tool)
             && self.surface == surface
             && self.input == input
             && self.verifiedSessionID == verifiedSessionID
@@ -440,6 +728,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
     /// dispatcher acts on. Nil ⇒ injection tools cannot run at all (fail
     /// closed), which is the correct posture for a raw/noninteractive chain.
     private let injectionApprovalVerifier: (any InjectionApprovalVerifying)?
+    /// 2026-09-06. The same authority for every OTHER tool's replay: the
+    /// approval id must resolve to a real, approved, this-tool/this-body record
+    /// that the executor spent moments ago, and it is good for exactly one
+    /// dispatch. Nil ⇒ no replay exemption is granted at all (fail closed).
+    private let approvedReplayVerifier: (any ApprovedReplayVerifying)?
     private static let approvalStagingToolNames: Set<String> = [
         "agentmail.send",
         "agentmail_send",
@@ -462,8 +755,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         approvalTimeoutSeconds: Double = 30,
         verifiedSessionId: String? = nil,
         approvedReplay: ApprovedChatToolReplay? = nil,
-        injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil
+        injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil,
+        approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil
     ) {
+        self.approvedReplayVerifier = approvedReplayVerifier
         self.inner = inner
         self.gate = gate
         self.approvalFiler = approvalFiler
@@ -520,20 +815,54 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             originTrusted: envelope.originTrusted
         )
         let admittedFullMacYolo = envelope.fullMacYoloAuthority == .admitted
+        // 2026-09-06: EVERY replay exemption is verified against the approval
+        // inbox, not just the injection ones. `ApprovedChatToolReplay` is a
+        // public struct with a public init, so field equality proved only that
+        // the caller agreed with itself — enough, until now, to skip the
+        // SecurityCenter `.ask` on every non-injection tool, repeatedly, with a
+        // made-up id. The verifier resolves the id against the real record
+        // (approved, this tool, this body, spent by the executor moments ago)
+        // and burns it, so a second dispatch with the same id is refused. An
+        // unverified replay is denied here rather than falling through to an
+        // ordinary approval prompt, which would hide the forgery attempt.
+        let approvedReplayAuthorizes: Bool
+        if !MacInjectionToolNames.isInjectionTool(tool),
+           let replay = approvedReplay,
+           replay.matches(
+            tool: tool,
+            surface: surface,
+            input: input,
+            verifiedSessionID: verifiedSessionId
+           ) {
+            let verdict = await Self.verifyApprovedReplay(
+                verifier: approvedReplayVerifier,
+                approvalID: replay.approvalID,
+                tool: tool,
+                surface: surface,
+                input: input
+            )
+            guard verdict == .verified else {
+                let reason = "approved_replay_evidence_unverified: \(verdict.rawValue) "
+                    + "(\(tool) replay claimed approval \(replay.approvalID))"
+                try? await securityCenter.record(
+                    Self.securityEnvelope(envelope, decision: .block, reason: reason)
+                )
+                throw AutonomyGateError.toolDenied(reason: reason)
+            }
+            approvedReplayAuthorizes = true
+        } else {
+            approvedReplayAuthorizes = false
+        }
         let guardResult = PersonaWriteGuard.apply(
             tool: tool,
             kind: Self.jsonString(input["kind"]),
             resolvedAutonomy: autonomyLevel,
             // A resolved approval is equivalent to the explicit confirmation
             // PersonaWriteGuard was created to require, but only for the exact
-            // persisted call and authenticated origin. A mismatch falls back
+            // persisted call and authenticated origin, and only once the
+            // approval record itself has been verified. A mismatch falls back
             // to the normal guard and fails closed when no filer is present.
-            hasExplicitAutonomyOverride: admittedFullMacYolo || approvedReplay?.matches(
-                tool: tool,
-                surface: surface,
-                input: input,
-                verifiedSessionID: verifiedSessionId
-            ) == true
+            hasExplicitAutonomyOverride: admittedFullMacYolo || approvedReplayAuthorizes
         )
         // W2/W3-FIX 3 — injection authority is enforced HERE as well as in the
         // trust resolver, because this dispatcher accepts ANY
@@ -601,12 +930,33 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // external_send) on a staging tool must file a REAL approval record,
         // or the inner dispatcher returns a bare pending_approval with
         // nothing ever staged (gpt-5.5 review 2026-07-21).
+        //
+        // 2026-09-06: a post-approval REPLAY must not be asked again. The
+        // executor resolves the approval, durably SPENDS it, then re-dispatches
+        // here with `approvedReplay` and no filer — so a second security .ask
+        // (external_send, with sendExternalMessagesRequiresApproval on) fell
+        // through to the `hasFiler` deny below and mail_send / messages_send /
+        // mail_reply were consumed and then refused. The exemption is bound to
+        // the exact persisted tool, surface, body and verified origin, and it
+        // does NOT cover injection tools — those keep the inbox-verified
+        // `injectionReplayApprovalID` path above, which is stricter.
+        // `approvedReplayAuthorizes` was resolved (and the approval record
+        // verified and burned) before the persona guard above.
+        if approvedReplayAuthorizes, envelope.requiresApproval {
+            // The exemption is audited, not silent.
+            try? await securityCenter.record(Self.securityEnvelope(
+                envelope,
+                decision: .allow,
+                reason: "approved replay of \(tool) honours approval "
+                    + "\(approvedReplay?.approvalID ?? "unknown")"
+            ))
+        }
         let securityAsked: Bool
         let decision: AutonomyDecision
         if case .deny = autonomyDecision {
             decision = autonomyDecision
             securityAsked = false
-        } else if envelope.requiresApproval {
+        } else if envelope.requiresApproval, !approvedReplayAuthorizes {
             decision = .requireApproval(
                 reason: "security ask: \(Self.primarySecurityReason(envelope.reasons))"
             )
@@ -903,35 +1253,72 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         )
     }
 
+    /// 2026-09-06 — the same single place for every OTHER tool's replay id. No
+    /// verifier wired ⇒ `.noVerifier` ⇒ no exemption: a chain with no way to
+    /// check its approvals does not honour one.
+    private static func verifyApprovedReplay(
+        verifier: (any ApprovedReplayVerifying)?,
+        approvalID: String,
+        tool: String,
+        surface: String,
+        input: [String: JSONValue]
+    ) async -> ApprovedReplayVerification {
+        guard let verifier else { return .noVerifier }
+        return await verifier.verifyApprovedReplay(
+            approvalID: approvalID,
+            tool: tool,
+            surface: surface,
+            input: input
+        )
+    }
+
     private static func primarySecurityReason(_ reasons: [String]) -> String {
         reasons.first { !$0.hasPrefix("autonomy:") }
             ?? reasons.first
             ?? "tool denied"
     }
 
-    private static func securityOrigin(
+    /// THE origin projection. Every security field here comes from the TURN
+    /// ENVELOPE, not from the `surface` the caller happened to dispatch under.
+    ///
+    /// That distinction is the whole point. A remote adapter binds
+    /// `TurnEnvelope(surface: "signal", declaredRemote: true, verifiedUserId: …)`
+    /// while its `client.chat` call still runs with the shared tool surface
+    /// `"chat"` (the bridges deliberately do exactly that). Reading `surface`
+    /// here would then hand a genuinely remote turn a LOCAL, trusted origin —
+    /// `assessOrigin` short-circuits to "local app surface" before any
+    /// allowlist is consulted. The envelope is the one value that knows what
+    /// the turn actually is, so it is the one value this reads.
+    ///
+    /// `TurnEnvelope.current(surface:)` is the ONLY path to the task-locals:
+    /// when no envelope is bound it composes one from them, so a pre-envelope
+    /// adapter keeps its exact behavior and there is no second place that can
+    /// disagree about identity.
+    /// Internal, not private, for the same reason `resolvedChatId` is: this
+    /// projection is a trust boundary and gets tested directly.
+    static func securityOrigin(
         verifiedSessionId: String?,
         surface: String
     ) -> SecurityOriginContext {
         let sessionId = verifiedSessionId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let usableSessionId = sessionId?.isEmpty == false ? sessionId : nil
-        // Prefer the transport-verified chatId (covers UUID sessions where the
-        // id can't be parsed from the session string); fall back to the legacy
-        // `telegram:<chatId>` session form. See ChatToolSessionContext.
-        let chatId = Self.resolvedChatId(sessionId: usableSessionId)
-        let normalizedSurface = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let envelope = TurnEnvelope.current(surface: surface)
+        // Remoteness only ever WIDENS: the surface profile owns the known
+        // remote set, and `declaredRemote` can add remoteness to a surface the
+        // profile has not heard of yet. Neither can subtract it — see the
+        // same rule restated in `SecurityCenter.assessOrigin`.
+        let remote = ConversationSurfaceProfile(envelope.surface).isRemote
+            || envelope.declaredRemote == true
         return SecurityOriginContext(
-            surface: surface,
+            surface: envelope.surface,
             sessionId: usableSessionId,
-            userId: ChatToolSessionContext.verifiedUserId,
-            chatId: chatId,
+            userId: envelope.verifiedUserId,
+            chatId: envelope.verifiedChatId,
             deviceId: nil,
             source: "chat_runtime",
-            isRemote: [
-                "telegram", "slack", "ios", "icloud", "iphone", "ipad", "mobile", "remote", "watch",
-            ].contains(normalizedSurface),
-            commandSignatureVerified: ChatToolSessionContext.commandSignatureVerified
+            isRemote: remote,
+            commandSignatureVerified: envelope.commandSignatureVerified
         )
     }
 
@@ -945,21 +1332,34 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         }
     }
 
-    private static func telegramChatId(fromSessionId sessionId: String?) -> String? {
-        guard let sessionId else { return nil }
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("telegram:") else { return nil }
-        return String(trimmed.dropFirst("telegram:".count))
-    }
-
-    /// Transport-verified chatId wins (covers UUID sessions); otherwise parse
-    /// the legacy `telegram:<chatId>` session form. See ChatToolSessionContext.
+    /// The turn's verified remote chat identity, and NOTHING ELSE.
+    ///
+    /// PARSE SITE 2 of 5, DELETED (one-thread-many-surfaces plan §1.2). This
+    /// used to fall back to parsing `telegram:<chatId>` out of the session id
+    /// string. That fallback is unsound and always was: `chat/sessions.json`
+    /// holds rows whose ids are `telegram:codex-probe` and
+    /// `telegram:codex-tool-catalog-probe` but whose source is `app`, so the
+    /// "chatId" it yielded for those was the literal string `codex-probe`. It
+    /// failed closed only because that string is not in anyone's allowlist —
+    /// a namespace collision waiting for a collaborator.
+    ///
+    /// The session id is a STORAGE KEY. It is not identity, it is not
+    /// provenance, and it is not evidence. Identity comes from the transport,
+    /// on the envelope, or it does not come at all.
+    ///
+    /// `sessionId` stays in the signature because callers pass it and because
+    /// deleting the parameter would hide, rather than record, what was removed.
     static func resolvedChatId(sessionId: String?) -> String? {
-        if let verified = ChatToolSessionContext.verifiedChatId?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !verified.isEmpty {
-            return verified
+        _ = sessionId
+        if let bound = ChatToolSessionContext.envelope?.verifiedChatId?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !bound.isEmpty {
+            return bound
         }
-        return telegramChatId(fromSessionId: sessionId)
+        guard let verified = ChatToolSessionContext.verifiedChatId?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !verified.isEmpty else {
+            return nil
+        }
+        return verified
     }
 
     private static func securityEnvelope(

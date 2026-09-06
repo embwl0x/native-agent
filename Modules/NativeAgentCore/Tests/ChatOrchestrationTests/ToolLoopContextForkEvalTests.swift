@@ -128,7 +128,7 @@ func toolLoopContextFork_preservesPrebuiltThreadedContextAndCharacterizesRebuild
     try toolLoopContextForkWrite(
         """
         [
-          {"id":"prior-session","createdAt":"2026-07-31T12:00:00Z","updatedAt":"2026-08-01T11:00:00Z","title":"Prior","messageCount":2,"lastMessagePreview":"DIGEST-MARKER"},
+          {"id":"prior-session","createdAt":"2026-07-31T12:00:00Z","updatedAt":"2026-08-01T11:00:00Z","title":"Prior","messageCount":2,"lastMessagePreview":"prior tail"},
           {"id":"\(sessionId)","createdAt":"2026-08-01T12:00:00Z","updatedAt":"2026-08-01T12:00:00Z","title":"Current","messageCount":0,"lastMessagePreview":""}
         ]
         """,
@@ -141,11 +141,9 @@ func toolLoopContextFork_preservesPrebuiltThreadedContextAndCharacterizesRebuild
         activeToolsStore: ActiveToolsStore(dataRoot: dataRoot)
     )
     let history = SessionHistoryReader(dataRoot: dataRoot)
-    let digest = SessionDigestProvider(
-        dataRoot: dataRoot,
-        agentInboxDir: root.appendingPathComponent("agent_inbox"),
-        worklogPath: root.appendingPathComponent("worklog.jsonl")
-    )
+    // The prior-session anchor is deliberately NOT part of this fixture: it is
+    // a first-turn-only injection and this session already has history rows,
+    // which is exactly the case where the continuity card carries the thread.
     let threaded = try await engine.buildTurnContextWithHistory(
         surface: "chat",
         userMessage: message,
@@ -153,7 +151,7 @@ func toolLoopContextFork_preservesPrebuiltThreadedContextAndCharacterizesRebuild
         historyLimit: 10,
         historyReader: history,
         personaOverride: "PERSONA-OVERRIDE-MARKER",
-        sessionDigest: digest
+        sessionDigest: SessionDigestProvider(dataRoot: dataRoot)
     )
     let preBuilt = SwiftNativeTurnEngine.contextByAppendingRuntimeContext(
         threaded,
@@ -182,11 +180,11 @@ func toolLoopContextFork_preservesPrebuiltThreadedContextAndCharacterizesRebuild
     #expect(resolvedPreBuilt.systemPrompt == preBuilt.systemPrompt)
     #expect(resolvedPreBuilt.systemPrompt?.contains("PERSONA-CONTEXT-MARKER") == true)
     #expect(resolvedPreBuilt.systemPrompt?.contains("HISTORY-USER-MARKER") == true)
-    #expect(resolvedPreBuilt.systemPrompt?.contains("DIGEST-MARKER") == true)
+    #expect(resolvedPreBuilt.systemPrompt?.contains(SessionDigestProvider.headerLine) == false)
     #expect(resolvedPreBuilt.systemPrompt?.contains("COGNITIVE-CAPSULE-MARKER") == true)
     #expect(rebuilt.personaID == nil)
     #expect(rebuilt.systemPrompt?.contains("HISTORY-USER-MARKER") == false)
-    #expect(rebuilt.systemPrompt?.contains("DIGEST-MARKER") == false)
+    #expect(rebuilt.systemPrompt?.contains(SessionDigestProvider.headerLine) == false)
     #expect(rebuilt.systemPrompt?.contains("COGNITIVE-CAPSULE-MARKER") == false)
     #expect(resolvedPreBuilt.toolSchemas.map(\.name) == rebuilt.toolSchemas.map(\.name))
 

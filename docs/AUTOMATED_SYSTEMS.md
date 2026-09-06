@@ -250,8 +250,12 @@ inbox, model prefs) publish to `snapshots/` for the phone to render.
   couldn't be recorded. Durable "never again"; the dir being empty/absent
   means none stuck.
 - `snapshot_skips.json` — snapshot groups the last publish pass could not
-  build (phone would be holding stale state). **Absent = nothing skipped =
-  healthy.** Do not read absence as breakage.
+  build after one retry (phone would be holding stale state). **Absent =
+  nothing skipped = healthy.** Do not read absence as breakage. Since
+  2026-09-01 the pass also publishes `snapshot_staleness.json` (group →
+  reason) into the snapshot bundle; the phone badges Memory / Knowledge
+  Graph stale from it, and a healthy pass publishes `{}` (never deletes —
+  the phone's CloudKit cache only gains files).
 - An unreadable `processed_ids.json` is preserved as
   `processed_ids.corrupt.json` so Doctor can say the window was lost
   rather than silently starting empty.

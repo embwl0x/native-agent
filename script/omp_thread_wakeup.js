@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 "use strict";
+// The agent and the user are addressed by their configured names; nothing in
+// this file names a specific person.
+const AGENT_NAME = process.env.NATIVE_AGENT_AGENT_NAME || "the agent";
+const USER_NAME = process.env.NATIVE_AGENT_USER_NAME || "the user";
 
 // NativeAgent -> OMP asynchronous wake runner.
 //
 // The Swift tool owns authorization and the durable inbox. This helper owns a
 // second durable execution record, one serialized OMP session per topic, honest
 // child-process classification, and the authenticated completion POST back to
-// Agent. Production calls claim then detach; tests set OMP_WAKE_INLINE=1.
+// the agent. Production calls claim then detach; tests set OMP_WAKE_INLINE=1.
 
 const crypto = require("crypto");
 const fs = require("fs");
@@ -172,14 +176,14 @@ function resolveCwd(payload, pointer) {
 
 function prompt(payload) {
   return [
-    "Agent sent this through NativeAgent's unattended omp_message bridge.",
+    (AGENT_NAME + " sent this through NativeAgent's unattended omp_message bridge."),
     `Message id: ${payload.messageId}`,
     `Topic: ${payload.topic || DEFAULT_TOPIC}`,
     `Priority: ${payload.priority || "info"}`,
     "",
     String(payload.text || ""),
     "",
-    "Do the work now. Your final assistant text is returned to Agent as an asynchronous receipt. Always provide a nonempty final answer, including for failures or no-op work.",
+    ("Do the work now. Your final assistant text is returned to " + AGENT_NAME + " as an asynchronous receipt. Always provide a nonempty final answer, including for failures or no-op work."),
   ].join("\n");
 }
 
@@ -355,7 +359,7 @@ function bridgeURL() {
 function missingCompletionOrigin(sessionId) {
   if (typeof sessionId === "string" && sessionId.trim()) return null;
   return { status: "blocked", reason: "missing_origin_session", deliveryAttempted: false,
-    note: "Completion retained without posting. Identify the original Agent session and inspect this job before explicitly delivering the saved result; do not rerun the worker or guess from the current chat." };
+    note: ("Completion retained without posting. Identify the original " + AGENT_NAME + " session and inspect this job before explicitly delivering the saved result; do not rerun the worker or guess from the current chat.") };
 }
 
 function postBridge(text, sessionId) {

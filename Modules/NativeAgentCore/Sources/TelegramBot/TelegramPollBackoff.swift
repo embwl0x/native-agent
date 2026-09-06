@@ -41,11 +41,18 @@ public actor TelegramExponentialBackoff {
     private var consecutiveFailures: Int = 0
     private var nextAttemptAt: Date?
 
-    /// Defaults are the poll-loop curve from the u5-reliability plan:
-    /// 1s → 300s cap, doubling, ±20% jitter, reset on success.
+    /// Defaults are the poll-loop curve: 1s → 60s cap, doubling, ±20% jitter,
+    /// reset on success.
+    ///
+    /// FIX-7 (2026-09-01): the cap was 300s while `TelegramPollLoop` documented
+    /// 1s→60s and nothing in production passed an override, so an offline Mac
+    /// stayed dark five times longer than the contract said. Telegram is the
+    /// most-used remote surface; 60s is the contract, and it is now the code.
+    /// `commandMenuBackoff` still asks for 300s EXPLICITLY — a slow retry is
+    /// right for a menu sync, wrong for the lane that carries messages.
     public init(
         baseDelay: TimeInterval = 1,
-        maxDelay: TimeInterval = 300,
+        maxDelay: TimeInterval = 60,
         multiplier: Double = 2,
         jitterRange: ClosedRange<Double> = 0.8...1.2,
         now: @escaping @Sendable () -> Date = { Date() },

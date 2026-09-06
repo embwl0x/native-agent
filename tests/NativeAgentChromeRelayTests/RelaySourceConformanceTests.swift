@@ -130,26 +130,74 @@ struct RelaySourceConformanceTests {
 
     // MARK: relay.cli.argumentContract (source half)
 
-    @Test("the relay reads no argv — the origin pin lives only in the Chrome manifest")
-    func relayIgnoresArgv() throws {
-        // Chrome passes argv[1] = the calling extension origin. The relay
-        // authenticates nothing about its parent; the origin is pinned solely
-        // by the native-host manifest's allowed_origins. Pinning that here
-        // means a future origin check cannot be added-then-silently-reverted,
-        // and the "argv is ignored deliberately" assumption stops being
-        // unwritten. See productionSeamNeeded for the real authentication gap.
+    @Test("argv reaches launch authentication only, against a single origin constant")
+    func relayReadsArgvOnlyToAuthenticateItsLaunch() throws {
+        // 2026-09-06: 06af1541 ("Chrome control: a relay only counts if Chrome
+        // launched it") inverted this pin. The relay used to read no argv at
+        // all and the origin lived solely in the native-host manifest; it now
+        // refuses to start unless a signed Chromium-family parent launched it
+        // AND argv carries the registered extension origin
+        // (Sources/NativeAgentChromeRelay/main.swift refuseUnlessLaunchedByChrome).
+        //
+        // What still has to hold, and is what this guards:
+        //  1. argv feeds AUTHENTICATION ONLY. Nothing about how the relay runs
+        //     — socket path, framing bound, anything — may come from an
+        //     argument, or an impersonating launcher gets to configure the
+        //     process it just failed to authenticate. The socket path stays an
+        //     environment/default decision (see run()).
+        //  2. The origin the relay checks and the origin the manifest allows
+        //     are ONE value. Two literals silently drift, and drift here means
+        //     either a dead channel or a check that passes for an extension
+        //     Chrome would never have launched us for.
+        var argvSites: [String] = []
         for relativePath in try swiftSources(under: "Sources/NativeAgentChromeRelay") {
-            let source = try RelayTestPaths.source(relativePath)
-            #expect(
-                !source.contains("CommandLine"),
-                "\(relativePath) now reads argv — the runtime argv eval must be updated too"
-            )
+            for (index, line) in try relaySource(relativePath).enumerated() {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.hasPrefix("//") else { continue }
+                guard trimmed.contains("CommandLine") || trimmed.contains("processInfo.arguments")
+                else { continue }
+                argvSites.append("\(relativePath) | \(trimmed)")
+            }
         }
+        // File + exact source text, not line numbers: a pin that breaks on
+        // unrelated edits above it teaches people to rebaseline it.
+        #expect(
+            argvSites == [
+                // The self-path fallback, used only to decide whether this is
+                // the bundled relay that has to authenticate at all.
+                "Sources/NativeAgentChromeRelay/main.swift | ?? CommandLine.arguments.first ?? \"\"",
+                // The origin check itself.
+                "Sources/NativeAgentChromeRelay/main.swift | "
+                    + "guard ChromeHostIdentity.argumentsCarryAllowedOrigin(CommandLine.arguments) else {",
+            ],
+            "argv now reaches something other than launch authentication: \(argvSites)"
+        )
+
+        // One origin constant, shared by the check and the manifest.
+        let identity = try RelayTestPaths.source(
+            "Sources/NativeAgentChromeRelayCore/ChromeHostIdentity.swift"
+        )
+        guard let idRange = identity.range(of: "public static let extensionID = \""),
+              let closing = identity.range(of: "\"", range: idRange.upperBound..<identity.endIndex)
+        else {
+            Issue.record("ChromeHostIdentity.extensionID not found — did it get renamed?")
+            return
+        }
+        let extensionID = String(identity[idRange.upperBound..<closing.lowerBound])
+        #expect(!extensionID.isEmpty)
+        // allowedOrigin is what argumentsCarryAllowedOrigin matches argv against.
+        #expect(
+            identity.contains("chrome-extension://\\(extensionID)/"),
+            "the origin the relay checks no longer derives from extensionID"
+        )
         let manifest = try RelayTestPaths.source(
             "Extensions/NativeAgentChrome/native-host/com.nativeagent.chrome.json.in"
         )
         #expect(manifest.contains("allowed_origins"))
-        #expect(manifest.contains("chrome-extension://"))
+        #expect(
+            manifest.contains("chrome-extension://\(extensionID)/"),
+            "manifest allowed_origins drifted from ChromeHostIdentity.extensionID (\(extensionID))"
+        )
     }
 
     // MARK: relay.framing.customMaximumInit

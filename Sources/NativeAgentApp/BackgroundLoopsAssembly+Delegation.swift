@@ -39,19 +39,27 @@ extension BackgroundLoopsAssembly {
     ) -> some EventDeadlineLoopRunner {
         let root = configRoot ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config", isDirectory: true)
+        let deferral = DelegationDeferralState()
         let underlying = DelegationOutcomeLoop(
             // Normal reconciliation is event-driven. Six hours is only the
             // missed-vnode/restart integrity sweep.
             interval: 6 * 60 * 60,
             cursorPath: DelegationOutcomeLoop.defaultCursorPath(dataRoot: dataRoot),
-            readJobs: {
+            readJobsWithAvailability: {
                 // The default (20) is a chat-tool display budget. A loop that
                 // only ever looked at the newest 20
                 // rows could step over a terminal job during a busy window and
                 // never card it — the cursor would then advance past it.
-                DelegationStatusProjector(configRoot: configRoot)
-                    .allJobs(now: Date())
-                    .map(delegationJobSnapshot(from:))
+                //
+                // 2026-09-06: the availability half rides along from the SAME
+                // read, so an unreadable job file holds the cursor instead of
+                // disappearing into an empty-looking store.
+                let read = DelegationStatusProjector(configRoot: configRoot)
+                    .allJobsWithAvailability(now: Date())
+                return DelegationJobsRead(
+                    jobs: read.jobs.map(delegationJobSnapshot(from:)),
+                    allStoresReadable: read.allStoresReadable
+                )
             },
             fileCard: { card in
                 await fileDelegationOutcomeNotice(dataRoot: dataRoot, card: card)
@@ -64,12 +72,14 @@ extension BackgroundLoopsAssembly {
                     )
                 }
                 return await recordBoundDelegationSettlement(dataRoot: dataRoot, job: job)
-            }
+            },
+            reportDeferral: { deferred in await deferral.record(deferred) }
         )
         return DelegationOutcomeEventRunner(
             underlying: underlying,
             dataRoot: dataRoot,
             configRoot: root,
+            deferral: deferral,
             watchedPaths: [
                 root.appendingPathComponent("claude-bridge/wake-jobs", isDirectory: true),
                 root.appendingPathComponent("codex-nativeagent-bridge/reply-jobs", isDirectory: true),
@@ -97,6 +107,7 @@ extension BackgroundLoopsAssembly {
             deliveryOutcome: row.deliveryOutcome,
             deliveryLost: row.deliveryLost,
             completionTextHead: row.completionTextHead,
+            recoveryNote: row.recoveryNote,
             deskHandle: row.deskHandle,
             stalled: row.stalled,
             stallBasis: row.stallBasis.rawValue,
@@ -117,7 +128,7 @@ extension BackgroundLoopsAssembly {
         let delivery = job.deliveryOutcome ?? "unreported"
         let completed = job.completedAt ?? "timestamp unavailable"
         let note = "\(marker) — \(job.agent) run \(run); delivery \(delivery); completed \(completed). "
-            + "Execution/delivery evidence only; Agent must still assess the result against the request."
+            + "Execution/delivery evidence only; \(AgentVoice.live.subject) must still assess the result against the request."
         do {
             _ = try await SwiftNativeDeskStore(dataRoot: dataRoot).appendNoteIfAbsent(
                 handle,
@@ -131,6 +142,11 @@ extension BackgroundLoopsAssembly {
             // the outcome cursor behind an impossible write.
             return true
         } catch {
+            // 2026-09-06: the loop already retries on `false`, but the reason
+            // used to die here. A settlement that keeps failing is now both
+            // retried AND nameable from the log next to the failed tick.
+            FileHandle.standardError.write(Data(("DelegationOutcomeLoop: Desk settlement failed "
+                + "for \(job.source):\(job.id) on \(handle): \(error)\n").utf8))
             return false
         }
     }
@@ -304,11 +320,25 @@ extension BackgroundLoopsAssembly {
     }
 }
 
+/// Whether the last tick left outcomes unsettled. Written by the loop's
+/// deferral report, read by the runner's deadline projection.
+actor DelegationDeferralState {
+    private var deferred = false
+    func record(_ value: Bool) { deferred = value }
+    var hasDeferredWork: Bool { deferred }
+}
+
 private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     let underlying: DelegationOutcomeLoop
     let dataRoot: URL
     let configRoot: URL
+    let deferral: DelegationDeferralState
     let watchedPaths: [URL]
+
+    /// How soon a tick that deferred outcomes comes back. Short enough that the
+    /// remainder of a burst lands while the user is still in the same sitting,
+    /// long enough that a permanently failing settlement cannot spin.
+    static let deferredRerunGap: TimeInterval = 60
 
     var loopId: String { underlying.loopId }
     var interval: TimeInterval { underlying.interval }
@@ -339,7 +369,15 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     }
 
     func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        DelegationStatusProjector(configRoot: configRoot)
+        let stall = DelegationStatusProjector(configRoot: configRoot)
             .nextStallDeadline(after: now)
+        // 2026-09-06: the ten-card cap and contiguous settlement leave real
+        // work behind, and nothing in the store changes when they do — so the
+        // remainder used to wait for the next bridge write or the six-hour
+        // integrity sweep. A deferring tick books its own continuation.
+        guard await deferral.hasDeferredWork else { return stall }
+        let rerun = now.addingTimeInterval(Self.deferredRerunGap)
+        guard let stall else { return rerun }
+        return min(stall, rerun)
     }
 }

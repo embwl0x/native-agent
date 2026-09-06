@@ -13,18 +13,18 @@ enum TelegramAssistantDeliveryOutcome: Sendable, Equatable {
 actor TelegramAssistantDeliveryDriver {
     typealias SendRichDraft = @Sendable (
         _ token: String,
-        _ chatId: Int,
+        _ destination: TelegramDestination,
         _ draftId: Int,
         _ richMessage: TelegramInputRichMessage
     ) async throws -> Void
     typealias SendRichFinal = @Sendable (
         _ token: String,
-        _ chatId: Int,
+        _ destination: TelegramDestination,
         _ richMessage: TelegramInputRichMessage
     ) async throws -> Int
     typealias SendOrdinary = @Sendable (
         _ token: String,
-        _ chatId: Int,
+        _ destination: TelegramDestination,
         _ text: String
     ) async throws -> Void
     typealias Clock = @Sendable () -> Date
@@ -37,7 +37,7 @@ actor TelegramAssistantDeliveryDriver {
     }
 
     private let token: String
-    private let chatId: Int
+    private let destination: TelegramDestination
     private let draftId: Int
     private let ordinary: TelegramDraftStreamer
     private let sendOrdinary: SendOrdinary
@@ -53,7 +53,7 @@ actor TelegramAssistantDeliveryDriver {
 
     init(
         token: String,
-        chatId: Int,
+        destination: TelegramDestination,
         turnId: UUID,
         ordinary: TelegramDraftStreamer,
         sendOrdinary: @escaping SendOrdinary,
@@ -64,7 +64,7 @@ actor TelegramAssistantDeliveryDriver {
         recordFailure: @escaping FailureRecorder = { _ in }
     ) {
         self.token = token
-        self.chatId = chatId
+        self.destination = destination
         self.draftId = Self.draftId(for: turnId)
         self.ordinary = ordinary
         self.sendOrdinary = sendOrdinary
@@ -88,7 +88,7 @@ actor TelegramAssistantDeliveryDriver {
             // Bot API rich drafts are private-chat only. Group/supergroup ids
             // are negative; keep the rich final lane without manufacturing a
             // predictable draft rejection and false health error.
-            guard chatId > 0 else { return }
+            guard destination.chatId > 0 else { return }
             let now = clock()
             guard now.timeIntervalSince(lastRichDraftAt) >= richDraftInterval else {
                 return
@@ -99,7 +99,7 @@ actor TelegramAssistantDeliveryDriver {
                 return
             }
             do {
-                try await sendRichDraft(token, chatId, draftId, rich)
+                try await sendRichDraft(token, destination, draftId, rich)
                 lastRichDraftAt = now
             } catch {
                 // A rich draft is only a 30-second preview, never the durable
@@ -130,7 +130,7 @@ actor TelegramAssistantDeliveryDriver {
                 return await finalizeOrdinary(reply: safeReply)
             }
             do {
-                let messageId = try await sendRichFinal(token, chatId, rich)
+                let messageId = try await sendRichFinal(token, destination, rich)
                 lane = .terminal
                 return .delivered(messageId: messageId)
             } catch {
@@ -168,7 +168,7 @@ actor TelegramAssistantDeliveryDriver {
         guard lane == .rich else { return }
         lane = .ordinary
         if let reason {
-            await recordFailure("Telegram \(reason) for chat \(chatId); using ordinary draft")
+            await recordFailure("Telegram \(reason) for chat \(destination.chatId); using ordinary draft")
         }
         if !latestAccumulatedText.isEmpty {
             await ordinary.onDelta(latestAccumulatedText)
@@ -179,9 +179,18 @@ actor TelegramAssistantDeliveryDriver {
         lane = .ordinary
         do {
             for chunk in await ordinary.finalize(reply: reply) {
-                try await sendOrdinary(token, chatId, chunk)
+                try await sendOrdinary(token, destination, chunk)
             }
             lane = .terminal
+            // 2026-09-06: a draft send OR final edit crossed the wire without a
+            // response, so finalize deliberately withheld the chunk it carried.
+            // Whether the user can see that text is unknowable; say so on the
+            // work card instead of claiming a clean delivery.
+            if await ordinary.hasUnknownOutcome {
+                return .outcomeUnknown(
+                    reason: "the draft update was not confirmed, so part of the reply may be missing"
+                )
+            }
             return .delivered(messageId: nil)
         } catch {
             lane = .terminal
@@ -195,7 +204,7 @@ actor TelegramAssistantDeliveryDriver {
 
     private func reportFailure(step: String, error: Error) async {
         await recordFailure(
-            "Telegram assistant \(step) failed for chat \(chatId): \(Self.safeReason(error))"
+            "Telegram assistant \(step) failed for chat \(destination.chatId): \(Self.safeReason(error))"
         )
     }
 

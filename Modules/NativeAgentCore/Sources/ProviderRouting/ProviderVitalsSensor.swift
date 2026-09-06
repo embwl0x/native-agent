@@ -276,10 +276,10 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
         var state = states[key] ?? State()
         let previousBand = state.band
 
-        // Latency EMAs (fast + slow baseline).
+        // Fast latency EMA. The slow baseline is deliberately NOT updated here
+        // — see below, after the band for this sample is known.
         if let duration = sample.durationMs {
             state.emaLatencyMs = ema(state.emaLatencyMs, duration, alpha: configuration.fastAlpha)
-            state.baselineLatencyMs = ema(state.baselineLatencyMs, duration, alpha: configuration.baselineAlpha)
         }
         if let ttft = sample.ttftMs {
             state.emaTTFTMs = ema(state.emaTTFTMs, ttft, alpha: configuration.fastAlpha)
@@ -298,6 +298,26 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
         let strain = state.sampleCount < configuration.warmupSamples ? 0 : self.strain(for: state)
         let nextBand = resolveBand(current: state.band, strain: strain)
         state.band = nextBand
+
+        // User, 2026-09-06: the baseline is what NORMAL looks like, so it learns
+        // only from samples that were nominal going in AND coming out.
+        //
+        // Folding every sample in taught the baseline the provider's own
+        // degradation: under sustained slowness `ratio = ema / base` walked
+        // back toward 1, the latency contributor fell out of the strain, and
+        // the sensor announced a recovery that never happened. Gating on the
+        // PREVIOUS band alone still let the transition sample through — the
+        // one sample that broke the band is the worst one to call normal, and
+        // on a flapping provider every excursion donated its first bad sample
+        // to the baseline. The band is resolved first (against the established
+        // baseline, which is the comparison that makes it meaningful), and the
+        // baseline learns only if the sample left the provider nominal too.
+        // Cold start still learns freely — a warming provider is pinned
+        // nominal until `warmupSamples`.
+        if previousBand == .nominal, nextBand == .nominal, let duration = sample.durationMs {
+            state.baselineLatencyMs = ema(
+                state.baselineLatencyMs, duration, alpha: configuration.baselineAlpha)
+        }
 
         if nextBand == .degraded {
             if state.degradedSince == nil { state.degradedSince = sample.occurredAt }
@@ -375,6 +395,19 @@ public actor ProviderVitalsSensor: LLMCallLifecycleObserving {
             }
         }
         return decisions
+    }
+
+    /// Put the card latch back where it was after the owner's inbox write
+    /// FAILED. User, 2026-09-06: `evaluateCardDecisions` flips `cardActive`
+    /// optimistically and the owner's append can fail (it logs and returns), so
+    /// a failed stage permanently consumed the transition — the latch said a
+    /// card was up, no card existed, and it was never re-staged. The owner
+    /// reverts here so the next sweep retries.
+    public func revertCardLatch(providerId: String, to active: Bool) {
+        let key = normalizedProviderId(providerId)
+        guard var state = states[key] else { return }
+        state.cardActive = active
+        states[key] = state
     }
 
     // MARK: Read-only introspection / snapshot

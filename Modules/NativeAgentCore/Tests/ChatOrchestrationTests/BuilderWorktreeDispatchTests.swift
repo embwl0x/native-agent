@@ -422,7 +422,7 @@ func nonGitBuilderDispatchPreservesNilWorkingDirectory() async throws {
             ],
             surface: "chat"
         )
-        #expect(builderString("status", in: first) == "queued")
+        #expect(builderString("status", in: first) == (route.tool == "claude_message" ? "accepted" : "queued"))
         #expect(builderString("workingDirectory", in: first) == nil)
         let conversationId = try #require(builderString("conversationId", in: first))
 
@@ -435,7 +435,7 @@ func nonGitBuilderDispatchPreservesNilWorkingDirectory() async throws {
             ],
             surface: "chat"
         )
-        #expect(builderString("status", in: followUp) == "queued")
+        #expect(builderString("status", in: followUp) == (route.tool == "claude_message" ? "accepted" : "queued"))
         #expect(builderString("workingDirectory", in: followUp) == nil)
     }
 
@@ -464,7 +464,7 @@ func nonGitBuilderDispatchPreservesRequestedWorkingDirectory() async throws {
             ],
             surface: "chat"
         )
-        #expect(builderString("status", in: result) == "queued")
+        #expect(builderString("status", in: result) == (route.tool == "claude_message" ? "accepted" : "queued"))
         #expect(builderString("workingDirectory", in: result) == fixture.repo.path)
     }
 

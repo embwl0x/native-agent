@@ -13,9 +13,21 @@ public enum OpenAIExecutionControls {
     }
 
     private static let standardEfforts: Set<String> = ["low", "medium", "high", "xhigh"]
+    private static let publicGPT6AstraEfforts = Set(FirstPartyModelCatalog.publicGPT6AstraEfforts)
+    private static let accountGPT6AstraEfforts = Set(FirstPartyModelCatalog.accountGPT6AstraEfforts)
     private static let publicGPT56Efforts: Set<String> = ["none", "low", "medium", "high", "xhigh", "max"]
     private static let accountSolTerraEfforts: Set<String> = ["low", "medium", "high", "xhigh", "max", "ultra"]
     private static let accountLunaEfforts: Set<String> = ["low", "medium", "high", "xhigh", "max"]
+
+    /// Models intentionally exposed by the model-facing Codex bridge tools.
+    /// The parser remains open to account-discovered models for compatibility;
+    /// these are the built-in choices advertised to the model.
+    public static let codexBridgeModelIDs = [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        FirstPartyModelCatalog.gpt6AstraModelID,
+    ]
 
     public static func supportedReasoningEfforts(
         model: String,
@@ -24,12 +36,16 @@ public enum OpenAIExecutionControls {
         let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch transport {
         case .publicAPI:
+            if normalizedModel == FirstPartyModelCatalog.gpt6AstraModelID {
+                return publicGPT6AstraEfforts
+            }
             if normalizedModel == "gpt-5.6" || normalizedModel.hasPrefix("gpt-5.6-") {
                 return publicGPT56Efforts
             }
             return standardEfforts
         case .chatGPTOAuth, .codexCLI:
             switch normalizedModel {
+            case FirstPartyModelCatalog.gpt6AstraModelID: return accountGPT6AstraEfforts
             case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra": return accountSolTerraEfforts
             case "gpt-5.6-luna": return accountLunaEfforts
             default: return standardEfforts

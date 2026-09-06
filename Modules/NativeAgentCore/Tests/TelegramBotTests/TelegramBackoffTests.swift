@@ -88,15 +88,36 @@ private func readRows(_ url: URL) -> [JSONValue] {
 
 // MARK: - TelegramExponentialBackoff unit tests (virtual time)
 
-@Test func backoff_curve_doubles_from_1s_to_300s_cap_with_unit_jitter() async {
+/// FIX-7 (2026-09-01): the poll lane's default cap is 60s — the figure
+/// `TelegramPollLoop` documents. Pinned here because nothing in production
+/// passes an override, so this default IS the contract User's most-used remote
+/// surface runs on.
+@Test func backoff_curve_doubles_from_1s_to_60s_cap_with_unit_jitter() async {
     let clock = VirtualClock()
     let backoff = TelegramExponentialBackoff(now: { clock.now }, random: { _ in 1.0 })
     var delays: [TimeInterval] = []
     for _ in 0..<8 {
         delays.append(await backoff.recordFailure())
     }
-    #expect(delays == [1, 2, 4, 8, 16, 32, 64, 128])
+    #expect(delays == [1, 2, 4, 8, 16, 32, 60, 60])
     #expect(await backoff.failureCount() == 8)
+}
+
+/// The command-menu lane keeps its own, slower ceiling by passing it
+/// explicitly: capping the poll lane must not have moved it.
+@Test func command_menu_backoff_keeps_its_explicit_300s_cap() async {
+    let clock = VirtualClock()
+    let backoff = TelegramExponentialBackoff(
+        baseDelay: 5,
+        maxDelay: 300,
+        now: { clock.now },
+        random: { _ in 1.0 }
+    )
+    var last: TimeInterval = 0
+    for _ in 0..<12 {
+        last = await backoff.recordFailure()
+    }
+    #expect(last == 300)
 }
 
 @Test func backoff_success_resets_curve_and_window() async {
@@ -139,13 +160,13 @@ private func readRows(_ url: URL) -> [JSONValue] {
     )
     // First failure: raw 1s × 1.2 jitter.
     #expect(await backoff.recordFailure() == 1.2)
-    // Drive to the cap: raw clamps to 300 BEFORE jitter, and the jittered
-    // value re-clamps to 300 — the documented cap is a hard ceiling.
+    // Drive to the cap: raw clamps to 60 BEFORE jitter, and the jittered
+    // value re-clamps to 60 — the documented cap is a hard ceiling.
     var last: TimeInterval = 0
     for _ in 0..<10 {
         last = await backoff.recordFailure()
     }
-    #expect(last == 300)
+    #expect(last == 60)
 }
 
 // MARK: - Poll-loop integration (failure gating + recovery, virtual time)

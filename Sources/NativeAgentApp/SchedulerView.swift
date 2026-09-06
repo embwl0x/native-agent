@@ -67,6 +67,48 @@ struct SchedulerJobsRefreshCoalescer: Equatable {
     }
 }
 
+/// What the Scheduler screen says after a pause/resume settles. The switch is a
+/// control now (item 36), so every outcome gets a line: a refused write must
+/// never read like an accepted one.
+enum SchedulerJobToggleOutcome: Equatable {
+    case verified(SchedulerJob)
+    case failed(String)
+}
+
+enum SchedulerJobTogglePresentation {
+    struct Message: Equatable {
+        let text: String
+        let isError: Bool
+    }
+
+    static func receipt(
+        jobName: String,
+        requestedEnabled: Bool,
+        outcome: SchedulerJobToggleOutcome
+    ) -> Message {
+        switch outcome {
+        case .verified(let job):
+            let name = nonempty(job.name, fallback: jobName)
+            return Message(
+                text: "\(name) is \(job.enabled ? "enabled" : "paused").",
+                isError: false
+            )
+        case .failed(let detail):
+            return Message(
+                text: "Could not \(requestedEnabled ? "enable" : "pause") "
+                    + "\(nonempty(jobName, fallback: "job")): "
+                    + nonempty(detail, fallback: "the scheduler did not confirm the change"),
+                isError: true
+            )
+        }
+    }
+
+    private static func nonempty(_ value: String?, fallback: String) -> String {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+}
+
 struct SchedulerView: View {
     @Environment(AppModel.self) private var appModel
     @State private var isLoadingJobs = true
@@ -74,6 +116,8 @@ struct SchedulerView: View {
     @State private var reflectionOutcome: NightlyReflectionJobOutcome?
     @State private var jobsLoadResult: SchedulerJobsRefreshResult?
     @State private var refreshCoalescer = SchedulerJobsRefreshCoalescer()
+    @State private var togglingJobIDs: Set<String> = []
+    @State private var toggleMessage: SchedulerJobTogglePresentation.Message?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -123,12 +167,32 @@ struct SchedulerView: View {
                     if let detail = jobsLoadResult?.failureDetail {
                         StalePanelNotice(text: detail)
                     }
+                    if let toggleMessage {
+                        Text(toggleMessage.text)
+                            .font(.caption)
+                            .foregroundStyle(toggleMessage.isError ? Color.red : Color.secondary)
+                    }
                     List(appModel.jobs) { job in
-                        VStack(alignment: .leading) {
-                            Text(job.name)
-                            Text("\(job.kind) · \(job.enabled ? "enabled" : "paused")")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        HStack(alignment: .firstTextBaseline) {
+                            VStack(alignment: .leading) {
+                                Text(job.name)
+                                Text(job.kind)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                            // Item 36: this used to be a plain Text reading
+                            // "enabled"/"paused" beside a write nothing called.
+                            // It is the control now — the state User reads and
+                            // the state he sets are the same thing.
+                            Toggle("", isOn: Binding(
+                                get: { job.enabled },
+                                set: { setEnabled(job, $0) }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .disabled(togglingJobIDs.contains(job.id))
+                            .accessibilityLabel("\(job.name) enabled")
                         }
                     }
                 }
@@ -141,6 +205,24 @@ struct SchedulerView: View {
             await SchedulerJobsLiveRefresh.observe(path: jobsPath) {
                 await loadJobs()
             }
+        }
+    }
+
+    /// One pause/resume per job in flight. The row is repainted from
+    /// `appModel.jobs` after the write settles, so the switch always shows the
+    /// store's truth rather than the click's.
+    private func setEnabled(_ job: SchedulerJob, _ enabled: Bool) {
+        guard !togglingJobIDs.contains(job.id) else { return }
+        togglingJobIDs.insert(job.id)
+        toggleMessage = nil
+        Task { @MainActor in
+            let outcome = await appModel.setSchedulerJobEnabled(id: job.id, enabled: enabled)
+            togglingJobIDs.remove(job.id)
+            toggleMessage = SchedulerJobTogglePresentation.receipt(
+                jobName: job.name,
+                requestedEnabled: enabled,
+                outcome: outcome
+            )
         }
     }
 

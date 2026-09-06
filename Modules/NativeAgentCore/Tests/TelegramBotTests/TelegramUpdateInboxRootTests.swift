@@ -194,12 +194,27 @@ private final class TelegramClaimReadCapture: @unchecked Sendable {
             await loop.tick()
         }
         let elapsed = started.duration(to: clock.now)
+        // 2026-09-06: `/help` is a slash command, and a slash command now runs
+        // in its own detached task that settles its own claim — so the send,
+        // the claim transition and the retention prune all land after `tick()`
+        // returns. Wait for the end state instead of reading straight through.
+        #expect(await telegramWaitFor {
+            fileNames(inbox.directory).contains("corrupt-later.json")
+                && claimFileNames(inbox.directory).contains("300.json")
+        })
 
         let claimNames = claimFileNames(inbox.directory)
-        #expect(claimNames.count == 256)
+        // 2026-09-06: `/help` is a slash command, and a slash command now runs
+        // in its own detached task that settles its own claim, so update 300 is
+        // still in flight when the tick's retention step runs. The prune
+        // therefore sees the 257 SEEDED terminal claims and drops exactly one
+        // to reach the 256 cap; 300's own claim lands afterwards. What this
+        // test is about is unchanged: the prune ran off the single recovery
+        // read (0.json is gone) without a second scan of retained history.
+        #expect(claimNames.count == 257)
         #expect(fileNames(inbox.directory).contains("corrupt-later.json"))
         #expect(!claimNames.contains("0.json"))
-        #expect(!claimNames.contains("1.json"))
+        #expect(claimNames.contains("1.json"))
         #expect(claimNames.contains("300.json"))
         // 256 historical terminal claims exist, but this tick only decodes
         // the two mutation reads for update 300. A retained-history scan

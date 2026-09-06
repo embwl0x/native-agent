@@ -294,18 +294,32 @@ struct SlackDurableInboundDeliveryTests {
         #expect(await recorder.posts.count == 1)
     }
 
+    /// The turn is never replayed (its tool effects may already have landed),
+    /// but the sender is TOLD, once, on Slack — fable51 #9. Before this, the
+    /// message was consumed and only the error log knew.
     @Test func crashDuringGenerationDoesNotReplayPotentialToolEffects() async throws {
         let root = try root()
         defer { try? FileManager.default.removeItem(at: root) }
-        let message = inbound()
+        let message = inbound(thread: "0.500")
         let journal = SlackInboundDeliveryJournal(dataRoot: root)
         _ = try await journal.claim(message)
         _ = try await journal.beginGeneration(eventId: message.eventId)
         let recorder = DurableSlackRecorder()
         #expect(await loop(root: root, recorder: recorder).handleDurableInbound(message) == false)
         #expect(await recorder.generations == 0)
-        #expect(await recorder.posts.isEmpty)
         #expect(try await journal.record(eventId: message.eventId)?.phase == .outcomeUnknown)
+
+        // ONE honest notice, in the thread the lost message lives in — and no
+        // regenerated reply.
+        #expect(await recorder.posts.count == 1)
+        #expect(await recorder.posts.first?["text"] == .string(SlackSocketModeLoop.lostTurnNotice))
+        #expect(await recorder.posts.first?["thread_ts"] == .string("0.500"))
+
+        // A restart loop cannot repeat it: the durable phase flip routes every
+        // later pass into reconciliation instead.
+        #expect(await loop(root: root, recorder: recorder).handleDurableInbound(message) == false)
+        #expect(await recorder.posts.count == 1)
+        #expect(await recorder.generations == 0)
     }
 
     @Test func crashAfterSlackAcceptanceReconcilesCorrectThreadWithoutResending() async throws {
@@ -458,7 +472,7 @@ struct SlackDurableInboundDeliveryTests {
         #expect(SlackSocketModeLoop.teardownGrace(
             closing: SlackSocketSessionClosure.disconnect(reason: "refresh_requested"),
             recyclePlanned: false) == planned)
-        for fatal in ["link_disabled", "too_many_connections"] {
+        for fatal in ["link_disabled", "too_many_connections", "too_many_websockets"] {
             #expect(SlackSocketModeLoop.teardownGrace(
                 closing: SlackSocketSessionClosure.disconnect(reason: fatal),
                 recyclePlanned: true) == 0)

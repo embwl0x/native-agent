@@ -308,6 +308,11 @@ struct TelegramInboundDropTests {
             "empty_or_non_text",
             "chat_handler_not_configured",
             "unsupported_slash_command",
+            // 2026-09-06: a group delivers `/cmd@OtherBot` to every bot in the
+            // room and slash dispatch runs BEFORE the mention filter, so
+            // `/stop@SomeOtherBot` used to stop this agent's own turn. A
+            // command addressed to another bot is dropped with this reason.
+            "command_for_other_bot",
         ]
 
         let sourceDir = try SourceTreeRepoRoot.locate()

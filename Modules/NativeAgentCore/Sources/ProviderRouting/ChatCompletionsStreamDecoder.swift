@@ -69,6 +69,10 @@ public struct ChatCompletionsStreamDecoder {
     /// telemetry shape. `nil` when the stream sent no usage frame — the recorder
     /// omits nil keys, so the row simply carries no token fields.
     public private(set) var usage: LLMUsage?
+    /// True once this stream has produced model output of any kind — a content
+    /// delta, reasoning, or a tool-call fragment. User, 2026-09-06: gates the
+    /// malformed-frame rule in `consume`.
+    private var sawSemanticOutput = false
 
     public init(providerLabel: String) {
         self.providerLabel = providerLabel
@@ -107,7 +111,16 @@ public struct ChatCompletionsStreamDecoder {
         }
         guard let data = payload.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return frame  // malformed JSON frame — skip
+            // User, 2026-09-06: an unparseable frame used to vanish, so a
+            // corrupted transport mid-answer silently dropped a chunk of the
+            // reply (or of a tool call's arguments) and the turn still finished
+            // "successfully". Once the stream has started producing output,
+            // a frame we cannot read is a stream failure — transient, so the
+            // reconnect ladder re-asks — not silence. Before any output it is
+            // still skipped: a provider preamble is not a corrupted answer.
+            guard sawSemanticOutput else { return frame }
+            throw LLMError.transient(
+                message: "\(providerLabel): malformed stream frame after content")
         }
         // Root error frame FIRST: it carries no `choices`, so a bare delta
         // guard swallows it (the B2 bug). Throw the provider's own message,
@@ -134,12 +147,15 @@ public struct ChatCompletionsStreamDecoder {
         if let thought = delta["reasoning_content"] as? String, !thought.isEmpty {
             reasoning += thought
             frame.reasoning = thought
+            sawSemanticOutput = true
         }
         if let content = delta["content"] as? String, !content.isEmpty {
             frame.content = content
+            sawSemanticOutput = true
         }
         if let calls = delta["tool_calls"] as? [[String: Any]] {
             frame.toolCallDeltaCount = calls.count
+            sawSemanticOutput = true
             var touched: [Int] = []
             frameAligned = true
             for (position, raw) in calls.enumerated() {
@@ -272,6 +288,78 @@ public struct ChatCompletionsToolCall: Sendable, Equatable {
 }
 
 // MARK: - Shared adapter helpers (C10)
+
+/// A non-streaming Chat-Completions `tool_calls` array, finalized.
+struct ChatCompletionsToolCallSet {
+    /// The calls to execute. EMPTY when the set was dropped.
+    var calls: [ChatCompletionsToolCall]
+    /// Set when the whole set was dropped; the adapter appends it to the reply
+    /// text so the turn says what it discarded instead of going quiet.
+    var incompleteNote: String?
+}
+
+/// User, 2026-09-06: the non-streaming lanes `compactMap`ped their `tool_calls`,
+/// so an entry the adapter could not execute (no `function` object, or no
+/// name) was silently dropped and its siblings ran anyway — half of a plan the
+/// model wrote as one decision, chosen by which entry happened to be
+/// well-formed. The rule is now the streaming lanes': all-or-nothing, with the
+/// note that names what was lost.
+func finalizeChatCompletionsToolCalls(
+    _ raw: [[String: Any]],
+    idPrefix: String
+) -> ChatCompletionsToolCallSet {
+    guard !raw.isEmpty else { return ChatCompletionsToolCallSet(calls: [], incompleteNote: nil) }
+    var calls: [ChatCompletionsToolCall] = []
+    var malformed = 0
+    for (index, entry) in raw.enumerated() {
+        guard let function = entry["function"] as? [String: Any],
+              let rawName = function["name"] as? String,
+              case let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty
+        else {
+            malformed += 1
+            continue
+        }
+        // User, 2026-09-06: any nonempty `arguments` string used to be accepted
+        // verbatim. Downstream, the tool loop's marker parse falls back to an
+        // EMPTY input object when the body is not parseable JSON
+        // (ChatOrchestration+ToolLoop.swift), so a truncated or corrupt
+        // arguments payload ran the tool with no arguments at all — a
+        // different action than the model asked for, executed silently. An
+        // unparseable arguments string is malformed, and the set goes with it.
+        let rawArguments = (function["arguments"] as? String) ?? ""
+        let trimmedArguments = rawArguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        let arguments: String
+        if trimmedArguments.isEmpty {
+            // A genuinely no-argument call: the wire form is "" or "{}".
+            arguments = "{}"
+        } else if let data = trimmedArguments.data(using: .utf8),
+                  (try? JSONSerialization.jsonObject(with: data)) is [String: Any] {
+            arguments = rawArguments
+        } else {
+            malformed += 1
+            continue
+        }
+        let id = (entry["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? "\(idPrefix)_\(index)_\(name)"
+        calls.append(ChatCompletionsToolCall(id: id, name: name, arguments: arguments))
+    }
+    guard malformed == 0 else {
+        return ChatCompletionsToolCallSet(
+            calls: [],
+            incompleteNote: OpenAIOAuthDirectAdapter.incompleteNote(
+                "\(malformed) of \(raw.count) tool call(s) were unusable"
+            )
+        )
+    }
+    return ChatCompletionsToolCallSet(calls: calls, incompleteNote: nil)
+}
+
+/// The `<tool_use …>` marker shape every Chat-Completions-family adapter
+/// returns from its non-streaming path for the tool loop.
+func chatCompletionsToolUseMarker(_ call: ChatCompletionsToolCall) -> String {
+    "<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(call.arguments)</tool_use>"
+}
 
 /// Truncate an error-response body for inclusion in a thrown message. Plain
 /// (non-redacting) — the OAuth-direct adapters keep their own redacting

@@ -64,6 +64,7 @@ extension AppModel {
     func savePersonality(_ profile: PersonalityProfile) async {
         do {
             personality = try await client.savePersonality(profile)
+            teachMemoryHygieneName()
             compiledPersonality = try? await client.getCompiledPersonality(surface: "chat")
             if let docsResponse = try? await client.getPersonalityDocs() {
                 personalityDocs = docsResponse.docs
@@ -94,6 +95,7 @@ extension AppModel {
         do {
             let saved = try await client.savePersonalityName(name)
             personality = saved
+            teachMemoryHygieneName()
             statusText = "Name saved as \(saved.name)"
             return .saved(saved)
         } catch {

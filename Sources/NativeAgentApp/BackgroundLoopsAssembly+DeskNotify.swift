@@ -23,7 +23,12 @@ extension BackgroundLoopsAssembly {
             await NativeAgentNotifications.postAndReport(title: title, body: body).posted
         },
         postPairedDeviceNotification: @escaping @Sendable (String, String) async -> Bool = { title, body in
-            (try? await MacSyncEngine.shared.sendNotificationToPairedDevices(
+            // Item 26: a Desk row marked direct/urgent IS User being asked, so
+            // this routes owner-waiting — to the surface he is on, phone as
+            // fallback. Payload unchanged.
+            (try? await AttentionRouter.shared.route(
+                eventId: "desk_notify:\(AttentionRouter.stableDigest(title + "|" + body))",
+                importance: .ownerWaiting,
                 title: title,
                 body: body,
                 userInfo: ["screen": "inbox", "source": "desk"]
@@ -239,7 +244,9 @@ private struct DeskNotifyRunner: EventDeadlineLoopRunner {
     /// with both channel outcomes logged so no failure is silent.
     private func deliverNag(title: String, body: String, label: String, failures: inout [String]) async {
         let macResult = await NativeAgentNotifications.postAndReport(title: title, body: body)
-        let mobileOK = (try? await MacSyncEngine.shared.sendNotificationToPairedDevices(
+        let mobileOK = (try? await AttentionRouter.shared.route(
+            eventId: "desk_nag:\(label)",
+            importance: .ownerWaiting,
             title: title,
             body: body,
             userInfo: ["screen": "inbox", "source": "desk"]

@@ -5,6 +5,43 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// Who is asking for the introspective call.
+public enum CognitiveReflectionDemand: String, Sendable, Equatable {
+    /// A person asked (the Observatory button, an explicit call). The cost
+    /// ceiling still holds; unresolved load does not gate it — refusing a
+    /// direct ask because her seeds are quiet would be a lie about why.
+    case requested
+    /// Nobody asked: the dream/REM commit signal reached her. Admitted ONLY
+    /// when unresolved load is above threshold, under the same ceiling.
+    case spontaneous
+}
+
+/// Why a reflection was (or was not) admitted — the honest ledger line behind
+/// a skipped autonomous call, including the load reading that produced it.
+public struct CognitiveReflectionAdmission: Sendable, Equatable {
+    public var admitted: Bool
+    public var reason: String
+    public var demand: CognitiveReflectionDemand
+    public var load: Double
+    public var threshold: Double
+    public var backlog: Double
+    public var urgency: Double
+    public var dispositionDrift: Double
+    public var callsInWindow: Int
+    public var ceiling: Int
+
+    public var detail: String {
+        "\(reason) (load \(String(format: "%.2f", load))/\(String(format: "%.2f", threshold)), "
+            + "backlog \(String(format: "%.2f", backlog)), urgency \(String(format: "%.2f", urgency)), "
+            + "drift \(String(format: "%.2f", dispositionDrift)), spend \(callsInWindow)/\(ceiling) per 24h)"
+    }
+}
+
+public enum CognitiveReflectionPlan: Sendable {
+    case admitted(CognitiveReflectionRequest)
+    case refused(CognitiveReflectionAdmission)
+}
+
 extension CognitiveSubstrate {
     /// Reflection may propose one settled standing view. REM remains the only
     /// canonical growth-proposal owner; reflection does not manufacture generic
@@ -18,9 +55,17 @@ extension CognitiveSubstrate {
     pass is a correct, expected outcome. Never invent one to fill space.
     """ }
 
-    public func planReflection(reason: String) async -> CognitiveReflectionRequest? {
+    /// Admission-checked planning. A `.spontaneous` call must be earned by
+    /// unresolved load; a `.requested` one only has to fit under the ceiling.
+    /// The refusal carries its reason so the caller can report it instead of
+    /// swallowing a nil.
+    public func planReflectionChecked(
+        reason: String,
+        demand: CognitiveReflectionDemand = .requested
+    ) async -> CognitiveReflectionPlan {
         await waitForMaintenanceTransition()
-        guard reflectionBudgetSlotAvailable() else { return nil }
+        let admission = await reflectionAdmission(demand: demand)
+        guard admission.admitted else { return .refused(admission) }
         let now = dependencies.now()
         let capsule = await compileCapsule(
             CognitiveCapsuleRequest(
@@ -41,10 +86,11 @@ extension CognitiveSubstrate {
         // compileCapsule is async. Recheck after it returns: another manual or
         // scheduled planner may have claimed the final slot while this actor was
         // reentrant, or Settings may have disabled/lowered the budget.
-        guard reflectionBudgetSlotAvailable() else { return nil }
+        let recheck = await reflectionAdmission(demand: demand)
+        guard recheck.admitted else { return .refused(recheck) }
         let reservation = ReflectionReservation(id: dependencies.makeUUID(), since: dependencies.now())
         reflectionReservation = reservation
-        return CognitiveReflectionRequest(
+        return .admitted(CognitiveReflectionRequest(
             reservationId: reservation.id,
             reason: bounded(reason, maxCharacters: 200),
             prompt: prompt,
@@ -53,7 +99,16 @@ extension CognitiveSubstrate {
             provider: configuration.reflectionProvider,
             reasoningEffort: configuration.reflectionReasoningEffort,
             requestedAt: now
-        )
+        ))
+    }
+
+    /// The unchanged entry point: an explicit request, refusal collapsed to nil.
+    public func planReflection(reason: String) async -> CognitiveReflectionRequest? {
+        guard case .admitted(let request) = await planReflectionChecked(
+            reason: reason,
+            demand: .requested
+        ) else { return nil }
+        return request
     }
 
     @discardableResult
@@ -263,23 +318,121 @@ extension CognitiveSubstrate {
         dispositionTone(from: result)
     }
 
-    func reflectionReceiptsToday() -> Int {
-        let calendar = Calendar(identifier: .gregorian)
-        let now = dependencies.now()
-        return reflectionReceipts.values.filter {
-            calendar.isDate($0.createdAt, inSameDayAs: now)
-        }.count
+    /// Refusal vocabulary — stable strings, so a skipped call reads the same in
+    /// a loop outcome, a receipt and a test.
+    public static let reflectionRefusalDisabled = "reflection_disabled"
+    public static let reflectionRefusalCeilingReached = "reflection_cost_ceiling_reached"
+    public static let reflectionRefusalInFlight = "reflection_in_flight"
+    public static let reflectionRefusalLoadBelowThreshold = "reflection_load_below_threshold"
+    static let reflectionAdmittedReason = "admitted"
+
+    /// The cost ceiling's window. ROLLING, not calendar: a reflection at 23:50
+    /// used to free its slot ten minutes later, and a hard afternoon could not
+    /// borrow against a quiet morning.
+    static let reflectionCostWindow: TimeInterval = 24 * 60 * 60
+
+    /// This many live thought seeds read as a full backlog. Deliberately small:
+    /// the seeds decay, so six still-standing ones IS an unresolved pile.
+    static let reflectionBacklogSaturation = 6.0
+
+    /// Reflection calls already spent inside the rolling window. The ledger is
+    /// the receipts themselves — the same rows the calendar-day count read.
+    func reflectionCallsInCostWindow(at now: Date) -> Int {
+        let cutoff = now.addingTimeInterval(-Self.reflectionCostWindow)
+        return reflectionReceipts.values.filter { $0.createdAt > cutoff }.count
     }
 
-    private func reflectionBudgetSlotAvailable() -> Bool {
+    /// What is still unresolved in her, 0...1 — the thing that earns the call.
+    /// All three existing signals, multiplied and read back as a geometric mean
+    /// so the scale stays comparable to the threshold: a backlog nobody would
+    /// interrupt for, or one that has not moved her undertone at all, is not
+    /// load. Any factor at zero is a quiet day.
+    func reflectionUnresolvedLoad(
+        at now: Date
+    ) async -> (backlog: Double, urgency: Double, drift: Double, score: Double) {
+        let backlog = (Double(projectedThoughtSeeds(at: now).count) / Self.reflectionBacklogSaturation).clamped01()
+        let urgency = (await thoughtSuggestionSnapshot(
+            surface: "reflection_admission",
+            limit: 1,
+            minimumInterruptionScore: 0
+        )).first?.interruptionScore ?? 0
+        let cap = max(0.0001, dynamics.dispositionValenceCap)
+        let drift = (abs(decayedDispositionValence(at: now)) / cap).clamped01()
+        let score = cbrt(backlog * urgency * drift).clamped01()
+        return (backlog, urgency, drift, score)
+    }
+
+    /// The hard fence: enabled, under the rolling ceiling, nothing in flight.
+    /// Nil means "no cost objection". Sync and cheap — the terminal recheck and
+    /// the load path share it.
+    private func reflectionCostRefusal(at now: Date) -> String? {
         guard configuration.enabled,
               configuration.reflectiveCallsEnabled,
-              configuration.dailyReflectionCallBudget > 0,
-              reflectionReceiptsToday() < configuration.dailyReflectionCallBudget else {
-            return false
+              configuration.dailyReflectionCallBudget > 0 else {
+            return Self.reflectionRefusalDisabled
         }
-        guard let reservation = reflectionReservation else { return true }
-        return dependencies.now().timeIntervalSince(reservation.since) >= Self.reflectionInFlightMaximumAge
+        guard reflectionCallsInCostWindow(at: now) < configuration.dailyReflectionCallBudget else {
+            return Self.reflectionRefusalCeilingReached
+        }
+        if let reservation = reflectionReservation,
+           now.timeIntervalSince(reservation.since) < Self.reflectionInFlightMaximumAge {
+            return Self.reflectionRefusalInFlight
+        }
+        return nil
+    }
+
+    /// Would a reflection be admitted right now, and why. Load is read only for
+    /// the spontaneous demand — a person asking is never told her seeds are too
+    /// quiet.
+    public func reflectionAdmission(
+        demand: CognitiveReflectionDemand = .spontaneous
+    ) async -> CognitiveReflectionAdmission {
+        let now = dependencies.now()
+        let ceiling = configuration.dailyReflectionCallBudget
+        let threshold = configuration.reflectionLoadThreshold
+        let spent = reflectionCallsInCostWindow(at: now)
+        if let refusal = reflectionCostRefusal(at: now) {
+            return CognitiveReflectionAdmission(
+                admitted: false,
+                reason: refusal,
+                demand: demand,
+                load: 0,
+                threshold: threshold,
+                backlog: 0,
+                urgency: 0,
+                dispositionDrift: 0,
+                callsInWindow: spent,
+                ceiling: ceiling
+            )
+        }
+        guard demand == .spontaneous else {
+            return CognitiveReflectionAdmission(
+                admitted: true,
+                reason: Self.reflectionAdmittedReason,
+                demand: demand,
+                load: 0,
+                threshold: threshold,
+                backlog: 0,
+                urgency: 0,
+                dispositionDrift: 0,
+                callsInWindow: spent,
+                ceiling: ceiling
+            )
+        }
+        let load = await reflectionUnresolvedLoad(at: now)
+        let admitted = load.score > 0 && load.score >= threshold
+        return CognitiveReflectionAdmission(
+            admitted: admitted,
+            reason: admitted ? Self.reflectionAdmittedReason : Self.reflectionRefusalLoadBelowThreshold,
+            demand: demand,
+            load: load.score,
+            threshold: threshold,
+            backlog: load.backlog,
+            urgency: load.urgency,
+            dispositionDrift: load.drift,
+            callsInWindow: reflectionCallsInCostWindow(at: dependencies.now()),
+            ceiling: ceiling
+        )
     }
 
     private func parseReflectionProposals(

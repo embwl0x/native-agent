@@ -124,8 +124,15 @@ struct CognitionProposalsView: View {
                 .foregroundStyle(.secondary)
         } else {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                // Pending first: actionable rows must never hide behind the cap.
-                ForEach(Array((visibleViews.filter { $0.status == .proposed } + visibleViews.filter { $0.status != .proposed }).prefix(8)), id: \.id) { view in
+                // Pending first: actionable rows come first.
+                //
+                // 2026-09-06: the `prefix(8)` cap is gone. The substrate keeps
+                // more standing views than that, and this screen is the ONLY
+                // place they can be approved or retired — anything past the
+                // eighth row was simply invisible, with no expander and no
+                // count to say rows were being withheld. The page already
+                // scrolls; a long list is a long list.
+                ForEach(visibleViews.filter { $0.status == .proposed } + visibleViews.filter { $0.status != .proposed }, id: \.id) { view in
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(view.body)
@@ -138,19 +145,19 @@ struct CognitionProposalsView: View {
                         Spacer()
                         ForEach(
                             CognitionSurfaceDispositionPresentation.standingViewActions(
-                                isPending: view.status == .proposed
+                                isPending: view.status == .proposed,
+                                isLeaning: view.isLeaning
                             ),
                             id: \.self
                         ) { action in
-                            Button(
-                                action.title,
-                                systemImage: action == .approve ? "checkmark" : "xmark"
-                            ) {
+                            Button(action.title, systemImage: action.systemImage) {
                                 Task {
-                                    let result = await CognitionProposalActions.resolveWithOutcome(
-                                        id: view.id,
-                                        approved: action.approved
-                                    )
+                                    let result = action == .retire
+                                        ? await CognitionProposalActions.retireWithOutcome(id: view.id)
+                                        : await CognitionProposalActions.resolveWithOutcome(
+                                            id: view.id,
+                                            approved: action.approved
+                                        )
                                     detail = result.detail
                                     reportReview(result.status, action: action.title)
                                 }
@@ -173,7 +180,12 @@ struct CognitionProposalsView: View {
                 .foregroundStyle(.secondary)
         } else {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                ForEach(Array((proposals.filter { $0.status == .proposed } + proposals.filter { $0.status != .proposed }).prefix(8)), id: \.id) { proposal in
+                // 2026-09-06: uncapped for the same reason the standing-view
+                // list above is — the eight-row cap had no expander and no
+                // count, so every schema proposal past the eighth was simply
+                // invisible on the only screen that shows them. The page
+                // scrolls.
+                ForEach(proposals.filter { $0.status == .proposed } + proposals.filter { $0.status != .proposed }, id: \.id) { proposal in
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(proposal.title)
@@ -201,6 +213,9 @@ struct CognitionProposalsView: View {
         case .unavailable(let message):
             reviewError = "\(action) not applied: \(message)"
             appModel.systemToasts.push(error: reviewError ?? message)
+        case .notSaved(let detail):
+            reviewError = "\(action) was not saved and will not survive a restart: \(detail)"
+            appModel.systemToasts.push(error: reviewError ?? detail)
         }
     }
 }
@@ -265,6 +280,8 @@ final class InlineCognitionProposalCardActionState {
                 : "Standing view rejected and retired.")
         case .unavailable(let detail):
             result = .unavailable("Standing-view review not applied: \(detail)")
+        case .notSaved(let detail):
+            result = .unavailable("Standing-view review was not saved: \(detail)")
         }
         feedback = result
         return result

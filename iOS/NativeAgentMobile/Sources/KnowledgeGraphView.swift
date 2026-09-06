@@ -405,7 +405,7 @@ struct KnowledgeGraphView: View {
         .navigationTitle("Knowledge Graph")
         .macSyncErrorBanner()
         // E6: freshness of the Mac snapshot behind this graph.
-        .macSnapshotFreshnessBadge()
+        .macSnapshotFreshnessBadge(group: "knowledge_graph")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {

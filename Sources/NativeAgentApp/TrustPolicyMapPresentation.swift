@@ -123,13 +123,27 @@ struct TrustPolicyMapRow: Identifiable, Equatable {
     let title: String
     let files: String
     let autonomy: String
+    /// What SELECTING this mode would write — the mode's template.
     let macControlPolicy: TrustMacControlPolicy
+    /// The policy actually on disk, carried only by the highlighted row.
+    /// User, 2026-09-06: the highlighted row described the template rather than
+    /// what is saved, so with Full Mac active it always claimed Mac control and
+    /// iOS remote were on — but the Mac-control screen turns each of those off
+    /// independently without leaving the mode. The row a person reads as "what
+    /// is on right now" now reads the saved values.
+    var savedPolicy: TrustMacControlPolicy?
     let isActive: Bool
 
     var id: String { mode }
-    var shellAllowed: Bool { macControlPolicy.enabled && macControlPolicy.shellAllowed }
-    var macControlAllowed: Bool { macControlPolicy.enabled }
-    var iosRemoteAllowed: Bool { macControlPolicy.enabled && macControlPolicy.remoteFromIosAllowed }
+    /// The template for every other row; the saved policy for the active one.
+    private var describedPolicy: TrustMacControlPolicy {
+        isActive ? (savedPolicy ?? macControlPolicy) : macControlPolicy
+    }
+    var shellAllowed: Bool { describedPolicy.enabled && describedPolicy.shellAllowed }
+    var macControlAllowed: Bool { describedPolicy.enabled }
+    var iosRemoteAllowed: Bool {
+        describedPolicy.enabled && describedPolicy.remoteFromIosAllowed
+    }
 }
 
 enum TrustPolicyMapPresentation: Equatable {
@@ -158,6 +172,7 @@ enum TrustPolicyMapPresentation: Equatable {
                     remoteFromIosAllowed: remoteFromIosAllowed,
                     developerMode: developerMode
                 ),
+                savedPolicy: policy.macControlPolicy,
                 isActive: definition.mode == active
             )
         })

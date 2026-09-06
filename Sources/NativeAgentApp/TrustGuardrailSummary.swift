@@ -264,19 +264,19 @@ struct TrustGuardrailSummaryPanel: View {
     }
 
     var body: some View {
-        NativePanel(title: "What Agent can do right now", systemImage: "eye", tint: .blue) {
+        NativePanel(title: "What \(AgentVoice.live.subject) can do right now", systemImage: "eye") {
             if rows.isEmpty {
-                HStack(spacing: 10) {
+                HStack(spacing: NativeAgentSpacing.sm) {
                     ProgressView().controlSize(.small)
                     Text("Reading your current settings…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             } else {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
                     Text("Every line below is read from your settings as they are right now, not a description of how the app usually works.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                     ForEach(rows) { row in
                         TrustGuardrailRowView(row: row)
@@ -287,50 +287,42 @@ struct TrustGuardrailSummaryPanel: View {
     }
 }
 
+/// One line of the answer. The tinted plate and the warning triangle it used to
+/// wear made five rows read as five alarms; the state now lives in the colour of
+/// the answer itself, on the card's own ground (advanced-page kit, 2026-09-03).
 private struct TrustGuardrailRowView: View {
     let row: TrustGuardrailRow
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: iconName)
-                .foregroundStyle(tint)
-                .font(.body)
-                .frame(width: 18)
-                .padding(.top, 1)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(row.title)
-                        .font(.subheadline.weight(.semibold))
-                    Text(row.value)
-                        .font(.subheadline)
-                        .foregroundStyle(tint)
-                }
-                Text(row.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.md) {
+                Text(row.title)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: NativeAgentSpacing.sm)
+                Text(row.value)
+                    .font(ShellType.label)
+                    .foregroundStyle(tint)
+                    .multilineTextAlignment(.trailing)
             }
-            Spacer(minLength: 0)
+            Text(row.detail)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(10)
-        .background(tint.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(row.title): \(row.value). \(row.detail)")
     }
 
+    /// Calm when this is the safe end, trouble when a safety net is off, and the
+    /// quiet ink for the middle — nothing here waits on User, so no teal.
     private var tint: Color {
         switch row.tone {
-        case .ok: return .green
-        case .caution: return .orange
-        case .danger: return .red
+        case .ok: return NativeAgentShell.calm
+        case .caution: return NativeAgentShell.secondary
+        case .danger: return NativeAgentShell.trouble
         }
-    }
-
-    /// The row carries its own glyph; tone only overrides it when the row is
-    /// at the alarming end, so a scan down the column reads as a column.
-    private var iconName: String {
-        row.tone == .danger ? "exclamationmark.triangle.fill" : row.systemImage
     }
 }

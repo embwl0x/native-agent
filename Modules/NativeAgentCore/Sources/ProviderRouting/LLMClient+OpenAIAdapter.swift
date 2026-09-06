@@ -5,6 +5,11 @@ import PersistenceCore
 /// OpenAI Chat Completions adapter. URLSession is injectable for tests.
 public final class OpenAIAdapter: LLMAdapter {
     public let providerId: String = "openai"
+    /// Request timeout for the API-key lane. Same resolved value the OAuth
+    /// direct adapters use (240s), so both lanes fail a stalled request the
+    /// same way instead of inheriting whatever the injected session carries.
+    static let requestTimeoutSeconds: TimeInterval = 240
+
     private let session: URLSession
     private let endpoint: URL
     private let apiKeyOverride: String?
@@ -83,6 +88,10 @@ public final class OpenAIAdapter: LLMAdapter {
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // An injected session may carry URLSession's 60s default (or none at
+        // all); match the OAuth lanes' resolved 240s so a stalled completion
+        // fails instead of hanging the turn.
+        req.timeoutInterval = Self.requestTimeoutSeconds
 
         var messages: [[String: String]] = []
         if let sys = system, !sys.isEmpty {
@@ -201,6 +210,10 @@ public final class OpenAIAdapter: LLMAdapter {
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // An injected session may carry URLSession's 60s default (or none at
+        // all); match the OAuth lanes' resolved 240s so a stalled completion
+        // fails instead of hanging the turn.
+        req.timeoutInterval = Self.requestTimeoutSeconds
 
         var body: [String: Any] = [
             "model": model,
@@ -458,13 +471,18 @@ public final class OpenAIAdapter: LLMAdapter {
                     defer { bytes.task.cancel() }
                     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                     if !(200..<300).contains(status) {
-                        var errData = Data()
-                        do {
-                            for try await byte in bytes {
-                                errData.append(byte)
-                                if errData.count >= 4096 { break }
-                            }
-                        } catch {}
+                        // User, 2026-09-06: this drained the body with no
+                        // deadline, so the status — including a 429 whose
+                        // Retry-After was already in hand — was mapped only
+                        // after the read finished. A provider that answers the
+                        // headers and then stalls the body wedged the turn for
+                        // as long as it cared to. `ProviderErrorBodyDrain`
+                        // bounds the read (4 KiB / 2s) and keeps a user Stop
+                        // as cancellation instead of a provider verdict; an
+                        // empty body still maps the status correctly.
+                        let errData = try await ProviderErrorBodyDrain.read(
+                            bytes, maxBytes: 4096, timeout: 2.0
+                        )
                         try throwIfChatCompletionsError(
                             status: status, data: errData,
                             mapping: Self.statusMapping, response: response
@@ -617,22 +635,29 @@ public final class OpenAIAdapter: LLMAdapter {
             throw LLMError.invalidResponse(status: status)
         }
         let content = (message["content"] as? String) ?? ""
-        let rawCalls = message["tool_calls"] as? [[String: Any]] ?? []
-        let markers: [String] = rawCalls.enumerated().compactMap { index, raw in
-            guard let function = raw["function"] as? [String: Any],
-                  let name = function["name"] as? String, !name.isEmpty else { return nil }
-            let id = (raw["id"] as? String) ?? "openai_tool_\(index)_\(name)"
-            let args = (function["arguments"] as? String) ?? "{}"
-            return "<tool_use id=\"\(id)\" name=\"\(name)\">\(args)</tool_use>"
-        }
-        if content.isEmpty && markers.isEmpty {
-            // Neither text nor a tool call: the reply is genuinely unusable.
-            // Keep the pre-change failure mode for that case.
-            if message["content"] is String { return "" }
-            throw LLMError.invalidResponse(status: status)
-        }
+        // User, 2026-09-06: all-or-nothing on the tool set, same as the streams
+        // — a `compactMap` used to drop the entries it could not execute and
+        // run their siblings, which is half a plan the model wrote as one
+        // decision.
+        let toolSet = finalizeChatCompletionsToolCalls(
+            message["tool_calls"] as? [[String: Any]] ?? [],
+            idPrefix: "openai"
+        )
         var pieces: [String] = content.isEmpty ? [] : [content]
-        pieces.append(contentsOf: markers)
+        if let note = toolSet.incompleteNote {
+            pieces.append(note)
+        } else {
+            pieces.append(contentsOf: toolSet.calls.map(chatCompletionsToolUseMarker))
+        }
+        guard !pieces.isEmpty else {
+            // User, 2026-09-06: an empty `content` string used to be returned
+            // AS an empty reply, so a silent no-reply reached the chat as a
+            // blank turn. The streaming lanes call that `.streamTruncated`;
+            // this one does now too, and the ladder can retry it.
+            throw LLMError.streamTruncated(
+                message: "openai returned no content (empty reply)"
+            )
+        }
         return pieces.joined(separator: "\n")
     }
 
@@ -645,7 +670,18 @@ public final class OpenAIAdapter: LLMAdapter {
         provider: "openai",
         rateLimited: { OpenAIAdapter.errorBodyText($0, fallback: "rate limited") },
         serverError: { OpenAIAdapter.errorBodyText($0, fallback: "5xx") },
-        otherwise: { status, _ in .invalidResponse(status: status) }
+        // User, 2026-09-06: carry the body. It was dropped here, so a 400 whose
+        // message says "maximum context length" arrived as a bare
+        // `.invalidResponse(400)` and `isContextOverflow` had no text to read
+        // — the turn retried the same oversized prompt instead of compacting.
+        // The status is still named in the message, so the recovery policy's
+        // status extraction classifies it exactly as the typed payload did.
+        otherwise: { status, data in
+            guard let detail = providerErrorDetail(data), !detail.isEmpty else {
+                return .invalidResponse(status: status)
+            }
+            return .providerError(message: "openai HTTP \(status): \(detail)")
+        }
     )
 
     private static func errorBodyText(_ data: Data, fallback: String) -> String {

@@ -191,9 +191,12 @@ private struct W1Router: ProviderRoutingProtocol {
     }
 }
 
-private final class W1NoopAdapter: LLMAdapter, @unchecked Sendable {
+private final class W1NoopAdapter: LLMAdapter, OAuthCredentialPresence, @unchecked Sendable {
     let providerId: String
     init(_ id: String) { providerId = id }
+    /// 2026-09-06 (2de2f5a0): an `*_oauth_direct` provider is resolved only
+    /// when its adapter reports a stored credential.
+    var hasStoredOAuthCredential: Bool { providerId.hasSuffix("_oauth_direct") }
     func complete(prompt: String, system: String?, model: String) async throws -> String { "ok" }
     func streamMessages(
         messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
@@ -209,13 +212,19 @@ struct GateResolverDisagreementTests {
     /// disagreement — it must throw LOUD (never hand tools[] to a Claude
     /// adapter, never silently strip them) BEFORE any adapter dispatch.
     @Test func tools_bound_to_non_native_resolved_provider_throws_named_error() async throws {
-        // model "claude-opus-4-8" with no active pin resolves to providerId
-        // "anthropic" (NOT native-tools capable), while tools[] were supplied.
+        // 2026-09-06 (7df7a4cd): "anthropic" — the api-key adapter — was
+        // deliberately opted INTO the native lane, so it is no longer the
+        // non-native Claude provider this guard is about. The provider that
+        // must never receive a tools array is the SUBSCRIPTION connection,
+        // `anthropic_oauth_direct`: Anthropic's harness detector rejects a body
+        // carrying tools. "claude-opus-4-8" resolves there once the OAuth
+        // adapter reports a stored credential (2de2f5a0).
         let client = SwiftNativeLLMClient(
             router: W1Router(chatModel: "claude-opus-4-8"),
             codex: W1NoopAdapter("codex"),
             anthropic: W1NoopAdapter("anthropic"),
             openAI: W1NoopAdapter("openai"),
+            anthropicOAuthDirect: W1NoopAdapter("anthropic_oauth_direct"),
             moonshotCatalogDataRoot: hermeticMoonshotCatalogDataRoot()
         )
 

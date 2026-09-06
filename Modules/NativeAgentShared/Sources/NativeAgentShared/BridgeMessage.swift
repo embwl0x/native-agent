@@ -163,6 +163,16 @@ public struct ICloudTransactionRecord: Codable, Identifiable, Sendable {
     public var attempts: Int
     public var lastError: String?
     public var response: [String: String]?
+    /// 2026-09-06: `id` here is the phone-supplied TRANSACTION id, which is only
+    /// defaulted to the message id — two unrelated actions can collide on it.
+    /// These two fields bind the row to the exact envelope that reserved it, so
+    /// a redelivery can tell "my action, already run" from "someone else's
+    /// action wearing my id". Optional: rows written before this field existed
+    /// decode with nil and are treated as unbound.
+    public var msgId: String?
+    /// SHA-256 over the action envelope's canonical body (sorted keys, the
+    /// `signature` key removed) — the same bytes the inner HMAC covers.
+    public var actionDigest: String?
 
     public init(
         id: String,
@@ -173,7 +183,9 @@ public struct ICloudTransactionRecord: Codable, Identifiable, Sendable {
         updatedAt: String,
         attempts: Int = 0,
         lastError: String? = nil,
-        response: [String: String]? = nil
+        response: [String: String]? = nil,
+        msgId: String? = nil,
+        actionDigest: String? = nil
     ) {
         self.id = id
         self.direction = direction
@@ -184,6 +196,8 @@ public struct ICloudTransactionRecord: Codable, Identifiable, Sendable {
         self.attempts = attempts
         self.lastError = lastError
         self.response = response
+        self.msgId = msgId
+        self.actionDigest = actionDigest
     }
 }
 

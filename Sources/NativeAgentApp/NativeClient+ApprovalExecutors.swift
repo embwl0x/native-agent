@@ -226,6 +226,144 @@ extension NativeClient {
         }
     }
 
+    /// Applies a resolved `skill.proposal` card (sweep item 38 — the
+    /// procedural lane's only landing).
+    ///
+    /// APPROVE → the draft body the card previewed lands under
+    /// `data/skills/bodies/<name>.md` (the RUNTIME shelf; `persona/skills/
+    /// bodies` stays curated, per the plan's non-goals), then the canonical
+    /// serialized pointer sync runs so recall surfaces it. DENY/CANCEL → the
+    /// core refuses to write and returns `.declined`; nothing lands and no
+    /// pointer appears. Every branch annotates, including failures: an
+    /// approved card must never read as silently applied (W8 lesson).
+    static func applyResolvedProceduralSkillProposal(
+        from rec: ApprovalRecord,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async {
+        guard rec.action == ProceduralSkillProposal.approvalAction,
+              rec.status == "resolved", let decision = rec.decision else { return }
+        do {
+            let outcome = try await ProceduralSkillProposal.applyResolved(
+                record: rec, dataRoot: dataRoot
+            )
+            switch outcome {
+            case .applied(let skillName, let bodyPath, let bodyWritten):
+                // Pointer sync AFTER the body exists. A sync failure must not
+                // make a written body read as unwritten, so it annotates its
+                // own outcome rather than throwing the whole apply away.
+                var pointerSynced = true
+                do {
+                    try await Self.reconcileSkillEvolutionRecall(
+                        memory: SwiftNativeMemoryV2.shared,
+                        dataRoot: dataRoot,
+                        personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
+                    )
+                } catch {
+                    pointerSynced = false
+                    NSLog("[proceduralSkill] pointer sync failed for \(skillName): \(error)")
+                }
+                try? await Self.annotateApprovalExecution(
+                    id: rec.id,
+                    executedAction: .object([
+                        "op": .string("procedural_skill_approve"),
+                        "skillName": .string(skillName),
+                        "bodyWritten": .bool(bodyWritten),
+                        "pointerSynced": .bool(pointerSynced),
+                    ]),
+                    detail: pointerSynced
+                        ? "Skill proposal approved — body at \(bodyPath); recall pointer synced"
+                        : "Skill proposal approved — body at \(bodyPath); POINTER SYNC FAILED "
+                            + "(the body is on disk; the next skill mutation or launch re-syncs)")
+            case .declined(let skillName):
+                try? await Self.annotateApprovalExecution(
+                    id: rec.id,
+                    executedAction: .object([
+                        "op": .string("procedural_skill_\(decision)"),
+                        "skillName": .string(skillName),
+                        "bodyWritten": .bool(false),
+                    ]),
+                    detail: "Skill proposal \(decision) — nothing written, no recall pointer")
+            }
+        } catch {
+            NSLog("[proceduralSkill] \(decision) failed for approval \(rec.id): \(error)")
+            try? await Self.annotateApprovalExecution(
+                id: rec.id,
+                executedAction: .object(["error": .string("\(error)")]),
+                detail: "Skill proposal \(decision) FAILED: \(error.localizedDescription)")
+        }
+    }
+
+    /// Applies a resolved `studio.canon` card (desk 903 phase 4) — the ONE card
+    /// in this app the owner may not approve, and the one executor that can
+    /// never write anything.
+    ///
+    /// Her line: "my taste, not User's to sign off." A canon row now requires two
+    /// things a resolver must HAVE, not claim: her agent seat, and the live-turn
+    /// provenance `StudioCanonSeatGate` derives from a running chat turn. An
+    /// executor has neither — it runs after the turn, from the approval inbox —
+    /// so this branch's only job is the honest, annotated refusal:
+    ///
+    ///   * an owner-resolved card (Activity UI, desk click, Full Mac YOLO, a
+    ///     signed iOS operator) → refused, annotated, no row;
+    ///   * a card she resolved whose row never landed (the crash window) →
+    ///     annotated as needing her to run `studio_canon_resolve` again, which
+    ///     is idempotent by proposal id. Inventing a provenance here so the
+    ///     replay could write the row would forge exactly the evidence the seat
+    ///     exists to require.
+    static func applyResolvedStudioCanonProposal(
+        from rec: ApprovalRecord,
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async {
+        guard rec.action == StudioCanonProposal.approvalAction,
+              rec.status == "resolved", let decision = rec.decision else { return }
+        let workTitle = StudioCanonProposal.draft(of: rec)?.workTitle ?? "(unnamed work)"
+        guard decision == ApprovalDecision.approved.rawValue else {
+            // Denied or canceled: nothing to write from any seat, which is the
+            // one outcome this executor can state without qualification.
+            try? await Self.annotateApprovalExecution(
+                id: rec.id,
+                executedAction: .object([
+                    "op": .string("studio_canon_\(decision)"),
+                    "work": .string(workTitle),
+                    "rowWritten": .bool(false),
+                ]),
+                detail: "Canon proposal \(decision) — nothing written; "
+                    + "the journal entries and the graph are untouched")
+            return
+        }
+        let landed = (try? await SwiftNativeStudioStore(dataRoot: dataRoot).readCanon())?
+            .contains { $0.proposalID == rec.id } ?? false
+        if landed {
+            try? await Self.annotateApprovalExecution(
+                id: rec.id,
+                executedAction: .object([
+                    "op": .string("studio_canon_already_applied"),
+                    "work": .string(workTitle),
+                    "rowWritten": .bool(false),
+                ]),
+                detail: "Canon row for \(workTitle) is already on the ledger")
+            return
+        }
+        let herSeat = StudioCanonSeat.isAgent(rec.decidedBy)
+        NSLog("[studioCanon] not applying \(rec.id) from an executor "
+            + "(decidedBy=\(rec.decidedBy ?? "unknown"))")
+        try? await Self.annotateApprovalExecution(
+            id: rec.id,
+            executedAction: .object([
+                "op": .string(herSeat ? "studio_canon_needs_her_turn" : "studio_canon_refused"),
+                "decidedBy": .string(rec.decidedBy ?? ""),
+                "work": .string(workTitle),
+                "rowWritten": .bool(false),
+            ]),
+            detail: herSeat
+                ? "Canon proposal approved by the agent but the row did not land; an executor has "
+                    + "no live turn to record, so nothing was written. Re-run "
+                    + "studio_canon_resolve in chat — it is idempotent by proposal id."
+                : "Canon proposal NOT applied: "
+                    + (StudioCanonError.approvalNotFromAgentSeat(rec.decidedBy ?? "unknown")
+                        .errorDescription ?? "the canon is the agent's to tend"))
+    }
+
     // MARK: - U5 W-A item 3: generic resolve→execute crash-window reconcile
 
     /// One reconcilable approval kind: the action string, an eligibility/
@@ -340,6 +478,17 @@ extension NativeClient {
                 action: ExternalSendApprovalRequest.approvalAction,
                 shouldReconcile: { _ in true },
                 execute: { _ = await Self.applyResolvedExternalSend(from: $0) }),
+            ApprovalExecutionReconcileKind(
+                action: ProceduralSkillProposal.approvalAction,
+                shouldReconcile: { _ in true },
+                execute: { await Self.applyResolvedProceduralSkillProposal(from: $0) }),
+            // Desk 903 phase 4. Reconcilable like the rest, and refusing like
+            // nothing else: an owner-resolved canon card replays into the same
+            // annotated refusal rather than into her museum.
+            ApprovalExecutionReconcileKind(
+                action: StudioCanonProposal.approvalAction,
+                shouldReconcile: { _ in true },
+                execute: { await Self.applyResolvedStudioCanonProposal(from: $0) }),
             ApprovalExecutionReconcileKind(
                 action: SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
                 shouldReconcile: { _ in true },
@@ -1309,6 +1458,25 @@ extension NativeClient {
                 from: rec,
                 dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
             )
+        } else if rec.action == ProceduralSkillProposal.approvalAction {
+            // Sweep item 38, the procedural lane: approve WRITES the draft
+            // body the card showed verbatim to data/skills/bodies and fires
+            // the same pointer sync every other skill mutation fires, so the
+            // craft is recallable the same day. Deny/cancel write nothing —
+            // the executor self-guards on the decision. Crash window healed by
+            // the reconcile kind registered below.
+            await Self.applyResolvedProceduralSkillProposal(from: rec)
+        } else if rec.action == StudioCanonProposal.approvalAction {
+            // Desk 903 phase 4, and the one inverted card in the app: SHE is the
+            // sole approver of her own canon. Resolving from an owner surface
+            // reaches here and is REFUSED with an annotation — no canon row, no
+            // silent success. Her own `studio_canon_resolve` applies its own
+            // resolution; this branch is the honest refusal for everyone else
+            // and the crash-window replay for her.
+            await Self.applyResolvedStudioCanonProposal(
+                from: rec,
+                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            )
         } else if rec.action == ExternalSendApprovalRequest.approvalAction {
             let outcome = await Self.applyResolvedExternalSend(from: rec)
             shouldArchiveVisibleCard = outcome.shouldArchiveVisibleCard
@@ -1385,7 +1553,13 @@ private struct SingleApprovedToolAutonomyResolver: AutonomyResolver {
     }
 
     func autonomyLevel(forTool toolName: String, surface: String) async throws -> String {
-        if toolName == approvedTool && surface == approvedSurface {
+        // 2026-09-06: `approvedTool` is the PERSISTED spelling (`save.skill`),
+        // and the gated chain canonicalizes before this resolver is consulted,
+        // so a pre-upgrade dotted approval no longer recognized its own tool.
+        // Compare canonical names on both sides.
+        if CanonicalToolNameDispatcher.canonical(toolName)
+            == CanonicalToolNameDispatcher.canonical(approvedTool),
+           surface == approvedSurface {
             return "auto"
         }
         return try await delegate.autonomyLevel(forTool: toolName, surface: surface)

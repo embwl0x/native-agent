@@ -50,13 +50,13 @@ struct OAuthSignInButton: View {
                             Image(systemName: provider.iconSystemName)
                         }
                         Text(buttonControl.title)
-                            .fontWeight(.medium)
+                            .font(ShellType.label)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(provider.tintColor)
+                // House rule 1 — one accent, one job. A brand fill per provider
+                // is a second, third and fourth accent on one page, so the
+                // sign-in control is a plain bordered button like every other.
+                .buttonStyle(.bordered)
                 .disabled(buttonControl.isDisabled)
 
                 if status == .complete {
@@ -71,13 +71,13 @@ struct OAuthSignInButton: View {
 
             if let detail = authStatusText {
                 Label(detail, systemImage: status == .complete ? "checkmark.seal.fill" : "key.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             if let err = lastError {
                 Label(err, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.red)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.trouble)
             }
             if status != .complete, provider.id == "openai_oauth_direct",
                let offer = cliSessionOffer {
@@ -89,8 +89,8 @@ struct OAuthSignInButton: View {
                                 ?? "Found an existing Codex CLI sign-in on this Mac (~/.codex).",
                             systemImage: "terminal"
                         )
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         HStack(spacing: 8) {
                             Button("Use it") {
                                 Task { await acceptCLISessionOffer() }
@@ -100,12 +100,14 @@ struct OAuthSignInButton: View {
                             if !alreadyDeclined {
                                 Button("Ignore") {
                                     NativeOAuthFlow.recordCodexCLISessionDecision(
-                                        allow: false, source: "providers_offer")
-                                    cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer()
+                                        allow: false, source: "providers_offer",
+                                        dataRoot: oauthDataRoot)
+                                    cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer(
+                                        dataRoot: oauthDataRoot)
                                 }
                                 .buttonStyle(.plain)
                                 .controlSize(.small)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(NativeAgentShell.secondary)
                             }
                         }
                     }
@@ -113,11 +115,11 @@ struct OAuthSignInButton: View {
                 case .unavailable(let reason):
                     VStack(alignment: .leading, spacing: 6) {
                         Label("Codex CLI sign-in adoption is unavailable.", systemImage: "exclamationmark.triangle.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.orange)
+                            .font(ShellType.captionSemibold)
+                            .foregroundStyle(NativeAgentShell.trouble)
                         Text(reason)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
+                            .font(ShellType.caption)
+                            .foregroundStyle(NativeAgentShell.secondary)
                         Button("Repair saved consent…") {
                             showingCLIConsentRepairConfirmation = true
                         }
@@ -129,8 +131,8 @@ struct OAuthSignInButton: View {
             }
             if let cliConsentRepairMessage {
                 Label(cliConsentRepairMessage, systemImage: "checkmark.circle")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
         }
         .task {
@@ -275,9 +277,14 @@ struct OAuthSignInButton: View {
 
     @MainActor
     private func signOut() async {
-        _ = NativeOAuthFlow.clearTokens(providerId: provider.id, dataRoot: oauthDataRoot)
+        // User, 2026-09-06: the result was discarded, so a sign-out whose lock
+        // or delete failed left the credential on disk and still looked like it
+        // had worked. A failed sign-out now says so.
+        let cleared = NativeOAuthFlow.clearTokens(providerId: provider.id, dataRoot: oauthDataRoot)
         await refreshStatus()
-        if provider.id == "openai_oauth_direct",
+        if !cleared {
+            lastError = "Sign-out did not finish — a credential file could not be removed. Check permissions on the data folder and try again."
+        } else if provider.id == "openai_oauth_direct",
            NativeOAuthFlow.isSignedIn(providerId: provider.id, dataRoot: oauthDataRoot) {
             lastError = "Shared Codex auth is still signed in. Sign out from Codex to remove it."
         }
@@ -296,7 +303,7 @@ struct OAuthSignInButton: View {
         authStatusText = projection.detail
         lastError = projection.error
         cliSessionOffer = provider.id == "openai_oauth_direct"
-            ? NativeOAuthFlow.codexCLISessionOffer()
+            ? NativeOAuthFlow.codexCLISessionOffer(dataRoot: oauthDataRoot)
             : nil
     }
 
@@ -306,7 +313,7 @@ struct OAuthSignInButton: View {
     @MainActor
     private func acceptCLISessionOffer() async {
         guard NativeOAuthFlow.recordCodexCLISessionDecision(
-            allow: true, source: "providers_offer") else {
+            allow: true, source: "providers_offer", dataRoot: oauthDataRoot) else {
             lastError = "Could not save the choice — check disk permissions."
             return
         }
@@ -319,10 +326,11 @@ struct OAuthSignInButton: View {
     @MainActor
     private func repairCLISessionConsent() async {
         do {
-            let backup = try NativeOAuthFlow.repairCodexCLISessionConsent()
+            let backup = try NativeOAuthFlow.repairCodexCLISessionConsent(
+                dataRoot: oauthDataRoot)
             cliConsentRepairMessage = "Unreadable consent was backed up as \(backup.lastPathComponent). Choose Use it or Ignore again."
             lastError = nil
-            cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer()
+            cliSessionOffer = NativeOAuthFlow.codexCLISessionOffer(dataRoot: oauthDataRoot)
         } catch {
             lastError = "Consent repair failed: \(error.localizedDescription)"
         }
@@ -332,32 +340,29 @@ struct OAuthSignInButton: View {
 
 // MARK: - Provider catalog
 
-/// Identity + branding for each OAuth provider exposed in NativeAgent.
+/// Identity for each OAuth provider exposed in NativeAgent. No brand colour:
+/// the sign-in control is bordered, so a per-provider tint has nowhere to go.
 struct OAuthProvider {
     let id: String                  // matches the daemon's provider_id
     let displayShort: String        // "ChatGPT", "Claude" — used in button label
     let iconSystemName: String
-    let tintColor: Color
 
     static let chatgpt = OAuthProvider(
         id: "openai_oauth_direct",
         displayShort: "ChatGPT",
-        iconSystemName: "person.crop.circle.badge.checkmark",
-        tintColor: .green
+        iconSystemName: "person.crop.circle.badge.checkmark"
     )
 
     static let anthropic = OAuthProvider(
         id: "anthropic_oauth_direct",
         displayShort: "Anthropic",
-        iconSystemName: "brain.head.profile",
-        tintColor: .orange
+        iconSystemName: "brain.head.profile"
     )
 
     static let xai = OAuthProvider(
         id: "xai_oauth_direct",
         displayShort: "xAI Grok",
-        iconSystemName: "sparkles",
-        tintColor: .cyan
+        iconSystemName: "sparkles"
     )
 
     /// Back-compat alias — earlier code referred to this provider as `.claude`.

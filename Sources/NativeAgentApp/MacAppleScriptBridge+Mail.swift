@@ -132,12 +132,21 @@ extension MacAppleScriptBridge {
             tell newMsg
                 \(recipientsBlock)
             end tell
-            send newMsg
-            return "sent"
+            set sendOK to send newMsg
+            if sendOK is true then
+                return "sent"
+            end if
+            return "refused"
         end tell
         """
         do {
-            _ = try await runAppleScript(source)
+            // 2026-09-06: Mail's `send` returns a boolean and this discarded it,
+            // so a message Mail refused (no account able to send from, offline
+            // outbox rejection) was reported to the operator as sent.
+            let raw = try await runAppleScript(source).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard raw == "sent" else {
+                return failedEnvelope(integration: "mail", reason: "mail_refused_send")
+            }
             return .object([
                 "status": .string("completed"),
                 "action": .string("sent"),
@@ -313,15 +322,24 @@ extension MacAppleScriptBridge {
             set replyMsg to reply originalMsg opening window false \(replyAllPhrase)
             tell replyMsg
                 set content to "\(bodyAS)"
-                send
+                set sendOK to send
             end tell
-            return "1"
+            if sendOK is true then
+                return "1"
+            end if
+            return "-1"
         end tell
         """
         do {
+            // 2026-09-06: `send` returns a boolean and the reply path discarded
+            // it too, so "1" meant only "a matching message was found", never
+            // "Mail sent it". -1 is now Mail's own refusal.
             let raw = try await runAppleScript(source)
-            let sent = (Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) > 0
-            if !sent {
+            let code = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            if code < 0 {
+                return failedEnvelope(integration: "mail", reason: "mail_refused_send")
+            }
+            if code == 0 {
                 return failedEnvelope(integration: "mail", reason: "no_matching_message")
             }
             return .object([

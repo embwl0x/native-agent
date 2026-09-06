@@ -138,15 +138,18 @@ public struct TriggerContentBuilder: Sendable {
 
     // MARK: - idle_checkin
 
-    /// The quiet duration comes from the cheapest honest activity signal that
-    /// is already persisted: `max(updatedAt)` over `<root>/chat/sessions.json`.
-    /// When no such signal resolves we SAY SO rather than inventing a duration.
+    /// The quiet duration comes from the cheapest honest activity signals that
+    /// are already persisted — `max(updatedAt)` over `<root>/chat/sessions.json`
+    /// and, since 2026-09-06, the human-presence stamp, whichever is later (see
+    /// `lastActivityInstant`). When no such signal resolves we SAY SO rather
+    /// than inventing a duration.
     public func idleCheckin() async -> TriggerContent {
         let current = now()
         let desk = await deskSection()
         let session = lastSessionSection()
 
-        guard let last = Self.lastActivityInstant(root: root), last <= current else {
+        guard let last = Self.lastActivityInstant(root: root, reference: current),
+              last <= current else {
             return TriggerContent(
                 title: "Idle check-in",
                 summary: "You've been quiet — I can't tell how long (no recorded session activity).",
@@ -298,12 +301,33 @@ public struct TriggerContentBuilder: Sendable {
 
     // MARK: - Activity signal (shared with the scheduler's `idle` condition)
 
-    /// `max(updatedAt)` over `<root>/chat/sessions.json`. THE last-user-activity
-    /// timestamp the scheduler's `idle` kind was waiting on. Synchronous and
-    /// pure so `scheduledInstantIfDue` can call it from its `nonisolated`,
-    /// inside-the-flock recompute. nil ⇒ no signal ⇒ idle stays dark.
-    public nonisolated static func lastActivityInstant(root: URL) -> Date? {
-        newestSession(root: root)?.updatedAt
+    /// THE last-user-activity timestamp the scheduler's `idle` kind waits on.
+    /// Synchronous and pure so `scheduledInstantIfDue` can call it from its
+    /// `nonisolated`, inside-the-flock recompute. nil ⇒ no signal ⇒ idle stays
+    /// dark.
+    ///
+    /// TWO signals, and it is the LATER of them (2026-09-06):
+    ///
+    ///   1. `max(updatedAt)` over `<root>/chat/sessions.json` — how long the
+    ///      CHAT has been quiet. Required: no chat signal still means dark, so
+    ///      this change can never light a trigger that used to stay dormant.
+    ///   2. `<root>/activity_watch/last_input.json` — how long the PERSON has
+    ///      been away from the Mac, published by the ActivityWatch tick (see
+    ///      `HumanPresenceStamp`). Absent, unparseable or STALE ⇒ ignored, and
+    ///      the answer is signal 1 alone, exactly as it was before.
+    ///
+    /// Taking the max is what makes "idle" mean idle: a person reading a paper
+    /// at their desk for an hour has a quiet chat, and the check-in that used
+    /// to arrive at their elbow now waits until they actually walk away.
+    public nonisolated static func lastActivityInstant(
+        root: URL,
+        reference: Date = Date()
+    ) -> Date? {
+        guard let chat = newestSession(root: root)?.updatedAt else { return nil }
+        guard let presence = HumanPresenceStamp.lastHumanInputInstant(
+            dataRoot: root, reference: reference
+        ) else { return chat }
+        return max(chat, presence)
     }
 
     /// Newest `(title, updatedAt)` across every non-archived session row.

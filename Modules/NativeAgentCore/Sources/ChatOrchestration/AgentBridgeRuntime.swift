@@ -90,6 +90,22 @@ public enum AgentBridgeRuntime {
         ], fileManager: fileManager)
     }
 
+    /// The configured agent and user names from the persona profile, for the
+    /// wake helpers' prompts and receipts. Nothing shipped names a specific
+    /// agent; an install without a profile yet gets "the agent" / "the user".
+    public static func configuredNames(dataRoot: URL) -> (agent: String, user: String) {
+        let path = dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("profile.json")
+        var agent = "the agent", user = "the user"
+        if let data = try? Data(contentsOf: path),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let n = (object["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !n.isEmpty { agent = n }
+            if let n = (object["userName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !n.isEmpty { user = n }
+        }
+        return (agent, user)
+    }
+
     public static func executableURL(
         named name: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,

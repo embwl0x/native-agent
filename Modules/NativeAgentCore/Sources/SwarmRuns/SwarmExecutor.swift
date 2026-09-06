@@ -715,7 +715,7 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
         do {
             try Task.checkCancellation()
             let prompt = Self.workerPrompt(worker: worker, request: request)
-            let output = try await withTimeout(seconds: request.timeoutSeconds) {
+            let output = try await withTimeout(seconds: request.timeoutSeconds, reportID: workerId) {
                 if worker.access == "inherit" {
                     guard let workerRunner else {
                         throw AgentSwarmError.invalidRequest(
@@ -835,7 +835,7 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
         }
         let started = Date()
         do {
-            let output = try await withTimeout(seconds: request.timeoutSeconds) {
+            let output = try await withTimeout(seconds: request.timeoutSeconds, reportID: "\(runId)-synthesis") {
                 try await withPromptCallTrace(runId: runId, reportId: "synthesis", traceId: "\(runId)-synthesis", request: request) {
                     try await llm.complete(
                         prompt: Self.synthesisPrompt(request: request, workers: workerResults),
@@ -926,25 +926,63 @@ public struct SwiftNativeAgentSwarmExecutor: AgentSwarmExecuting {
         return rows
     }
 
-    private func withTimeout<T: Sendable>(
+    private enum DeadlineEvent: Sendable {
+        case result(Result<String, Error>)
+        case expired
+        case cancelled
+    }
+
+    // Cancellation is a request, not proof of settlement. Keep structured
+    // ownership until the worker returns; preserve late evidence as incomplete.
+    func withTimeout(
         seconds: Int,
-        operation: @escaping @Sendable () async throws -> T
-    ) async throws -> T {
+        reportID: String,
+        operation: @escaping @Sendable () async throws -> String
+    ) async throws -> String {
         try Task.checkCancellation()
-        return try await withThrowingTaskGroup(of: T.self) { group in
+        return try await withThrowingTaskGroup(of: DeadlineEvent.self) { group in
             defer { group.cancelAll() }
             group.addTask {
-                try Task.checkCancellation()
-                return try await operation()
+                do {
+                    try Task.checkCancellation()
+                    return .result(.success(try await operation()))
+                } catch { return .result(.failure(error)) }
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
-                throw AgentSwarmError.timeout(seconds: seconds)
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(max(0, seconds)) * 1_000_000_000)
+                    return .expired
+                } catch { return .cancelled }
             }
-            guard let result = try await group.next() else {
-                throw AgentSwarmError.invalidRequest("swarm worker produced no result")
+            var expired = false
+            while let event = try await group.next() {
+                switch event {
+                case .expired:
+                    expired = true
+                    group.cancelAll()
+                    if let bus = TurnTraceContext.bus ?? turnTraceBus {
+                        TurnTraceBus.fire(TurnTraceEvent(turnId: reportID,
+                            kind: "swarm.report.deadline_exceeded", surface: "swarms",
+                            payload: .object(["reportId": .string(reportID),
+                                "timeoutSeconds": .int(Int64(seconds)),
+                                "state": .string("cancellation_requested_awaiting_settlement")])), on: bus)
+                    }
+                case .cancelled:
+                    group.cancelAll()
+                case .result(let result):
+                    if expired {
+                        let output: String
+                        switch result {
+                        case .success(let text): output = text
+                        case .failure(let error): output = (error as? AgentSwarmWorkerIncomplete)?.output ?? ""
+                        }
+                        throw AgentSwarmWorkerIncomplete(output: output,
+                            reason: "deadline exceeded (\(seconds)s); cancellation requested and worker settlement awaited; late output is evidence, not verified completion")
+                    }
+                    return try result.get()
+                }
             }
-            return result
+            throw CancellationError()
         }
     }
 

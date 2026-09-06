@@ -215,7 +215,9 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     var invalidationNamespaces: Set<String> { ["memory-v2"] }
     let invalidationSourceURL: URL?
 
-    private static let schemaVersion = "memory-context-projection-v1"
+    // v2 (2026-09-01): skill-pointer rows now carry the `.procedure` content
+    // role so the selector can reserve their share of the memory lane.
+    private static let schemaVersion = "memory-context-projection-v2"
     private let memory: any NativeMemoryContextProjectionMemory
     let limits: NativeMemoryContextProjectionLimits
     private let provenanceIndex: MemoryAtomRecordIndex?
@@ -449,6 +451,19 @@ private extension NativeMemoryContextProjection {
             ? .explicitCorrection
             : (pinned ? .canonical : .inferred)
         let atomKind: ContextAtomKind = correction ? .correction : .memory
+        // Skills-as-recall (2026-07-03) dissolved the skill library into memory
+        // pointer rows. The legacy recall lane still shares its budget with
+        // them (`selectRecallResults`); the ContextFlow lane cannot, because
+        // every pointer arrives as an ordinary `.memory` atom competing on
+        // cosine against 200+ real memories inside one 8-slot kind quota.
+        // Stamping the PROCEDURAL content role is what makes them findable to
+        // the selector's reservation without minting a second atom kind — the
+        // row is still a memory record, its content is still a skill.
+        let skillPointer = !correction && MemoryRecallScoring.isSkillRecallHint(
+            id: recordID,
+            kind: record.memoryKind ?? MemoryRecallScoring.kind(of: record.extras)
+        )
+        let contentRole: ContextContentRole = skillPointer ? .procedure : .memory
         guard let disclosure = MemoryRecordDisclosurePolicy.classify(
             personaID: record.personaId,
             status: record.status,
@@ -536,6 +551,7 @@ private extension NativeMemoryContextProjection {
             schemaVersion,
             body,
             atomKind.rawValue,
+            contentRole.rawValue,
             authority.rawValue,
             privacy.rawValue,
             surfaces.sorted().map(\.rawValue).joined(separator: ","),
@@ -561,7 +577,7 @@ private extension NativeMemoryContextProjection {
             descriptor: descriptor,
             atomID: atomID,
             atomKind: atomKind,
-            contentRole: .memory,
+            contentRole: contentRole,
             body: body,
             embeddingText: embeddingText,
             sourceHash: sourceHash,
@@ -644,6 +660,19 @@ private extension NativeMemoryContextProjection {
                 return nil
             }
             components.append("provenance=\(value)")
+        }
+        // Who told her, when provenance is `told` (commit_memory's
+        // `provenance_by`). Without it the packet can only render "[told]",
+        // which loses the half that matters: told BY WHOM.
+        //
+        // Emitted only as a bounded display name (the same rule the memory tool
+        // validates on commit). This blob is `key=value;…`, so a name carrying a
+        // delimiter would be read back as another field: it is dropped here, and
+        // the reader takes the FIRST value per key, so neither side alone has to
+        // be the one that holds.
+        if let raw = stringValue(record.extras, key: "provenance_by"),
+           let by = ContextMemoryLead.validDisplayName(raw) {
+            components.append("provenance_by=\(by)")
         }
         if let validFrom = record.validFrom { components.append("valid_from=\(validFrom)") }
         if let validTo = record.validTo { components.append("valid_to=\(validTo)") }

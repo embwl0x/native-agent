@@ -101,9 +101,15 @@ struct HonestSurfacesW6LiteTests {
         #expect(!source.contains("struct CapabilityFoundryLaneCard"))
         #expect(!source.contains("CapabilityFoundryLaneCard(lane:"))
         #expect(!source.contains("appModel.capabilityFoundry"))
-        // The "Foundry Index" panel over the real capability catalog stays —
+        // The Foundry index panel over the real capability catalog stays —
         // deleting the theater must not take the working surface with it.
-        #expect(source.contains("NativePanel(title: \"Foundry Index\""))
+        // 2026-09-06: 5dc30189 ("Advanced page kit: Capabilities, Knowledge
+        // Graph, Dreams") restyled the whole page — every NativePanel became an
+        // AdvancedSection and the title lost its title case. The surface is the
+        // same one, still reading the real catalog, so the pin follows the
+        // wrapper it lives in now (CapabilitiesView.swift:920).
+        #expect(source.contains("AdvancedSection(title: \"Foundry index\")"))
+        #expect(source.contains("CapabilitiesFoundryIndexPresentation.state(summary:"))
     }
 
     // MARK: - L4-06 — restartLoop tri-state

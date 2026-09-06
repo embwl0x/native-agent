@@ -130,13 +130,23 @@ private func iso(_ s: String) -> Date {
 }
 
 // 7
+// 2026-09-06: 045615fb made the window a range of LOCAL CALENDAR DATES that
+// INCLUDES the boundary day. It used to parse each stem as midnight UTC and
+// require `> since`, which dropped the boundary Sunday's own dream every week
+// — REM fires Sunday 04:30 local and that night's entry always landed before
+// the next week's boundary too, so it was never once consolidated. The
+// boundary is therefore built here from the same local-day parse the reader
+// uses, not from a UTC instant: `iso()` would shift the day west of UTC and
+// the assertion would pass for the wrong reason.
 @Test func dreamDiaryReader_filters_by_since_timestamp() async throws {
     let root = tempDir()
     try writeDiaryEntry(root: root, date: "2026-01-01", content: "a")
     try writeDiaryEntry(root: root, date: "2026-01-02", content: "b")
     try writeDiaryEntry(root: root, date: "2026-01-03", content: "c")
     let reader = DreamDiaryReader(dataRoot: root)
-    let result = try await reader.entriesSince(iso("2026-01-01"))
+    let boundary = try #require(DreamDiaryReader.localDate(fromDateStem: "2026-01-02"))
+    let result = try await reader.entriesSince(boundary)
+    // The boundary day itself is in; the day before it is out.
     #expect(result.map { $0.date } == ["2026-01-02", "2026-01-03"])
 }
 

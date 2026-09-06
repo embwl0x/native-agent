@@ -22,6 +22,43 @@ enum OrganismProspectiveAffect {
     /// A recent violation keeps the body braced for this long (fading).
     static let violationShadowHalfLife: TimeInterval = 20 * 60
 
+    // MARK: - Item 5 (2026-09-02): the horizon's share of anticipation
+    //
+    // The five plumbing paths above are minutes away, so their window is ten
+    // minutes. A horizon is DAYS away, and the whole point of `toward` is that
+    // Friday weighs a little more on Thursday than it did on Monday. Same
+    // shape, same 0.15/dim ceiling, wider window — and the horizon terms fold
+    // INTO the existing per-dim accumulators rather than adding a second budget
+    // on top of them, so no dimension can exceed `maxDelta` no matter how many
+    // rows are open.
+
+    /// A horizon weighs from a week out, growing as it nears.
+    static let horizonWindow: TimeInterval = OrganismHorizonRegister.maximumHorizon
+    /// Looking forward is warm as well as curious, but less warm than curious —
+    /// an undertone in the dim that carries the most social meaning, so it never
+    /// manufactures affection out of a calendar.
+    static let horizonWarmthShare = 0.5
+
+    /// A horizon row's share of looking-forward / dread. Pure; nil payload or a
+    /// horizon still a week out contributes nothing.
+    ///
+    /// Nearness is linear in the distance to due and FULL once overdue: a thing
+    /// that should have happened and has not is exactly when a person feels it
+    /// most. Valence decides which register it lands in — she does not brace
+    /// for Friday and she does not look forward to the call.
+    static func horizonContribution(
+        _ p: OrganismPrediction,
+        at now: Date
+    ) -> (toward: Double, dread: Double) {
+        guard let horizon = p.horizon else { return (0, 0) }
+        let untilDue = p.dueAt.timeIntervalSince(now)
+        let nearness = untilDue <= 0 ? 1.0 : max(0, 1 - untilDue / horizonWindow)
+        guard nearness > 0 else { return (0, 0) }
+        let magnitude = nearness * abs(horizon.valence)
+        guard magnitude > 0 else { return (0, 0) }
+        return horizon.valence > 0 ? (magnitude, 0) : (0, magnitude)
+    }
+
     /// Modulate a chemical state with what's PENDING. Pure: same inputs → same
     /// output; empty/idle ledger → the input state unchanged.
     static func modulate(
@@ -37,19 +74,33 @@ enum OrganismProspectiveAffect {
 
         var bracing = 0.0        // → vigilance up, confidence down
         var lookingForward = 0.0 // → curiosity up
+        var horizonToward = 0.0  // item 5 → curiosity + warmth
+        var horizonDread = 0.0   // item 5 → vigilance
         for p in pending {
             let contribution = predictionBracingContribution(p, ledger: ledger, at: now)
             bracing += contribution.bracing
             lookingForward += contribution.lookingForward
+            let horizon = horizonContribution(p, at: now)
+            horizonToward += horizon.toward
+            horizonDread += horizon.dread
         }
         bracing = min(1, bracing + shadow)
         lookingForward = min(1, lookingForward)
+        horizonToward = min(1, horizonToward)
+        horizonDread = min(1, horizonDread)
 
         var out = state
-        out.vigilance = ChemicalState.clamp(out.vigilance + maxDelta * bracing)
+        // Item 5 rides INSIDE the existing per-dim budget (the inner `min(1,…)`),
+        // so vigilance and curiosity can still move at most `maxDelta` in total
+        // however many rows are open. Confidence and urgency stay on `bracing`
+        // alone: dreading Friday should not make her doubt her hands or feel
+        // late. With no horizon rows both terms are 0 and every line below is
+        // byte-identical to what it was.
+        out.vigilance = ChemicalState.clamp(out.vigilance + maxDelta * min(1, bracing + horizonDread))
         out.confidence = ChemicalState.clamp(out.confidence - maxDelta * bracing * 0.7)
-        out.curiosity = ChemicalState.clamp(out.curiosity + maxDelta * lookingForward)
+        out.curiosity = ChemicalState.clamp(out.curiosity + maxDelta * min(1, lookingForward + horizonToward))
         out.urgency = ChemicalState.clamp(out.urgency + maxDelta * bracing * 0.5)
+        out.warmth = ChemicalState.clamp(out.warmth + maxDelta * horizonWarmthShare * horizonToward)
         return out
     }
 
@@ -62,6 +113,12 @@ enum OrganismProspectiveAffect {
         ledger: OrganismPredictionLedger,
         at now: Date
     ) -> (bracing: Double, lookingForward: Double) {
+        // Item 5: a horizon row is not plumbing. Its anticipation is measured by
+        // `horizonContribution` on a seven-day window; running it through the
+        // ten-minute path as well would double-count it and, worse, read a
+        // week-away Friday as a near-due low-confidence expectation about her
+        // own wiring.
+        guard p.horizon == nil else { return (0, 0) }
         // Nearness: full weight inside the window, fading with distance to due;
         // an overdue pending prediction weighs FULLY (the outcome is late).
         let untilDue = p.dueAt.timeIntervalSince(now)
@@ -98,6 +155,9 @@ enum OrganismProspectiveAffect {
         case .phoneDelivery: return confidence.phonePath
         case .approvalResolution: return confidence.approvalPath
         case .workflowAdvance: return confidence.workflowPath
+        // Item 46: a semantic expectation has no body path. Even odds is the
+        // honest read — the body knows nothing about how work lands.
+        case .semanticExpectation: return 0.5
         }
     }
 

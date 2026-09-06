@@ -561,7 +561,10 @@ release_identity_leak_regex() {
 # A general language-model vocabulary legitimately contains ordinary person
 # names, so applying a maintainer's local identity denylist to it creates false
 # positives. The exemption is deliberately tied to MemoryV2's known SwiftPM
-# resource bundle; similarly named files elsewhere remain in scope. Secret
+# resource bundle and to the staged large embedding model under
+# Contents/Resources/embedding/ (the same kind of vocabulary; 2026-09-05, when
+# the standard BERT vocabulary's token "user" tripped the guard). Similarly
+# named files elsewhere remain in scope. Secret
 # value/file scans still cover the full Resources tree in release.sh.
 #
 # rc 0 = the scan ran; stdout is authoritative (empty really means clean).
@@ -574,7 +577,9 @@ release_personal_identity_hit_files() {
   release_scan_dir_for_regex "$bundle" "personal identity" cs "$regex" \
     '*/_CodeSignature' \
     '*/NativeAgentCore_MemoryV2.bundle/minilm_vocab.txt' \
-    '*/NativeAgentCore_MemoryV2.bundle/minilm.mlpackage/*'
+    '*/NativeAgentCore_MemoryV2.bundle/minilm.mlpackage/*' \
+    '*/Contents/Resources/embedding/vocab.txt' \
+    '*/Contents/Resources/embedding/embedding.mlpackage/*'
 }
 
 # release_assert_no_identity_strings <bundle>
@@ -859,7 +864,8 @@ release_assert_no_leaked_data() {
   if [[ -n "$_PUBLIC_IDENTITY_RE" ]]; then
     _identity_text_hits="$(
       release_scan_dir_for_regex "$_RES_DIR" "release resource identity" ci "$_PUBLIC_IDENTITY_RE" \
-        '*/minilm_vocab.txt' '*/minilm.mlpackage/*'
+        '*/minilm_vocab.txt' '*/minilm.mlpackage/*' \
+        '*/embedding/vocab.txt' '*/embedding/embedding.mlpackage/*'
     )" || { echo "ERROR: identity resource scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
   else
     # A silently skipped identity scan is how a leak ships as a green gate.

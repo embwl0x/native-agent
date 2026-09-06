@@ -86,11 +86,16 @@ struct BuilderWakeupReceiptTests {
             .appendingPathComponent("claude-receipt-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        for (status, expected) in [
-            ("sent", "wake was accepted"),
-            ("queued", "not yet confirmed running"),
-            ("skipped", "did not confirm a new Claude wake"),
-            ("failed", "did not confirm a new Claude wake"),
+        // The top-level receipt status now REPORTS the wake evidence instead of
+        // hardcoding "queued" for all four. A flat "queued" classified every
+        // send `.unknown`, which the transcript rendered "completion
+        // unconfirmed" even for a wake the helper had accepted.
+        for (status, receiptStatus, expected) in [
+            ("sent", "accepted", "wake was accepted"),
+            ("queued", "queued", "not yet confirmed running"),
+            // Nothing heard: the durable row is still a real enqueue.
+            ("skipped", "queued", "did not confirm a new Claude wake"),
+            ("failed", "failed", "did not confirm a new Claude wake"),
         ] {
             let dispatcher = SwiftToolDispatcher(
                 dataRoot: root,
@@ -103,7 +108,7 @@ struct BuilderWakeupReceiptTests {
                 surface: "chat"
             )
             let object = try #require(result.receiptObject)
-            #expect(object["status"] == .string("queued"))
+            #expect(object["status"] == .string(receiptStatus))
             #expect(object["note"]?.receiptString?.contains(expected) == true)
         }
     }

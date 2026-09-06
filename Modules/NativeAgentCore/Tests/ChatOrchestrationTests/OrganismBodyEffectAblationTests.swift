@@ -19,15 +19,12 @@ struct OrganismBodyEffectAblationTests {
         let postureFieldChanges: Int
         let capsuleUTF8Delta: Int
         let runtimeContextUTF8Delta: Int
-        let metacognitiveLaneChanges: Int
-        let metacognitiveReasonSymmetricDifference: Int
         let selectedContextAtomSymmetricDifference: Int
     }
 
     @Test("body interventions causally change only their bounded downstream seams")
     func bodyInterventionsHaveBoundedCausalEffects() async throws {
         let substrate = makeSubstrate()
-        let plan = makePlan()
         let controlSnapshot = snapshot()
         let controlPosture = try #require(OrganismBehaviorPosture.from(snapshot: controlSnapshot))
         let controlProjection = OrganismChemistry.projection(
@@ -37,7 +34,6 @@ struct OrganismBodyEffectAblationTests {
         )
         let controlCapsule = await capsule(substrate: substrate, projection: controlProjection)
         let controlRuntime = runtimeContext(capsule: controlCapsule, posture: controlPosture)
-        let controlShadow = MetacognitiveShadowEvaluator.recommend(plan: plan, posture: controlPosture)
         let controlPacket = try selectedContextPacket()
 
         let providerBrittle = snapshot(
@@ -45,11 +41,9 @@ struct OrganismBodyEffectAblationTests {
         )
         let providerEffect = try await effect(
             substrate: substrate,
-            plan: plan,
             controlPosture: controlPosture,
             controlCapsule: controlCapsule,
             controlRuntime: controlRuntime,
-            controlShadow: controlShadow,
             controlPacket: controlPacket,
             intervention: providerBrittle
         )
@@ -59,8 +53,6 @@ struct OrganismBodyEffectAblationTests {
         #expect(providerEffect.postureFieldChanges == 3)
         #expect(providerEffect.capsuleUTF8Delta > 0)
         #expect(providerEffect.runtimeContextUTF8Delta > 0)
-        #expect(providerEffect.metacognitiveLaneChanges == 0)
-        #expect(providerEffect.metacognitiveReasonSymmetricDifference == 0)
         #expect(providerEffect.selectedContextAtomSymmetricDifference == 0)
 
         let resourceCritical = snapshot(
@@ -68,11 +60,9 @@ struct OrganismBodyEffectAblationTests {
         )
         let resourceEffect = try await effect(
             substrate: substrate,
-            plan: plan,
             controlPosture: controlPosture,
             controlCapsule: controlCapsule,
             controlRuntime: controlRuntime,
-            controlShadow: controlShadow,
             controlPacket: controlPacket,
             intervention: resourceCritical
         )
@@ -82,10 +72,6 @@ struct OrganismBodyEffectAblationTests {
         #expect(resourceEffect.postureFieldChanges == 3)
         #expect(resourceEffect.capsuleUTF8Delta > 0)
         #expect(resourceEffect.runtimeContextUTF8Delta > 0)
-        // The metacognitive governor remains shadow-only. Body pressure changes
-        // its reason evidence, not its compute/tool/context recommendation.
-        #expect(resourceEffect.metacognitiveLaneChanges == 0)
-        #expect(resourceEffect.metacognitiveReasonSymmetricDifference == 3)
         #expect(resourceEffect.selectedContextAtomSymmetricDifference == 0)
 
         let deliveryStale = snapshot(
@@ -93,11 +79,9 @@ struct OrganismBodyEffectAblationTests {
         )
         let deliveryEffect = try await effect(
             substrate: substrate,
-            plan: plan,
             controlPosture: controlPosture,
             controlCapsule: controlCapsule,
             controlRuntime: controlRuntime,
-            controlShadow: controlShadow,
             controlPacket: controlPacket,
             intervention: deliveryStale
         )
@@ -107,7 +91,6 @@ struct OrganismBodyEffectAblationTests {
         #expect(deliveryEffect.postureFieldChanges == 3)
         #expect(deliveryEffect.capsuleUTF8Delta > 0)
         #expect(deliveryEffect.runtimeContextUTF8Delta > 0)
-        #expect(deliveryEffect.metacognitiveLaneChanges == 0)
         #expect(deliveryEffect.selectedContextAtomSymmetricDifference == 0)
 
         print("[organism-body-ablation] provider=\(describe(providerEffect))")
@@ -160,23 +143,15 @@ struct OrganismBodyEffectAblationTests {
         )
     }
 
-    @Test("body state does not directly rerank Fluid Context or gain shadow control")
-    func bodyStateHasNoDirectContextOrGovernorControl() throws {
-        let plan = makePlan()
+    @Test("body state does not directly rerank Fluid Context")
+    func bodyStateHasNoDirectContextControl() throws {
         let control = try #require(OrganismBehaviorPosture.from(snapshot: snapshot()))
         let pressure = try #require(OrganismBehaviorPosture.from(snapshot: snapshot(
             body: BodySchema(resourcePressure: .critical)
         )))
-
-        let controlRecommendation = MetacognitiveShadowEvaluator.recommend(plan: plan, posture: control)
-        let pressureRecommendation = MetacognitiveShadowEvaluator.recommend(plan: plan, posture: pressure)
-        #expect(laneChanges(controlRecommendation, pressureRecommendation) == 0)
-        #expect(controlRecommendation.feasibleAffordances == pressureRecommendation.feasibleAffordances)
-        guard case .object(let trace) = pressureRecommendation.traceValue else {
-            Issue.record("shadow recommendation should have an object trace")
-            return
-        }
-        #expect(trace["controlAuthority"] == .bool(false))
+        // The intervention is real at the posture seam, so an unchanged packet
+        // below is evidence of isolation rather than of a no-op fixture.
+        #expect(postureChanges(control, pressure) == 3)
 
         // Fluid Context receives NeedSignal, not OrganismSnapshot/BodySchema.
         // With every selector input held fixed, the paired packet is exact.
@@ -188,11 +163,9 @@ struct OrganismBodyEffectAblationTests {
 
     private func effect(
         substrate: CognitiveSubstrate,
-        plan: TurnPlan,
         controlPosture: OrganismBehaviorPosture,
         controlCapsule: CognitiveCapsule,
         controlRuntime: String,
-        controlShadow: MetacognitiveShadowRecommendation,
         controlPacket: ContextPacket,
         intervention: OrganismSnapshot
     ) async throws -> Effect {
@@ -204,7 +177,6 @@ struct OrganismBodyEffectAblationTests {
         )
         let changedCapsule = await capsule(substrate: substrate, projection: projection)
         let changedRuntime = runtimeContext(capsule: changedCapsule, posture: posture)
-        let changedShadow = MetacognitiveShadowEvaluator.recommend(plan: plan, posture: posture)
         // No organism/body input enters the selector in the current architecture.
         let changedPacket = try selectedContextPacket()
 
@@ -212,11 +184,6 @@ struct OrganismBodyEffectAblationTests {
             postureFieldChanges: postureChanges(controlPosture, posture),
             capsuleUTF8Delta: absoluteDelta(controlCapsule.combined.utf8.count, changedCapsule.combined.utf8.count),
             runtimeContextUTF8Delta: absoluteDelta(controlRuntime.utf8.count, changedRuntime.utf8.count),
-            metacognitiveLaneChanges: laneChanges(controlShadow, changedShadow),
-            metacognitiveReasonSymmetricDifference: symmetricDifference(
-                controlShadow.reasonCodes,
-                changedShadow.reasonCodes
-            ),
             selectedContextAtomSymmetricDifference: symmetricDifference(
                 controlPacket.receipt.selectedAtomIDs.map(\.rawValue),
                 changedPacket.receipt.selectedAtomIDs.map(\.rawValue)
@@ -280,33 +247,6 @@ struct OrganismBodyEffectAblationTests {
             bodySchema: body,
             signalCount: enabled ? 1 : 0,
             lastSignalAt: enabled ? now : nil
-        )
-    }
-
-    private func makePlan() -> TurnPlan {
-        TurnPlan(
-            id: "body-ablation-plan",
-            messageCharCount: 39,
-            goalType: "file_work",
-            contextMode: "planned",
-            recommendedSurface: "chat",
-            risk: "low",
-            requiresApprovalHint: false,
-            matchedCapabilityIds: [],
-            preloadPrediction: nil,
-            policySnapshot: TurnPolicySnapshot(
-                permissionLevel: "read_only",
-                autonomyDefault: "confirm",
-                fullMacActive: false,
-                developerMode: false,
-                remoteSurface: false,
-                surfaceTrusted: true,
-                fileAccess: "read_only",
-                approvalAvailable: true,
-                remoteIOSAllowed: false
-            ),
-            receiptHints: [],
-            createdAt: "1970-01-01T11:40:00Z"
         )
     }
 
@@ -403,17 +343,6 @@ struct OrganismBodyEffectAblationTests {
         return count
     }
 
-    private func laneChanges(
-        _ lhs: MetacognitiveShadowRecommendation,
-        _ rhs: MetacognitiveShadowRecommendation
-    ) -> Int {
-        var count = 0
-        if lhs.computeLane != rhs.computeLane { count += 1 }
-        if lhs.toolLane != rhs.toolLane { count += 1 }
-        if lhs.contextLane != rhs.contextLane { count += 1 }
-        return count
-    }
-
     private func symmetricDifference(_ lhs: [String], _ rhs: [String]) -> Int {
         Set(lhs).symmetricDifference(Set(rhs)).count
     }
@@ -426,8 +355,6 @@ struct OrganismBodyEffectAblationTests {
         "posture_fields=\(effect.postureFieldChanges) "
             + "capsule_utf8_delta=\(effect.capsuleUTF8Delta) "
             + "runtime_utf8_delta=\(effect.runtimeContextUTF8Delta) "
-            + "shadow_lane_delta=\(effect.metacognitiveLaneChanges) "
-            + "shadow_reason_delta=\(effect.metacognitiveReasonSymmetricDifference) "
             + "context_atom_delta=\(effect.selectedContextAtomSymmetricDifference)"
     }
 }

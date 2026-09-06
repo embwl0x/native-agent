@@ -147,6 +147,15 @@ extension ChatStore {
         _ macMessages: [ChatMessage],
         replyArrived: Bool
     ) -> [ChatMessage] {
+        // 2026-09-06: reply SELECTION already refuses a regenerated-away row,
+        // but the merge did not: the anchor walk appends every unmatched
+        // snapshot row verbatim, so a snapshot taken before the regeneration
+        // landed put the answer being replaced straight back into the
+        // transcript. The Mac deletes that row and appends the replacement
+        // under a new id, so the id can never legitimately come back.
+        let macMessages = regeneratedAwayAssistantIDs.isEmpty
+            ? macMessages
+            : macMessages.filter { !regeneratedAwayAssistantIDs.contains($0.id) }
         let pendingPlaceholderIds = Set(pendingICloudPlaceholders.values)
         let pendingUserIds = Set(pendingSendArgs.keys.compactMap { pendingUserMessage(for: $0)?.id })
         let preserveFloor = Date().addingTimeInterval(-Self.resolvedPreserveWindowSeconds)
@@ -331,7 +340,12 @@ extension ChatStore {
         // and the real reply was then dropped by the resolvedICloudReplyIds
         // guard. Anchoring on position (not content-suppression of known reply
         // texts) keeps legitimately repeated replies ("ok") resolvable.
+        // 2026-09-06: an assistant row the phone removed for a regenerate is
+        // absent locally by construction, so "absent locally" alone would let a
+        // stale snapshot answer the regeneration with the very answer being
+        // replaced. Exclude those ids from every candidate lane below.
         let localAssistantIDs = Set(messages.filter { $0.role == .assistant && !$0.isStreaming }.map(\.id))
+            .union(regeneratedAwayAssistantIDs)
         if let pendingId = pendingICloudPlaceholders.keys.first,
            let pendingUser = pendingUserMessage(for: pendingId) {
             guard let userIndex = indexOfUserOccurrence(pendingUser, in: macMessages) else {

@@ -19,6 +19,23 @@ import PersistenceCore
 
 @Suite("DelegationStatusTool")
 struct DelegationStatusToolTests {
+    @Test func retainedReplyRecoveryShowsMatchingReceiptsWithoutMutatingEvidence() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = codexDir(root, undelivered: true)
+        let raw = #"{"id":"retained-job","entries":[{"payload":{"messageId":"original-message"}}],"completedExecution":{"threadId":"original-thread","turnId":"original-turn","turnResult":{"status":"completed","message":"historical result"}}}"#
+        write(raw, to: directory, named: "retained-job.json")
+        let receipts = root.appendingPathComponent("codex-nativeagent-bridge/reply-deliveries.jsonl")
+        try Data(#"{"messageIds":["original-message"],"threadId":"later-thread","turnId":"later-turn","bridge":{"status":"delivered"}}"#.utf8).write(to: receipts)
+        let row = try #require(projector(root).allJobs(now: Self.now).first { $0.id == "retained-job" })
+        #expect(row.deliveryOutcome == "unknown")
+        #expect(row.recoveryNote?.contains("original-message") == true)
+        #expect(row.recoveryNote?.contains("no replay or deletion") == true)
+        guard case .object(let json) = row.toJSON() else { Issue.record("missing details"); return }
+        #expect(json["thread_id"] == .string("original-thread"))
+        #expect(json["turn_id"] == .string("original-turn"))
+        #expect(try String(contentsOf: directory.appendingPathComponent("retained-job.json"), encoding: .utf8) == raw)
+    }
 
     // 2026-08-05T19:00:00Z — a fixed instant every fixture is written against.
     private static let now = Date(timeIntervalSince1970: 1_785_956_400)

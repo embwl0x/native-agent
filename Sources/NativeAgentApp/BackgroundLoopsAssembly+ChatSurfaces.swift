@@ -47,7 +47,7 @@ extension BackgroundLoopsAssembly {
             profile: .slack,
             dataRoot: dataRoot
         )
-        let handler: SlackSocketModeChatHandler = { inbound in
+        let handler: SlackSocketModeProgressChatHandler = { inbound, progress in
             let sessionId = try await slackSessions.activeSessionId(for: inbound)
             let prompt = """
             [from: slack, user: \(inbound.userId), channel: \(inbound.channelId)]
@@ -77,7 +77,17 @@ extension BackgroundLoopsAssembly {
                                 attachments: inbound.attachments,
                                 persona: NativeAgentNotificationDefaults.agentDisplayName(dataRoot: dataRoot),
                                 surface: "slack",
-                                suppressUserAppend: false
+                                suppressUserAppend: false,
+                                // 2026-09-06: Slack supplied no progress
+                                // callback at all, so reconnect and compaction
+                                // notices died here. Only notices are
+                                // forwarded — tool events would be channel
+                                // noise; the sink posts one line per kind.
+                                progress: { event in
+                                    if case .notice(let kind, let text) = event {
+                                        await progress(kind, text)
+                                    }
+                                }
                             )
                         }
                     }
@@ -91,7 +101,7 @@ extension BackgroundLoopsAssembly {
         return SlackSocketModeLoop(
             config: cfg,
             dataRoot: dataRoot,
-            chatHandler: handler
+            progressChatHandler: handler
         )
     }
 
@@ -168,8 +178,22 @@ extension BackgroundLoopsAssembly {
             // backend is present so trusted Full Mac YOLO can read
             // `evolution_status`; propose/install retain their ordinary
             // TrustCenter and approval floors.
-            let sessionId = try await telegramSessions.activeSessionId(chatId: chatId)
-            let persona = (try? await telegramSessions.persona(chatId: chatId))
+            // 2026-09-06: an approval continuation names the session its
+            // interrupted turn ran in. Honour it — resolving the chat's active
+            // binding here put the replayed tool result into whatever session
+            // a /new or /resume had bound in the meantime.
+            // 2026-09-06: a Telegram forum topic is its own conversation, so
+            // the session is keyed on (chat, topic). `context.threadId` is nil
+            // for a DM, an ordinary group, and a forum's General topic — all of
+            // which keep the chat-only key they already have on disk.
+            let destination = TelegramDestination(chatId: chatId, threadId: context.threadId)
+            let sessionId: String
+            if let pinnedSessionId = context.sessionId {
+                sessionId = pinnedSessionId
+            } else {
+                sessionId = try await telegramSessions.activeSessionId(destination: destination)
+            }
+            let persona = (try? await telegramSessions.persona(destination: destination))
                 ?? NativeAgentNotificationDefaults.agentDisplayName(dataRoot: dataRoot)
             let effectiveText = TelegramReplyPromptRenderer.messageWithReplyContext(
                 text: text,
@@ -177,7 +201,10 @@ extension BackgroundLoopsAssembly {
             )
             let replyRoute = ChatToolSessionContext.ReplyRoute(
                 surface: "telegram",
-                destinationId: String(chatId)
+                destinationId: String(chatId),
+                // The topic a tool-driven send or an approval prompt must
+                // answer in. Nil keeps the historical whole-chat route.
+                threadId: destination.threadId.map(String.init)
             )
             // Convert downloaded Telegram images into the Mac-path attachment
             // shape. Mirrors ChatView.swift's MultimodalAttachment(type:"image",

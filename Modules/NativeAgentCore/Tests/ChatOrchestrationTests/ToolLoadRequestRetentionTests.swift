@@ -113,4 +113,42 @@ struct ToolLoadRequestRetentionTests {
         #expect(result["session_active_count"] == .int(Int64(requested.count)))
         #expect(await dispatcher.activeToolsStore.load(sessionId: session).activeTools == requested)
     }
+
+    /// A load pins the descriptor it SAW. Before this, `tool_load` persisted
+    /// names only, so a tool whose schema was present at load time and absent
+    /// from the next turn-start catalog reached step 3 of
+    /// `commitTurnStartContract` with no pinned schema and had its row
+    /// RELEASED — the exact readiness flap pinning exists to survive, and with
+    /// the contract now the advertising authority, a released row is a tool
+    /// the model was told it loaded and then cannot see.
+    @Test func aLoadPinsItsDescriptorSoAVanishedSchemaKeepsItsAdvertisedRow() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dispatcher = SwiftToolDispatcher(dataRoot: root)
+        let session = UUID().uuidString
+        let name = "workshop_status"
+
+        let result = try object(try await dispatcher.dispatch(tool: "tool_load", input: [
+            "session_id": .string(session), "names": .array([.string(name)]),
+        ], surface: "chat"))
+        #expect(result["loaded_now"] == .array([.string(name)]))
+        #expect(await dispatcher.activeToolsStore.load(sessionId: session)
+            .pinnedSchemas[name] != nil)
+
+        // Next turn start, and the tool has dropped out of the live catalog.
+        let catalog = (try await dispatcher.listAvailableToolSchemas())
+            .filter { $0.name != name }
+        #expect(!catalog.contains { $0.name == name })
+        let store = ActiveToolsStore(dataRoot: root)
+        _ = await store.beginTurn(sessionId: session)
+        let commit = try #require(await store.commitTurnStartContract(
+            sessionId: session, promoting: [], catalog: catalog
+        ))
+
+        // The row survives, advertised from the descriptor the load froze.
+        #expect(commit.state.activeTools.contains(name))
+        #expect(commit.state.advertisedLoadOrder.contains(name))
+        #expect(commit.state.pinnedSchemas[name] != nil)
+        #expect(!commit.state.lastDropped.contains(name))
+    }
 }

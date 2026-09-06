@@ -320,7 +320,10 @@ final class ActionChannelTests: XCTestCase {
         XCTAssertEqual(object["action"] as? String, "recordNotificationReceipt")
         XCTAssertEqual(
             object["payload"] as? [String: String],
-            ["eventId": eventID, "channel": "apns"]
+            // `direction` is not decoration: the Mac router rejects a receipt
+            // without it, so a payload that loses this key silently kills the
+            // whole delivery-confirmation lane again.
+            ["eventId": eventID, "channel": "apns", "direction": "mac_to_ios"]
         )
         XCTAssertEqual(try XCTUnwrap(object["signature"] as? String), try oracleSignature(object))
     }

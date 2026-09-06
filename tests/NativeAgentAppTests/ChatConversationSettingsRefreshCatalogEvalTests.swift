@@ -61,8 +61,19 @@ struct ChatConversationSettingsRefreshCatalogEvalTests {
             Issue.record("catalog refresh owner moved")
             return
         }
-        let body = String(appModel[start.lowerBound...].prefix(700))
-        #expect(body.contains("return true"))
+        // 2026-09-06: d14bb211 ("a refresh says whether it reached the
+        // provider") and c277f3af (a partial page is still a live read) made
+        // the success answer conditional — the unconditional `return true`
+        // became `return freshness?.reachedProvider ?? true`, and the switch
+        // that names each freshness case pushed the body well past the old
+        // 700-character window, so the pins below were reading truncated
+        // source. Slice to the end of the function instead of a fixed prefix.
+        let owner = appModel[start.lowerBound...]
+        let body = owner.range(of: "\n    @MainActor")
+            .map { String(owner[..<$0.lowerBound]) } ?? String(owner)
+        // Success is no longer asserted, it is derived: only a read that
+        // reached the provider may report a refresh.
+        #expect(body.contains("return freshness?.reachedProvider ?? true"))
         #expect(body.contains("return false"))
         #expect(body.contains("statusText = \"Model refresh failed:"))
     }

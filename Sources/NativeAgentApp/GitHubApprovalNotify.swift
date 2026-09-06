@@ -77,7 +77,11 @@ actor GitHubApprovalEdgeNotifier {
             let isNewApproval = info.reviewState.lowercased() == "approved" && prior != "approved"
             if isNewApproval {
                 do {
-                    _ = try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+                    // Item 26: news, not work (see the header) — informational,
+                    // so it lands on the phone once and the card is the receipt.
+                    _ = try await AttentionRouter.shared.route(
+                        eventId: "pr_approved:\(itemId)",
+                        importance: .informational,
                         title: "PR approved",
                         body: "\(info.title) (\(itemId)) was approved.",
                         userInfo: [

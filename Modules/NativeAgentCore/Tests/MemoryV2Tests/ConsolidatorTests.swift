@@ -19,6 +19,14 @@ struct MemoryConsolidatorTests {
         [a, b, c, d]
     }
 
+    /// 2026-09-06 (ff5a11b8): duplicate selection, supersession and the active
+    /// semantic pass compare vectors ONLY when both rows carry the same
+    /// non-empty `embedding_epoch` — "cosine across two vector spaces is a
+    /// number, not a similarity". Unstamped rows are legacy/unverified and are
+    /// never compared, so any fixture whose point is a vector comparison has
+    /// to put both rows in one stamped space.
+    private let testEpoch = "consolidator-test-epoch"
+
     @Test func autoAcceptsAboveDurabilityThreshold() async throws {
         let store = try makeStore()
         let p = StoredProposal(
@@ -84,14 +92,17 @@ struct MemoryConsolidatorTests {
             content: "the user uses Claude persona for Opus",
             source: "chat",
             embedding: vec(1, 0, 0, 0),
+            embeddingEpoch: testEpoch,
             status: "active"
         )
         _ = try await store.insertMemory(mem)
-        // Near-identical proposal (same vector → cosine = 1.0).
+        // Near-identical proposal (same vector → cosine = 1.0), in the SAME
+        // stamped embedding epoch so the vectors are comparable at all.
         let p = StoredProposal(
             content: "the user uses Claude persona for Opus model",
             source: "consolidator-test",
             embedding: vec(1, 0, 0, 0),
+            embeddingEpoch: testEpoch,
             metadata: .object(["durability_score": .double(0.99)])
         )
         _ = try await store.insertProposal(p)
@@ -213,6 +224,7 @@ struct MemoryConsolidatorTests {
             createdAt: old,
             updatedAt: old,
             embedding: vec(1, 0, 0, 0),
+            embeddingEpoch: testEpoch,
             status: "active",
             metadata: .object(["kind": .string("preference")])
         ))
@@ -222,6 +234,7 @@ struct MemoryConsolidatorTests {
             source: "adaptive-promoter:test",
             confidence: 0.9,
             embedding: vec(1, 0, 0, 0),
+            embeddingEpoch: testEpoch,
             status: "active",
             metadata: .object(["kind": .string("preference")])
         ))
@@ -426,24 +439,24 @@ struct MemoryConsolidatorTests {
         _ = try await store.insertMemory(StoredMemory(
             id: "loc-old", content: "user lives in Example County",
             createdAt: old, updatedAt: old,
-            embedding: [1, 0, 0], status: "active",
+            embedding: [1, 0, 0], embeddingEpoch: testEpoch, status: "active",
             metadata: .object(["kind": .string("location")])
         ))
         _ = try await store.insertMemory(StoredMemory(
             id: "loc-new", content: "user lives in Austin",
-            embedding: [0.9, 0.43, 0], status: "active",
+            embedding: [0.9, 0.43, 0], embeddingEpoch: testEpoch, status: "active",
             metadata: .object(["kind": .string("location")])
         ))
         // Two preference facts (multi-valued kind) — must coexist.
         _ = try await store.insertMemory(StoredMemory(
             id: "pref-a", content: "user likes tea",
             createdAt: old, updatedAt: old,
-            embedding: [0, 1, 0], status: "active",
+            embedding: [0, 1, 0], embeddingEpoch: testEpoch, status: "active",
             metadata: .object(["kind": .string("preference")])
         ))
         _ = try await store.insertMemory(StoredMemory(
             id: "pref-b", content: "user likes green tea",
-            embedding: [0, 0.99, 0.14], status: "active",
+            embedding: [0, 0.99, 0.14], embeddingEpoch: testEpoch, status: "active",
             metadata: .object(["kind": .string("preference")])
         ))
 

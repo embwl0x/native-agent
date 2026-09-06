@@ -7,7 +7,7 @@ import Carbon.HIToolbox
 
 /// Registers a global hotkey using Carbon's RegisterEventHotKey.
 /// Default: ⌘-⇧-J (configurable via AppStorage "globalHotkey").
-/// Tap = open/toggle window. Hold >200ms = voice push-to-talk (wired to VoiceInputController).
+/// Tap = bring the main window forward. Hold >200ms = voice push-to-talk (wired to VoiceInputController).
 @MainActor
 final class GlobalHotkeyManager: NSObject {
     enum RegistrationTransition: Equatable, Sendable {
@@ -211,7 +211,7 @@ struct HotkeyControlView: View {
                 .onChange(of: enabled) { _, newValue in
                     GlobalHotkeyManager.shared.setEnabled(newValue)
                 }
-            Text("⌘⇧J — Tap to open quick chat. Hold to activate voice input.")
+            Text("⌘⇧J — Tap to bring NativeAgent forward. Hold to activate voice input.")
                 .font(NativeAgentFont.label)
                 .foregroundStyle(.secondary)
             Text("Tap works without Accessibility access. Hold-to-talk needs Microphone and Speech Recognition permission.")

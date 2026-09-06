@@ -68,12 +68,11 @@
 //      `benchCognitiveConfiguration`). It grades what she IS when the
 //      subsystem is on, not whether the user turned it on.
 //
-//  One seam is real but HERMETICALLY ROOTED: the since-last-session digest
-//  (`SessionDigestProvider`) defaults to reading `<dataRoot parent>/docs/
-//  agent_inbox` and `~/.claude/state/claude-worklog.jsonl`. The bench passes
-//  a provider whose every path sits INSIDE the fixture root (absent → the
-//  digest fails open to empty, as it does in production), so a replay never
-//  reads the live worklog or repo inbox.
+//  One seam is real but HERMETICALLY ROOTED: the prior-session anchor
+//  (`SessionDigestProvider`) reads `<dataRoot>/chat/sessions.json`. The bench
+//  passes a provider rooted INSIDE the fixture, so a replay never reads the
+//  live session index; an absent one fails open to no anchor, as in
+//  production.
 //
 //  ─────────────────────────────────────────────────────────────────────────
 //  WHAT IT GRADES: ENVELOPE INVARIANTS, NOT BYTE EQUALITY
@@ -937,17 +936,12 @@ actor TurnReplayBench {
         return result
     }
 
-    /// The since-last-session digest provider, with EVERY source path inside
-    /// the fixture root. The production default reads the repo's agent inbox
-    /// and User's live worklog — a hermetic replay must not. Absent sources
-    /// fail open to an empty digest, exactly as in production.
+    /// The prior-session anchor provider, rooted INSIDE the fixture. Its only
+    /// source is `<root>/chat/sessions.json`, so a replay can never reach the
+    /// live index; an absent or unqualifying index fails open to no anchor,
+    /// exactly as in production.
     static func hermeticDigestProvider(root: URL) -> SessionDigestProvider {
-        let absent = root.appendingPathComponent("bench-absent", isDirectory: true)
-        return SessionDigestProvider(
-            dataRoot: root,
-            agentInboxDir: absent.appendingPathComponent("agent_inbox", isDirectory: true),
-            worklogPath: absent.appendingPathComponent("worklog.jsonl")
-        )
+        SessionDigestProvider(dataRoot: root)
     }
 
     /// Bounded persistence drain for this turn's canonical JSONL receipt(s).
@@ -1119,8 +1113,27 @@ actor TurnReplayBench {
         if stable <= 0 {
             breach("segments.stable", "a non-empty STABLE system segment (persona + pins)", "0 chars")
         }
-        if dynamic <= 0 {
-            breach("segments.dynamic", "a non-empty DYNAMIC system segment (packet + recall)", "0 chars")
+        // 2026-09-06: graded on the receipt that OWNS the final rendering, not
+        // always on `summary`. On the history lane the base builder is called
+        // with `includeClockContext: false`
+        // (ChatOrchestration+SessionHistory.swift, the buildTurnContext call in
+        // buildTurnContextWithHistory) precisely so the history assembler does
+        // the one eventual prompt rendering — so the base receipt's dynamic
+        // segment is deliberately UNFINISHED there, and on a root with no
+        // ContextFlow packet and no memory store it is legitimately 0. The
+        // segment that actually reaches the model on such a turn is the one
+        // measured by `context.history.summary`, and grading `summary` here
+        // asserted a segment production never intended to be complete.
+        //
+        // This is not a softening: on a history turn (7a) below still requires
+        // outerDynamic − innerDynamic >= the rendered history block, so a block
+        // that is computed and never appended still fails by name.
+        let finalDynamic = historySummary?.count("system.dynamicChars") ?? dynamic
+        if finalDynamic <= 0 {
+            breach("segments.dynamic",
+                   "a non-empty DYNAMIC system segment (packet + recall"
+                   + (historySummary == nil ? ")" : " + history)"),
+                   "0 chars")
         }
         func band(_ name: String, _ source: Int, _ replay: Int, _ range: ClosedRange<Double>) {
             guard source > 0, replay > 0 else { return }

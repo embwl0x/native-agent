@@ -17,7 +17,7 @@ extension TelegramPollLoop {
             return true
         }
         guard let queued = await turnCoordinator.queuedTurn(
-            chatId: parsed.chatId,
+            destination: parsed.destination,
             updateId: parsed.updateId
         ), queued.acknowledgementMessageId == parsed.messageId else {
             await answerQueuedTurnControlCallback(
@@ -66,7 +66,7 @@ extension TelegramPollLoop {
                 return true
             }
             guard await turnCoordinator.removeQueuedTurn(
-                chatId: parsed.chatId,
+                destination: parsed.destination,
                 updateId: parsed.updateId
             ) != nil else {
                 await answerQueuedTurnControlCallback(
@@ -94,9 +94,9 @@ extension TelegramPollLoop {
             // if that old turn finishes naturally there, the promoted item can
             // already be active. An unbound chat-level stop would then cancel
             // the very message the user chose to steer to.
-            let interruptedTurnID = await turnCoordinator.activeTurnID(chatId: parsed.chatId)
+            let interruptedTurnID = await turnCoordinator.activeTurnID(destination: parsed.destination)
             guard await turnCoordinator.promoteQueuedTurn(
-                chatId: parsed.chatId,
+                destination: parsed.destination,
                 updateId: parsed.updateId
             ) != nil else {
                 await answerQueuedTurnControlCallback(
@@ -114,7 +114,7 @@ extension TelegramPollLoop {
             let stopOutcome: TelegramTurnCoordinator.StopOutcome
             if let interruptedTurnID {
                 stopOutcome = await requestLiveTurnStop(
-                    chatId: parsed.chatId,
+                    destination: parsed.destination,
                     turnId: interruptedTurnID
                 )
             } else {

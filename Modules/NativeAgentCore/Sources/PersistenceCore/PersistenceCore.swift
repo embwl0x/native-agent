@@ -855,13 +855,32 @@ public final class SwiftNativePersistenceCore: PersistenceCoreProtocol {
                 path.standardizedFileURL.path
             )
         }
+        // 2026-09-06: every caller here writes newline-terminated lines, so a
+        // file that does NOT end in a newline is a torn append (a crash or a
+        // short write mid-line). Appending straight onto it fuses the torn
+        // bytes with the next record: the reader then sees one malformed line
+        // and drops BOTH — the torn row was already lost, but the new one need
+        // not be. Close the torn line first so only the torn row is lost.
+        var payload = data
+        if let size = (try? FileManager.default.attributesOfItem(atPath: path.path))
+            .flatMap({ ($0[.size] as? NSNumber)?.intValue }), size > 0 {
+            let probeFD = open(path.path, O_RDONLY)
+            if probeFD >= 0 {
+                var lastByte: UInt8 = 0
+                let read = pread(probeFD, &lastByte, 1, off_t(size - 1))
+                _ = Darwin.close(probeFD)
+                if read == 1 && lastByte != 0x0A {
+                    payload = Data([0x0A]) + data
+                }
+            }
+        }
         let fd = open(path.path, O_WRONLY | O_CREAT | O_APPEND, createMode)
         if fd < 0 {
             throw PersistenceCoreError.ioFailure("open(append) failed: \(String(cString: strerror(errno)))")
         }
         var handedOff = false
         defer { if !handedOff { _ = syscalls.close(fd) } }
-        try data.withUnsafeBytes { raw in
+        try payload.withUnsafeBytes { raw in
             var ptr = raw.baseAddress!
             var remaining = raw.count
             while remaining > 0 {
@@ -1128,15 +1147,13 @@ public enum JSONLLineCaps {
     /// `<dataRoot>/native_power/browser/receipts.jsonl` and
     /// `<dataRoot>/native_power/actions/receipts.jsonl`.
     public static let actionReceipts = 5000
-    /// `<dataRoot>/workflows/runs.jsonl`.
-    public static let workflowRuns = 5000
-    /// `<dataRoot>/logs/maintenance_sweep.jsonl` — one line per file the A5.5
-    /// stale-artifact sweep removed (plus one per-pass summary). Audit-class:
-    /// this is the ONLY record that a given backup or receipt ever existed, so
-    /// it keeps a deeper history than the receipt-class feeds above. At the
-    /// sweep's 200/tick cap this holds roughly two months of a fully-saturated
-    /// sweep, and years of the steady state (a handful of files a week).
-    public static let maintenanceSweep = 20_000
+    // `<dataRoot>/workflows/runs.jsonl` had a 5000-line cap here. The workflow
+    // run engine was retired 2026-09-01 (User authorized) and nothing appends to
+    // that feed any more; the file stays on disk as frozen history.
+    // `<dataRoot>/logs/maintenance_sweep.jsonl` had a 20,000-line cap here. The
+    // maintenance pass stopped writing it 2026-09-01 (User's call): 2,921 rows /
+    // 613 KB had accumulated with no production reader. The retention work
+    // itself is unchanged; the file stays on disk as frozen history.
     /// `<dataRoot>/logs/background_loop_failures.jsonl` — operational loop
     /// failures surfaced through `LoopTickOutcome`.
     public static let backgroundLoopFailures = 5000
@@ -1204,6 +1221,12 @@ public enum JSONLLineCaps {
     /// rely on this trim to bound it.
     public static let studioJournal = 100_000
 
+    /// `<dataRoot>/studio/canon/canon.jsonl` — the museum's promote/demote
+    /// ledger. Deliberate acts of tending, a handful a year at most, so this is
+    /// a runaway-writer backstop and never retention: like the journal, the
+    /// canon's promise is that a decided row never ceases to exist.
+    public static let studioCanon = 20_000
+
     /// Byte threshold below which the turn-trace feed skips its line count
     /// entirely (see `enforceJSONLLineCap(trimWhenBytesExceed:)`). Sized so the
     /// per-turn append never reads a multi-megabyte file just to learn it is
@@ -1215,10 +1238,11 @@ public enum JSONLLineCaps {
     public static let turnTraceMaximumBytes = 12 * 1024 * 1024
     public static let turnTraceTrimTargetBytes = 8 * 1024 * 1024
 
-    /// `<dataRoot>/mobile_push/receipts.jsonl` — one row per APNs delivery
-    /// attempt. Raw uncapped append until C8 (2026-08-28); receipt-class, same
-    /// budget as the other delivery ledgers.
-    public static let mobilePushReceipts = 5000
+    // `<dataRoot>/mobile_push/receipts.jsonl` had a 5,000-line budget here
+    // (C8, 2026-08-28). RETIRED 2026-09-01 (sweep item 21): the APNs writer is
+    // gone — no production code ever read the feed back, the receipt is
+    // returned to the caller instead — so a cap on it would bound nothing. The
+    // existing rows stay on disk as history and nothing appends to them.
 
     /// How often `appendJSONLCapped` evaluates the LINE cap in full, in
     /// appends-per-path, regardless of `trimWhenBytesExceed`.
@@ -1645,9 +1669,6 @@ public func jsonlPathOwnedCapPolicy(for path: URL) -> JSONLPathOwnedCapPolicy? {
             trimWhenBytesExceed: JSONLLineCaps.activityTrimTriggerBytes
         )
     }
-    if file == "receipts.jsonl", parent == "mobile_push" {
-        return JSONLPathOwnedCapPolicy(maxLines: JSONLLineCaps.mobilePushReceipts)
-    }
     if file == "runs.jsonl",
        parent == "benchmark",
        path.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "harness" {
@@ -1659,6 +1680,11 @@ public func jsonlPathOwnedCapPolicy(for path: URL) -> JSONLPathOwnedCapPolicy? {
         // No byte trigger: the line budget is the ONLY constraint, and the feed
         // is small enough that evaluating it costs nothing.
         return JSONLPathOwnedCapPolicy(maxLines: JSONLLineCaps.studioJournal)
+    }
+    if file == "canon.jsonl",
+       parent == "canon",
+       path.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "studio" {
+        return JSONLPathOwnedCapPolicy(maxLines: JSONLLineCaps.studioCanon)
     }
     return nil
 }

@@ -340,8 +340,12 @@ private func runLedgerRows(_ root: URL) -> [JSONValue] {
     #expect(result.workers.count == 2)
     for worker in result.workers {
         #expect(worker.status == "failed", "a timed-out worker must report status failed")
+        // 2026-09-06 (06ebf4a3): the worker error names the deadline and its
+        // length, and says explicitly that any output arriving after
+        // cancellation is evidence rather than a verified completion — the
+        // phrase "timed out" was replaced by that fuller statement.
         #expect(
-            (worker.error ?? "").contains("timed out"),
+            (worker.error ?? "").contains("deadline exceeded (1s)"),
             "the timeout must be NAMED in the worker error; got \(worker.error ?? "nil")"
         )
         #expect(worker.output.isEmpty)

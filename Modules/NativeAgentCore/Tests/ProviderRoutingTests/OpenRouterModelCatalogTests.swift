@@ -89,11 +89,17 @@ import Testing
     try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
     let cache = providers.appendingPathComponent("openrouter-models-cache.json")
 
-    func write(updatedAt: Date) throws {
+    // 2026-09-06 (630c7507): only a cache whose source response carried the
+    // WHOLE list may convict a model of absence, and a cache carrying no
+    // `complete` stamp is `.unknown` for the same reason — absence of the stamp
+    // is not authority to convict. This fixture is the complete-cache case the
+    // test is about, so it stamps itself complete.
+    func write(updatedAt: Date, complete: Bool = true) throws {
         let payload: [String: Any] = [
             "schema_version": 1,
             "updated_at": ISO8601DateFormatter().string(from: updatedAt),
             "source": OpenRouterModelCatalog.endpoint.absoluteString,
+            "complete": complete,
             "models": [[
                 "id": "anthropic/claude-sonnet-5",
                 "name": "Claude Sonnet 5",

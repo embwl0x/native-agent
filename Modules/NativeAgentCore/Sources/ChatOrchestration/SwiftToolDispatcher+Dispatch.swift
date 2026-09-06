@@ -144,6 +144,13 @@ extension SwiftToolDispatcher {
             if allAvailable.contains(tool) {
                 let persisted = await activeToolsStore.load(sessionId: sessionId).activeTools
                 let active = persisted.union(LLMCallContext.turnActiveTools ?? [])
+                // USAGE STAMP (2026-09-01): a session-loaded tool that is being
+                // CALLED stays advertised. This is the only signal feeding
+                // beginTurn's idle drop — without it the drop would be a timer,
+                // not "she's done with it".
+                if persisted.contains(tool) {
+                    await activeToolsStore.markUsed(sessionId: sessionId, names: [tool])
+                }
                 if !active.contains(tool) {
                     return .object([
                         "status": .string("failed"),
@@ -174,6 +181,15 @@ extension SwiftToolDispatcher {
         case "recall_memory":   return try await impl_recall_memory(input: input, surface: surface)
         case "recall_search":   return try await impl_recall_memory(input: input, surface: surface)
         case "commit_memory":   return try await impl_commit_memory(input: input)
+        // The moments lane (2026-09-02): her review seat over the moment
+        // proposals the post-turn promoter stages. Both refuse any id whose
+        // lane is not "moment".
+        case "memory_moments_pending": return try await impl_memory_moments_pending()
+        case "memory_moment_review": return try await impl_memory_moment_review(input: input)
+        case "list_memories":   return try await impl_list_memories(input: input)
+        case "rewrite_memory":  return try await impl_rewrite_memory(input: input)
+        case "forget_memory":   return try await impl_forget_memory(input: input)
+        case "rebuild_knowledge_graph": return try await impl_rebuild_knowledge_graph(input: input)
         case "workshop_submit": return try await impl_workshop_submit(input: input)
         case "workshop_status": return try await impl_workshop_status(input: input)
         case "task_ledger_post": return try await impl_task_ledger_post(input: input)
@@ -204,9 +220,23 @@ extension SwiftToolDispatcher {
         case "studio_consult_read": return try await impl_studio_consult_read(input: input)
         case "studio_journal": return try await impl_studio_journal(input: input)
         case "studio_recall": return try await impl_studio_recall(input: input)
+        case "studio_canon": return try await impl_studio_canon(input: input)
+        // `surface` is threaded in because the canon SEAT is decided from
+        // runtime provenance and cross-checked against the running turn, never
+        // read from tool input. See StudioCanonSeatGate.
+        case "studio_canon_resolve":
+            return try await impl_studio_canon_resolve(input: input, surface: surface)
+        // Item 7 (2026-09-02): the held tier's two verbs. Both are seated on
+        // her own live local turn inside the impl — see
+        // SwiftToolDispatcher+StandingViewTools.swift.
+        case "hold_view":
+            return await impl_hold_view(input: input, surface: surface)
+        case "release_view":
+            return await impl_release_view(input: input, surface: surface)
         case "search_kg":       return try await impl_search_kg(input: input)
         case "search_chat_history": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "session_search": return try await impl_search_chat_history(input: input, invokedAs: tool)
+        case "read_chat_message": return try await impl_read_chat_message(input: input, invokedAs: tool)
         case "get_persona_doc": return try await impl_get_persona_doc(input: input)
         case "persona_read": return try await impl_persona_read(input: input)
         case "persona_write": return try await impl_persona_write(input: input)
@@ -226,6 +256,10 @@ extension SwiftToolDispatcher {
         case "scratchpad_read": return try await impl_scratchpad_read(input: input)
         case "recent_trace_summary": return try await impl_recent_trace_summary(input: input)
         case "time_now": return Self.impl_time_now()
+        // Personality depth item 3 (2026-09-02): a PURE read of her own inner
+        // state. No mutation, no persistence, no provider call — reading never
+        // changes what it reads (substrate design law 5).
+        case "inner_state": return await impl_inner_state(input: input)
         // ── Builder tools (2026-06-08 agent-builder-tools) ──
         // Process-based CLI execution. Trust Center Full Mac file_ops_allowed
         // REQUIRED upstream; default autonomy is `confirm` so every call
@@ -323,6 +357,14 @@ extension SwiftToolDispatcher {
                 return Self.evolutionBridgeNotWiredEnvelope(tool: "evolution_status")
             }
             return try await bridge.evolutionStatus(input: input)
+        case "evolution_withdraw":
+            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
+                return Self.builderFullMacRequiredEnvelope(tool: "evolution_withdraw")
+            }
+            guard let bridge = evolutionBridge else {
+                return Self.evolutionBridgeNotWiredEnvelope(tool: "evolution_withdraw")
+            }
+            return try await bridge.evolutionWithdraw(input: input)
         case "self_install":
             if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
                 return Self.builderFullMacRequiredEnvelope(tool: "self_install")
@@ -764,6 +806,24 @@ extension SwiftToolDispatcher {
         // impl_mac_injection_tool, and it could not use one if it did.
         case let name where Self.fullMacNudgeToolNames.contains(name):
             return try await impl_mac_nudge_tool(tool: name, input: input, surface: surface)
+        // fable51 item 30 — THE CLIPBOARD ORGAN. Its own route, because its
+        // gate is split down the middle: the read clears the accessibility READ
+        // tier, the write clears app control. Neither needs an injection
+        // capability, so it must not reach `impl_mac_injection_tool`.
+        case let name where Self.macClipboardToolNames.contains(name):
+            return try await impl_mac_clipboard_tool(tool: name, input: input, surface: surface)
+        // fable51 item 29 — THE MENU BAR ORGAN. Its own route for the same
+        // reason: the walk is read tier, the press is the full injection
+        // contract, and one route that knows the difference is clearer than
+        // splitting one organ across two neighbours' lists.
+        case let name where Self.macMenuToolNames.contains(name):
+            return try await impl_mac_menu_tool(tool: name, input: input, surface: surface)
+        // fable51 item 33 — THE READ ORGAN. Its own route because its gate is
+        // CONDITIONAL: read tier always, plus file_ops when — and only when —
+        // the call names a path of its own. No neighbour's list can express
+        // "the gate depends on an argument", so it gets its own case.
+        case let name where Self.macReadToolNames.contains(name):
+            return try await impl_mac_read_tool(tool: name, input: input, surface: surface)
         // W7 — the ambient activity watcher's query tool. Its own route because
         // its gate is not a Mac-control category at all: the impl reads the
         // Trust Center capture toggle and refuses when it is off, and refuses

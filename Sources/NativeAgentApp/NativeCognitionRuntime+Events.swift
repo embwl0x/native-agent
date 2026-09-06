@@ -49,7 +49,18 @@ enum NativeCognitiveEventFactory {
             subject: CognitiveSubjectReference(
                 type: "chat_turn",
                 id: "\(safeSession):\(safeMessage)",
-                label: "\(safeSurface) \(normalizedRole)"
+                // 2026-09-02 — A TOPIC, NOT A ROUTE. This label used to be
+                // "<surface> <role>" ("chat user"), which is where the turn
+                // came from, not what it was about; the felt line's object
+                // organ read subject labels and could only ever have said
+                // "warm — chat user" with it. The topic label is up to three
+                // salient content words from the already-redacted turn text,
+                // through the same extractor Fluid Context uses for attention
+                // terms, and nil when nothing is salient (then no object).
+                // The route itself is not lost: `surface` and `role` are
+                // already separate metadata keys below, and `routeLabel`
+                // preserves the exact composed string anything was reading.
+                label: CognitiveSubstrate.feltTopicLabel(from: safeText)
             ),
             sourceClass: sourceClass,
             occurredAt: now,
@@ -62,6 +73,7 @@ enum NativeCognitiveEventFactory {
                 "sessionId": .string(safeSession),
                 "messageId": .string(safeMessage),
                 "event_class": .string(kind.rawValue),
+                "routeLabel": .string("\(safeSurface) \(normalizedRole)"),
             ]
         )
     }

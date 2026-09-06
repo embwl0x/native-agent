@@ -390,6 +390,144 @@ func grepDispatchTreatsLeadingDashPatternsAsRegexData(engine: String, pattern: S
     #expect(rstr(obj["error_code"]) == "git_unavailable")
 }
 
+// MARK: - read-only git really is read-only (GIT_OPTIONAL_LOCKS)
+//
+// git_status / git_diff / git_log / repo_dirty_summary are classified read-only
+// and admitted to ParallelToolDispatch's concurrent set on that basis. But
+// `git status` and `git diff` take an OPTIONAL lock on `.git/index` to write
+// back a refreshed stat cache — a shared-file write two concurrent readers can
+// contend on. `GIT_OPTIONAL_LOCKS=0` is git's own switch for read-only callers.
+// These pin the switch, the plumbing that carries it into the child process,
+// and the observable effect on `.git/index`.
+
+// 2026-09-06: the read-tier git environment is no longer "inherit everything,
+// plus GIT_OPTIONAL_LOCKS=0". These four tools run git UNSANDBOXED
+// (runProcess applies none), and git happily executes commands the repository
+// or the inherited environment names — an external diff driver, a pager, an
+// SSH command, a system-config hook — so a cloned or attacker-supplied
+// checkout could run arbitrary code from git_diff / git_status. The
+// environment is pinned closed: the exec-capable keys are REMOVED, PATH is
+// replaced with a fixed system path (git shells out and resolves helpers
+// through it), and gitReadOnlyConfigOverrideArgs closes the config-file half.
+// Everything unrelated is still inherited, which is the part of the old
+// contract that still matters: Process.environment replaces wholesale.
+@Test func gitReadOnlyEnvironmentDisablesOptionalLocksAndPinsTheExecSurfaceClosed() {
+    #expect(FileSystemActions.gitReadOnlyEnvironmentOverrides == [
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PATH": FileSystemActions.gitSanitizedSearchPath,
+    ])
+    let env = FileSystemActions.gitReadOnlyEnvironment
+    #expect(env["GIT_OPTIONAL_LOCKS"] == "0")
+    #expect(env["PATH"] == FileSystemActions.gitSanitizedSearchPath)
+    // The exec-capable keys never reach the child, whatever the app inherited.
+    for key in FileSystemActions.gitReadOnlyEnvironmentRemovals {
+        #expect(env[key] == nil, "\(key) must not reach a read-tier git child")
+    }
+    // ...and nothing else is stripped: a bare overrides dictionary would drop
+    // HOME and every other variable git and its helpers rely on.
+    let inherited = ProcessInfo.processInfo.environment
+    let pinned = Set(FileSystemActions.gitReadOnlyEnvironmentOverrides.keys)
+        .union(FileSystemActions.gitReadOnlyEnvironmentRemovals)
+    for (key, value) in inherited where !pinned.contains(key) {
+        #expect(env[key] == value, "inherited \(key) was dropped")
+    }
+}
+
+@Test func runProcessCarriesTheReadOnlyGitEnvironmentIntoTheChild() throws {
+    let envBin = "/usr/bin/env"
+    guard FileManager.default.isExecutableFile(atPath: envBin) else { return }
+    let overridden = runProcess(envBin, [], timeout: 30,
+                                environment: FileSystemActions.gitReadOnlyEnvironment)
+    #expect(overridden.launched)
+    #expect(overridden.stdout.contains("GIT_OPTIONAL_LOCKS=0"))
+    // The default (nil) still inherits verbatim, so every pre-existing
+    // runProcess caller is unchanged.
+    if ProcessInfo.processInfo.environment["GIT_OPTIONAL_LOCKS"] == nil {
+        let inheritedRun = runProcess(envBin, [], timeout: 30)
+        #expect(inheritedRun.launched)
+        #expect(!inheritedRun.stdout.contains("GIT_OPTIONAL_LOCKS="))
+    }
+}
+
+/// Builds a repo whose stat cache is stale, so the next `git status` wants to
+/// refresh the index and write it back.
+private func makeStaleStatCacheRepo() throws -> URL? {
+    guard let git = gitBin() else { return nil }
+    let sb = makeRepoSandbox()
+    try sh(git, ["init", "-q"], cwd: sb)
+    try sh(git, ["config", "user.email", "t@t.test"], cwd: sb)
+    try sh(git, ["config", "user.name", "Tester"], cwd: sb)
+    try sh(git, ["config", "commit.gpgsign", "false"], cwd: sb)
+    try "hello\n".write(to: sb.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+    try sh(git, ["add", "-A"], cwd: sb)
+    try sh(git, ["commit", "-q", "-m", "baseline"], cwd: sb)
+    // Rewrite byte-identical content atomically: new inode and mtime, same
+    // hash. git sees a stat mismatch, re-hashes, and wants to store the
+    // refreshed stat info back into .git/index.
+    try "hello\n".write(to: sb.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+    return sb
+}
+
+private func indexIdentity(_ repo: URL) -> (inode: UInt64, modified: Date)? {
+    let path = repo.appendingPathComponent(".git/index").path
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          let inode = attrs[.systemFileNumber] as? UInt64,
+          let modified = attrs[.modificationDate] as? Date else { return nil }
+    return (inode, modified)
+}
+
+@Test func readOnlyGitReadsLeaveTheIndexUnwrittenExceptWorkingTreeDiff() throws {
+    guard let git = gitBin() else { return }
+
+    // CONTROL: without the override the same command DOES rewrite .git/index.
+    // Without this the assertions below could pass vacuously (e.g. if a future
+    // git stopped refreshing at all).
+    guard let controlRepo = try makeStaleStatCacheRepo() else { return }
+    let controlBefore = try #require(indexIdentity(controlRepo))
+    let controlRun = runProcess(git, ["status", "--short", "--branch"],
+                                cwd: controlRepo, timeout: 30)
+    #expect(controlRun.launched && controlRun.status == 0)
+    let controlAfter = try #require(indexIdentity(controlRepo))
+    #expect(controlAfter.inode != controlBefore.inode,
+            "control: bare `git status` did not take the optional index lock — the mechanism under test is not live here")
+
+    // SUBJECTS: the production read path leaves .git/index untouched.
+    let writeFreeReads: [(String, (URL) -> JSONValue)] = [
+        ("git_status", { FileSystemActions.gitStatus([:], rctx($0)) }),
+        ("git_log", { FileSystemActions.gitLog([:], rctx($0)) }),
+        ("repo_dirty_summary", { FileSystemActions.repoDirtySummary([:], rctx($0)) }),
+        ("git_diff --staged", { FileSystemActions.gitDiff(["staged": .bool(true)], rctx($0)) }),
+    ]
+    for (label, run) in writeFreeReads {
+        guard let repo = try makeStaleStatCacheRepo() else { return }
+        let before = try #require(indexIdentity(repo))
+        #expect(rbool(robj(run(repo))?["ok"]) == true, "\(label) did not succeed")
+        let after = try #require(indexIdentity(repo))
+        #expect(after.inode == before.inode, "\(label) rewrote .git/index")
+        #expect(after.modified == before.modified, "\(label) touched .git/index")
+    }
+}
+
+/// The documented EXCEPTION, asserted rather than assumed. git's
+/// `builtin/diff.c refresh_index_quietly()` does not consult
+/// `use_optional_locks()`, so a working-tree `git diff` still rewrites
+/// `.git/index` even under GIT_OPTIONAL_LOCKS=0 (git 2.50.1). That is why
+/// `git_diff` sits in ParallelToolDispatch.optionalIndexLockWriters and is the
+/// one Full-Mac read kept out of the concurrent set. WHEN THIS TEST FAILS, git
+/// has started honoring the flag here: delete this test and remove "git_diff"
+/// from optionalIndexLockWriters so it joins the other reads.
+@Test func workingTreeGitDiffStillRefreshesTheIndexDespiteOptionalLocksOff() throws {
+    guard gitBin() != nil else { return }
+    guard let repo = try makeStaleStatCacheRepo() else { return }
+    let before = try #require(indexIdentity(repo))
+    #expect(rbool(robj(FileSystemActions.gitDiff([:], rctx(repo)))?["ok"]) == true)
+    let after = try #require(indexIdentity(repo))
+    #expect(after.inode != before.inode,
+            "git diff no longer rewrites .git/index — re-admit git_diff to ParallelToolDispatch.fullMacReadOnlyNames")
+}
+
 // MARK: - git_diff
 
 @Test func gitDiffShowsUnstagedChange() throws {

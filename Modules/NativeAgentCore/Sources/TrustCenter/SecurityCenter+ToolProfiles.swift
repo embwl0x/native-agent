@@ -55,6 +55,23 @@ extension SwiftNativeSecurityCenter {
         // registration it would route through the unsigned path; the explicit
         // memory_write tag branch in profile() pins the capability shape.)
         "commit_memory",
+        // The moments lane (2026-09-02). memory_moments_pending is a pure
+        // read of her own proposal queue; memory_moment_review promotes or
+        // drops one row in her own MemoryV2 store. Registered explicitly so
+        // evaluateTool routes both through the built-in path and the pinned
+        // branches below decide their shape — "review"/"pending" trip no
+        // keyword catcher, so without this they would resolve to
+        // {tool_call}/.low with rollbackRequired false.
+        "memory_moments_pending", "memory_moment_review",
+        // User, 2026-09-05: the agent's own-store curation. Same shape as the
+        // moments lane: one plain local read, two writes to her own store.
+        "list_memories", "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
+        // Agent, 2026-09-06: read_chat_message reads one already-persisted
+        // transcript row. Registered explicitly so evaluateTool routes it
+        // through the built-in path — "read"/"message" would otherwise land it
+        // on the keyword classifier rather than the plain-local-read shape
+        // search_chat_history already has.
+        "read_chat_message",
         // workshop_submit / workshop_status (2026-06-11, U5 W-I): Agent's execution
         // chat lane. workshop_submit is a medium-risk write (a thin shim into
         // the execution queue; the executor's own gates apply downstream),
@@ -128,6 +145,7 @@ extension SwiftNativeSecurityCenter {
         // self_install as a medium filesystem_write.
         "evolution_propose",
         "evolution_status",
+        "evolution_withdraw",
         "self_install",
         "remote_node_list",
         "remote_node_execute",
@@ -233,6 +251,7 @@ extension SwiftNativeSecurityCenter {
         "browser.read_links",
         "browser.screenshot",
         "browser.chrome_acquire",
+        "browser.chrome_renew",
         "browser.chrome_navigate",
         "browser.chrome_snapshot",
         "browser.chrome_click",
@@ -388,6 +407,9 @@ extension SwiftNativeSecurityCenter {
             "browser.chrome_snapshot",
             "browser.chrome_wait",
             "browser.chrome_scroll",
+            // A renew moves the lease's own expiry and touches no page state,
+            // so it sits with release rather than with the page verbs.
+            "browser.chrome_renew",
             "browser.chrome_release",
         ]
         if browserReadTools.contains(tool) {
@@ -396,6 +418,62 @@ extension SwiftNativeSecurityCenter {
         }
         if tool == "doctor_status" || tool == "telegram_status" {
             add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // fable51 item 30 — THE CLIPBOARD ORGAN. Both EARLY-RETURN so neither
+        // falls through to the keyword classifier below ("write" would tag the
+        // write half `filesystem_write`, which is a lie: it touches no file).
+        //
+        // The read is a `safe_read`: it changes nothing, and the text it hands
+        // back has already been through the shape redactor.
+        //
+        // The write gets its own `clipboard_write` capability at MEDIUM rather
+        // than being folded into an existing tag. It is not a filesystem write
+        // and not input injection; what it IS is a change to shared machine
+        // state that every app can read, and it deserves a name that says so.
+        if tool == "clipboard_read" || tool == "mac.clipboard_read" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "clipboard_write" || tool == "mac.clipboard_write" {
+            add("clipboard_write", .medium)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // fable51 item 29 — THE MENU BAR ORGAN. Both EARLY-RETURN so neither
+        // reaches the keyword classifier ("press" trips nothing today, but a
+        // menu path like "File › Delete" must never be classified from its
+        // ARGUMENTS, and the walk must never be mistaken for an act).
+        //
+        // The walk is a `safe_read`: one bounded descent, no CGEvent, no AX
+        // action, and it does not even open a menu.
+        //
+        // The press carries the same `ax_injection` shape as the other
+        // accessibility acts, at HIGH: it runs the app's own handler, and the
+        // handler behind "File › Quit" or "Edit › Delete" is not medium.
+        if tool == "menu" || tool == "mac.menu" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // fable51 item 33 — THE READ ORGAN. An EARLY RETURN so it never reaches
+        // the keyword classifier, which would tag it from the word "read" alone
+        // and land it in whatever bucket that heuristic happens to pick.
+        //
+        // `safe_read` at LOW, beside `browser.chrome_scroll` — which is the
+        // exact precedent: a scroll whose only purpose is to bring more of a
+        // document into view, graded on what it can do rather than on the fact
+        // that it emits something. This organ presses nothing, types nothing
+        // and activates nothing; it moves a viewport and scrolls it back. Its
+        // text has already been through the shape redactor before it returns.
+        //
+        // The one authority it can reach beyond a read — opening a file the
+        // caller NAMES — is gated separately at dispatch on Full Mac file
+        // access, not here.
+        if tool == "read" || tool == "mac.read" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "menu_press" || tool == "mac.menu_press" {
+            add("ax_injection", .high)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "browser.open_url" || tool == "browser.navigate" {
@@ -472,6 +550,32 @@ extension SwiftNativeSecurityCenter {
         // keyword would otherwise imply (the word "commit" dodges that catcher,
         // but pin the shape explicitly for the policy preview).
         if tool == "commit_memory" {
+            add("memory_write", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // The moments lane. Same store, same shape as commit_memory: no Mac
+        // filesystem mutation, no process spawn, no third-party effect. The
+        // read half is a plain local read. Early-return so neither falls
+        // through to the keyword classifier.
+        if tool == "memory_moments_pending" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "memory_moment_review" {
+            add("memory_write", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "list_memories" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // One already-persisted transcript row, read back verbatim. Same shape
+        // as the search that hands out its id (Agent, 2026-09-06).
+        if tool == "read_chat_message" {
+            add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        if tool == "rewrite_memory" || tool == "forget_memory" || tool == "rebuild_knowledge_graph" {
             add("memory_write", .low)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
@@ -572,6 +676,16 @@ extension SwiftNativeSecurityCenter {
         }
         if tool == "evolution_status" {
             add("safe_read", .low)
+            return ToolProfile(capabilities: capabilities, risk: risk)
+        }
+        // evolution_withdraw (2026-09-02) EARLY-RETURNS too. It is an
+        // evolution-store write, so it carries `evolution_write` — but it is
+        // strictly DE-escalating (it can only park one of the agent's OWN
+        // proposals in the terminal denied state; it can never apply, install,
+        // or revert code), so it sits at high rather than critical. The early
+        // return keeps "withdraw" clear of the keyword classifier below.
+        if tool == "evolution_withdraw" {
+            add("evolution_write", .high)
             return ToolProfile(capabilities: capabilities, risk: risk)
         }
         if tool == "remote_node_list" {

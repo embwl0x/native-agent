@@ -621,7 +621,8 @@ public enum OrganismResidualRepair {
             ?? dreamQuietUntil
         let dreamDisposition: OrganismSleepLaneDisposition
         let dreamNext: Date?
-        if pressure < dreamPressure || evidenceCount == 0 {
+        let dreamEligible = pressure >= dreamPressure && evidenceCount > 0
+        if !dreamEligible {
             dreamDisposition = .inactive
             dreamNext = nil
         } else if resourceInhibited {
@@ -694,10 +695,20 @@ public enum OrganismResidualRepair {
             .map(\.dueAt)
             .min()
         // Only deadlines with a production consumer may wake the resident
-        // runtime. Operational consolidation is diagnostic bookkeeping and
-        // the identity-Dream lane is eligibility for its existing owner; this
-        // read model must not manufacture wakeups for either one.
-        let candidateDeadlines = [localNext, pendingPredictionDue, supplemental.nextModelReviewAt]
+        // runtime. Operational consolidation is still diagnostic bookkeeping and
+        // manufactures no wakeup.
+        //
+        // The identity-Dream lane ACQUIRED a production consumer on 2026-09-01
+        // (NORTHSTAR clause 4, sweep item 39): the cognition runtime now fires
+        // the same DreamCycleRunner path the 03:30 job uses when this lane says
+        // a dream is due, so 03:30 is the integrity fallback rather than the
+        // mechanism. Its eligibility boundary — the end of the 30-minute quiet
+        // window, or of the 24-hour refractory — is therefore a real deadline
+        // something waits on, not a manufactured one. When the lane is ALREADY
+        // eligible `dreamNext` is `now`, and the `> now` filter below keeps that
+        // from arming a zero-delay timer: the consumer acts on the reading it
+        // already holds instead of spinning against itself.
+        let candidateDeadlines = [localNext, dreamNext, pendingPredictionDue, supplemental.nextModelReviewAt]
             .compactMap { $0 }
             .filter { $0 > now }
         // Below threshold, monotonic residual decay cannot create a crossing;
@@ -715,11 +726,16 @@ public enum OrganismResidualRepair {
         let nextWake: Date?
         if resourceInhibited {
             let uninhibitedLocalNext = localEligible ? max(now, localQuietUntil) : nil
+            // The dream lane's consumer (see candidateDeadlines above) needs the
+            // same self-recovery: a Mac that cools while a dream is pending must
+            // re-sample instead of staying disarmed until an unrelated event.
+            let uninhibitedDreamNext = dreamEligible ? max(now, dreamCandidateAt) : nil
             let uninhibitedCandidateDeadlines =
-                [uninhibitedLocalNext, pendingPredictionDue, supplemental.nextModelReviewAt]
+                [uninhibitedLocalNext, uninhibitedDreamNext, pendingPredictionDue, supplemental.nextModelReviewAt]
                     .compactMap { $0 }
                     .filter { $0 > now }
             let wouldWakeAbsentInhibition = localEligible
+                || dreamEligible
                 || !uninhibitedCandidateDeadlines.isEmpty
             if wouldWakeAbsentInhibition {
                 let fallback = now.addingTimeInterval(resourceRecheckInterval)
@@ -832,8 +848,11 @@ public enum OrganismOperationalConsolidator {
     }
 
     /// The identity-Dream owner calls this only after its own provider/budget/
-    /// trust path accepted work. Merely becoming pressure-eligible never calls
-    /// a provider and never advances the 24-hour refractory control.
+    /// trust path accepted the work — i.e. it is committed to running a dream
+    /// now. Merely becoming pressure-eligible never calls a provider and never
+    /// advances the 24-hour refractory control. Since 2026-09-01 the resident
+    /// owner reaches this through `OrganismKernel.claimIdentityDreamIfDue`,
+    /// which makes the eligibility read and this write one atomic step.
     public static func recordingAcceptedIdentityDream(
         in state: OrganismSleepControlState,
         at date: Date
@@ -841,6 +860,52 @@ public enum OrganismOperationalConsolidator {
         var next = state
         next.lastProviderDreamAt = date
         return next
+    }
+}
+
+/// NORTHSTAR clause 4 (2026-09-01, sweep item 39). Sleep pressure derived from
+/// real residuals now FIRES the dream instead of only describing one: the
+/// identity-Dream lane's disposition is the whole judgement, and this is the
+/// pure read of it. No clock, no I/O, no provider — the app-side owner stays a
+/// thin hand on an organism-owned decision, and every existing gate (threshold,
+/// quiet, refractory, resource inhibition) is honored by construction because
+/// they already resolved into the disposition.
+///
+/// The one thing the lane cannot see is whether Agent is mid-turn. The 30-minute
+/// quiet window makes that nearly impossible on its own (a live turn keeps
+/// ingesting somatic signals, which pushes the quiet boundary out), but a dream
+/// must NEVER land on top of a turn in flight, so the caller passes that in and
+/// it defers rather than fires.
+public enum OrganismIdentityDreamTrigger {
+    public enum Decision: String, Sendable, Equatable, CaseIterable {
+        /// Every gate is satisfied: the owner may run ONE dream now.
+        case fire
+        case belowThreshold
+        case waitingForQuiet
+        /// A dream already ran inside the 24-hour refractory window.
+        case refractory
+        case resourceInhibited
+        /// Eligible, but a turn is in flight. Re-decided when the turn settles.
+        case turnInFlight
+    }
+
+    public static func decide(
+        opportunity: OrganismResidualRepairOpportunity,
+        turnInFlight: Bool
+    ) -> Decision {
+        let lane = opportunity.lanes.first { $0.lane == .identityDreamProposal }
+        switch lane?.disposition {
+        case .some(.providerBudgetGateRequired):
+            return turnInFlight ? .turnInFlight : .fire
+        case .some(.waitingForQuiet):
+            return .waitingForQuiet
+        case .some(.refractory):
+            return .refractory
+        case .some(.resourceInhibited):
+            return .resourceInhibited
+        default:
+            return .belowThreshold
+        }
     }
 }
 
@@ -1085,6 +1150,9 @@ public enum OrganismCapabilitySelfModel {
         case .phoneDelivery: confidence.phonePath
         case .approvalResolution: confidence.approvalPath
         case .workflowAdvance: confidence.workflowPath
+        // Item 46: no body path exists for a semantic expectation; its
+        // capability belief rests on the cumulative outcome counts alone.
+        case .semanticExpectation: 0.5
         }
     }
 }

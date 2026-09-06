@@ -333,6 +333,22 @@ public struct ContextPrewarmLimits: Equatable, Sendable {
         self.maximumPlanningNanoseconds = maximumPlanningNanoseconds
         self.maximumUsefulnessReceipts = maximumUsefulnessReceipts
     }
+
+    /// The defaults above, each already inside its hard bound. Validation
+    /// cannot fail for them, so this needs no `try` — and nothing has to
+    /// `try!` its way to a default set of limits.
+    public static let standard = ContextPrewarmLimits(validatedDefaults: ())
+
+    private init(validatedDefaults: ()) {
+        maximumQueuedHints = 32
+        maximumTrackedScopes = 128
+        maximumAtomsPerHint = 16
+        maximumAtomsPerPlan = 32
+        maximumBytesPerHint = 2 * 1_048_576
+        maximumBytesPerPlan = 4 * 1_048_576
+        maximumPlanningNanoseconds = 5_000_000
+        maximumUsefulnessReceipts = 128
+    }
 }
 
 public struct ContextPrewarmClock: Sendable {
@@ -487,7 +503,7 @@ public actor ContextPrewarmPlanner {
     }
 
     public init(clock: ContextPrewarmClock = .continuous) {
-        self.limits = try! ContextPrewarmLimits()
+        self.limits = .standard
         self.clock = clock
     }
 
@@ -498,7 +514,20 @@ public actor ContextPrewarmPlanner {
             return cancel(cancellation)
         default:
             guard let metadata = event.metadata else {
-                preconditionFailure("non-cancellation event must carry metadata")
+                // Only `.cancel` carries no metadata and it is handled above.
+                // A future metadata-less case gets a rejected receipt on the
+                // submit path, never a trap.
+                return ContextPrewarmSubmissionReceipt(
+                    eventID: "",
+                    scope: ContextPrewarmScope(kind: .session, id: ""),
+                    outcome: .rejected(.emptyEventID),
+                    supersededEventIDs: [],
+                    evictedEventIDs: [],
+                    acceptedAtomCount: 0,
+                    acceptedByteCount: 0,
+                    droppedAtomCount: 0,
+                    queueCount: queue.count
+                )
             }
             return submit(metadata)
         }

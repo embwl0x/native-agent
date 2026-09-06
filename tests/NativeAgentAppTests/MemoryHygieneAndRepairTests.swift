@@ -160,6 +160,17 @@ func weeklyHygieneTick_cardCarriesKGOrphanPreviewCounts() async throws {
 func approvedHygieneRun_sweepsKGOrphanEntities() async throws {
     let root = try makeMemTempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
+    // 2026-09-06: acbd2df8 put the hygiene cleanup block behind Settings ▸
+    // "Knowledge graph" as well as "Memory hygiene" — the block writes graph
+    // rows, so the switch being off must mean it does not run
+    // (MemoryConsolidationHygieneRunner.swift:147). knowledge_graph_enabled
+    // defaults to FALSE (MemoryV2+PolicyGate.swift:64), so a bare temp root now
+    // skips the sweep entirely. Turn the graph on in this fixture's own root,
+    // which is what the sweep this test is about requires.
+    let trustDir = root.appendingPathComponent("trust", isDirectory: true)
+    try FileManager.default.createDirectory(at: trustDir, withIntermediateDirectories: true)
+    try Data(#"{"memoryPolicy":{"knowledge_graph_enabled":true,"hygiene_enabled":true}}"#.utf8)
+        .write(to: trustDir.appendingPathComponent("policy.json"))
     let storage = try MemoryStorage(dataRoot: root)
     _ = try await storage.insertMemory(
         StoredMemory(id: "mem-a", content: "NativeAgent ships tonight."))

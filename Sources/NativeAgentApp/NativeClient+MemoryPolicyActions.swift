@@ -142,8 +142,21 @@ extension NativeClient {
     // (MemoryV2+Wiring.swift:191) re-runs the tombstone gate, promotes via
     // storage.insert + storage.updateProposalStatus — the same lifecycle the
     // daemon's POST /v1/memory/proposals/<id>/approve walked.
+    // User, 2026-09-06: approve/reject must act on the SAME root the listing
+    // read from. `getMemoryProposals` lists via `dataRootOverride ?? default`,
+    // but these two used `.shared` (always the default root), so under an
+    // override the review surface showed one store's proposals and the buttons
+    // mutated another's — approve failed "not found", or worse, hit a
+    // same-id row in the live store. `resolvedOwner` hands back `.shared` for
+    // the default root and an isolated actor for an override.
+    private var memoryProposalOwner: SwiftNativeMemoryV2 {
+        SwiftNativeMemoryV2.resolvedOwner(
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        )
+    }
+
     func approveMemoryProposal(id: String) async throws -> [String: Any] {
-        let record = try await SwiftNativeMemoryV2.shared.acceptProposal(id: id)
+        let record = try await memoryProposalOwner.acceptProposal(id: id)
         var out: [String: Any] = [
             "ok": true,
             "id": record.id,
@@ -158,7 +171,7 @@ extension NativeClient {
     }
 
     func rejectMemoryProposal(id: String, reason: String) async throws -> [String: Any] {
-        _ = try await SwiftNativeMemoryV2.shared.rejectProposal(
+        _ = try await memoryProposalOwner.rejectProposal(
             id: id,
             reason: reason.isEmpty ? nil : reason
         )

@@ -108,13 +108,20 @@ struct ChatConversationSettingsModelWarning: Equatable {
 /// beside this compact control, so this is the local, user-observable receipt.
 enum ChatCatalogRefreshPresentation: Equatable {
     case refreshed
+    /// User, 2026-09-06: the provider answered, but its envelope said there is
+    /// more than it sent. The rows are fresh; the list may not be all of them.
+    case refreshedPartialCatalog
     case catalogUnavailable
     case providersUnavailable
     case catalogAndProvidersUnavailable
 
-    static func resolve(catalogRefreshed: Bool, providersFresh: Bool) -> Self {
+    static func resolve(
+        catalogRefreshed: Bool,
+        catalogComplete: Bool = true,
+        providersFresh: Bool
+    ) -> Self {
         switch (catalogRefreshed, providersFresh) {
-        case (true, true): return .refreshed
+        case (true, true): return catalogComplete ? .refreshed : .refreshedPartialCatalog
         case (false, true): return .catalogUnavailable
         case (true, false): return .providersUnavailable
         case (false, false): return .catalogAndProvidersUnavailable
@@ -125,6 +132,8 @@ enum ChatCatalogRefreshPresentation: Equatable {
         switch self {
         case .refreshed:
             "Providers and model catalog refreshed."
+        case .refreshedPartialCatalog:
+            "Providers and model catalog refreshed; the provider's list may be partial."
         case .catalogUnavailable:
             "Model catalog could not refresh. Showing existing choices."
         case .providersUnavailable:
@@ -135,7 +144,7 @@ enum ChatCatalogRefreshPresentation: Equatable {
     }
 
     var isFailure: Bool {
-        self != .refreshed
+        self != .refreshed && self != .refreshedPartialCatalog
     }
 }
 
@@ -151,10 +160,15 @@ struct ChatCatalogRefreshState: Equatable {
         return true
     }
 
-    mutating func finish(catalogRefreshed: Bool, providersFresh: Bool) {
+    mutating func finish(
+        catalogRefreshed: Bool,
+        catalogComplete: Bool = true,
+        providersFresh: Bool
+    ) {
         isRefreshing = false
         presentation = ChatCatalogRefreshPresentation.resolve(
             catalogRefreshed: catalogRefreshed,
+            catalogComplete: catalogComplete,
             providersFresh: providersFresh
         )
     }
@@ -224,10 +238,13 @@ struct ChatBrainControlBar: View {
     }
 
     private var selectedModelIsUnavailable: Bool {
+        // User, 2026-09-06: this read the DEFAULT root's catalogue while the
+        // rest of the app works off the selected one, so under an override root
+        // the bar convicted the chosen model on another root's evidence.
         appModel.chatProvider == "openrouter"
             && OpenRouterModelCatalog.cachedAvailability(
                 of: appModel.chatModel,
-                dataRoot: PersistenceCore.defaultDataRoot()
+                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             ) == .unavailable
     }
 
@@ -481,9 +498,14 @@ struct ChatBrainControlBar: View {
     private func refreshConversationCatalog() async {
         guard catalogRefresh.begin() else { return }
         let catalogRefreshed = await appModel.refreshModelCatalog()
+        // User, 2026-09-06: a live but partial list reads as refreshed, and says
+        // so — it used to be reported as a catalog that could not refresh.
+        let catalogComplete = appModel.modelCatalog?.catalogFreshness
+            != ModelCatalogFreshness.liveIncomplete.rawValue
         let providersFresh = await appModel.loadProvidersForChat()
         catalogRefresh.finish(
             catalogRefreshed: catalogRefreshed,
+            catalogComplete: catalogComplete,
             providersFresh: providersFresh
         )
     }

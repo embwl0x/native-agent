@@ -44,38 +44,63 @@ struct TextCompatToolReceipt: Sendable {
 }
 
 extension SwiftNativeChatOrchestrationClient {
+    /// Why this turn is (or isn't) on the provider-native tools lane. Carried
+    /// as a value rather than a bare Bool so the eligibility trace can name the
+    /// PROVIDER and the RESOLUTION STEP that decided it: "this Claude turn
+    /// parsed markers out of prose" and "this Claude turn shipped a tools
+    /// array" are materially different wires, and after the api-key opt-in they
+    /// are both reachable for `claude-*` models depending only on which
+    /// provider id is bound.
+    struct NativeToolLaneDecision: Sendable {
+        let engaged: Bool
+        /// The id the decision was made ON (nil when nothing resolved).
+        let providerId: String?
+        /// Which step in the ladder answered: "call_context", "model_backstop",
+        /// "surface_active", or "unresolved".
+        let resolvedFrom: String
+    }
+
     /// Does THIS turn ride the provider-native tools lane?
     ///
     /// Resolution order mirrors the existing async text-compat gate: an already
     /// admitted provider id wins (it is the one the router actually bound),
     /// then the requested model's implied provider, then the surface's active
     /// provider. Every branch funnels through the single NativeToolCapability
-    /// predicate, so "only kimi-code" is enforced in exactly one place and the
-    /// Claude OAuth adapters can never be reached by this lane.
-    func usesNativeToolLane(model: String, surface: String) async -> Bool {
+    /// predicate, so the admitted set is enforced in exactly one place and the
+    /// Claude OAUTH-direct adapter can never be reached by this lane — a
+    /// `claude-*` model id alone is NOT enough (see
+    /// modelImpliesNativeToolProvider), because the same id is served by both
+    /// Claude transports and only the resolved provider id tells them apart.
+    func usesNativeToolLane(model: String, surface: String) async -> NativeToolLaneDecision {
         if let admitted = LLMCallContext.providerId {
-            return NativeToolCapability.providerSupportsNativeTools(admitted)
+            return NativeToolLaneDecision(
+                engaged: NativeToolCapability.providerSupportsNativeTools(admitted),
+                providerId: admitted,
+                resolvedFrom: "call_context"
+            )
         }
-        if NativeToolCapability.modelImpliesNativeToolProvider(model) { return true }
+        if NativeToolCapability.modelImpliesNativeToolProvider(model) {
+            return NativeToolLaneDecision(
+                engaged: true, providerId: "kimi-code", resolvedFrom: "model_backstop")
+        }
         let active = try? await engine.checkedActiveProviderID(for: surface)
-        return NativeToolCapability.providerSupportsNativeTools(active ?? nil)
+        let resolved = active ?? nil
+        return NativeToolLaneDecision(
+            engaged: NativeToolCapability.providerSupportsNativeTools(resolved),
+            providerId: resolved,
+            resolvedFrom: resolved == nil ? "unresolved" : "surface_active"
+        )
     }
 
-    /// Append user-role text to the native conversation WITHOUT creating two
-    /// consecutive user turns: if the conversation already ends with a user
-    /// message, the text rides as an extra block on that message.
+    /// Append user-role text to the native conversation without producing a
+    /// shape the wire rejects — two consecutive user turns, or (since v2Prefix)
+    /// a user turn directly after the trailing volatile system message. Both
+    /// rules have one owner; see `ConversationPrefixSeeding.appendUserText`.
     nonisolated static func appendNativeUserText(
         _ text: String,
         to conversation: inout [LLMMessage]
     ) {
-        if let last = conversation.last, last.role == .user {
-            conversation[conversation.count - 1] = LLMMessage(
-                role: .user,
-                content: last.content + [.text(text)]
-            )
-        } else {
-            conversation.append(.user(text))
-        }
+        ConversationPrefixSeeding.appendUserText(text, to: &conversation)
     }
 
     func executeTextStreamingCompatibilityChat(
@@ -303,6 +328,11 @@ extension SwiftNativeChatOrchestrationClient {
         emitTextDeltas: Bool,
         continuation: AsyncThrowingStream<TurnStreamEvent, Error>.Continuation
     ) async {
+        // v2Prefix (a): the adapters read ONLY the task-local override, so this
+        // entry resolves `.effective` exactly once and binds it for the whole
+        // turn. Redundant when the streaming facade already bound it (same
+        // value); load-bearing for the non-streaming caller.
+        await ConversationPrefixShape.$override.withValue(ConversationPrefixShape.effective) {
         // Whole-turn clock, from entry (user-message persist, compaction, tool
         // preload all happen before the loop). Each iteration's streamTurn starts
         // its own clock, so a result's elapsedMs was the LAST segment only —
@@ -355,8 +385,14 @@ extension SwiftNativeChatOrchestrationClient {
         // Native vision: image attachments become per-turn DYNAMIC image blocks
         // on the CURRENT user message; the model sees the RAW message text (no
         // stringified suffix). Empty → byte-identical wire shape.
-        let composed = message
-        let imageBlocks = Self.imageBlocksFromAttachments(attachments)
+        // 2026-09-06: through the Trust ▸ Multimodal gates like the structured
+        // lanes — "Allow vision API calls" off skips the images (and says so),
+        // "Allow PDF file ingestion" on puts an attached PDF's text into the
+        // model-facing message. The PERSISTED user row keeps `message`.
+        let attachmentInput = Self.turnAttachmentInput(
+            message: message, attachments: attachments, dataRoot: dataRoot)
+        let composed = attachmentInput.userMessage
+        let imageBlocks = attachmentInput.imageBlocks
 
         if !suppressUserAppend {
             do {
@@ -380,31 +416,47 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
 
+        // The window cursor must not slide in a turn the autocompactor already
+        // rewrote (see HistoryWindowCursor) — so the outcome is carried, not
+        // discarded.
+        var compactionRanThisTurn = false
         do {
-            _ = try await compactSessionBeforeContextIfNeeded(
+            compactionRanThisTurn = try await compactSessionBeforeContextIfNeeded(
                 sessionId: resolvedSession,
                 model: model,
                 surface: surface,
                 runId: runId
-            )
+            ).compacted
         } catch is CancellationError {
             continuation.yield(.error("cancelled"))
             continuation.finish()
             return
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            if Self.shouldPersistFailureMessage(surface: surface) {
-                try? await appendFailureMessageIfNeeded(
-                    sessionId: resolvedSession,
-                    runId: runId,
-                    errorMessage: "Autocompact failed before context assembly: \(message)",
-                    persona: persona
-                )
-            }
-            continuation.yield(.error("autocompact failed before context assembly: \(message)"))
-            continuation.finish()
-            return
+            // 2026-09-05: compaction is a BACKSTOP, not a precondition. Killing
+            // the turn here spent the user's turn on a failure nothing about
+            // this turn depended on: the history window cursor already bounds
+            // the replayed prefix, so an oversized session still assembles a
+            // bounded prompt, and the aging lane retries the fold later. Trace
+            // it and carry on with compactionRanThisTurn = false.
+            TurnTraceBus.fireFromContext(
+                kind: "compaction.backstop_failed", surface: surface,
+                payload: .object(["message": .string(message)])
+            )
         }
+
+        // Continuous consolidation (NORTHSTAR clause 4, sweep item 45). The
+        // append above may have carried this session past the aging boundary;
+        // if it did, older turns decay into recollection in the background,
+        // through the same body-throttle gate every other background-cognition
+        // lane passes. Not awaited, cannot fail the turn — which is precisely
+        // why the synchronous check above can stay a rare backstop.
+        scheduleTranscriptAgingIfNeeded(
+            sessionId: resolvedSession,
+            model: model,
+            surface: surface,
+            runId: runId
+        )
 
         let gated = makeTracedGatedDispatcher(
             fileAccess: fileAccess, verifiedSessionId: resolvedSession
@@ -415,7 +467,11 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: resolvedSession,
             fileAccess: fileAccess
         )
-        async let preloadActiveToolsTask = activeToolsStore.load(sessionId: resolvedSession)
+        // TURN START: advance the session turn clock and batch-drop tools that
+        // went two completed turns without being called, before the catalog is
+        // read. Drops rewrite the advertised contract, so they happen here and
+        // nowhere else in the turn.
+        async let preloadActiveToolsTask = activeToolsStore.beginTurn(sessionId: resolvedSession)
         async let preloadToolSchemaCatalogSeedTask: TurnToolSchemaCatalogSeed? = {
             guard let schemas = try? await tools.listAvailableToolSchemas() else { return nil }
             return TurnToolSchemaCatalogSeed(schemas: schemas)
@@ -438,7 +494,7 @@ extension SwiftNativeChatOrchestrationClient {
         let preloadAvailableNames = Set(preloadToolSchemaCatalogSeed?.schemas.map(\.name) ?? [])
         let preloadPrediction = turnPlan?.preloadPrediction
             ?? ToolPreloadHeuristics.predict(userMessage: message)
-        let turnActiveTools = await ToolPreloadHeuristics.preloadIfConfident(
+        let preloadOutcome = await ToolPreloadHeuristics.preloadOutcome(
             prediction: preloadPrediction,
             sessionId: resolvedSession,
             activeTools: preloadActiveTools,
@@ -446,6 +502,26 @@ extension SwiftNativeChatOrchestrationClient {
             surface: surface,
             dataRoot: dataRoot
         )
+        // Still TURN START, before the first prefix is built: snapshot MCP
+        // membership, freeze a descriptor per slot, and promote the confident
+        // route prediction into the load order so its schemas are ADVERTISED on
+        // this turn (docs/ANATOMY_OF_A_TURN.md §3 — a GitHub URL prepares the
+        // GitHub read tools with no discovery round) and byte-stable after it.
+        let contractCommit = await activeToolsStore.commitTurnStartContract(
+            sessionId: resolvedSession,
+            promoting: preloadOutcome.promotable,
+            catalog: preloadToolSchemaCatalogSeed?.schemas ?? []
+        )
+        // A name that was NOT admitted (no headroom, or the write failed) stays
+        // discovery-only — tool_load is the honest recovery path, and
+        // tool_catalog must not describe it as loaded.
+        let turnActiveTools = preloadOutcome.activeTools.subtracting(
+            preloadOutcome.promotable.subtracting(contractCommit?.promoted ?? [])
+        )
+        // Pinned for the WHOLE turn: every later iteration advertises this
+        // exact contract, so a mid-turn tool_unload or idle drop cannot shrink
+        // the catalog inside the cache-breakpointed stable segment.
+        let turnContract = contractCommit?.state.toolContract
         // Route focus now lives in TurnPlan's dynamic system segment, shared
         // by structured and text-compatible providers. Keeping it there makes
         // the cue identical across Mac, Telegram, Slack, and bridge surfaces,
@@ -495,6 +571,16 @@ extension SwiftNativeChatOrchestrationClient {
         // result site this function emits, same pattern as the structured loops
         // (ChatOrchestration+ToolLoop.swift:1548 B3).
         var providerCallCount = 0
+        // User, 2026-09-06: replay-only reconnect ladder for this lane (the
+        // structured loops' ladder lives in ChatOrchestration+ToolLoop.swift).
+        // `providerCallAttempt` counts the attempts the CURRENT provider call
+        // has burned — reset once an attempt gets through the stream — and
+        // `providerTurnRecoveries` is the whole-turn ceiling both lanes share.
+        // `providerReplayError` is set by a failure site that wants the call
+        // replayed; the ladder itself runs once, after the stream block.
+        var providerCallAttempt = 1
+        var providerTurnRecoveries = 0
+        var providerReplayError: Error?
 
         let effectiveModel = LLMCallContext.admittedModel ?? model
         // The user's selected effort is the provider contract. The retired
@@ -554,10 +640,12 @@ extension SwiftNativeChatOrchestrationClient {
         // lane (its provider tools array is its only call channel). Mid-turn
         // tool_load stays usable everywhere via schemas_added in its result
         // + the store-reading dispatch gate.
-        // NATIVE TOOL LANE (kimi-code only). Resolved ONCE per turn — the
-        // provider cannot change mid-turn, and re-resolving per iteration would
-        // add a routing-snapshot read to every provider call.
-        let nativeLane = await usesNativeToolLane(model: effectiveModel, surface: surface)
+        // NATIVE TOOL LANE (kimi-code and the Anthropic API-KEY provider —
+        // never OAuth). Resolved ONCE per turn: the provider cannot change
+        // mid-turn, and re-resolving per iteration would add a routing-snapshot
+        // read to every provider call.
+        let nativeDecision = await usesNativeToolLane(model: effectiveModel, surface: surface)
+        let nativeLane = nativeDecision.engaged
         // This preflight chooses a materially different provider wire shape.
         // It must remain visible in the per-turn trace: a missing OAuth file,
         // an adapter regression, or the emergency rollback lever otherwise
@@ -583,6 +671,13 @@ extension SwiftNativeChatOrchestrationClient {
             effectiveTransport: appendOnlyEligible
                 ? (nativeLane ? "native_messages" : "append_only_messages")
                 : "grown_prompt",
+            nativeLane: nativeDecision,
+            // The lane only actually engages when the messages transport is
+            // there to carry tool_result blocks back — see `ridesNativeTools`
+            // just below. Both booleans are emitted so a denied native lane is
+            // legible as a DOWNGRADE rather than as a provider that was never
+            // eligible.
+            nativeToolsEngaged: nativeLane && appendOnlyEligible,
             sessionId: resolvedSession,
             surface: surface
         )
@@ -591,12 +686,6 @@ extension SwiftNativeChatOrchestrationClient {
         // results could never be returned, so the model would call the same
         // tool forever. Drop back to the proven text-compat marker protocol.
         let ridesNativeTools = nativeLane && appendOnlyEligible
-        // Image blocks ride the FIRST user message of the append-only
-        // conversation (per-turn DYNAMIC). Later iterations append assistant +
-        // tool-result user messages WITHOUT images — base64 is never re-sent.
-        var conversation: [LLMMessage] = imageBlocks.isEmpty
-            ? [.user(routedComposed)]
-            : [.userWithImages(routedComposed, images: imageBlocks)]
         var emittedProviderFirstDelta = false
         // Sibling of the catalog pin: the clock line renders into the dynamic
         // system segment, and a turn crossing a minute boundary re-rendered
@@ -622,6 +711,23 @@ extension SwiftNativeChatOrchestrationClient {
             func get() -> TurnContext? { lock.lock(); defer { lock.unlock() }; return value }
         }
         let turnContextBox = TurnContextBox()
+        // User, 2026-09-06: the typed error behind an engine-yielded
+        // `.error(String)`. `@unchecked Sendable` for the same reason
+        // TurnContextBox is — written inside the provider stream's task,
+        // read on this one after the event that follows the write, with an
+        // NSLock making the handoff safe. Without it a typed
+        // `LLMError.streamTruncated` (a clean Anthropic EOF with no
+        // message_stop — the commonest drop there is) reached the reconnect
+        // ladder as prose, got re-wrapped as `.providerError`, and failed
+        // classification, so the ladder never ran.
+        final class StreamFailureBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: (any Error)?
+            func set(_ error: any Error) {
+                lock.lock(); if value == nil { value = error }; lock.unlock()
+            }
+            func get() -> (any Error)? { lock.lock(); defer { lock.unlock() }; return value }
+        }
         // Reuse ONLY on the append-only messages transport: the legacy
         // grown-prompt shape carries the growing transcript INSIDE
         // ctx.userMessage, so it structurally requires a fresh build per
@@ -630,6 +736,156 @@ extension SwiftNativeChatOrchestrationClient {
         let reuseTurnContext = !ridesNativeTools && appendOnlyEligible
         let onTurnContextBuilt: (@Sendable (TurnContext) -> Void)? =
             reuseTurnContext ? { @Sendable ctx in turnContextBox.set(ctx) } : nil
+
+        // v2Prefix (2026-09-01) — the conversation-prefix shape FOR THIS TURN.
+        //
+        // v2 only engages on the reuse lane, and that is not a convenience:
+        //   - the legacy GROWN-PROMPT shape carries the transcript inside
+        //     `ctx.userMessage`, so there is no message array to put a prefix
+        //     in at all;
+        //   - the KIMI native lane deliberately rebuilds its context every
+        //     iteration for its tools-array refresh, which is exactly the
+        //     mid-turn prefix churn v2 exists to remove.
+        // Both fall back to `.v1Legacy` for the whole turn — an honest v1 turn,
+        // not a half-migrated one.
+        let prefixShape: ConversationPrefixShape = reuseTurnContext
+            ? (ConversationPrefixShape.override ?? .v1Legacy)
+            : .v1Legacy
+        var prefixTelemetry: ConversationPrefixTelemetrySnapshot?
+        // What the seed ACTUALLY produced. `.v2Prefix` is only reached when a
+        // replayed prefix exists; everything else (no history, kimi native,
+        // grown-prompt compat) resolves to `.v1Legacy` and is re-bound below so
+        // the body and the adapter's wire layout cannot disagree.
+        var resolvedPrefixShape: ConversationPrefixShape = .v1Legacy
+        // Where THIS turn's user message sits in `conversation`. 0 is correct
+        // for every non-seeded shape here (grown-prompt and kimi both start the
+        // array with the user message); the v2 seed overwrites it below.
+        var resolvedCurrentUserIndex = 0
+        // Image blocks ride the FIRST user message of the append-only
+        // conversation (per-turn DYNAMIC). Later iterations append assistant +
+        // tool-result user messages WITHOUT images — base64 is never re-sent.
+        var conversation: [LLMMessage] = imageBlocks.isEmpty
+            ? [.user(routedComposed)]
+            : [.userWithImages(routedComposed, images: imageBlocks)]
+        if prefixShape == .v2Prefix {
+            // The volatile block IS the context's dynamic segment, so the
+            // context has to exist before the messages it goes into. Build it
+            // here, once, and hand it to iteration 1 as its preBuiltContext —
+            // the same context every later iteration already reused.
+            do {
+                let built = try await ConversationPrefixShape.$override.withValue(.v2Prefix) {
+                    try await HistoryWindowTurnFacts.$compactionRanThisTurn
+                        .withValue(compactionRanThisTurn) {
+                        // The SAME build path streamTurn takes — one owner,
+                        // called a frame earlier so the volatile block exists
+                        // before the message array it goes into.
+                        try await engine.prepareTurnContext(
+                            surface: surface,
+                            userMessage: routedComposed,
+                            sessionId: resolvedSession,
+                            historyLimit: historyLimit,
+                            historyReader: history,
+                            personaOverride: persona,
+                            excludeHistoryRunId: runId,
+                            imageBlocks: imageBlocks,
+                            queryUserMessage: message,
+                            clockNowOverride: turnClockNow,
+                            toolSchemaCatalogSeed: preloadToolSchemaCatalogSeed,
+                            quietHoursSnapshot: quietHoursSnapshot,
+                            turnPlan: turnPlan,
+                            runtimeContext: cognitiveRuntimeContext,
+                            turnActiveTools: turnActiveTools,
+                            pinnedActiveTools: turnActiveTools,
+                            // Same pin as the iterations that reuse this
+                            // context. Without it the SEEDED first call would
+                            // resolve the contract from a fresh store read and
+                            // could differ from every later iteration — a
+                            // mismatch at the exact byte the prefix cache keys.
+                            pinnedContract: turnContract
+                        )
+                    }
+                }
+                // TEXT lane: the session-loaded catalog run is delivered in the
+                // volatile block, not the cached prefix, so a mid-session
+                // tool_load/promotion cannot invalidate the replayed history.
+                // `textToolCompatibilityLayout` drops it from the system prompt
+                // under the same v2 gate. `reuseTurnContext` already excludes
+                // the native-tools lane, so this is always the prose lane.
+                let seed = ConversationPrefixSeeding.seed(
+                    built,
+                    shape: .v2Prefix,
+                    textToolCatalogAppendix: SwiftNativeTurnEngine
+                        .textToolCatalogSections(
+                            schemas: built.toolSchemas,
+                            names: built.toolsAvailable
+                        ).appended
+                )
+                resolvedPrefixShape = seed.shape
+                resolvedCurrentUserIndex = seed.currentUserIndex
+                // Iteration 1 now reads the SAME context every later
+                // iteration already reused — the "one context per turn" pin,
+                // extended to cover the turn's first provider call.
+                turnContextBox.set(seed.context)
+                conversation = seed.messages
+                // ARCHIVE THIS TURN'S REPLAYABLE TAIL — every message the seed
+                // placed AFTER the current user turn. A turn-scoped system
+                // message is cleared once a later user message arrives (0 input
+                // tokens) but must STAY in `messages` byte-for-byte; dropping it
+                // made turn N+1's prefix diverge from turn N's immediately after
+                // `user(N)`, so the previous turn's tool rounds and reply were
+                // re-created at full price every turn.
+                //
+                // Taking the SEEDED MESSAGES rather than re-deriving them is the
+                // point: what gets archived is exactly what went on the wire, so
+                // the replay cannot drift from the original by a byte.
+                let replayable = Array(seed.messages.dropFirst(seed.currentUserIndex + 1))
+                if !replayable.isEmpty {
+                    await TurnVolatileArchiveRegistry.shared
+                        .archive(dataRoot: history.dataRoot)
+                        .record(
+                            sessionId: resolvedSession, runId: runId,
+                            messages: replayable
+                        )
+                }
+                // The window decision rides on the context (the cursor ran
+                // once, inside the build), so this no longer costs a second
+                // locked read of the cursor file.
+                prefixTelemetry = ConversationPrefixSeeding.telemetry(
+                    seed,
+                    shape: .v2Prefix,
+                    toolSchemaFingerprint: SwiftNativeTurnEngine
+                        .toolSchemaFingerprint(seed.context.toolSchemas)
+                )
+            } catch is CancellationError {
+                continuation.yield(.error("cancelled"))
+                continuation.finish()
+                return
+            } catch {
+                // Same terminal shape streamTurn's own build failure produces —
+                // an honest error event, not a silent degrade to a shape the
+                // caller did not ask for.
+                let text = (error as? LocalizedError)?.errorDescription
+                    ?? String(describing: error)
+                continuation.yield(.error(text))
+                continuation.finish()
+                return
+            }
+        }
+        if let prefixTelemetry { ConversationPrefixTelemetry.sink?.set(prefixTelemetry) }
+        // (b) Every provider call for the REST of this turn — every tool-loop
+        // iteration's streamTurn — runs under the shape that was actually
+        // seeded. Zero re-indent: the remainder of this function is the loop
+        // plus its terminal persistence, and each `return` inside simply exits
+        // the closure at the same point the function used to end.
+        await ConversationPrefixShape.$override.withValue(resolvedPrefixShape) {
+        // The authoritative current-turn seam for the adapter's cross-turn
+        // marker. Without it the adapter anchored on the last `system` message,
+        // which on a replayed prefix is an ARCHIVED block from an old turn —
+        // so the 1h marker landed near the start of the conversation and cached
+        // almost nothing. Within-turn rounds only append, so this index holds
+        // for the whole turn.
+        await ConversationPrefixBoundary.$currentUserIndex
+            .withValue(resolvedCurrentUserIndex) {
 
         toolLoop: for iteration in 0..<maxToolIterations {
             // A6: observe the whole-turn ceiling only between iterations. An
@@ -643,6 +899,14 @@ extension SwiftNativeChatOrchestrationClient {
             }
             providerCallCount += 1
             var iterAccumulated = ""
+            // User, 2026-09-06: bytes this attempt actually HANDED TO THE
+            // SURFACE. The replay condition used to read `iterAccumulated`,
+            // which counts text the compatibility buffer is still holding back
+            // (up to 16 chars, or a marker candidate) — so a provider that sent
+            // "Hello" and dropped had shown the user nothing yet was refused the
+            // replay it qualified for, and the terminal branch then force-
+            // flushed that held text as the whole reply.
+            var iterFlushedToSurface = false
             var iterFinal: TurnEngineResult?
             var emptyReplyRecovery = false
             // Fresh per iteration — see NativeToolCallCollector's note.
@@ -650,6 +914,15 @@ extension SwiftNativeChatOrchestrationClient {
             var nativeSink: (@Sendable (LLMStreamToolCall) async -> Void)?
             if let nativeCollector {
                 nativeSink = { @Sendable call in await nativeCollector.append(call) }
+            }
+            // The typed failure behind this iteration's `.error(String)` event.
+            // Fresh per iteration, so a previous attempt's error can never be
+            // read as this one's. The engine calls the sink and returns before
+            // it yields the matching event, so by the time the event is in hand
+            // here the box holds the error the string was rendered from.
+            let failureBox = StreamFailureBox()
+            let failureSink: (@Sendable (any Error) -> Void) = { @Sendable err in
+                failureBox.set(err)
             }
             let reusedTurnContext = reuseTurnContext ? turnContextBox.get() : nil
             // MEMORY-SAFETY (2026-07-04): pass turnActiveTools EXPLICITLY so
@@ -690,6 +963,7 @@ extension SwiftNativeChatOrchestrationClient {
                 providerIDOverride: nil,
                 turnActiveTools: turnActiveTools,
                 pinnedActiveTools: ridesNativeTools ? nil : turnActiveTools,
+                pinnedContract: ridesNativeTools ? nil : turnContract,
                 clockNowOverride: turnClockNow,
                 toolSchemaCatalogSeed: preloadToolSchemaCatalogSeed,
                 quietHoursSnapshot: quietHoursSnapshot,
@@ -702,9 +976,17 @@ extension SwiftNativeChatOrchestrationClient {
                 // hint (and any loop nudges grown onto currentUserMessage)
                 // stay wire-only. Without this, the hint's tool names are
                 // selection-query vocabulary on every text-compat turn.
-                queryUserMessage: message
+                queryUserMessage: message,
+                // User, 2026-09-06: the router shortens THIS call's wall to
+                // what the turn can still afford, minus the reconnect
+                // reserve — the structured loops already bind this. Without
+                // it the wall (600s) equalled the interactive and Telegram
+                // turn window, so one hung first call spent the whole budget
+                // and the ladder below never got a second attempt.
+                remainingTurnSeconds: { [wholeTurnBudget] in wholeTurnBudget.remainingSeconds },
+                streamFailureSink: failureSink
             )
-            do {
+            providerCall: do {
                 for try await event in stream {
                     if Task.isCancelled {
                         didCancel = true
@@ -729,13 +1011,16 @@ extension SwiftNativeChatOrchestrationClient {
                                 force: false,
                                 continuation: continuation
                             )
-                            if enqueued, await outputMilestoneGate.claim() {
-                                TurnLifecycleTelemetry.emit(
-                                    .surfaceOutputEnqueued,
-                                    surface: surface,
-                                    sessionId: resolvedSession,
-                                    observedBy: "text_compat.continuation"
-                                )
+                            if enqueued {
+                                iterFlushedToSurface = true
+                                if await outputMilestoneGate.claim() {
+                                    TurnLifecycleTelemetry.emit(
+                                        .surfaceOutputEnqueued,
+                                        surface: surface,
+                                        sessionId: resolvedSession,
+                                        observedBy: "text_compat.continuation"
+                                    )
+                                }
                             }
                         }
                     case .toolUse, .toolResult, .notice:
@@ -752,6 +1037,20 @@ extension SwiftNativeChatOrchestrationClient {
                                     // after .error so the loop ends and the
                                     // didCancel block (~2171) persists cancelled:true
                         }
+                        // User, 2026-09-06: the engine REFUSED to start a call
+                        // this turn cannot pay for. That is the whole-turn
+                        // budget ending, not a provider failure — take the same
+                        // exhausted exit the loop head takes, so the turn ends
+                        // on its fallback instead of through the reconnect
+                        // ladder (which would replay a call there is equally no
+                        // time for). The round-head increment counted a
+                        // provider round that never happened; take it back.
+                        if failureBox.get() is TurnBudgetSpentBeforeProviderCall {
+                            exhaustedToolLoop = true
+                            wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                            providerCallCount = max(0, providerCallCount - 1)
+                            break toolLoop
+                        }
                         // "no answer text" is the adapter's own grammar for a
                         // thinking-only empty 200/stream (emptyTextResponseError
                         // / the stream message_stop guard, both test-pinned).
@@ -765,6 +1064,26 @@ extension SwiftNativeChatOrchestrationClient {
                             emptyReplyRecovery = true
                             break
                         }
+                        // User, 2026-09-06: RECONNECT instead of dying. Classify
+                        // the TYPED failure the engine handed the sink when it
+                        // has one — an `LLMError.streamTruncated`, a URLError,
+                        // whatever was actually thrown — and only fall back to
+                        // wrapping the string when the failure had no type to
+                        // carry. Replay the identical call when this attempt put
+                        // NOTHING on the surface (no delta flushed; tool dispatch
+                        // happens after the stream ends, so nothing was
+                        // dispatched either). An attempt that already emitted
+                        // output keeps the old behaviour: persist the partial and
+                        // end the turn.
+                        let classified: any Error = failureBox.get()
+                            ?? LLMError.providerError(message: m)
+                        if !iterFlushedToSurface,
+                           providerCallAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
+                           providerTurnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
+                           ProviderRecoveryPolicy.isRecoverableTurnFailure(classified) {
+                            providerReplayError = classified
+                            break providerCall
+                        }
                         // Provider failures arriving as ENGINE-YIELDED .error
                         // events bypassed the thrown-stream catch's post-tool-
                         // effect wrap below, so a surface retry ladder saw a
@@ -772,9 +1091,16 @@ extension SwiftNativeChatOrchestrationClient {
                         // (gpt-5.5 BLOCKING, 2026-07-20 — the 13:08Z live error
                         // carried no marker despite 3 dispatches). Stamp the
                         // same cross-module marker contract here.
-                        let m = dispatches.isEmpty
+                        // User, 2026-09-06: count EFFECTFUL dispatches, as the
+                        // thrown-error sibling below already does. Counting
+                        // every dispatch stamped "tool effects present" on a
+                        // turn whose only tools were read-only (inner_state,
+                        // agent_introspect) and refused it the whole-turn
+                        // replay it was safe to have.
+                        let effectful = ProviderErrorAfterToolEffects.effectfulCount(dispatches)
+                        let m = effectful == 0
                             ? m
-                            : "provider failure after \(dispatches.count) tool "
+                            : "provider failure after \(effectful) tool "
                               + "dispatch(es) [\(ProviderErrorAfterToolEffects.markerPhrase)]: \(m)"
                         // Real provider error mid-turn: TERMINAL. A plain `break`
                         // only exits the switch (Swift semantics), so the loop
@@ -852,12 +1178,27 @@ extension SwiftNativeChatOrchestrationClient {
                 }
             } catch is CancellationError {
                 didCancel = true
+                TurnTraceBus.fireFromContext(
+                    kind: "turn.cancelled", surface: surface,
+                    payload: .object(["where": .string("text_compat.\(#line)")])
+                )
                 continuation.yield(.error("cancelled"))
             } catch {
+                // Same ladder as the engine-yielded sibling above, on a TYPED
+                // error — `isRecoverableTurnFailure` unwraps the two wrappers
+                // this module owns, so no string round-trip is needed here
+                // (User, 2026-09-06).
+                if !iterFlushedToSurface,
+                   providerCallAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
+                   providerTurnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
+                   ProviderRecoveryPolicy.isRecoverableTurnFailure(error) {
+                    providerReplayError = error
+                    break providerCall
+                }
                 // Marker-wrap post-tool-effect failures so the surface retry
                 // ladder (Telegram) sees "whole-turn retry unsafe" in the event
                 // text and does not replay a turn whose tools already ran.
-                let surfaced = ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: dispatches.count)
+                let surfaced = ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
                 TurnTraceBus.fireFromContext(
                     kind: "turn.failed",
                     surface: surface,
@@ -901,6 +1242,103 @@ extension SwiftNativeChatOrchestrationClient {
                 )
                 continuation.finish()
                 return
+            }
+            // The ladder. Same budgets, same backoff, same Retry-After rule and
+            // the same `provider_retry` notice the structured loops emit; the
+            // replay itself is `continue toolLoop`, which re-runs the identical
+            // provider call with the iteration-scoped accumulators rebuilt
+            // (that is exactly what the empty-reply recovery below already
+            // does). A replay spends one tool-loop iteration.
+            if let replayError = providerReplayError {
+                providerReplayError = nil
+                // User, 2026-09-06: a replay costs one tool-loop iteration, so on
+                // the LAST one there is nothing to replay into — `continue
+                // toolLoop` would just end the loop with `exhaustedToolLoop`
+                // unset, and the post-loop branch would persist an empty partial
+                // as `cancelled: true`: a provider drop reported to the user as a
+                // Stop the user never pressed. Don't schedule what cannot run —
+                // no notice, no sleep — and leave through the exhausted path
+                // carrying the failure as the reason.
+                if iteration + 1 >= maxToolIterations {
+                    loopRecoveryReply = "(provider failed on the last of "
+                        + "\(maxToolIterations) tool-loop iterations, with no "
+                        + "iteration left to reconnect into: "
+                        + "\(String(ProviderRecoveryPolicy.describe(replayError).prefix(200))))"
+                    exhaustedToolLoop = true
+                    break toolLoop
+                }
+                let delaySeconds = ProviderRecoveryPolicy.retryDelaySeconds(
+                    forRetry: providerCallAttempt, error: replayError
+                )
+                let remainingBudget = wholeTurnBudget.remainingSeconds
+                if delaySeconds >= remainingBudget {
+                    // Only say it when the PROVIDER asked for the long wait; an
+                    // ordinary backoff that outlasts the budget is just the
+                    // budget ending.
+                    if let retryAfter = ProviderRecoveryPolicy.retryAfterSeconds(in: replayError),
+                       retryAfter >= remainingBudget {
+                        continuation.yield(.notice(
+                            kind: "provider_retry",
+                            text: ProviderRecoveryPolicy.retryAfterBeyondBudgetStatus(
+                                delaySeconds: retryAfter,
+                                remainingSeconds: remainingBudget
+                            )
+                        ))
+                    }
+                    exhaustedToolLoop = true
+                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                    break toolLoop
+                }
+                providerTurnRecoveries += 1
+                TurnTraceBus.fireFromContext(
+                    kind: TurnLifecycleMilestone.providerRetry.rawValue,
+                    surface: surface,
+                    payload: .object([
+                        "attempt": .int(Int64(providerCallAttempt)),
+                        "delaySeconds": .double(delaySeconds),
+                        "reason": .string(String(ProviderRecoveryPolicy.describe(replayError).prefix(200))),
+                        "mode": .string("replay"),
+                        "turnRecoveries": .int(Int64(providerTurnRecoveries)),
+                    ])
+                )
+                // Cancellation outranks recovery, by Task state and by the
+                // cross-process flag — same order as the structured ladder.
+                // This lane cannot throw (the producer body is non-throwing),
+                // so a Stop sets didCancel and falls into the persistence
+                // block below instead of unwinding.
+                let stopped = { Task.isCancelled
+                    || FileManager.default.fileExists(atPath: cancelFlagPath.path) }
+                if stopped() {
+                    didCancel = true
+                } else {
+                    // A silent reconnect looks identical to a hang. After the
+                    // cancellation check so a Stop never leaves "reconnecting"
+                    // as the last thing the surface said, before the backoff so
+                    // it stands for the whole wait.
+                    continuation.yield(.notice(
+                        kind: "provider_retry",
+                        text: ProviderRecoveryPolicy.reconnectStatus(
+                            attemptsMade: providerCallAttempt
+                        )
+                    ))
+                    try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                    if stopped() {
+                        didCancel = true
+                    } else {
+                        providerCallAttempt += 1
+                        // The dropped attempt is discarded WHOLE, so the text
+                        // the buffer is still holding back goes with it — the
+                        // re-issued call emits its own bytes, and keeping these
+                        // would render the same fragment twice.
+                        pendingDelta.removeAll(keepingCapacity: true)
+                        // The loop head re-checks the whole-turn budget, so an
+                        // expired budget ends on the exhausted path rather than
+                        // starting one more attempt.
+                        continue toolLoop
+                    }
+                }
+            } else {
+                providerCallAttempt = 1
             }
             if didCancel {
                 let partialVisible: String = {
@@ -961,7 +1399,11 @@ extension SwiftNativeChatOrchestrationClient {
                     // another failure).
                     Self.appendNativeUserText(feedback, to: &conversation)
                 } else if appendOnlyEligible {
-                    conversation.append(.user(feedback))
+                    // Was a bare append. On v2 the array ends with the volatile
+                    // system message, so a bare user append here is the exact
+                    // 400 this lane can least afford — route it through the
+                    // same rule.
+                    Self.appendNativeUserText(feedback, to: &conversation)
                 } else {
                     currentUserMessage += "\n\n" + feedback
                 }
@@ -998,6 +1440,10 @@ extension SwiftNativeChatOrchestrationClient {
                         violation: violation
                     )
                 }
+                // 2026-09-06: deliberately NOT absorbed into `accumulated` —
+                // this round's prose is the rejected output the bounce exists
+                // to replace, and keeping it would ship the malformed attempt
+                // alongside the retry's real answer.
                 continue toolLoop
             }
             if !ridesNativeTools { lastProtocolViolation = nil }
@@ -1078,6 +1524,10 @@ extension SwiftNativeChatOrchestrationClient {
                     } else {
                         currentUserMessage += "\n\n" + feedback
                     }
+                    // 2026-09-06: deliberately NOT absorbed into `accumulated`
+                    // — the narration this bounce rejected is the thing the
+                    // user must not be shown, so the retry's reply stands
+                    // alone.
                     continue toolLoop
                 }
                 // Marker stripping is a TEXT-lane concern. On the native lane
@@ -1092,7 +1542,7 @@ extension SwiftNativeChatOrchestrationClient {
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     : iterAccumulated
                 sawFinal = iterFinal != nil
-                accumulated += visibleIteration
+                accumulated = Self.absorbingVisibleRound(accumulated, visibleIteration)
                 if emitTextDeltas {
                     if ignoredOnly {
                         pendingDelta = ToolCallParser.stripToolUseMarkers(pendingDelta)
@@ -1126,6 +1576,19 @@ extension SwiftNativeChatOrchestrationClient {
                 break toolLoop
             }
             pendingDelta.removeAll(keepingCapacity: true)
+            // User, 2026-09-06: this round NARRATED before it called its tools,
+            // and the user watched that prose render. Absorb it now, before the
+            // dispatch, so `accumulated` is the whole visible reply and not just
+            // its last call-free round — the exhaustion composition below reads
+            // it, and used to find it empty after any narrated tool round and
+            // persist the fallback line alone. Markers are stripped on the text
+            // lane only; on the native lane the model's prose is just prose.
+            accumulated = Self.absorbingVisibleRound(
+                accumulated,
+                ridesNativeTools
+                    ? iterAccumulated
+                    : ToolCallParser.stripToolUseMarkers(iterAccumulated)
+            )
 
             if iteration == maxToolIterations - 1 {
                 exhaustedToolLoop = true
@@ -1233,6 +1696,8 @@ extension SwiftNativeChatOrchestrationClient {
                             continuation.yield(.notice(kind: kind, text: text))
                         }
                     },
+                    imagesEnabled: appendOnlyEligible,
+                    cancelFlagPath: cancelFlagPath,
                     onToolUse: { prepared in
                         continuation.yield(.toolUse(
                             name: prepared.internalName,
@@ -1325,7 +1790,11 @@ extension SwiftNativeChatOrchestrationClient {
             // is the SAME classification the structured lane reads through
             // ChatToolOutcome.outputLooksSuccessful — an all-errored round is
             // the stuck case the budget exists to kill and extends nothing.
-            if slots.contains(where: { !$0.isError }) {
+            // User, 2026-09-06: and an approval FILED is not a tool that ran —
+            // same rule as the structured lane.
+            if slots.contains(where: {
+                !$0.isError && !ChatToolOutcome.isWaitingApproval($0.result)
+            }) {
                 wholeTurnBudget.recordProgress()
             }
 
@@ -1368,22 +1837,33 @@ extension SwiftNativeChatOrchestrationClient {
                 if !iterAccumulated.isEmpty { assistantBlocks.append(.text(iterAccumulated)) }
                 assistantBlocks.append(contentsOf: nativeToolUseBlocks)
                 conversation.append(LLMMessage(role: .assistant, content: assistantBlocks))
-                conversation.append(LLMMessage(role: .user, content: nativeToolResultBlocks))
+                conversation.append(contentsOf: LocalToolImage.continuation(
+                    nativeToolResultBlocks + slots.flatMap(\.images)))
             } else if appendOnlyEligible {
                 conversation.append(.assistantText(iterAccumulated))
-                conversation.append(.user(iterationToolResults))
+                conversation.append(contentsOf: LocalToolImage.continuation(
+                    [.text(iterationToolResults)] + slots.flatMap(\.images)))
             }
+            LocalToolImage.boundConversation(&conversation)
             if stopForNoProgress { break toolLoop }
         }
 
         if exhaustedToolLoop && !sawFinal {
-            let fallback = loopRecoveryReply ?? lastProtocolViolation?.terminalReply
+            let exhaustionReply = loopRecoveryReply ?? lastProtocolViolation?.terminalReply
                 ?? ToolLoopExhaustion.fallbackReply(
                     iterationLimit: maxToolIterations,
                     dispatchCount: dispatches.count,
                     providerRounds: providerCallCount,
                     wallClockElapsedSeconds: wallClockElapsedSeconds
                 )
+            // User, 2026-09-06: same rule as the structured lane's
+            // finishExhaustedTurn — the exhaustion line EXPLAINS the stop, it
+            // never REPLACES prose the user already watched render. `accumulated`
+            // is the marker-stripped visible text of the rounds that completed,
+            // so an exhaustion after narrated tool rounds used to persist the
+            // fallback alone and the narration vanished on reload.
+            let shown = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fallback = shown.isEmpty ? exhaustionReply : shown + "\n\n" + exhaustionReply
             let fallbackResult = TurnEngineResult(
                 reply: fallback,
                 modelUsed: finalResult?.modelUsed ?? effectiveModel,
@@ -1458,15 +1938,28 @@ extension SwiftNativeChatOrchestrationClient {
             } catch {
                 continuation.yield(.error("persist assistant turn failed: \(error)"))
             }
-            if let promoter {
-                await promoter.observeTurn(
+            if promoter != nil {
+                // Sweep item 35: this lane terminates Claude turns without
+                // going through `finishCompletedTurn`, so it must hand the
+                // promoter its own tool evidence or the projection is dead
+                // on the surface Agent actually talks on. Through the engine's
+                // observer (2026-09-02) so this lane emits the same
+                // memory.promotion stage — with the moment outcome — as the
+                // tool-loop lane; before, the surface she actually talks on
+                // left no receipt at all.
+                await engine.observeMemoryPromotion(
                     userMessage: message,
                     assistantMessage: replyText,
-                    sessionId: resolvedSession
+                    toolDispatches: finalResult?.toolDispatches ?? [],
+                    sessionId: resolvedSession,
+                    surface: surface
                 )
             }
         }
         continuation.finish()
+        } // ConversationPrefixBoundary.$currentUserIndex.withValue
+        } // ConversationPrefixShape.$override.withValue (resolved seed shape)
+        } // ConversationPrefixShape.$override.withValue (turn entry)
     }
 
     /// U1 item 9: pick the append-only messages transport ONLY when the
@@ -1527,9 +2020,19 @@ extension SwiftNativeChatOrchestrationClient {
     /// Emits only booleans and stable reason codes: enough to account for a
     /// transport downgrade without disclosing credential contents, file paths,
     /// prompt text, or provider response data.
+    ///
+    /// The native-tools fields are what make a Claude turn's transport
+    /// PROVABLE from the trace alone. Since the api-key opt-in (item 34) the
+    /// same `claude-*` model reaches the provider two different ways, and the
+    /// difference is invisible in the reply: `toolProtocol` says whether the
+    /// turn shipped a `tools` array or asked the model for `<tool_use>` markers
+    /// in prose, and `nativeToolProviderId` / `nativeToolLaneResolvedFrom` say
+    /// which id decided it and which step of the ladder answered.
     private nonisolated static func emitAppendOnlyMessagesEligibilityTrace(
         _ eligibility: AppendOnlyMessagesEligibility,
         effectiveTransport: String,
+        nativeLane: NativeToolLaneDecision,
+        nativeToolsEngaged: Bool,
         sessionId: String,
         surface: String
     ) {
@@ -1545,8 +2048,28 @@ extension SwiftNativeChatOrchestrationClient {
                 "messagesStreamingSupported": .bool(eligibility.messagesStreamingSupported),
                 "usableAnthropicOAuthCredentials": .bool(eligibility.usableAnthropicOAuthCredentials),
                 "blockers": .array(eligibility.blockers.map(JSONValue.string)),
+                "nativeToolLaneAvailable": .bool(nativeLane.engaged),
+                "nativeToolLaneEngaged": .bool(nativeToolsEngaged),
+                "nativeToolProviderId": nativeLane.providerId.map(JSONValue.string) ?? .null,
+                "nativeToolLaneResolvedFrom": .string(nativeLane.resolvedFrom),
+                "toolProtocol": .string(nativeToolsEngaged ? "provider_native_tools" : "text_markers"),
             ])
         )
+    }
+
+    /// User, 2026-09-06: the turn's VISIBLE prose, round by round. `accumulated`
+    /// used to absorb only the round that ended call-free, so every narrated
+    /// tool round's prose was dropped — and the exhaustion composition, which
+    /// reads `accumulated`, found it empty and persisted the fallback line
+    /// alone. Rounds are joined by a blank line because they are separate
+    /// paragraphs of the same reply, not one run-on string.
+    private nonisolated static func absorbingVisibleRound(
+        _ accumulated: String, _ round: String
+    ) -> String {
+        let trimmed = round.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return accumulated }
+        if accumulated.isEmpty { return trimmed }
+        return accumulated + "\n\n" + trimmed
     }
 
     @discardableResult

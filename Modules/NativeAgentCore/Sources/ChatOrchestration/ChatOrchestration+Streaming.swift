@@ -245,6 +245,12 @@ extension SwiftNativeTurnEngine {
         // tool catalog and bust the prompt-cache prefix. nil = today's
         // behavior (fresh store read), used by all other callers.
         pinnedActiveTools: Set<String>? = nil,
+        // Sibling of pinnedActiveTools, pinned for the same reason: the
+        // advertised CONTRACT (order, pinned MCP membership, pinned schema
+        // descriptors) held still for the whole turn, so a mid-turn unload,
+        // idle drop, or MCP cache rewrite cannot shrink the catalog inside the
+        // stable segment. nil = fresh store read.
+        pinnedContract: SessionToolContract? = nil,
         // Sibling of pinnedActiveTools: turn-start instant for the dynamic
         // segment's clock line, passed identically on every iteration of a
         // tool loop so a minute boundary can't churn the cache mid-turn.
@@ -294,7 +300,29 @@ extension SwiftNativeTurnEngine {
         // Raw user text for relevance consumers (selection queryText, memory
         // recall, query embedding) when `userMessage` carries turn-scoped wire
         // riders — the text-compat tool-routing hint. nil → `userMessage`.
-        queryUserMessage: String? = nil
+        queryUserMessage: String? = nil,
+        // User, 2026-09-06: how long the WHOLE turn has left, so the router can
+        // shorten this call's provider wall and leave the reconnect ladder room
+        // (ProviderRecoveryPolicy.callWallSeconds). Passed EXPLICITLY and bound
+        // inside this function's Task for the same memory-safety reason
+        // `turnActiveTools` is — a sync withValue around the streamTurn CALL
+        // pops the task-local while the spawned Task still references it. nil →
+        // inherit whatever the caller's task already carries.
+        // 2026-09-06: a closure, sampled at the provider call, not a value
+        // sampled before context assembly; a slow history build must shrink
+        // this call's wall like any other elapsed time.
+        remainingTurnSeconds: (@Sendable () -> TimeInterval?)? = nil,
+        // User, 2026-09-06: the TYPED failure behind a `.error(String)` event.
+        // Kept OUT of TurnStreamEvent for exactly the reason nativeToolCallSink
+        // is (a payload change on that public enum touches every exhaustive
+        // switch on every surface), but without it a typed LLMError — the
+        // `.streamTruncated` an Anthropic stream throws on a clean EOF with no
+        // message_stop, above all — reached the text-compat reconnect ladder as
+        // a bare string, was re-wrapped as `.providerError`, and failed
+        // classification: the ladder never ran on the single most common drop.
+        // Called (and completed) immediately BEFORE the matching `.error` yield,
+        // so a consumer that stashes it has it in hand when the event arrives.
+        streamFailureSink: (@Sendable (any Error) -> Void)? = nil
     ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let startNs = DispatchTime.now().uptimeNanoseconds
@@ -344,62 +372,34 @@ extension SwiftNativeTurnEngine {
                     ctx = preBuiltContext
                 } else {
                 do {
-                    // Wave 16: when a sessionId is supplied, thread prior
-                    // conversation history through the context so streaming
-                    // is coherent across turns (Mac UI's normal sends carry
-                    // a sessionId). When nil, fall back to context-only
-                    // (one-shot). gpt-5.5 review flagged the original
-                    // history-less path as a behavioral regression vs the
-                    // daemon's /v1/chat/stream which threaded history.
-                    let rawCtx: TurnContext
-                    if let sessionId, !sessionId.isEmpty {
-                        rawCtx = try await self.buildTurnContextWithHistory(
-                            surface: surface,
-                            userMessage: userMessage,
-                            sessionId: sessionId,
-                            historyLimit: historyLimit,
-                            historyReader: historyReader,
-                            personaOverride: personaOverride,
-                            excludeHistoryRunId: excludeHistoryRunId,
-                            imageBlocks: imageBlocks,
-                            queryUserMessage: queryUserMessage,
-                            clockNowOverride: clockNowOverride,
-                            toolSchemaCatalogSeed: toolSchemaCatalogSeed,
-                            quietHoursSnapshot: quietHoursSnapshot
-                        )
-                    } else {
-                        rawCtx = try await self.buildTurnContext(
-                            surface: surface,
-                            userMessage: userMessage,
-                            personaOverride: personaOverride,
-                            imageBlocks: imageBlocks,
-                            queryUserMessage: queryUserMessage,
-                            clockNowOverride: clockNowOverride,
-                            toolSchemaCatalogSeed: toolSchemaCatalogSeed,
-                            quietHoursSnapshot: quietHoursSnapshot
-                        )
-                    }
-                    let plannedCtx = Self.contextByAppendingTurnPlanHint(
-                        rawCtx,
-                        turnPlan: turnPlan
-                    )
-                    let runtimeCtx = Self.contextByAppendingRuntimeContext(
-                        plannedCtx,
-                        runtimeContext: runtimeContext ?? ""
-                    )
-                    // 2026-06-08 lazy-tool-skill-loading close-out: Anthropic
-                    // OAuth compat path (textToolCompatibility: true) goes
-                    // through here too — apply the SAME per-session lazy
-                    // filter the structured tool loop applies so this surface
-                    // doesn't ship the full eager catalog. Empty/nil sessionId
-                    // falls closed to alwaysOnCore + MCP only. (C3 shared helper.)
-                    ctx = await self.lazyFilteredTurnContext(
-                        runtimeCtx,
+                    // ONE owner for the four-step sequence (see
+                    // `prepareTurnContext`). The text-compat lane has to build
+                    // the context BEFORE the call it is an argument to — v2
+                    // seeds the volatile block into `messages` — so the steps
+                    // live in one place and both callers read them from there
+                    // instead of keeping two copies in step.
+                    ctx = try await self.prepareTurnContext(
+                        surface: surface,
+                        userMessage: userMessage,
                         sessionId: sessionId,
-                        pinnedActiveTools: pinnedActiveTools
+                        historyLimit: historyLimit,
+                        historyReader: historyReader,
+                        personaOverride: personaOverride,
+                        excludeHistoryRunId: excludeHistoryRunId,
+                        imageBlocks: imageBlocks,
+                        queryUserMessage: queryUserMessage,
+                        clockNowOverride: clockNowOverride,
+                        toolSchemaCatalogSeed: toolSchemaCatalogSeed,
+                        quietHoursSnapshot: quietHoursSnapshot,
+                        turnPlan: turnPlan,
+                        runtimeContext: runtimeContext,
+                        turnActiveTools: turnActiveTools,
+                        pinnedActiveTools: pinnedActiveTools,
+                        pinnedContract: pinnedContract
                     )
                 } catch {
                     let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    streamFailureSink?(error)
                     continuation.yield(.error(message))
                     continuation.finish()
                     return
@@ -453,7 +453,19 @@ extension SwiftNativeTurnEngine {
                     toolSchemas: ctx.toolSchemas,
                     systemSegments: resolvedSegments,
                     imageBlocks: ctx.imageBlocks,
-                    fluidContextTurn: ctx.fluidContextTurn
+                    fluidContextTurn: ctx.fluidContextTurn,
+                    naturalExpressionCue: ctx.naturalExpressionCue,
+                    // v2Prefix (live 92023f8c): these were dropped here as
+                    // "trace-only", which was true until the snapshot started
+                    // reading them. On the text lane `ctx` is the already-SEEDED
+                    // context, so its dynamic segment is empty and the per-turn
+                    // mass lives in `turnVolatileBlock` — dropping it left the
+                    // snapshot with nothing to measure and it reported
+                    // cognitiveCapsuleBytes 0 on a turn carrying 20,068
+                    // characters of packet + capsule.
+                    historyMessages: ctx.historyMessages,
+                    turnVolatileBlock: ctx.turnVolatileBlock,
+                    historyWindowReceipt: ctx.historyWindowReceipt
                 )
                 Self.fireContextSnapshotEvent(
                     surface: surface,
@@ -575,6 +587,8 @@ extension SwiftNativeTurnEngine {
                         }
                     } catch {
                         let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                        // The typed failure, before the string that loses it.
+                        streamFailureSink?(error)
                         continuation.yield(.error(message))
                         continuation.finish()
                         return
@@ -603,6 +617,12 @@ extension SwiftNativeTurnEngine {
                     // tool calls travel through the separate sink and produce
                     // no text by design; native adapters enforce their own
                     // text-or-tool invariant.
+                    // NO typed failure on the sink here, deliberately (User,
+                    // 2026-09-06): this is a verdict this engine reaches about
+                    // a stream that ENDED CLEANLY, not a provider error, and an
+                    // identical replay is proven useless against it. The
+                    // text-compat lane's empty-reply nudge owns this shape; the
+                    // untyped string keeps the reconnect ladder off it.
                     if accumulated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                        !nativeTools {
                         continuation.yield(.error(
@@ -627,8 +647,30 @@ extension SwiftNativeTurnEngine {
                     continuation.yield(.final(result))
                     continuation.finish()
                 }
+                // User, 2026-09-06: THE SAMPLE, taken once, right before the
+                // call — and it decides whether the call may start at all. The
+                // caller's loop checked the budget before context assembly, and
+                // assembly spends real wall time, so the turn can be spent by
+                // now; `callWallSeconds` would then hand this call the 60 s
+                // floor. A remainder of zero or less means there is no call to
+                // make, so none is made.
+                let remainingAtCall = remainingTurnSeconds?()
+                if let remainingAtCall, remainingAtCall <= 0 {
+                    let spent = TurnBudgetSpentBeforeProviderCall()
+                    streamFailureSink?(spent)
+                    continuation.yield(.error(spent.description))
+                    continuation.finish()
+                    return
+                }
                 if let conversation,
                    let messagesLLM = streamingLLM as? any MessagesStreamingLLMClient {
+                    // What the WHOLE turn has left, so the router can shorten
+                    // THIS call's wall and leave the reconnect ladder room.
+                    // Bound around the provider call only, exactly where the
+                    // structured loops bind it.
+                    await LLMCallContext.$remainingTurnSeconds.withValue(
+                        remainingAtCall ?? LLMCallContext.remainingTurnSeconds
+                    ) {
                     await LLMCallContext.$admittedModel.withValue(resolvedModel) {
                     await LLMCallContext.$providerId.withValue(snapshotContext.providerId) {
                     await LLMCallContext.$serviceTier.withValue(snapshotContext.serviceTier) {
@@ -669,6 +711,7 @@ extension SwiftNativeTurnEngine {
                     }
                     }
                     }
+                    }
                 } else {
                     // TRIPWIRE (streaming legacy prompt lane): the plain
                     // `stream(prompt:)` transport has NO image channel, so any
@@ -686,6 +729,11 @@ extension SwiftNativeTurnEngine {
                         )
                     }
                     let streamPrompt = promptForStream
+                    // Same per-call wall bound as the messages transport above,
+                    // from the same single sample.
+                    await LLMCallContext.$remainingTurnSeconds.withValue(
+                        remainingAtCall ?? LLMCallContext.remainingTurnSeconds
+                    ) {
                     await LLMCallContext.$admittedModel.withValue(resolvedModel) {
                     await LLMCallContext.$providerId.withValue(snapshotContext.providerId) {
                     await LLMCallContext.$serviceTier.withValue(snapshotContext.serviceTier) {
@@ -698,6 +746,7 @@ extension SwiftNativeTurnEngine {
                             model: resolvedModel,
                             surface: surface
                         ))
+                    }
                     }
                     }
                     }
@@ -794,38 +843,93 @@ extension SwiftNativeTurnEngine {
 
     /// Places the lazy tool contract ahead of volatile recall/history so the
     /// provider can reuse one honest stable prefix across ordinary turns.
-    /// The contract and catalog are stable until the session loads a different
-    /// tool set; that mutation intentionally rewrites the cache once. No tool,
-    /// memory, or conversation content is removed.
+    ///
+    /// THREE segments (2026-09-01):
+    ///   stable       persona + pins + protocol prose + the always-on FLOOR
+    ///                catalog — bytes that do not move for the life of the
+    ///                session.
+    ///   stableSuffix the "Also loaded this session:" run — append-only within
+    ///                the session, so growing it cannot disturb `stable`.
+    ///   dynamic      per-turn recall/history, unchanged.
+    ///
+    /// The old two-segment shape put the whole catalog in `stable`, so one
+    /// mid-session `tool_load` rewrote everything the breakpoint covered. With
+    /// no session-loaded tools the suffix is empty and the combined bytes are
+    /// identical to before. No tool, memory, or conversation content is
+    /// removed by this split — it is a cache layout, and `reassembles(into:)`
+    /// is what proves that to the adapters.
     nonisolated static func textToolCompatibilityLayout(
         baseSystem: String?,
         segments: SystemPromptSegments?,
         context: TurnContext,
         nativeTools: Bool = false
     ) -> (system: String, segments: SystemPromptSegments?) {
-        let toolBlock = nativeTools
-            ? renderNativeToolInstructions()
-            : renderTextToolCompatibilityInstructions(
+        let floorBlock: String
+        let appendedBlock: String
+        if nativeTools {
+            // The native lane carries no rendered catalog at all — the
+            // provider's own tools array is the contract.
+            floorBlock = renderNativeToolInstructions()
+            appendedBlock = ""
+        } else {
+            let sections = textToolCatalogSections(
                 schemas: context.toolSchemas,
                 names: context.toolsAvailable
             )
+            floorBlock = renderTextToolCompatibilityFloor(rows: sections.floor)
+            appendedBlock = sections.appended
+        }
+        // v2Prefix, 2026-09-01 (live measurement on c83a39b8): even in
+        // `stableSuffix` the catalog run sits INSIDE the cached prefix, ahead
+        // of the replayed messages — so one promoted preload growing the
+        // contract 65 → 66 invalidated 19,737 tokens of history on the very
+        // next turn. On the v2 shape the run therefore leaves the prefix
+        // entirely and is delivered in the per-turn volatile block
+        // (`ConversationPrefixSeeding.seed`, which is the ONLY place that both
+        // knows the shape resolved to v2 and owns that block). The floor stays
+        // in `stable` — a tool the model is told it always has must not be
+        // something the provider can clear.
+        //
+        // The task-local is the exact gate: the text-compat lane binds the
+        // RESOLVED shape around every `streamTurn` of the turn, so this reads
+        // `.v2Prefix` precisely when the seed relocated the run, and
+        // `.v1Legacy` (unbound, or a seed that fell back for want of history)
+        // precisely when it did not. v1Legacy bytes are untouched.
+        //
+        // The structured/native lanes keep their `tools` array as is: there is
+        // no prose catalog to move, and their equivalent of this fix is
+        // Anthropic's mid-conversation `tool_addition` content blocks —
+        // follow-up, deliberately not attempted here.
+        let appendedRidesVolatileBlock = ConversationPrefixShape.override == .v2Prefix
+        let systemAppendedBlock = appendedRidesVolatileBlock ? "" : appendedBlock
         guard let segments,
               let baseSystem,
               segments.reassembles(into: baseSystem) else {
-            return (
-                withTextToolCompatibilityInstructions(
-                    baseSystem,
-                    context: context,
-                    nativeTools: nativeTools
-                ),
-                nil
-            )
+            // No usable segments: one flat block, catalog run included or not
+            // by the same rule as the segmented arm.
+            let toolBlock = systemAppendedBlock.isEmpty
+                ? floorBlock
+                : floorBlock + "\n\n" + systemAppendedBlock
+            guard let base = baseSystem?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !base.isEmpty else {
+                return (toolBlock, nil)
+            }
+            return (base + "\n\n" + toolBlock, nil)
         }
         let stable = segments.stable.isEmpty
-            ? toolBlock
-            : segments.stable + "\n\n" + toolBlock
+            ? floorBlock
+            : segments.stable + "\n\n" + floorBlock
+        // An incoming suffix (another builder's session-stable text) keeps its
+        // place ahead of the catalog run; both stay inside the cached prefix.
+        // On the v2 text lane `systemAppendedBlock` is empty, so with no other
+        // builder contributing this field goes empty — kept, not deleted: the
+        // structured lanes and v1Legacy still fill it.
+        let stableSuffix = [segments.stableSuffix, systemAppendedBlock]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
         let reordered = SystemPromptSegments(
             stable: stable,
+            stableSuffix: stableSuffix,
             dynamic: segments.dynamic
         )
         return (reordered.combined, reordered)
@@ -859,36 +963,82 @@ extension SwiftNativeTurnEngine {
         """
     }
 
+    /// The advertised catalog, split the way the cache needs it.
+    ///
+    /// `floor` renders the always-on core — sorted by name, NEVER truncated,
+    /// byte-identical on every turn of every session with the same policy. It
+    /// is the tail of the cacheable stable block.
+    ///
+    /// `appended` renders what THIS session has loaded, in load order, never
+    /// re-sorted. It only ever grows within a session, so it can ride in
+    /// `stableSuffix` without moving a byte of what precedes it. The bounded
+    /// prefix(80) applies to this run alone: truncating the floor would drop a
+    /// tool the model is told it always has.
+    struct TextToolCatalogSections {
+        var floor: String
+        var appended: String
+    }
+
+    nonisolated static func textToolCatalogSections(
+        schemas: [LLMToolSchema],
+        names: [String]
+    ) -> TextToolCatalogSections {
+        let core = SwiftToolDispatcher.alwaysOnCoreNames
+        var floorRows: [String] = []
+        var appendedRows: [String] = []
+        var appendedTotal = 0
+        if !schemas.isEmpty {
+            // Incoming order is already canonical (applyLazyToolFilter owns
+            // it); partitioning preserves it, and the floor is re-sorted here
+            // so this renderer is correct even for a caller that never went
+            // through the filter.
+            let floorSchemas = schemas.filter { core.contains($0.name) }
+                .sorted { $0.name < $1.name }
+            let appendedSchemas = schemas.filter { !core.contains($0.name) }
+            appendedTotal = appendedSchemas.count
+            let row: (LLMToolSchema) -> String = { schema in
+                let params = parameterSummary(schema.parametersJSON)
+                let suffix = params.isEmpty ? "" : "(\(params))"
+                return "- \(schema.name)\(suffix): \(compact(schema.description, limit: 180))"
+            }
+            floorRows = floorSchemas.map(row)
+            appendedRows = appendedSchemas.prefix(80).map(row)
+        } else {
+            let floorNames = names.filter { core.contains($0) }.sorted()
+            let appendedNames = names.filter { !core.contains($0) }
+            appendedTotal = appendedNames.count
+            floorRows = floorNames.map { "- \($0)" }
+            appendedRows = appendedNames.prefix(80).map { "- \($0)" }
+        }
+        let omittedToolCount = max(0, appendedTotal - appendedRows.count)
+        let disclosure = omittedToolCount > 0
+            ? "\n- \(omittedToolCount) more tools not listed in this bounded catalog; use tool_load to expose a needed capability."
+            : ""
+        return TextToolCatalogSections(
+            floor: floorRows.isEmpty
+                ? "- No Swift tools are exposed for this turn."
+                : floorRows.joined(separator: "\n"),
+            appended: appendedRows.isEmpty
+                ? ""
+                : "Also loaded this session:\n" + appendedRows.joined(separator: "\n") + disclosure
+        )
+    }
+
     private nonisolated static func renderTextToolCompatibilityInstructions(
         schemas: [LLMToolSchema],
         names: [String]
     ) -> String {
-        let rows: [String]
-        let totalToolCount: Int
-        if !schemas.isEmpty {
-            totalToolCount = schemas.count
-            rows = schemas
-                .sorted { $0.name < $1.name }
-                .prefix(80)
-                .map { schema in
-                    let params = parameterSummary(schema.parametersJSON)
-                    let suffix = params.isEmpty ? "" : "(\(params))"
-                    return "- \(schema.name)\(suffix): \(compact(schema.description, limit: 180))"
-                }
-        } else {
-            totalToolCount = names.count
-            rows = names
-                .sorted()
-                .prefix(80)
-                .map { "- \($0)" }
-        }
-        let omittedToolCount = max(0, totalToolCount - rows.count)
-        let disclosure = omittedToolCount > 0
-            ? "\n- \(omittedToolCount) more tools not listed in this bounded catalog; use tool_load to expose a needed capability."
-            : ""
-        let renderedRows = rows.isEmpty
-            ? "- No Swift tools are exposed for this turn."
-            : rows.joined(separator: "\n") + disclosure
+        let sections = textToolCatalogSections(schemas: schemas, names: names)
+        let base = renderTextToolCompatibilityFloor(rows: sections.floor)
+        return sections.appended.isEmpty ? base : base + "\n\n" + sections.appended
+    }
+
+    /// Everything up to and including the always-on catalog. With no
+    /// session-loaded tools this is byte-identical to the pre-2026-09-01
+    /// single-block renderer.
+    private nonisolated static func renderTextToolCompatibilityFloor(
+        rows renderedRows: String
+    ) -> String {
         return """
         NativeAgent Swift tool protocol (text compatibility):
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.

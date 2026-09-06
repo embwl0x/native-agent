@@ -386,6 +386,115 @@ enum DoctorLoopHealth {
         return result
     }
 
+    // MARK: - Doctor row (FIX-4, 2026-09-01)
+
+    /// The id of the single Doctor row that carries loop health.
+    ///
+    /// Until this existed, `DoctorLoopHealth` was rendered only inside the
+    /// Doctor loops section: `doctorReport.checks` carried no loop row, so
+    /// `AppModel.systemHealthSummary` (the toolbar pill) could not see a
+    /// verdict from here. On 2026-09-01 the receipts file held 215
+    /// telegram_poll and 212 slack failures and the pill was green.
+    ///
+    /// The `live.` prefix is load-bearing, not decoration: it marks an
+    /// app-added live-owner row, which keeps this out of the Support
+    /// Snapshot's OFFLINE rollup (a cold core `runAll` in another process has
+    /// no loop fleet to report) and out of onboarding's app-scaffold gate.
+    static let doctorCheckID = "live.background_loops"
+
+    /// One Doctor row summarizing every loop verdict: counts by bucket and the
+    /// worst offender named, so a flapping fleet lowers the pill.
+    ///
+    /// Buckets are assigned per loop with precedence failing > dormant >
+    /// degraded > healthy. `dormancyVerdict` is READ, never re-decided: a loop
+    /// it flags is reported as dormant unless the schedule/error lanes already
+    /// called it failing.
+    static func doctorCheck(
+        observations: [LoopHealthObservation],
+        recentFailureDates: [String: [Date]],
+        now: Date
+    ) -> DoctorCheck {
+        // Absence of loops is no signal, never health: the app registers its
+        // fleet at launch, so an empty status list means the scheduler has not
+        // come up (or has gone away) rather than that everything is fine.
+        guard !observations.isEmpty else {
+            return DoctorCheck(
+                id: doctorCheckID,
+                title: "Background Loops",
+                status: "warn",
+                detail: "No background loops are registered, so there is nothing to report on. "
+                    + "That is a missing signal, not a clean bill of health.",
+                repair: nil
+            )
+        }
+        let verdicts = evaluate(
+            observations: observations,
+            recentFailureDates: recentFailureDates,
+            now: now
+        )
+        let dormant = Set(
+            observations
+                .filter { dormancyVerdict(for: $0, now: now) != nil }
+                .map(\.loopId)
+        )
+        var failing: [LoopHealthVerdict] = []
+        var dormantVerdicts: [LoopHealthVerdict] = []
+        var degraded: [LoopHealthVerdict] = []
+        var healthy = 0
+        for verdict in verdicts {
+            switch verdict.level {
+            case .fail: failing.append(verdict)
+            case .warn:
+                if dormant.contains(verdict.loopId) {
+                    dormantVerdicts.append(verdict)
+                } else {
+                    degraded.append(verdict)
+                }
+            case .ok: healthy += 1
+            }
+        }
+        var counts = ["\(failing.count) failing", "\(dormantVerdicts.count) dormant"]
+        if !degraded.isEmpty { counts.append("\(degraded.count) degraded") }
+        counts.append("\(healthy) healthy")
+        var detail = "\(verdicts.count) background loop(s): \(counts.joined(separator: ", "))."
+        // `evaluate` sorts worst-first, so the head of the list IS the worst
+        // offender; naming it means the pill's tooltip points somewhere.
+        if let worst = verdicts.first, worst.level != .ok {
+            detail += " Worst: \(worst.loopId) — \(worst.detail)"
+        }
+        let status: String
+        if !failing.isEmpty {
+            status = "fail"
+        } else if dormantVerdicts.isEmpty && degraded.isEmpty {
+            status = "ok"
+        } else {
+            status = "warn"
+        }
+        return DoctorCheck(
+            id: doctorCheckID,
+            title: "Background Loops",
+            status: status,
+            detail: detail,
+            repair: status == "ok" ? nil : "Open Doctor → background loops for the per-loop verdicts."
+        )
+    }
+
+    /// Live variant of `doctorCheck`, sharing `current`'s inputs.
+    static func doctorCheck(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        now: Date = Date()
+    ) async -> DoctorCheck {
+        let statuses = await BackgroundLoops.BackgroundLoopsManager.shared.status()
+        let receipts = recentFailureDates(
+            receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")
+        )
+        return doctorCheck(
+            observations: statuses.map(LoopHealthObservation.init(status:)),
+            recentFailureDates: receipts,
+            now: now
+        )
+    }
+
     /// Live snapshot for DoctorView: core manager states + receipts tail.
     static func current(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),

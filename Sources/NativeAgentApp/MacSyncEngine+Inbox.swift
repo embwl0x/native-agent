@@ -77,6 +77,54 @@ extension MacSyncEngine {
         }
     }
 
+    /// Refuse one inbox file: signed rejection to the peer, a `rejected` ledger
+    /// row, and the file archived so it is not retried. Extracted 2026-09-06 —
+    /// the Drive lane now refuses at two points (signature, then freshness once
+    /// the ledger has been consulted) and both refuse identically.
+    private func rejectInboxFile(
+        action: InboxAction,
+        fileURL: URL,
+        inboxDir: URL,
+        transactionId: String,
+        actionDigest: String?,
+        validationError: String
+    ) async {
+        syncError = "Rejected inbox message \(action.msgId): \(validationError)"
+        if validationError.contains("pairing secret unavailable") {
+            // Local authority is unavailable, so this is not evidence
+            // that the peer sent a bad action. Leave it untouched for
+            // exact retry after deliberate local repair.
+            return
+        }
+        guard await writeRejectedResponseIfNeeded(
+            action: action,
+            transactionId: transactionId,
+            message: validationError
+        ) else {
+            // Do not consume an invalid remote action unless its
+            // signed rejection durably exists for the peer to read.
+            return
+        }
+        await writeTransaction(
+            id: transactionId,
+            action: action.action,
+            state: "rejected",
+            attempts: 1,
+            error: validationError,
+            msgId: action.msgId,
+            actionDigest: actionDigest
+        )
+        // Still mark as processed so a replayed/tampered file isn't retried.
+        recordProcessed(action.msgId)  // fix-R9-9
+        saveProcessedIds()
+        // PATCH-2026-05-08: fix-A.3 Use .done suffix so the file is no longer
+        // matched by the `.json` filter on next query update or restart.
+        let archiveURL = inboxDir.appendingPathComponent("rejected_\(fileURL.lastPathComponent).done")
+        await Task.detached(priority: .utility) { [fileURL, archiveURL] in
+            try? FileManager.default.moveItem(at: fileURL, to: archiveURL)
+        }.value
+    }
+
     private func processInboxFiles() async {
         guard let inboxDir, let responsesDir else { return }
         if inboxProcessingInFlight {
@@ -236,38 +284,182 @@ extension MacSyncEngine {
                 continue
             }
             let transactionId = ids.transactionID
-            await writeTransaction(id: transactionId, action: action.action, state: "received", attempts: 1)
+            let actionDigest = Self.inboxActionDigest(envelope: data)
 
-            // C.1: Validate HMAC signature + timestamp freshness before dispatching.
-            if let validationError = await validateInboxAction(data: data, action: action) {
-                syncError = "Rejected inbox message \(action.msgId): \(validationError)"
-                if validationError.contains("pairing secret unavailable") {
-                    // Local authority is unavailable, so this is not evidence
-                    // that the peer sent a bad action. Leave it untouched for
-                    // exact retry after deliberate local repair.
-                    continue
-                }
-                guard await writeRejectedResponseIfNeeded(
+            // C.1: Validate the HMAC signature before dispatching.
+            // 2026-09-06: freshness NO LONGER runs here. Authenticity has to
+            // come first — anything on the account can drop a file in this
+            // folder — but an action whose response was lost and which arrives
+            // again beyond the ±5-minute window is a REDELIVERY, and rejecting
+            // it here meant its completed ledger row was never consulted and
+            // the phone was told the command failed when it had run. Freshness
+            // moves below the ledger, where it gates new work only.
+            if let validationError = await validateInboxAction(
+                data: data,
+                action: action,
+                enforceFreshness: false
+            ) {
+                await rejectInboxFile(
                     action: action,
+                    fileURL: fileURL,
+                    inboxDir: inboxDir,
                     transactionId: transactionId,
-                    message: validationError
+                    actionDigest: actionDigest,
+                    validationError: validationError
+                )
+                continue
+            }
+
+            // 2026-09-06: the same guarantee the CloudKit lane got this week.
+            // Placed AFTER the signature check, unlike that lane's: a CloudKit
+            // envelope arrived through a verified channel, while anything that
+            // can write to the iCloud Drive folder can drop a file here, and
+            // only a SIGNED envelope may be answered with a stored result.
+            // Freshness is deliberately below this block, not above it.
+            // The `pending_` rename claims a file, but a file is not a command:
+            // iCloud can re-materialise `<msgId>.json` after the claim, and
+            // `processedMsgIds` is only written AFTER execution — so a
+            // redelivery following a crash mid-dispatch re-ran a non-idempotent
+            // action. The ledger's "running" row is the durable "this already
+            // began executing" marker, so consult it before doing anything with
+            // this envelope.
+            var priorTransaction: ICloudTransactionRecord?
+            var alreadyExecuted = false
+            // Set when this envelope cannot be shown to be fresh work. Such an
+            // action is NEVER executed and NEVER served another action's
+            // result — it gets a signed, honest outcome instead.
+            var ledgerRefusal: (code: String, message: String)?
+            switch await readTransaction(id: transactionId) {
+            case .absent:
+                break
+            case .unreadable:
+                // Unreadable is not absent: a row may exist and we cannot tell
+                // what it says, so the outcome is unknown and an unknown
+                // outcome is never re-executed.
+                ledgerRefusal = (
+                    "unknown_outcome",
+                    "Mac could not read the durable record for this command, so it was not run again."
+                )
+            case .present(let record):
+                guard Self.inboxLedgerRow(
+                    record,
+                    matchesMsgId: action.msgId,
+                    digest: actionDigest,
+                    action: action.action
                 ) else {
-                    // Do not consume an invalid remote action unless its
-                    // signed rejection durably exists for the peer to read.
+                    // `transactionId` comes from the phone and only DEFAULTS to
+                    // msgId, so two unrelated actions can collide on it. A
+                    // colliding envelope is new work, not a redelivery.
+                    ledgerRefusal = (
+                        "transaction_id_collision",
+                        "This command carries a transaction id that already belongs to a different command, so it was refused rather than answered with that command's result."
+                    )
+                    break
+                }
+                priorTransaction = record
+                alreadyExecuted = Self.inboxActionDidExecute(record.state)
+            }
+
+            // 2026-09-06: freshness, at last — and only for work that has not
+            // already run. A signed envelope whose ledger row says it executed
+            // is answered from that row however old the redelivery is; a signed
+            // envelope with no such row is new work, and new work still has to
+            // arrive inside the ±5-minute window.
+            if ledgerRefusal == nil, !alreadyExecuted,
+               let staleError = inboxActionFreshnessError(action) {
+                await rejectInboxFile(
+                    action: action,
+                    fileURL: fileURL,
+                    inboxDir: inboxDir,
+                    transactionId: transactionId,
+                    actionDigest: actionDigest,
+                    validationError: staleError
+                )
+                continue
+            }
+
+            if ledgerRefusal != nil || alreadyExecuted {
+                // Answer, never redispatch. A refusal deliberately writes no
+                // ledger row: whatever is there belongs to the run we could not
+                // read, or to the other action holding this id.
+                let response: [String: String]
+                if let retained = priorTransaction?.response, ledgerRefusal == nil {
+                    // Already signed when the action completed; re-signing it
+                    // would change nothing and could fail on a missing secret.
+                    response = retained
+                } else {
+                    let body: [String: String] = ledgerRefusal.map { refusal in
+                        [
+                            "status": "error",
+                            "ok": "false",
+                            "code": refusal.code,
+                            "message": refusal.message,
+                            "msgId": action.msgId,
+                            "transactionId": transactionId,
+                            "action": action.action,
+                        ]
+                    } ?? [
+                        // Executed, but its outcome was never signed — the same
+                        // wording the stale-pending sweep uses.
+                        "status": "error",
+                        "ok": "false",
+                        "message": "Mac could not confirm whether this command completed, so it was not retried automatically.",
+                        "msgId": action.msgId,
+                        "transactionId": transactionId,
+                        "action": action.action,
+                    ]
+                    guard let signed = try? signedResponse(body) else {
+                        syncError = "Pairing secret unavailable; iCloud command \(action.msgId) remains unanswered."
+                        continue
+                    }
+                    response = signed
+                }
+                guard let responseURL = InboxActionFileBoundary.jsonURL(
+                    in: responsesDir,
+                    validatedID: ids.messageID
+                ), await writeInboxResponse(response, to: responseURL) else {
+                    syncError = "Could not write iCloud response for redelivered command \(action.msgId); left in place for retry."
                     continue
                 }
-                await writeTransaction(id: transactionId, action: action.action, state: "rejected", attempts: 1, error: validationError)
-                // Still mark as processed so a replayed/tampered file isn't retried.
-                recordProcessed(action.msgId)  // fix-R9-9
-                saveProcessedIds()
-                // PATCH-2026-05-08: fix-A.3 Use .done suffix so the file is no longer
-                // matched by the `.json` filter on next query update or restart.
-                let archiveURL = inboxDir.appendingPathComponent("rejected_\(fileURL.lastPathComponent).done")
+                if ledgerRefusal == nil, priorTransaction?.response == nil {
+                    await writeTransaction(
+                        id: transactionId,
+                        action: action.action,
+                        state: "unknown",
+                        attempts: 1,
+                        error: response["message"],
+                        response: response,
+                        msgId: action.msgId,
+                        actionDigest: actionDigest
+                    )
+                }
+                let redeliveredMsgId = action.msgId
+                _ = await withCKTimeout("MacSyncEngine.processInboxFiles.redeliveredResponseKVS") {
+                    let kvs = NSUbiquitousKeyValueStore.default
+                    kvs.set(redeliveredMsgId, forKey: "inbox_response_\(redeliveredMsgId)")
+                    return kvs.synchronize()
+                }
+                // Only an action whose outcome IS known is closed out here; a
+                // refusal leaves no processed id, because nothing ran.
+                if ledgerRefusal == nil {
+                    recordProcessed(action.msgId)
+                    saveProcessedIds()
+                }
+                let archiveURL = inboxDir.appendingPathComponent("processed_\(fileURL.lastPathComponent).done")
                 await Task.detached(priority: .utility) { [fileURL, archiveURL] in
                     try? FileManager.default.moveItem(at: fileURL, to: archiveURL)
                 }.value
                 continue
             }
+
+            await writeTransaction(
+                id: transactionId,
+                action: action.action,
+                state: "received",
+                attempts: 1,
+                msgId: action.msgId,
+                actionDigest: actionDigest
+            )
 
             // The body may treat this as peer-presence evidence only after the
             // action's HMAC and timestamp have passed validation. Token and
@@ -297,7 +489,29 @@ extension MacSyncEngine {
             }
 
             // Dispatch to the in-process Swift runtime.
-            await writeTransaction(id: transactionId, action: action.action, state: "running", attempts: 1)
+            //
+            // 2026-09-06: the reservation is CHECKED, like the CloudKit lane's.
+            // This row is what the redelivery check above reads, and it was
+            // fire-and-forget — an encode, coordination or disk failure left no
+            // row and the lane dispatched anyway, so a redelivered envelope
+            // read as fresh work and ran the action twice. If it does not land,
+            // do not execute: touch the pending file so the stale sweep answers
+            // the phone honestly, and leave the command alone. Sits immediately
+            // before `dispatchAction` with no await between them on purpose.
+            guard await writeTransaction(
+                id: transactionId,
+                action: action.action,
+                state: "running",
+                attempts: 1,
+                msgId: action.msgId,
+                actionDigest: actionDigest
+            ) else {
+                syncError = "Could not reserve iCloud command \(action.msgId) durably; it was not run and remains pending."
+                await Task.detached(priority: .utility) { [pendingURL] in
+                    try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: pendingURL.path)
+                }.value
+                continue
+            }
             var responseBody = await dispatchAction(action)
             responseBody["msgId"] = action.msgId
             responseBody["transactionId"] = transactionId
@@ -420,11 +634,20 @@ extension MacSyncEngine {
             return false
         }
         for attempt in 1...2 {
-            // Writing to iCloud Drive may block — do it off the main actor.
-            await Task.detached(priority: .utility) { [responseURL, responseData] in
-                Self.coordinatedWrite(data: responseData, to: responseURL)
+            // 2026-09-06: check the write, then READ THE FILE BACK AND DECODE
+            // it. `fileExists` passed for a zero-length or half-written file —
+            // a phone that reads one of those gets a decode failure and waits
+            // forever, which is exactly the outcome this function exists to
+            // prevent. Only a response that decodes back into the same keys is
+            // a landed response.
+            let landed = await Task.detached(priority: .utility) { [responseURL, responseData] () -> Bool in
+                guard Self.coordinatedWrite(data: responseData, to: responseURL) else { return false }
+                guard let readBack = Self.coordinatedRead(at: responseURL),
+                      let decoded = try? JSONDecoder().decode([String: String].self, from: readBack)
+                else { return false }
+                return decoded == response
             }.value
-            if FileManager.default.fileExists(atPath: responseURL.path) { return true }
+            if landed { return true }
             NSLog("MacSyncEngine.writeInboxResponse: attempt %d did not land %@",
                   attempt, responseURL.lastPathComponent)
         }
@@ -455,14 +678,28 @@ extension MacSyncEngine {
                 validatedID: ids.messageID
               ) else { return false }
 
+        let transactionId = ids.transactionID
+        let actionDigest = Self.inboxActionDigest(envelope: data)
+
         // A prior attempt may have executed successfully but lost its CloudKit
         // response send. Re-send the durable signed response; never redispatch.
         if processedMsgIds.contains(action.msgId) {
             let responseTask = Task<[String: String]?, Never>.detached(priority: .utility) {
-                guard let data = try? Data(contentsOf: responseURL) else { return nil }
+                guard case .data(let data) = Self.coordinatedReadOutcome(at: responseURL) else { return nil }
                 return try? JSONDecoder().decode([String: String].self, from: data)
             }
-            guard let response = await responseTask.value else {
+            var resolved = await responseTask.value
+            if resolved == nil,
+               case .present(let record) = await readTransaction(id: transactionId),
+               Self.inboxLedgerRow(record, matchesMsgId: action.msgId, digest: actionDigest, action: action.action),
+               let retained = record.response {
+                // 2026-09-06: the response file is missing or does not decode.
+                // The ledger kept a copy of the same signed response when the
+                // action completed, so it — not the file — is authoritative
+                // here. Without this the phone got nothing at all.
+                resolved = retained
+            }
+            guard let response = resolved else {
                 return false
             }
             do {
@@ -474,17 +711,113 @@ extension MacSyncEngine {
             }
         }
 
-        let transactionId = ids.transactionID
-        await writeTransaction(
-            id: transactionId,
-            action: action.action,
-            state: "received",
-            attempts: 1
-        )
+        // 2026-09-06: processedMsgIds is only written AFTER execution, so a
+        // CloudKit redelivery following a response-signing failure, a response
+        // write failure, or a crash re-ran the action — createDeskItem and
+        // appendDeskItemNote are not idempotent. The ledger records "running"
+        // before dispatch, so consult it first: an action that already began
+        // executing gets its stored response resent, never a second run.
+        var priorTransaction: ICloudTransactionRecord?
+        var alreadyExecuted = false
+        // Set when we cannot prove this envelope is fresh work. Such an action
+        // is NEVER executed and NEVER served another action's result: it gets a
+        // signed, honest outcome and nothing in the ledger is overwritten.
+        var refusal: (code: String, message: String)?
+        switch await readTransaction(id: transactionId) {
+        case .absent:
+            break
+        case .unreadable:
+            // 2026-09-06: absence and unreadability used to collapse into the
+            // same nil, so a corrupt or unreadable ledger row read as "fresh
+            // work" and the action ran a second time. Unreadable means the
+            // outcome is unknown, and an unknown outcome is not re-executed.
+            refusal = (
+                "unknown_outcome",
+                "Mac could not read the durable record for this command, so it was not run again."
+            )
+        case .present(let record):
+            guard Self.inboxLedgerRow(record, matchesMsgId: action.msgId, digest: actionDigest, action: action.action) else {
+                // 2026-09-06: `transactionId` comes from the phone and only
+                // DEFAULTS to msgId, so two unrelated actions can collide on it.
+                // A colliding envelope is a new action, not a redelivery — it is
+                // refused, never answered with the other action's response.
+                refusal = (
+                    "transaction_id_collision",
+                    "This command carries a transaction id that already belongs to a different command, so it was refused rather than answered with that command's result."
+                )
+                break
+            }
+            priorTransaction = record
+            alreadyExecuted = Self.inboxActionDidExecute(record.state)
+        }
+
+        if let refusal {
+            guard let signed = try? signedResponse([
+                "status": "error",
+                "ok": "false",
+                "code": refusal.code,
+                "message": refusal.message,
+                "msgId": action.msgId,
+                "transactionId": transactionId,
+                "action": action.action,
+            ]) else {
+                syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
+                return false
+            }
+            // Deliberately no ledger write and no response file: whatever is at
+            // either path belongs to the run we could not read, or to the other
+            // action holding this id, and must not be clobbered.
+            do {
+                try await sendCloudKitActionResponse(signed, correlationID: action.msgId)
+                return true
+            } catch {
+                syncError = "Could not send CloudKit action refusal \(action.msgId): \(error.localizedDescription)"
+                return false
+            }
+        }
+
+        if !alreadyExecuted {
+            await writeTransaction(
+                id: transactionId,
+                action: action.action,
+                state: "received",
+                attempts: 1,
+                msgId: action.msgId,
+                actionDigest: actionDigest
+            )
+        }
 
         let response: [String: String]
         let inboundActionVerified: Bool
-        if let validationError = await validateInboxAction(data: data, action: action) {
+        if alreadyExecuted, let priorTransaction {
+            inboundActionVerified = false
+            if let storedResponse = priorTransaction.response {
+                response = storedResponse
+            } else {
+                // Executed, but its outcome was never signed. Same wording the
+                // Drive lane's stale-pending sweep uses.
+                guard let signed = try? signedResponse([
+                    "status": "error",
+                    "ok": "false",
+                    "message": "Mac could not confirm whether this command completed, so it was not retried automatically.",
+                    "msgId": action.msgId,
+                    "transactionId": transactionId,
+                    "action": action.action,
+                ]) else {
+                    syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
+                    return false
+                }
+                response = signed
+                await writeTransaction(
+                    id: transactionId,
+                    action: action.action,
+                    state: "unknown",
+                    attempts: 1,
+                    error: response["message"],
+                    response: response
+                )
+            }
+        } else if let validationError = await validateInboxAction(data: data, action: action) {
             inboundActionVerified = false
             if validationError.contains("pairing secret unavailable") {
                 syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
@@ -526,12 +859,33 @@ extension MacSyncEngine {
                           action.msgId, error.localizedDescription)
                 }
             }
-            await writeTransaction(
+            // 2026-09-06: the reservation is CHECKED. This write is the only
+            // thing standing between a lost response and a second execution of
+            // a non-idempotent action, and it used to be fire-and-forget — an
+            // encode, coordination or disk failure left no row and the lane
+            // dispatched anyway. If it does not land, do not execute: return a
+            // retriable transport failure so CloudKit redelivers the action
+            // later, when the ledger is writable again.
+            //
+            // 2026-09-06: this write sits IMMEDIATELY before `dispatchAction`
+            // with no await between them on purpose. The crash window it leaves
+            // — a stale "running" row whose action never ran — is now a crash
+            // inside these few synchronous lines, and for that window "Mac
+            // could not confirm whether this command completed" is the honest
+            // answer. Deliberately NOT closed with a timeout-based
+            // re-execution: re-running a non-idempotent action on a guess is
+            // the worse failure.
+            guard await writeTransaction(
                 id: transactionId,
                 action: action.action,
                 state: "running",
-                attempts: 1
-            )
+                attempts: 1,
+                msgId: action.msgId,
+                actionDigest: actionDigest
+            ) else {
+                syncError = "Could not reserve CloudKit action \(action.msgId) durably; it was not run and remains unacknowledged."
+                return false
+            }
             var body = await dispatchAction(action)
             body["msgId"] = action.msgId
             body["transactionId"] = transactionId
@@ -612,8 +966,8 @@ extension MacSyncEngine {
 
     private func dispatchAction(_ action: InboxAction) async -> [String: String] {
         let router = MacSyncActionRouter(
-            cancelChatTask: { [weak self] sessionId in
-                self?.cancelActiveChatTask(for: sessionId) ?? false
+            cancelChatTask: { [weak self] sessionId, runIDs in
+                self?.cancelActiveChatTask(for: sessionId, runIDs: runIDs) ?? .noActiveTask
             }
         )
         return await router.dispatch(action)

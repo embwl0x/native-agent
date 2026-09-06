@@ -229,12 +229,43 @@ public protocol MemoryStorageProtocol: Sendable {
     ) async throws
     func getProposal(id: String) async throws -> ProposalRecord?
     func acceptProposal(id: String) async throws -> MemoryRecord
+    func acceptReviewedMoment(id: String, review: ReviewedMomentAcceptance) async throws -> MemoryRecord
     func updateProposalStatus(id: String, status: String, rejectionReason: String?) async throws
     /// 2026-07-21 audit fix: metadata merge target for propose()'s
     /// pending-proposal content-hash dedup. Pending-only semantics — a
     /// resolved proposal must never have its metadata rewritten.
     func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> ProposalRecord
     func listProposals(status: String?) async throws -> [ProposalRecord]
+}
+
+/// Optional storage capability: stage a proposal with the pending-dedup match,
+/// merge and insert done under ONE storage write lock (User, 2026-09-06 — the
+/// read-merge-write in `propose` lost evidence and double-inserted when two
+/// observations of the same fact raced). Kept OFF `MemoryStorageProtocol`, like
+/// the other refinements, so lightweight fixtures keep the old path.
+public protocol AtomicProposalStagingStorage: MemoryStorageProtocol {
+    /// Returns the merged existing proposal, the freshly inserted one, or nil
+    /// when nothing matched and `insertIfAbsent` was false.
+    func stagePendingProposal(
+        _ proposal: ProposalRecord,
+        embedding: [Float]?,
+        embeddingEpoch: MemoryEmbeddingEpoch?,
+        insertIfAbsent: Bool,
+        foldedKey: @Sendable (String) -> String,
+        merge: @Sendable (ProposalRecord) -> JSONValue?
+    ) async throws -> ProposalRecord?
+}
+
+/// Optional storage capability: COUNT the moments lane without materializing
+/// it. The per-turn nudge line needs one number, and `listProposals` is
+/// `SELECT *` + a full row decode + a Swift-side JSON filter — a real per-turn
+/// cost for a scalar. Kept as a refinement (not a `MemoryStorageProtocol`
+/// requirement) so lightweight fixtures stay minimal; callers fall back to the
+/// list path when a storage seam does not implement it.
+public protocol MomentProposalCountingStorage: MemoryStorageProtocol {
+    /// Proposals in the moments lane, optionally scoped to one status
+    /// ("pending"/"accepted"/"rejected"); nil counts every status.
+    func countMomentProposals(status: String?) async throws -> Int
 }
 
 /// Optional storage capability for hybrid memory retrieval. Kept separate from
@@ -255,6 +286,16 @@ public protocol HybridMemoryStorageProtocol: MemoryStorageProtocol {
         topK: Int,
         persona: String?
     ) async throws -> [ScoredMemoryRecord]
+    /// 2026-09-06: the same recall, plus whether it degraded to the keyword
+    /// lane. That decision is made inside storage, below the layer that owns
+    /// provenance, so without this the hits went out labelled as semantic ones.
+    func recallReportingKeywordFallback(
+        embedding: [Float],
+        embeddingEpoch: MemoryEmbeddingEpoch?,
+        queryText: String,
+        topK: Int,
+        persona: String?
+    ) async throws -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool)
 }
 
 /// Optional storage capability: lexical-only recall for when no usable query
@@ -277,6 +318,10 @@ protocol MemoryRecordLookupStorage: MemoryStorageProtocol {
 }
 
 public extension MemoryStorageProtocol {
+    func acceptReviewedMoment(id: String, review: ReviewedMomentAcceptance) async throws -> MemoryRecord {
+        throw MemoryV2Error.underlying("storage does not support atomic moment review")
+    }
+
     func insert(
         record: MemoryRecord,
         embedding: [Float]?,
@@ -371,6 +416,23 @@ public extension HybridMemoryStorageProtocol {
             persona: persona
         )
     }
+
+    /// Default: a storage with no lexical lane can never degrade into one.
+    func recallReportingKeywordFallback(
+        embedding: [Float],
+        embeddingEpoch: MemoryEmbeddingEpoch?,
+        queryText: String,
+        topK: Int,
+        persona: String?
+    ) async throws -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool) {
+        (try await recall(
+            embedding: embedding,
+            embeddingEpoch: embeddingEpoch,
+            queryText: queryText,
+            topK: topK,
+            persona: persona
+        ), false)
+    }
 }
 
 // MARK: - SwiftNativeMemoryV2 — Phase B method surface
@@ -390,7 +452,19 @@ extension SwiftNativeMemoryV2 {
     /// Engine in production), then ask `MemoryStorage` for the top-K nearest
     /// records by cosine. Hits are sorted by score descending; `total` reflects
     /// how many records the storage layer returned (≤ topK).
-    public func recall(_ query: MemoryV2RecallRequest) async throws -> MemoryV2RecallResponse {
+    ///
+    /// User, 2026-09-06: `recordingUsage` false suppresses the access bump below
+    /// for callers that RETRIEVE more than they DELIVER — the Mac memory
+    /// search asks for 50 rows on every keystroke pause and shows whatever
+    /// subset it can map, so crediting the recall set made browsing your own
+    /// store look like the agent using every row in it, and use_count is the
+    /// signal that vetoes eviction. Those callers report what they actually
+    /// delivered with `recordRecallHits(ids:)`. Default true: every existing
+    /// caller behaves exactly as before.
+    public func recall(
+        _ query: MemoryV2RecallRequest,
+        recordingUsage: Bool = true
+    ) async throws -> MemoryV2RecallResponse {
         guard !query.text.isEmpty else { throw MemoryV2Error.invalidQuery }
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try Task.checkCancellation()
@@ -429,53 +503,133 @@ extension SwiftNativeMemoryV2 {
         let storageTopK = (query.surface != nil || query.persona != nil)
             ? min(memoryStoredRowCap, max(topK, topK * 8))
             : topK
-        let scored: [ScoredMemoryRecord]
         var usedKeywordFallback = false
+        // Immutable copies for the retrieval closure below: a nested async
+        // function that captured the mutable locals directly is a data-race
+        // error under strict concurrency.
+        let resolvedQueryEmbedding = queryEmbedding
+        let resolvedEmbedFailure = embedFailure
         // A vector of all zeros is what a not-yet-warm embedder returns; it has
         // no direction, so cosine recall would return [] just as surely as a
         // thrown error would.
         let hasUsableVector = !qvec.isEmpty && qvec.contains { $0 != 0 && $0.isFinite }
-        if let queryEmbedding, hasUsableVector {
-            if let hybrid = storage as? any HybridMemoryStorageProtocol {
-                scored = try await hybrid.recall(
-                    embedding: qvec,
-                    embeddingEpoch: queryEmbedding.epoch,
-                    queryText: query.text,
-                    topK: storageTopK,
-                    persona: query.persona
-                )
-            } else {
-                scored = try await storage.recall(
-                    embedding: qvec,
-                    embeddingEpoch: queryEmbedding.epoch,
-                    topK: storageTopK,
-                    persona: query.persona
-                )
-            }
-        } else if let keywordStorage = storage as? any KeywordRecallStorageProtocol {
-            usedKeywordFallback = true
-            FileHandle.standardError.write(Data(
-                ("MemoryV2: query embedding unavailable"
-                 + (embedFailure.map { " (\($0))" } ?? "")
-                 + " — falling back to keyword recall\n").utf8
-            ))
-            scored = try await keywordStorage.recallByKeyword(
-                queryText: query.text,
-                topK: storageTopK,
-                persona: query.persona
+        // The same question in the other voice ("me" → the agent's name,
+        // "you" → the user's), asked alongside the original; a row keeps the
+        // better of its two scores. See MemoryRecallQueryExpansion.
+        let storeDirectory = await (storage as? MemoryStorageBridge)?.path.deletingLastPathComponent()
+        let rewritten = storeDirectory.flatMap { directory in
+            MemoryRecallQueryExpansion.rewrite(
+                query.text,
+                names: MemoryRecallQueryExpansion.names(storeDirectory: directory)
             )
-        } else if let embedFailure {
-            // No embedding AND no lexical lane: nothing honest to return.
-            throw embedFailure
+        }
+        // The other voice costs ONE embedder round-trip per recall, not one
+        // per pass (User, 2026-09-06): computing it inside `retrieve` meant the
+        // refill below asked the Neural Engine for the same rewritten question
+        // a second time, on the exact turns where recall was already short.
+        let rewrittenEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?
+        if let rewritten, resolvedQueryEmbedding != nil, hasUsableVector {
+            rewrittenEmbedding = try? await embedOneWithEpoch(rewritten)
         } else {
-            scored = []
+            rewrittenEmbedding = nil
         }
         try Task.checkCancellation()
-        let disclosed = scored.filter { scoredRecord in
-            guard let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record) else {
-                return false
+        // One retrieval at a given candidate-window size. Hoisted out of the
+        // straight-line code (User, 2026-09-06) purely so the refill below can
+        // re-ask the same lane wider; the lane selection itself is unchanged.
+        func retrieve(
+            _ window: Int, loggingKeywordFallback: Bool
+        ) async throws -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool) {
+            if let queryEmbedding = resolvedQueryEmbedding, hasUsableVector {
+                var keywordFallback = false
+                // 2026-09-06: storage degrades to the keyword lane on its own when
+                // the query vector's epoch does not match the corpus. It reports
+                // that, and the caller raises `usedKeywordFallback`, so `source`,
+                // `search_kg` and the dense-lane starvation alarm all describe the
+                // lane that actually answered.
+                func dense(
+                    _ text: String, _ vector: [Float], _ epoch: MemoryEmbeddingEpoch
+                ) async throws -> (hits: [ScoredMemoryRecord], usedKeywordFallback: Bool) {
+                    if let hybrid = storage as? any HybridMemoryStorageProtocol {
+                        return try await hybrid.recallReportingKeywordFallback(
+                            embedding: vector,
+                            embeddingEpoch: epoch,
+                            queryText: text,
+                            topK: window,
+                            persona: query.persona
+                        )
+                    }
+                    return (try await storage.recall(
+                        embedding: vector,
+                        embeddingEpoch: epoch,
+                        topK: window,
+                        persona: query.persona
+                    ), false)
+                }
+                let written = try await dense(query.text, qvec, queryEmbedding.epoch)
+                if written.usedKeywordFallback { keywordFallback = true }
+                var merged = written.hits
+                if let rewritten,
+                   let other = rewrittenEmbedding,
+                   other.vector.contains(where: { $0 != 0 && $0.isFinite }) {
+                    try Task.checkCancellation()
+                    let expanded = try await dense(rewritten, other.vector, other.epoch)
+                    if expanded.usedKeywordFallback { keywordFallback = true }
+                    var best: [String: ScoredMemoryRecord] = [:]
+                    for hit in merged + expanded.hits {
+                        if let existing = best[hit.record.id], existing.score >= hit.score { continue }
+                        best[hit.record.id] = hit
+                    }
+                    merged = Array(best.values)
+                }
+                return (merged, keywordFallback)
+            } else if let keywordStorage = storage as? any KeywordRecallStorageProtocol {
+                if loggingKeywordFallback {
+                    FileHandle.standardError.write(Data(
+                        ("MemoryV2: query embedding unavailable"
+                         + (resolvedEmbedFailure.map { " (\($0))" } ?? "")
+                         + " — falling back to keyword recall\n").utf8
+                    ))
+                }
+                return (try await keywordStorage.recallByKeyword(
+                    queryText: rewritten.map { query.text + " " + $0 } ?? query.text,
+                    topK: window,
+                    persona: query.persona
+                ), true)
+            } else if let resolvedEmbedFailure {
+                // No embedding AND no lexical lane: nothing honest to return.
+                throw resolvedEmbedFailure
+            } else {
+                return ([], false)
             }
-            return classification.permits(surface: query.surface, personaID: query.persona)
+        }
+        func disclosedRows(_ rows: [ScoredMemoryRecord]) -> [ScoredMemoryRecord] {
+            rows.filter { scoredRecord in
+                guard let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record) else {
+                    return false
+                }
+                return classification.permits(surface: query.surface, personaID: query.persona)
+            }
+        }
+        var retrieved = try await retrieve(storageTopK, loggingKeywordFallback: true)
+        usedKeywordFallback = retrieved.usedKeywordFallback
+        var scored = retrieved.hits
+        try Task.checkCancellation()
+        var disclosed = disclosedRows(scored)
+        // User, 2026-09-06: the ×8 window is a heuristic, not a guarantee. When
+        // the rows this surface may not see are also the top scorers, a
+        // saturated window can come back with fewer eligible rows than the
+        // caller asked for — or none — and recall reported an empty store to a
+        // surface whose own memories were sitting below the cut. The whole
+        // table is capped at `memoryStoredRowCap`, so one re-ask at the cap
+        // exhausts the candidate set; it only runs when the window came back
+        // full AND still short.
+        if disclosed.count < topK, scored.count >= storageTopK, storageTopK < memoryStoredRowCap {
+            retrieved = try await retrieve(memoryStoredRowCap, loggingKeywordFallback: false)
+            usedKeywordFallback = usedKeywordFallback || retrieved.usedKeywordFallback
+            scored = retrieved.hits
+            try Task.checkCancellation()
+            disclosed = disclosedRows(scored)
         }
         // storageTopK is a wider disclosure candidate window, not the result
         // budget. Reapply the existing skill-hint share AFTER disclosure at
@@ -513,7 +667,7 @@ extension SwiftNativeMemoryV2 {
         // signal that stops archiveStale from evicting hot-but-never-merged
         // memories as "unused" (#0).
         try Task.checkCancellation()
-        let usedIds = sorted.map { $0.record.id }
+        let usedIds = recordingUsage ? sorted.map { $0.record.id } : []
         if !usedIds.isEmpty {
             let storageRef = storage
             Task {
@@ -563,6 +717,16 @@ extension SwiftNativeMemoryV2 {
             if let value = sr.record.validFrom { extras["valid_from"] = .string(value) }
             if let value = sr.record.validTo { extras["valid_to"] = .string(value) }
             if let value = sr.record.observedAt { extras["observed_at"] = .string(value) }
+            // How the fact came to be known (commit_memory's `provenance` /
+            // `provenance_by`). Carried verbatim so recall can tell "I checked
+            // this" from "someone told me"; absent on rows written before it.
+            if case .object(let metadata)? = sr.record.extras {
+                for key in ["provenance", "provenance_by"] {
+                    if case .string(let value)? = metadata[key], !value.isEmpty {
+                        extras[key] = .string(value)
+                    }
+                }
+            }
             return MemoryRecallHit(
                 score: sr.score,
                 sessionId: sr.record.sourceRunId,
@@ -946,7 +1110,17 @@ extension SwiftNativeMemoryV2 {
             // Caller-provided kinds pass through verbatim; absent a signal,
             // the semantics-neutral default ("general", decayFactor 1.0,
             // no supersession) is stamped. See MemoryKindStamp.
-            extras: MemoryKindStamp.stampingDefaultKind(metadata)
+            // Item 5 follow-up (2026-09-02): if her own words point at a
+            // moment, the atom carries it. Deterministic, silent when
+            // ambiguous, and never overwriting a caller's own `due_at` — see
+            // MemoryV2+DueDateStamp.swift. This is what gives the forward
+            // register a source for "the user's stated plans"; without it a
+            // spoken "tomorrow around nine" was durable prose she could recall
+            // and nothing she could look toward.
+            extras: MemoryDueDateStamp.stamping(
+                MemoryKindStamp.stampingDefaultKind(metadata),
+                text: content
+            )
         )
         let inserted = try await storage.insert(
             record: record,
@@ -972,7 +1146,13 @@ extension SwiftNativeMemoryV2 {
         confidence: Double? = nil,
         kind: String? = nil,
         supportingSessionIDs: [String] = [],
-        recurrenceCount: Int? = nil
+        recurrenceCount: Int? = nil,
+        // Lane-specific metadata the caller owns (the moments lane's
+        // lane/valence/salience/quote/session/surface/author). Merged UNDER the
+        // typed fields above so no caller can overwrite confidence/kind through
+        // the side door. Empty (the default) is byte-identical to the previous
+        // behavior on both the fresh-insert and the dedup-merge path.
+        extraMetadata: [String: JSONValue] = [:]
     ) async throws -> ProposalRecord {
         let content = MemoryTextClip.memoryDisplayText(content, kind: kind)
         guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
@@ -1002,7 +1182,7 @@ extension SwiftNativeMemoryV2 {
         // LOCAL to this comparison — both sides are folded at compare time
         // and no folded hash is ever stored, so stored contentHash uses
         // (KG memory index, kind backfill) are untouched.
-        func dedupKey(_ s: String) -> String {
+        let dedupKey: @Sendable (String) -> String = { s in
             let folded = s.replacingOccurrences(
                 of: #"(?i)\b(?:a|an|the)\s+"#,
                 with: "",
@@ -1010,9 +1190,10 @@ extension SwiftNativeMemoryV2 {
             )
             return MemoryStorage.contentHash(folded)
         }
-        let newContentHash = dedupKey(content)
-        if let existing = try await storage.listProposals(status: "pending")
-            .first(where: { dedupKey($0.content) == newContentHash }) {
+        // The evidence merge, lifted out of the old inline branch so BOTH the
+        // atomic staging path and the legacy fallback below apply exactly the
+        // same rules to the row they found.
+        let mergedMetadata: @Sendable (ProposalRecord) -> JSONValue? = { existing in
             var merged: [String: JSONValue]
             if case .object(let m)? = existing.metadata { merged = m } else { merged = [:] }
             var sessionSet = Set<String>()
@@ -1047,12 +1228,14 @@ extension SwiftNativeMemoryV2 {
             if merged["kind"] == nil, let kind, !kind.isEmpty {
                 merged["kind"] = .string(kind)
             }
-            return try await storage.updateProposalMetadata(
-                id: existing.id,
-                metadata: merged.isEmpty ? nil : .object(merged)
-            )
+            // A re-staged moment refreshes its lane fields on the surviving
+            // row: the newest telling is the one she will read.
+            for (key, value) in extraMetadata where key != "kind" {
+                merged[key] = value
+            }
+            return merged.isEmpty ? nil : .object(merged)
         }
-        var meta: [String: JSONValue] = [:]
+        var meta: [String: JSONValue] = extraMetadata
         if let confidence { meta["confidence"] = .double(confidence) }
         if let kind, !kind.isEmpty { meta["kind"] = .string(kind) }
         if !sessions.isEmpty {
@@ -1069,6 +1252,47 @@ extension SwiftNativeMemoryV2 {
             createdAt: Self.iso8601Now(),
             metadata: meta.isEmpty ? nil : .object(meta)
         )
+
+        // User, 2026-09-06: match + merge (or insert) under ONE storage write
+        // lock where the store supports it. The list → merge-in-Swift →
+        // unconditional-overwrite shape below loses a concurrent observation's
+        // evidence, and two observers who both miss the pending row both
+        // insert. Pass one asks for a merge WITHOUT insert so no embedding work
+        // happens on the repeat-observation path; pass two embeds and inserts,
+        // re-checking for a row that appeared in between and merging into it.
+        if let atomic = storage as? AtomicProposalStagingStorage {
+            if let merged = try await atomic.stagePendingProposal(
+                proposal,
+                embedding: nil,
+                embeddingEpoch: nil,
+                insertIfAbsent: false,
+                foldedKey: dedupKey,
+                merge: mergedMetadata
+            ) {
+                return merged
+            }
+            let embedded = try await embedOneWithEpoch(content)
+            if let staged = try await atomic.stagePendingProposal(
+                proposal,
+                embedding: embedded.vector,
+                embeddingEpoch: embedded.epoch,
+                insertIfAbsent: true,
+                foldedKey: dedupKey,
+                merge: mergedMetadata
+            ) {
+                return staged
+            }
+            return proposal
+        }
+
+        let newContentHash = dedupKey(content)
+        if let existing = try await storage.listProposals(status: "pending")
+            .first(where: { dedupKey($0.content) == newContentHash }) {
+            return try await storage.updateProposalMetadata(
+                id: existing.id,
+                metadata: mergedMetadata(existing)
+            )
+        }
         let embedded = try await embedOneWithEpoch(content)
         try await storage.insertProposal(
             proposal,
@@ -1108,6 +1332,26 @@ extension SwiftNativeMemoryV2 {
         return accepted
     }
 
+    /// Prepare the final words before promotion. No active row or projection
+    /// exists until the storage transaction accepts this exact reviewed version.
+    public func acceptReviewedMoment(id: String, content: String) async throws -> MemoryRecord {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        guard let proposal = try await storage.getProposal(id: id),
+              proposal.status == "pending", MemoryMoments.isMoment(proposal.metadata) else {
+            throw MemoryV2Error.recordNotFound
+        }
+        if let reason = MemoryCandidateQuality.rejectionReason(
+            text: content, source: proposal.source, kind: Self.metadataKind(proposal.metadata)
+        ) { throw MemoryV2Error.underlying("not durable memory: \(reason)") }
+        let embedded = try await embedOneWithEpoch(content)
+        let accepted = try await storage.acceptReviewedMoment(id: id, review: ReviewedMomentAcceptance(
+            expectedContent: proposal.content, content: content,
+            embedding: embedded.vector, embeddingEpoch: embedded.epoch.rawValue
+        ))
+        await flushDerivedMemoryChanges()
+        return accepted
+    }
+
     @discardableResult
     public func rejectProposal(id: String, reason: String? = nil) async throws -> Bool {
         guard let storage else { throw MemoryV2Error.storageUnavailable }
@@ -1124,6 +1368,19 @@ extension SwiftNativeMemoryV2 {
     public func listProposals(status: String? = nil) async throws -> [ProposalRecord] {
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         return try await storage.listProposals(status: status)
+    }
+
+    /// Count the moments lane. Uses the storage-level scalar when the seam
+    /// offers one (production SQLite does) and falls back to the list path
+    /// otherwise, so the answer is identical either way — only the cost differs.
+    public func countMomentProposals(status: String? = "pending") async throws -> Int {
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        if let counting = storage as? any MomentProposalCountingStorage {
+            return try await counting.countMomentProposals(status: status)
+        }
+        return try await storage.listProposals(status: status)
+            .filter { MemoryMoments.isMoment($0.metadata) }
+            .count
     }
 
     // MARK: - utilities
@@ -1149,7 +1406,7 @@ extension SwiftNativeMemoryV2 {
 // A trivial in-memory `MemoryStorageProtocol` for tests and any callsite that
 // wants to exercise the actor before m1's SQLite-backed `MemoryStorage` lands.
 // NOT for production use.
-public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupStorage {
+public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupStorage, MomentProposalCountingStorage {
     private var records: [String: MemoryRecord] = [:]
     private var embeddings: [String: [Float]] = [:]
     private var personas: [String: String] = [:]
@@ -1272,6 +1529,28 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupSto
         proposals[id]
     }
 
+    public func acceptReviewedMoment(id: String, review: ReviewedMomentAcceptance) async throws -> MemoryRecord {
+        guard var proposal = proposals[id], proposal.status == "pending",
+              proposal.content == review.expectedContent, MemoryMoments.isMoment(proposal.metadata) else {
+            throw MemoryV2Error.recordNotFound
+        }
+        guard !tombstones.contains(Self.normalize(review.content)) else {
+            throw MemoryV2Error.underlying("tombstoned reviewed moment")
+        }
+        if let reason = MemoryCandidateQuality.rejectionReason(
+            text: review.content, source: proposal.source, kind: MemoryMoments.kind
+        ) { throw MemoryV2Error.underlying(reason) }
+        let now = ISO8601DateFormatter().string(from: Date())
+        let record = MemoryRecord(id: id, text: review.content, layer: "semantic",
+            memoryKind: MemoryMoments.kind, createdAt: now, updatedAt: now,
+            sourceRunId: proposal.source, status: "active")
+        records[id] = record
+        embeddings[id] = review.embedding
+        proposal.status = "accepted"
+        proposals[id] = proposal
+        return record
+    }
+
     public func acceptProposal(id: String) async throws -> MemoryRecord {
         guard var proposal = proposals[id] else { throw MemoryV2Error.recordNotFound }
         guard proposal.status == "pending" else {
@@ -1311,6 +1590,13 @@ public actor InMemoryMemoryStorage: MemoryStorageProtocol, MemoryRecordLookupSto
         p.metadata = metadata
         proposals[id] = p
         return p
+    }
+
+    public func countMomentProposals(status: String?) async throws -> Int {
+        proposals.values
+            .filter { status == nil || $0.status == status }
+            .filter { MemoryMoments.isMoment($0.metadata) }
+            .count
     }
 
     public func listProposals(status: String?) async throws -> [ProposalRecord] {

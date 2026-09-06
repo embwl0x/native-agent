@@ -216,10 +216,27 @@ extension MacAppleScriptBridge {
         guard let body = inputString(input["body"]) else {
             return failedEnvelope(integration: "notes", reason: "missing_body")
         }
-        let folder = inputString(input["folder"]) ?? "Notes"
+        // 2026-09-06: a REQUESTED folder that could not be resolved used to
+        // fall through to Notes' default folder, so the note landed somewhere
+        // the caller never asked for and the receipt still said "created". The
+        // schema promises the default only when `folder` is omitted, so a
+        // supplied-but-unresolvable folder is now an error naming what exists.
+        let requestedFolder = inputString(input["folder"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let folder = (requestedFolder?.isEmpty == false) ? requestedFolder! : "Notes"
+        let folderWasRequested = requestedFolder?.isEmpty == false
         let titleAS = escapeForAppleScript(title)
         let bodyAS = escapeForAppleScript(body)
         let folderAS = escapeForAppleScript(folder)
+        let missingFolderBranch = folderWasRequested ? """
+                set folderNames to ""
+                repeat with f in folders
+                    set folderNames to folderNames & (name of f as string) & "###"
+                end repeat
+                return "\(Self.notesFolderMissingSentinel)" & folderNames
+        """ : """
+                make new note with properties {name:"\(titleAS)", body:"\(bodyAS)"}
+        """
         let source = """
         tell application "Notes"
             set targetFolder to missing value
@@ -227,7 +244,7 @@ extension MacAppleScriptBridge {
                 set targetFolder to folder "\(folderAS)"
             end try
             if targetFolder is missing value then
-                make new note with properties {name:"\(titleAS)", body:"\(bodyAS)"}
+        \(missingFolderBranch)
             else
                 tell targetFolder
                     make new note with properties {name:"\(titleAS)", body:"\(bodyAS)"}
@@ -237,7 +254,20 @@ extension MacAppleScriptBridge {
         end tell
         """
         do {
-            _ = try await runAppleScript(source)
+            let raw = try await runAppleScript(source)
+            if raw.hasPrefix(Self.notesFolderMissingSentinel) {
+                let names = raw.dropFirst(Self.notesFolderMissingSentinel.count)
+                    .components(separatedBy: "###")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                return .object([
+                    "status": .string("failed"),
+                    "integration": .string("notes"),
+                    "reason": .string("folder_not_found"),
+                    "requested_folder": .string(folder),
+                    "available_folders": .array(names.map { .string($0) }),
+                ])
+            }
             return .object([
                 "status": .string("completed"),
                 "action": .string("created"),

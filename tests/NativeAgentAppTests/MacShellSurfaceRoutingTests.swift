@@ -201,7 +201,9 @@ func activityNavigationDestination_keepsItsExplicitInitialTab() throws {
         guard !view.isEmpty else { continue }
         destinations.append(String(view.prefix { $0 != "(" }))
     }
-    #expect(destinations.count == 6, "ActivitySection case count changed: \(destinations)")
+    // 5, not 6: User authorized retiring the Native Experience / Journey
+    // section on 2026-09-01, so `.journey` and its destination are gone.
+    #expect(destinations.count == 5, "ActivitySection case count changed: \(destinations)")
     #expect(Set(destinations).count == destinations.count, "two sections share a destination: \(destinations)")
 }
 
@@ -222,28 +224,42 @@ func appearanceDarkMode_readSitesAreTheDocumentedSet() throws {
     //   SlimSettingsView.swift      — the writer
     //   DetachedChatPanelView.swift — detached chat content
     //   DetachedChatPanel.swift     — the detached NSPanel chrome
+    // 2026-09-06: two sites joined the documented set and both are deliberate.
+    //   AppearanceController.swift  — 69fd1891 made one controller the answer
+    //     to "is the window dark?" (it owns the key, and the two SwiftUI scenes
+    //     feed it rather than each computing a scheme).
+    //   SetupView.swift             — 2e29b8c9 put the appearance toggle on the
+    //     Setup page too, so it is a second writer of the same key.
     #expect(
         readers == [
             "NativeAgentApp.swift",
             "SlimSettingsView.swift",
             "DetachedChatPanelView.swift",
             "DetachedChatPanel.swift",
+            "AppearanceController.swift",
+            "SetupView.swift",
         ],
         "dark-mode read sites changed: \(readers.sorted())"
     )
 
-    // The two KNOWN exceptions, pinned so they stay deliberate rather than
-    // becoming forgotten: the Spotlight panel and the agent browser window
-    // render in system appearance today.
-    let spotlight = try AppSourceScraping.appSource("SpotlightOverlay.swift")
+    // The KNOWN exception, pinned so it stays deliberate rather than becoming
+    // forgotten: the agent browser window renders in system appearance today.
+    // (The Spotlight panel was the other one; User authorized retiring it,
+    // 2026-09-01, so there is no longer a second offender to pin.)
     let browser = try AppSourceScraping.appSource("BrowserWindow.swift")
-    #expect(!spotlight.contains("preferredColorScheme"))
     #expect(!browser.contains("preferredColorScheme"))
 
     // Every reader that owns a window must actually APPLY it; a read with no
     // application is the same stale surface with extra steps.
     let appSource = try AppSourceScraping.appSource("NativeAgentApp.swift")
-    #expect(AppSourceScraping.occurrences(of: "preferredColorScheme(preferDarkAppearance ? .dark : nil)", in: appSource) == 2)
+    // 2026-09-06: 69fd1891 — "never a nil scheme". Handing SwiftUI nil left the
+    // title bar and rail dark while the page repainted white, so both scenes
+    // now apply AppearanceController's explicit dark-or-light answer
+    // (NativeAgentApp.swift:250 and :339). Still two applications, one per
+    // window-owning scene; the nil form must not come back.
+    #expect(AppSourceScraping.occurrences(of: "preferredColorScheme(appearance.colorScheme)", in: appSource) == 2)
+    #expect(!appSource.contains("preferredColorScheme(preferDarkAppearance ? .dark : nil)"))
+    #expect(AppSourceScraping.occurrences(of: "appearance.setPreferDark(dark)", in: appSource) == 2)
 }
 
 // MARK: - launch gate ordering (silent no-launch / data-root split)

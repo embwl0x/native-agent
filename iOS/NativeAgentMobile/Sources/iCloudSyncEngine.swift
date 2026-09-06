@@ -72,7 +72,25 @@ final class iCloudSyncEngine: ObservableObject {
     @Published var personality: PersonalityProfile?
     @Published var sessions: [ChatSession] = []
     @Published var pinnedChatSessions: [ChatSession] = []
-    @Published var chatTranscripts: [String: [ChatMessageRecord]] = [:]
+    /// The conversation anchor the Mac published beside `sessions.json` — the
+    /// session the human is currently active in on a direct remote surface.
+    /// Read-only on the phone: it is merged into the tab strip and defaulted to,
+    /// never written into anyone's pins and never synced back.
+    @Published var chatAnchor: ConversationAnchorPin?
+    /// 2026-09-06: one published transcript for a session — the rows the Mac
+    /// published and the version it published them at, in ONE value. Two
+    /// properties would not do: only the rows map is observed, so a republished
+    /// empty transcript that differs solely by version would never be
+    /// delivered, and an empty transcript is exactly the one that needs its
+    /// version looked at.
+    struct PublishedTranscript: Equatable {
+        var records: [ChatMessageRecord]
+        /// The Mac session's transcript version — a counter bumped on every
+        /// clear and every transcript write. nil on pre-2026-09-06 Mac builds;
+        /// an empty transcript with no version never clears anything.
+        var generation: Int?
+    }
+    @Published var chatTranscripts: [String: PublishedTranscript] = [:]
     @Published var health: RuntimeHealth?
     @Published var organismLivingStatus: OrganismLivingStatusFile?
     // R25: worker/codex runs from runs.json (newest 50, written by the Mac's
@@ -87,6 +105,11 @@ final class iCloudSyncEngine: ObservableObject {
     // Turn Inspector W4: read-only per-turn summaries from the Mac snapshot lane.
     @Published var turnSummaries: TurnSummaryFile?
     @Published var lastSyncAt: Date?
+    /// Snapshot groups the Mac could not rebuild on its last pass, group name →
+    /// reason (sweep 2026-09-01 item 2). A screen whose group is named here is
+    /// rendering rows the Mac already knows are old, however fresh the sync
+    /// timestamp looks.
+    @Published var staleSnapshotGroups: [String: String] = [:]
     @Published var syncError: String?
     var inboxSnapshotLoaded = false
 
@@ -123,6 +146,12 @@ final class iCloudSyncEngine: ObservableObject {
     /// refreshChatTranscriptsSnapshot (concurrent overlapping reads could
     /// complete out of order, reverting chatTranscripts to an older read).
     var chatTranscriptsRefreshGeneration: UInt64 = 0
+    /// 2026-09-06: the same stale-clobber guard for the chat SESSION LIST.
+    /// `.onAppear` and the foreground scene-phase path both refresh it, and each
+    /// read can block on iCloud download; two overlapping reads could complete
+    /// newest-first and leave the phone showing an older sessions/pins/anchor
+    /// set than it had already adopted.
+    var chatSessionListRefreshGeneration: UInt64 = 0
     // R10-N8: processed IDs are session-only on iOS (in-memory set in caller logic) — Mac persists
     // processed_ids.json with corruption recovery; that is N/A here because iOS never persists this set.
 

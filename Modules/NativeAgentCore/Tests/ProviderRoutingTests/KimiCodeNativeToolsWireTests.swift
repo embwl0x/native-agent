@@ -118,13 +118,15 @@ private func parsedBody() throws -> [String: Any] {
 struct KimiCodeNativeToolsWireTests {
     // MARK: - Capability flag
 
-    @Test func nativeToolCapability_admits_only_kimiCode() {
+    @Test func nativeToolCapability_admits_kimiCode_and_apiKeyAnthropic() {
         #expect(NativeToolCapability.providerSupportsNativeTools("kimi-code"))
         #expect(NativeToolCapability.providerSupportsNativeTools("kimi_code"))
         #expect(NativeToolCapability.providerSupportsNativeTools("  KIMI-CODE "))
-        // The OAuth-direct Claude adapters must NEVER be admitted — sending a
+        // The api-key Anthropic path joined the lane on 2026-09-01 (sweep item
+        // 34); its own wire pins live in AnthropicAPIKeyNativeToolsTests.
+        #expect(NativeToolCapability.providerSupportsNativeTools("anthropic"))
+        // The OAuth-direct Claude adapter must NEVER be admitted — sending a
         // tools array on a Claude subscription connection is documented history.
-        #expect(!NativeToolCapability.providerSupportsNativeTools("anthropic"))
         #expect(!NativeToolCapability.providerSupportsNativeTools("anthropic_oauth_direct"))
         #expect(!NativeToolCapability.providerSupportsNativeTools("moonshot"))
         #expect(!NativeToolCapability.providerSupportsNativeTools("openai"))
@@ -380,50 +382,16 @@ struct KimiCodeNativeToolsWireTests {
         #expect(calls.map(\.id) == ["tool_s"])
     }
 
-    // MARK: - REGRESSION: non-kimi providers keep the exact pre-change wire shape
-
-    @Test func anthropicApiKeyAdapter_never_ships_a_tools_array_even_when_tools_are_passed() async throws {
-        NativeToolsStubURLProtocol.reset()
-        NativeToolsStubURLProtocol.responder = { _ in
-            .init(status: 200, body: #"{"content":[{"type":"text","text":"hi"}]}"#.data(using: .utf8)!)
-        }
-        let root = try nativeToolsTempRoot()
-        defer { try? FileManager.default.removeItem(at: root) }
-
-        // Plain Anthropic api-key adapter (providerId "anthropic"): NOT native-
-        // tool capable. Handing it tools must change nothing on the wire.
-        let adapter = AnthropicAdapter(
-            session: nativeToolsStubSession(),
-            apiKeyOverride: "sk-test",
-            dataRootOverride: root,
-            telemetryDataRootOverride: root
-        )
-        let reply = try await adapter.completeMessages(
-            messages: [
-                .user("hello"),
-                LLMMessage(role: .assistant, content: [
-                    .toolUse(id: "t1", name: "git_status", inputJSON: Data("{}".utf8)),
-                ]),
-                LLMMessage(role: .user, content: [
-                    .toolResult(toolUseId: "t1", content: "clean", isError: false),
-                ]),
-            ],
-            system: "sys",
-            model: "claude-opus-4-8",
-            tools: [echoSchema]
-        )
-        #expect(reply == "hi")
-
-        let body = try parsedBody()
-        #expect(body["tools"] == nil, "the Claude api-key path must never ship tools[]")
-        // And the conversation still flattens to the legacy single-prompt shape
-        // (no structured messages array beyond the one flattened user message).
-        let messages = try #require(body["messages"] as? [[String: Any]])
-        #expect(messages.count == 1)
-        let flattened = try #require(messages[0]["content"] as? String)
-        #expect(flattened.contains("[tool_use git_status"))
-        #expect(flattened.contains("[tool_result] clean"))
-    }
+    // 2026-09-06: `anthropicApiKeyAdapter_never_ships_a_tools_array_even_when_
+    // tools_are_passed` removed here. It pinned the api-key Claude path to the
+    // flattened, tools-free legacy wire, and 7df7a4cd deliberately opted that
+    // exact provider id into the native lane ("so Claude turns on the api-key
+    // path stop parsing tool calls out of prose"). The guarantee it was really
+    // protecting — the OAuth-direct connection never receives a tools array —
+    // is pinned by `nativeToolCapability_admits_kimiCode_and_apiKeyAnthropic`
+    // above and by AnthropicAPIKeyNativeToolsTests, which the same commit added
+    // (predicate_admits_apiKeyAnthropic_and_still_refuses_oauth, plus the
+    // api-key wire pins and apiKeyNative_withoutTools_is_untouched_legacy_path).
 
     @Test func kimiCode_without_tools_keeps_the_legacy_flattened_shape() async throws {
         NativeToolsStubURLProtocol.reset()

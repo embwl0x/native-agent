@@ -3850,3 +3850,152 @@ func matchingWindowHandles_areAPass_notARefusal() {
         focusedWindowTitle: "window-a"
     ) == nil)
 }
+
+// MARK: - Sweep item 8: SECURE KEYBOARD ENTRY
+//
+// Two different silences, one symptom. While macOS secure input is on the
+// window server drops every synthesized keystroke without telling anyone, so
+// the closed loop reported "the fresh screen did not visibly change" and never
+// named the cause. And `AXSecureTextField` sat in `typeableRoles`, so `type`
+// aimed at a password box was an ordinary act.
+
+private func _guidance(_ output: [String: JSONValue]) -> String {
+    if case .string(let text)? = output["guidance"] { return text }
+    return ""
+}
+
+/// Records what it was asked to post AND reports secure input on, which is the
+/// only combination that can prove "refused, and nothing went out".
+private final class _SecureInputSink: MacEventSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _keys: [MacKeyEvent] = []
+    var isAvailable: Bool { true }
+    var secureKeyboardEntryActive: Bool { true }
+    var keys: [MacKeyEvent] { lock.lock(); defer { lock.unlock() }; return _keys }
+    func post(key: MacKeyEvent) { lock.lock(); _keys.append(key); lock.unlock() }
+    func post(mouse: MacMouseEvent) {}
+    func post(scroll: MacScrollEvent) {}
+}
+
+@Test
+func secureInputRefusal_namesTheCauseInWords_andOnlyWhenItIsActuallyOn() {
+    #expect(MacActClosedLoop.secureInputRefusal(active: false) == nil,
+            "secure input off is not a refusal — this must never become a standing block")
+    let refusal = MacActClosedLoop.secureInputRefusal(active: true)
+    #expect(refusal?.reason == MacActClosedLoop.secureInputReason)
+    #expect(refusal?.note.contains("secure keyboard entry") == true,
+            "the refusal has to say the cause, not just fail: \(refusal?.note ?? "nil")")
+    #expect(refusal?.note.contains("would go nowhere") == true)
+}
+
+@Test
+func secureFieldRefusal_firesOnPasswordFieldsOnly_andTypeStillKnowsTheRole() {
+    #expect(MacActClosedLoop.secureFieldRefusal(role: "AXTextField") == nil)
+    #expect(MacActClosedLoop.secureFieldRefusal(role: "AXSecureTextField")?.reason
+            == MacActClosedLoop.secureFieldReason)
+    #expect(MacActClosedLoop.secureFieldRefusal(role: "AXSecureTextField")?
+        .note.contains("password field") == true)
+    // The role stays TYPEABLE on purpose: a password box must get its own
+    // named refusal, not the generic `verb_not_supported_on_element` shrug the
+    // buttons get.
+    #expect(MacActClosedLoop.canType(role: "AXSecureTextField"))
+}
+
+@Test
+func type_refusesAPasswordField_byName_andTouchesNothing() async throws {
+    var elements = _composeElements()
+    elements[12] = _Element(
+        attributes: MacAXAttributes(role: "AXSecureTextField", title: "Password", value: "•••"),
+        children: []
+    )
+    elements[0] = _Element(
+        attributes: MacAXAttributes(role: "AXWindow", title: "Lunch tomorrow"),
+        children: [10, 11, 12]
+    )
+    let source = _MutableLookSource(elements: elements, rootID: 0)
+    var actElements = _composeActElements()
+    actElements[[2]] = _ActElement(role: "AXSecureTextField", title: "Password", value: "•••")
+    let actSource = _ActSource(actElements)
+    let sink = _SecureInputSink()
+    let client = SwiftNativeMacControl(
+        accessibilitySource: source,
+        eventSink: sink,
+        accessibilityActSource: actSource,
+        effectObserverSource: _EffectSource(),
+        lookFrameStore: MacLookFrameStore()
+    )
+    let look = _object(try await client.dispatch(action: "look", body: [:]).output)
+    guard case .string(let frameId)? = look["frame_id"] else {
+        Issue.record("no frame")
+        return
+    }
+    var handle = ""
+    for row in _array(look["affordances"]) where _object(row)["label"] == .string("Password") {
+        if case .string(let found)? = _object(row)["handle"] { handle = found }
+    }
+    #expect(!handle.isEmpty, "a login sheet's one control must be visible to a look")
+    let result = try await client.dispatch(
+        action: "act",
+        body: [
+            "handle": .string(handle),
+            "frame_id": .string(frameId),
+            "verb": .string("type"),
+            "text": .string("hunter2"),
+        ]
+    )
+    #expect(!result.ok)
+    #expect(result.error == MacActClosedLoop.secureFieldReason)
+    let output = _object(result.output)
+    #expect(_guidance(output).contains("password field"),
+            "an honest reason, not a mechanism shrug: \(output["guidance"] ?? .null)")
+    let calls = actSource.recordedCalls()
+    #expect(!calls.contains { $0.hasPrefix("setValue:") },
+            "AXSetValue would have filled the credential box: \(calls)")
+    #expect(!calls.contains { $0.hasPrefix("setFocused:") }, "\(calls)")
+    #expect(sink.keys.isEmpty, "nothing may be posted")
+    let serialized = String(data: try result.output.serializedData(pretty: false), encoding: .utf8) ?? ""
+    #expect(!serialized.contains("hunter2"))
+}
+
+@Test
+func type_refusesWhenSecureInputIsOn_andPostsNothing() async throws {
+    let source = _MutableLookSource(elements: _composeElements(), rootID: 0)
+    let actSource = _ActSource(_composeActElements())
+    // An editable field whose AXValue is not settable, so the verb reaches the
+    // keystroke fallback — the branch secure input actually eats.
+    actSource.valueSettable = false
+    let sink = _SecureInputSink()
+    let client = SwiftNativeMacControl(
+        accessibilitySource: source,
+        eventSink: sink,
+        accessibilityActSource: actSource,
+        effectObserverSource: _EffectSource(),
+        lookFrameStore: MacLookFrameStore()
+    )
+    let look = _object(try await client.dispatch(action: "look", body: [:]).output)
+    guard case .string(let frameId)? = look["frame_id"] else {
+        Issue.record("no frame")
+        return
+    }
+    var handle = ""
+    for row in _array(look["affordances"]) where _object(row)["label"] == .string("Subject") {
+        if case .string(let found)? = _object(row)["handle"] { handle = found }
+    }
+    let result = try await client.dispatch(
+        action: "act",
+        body: [
+            "handle": .string(handle),
+            "frame_id": .string(frameId),
+            "verb": .string("type"),
+            "text": .string("abc"),
+        ]
+    )
+    #expect(!result.ok)
+    #expect(result.error == MacActClosedLoop.secureInputReason)
+    let output = _object(result.output)
+    #expect(output["method"] == .string("none"))
+    #expect(_guidance(output).contains("secure keyboard entry"),
+            "\(output["guidance"] ?? .null)")
+    #expect(sink.keys.isEmpty,
+            "the whole point: not one character goes out into a void")
+}

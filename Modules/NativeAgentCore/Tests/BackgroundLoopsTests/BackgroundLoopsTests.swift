@@ -421,6 +421,27 @@ private func tempDoctorDir() -> URL {
     #expect(leftover.isEmpty)
 }
 
+@Test func doctorAutoRunLoop_emptyResults_skipsAndWritesNoSnapshot() async {
+    // Sweep FIX 4: zero checks means nothing was inspected. Persisting
+    // `{"checks":[]}` would read as a clean bill of health to every consumer
+    // (they derive "healthy" from "no check has status fail"), and stamping
+    // `.completed` would book work that never happened.
+    let dir = tempDoctorDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let loop = DoctorAutoRunLoop(
+        interval: 60, doctorChecks: MockDoctorChecks(results: []), storage: { dir })
+
+    let outcome = await loop.tickOutcome()
+
+    guard case .skipped(let reason, _) = outcome else {
+        Issue.record("expected .skipped, got \(outcome)")
+        return
+    }
+    #expect(reason.contains("no check results"))
+    #expect(!FileManager.default.fileExists(
+        atPath: dir.appendingPathComponent("latest.json").path))
+}
+
 @Test func doctorAutoRunLoop_default_interval_is_600_seconds() {
     let loop = DoctorAutoRunLoop(doctorChecks: MockDoctorChecks())
     #expect(loop.interval == 600)

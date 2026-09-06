@@ -18,9 +18,16 @@ struct AppShellMenuPresentationTests {
 
         // The drift the hand-kept list had: an Advanced tab holding a digit
         // while two primary tabs had none.
-        #expect(!entries.contains { $0.item == .personality })
-        #expect(entries.contains { $0.item == .skills && $0.shortcut != nil })
-        #expect(entries.contains { $0.item == .macIntegration && $0.shortcut != nil })
+        //
+        // 2026-09-06: the primary list itself moved with the new shell
+        // (3ccfb925/0b0c083f/df974e5f) — Personality is primary now, and
+        // Skills and Mac Integration became tabs on other rail pages, so
+        // `primaryItems` is shell-dependent. Pin the invariant that killed the
+        // drift instead of one shell's membership: the menu holds nothing but
+        // primary items, and no Advanced tab can ever claim a digit.
+        #expect(entries.allSatisfy { SidebarItem.primaryItems.contains($0.item) })
+        #expect(!entries.contains { $0.shortcut != nil && $0.item.isAdvanced })
+        #expect(Set(SidebarItem.primaryItems).isDisjoint(with: Set(SidebarItem.advancedItems)))
 
         // No digit may be claimed twice.
         let digits = entries.compactMap(\.shortcut)

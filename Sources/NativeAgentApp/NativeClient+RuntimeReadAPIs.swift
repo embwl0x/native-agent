@@ -111,7 +111,7 @@ extension NativeClient {
 
     /// Subsystem #17 cluster C4 / WAVE 5: GET /v1/command/search?q=...&limit=...
     /// Same flag gate as fetchCommandPaletteRawData. SwiftNative path returns
-    /// only the entries (the SpotlightOverlay caller only consumes the
+    /// only the entries (its caller only consumes the
     /// `entries` field, not the envelope), matching the field the daemon
     /// response always populates. Dynamic injection via CommandPaletteContext —
     /// see fetchCommandPaletteRawData for the per-field source map.
@@ -311,12 +311,10 @@ extension NativeClient {
         return try JSONDecoder().decode([WorkflowRecord].self, from: data)
     }
 
-    func getWorkflowRuns() async throws -> [WorkflowRun] {
-        let impl = makeWorkflowOrchestrationClient(root: dataRootOverride ?? PersistenceCore.defaultDataRoot())
-        let rows = try await impl.listWorkflowRuns()
-        let data = try JSONValue.array(rows).serializedData(pretty: false)
-        return try JSONDecoder().decode([WorkflowRun].self, from: data)
-    }
+    // 2026-09-01: `getWorkflowRuns()` retired with the workflow run engine
+    // (User authorized). It was polled on every AppModel refresh to render a
+    // ledger frozen since 2026-05-08. data/workflows/runs.jsonl stays on disk
+    // as history; nothing reads it.
 
     /// Create/replace a workflow record through the Swift runtime. The
     /// SwiftNative client does the registry read->merge->filter->append->write

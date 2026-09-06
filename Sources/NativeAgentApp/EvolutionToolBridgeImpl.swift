@@ -8,7 +8,8 @@ import TrustCenter
 
 // MARK: - EvolutionToolBridgeImpl (2026-06-11, U2b)
 //
-// App-side backend for the three privileged self-evolution chat tools. The
+// App-side backend for the privileged self-evolution chat tools (propose /
+// status / withdraw / self_install — withdraw added 2026-09-02). The
 // dispatch cases + Full-Mac gate + autonomy `confirm` gate live in the core
 // ChatOrchestration module (SwiftToolDispatcher); this struct is injected as
 // the EvolutionToolBridge so those cases can reach the EvolutionProposalStore
@@ -45,6 +46,15 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
     private static let maxDiffBytes = 1_000_000  // 1 MB unified diff ceiling
 
     func evolutionPropose(input: [String: JSONValue]) async throws -> JSONValue {
+        // User, 2026-09-03: risk is pinned to critical for every proposal by
+        // design, so a caller who passes one is refused with the reason,
+        // rather than believing they set something the store ignores.
+        if input["risk"] != nil {
+            return failed(
+                reason: "risk_is_pinned",
+                fix: "Do not pass 'risk'. Every evolution proposal is recorded as critical by design; the approval path cannot be lightened by the proposer."
+            )
+        }
         guard let title = nonEmptyString(input["title"]) else {
             return failed(reason: "missing_title", fix: "Pass a non-empty 'title'.")
         }
@@ -109,6 +119,131 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
             "count": .int(Int64(proposals.count)),
             "truncated": .bool(proposals.count > capped.count),
             "proposals": .array(capped.map { summary($0, includeReceipts: false) }),
+        ])
+    }
+
+    // MARK: - evolution_withdraw (2026-09-02)
+    //
+    // The queue was write-only from the agent's side: propose + status, no way
+    // to take back a card filed by mistake. This is the ONLY tool that walks a
+    // proposal backward, and it does so exclusively through the store's own
+    // `transition(...)` onto `denied` — the terminal state the legal-edge table
+    // already permits from every withdrawable status. It never deletes a
+    // record (sweep owns removal), never touches the repo, and never withdraws
+    // a proposal the agent did not file herself.
+
+    /// Statuses whose legal exits include `.denied` in
+    /// `EvolutionProposalStatus.legalTransitions`. `.building` is deliberately
+    /// absent (candidate run in flight → candidate_green/candidate_failed only)
+    /// and so are `.approved` / `.installed` (past the withdrawal point — their
+    /// exits are installed/verified/reverted; undoing those is a revert, not a
+    /// withdrawal).
+    private static let withdrawableStatuses: Set<EvolutionProposalStatus> = [
+        .needsDiff, .proposed, .candidateGreen, .candidateFailed, .staged,
+    ]
+
+    /// Sources the agent may withdraw. `evolution_propose` — her only filing
+    /// path — stamps `.chat`, so that is her own queue. `.weekly` (the
+    /// background improvement scan), `.selfHeal` (the healing loop) and
+    /// `.external` (filed by User or another writer) are NOT hers to cancel.
+    private static let agentOwnedSources: Set<EvolutionProposalSource> = [.chat]
+
+    /// Bounded like the other reason strings on this surface.
+    private static let maxReason = 500
+
+    func evolutionWithdraw(input: [String: JSONValue]) async throws -> JSONValue {
+        // Same id capping as status/self_install: the id is echoed back on
+        // several paths, so an over-long forged id is truncated (and then
+        // cannot match a real record).
+        guard let id = nonEmptyString(input["id"]).map({ Self.truncate($0, 128) }) else {
+            return failed(reason: "missing_id", fix: "Pass the 'id' (evo_…) of the proposal to withdraw.")
+        }
+        let reason = nonEmptyString(input["reason"])
+        if let reason, reason.count > Self.maxReason {
+            return failed(
+                reason: "reason_too_long",
+                fix: "Keep 'reason' under \(Self.maxReason) characters.")
+        }
+        guard let proposal = try await store.get(id: id) else {
+            return .object([
+                "status": .string("not_found"),
+                "id": .string(id),
+            ])
+        }
+        // Ownership first — do not even report the internal state of a record
+        // that is not hers beyond its source.
+        guard Self.agentOwnedSources.contains(proposal.source) else {
+            return .object([
+                "status": .string("not_withdrawable"),
+                "id": .string(id),
+                "proposal_source": .string(proposal.source.rawValue),
+                "reason": .string("not yours to withdraw: source=\(proposal.source.rawValue)"),
+                "fix": .string("Only proposals you filed yourself (source='chat', via evolution_propose) can be withdrawn. Ask User to deny this one."),
+            ])
+        }
+        guard !proposal.status.isTerminal else {
+            return .object([
+                "status": .string("already_terminal"),
+                "id": .string(id),
+                "proposal_status": .string(proposal.status.rawValue),
+                "reason": .string("already finished: status=\(proposal.status.rawValue)"),
+                "fix": .string("Terminal proposals (verified / reverted / denied) cannot be withdrawn; nothing is pending. Old terminal records age out via the store sweep."),
+            ])
+        }
+        guard proposal.status != .building else {
+            let runId = proposal.candidateRunId.map { " (candidate run \(Self.truncate($0, 128)))" } ?? ""
+            return .object([
+                "status": .string("candidate_in_flight"),
+                "id": .string(id),
+                "proposal_status": .string(proposal.status.rawValue),
+                "reason": .string("a candidate build/test run is in flight\(runId)"),
+                "fix": .string("Wait for the run to land on candidate_green or candidate_failed, then withdraw."),
+            ])
+        }
+        guard Self.withdrawableStatuses.contains(proposal.status) else {
+            return .object([
+                "status": .string("not_withdrawable"),
+                "id": .string(id),
+                "proposal_status": .string(proposal.status.rawValue),
+                "reason": .string("past the withdrawal point: status=\(proposal.status.rawValue)"),
+                "fix": .string("An approved or installed proposal is no longer a pending request; undoing it is a revert, which this tool never performs."),
+            ])
+        }
+
+        let denyReason = "withdrawn by agent: " + (reason ?? "no reason given")
+        // `require:` re-checks the status INSIDE the flock, so a concurrent
+        // build/approval that moved the record between the read above and this
+        // write loses cleanly (applied: false) instead of clobbering.
+        let (updated, applied) = try await store.transition(
+            id: id,
+            to: .denied,
+            require: Self.withdrawableStatuses,
+            receipt: "withdrawn by agent (was \(proposal.status.rawValue))",
+            denyReason: Self.truncate(denyReason, Self.maxReason + 64)
+        )
+        guard applied else {
+            return .object([
+                "status": .string("not_withdrawable"),
+                "id": .string(id),
+                "proposal_status": .string(updated.status.rawValue),
+                "reason": .string("the proposal changed state concurrently (now \(updated.status.rawValue)); nothing was withdrawn"),
+                "fix": .string("Re-read it with evolution_status and decide again."),
+            ])
+        }
+        // Explicit audit row on top of the transition receipt, so the trail
+        // names the withdrawal as such rather than only as an edge to denied.
+        try await store.appendReceipt(
+            id: id,
+            kind: "withdrawn",
+            detail: Self.truncate(denyReason, Self.maxReason + 64)
+        )
+        return .object([
+            "status": .string("withdrawn"),
+            "id": .string(id),
+            "previous_status": .string(proposal.status.rawValue),
+            "proposal_status": .string(updated.status.rawValue),
+            "deny_reason": .string(Self.truncate(denyReason, Self.maxReason + 64)),
+            "note": .string("Withdrawn: the proposal is now terminal (denied) and will not build, stage, or install. Nothing in the repo changed."),
         ])
     }
 
@@ -212,6 +347,9 @@ struct EvolutionToolBridgeImpl: EvolutionToolBridge {
             "status": .string(p.status.rawValue),
             "source": .string(p.source.rawValue),
             "risk": .string(p.risk),
+            // Agent, 2026-09-02: the risk a caller passes is not stored; every
+            // proposal is pinned to critical by design. Say so on the receipt.
+            "risk_note": .string("risk is pinned to critical for every proposal by design; a passed risk value is not stored"),
             "has_diff": .bool(p.diffText != nil),
             "created_at": .string(p.createdAt),
             "updated_at": .string(p.updatedAt),

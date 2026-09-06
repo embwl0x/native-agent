@@ -201,6 +201,11 @@ struct DispatchArgPlan {
     let mode: DispatchPlanMode
     /// Pre-filled values (populated for .singleStringArg when freeText is non-empty).
     let prefilled: [String: Any]
+    /// 2026-09-06: the conversation the command was typed into. Set by the
+    /// caller when the command is accepted, not read later — a form-backed
+    /// plan can sit on screen across a session switch, and the dispatch's
+    /// placeholder and receipt belong where the command was typed.
+    var sessionId: String = ""
 }
 
 extension CapabilitiesStore {

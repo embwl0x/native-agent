@@ -67,6 +67,14 @@ private let frozenSomaticValenceTable:
         .phoneDeliveryStarted: (0, true),
         .deskItemCreated: (0, true),
         .approvalRequested: (0, true),
+        // Item 5 (2026-09-02). The horizon refresh is the one kind that is
+        // inert on EVERY axis, and the zero here is the point of it: riding
+        // `.appWake` (0.15, three groups up) would have made a read of her own
+        // calendar faintly pleasant every time the residual deadline fired.
+        // The adapter can never produce one — no CognitiveEventKind maps to it —
+        // so `adapterSuppresses` is true in the honest sense: there is no
+        // intrinsic valence for it to stamp.
+        .horizonRefresh: (0, true),
     ]
 
 @Test

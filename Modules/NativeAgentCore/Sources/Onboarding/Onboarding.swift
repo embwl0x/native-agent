@@ -7,7 +7,8 @@ import PersonaEngine
 // MARK: - Onboarding
 //
 // This module is the sole implementation of the onboarding subsystem. It
-// serves start/complete/reset through Swift code inside NativeAgent.app.
+// serves start/complete/repair-profile/reset through Swift code inside
+// NativeAgent.app.
 // `complete` refuses unrelated persona state, but resumes an exact durable
 // pending transaction after interruption. It generates SOUL/VOICE/USER/GROWTH
 // from persona templates, writes them atomically, and updates
@@ -26,6 +27,15 @@ import PersonaEngine
 //
 //   • There is no HTTP fallback. `makeOnboardingClient()` always returns the
 //     Swift-native implementation.
+//
+//   • `repairProfile` (User, 2026-09-06) covers the one state `complete` and
+//     `reset` between them cannot: an anchored install whose profile.json is
+//     simply absent. It rewrites that file and NOTHING else — no persona doc,
+//     no sentinel, no transaction — and refuses if a completion transaction is
+//     pending, if onboarding is not provably FINISHED (the `.onboarded`
+//     sentinel, or the complete legacy SOUL/VOICE/USER/GROWTH set — a lone
+//     SOUL.md is an interrupted first run and takes the reset lane), or if a
+//     profile already exists.
 
 // MARK: - Result types — start
 
@@ -132,6 +142,22 @@ public struct OnboardingStartResult: Sendable, Equatable {
     /// explicit, backup-preserving reset; treating this as complete would hide
     /// a broken first run, while treating it as fresh would dead-end submit.
     public let resetRequired: Bool
+    /// True when onboarding really completed — the `.onboarded` sentinel, or
+    /// on pre-sentinel installs the complete SOUL/VOICE/USER/GROWTH set — but
+    /// `<dataRoot>/memory/profile.json` is GONE. A lone SOUL.md is an
+    /// interrupted first run, not a completed one, and takes `resetRequired`.
+    ///
+    /// User, 2026-09-06: this state used to be invisible to the wizard. SOUL.md
+    /// counted as an identity anchor on its own, so `resetRequired`
+    /// stayed false, `hasExisting` was true, and the wizard exited through
+    /// `onComplete` — every downstream reader then substituted a default
+    /// profile and the configured agent and user names were silently gone.
+    /// Reset is the WRONG answer here (it would back out perfectly good
+    /// persona documents over a single missing file), so this is its own
+    /// state: re-enter the two names, rewrite only profile.json, continue.
+    /// Deliberately absence-only — a profile that exists but is malformed
+    /// carries bytes that must not be destroyed, and Doctor still names it.
+    public let profileRepairRequired: Bool
 
     public init(
         ready: Bool,
@@ -140,7 +166,8 @@ public struct OnboardingStartResult: Sendable, Equatable {
         personaTypeOptions: [PersonaTypeOption],
         abilityOverview: [AbilityOverviewEntry],
         pendingRecovery: Bool = false,
-        resetRequired: Bool = false
+        resetRequired: Bool = false,
+        profileRepairRequired: Bool = false
     ) {
         self.ready = ready
         self.hasExisting = hasExisting
@@ -149,6 +176,7 @@ public struct OnboardingStartResult: Sendable, Equatable {
         self.abilityOverview = abilityOverview
         self.pendingRecovery = pendingRecovery
         self.resetRequired = resetRequired
+        self.profileRepairRequired = profileRepairRequired
     }
 
     public func toJSON() -> JSONValue {
@@ -160,6 +188,7 @@ public struct OnboardingStartResult: Sendable, Equatable {
             "ability_overview": .array(abilityOverview.map { $0.toJSON() }),
             "pending_recovery": .bool(pendingRecovery),
             "reset_required": .bool(resetRequired),
+            "profile_repair_required": .bool(profileRepairRequired),
         ])
     }
 
@@ -185,6 +214,8 @@ public struct OnboardingStartResult: Sendable, Equatable {
         if case .bool(let b) = obj["pending_recovery"] ?? .null { pendingRecovery = b }
         var resetRequired = false
         if case .bool(let b) = obj["reset_required"] ?? .null { resetRequired = b }
+        var profileRepairRequired = false
+        if case .bool(let b) = obj["profile_repair_required"] ?? .null { profileRepairRequired = b }
         self.init(
             ready: ready,
             hasExisting: hasExisting,
@@ -192,7 +223,8 @@ public struct OnboardingStartResult: Sendable, Equatable {
             personaTypeOptions: options,
             abilityOverview: overview,
             pendingRecovery: pendingRecovery,
-            resetRequired: resetRequired
+            resetRequired: resetRequired,
+            profileRepairRequired: profileRepairRequired
         )
     }
 }
@@ -364,6 +396,9 @@ public protocol OnboardingClient: Sendable {
     func startOnboarding() async throws -> OnboardingStartResult
     func completeOnboarding(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult
     func resumePendingOnboarding() async throws -> OnboardingCompleteResult
+    /// Rewrite ONLY `profile.json` for the `profileRepairRequired` state.
+    /// Never touches SOUL/VOICE/USER/GROWTH or the sentinel.
+    func repairProfile(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult
     func resetOnboarding(confirm: Bool) async throws -> OnboardingResetResult
 }
 
@@ -848,10 +883,30 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             let hasExisting = pending != nil
                 || personaPaths.contains { fm.fileExists(atPath: $0.path) }
                 || fm.fileExists(atPath: onboardedSentinel.path)
-            let hasIdentityAnchor = fm.fileExists(atPath: soulPath.path)
-                || fm.fileExists(atPath: onboardedSentinel.path)
-            let hasAuxiliaryOnly = !hasIdentityAnchor
-                && (fm.fileExists(atPath: voicePath.path) || fm.fileExists(atPath: growthPath.path))
+            // User, 2026-09-06: proof that onboarding FINISHED, and the anchor
+            // the profile-repair lane stands on. SOUL.md alone is NOT that
+            // proof: it is written first in the commit order, so an
+            // interrupted first run leaves exactly a lone SOUL.md, and
+            // accepting it here wrote a profile and told the user the agent
+            // was back while VOICE/USER/GROWTH and the sentinel were still
+            // absent. `repairProfile` re-checks the same predicate.
+            let hasCompletionAnchor = Self.hasCompletionAnchor(
+                personaTargets: targets,
+                fileManager: fm
+            )
+            // Persona bytes with no proof of completion: partial state, which
+            // takes the reset lane. USER.md is excluded as evidence for the
+            // reason above — the generator writes a header-only one on blank
+            // machines, and accepting it would hide the wizard again.
+            let hasPartialPersonaState = !hasCompletionAnchor
+                && (fm.fileExists(atPath: soulPath.path)
+                    || fm.fileExists(atPath: voicePath.path)
+                    || fm.fileExists(atPath: growthPath.path))
+            // `hasPartialPersonaState` (and therefore `resetRequired`) requires
+            // NO completion anchor, so the two states can never both be true.
+            let profileRepairRequired = pending == nil
+                && hasCompletionAnchor
+                && !fm.fileExists(atPath: profileJSONPath.path)
             let rawName = pending?.agentName ?? Self.readPersonaName(at: profileJSONPath)
             let currentName: String? = hasExisting ? rawName : nil
             return OnboardingStartResult(
@@ -861,7 +916,8 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                 personaTypeOptions: Self.personaTypeOptions,
                 abilityOverview: Self.abilityOverview,
                 pendingRecovery: pending != nil,
-                resetRequired: pending == nil && hasAuxiliaryOnly
+                resetRequired: pending == nil && hasPartialPersonaState,
+                profileRepairRequired: profileRepairRequired
             )
         }
     }
@@ -1036,6 +1092,138 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
                 persistence: persistence
             )
         }
+    }
+
+    // MARK: repair profile
+
+    /// Rewrite ONLY `profile.json` on an install that really did onboard but
+    /// lost that one file (User, 2026-09-06 — see `profileRepairRequired`).
+    ///
+    /// The persona documents are the identity of record and are left exactly as
+    /// they are; this restores the single derived file that went missing, with
+    /// the same content and shape `completeOnboarding` would have written for
+    /// these names. Fail-closed wherever this is not the honest operation: a
+    /// pending completion transaction already owns profile.json and must be
+    /// resumed instead, an install with no proof that onboarding FINISHED
+    /// (sentinel, or the complete legacy document set) belongs in the wizard's
+    /// normal lane, and an existing profile is never overwritten — those bytes
+    /// may be the user's only copy. Both names are required: a repair that
+    /// invents one of them writes a second wrong answer over the first.
+    public func repairProfile(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult {
+        let agentName = payload.agentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let userName = payload.userName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let personaType = payload.personaType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if agentName.isEmpty {
+            return OnboardingCompleteResult(ok: false, error: "missing_agent_name")
+        }
+        // User, 2026-09-06: an empty user name used to become "User". Repair
+        // exists because the real names were lost; substituting a placeholder
+        // for one of them writes a second wrong answer over the first.
+        if userName.isEmpty {
+            return OnboardingCompleteResult(ok: false, error: "missing_user_name")
+        }
+        if !PersonaTemplates.validTypes.contains(personaType) {
+            return OnboardingCompleteResult(ok: false, error: "invalid_persona_type")
+        }
+        let persistence = SwiftNativePersistenceCore()
+        return try await persistence.withFileLock(transactionManifestPath) {
+            let targets = Self.expectedTargetURLs(
+                personaRoot: personaRoot,
+                profilePath: profileJSONPath,
+                dataRoot: dataRoot
+            )
+            // User, 2026-09-06: every refusal is decided BEFORE any state is
+            // reconciled. `reconcilePendingResetLocked` commits a pending
+            // reset — it backs up and REMOVES the persona documents — so
+            // running it first let a repair that was going to be refused
+            // destroy state on its way to the refusal.
+            if let refusal = try profileRepairRefusalLocked(targets: targets) {
+                return refusal
+            }
+            try await reconcilePendingResetLocked(persistence: persistence)
+            // That reconcile may have committed a reset. Re-decide over the
+            // state it actually left behind rather than the state checked
+            // above; the anchor it was standing on may be gone.
+            if let refusal = try profileRepairRefusalLocked(targets: targets) {
+                return refusal
+            }
+            // User, 2026-09-06: the absence decision and the write now happen
+            // under the SAME profile-file lock. They used to be split by the
+            // plan build, which re-read profile.json — so a profile created in
+            // that window was recorded as the plan's BASE hash, and
+            // `ensureCommitted` permits replacing the base. The repair could
+            // overwrite the very file whose absence it had just confirmed.
+            return try await persistence.withFileLock(profileJSONPath) {
+                guard !FileManager.default.fileExists(atPath: profileJSONPath.path) else {
+                    return OnboardingCompleteResult(
+                        ok: false,
+                        error: "profile_already_present",
+                        detail: "profile.json is present; repair never overwrites existing bytes."
+                    )
+                }
+                let plan = try Self.makeProfileUpdatePlan(
+                    profilePath: profileJSONPath,
+                    agentName: agentName,
+                    personaType: personaType,
+                    userName: userName
+                )
+                // Same intent shape the completion transaction commits, so the
+                // write keeps its fail-closed guarantee: the plan saw no file,
+                // so its base hash is nil and `ensureCommitted` refuses any
+                // existing bytes rather than clobbering them. The written bytes
+                // are verified after.
+                let intent = OnboardingTargetIntent(
+                    role: "profile",
+                    content: plan.content,
+                    sha256: Self.sha256(Data(plan.content.utf8)),
+                    baseSHA256: plan.baseSHA256
+                )
+                try Self.ensureCommitted(intent, to: profileJSONPath)
+                return OnboardingCompleteResult(
+                    ok: true,
+                    agentName: agentName,
+                    personaType: personaType,
+                    userName: userName,
+                    docsWritten: ["profile.json"]
+                )
+            }
+        }
+    }
+
+    /// The complete set of reasons a profile repair is not the honest
+    /// operation, in one place so it can be re-decided after a reconcile
+    /// (User, 2026-09-06). Returns nil when the repair may proceed. Caller
+    /// holds the transaction-manifest lock.
+    private func profileRepairRefusalLocked(
+        targets: [String: URL]
+    ) throws -> OnboardingCompleteResult? {
+        if try Self.loadTransactionIfPresent(
+            at: transactionManifestPath,
+            personaRoot: personaRoot,
+            profilePath: profileJSONPath
+        ) != nil {
+            return OnboardingCompleteResult(
+                ok: false,
+                error: "onboarding_in_progress",
+                detail: "An interrupted onboarding transaction already owns profile.json. Resume it instead of repairing."
+            )
+        }
+        let fm = FileManager.default
+        guard Self.hasCompletionAnchor(personaTargets: targets, fileManager: fm) else {
+            return OnboardingCompleteResult(
+                ok: false,
+                error: "profile_repair_not_required",
+                detail: "No completed onboarding was found on this Mac, so there is no profile to repair."
+            )
+        }
+        guard !fm.fileExists(atPath: profileJSONPath.path) else {
+            return OnboardingCompleteResult(
+                ok: false,
+                error: "profile_already_present",
+                detail: "profile.json is present; repair never overwrites existing bytes."
+            )
+        }
+        return nil
     }
 
     private func commitPreparedTransaction(
@@ -1368,6 +1556,25 @@ public struct SwiftNativeOnboardingClient: OnboardingClient {
             return .authored
         }
         return .generatorProjection
+    }
+
+    /// Proof that onboarding FINISHED on this Mac: the `.onboarded` sentinel,
+    /// or — for installs that predate it — the complete legacy document set.
+    ///
+    /// User, 2026-09-06: deliberately not "SOUL.md exists". SOUL is written
+    /// first in the commit order, so a first run interrupted after one write
+    /// leaves exactly that; it is partial state, and partial state belongs in
+    /// the reset lane, never the profile-repair lane. Requiring all four
+    /// documents for the legacy case matches what `NativeAgentPublicSafety`
+    /// accepts as a pre-sentinel install.
+    private static func hasCompletionAnchor(
+        personaTargets targets: [String: URL],
+        fileManager fm: FileManager
+    ) -> Bool {
+        if fm.fileExists(atPath: targets["sentinel"]!.path) { return true }
+        return ["soul", "voice", "user", "growth"].allSatisfy {
+            fm.fileExists(atPath: targets[$0]!.path)
+        }
     }
 
     private static func expectedTargetURLs(

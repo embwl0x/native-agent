@@ -37,11 +37,11 @@ struct ChromeControlPermissionsView: View {
                     }
                 ))
                 .disabled(isSaving)
-                .help("Allows Agent to use leased background tabs in your signed-in Google Chrome. Off by default.")
+                .help("Allows \(AgentVoice.live.subject) to use leased background tabs in your signed-in Google Chrome. Off by default.")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
-            Text("Uses your real Chrome session. Agent creates inactive tabs or claims an exact tab, yields immediately when you touch it, and rechecks this switch before every action.")
+            Text("Uses your real Chrome session. \(AgentVoice.live.subject) creates inactive tabs or claims an exact tab, yields immediately when you touch it, and rechecks this switch before every action.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -99,13 +99,23 @@ struct MultimodalPermissionsView: View {
             }
             HStack {
                 Toggle("Allow PDF file ingestion", isOn: policyBinding(\.file_ingestion_pdf))
-                    .help("Allows PDF attachments to be parsed into chat context.")
+                    .help("The text of a PDF you attach is read into the conversation. Off, the attachment is skipped and the agent is told it was — it never guesses at what the document says. A PDF that is only pictures of pages has no text to read.")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
             HStack {
+                // 2026-09-06: this said DOC/DOCX attachments are "parsed into
+                // chat context". They are not — nothing reads a Word file, and
+                // a switch that promises a capability the app does not have is
+                // worse than no switch. Disabled and told the truth until the
+                // extraction exists; the stored key is left alone so turning it
+                // on later needs no migration.
                 Toggle("Allow Word document ingestion", isOn: policyBinding(\.file_ingestion_docx))
-                    .help("Allows DOC and DOCX attachments to be parsed into chat context.")
+                    .disabled(true)
+                    // 2026-09-06: the copy said DOC as well as DOCX. Both
+                    // attachment resolvers accept only .docx — an older .doc is
+                    // not carried at all, it is refused at the picker.
+                    .help("Not available yet. A .docx attachment is carried with the message but its text is not read into the conversation — attach a PDF, or paste the text. An older .doc file is not accepted at all.")
                 EffectTimingTag(timing: .now)
                 Spacer()
             }
@@ -229,6 +239,10 @@ struct TrainingPermissionsView: View {
     @State private var draftTraining = TrustTrainingPolicy()
     @State private var draftPromotion = TrustPromotionPolicy()
     @State private var isSaving = false
+    /// The EFFECTIVE dream gate (dream_scheduler AND dream_cycle_enabled), read
+    /// through the same composite the Dreams page and Setup read. `trustPolicy`
+    /// carries no personalityPolicy block, so it cannot come from the drafts.
+    @State private var draftDreamComposite = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -282,13 +296,18 @@ struct TrainingPermissionsView: View {
                 Toggle(
                     "Run dream cycle nightly",
                     isOn: Binding(
-                        get: { draftTraining.dream_scheduler },
+                        // 2026-09-06: this read and wrote trainingPolicy
+                        // .dream_scheduler alone, while the runtime requires
+                        // dream_scheduler AND personalityPolicy
+                        // .dream_cycle_enabled (DreamREMGatePolicy.dreamEnabled)
+                        // and Setup's "Dreams at night" row moves both. Turning
+                        // dreams off in Setup therefore left this switch showing
+                        // ON with dreams dead. Both controls now show and set
+                        // the EFFECTIVE gate, through the same composite write.
+                        get: { draftDreamComposite },
                         set: { newValue in
-                            var next = draftTraining
-                            next.autonomous_training = true
-                            next.dream_scheduler = newValue
-                            draftTraining = next
-                            Task { await saveAll(training: next, promotion: draftPromotion) }
+                            draftDreamComposite = newValue  // optimistic — no snap-back
+                            Task { await saveDreamCycle(newValue) }
                         }
                     )
                 )
@@ -384,10 +403,30 @@ struct TrainingPermissionsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .task { syncDraftsFromPolicy() }
-        .onChange(of: appModel.trustPolicy) { _, _ in
-            if !isSaving { syncDraftsFromPolicy() }
+        .task {
+            syncDraftsFromPolicy()
+            await refreshDreamComposite()
         }
+        .onChange(of: appModel.trustPolicy) { _, _ in
+            if !isSaving {
+                syncDraftsFromPolicy()
+                Task { await refreshDreamComposite() }
+            }
+        }
+    }
+
+    private func refreshDreamComposite() async {
+        draftDreamComposite = await appModel.client.swiftDreamCompositeEnabled()
+    }
+
+    /// One call: the two gates move together, and this is the same composite
+    /// write the Dreams page and Setup's "Dreams at night" row make.
+    private func saveDreamCycle(_ enabled: Bool) async {
+        isSaving = true
+        _ = await appModel.setDreamCycleEnabled(enabled)
+        isSaving = false
+        syncDraftsFromPolicy()
+        await refreshDreamComposite()
     }
 
     private func syncDraftsFromPolicy() {

@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import NativeAgentShared
 import PersistenceCore
 @testable import NativeAgentApp
 
@@ -281,6 +282,74 @@ struct MacSyncCompletionDurabilityTests {
         )
         #expect(recorded["providers"] == "provider catalog unavailable")
         #expect(recorded["health"] == nil)
+    }
+
+    /// Sweep 2026-09-01 item 2. `snapshot_skips.json` held `knowledge_graph`
+    /// and `memories` skipped on `Swift.CancellationError` — a lost race, not a
+    /// decision — and the phone rendered yesterday's rows as current.
+    @Test("a cancelled group read is retried once instead of going straight to stale")
+    @MainActor
+    func aCancelledGroupReadIsRetriedExactlyOnce() async throws {
+        var attempts = 0
+        let rows = try await MacSyncEngine.retryingCancelledGroupRead("memories") {
+            attempts += 1
+            if attempts == 1 { throw CancellationError() }
+            return ["memory-1"]
+        }
+        #expect(attempts == 2, "the cancelled read was not retried")
+        #expect(rows == ["memory-1"])
+
+        // A second cancellation is a real outcome: it must surface, not spin.
+        var stubbornAttempts = 0
+        await #expect(throws: CancellationError.self) {
+            _ = try await MacSyncEngine.retryingCancelledGroupRead("knowledge_graph") {
+                stubbornAttempts += 1
+                throw CancellationError()
+            } as [String]
+        }
+        #expect(stubbornAttempts == 2, "retry must happen exactly once, never in a loop")
+
+        // A non-cancellation failure is not a race; retrying it is just a
+        // second helping of the same error.
+        struct Unreadable: Error {}
+        var readAttempts = 0
+        await #expect(throws: Unreadable.self) {
+            _ = try await MacSyncEngine.retryingCancelledGroupRead("memories") {
+                readAttempts += 1
+                throw Unreadable()
+            } as [String]
+        }
+        #expect(readAttempts == 1)
+    }
+
+    @Test("a group that stays skipped is published to the phone, and a healthy pass clears it")
+    func stalenessMarkerReachesThePhone() throws {
+        let stale = try #require(MacSyncEngine.snapshotStalenessMarkerData(
+            unresolvedGroups: [
+                "memories": "The operation couldn\u{2019}t be completed. (Swift.CancellationError error 1.)",
+                "_observedAt": "2026-09-01T19:01:19Z",
+            ]
+        ))
+        let decoded = try JSONDecoder().decode([String: String].self, from: stale)
+        #expect(decoded["memories"]?.contains("CancellationError") == true)
+        #expect(decoded["_observedAt"] == nil, "bookkeeping keys must not reach the phone as group names")
+
+        // Healthy: an EMPTY marker, not a deleted file. The phone's snapshot
+        // cache only ever gains files, so a deletion would badge Memory stale
+        // forever.
+        let healthy = try #require(MacSyncEngine.snapshotStalenessMarkerData(unresolvedGroups: [:]))
+        #expect(try JSONDecoder().decode([String: String].self, from: healthy).isEmpty)
+        // The digest of a healthy marker must be stable, or every snapshot pass
+        // wakes the phone with a "changed" core group.
+        let healthyAgain = try #require(MacSyncEngine.snapshotStalenessMarkerData(unresolvedGroups: [:]))
+        #expect(healthy == healthyAgain)
+
+        #expect(
+            NAMobileSnapshotGroup.groups(
+                containingAny: [MacSyncEngine.snapshotStalenessFilename]
+            ) == [.core],
+            "an unbundled marker never reaches a CloudKit-transport phone"
+        )
     }
 
     @Test("a retried snapshot failure replaces its durable reason")

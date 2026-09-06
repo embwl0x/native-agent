@@ -86,10 +86,21 @@ public struct NeedSignal: Codable, Equatable, Sendable {
     public let staleRuntimeAtomIDs: Set<ContextAtomID>
     public let secretBearingAtomIDs: Set<ContextAtomID>
     public let queryEmbedding: [Float]?
+    /// The question in the other voice, same vector space as `queryEmbedding`.
+    /// See `ContextQueryEmbeddingValue.alternateValues`.
+    public let alternateQueryEmbedding: [Float]?
     public let queryEmbeddingModelFingerprint: String?
     public let availableGenerationID: Int64?
     public let characterBudget: Int
     public let mandatoryCharacterBudget: Int
+    /// Body length above which the CALLER's packet renderer replaces an atom's
+    /// full text with a lead + `context_expand` pointer. The selector uses it
+    /// only to publish a matching expandable pointer, and `ContextExpander`
+    /// uses it to admit that pointer. `0` = the caller renders atoms whole.
+    public let packetAtomExpandThresholdChars: Int
+    /// Upper bound on `.memory`-kind atoms in one packet. `nil` leaves the
+    /// selector's own per-kind quota in charge (pre-existing behavior).
+    public let memoryAtomRowLimit: Int?
     public let selectionTimeBucket: Int64
     public let timeBucketSeconds: Int
     public let explicitConflicts: [ContextConflictDefinition]
@@ -103,8 +114,11 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         case recentTurns, activeTask, unresolvedQuestion, goal, predictedToolGroups, contextualTerms
         case cognitiveActivation, feedbackUtilityOverrides, feedbackDecayOverrides
         case workingAtomIDs, precoveredSourceIDs, mandatoryAtomIDs, deletedAtomIDs, tombstonedAtomIDs
-        case staleRuntimeAtomIDs, secretBearingAtomIDs, queryEmbedding, queryEmbeddingModelFingerprint, availableGenerationID
-        case characterBudget, mandatoryCharacterBudget, selectionTimeBucket, timeBucketSeconds
+        case staleRuntimeAtomIDs, secretBearingAtomIDs, queryEmbedding, alternateQueryEmbedding
+        case queryEmbeddingModelFingerprint, availableGenerationID
+        case characterBudget, mandatoryCharacterBudget
+        case packetAtomExpandThresholdChars, memoryAtomRowLimit
+        case selectionTimeBucket, timeBucketSeconds
         case explicitConflicts, cacheState, measuredSelectionMicroseconds
     }
 
@@ -134,10 +148,13 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         staleRuntimeAtomIDs: Set<ContextAtomID> = [],
         secretBearingAtomIDs: Set<ContextAtomID> = [],
         queryEmbedding: [Float]? = nil,
+        alternateQueryEmbedding: [Float]? = nil,
         queryEmbeddingModelFingerprint: String? = nil,
         availableGenerationID: Int64? = nil,
         characterBudget: Int = 6_000,
         mandatoryCharacterBudget: Int? = nil,
+        packetAtomExpandThresholdChars: Int = 0,
+        memoryAtomRowLimit: Int? = nil,
         now: Date = Date(),
         timeBucketSeconds: Int = 60,
         explicitConflicts: [ContextConflictDefinition] = [],
@@ -174,6 +191,7 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         self.staleRuntimeAtomIDs = staleRuntimeAtomIDs
         self.secretBearingAtomIDs = secretBearingAtomIDs
         self.queryEmbedding = queryEmbedding
+        self.alternateQueryEmbedding = queryEmbedding == nil ? nil : alternateQueryEmbedding
         let embeddingFingerprint = queryEmbeddingModelFingerprint?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         self.queryEmbeddingModelFingerprint = queryEmbedding == nil
@@ -182,6 +200,8 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         self.availableGenerationID = availableGenerationID
         self.characterBudget = max(0, characterBudget)
         self.mandatoryCharacterBudget = max(0, mandatoryCharacterBudget ?? characterBudget)
+        self.packetAtomExpandThresholdChars = max(0, packetAtomExpandThresholdChars)
+        self.memoryAtomRowLimit = memoryAtomRowLimit.map { max(0, $0) }
         self.selectionTimeBucket = Int64(floor(now.timeIntervalSince1970 / Double(bucketSize)))
         self.timeBucketSeconds = bucketSize
         self.explicitConflicts = explicitConflicts
@@ -212,6 +232,8 @@ public struct NeedSignal: Codable, Equatable, Sendable {
             String(timeBucketSeconds),
             String(characterBudget),
             String(mandatoryCharacterBudget),
+            String(packetAtomExpandThresholdChars),
+            memoryAtomRowLimit.map(String.init) ?? "no-memory-atom-row-limit",
             String(availableGenerationID ?? -1),
             cacheState.rawValue,
         ]
@@ -241,6 +263,8 @@ public struct NeedSignal: Codable, Equatable, Sendable {
             "feedback-decay:\(atomID.rawValue):\(value.bitPattern)"
         }.sorted()
         parts += queryEmbedding?.map { String($0.bitPattern) } ?? ["no-query-embedding"]
+        parts += alternateQueryEmbedding?.map { String($0.bitPattern) }
+            ?? ["no-alternate-query-embedding"]
         parts.append(queryEmbeddingModelFingerprint ?? "no-query-embedding-fingerprint")
         for conflict in explicitConflicts.sorted(by: { $0.id < $1.id }) {
             parts.append(conflict.id)
@@ -438,18 +462,60 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
     public let representation: ContextPacketRepresentation
     public let mandatory: Bool
     public let characterCount: Int
+    /// The atom's `deterministicSummary` (the `summary` column of
+    /// `context_atom_versions`), carried alongside the body so a renderer can
+    /// lead with the RULE and leave the story behind a pointer without a second
+    /// store read. Nil when the compiler produced no summary for this atom.
+    /// Empty/whitespace summaries are normalized to nil here so every reader
+    /// gets one answer to "is there a lead".
+    public let summary: String?
+    /// When the memory this atom carries was recorded, so the renderer can lead
+    /// with its age instead of handing every memory over as equally present.
+    /// Memory atoms only; nil everywhere else and on legacy packets.
+    public let recordedAt: Date?
+    /// How the memory came to be known (`verified` / `told by X` / `inferred`),
+    /// when the record says. nil on rows written before provenance existed.
+    public let provenance: ContextMemoryProvenance?
 
     public init(
         pointer: ContextAtomPointer,
         text: String,
         representation: ContextPacketRepresentation,
-        mandatory: Bool
+        mandatory: Bool,
+        summary: String? = nil,
+        recordedAt: Date? = nil,
+        provenance: ContextMemoryProvenance? = nil
     ) {
         self.pointer = pointer
         self.text = text
         self.representation = representation
         self.mandatory = mandatory
         self.characterCount = text.count
+        let trimmedSummary = summary?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.summary = (trimmedSummary?.isEmpty == false) ? trimmedSummary : nil
+        self.recordedAt = recordedAt
+        self.provenance = provenance
+    }
+
+    /// The item as built from the atom it came from: identical to the
+    /// designated init, plus the memory facts the renderer needs and only the
+    /// atom knows (its recorded time and provenance).
+    public init(
+        atom: ContextStoredAtom,
+        generationID: Int64,
+        text: String,
+        representation: ContextPacketRepresentation,
+        mandatory: Bool
+    ) {
+        self.init(
+            pointer: ContextAtomPointer(atom: atom, generationID: generationID),
+            text: text,
+            representation: representation,
+            mandatory: mandatory,
+            summary: atom.draft.deterministicSummary,
+            recordedAt: ContextMemoryLead.recordedAt(for: atom.draft),
+            provenance: ContextMemoryLead.provenance(for: atom.draft)
+        )
     }
 }
 
@@ -561,6 +627,15 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
     /// Optional for wire compatibility with receipts persisted before latency
     /// provenance existed. Readers must treat nil as unavailable, never zero.
     public let selectionLatencyProvenance: ContextSelectionLatencyProvenance?
+    /// How many ranked `.memory` candidates the semantic floor refused this
+    /// turn (`configuration.memorySemanticFloor`). Absent in receipts persisted
+    /// before 2026-09-02, so decoding tolerates a missing key as 0 — the same
+    /// contract `messageCoverage` got.
+    public let memoryFloorDroppedCount: Int
+    /// Correction atoms this turn's per-turn correction cap kept OUT of the
+    /// packet. Zero on receipts written before the cap existed, which is the
+    /// truth for those turns: nothing was dropped by a rule that did not run.
+    public let correctionCapDropped: Int
 
     private enum CodingKeys: String, CodingKey {
         case id, needFingerprint, generationID, sourceFingerprint, selectionTimeBucket
@@ -568,6 +643,8 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
         case mandatoryAtomIDs, coveredMandatoryAtomIDs, mandatoryCoverage
         case conflicts, budget, degradedSources, cacheState
         case measuredSelectionMicroseconds, selectionLatencyProvenance
+        case memoryFloorDroppedCount
+        case correctionCapDropped
     }
 
     public init(
@@ -588,7 +665,9 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
         degradedSources: [ContextDegradedSourceNotice],
         cacheState: ContextSelectionCacheState,
         measuredSelectionMicroseconds: Int?,
-        selectionLatencyProvenance: ContextSelectionLatencyProvenance? = nil
+        selectionLatencyProvenance: ContextSelectionLatencyProvenance? = nil,
+        memoryFloorDroppedCount: Int = 0,
+        correctionCapDropped: Int = 0
     ) {
         self.id = id
         self.needFingerprint = needFingerprint
@@ -608,6 +687,8 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
         self.cacheState = cacheState
         self.measuredSelectionMicroseconds = measuredSelectionMicroseconds
         self.selectionLatencyProvenance = selectionLatencyProvenance
+        self.memoryFloorDroppedCount = memoryFloorDroppedCount
+        self.correctionCapDropped = max(0, correctionCapDropped)
     }
 
     public init(from decoder: any Decoder) throws {
@@ -633,7 +714,12 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
             selectionLatencyProvenance: try values.decodeIfPresent(
                 ContextSelectionLatencyProvenance.self,
                 forKey: .selectionLatencyProvenance
-            )
+            ),
+            memoryFloorDroppedCount: try values.decodeIfPresent(
+                Int.self,
+                forKey: .memoryFloorDroppedCount
+            ) ?? 0,
+            correctionCapDropped: try values.decodeIfPresent(Int.self, forKey: .correctionCapDropped) ?? 0
         )
     }
 
@@ -657,6 +743,14 @@ public struct ContextSelectionReceipt: Codable, Equatable, Sendable {
         try values.encode(cacheState, forKey: .cacheState)
         try values.encodeIfPresent(measuredSelectionMicroseconds, forKey: .measuredSelectionMicroseconds)
         try values.encodeIfPresent(selectionLatencyProvenance, forKey: .selectionLatencyProvenance)
+        // Written only when the floor actually refused something, so a receipt
+        // from a turn it never touched stays byte-identical to a pre-floor one.
+        if memoryFloorDroppedCount != 0 {
+            try values.encode(memoryFloorDroppedCount, forKey: .memoryFloorDroppedCount)
+        }
+        if correctionCapDropped != 0 {
+            try values.encode(correctionCapDropped, forKey: .correctionCapDropped)
+        }
     }
 }
 
@@ -809,6 +903,48 @@ public struct ContextScoreWeights: Equatable, Sendable {
     }
 }
 
+/// A floor for one content role inside one atom kind's budget.
+///
+/// Skills-as-recall (2026-07-03) dissolved the skill library into memory
+/// pointer rows so craft would arrive the way remembering does. The legacy
+/// recall lane honours that by sharing its result budget with skill hints
+/// (`MemoryRecallScoring.selectRecallResults`, max(1, k/3)); the ContextFlow
+/// lane had no equivalent, so 36 skill pointers competed against 177 other
+/// memory atoms inside one 8-slot quota. Live arena generation 3046: the memory
+/// quota saturated on 7 of 8 real skill-shaped queries, and the right skill for
+/// the message lost on two of them at ranks 32 and 54.
+///
+/// The reservation has two halves, and needs both:
+///   - a CAP on other roles, so the reserved slots stay free; and
+///   - a PROMOTION, so a qualifying atom actually takes one — capping alone
+///     just hands the freed slot to whatever ranks next.
+/// It reallocates the quota and never widens it: the dynamic atom budget,
+/// per-source cap and character budget all still apply unchanged. With no
+/// qualifying candidate in the turn, selection is byte-identical to having no
+/// reservation configured at all.
+public struct ContextRoleReservation: Equatable, Sendable {
+    public let role: ContextContentRole
+    public let slots: Int
+    /// Merit gate on the floor. A reserved slot is not a lottery: the atom has
+    /// to be about THIS message, not merely above the global relevance floor.
+    /// `messageCoverage` is the one score feature that cannot be diluted by
+    /// carried context, so it is the honest predicate for "this skill is what
+    /// the user just asked about".
+    ///
+    /// 0.35 is evidenced, not guessed. Live arena generation 3046 (36 skill
+    /// pointers among 213 memory atoms, 8 real queries): the correct skill for
+    /// a message scored messageCoverage 0.47-0.63 and every off-topic pointer
+    /// scored <= 0.19 — a 2.4x gap with nothing inside it. Below the gate the
+    /// reservation is inert and selection is byte-identical to having none.
+    public let minimumMessageCoverage: Double
+
+    public init(role: ContextContentRole, slots: Int, minimumMessageCoverage: Double = 0.35) {
+        self.role = role
+        self.slots = max(0, slots)
+        self.minimumMessageCoverage = max(0, minimumMessageCoverage)
+    }
+}
+
 public struct ContextSelectionConfiguration: Equatable, Sendable {
     public let maximumCandidates: Int
     public let maximumDynamicAtoms: Int
@@ -819,8 +955,59 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// larger quota by default so high-scoring memories are not crowded out
     /// of the 12-atom dynamic budget by the uniform per-kind cap.
     public let maximumAtomsPerKindOverrides: [ContextAtomKind: Int]
+    /// Reserved share of a kind's budget for one content role. Keyed by atom
+    /// kind; the reservation is clamped at init so a reserve can never claim a
+    /// kind's whole quota.
+    public let reservedRoleSlotsPerKind: [ContextAtomKind: ContextRoleReservation]
+    /// Per-turn ceiling on `.correction` atoms that are NOT about this message.
+    ///
+    /// Her store is nine-tenths corrections (live 2026-09-01: recall for
+    /// "memory" returned twelve correction rows and two facts), so the ordinary
+    /// per-kind quota let the packet describe her as mostly someone who got
+    /// things wrong. A correction the CURRENT message is actually about is
+    /// exempt (see `correctionIsAboutMessage`) and so are mandatory/pinned
+    /// corrections, which never reach the dynamic quota at all — this caps the
+    /// ambient ones only.
+    public let maximumCorrectionAtomsPerTurn: Int
     public let minimumRelevance: Double
+    /// Cosine below which a `.memory` atom is refused ADMISSION to the packet,
+    /// however well it ranked on everything else. `0` is the kill switch for
+    /// the whole 2026-09-02 precision pass — this floor AND
+    /// `shortMessageMemoryRowCap` — and restores the pre-floor selector
+    /// byte-for-byte, receipts included.
+    ///
+    /// The measured problem (live chat, 2026-09-01): on the short warm message
+    /// "My days bright and fuckin shiny with you in it" the best memory hit
+    /// scored cosine 0.41 and the selector still filled the whole 12-row memory
+    /// quota down to 0.24 — 18 lead+pointer rows of noise riding a turn that
+    /// asked for none of it. Targeted queries rank fine, so this is a PRECISION
+    /// problem on small talk, and a rank threshold is the honest instrument.
+    ///
+    /// It is deliberately narrow:
+    ///   - `.memory` atoms only. Identity, correction, instruction, relationship
+    ///     and mandatory atoms are authority, not recall breadth.
+    ///   - It never fires when the query has no embedding (cold embedder): with
+    ///     nothing to compare, every cosine is 0 and the floor would delete the
+    ///     memory lane instead of trimming it.
+    ///   - It never fires on an atom that has no comparable embedding (absent,
+    ///     or a different model epoch). That atom's 0 means "unknown", not
+    ///     "irrelevant"; `semanticScoreFailsClosedWhenQueryAndAtomEmbeddingEpochs
+    ///     Differ` is the same distinction one layer down.
+    ///   - Four exemptions carry an atom over the floor regardless of cosine:
+    ///     a whole-message lexical hit, a shared identifier, message coverage
+    ///     >= 0.5, or activation >= 0.5 (attention/working set).
+    public let memorySemanticFloor: Double
+    /// Effective `.memory` row cap on a message of at most
+    /// `shortMessageTokenCount` content tokens — the same token set (and the
+    /// same "4") the `messageCoverage` length damp already uses, so a message
+    /// too short to evidence coverage is also too short to earn a full memory
+    /// lane. Applied as `min(cap, shortMessageMemoryRowCap)`. `0` disables the
+    /// cap on its own, and `memorySemanticFloor == 0` disables it too.
+    public let shortMessageMemoryRowCap: Int
     public let weights: ContextScoreWeights
+
+    /// Content-token count at or below which a message counts as short.
+    public static let shortMessageTokenCount = 4
 
     public init(
         maximumCandidates: Int = 256,
@@ -828,8 +1015,14 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         maximumPointers: Int = 8,
         maximumAtomsPerSource: Int = 2,
         maximumAtomsPerKind: Int = 4,
-        maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8],
+        maximumAtomsPerKindOverrides: [ContextAtomKind: Int] = [.memory: 8, .relationship: 4],
+        reservedRoleSlotsPerKind: [ContextAtomKind: ContextRoleReservation] = [
+            .memory: ContextRoleReservation(role: .procedure, slots: 2),
+        ],
+        maximumCorrectionAtomsPerTurn: Int = 3,
         minimumRelevance: Double = 0.05,
+        memorySemanticFloor: Double = 0.30,
+        shortMessageMemoryRowCap: Int = 6,
         weights: ContextScoreWeights = ContextScoreWeights()
     ) {
         self.maximumCandidates = max(1, maximumCandidates)
@@ -837,8 +1030,28 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
         self.maximumPointers = max(0, maximumPointers)
         self.maximumAtomsPerSource = max(1, maximumAtomsPerSource)
         self.maximumAtomsPerKind = max(1, maximumAtomsPerKind)
-        self.maximumAtomsPerKindOverrides = maximumAtomsPerKindOverrides.mapValues { max(1, $0) }
+        let overrides = maximumAtomsPerKindOverrides.mapValues { max(1, $0) }
+        self.maximumAtomsPerKindOverrides = overrides
+        // A reserve that could consume a kind's entire quota would turn a floor
+        // for one role into a ceiling of zero for every other one.
+        self.reservedRoleSlotsPerKind = Dictionary(
+            uniqueKeysWithValues: reservedRoleSlotsPerKind.compactMap { kind, reservation in
+                let cap = overrides[kind] ?? max(1, maximumAtomsPerKind)
+                let slots = min(reservation.slots, cap - 1)
+                guard slots > 0 else { return nil }
+                return (kind, ContextRoleReservation(
+                    role: reservation.role,
+                    slots: slots,
+                    minimumMessageCoverage: reservation.minimumMessageCoverage
+                ))
+            }
+        )
+        self.maximumCorrectionAtomsPerTurn = max(0, maximumCorrectionAtomsPerTurn)
         self.minimumRelevance = max(0, minimumRelevance)
+        self.memorySemanticFloor = max(0, memorySemanticFloor)
+        // 0 is OFF, not "no memories at all": a short message is a reason to
+        // carry fewer rows, never a reason to empty the lane.
+        self.shortMessageMemoryRowCap = max(0, shortMessageMemoryRowCap)
         self.weights = weights
     }
 
@@ -987,7 +1200,8 @@ public struct ContextSelector: Sendable {
         }
         for atom in mandatoryAtoms {
             selectedItems.append(ContextPacketItem(
-                pointer: ContextAtomPointer(atom: atom, generationID: generation.generation.id),
+                atom: atom,
+                generationID: generation.generation.id,
                 text: atom.draft.body,
                 representation: .body,
                 mandatory: true
@@ -1004,17 +1218,78 @@ public struct ContextSelector: Sendable {
         let boundedCandidates = Array(rankedCandidates.prefix(configuration.maximumCandidates))
         let candidateIDs = Set(boundedCandidates.map(\.draft.id))
 
+        // MEMORY SEMANTIC FLOOR (see `memorySemanticFloor`). Ranking alone has
+        // no notion of "not relevant enough to be worth a row": a saturated
+        // memory quota is filled by whatever ranks next, however far down the
+        // cosine has fallen. This refuses ADMISSION rather than candidacy, so
+        // floored atoms keep their eligibility and score receipts and remain
+        // reachable through the pointer lanes — only their free ride into every
+        // packet is gone.
+        let floor = configuration.memorySemanticFloor
+        let queryIsComparable = !(need.queryEmbedding?.isEmpty ?? true)
+            && need.queryEmbeddingModelFingerprint != nil
+        let flooredMemoryIDs: Set<ContextAtomID> = floor > 0 && queryIsComparable
+            ? Set(boundedCandidates.lazy.filter { atom in
+                guard atom.draft.kind == .memory,
+                      let embedding = atom.draft.embedding,
+                      embedding.modelFingerprint == need.queryEmbeddingModelFingerprint,
+                      let features = baseScores[atom.draft.id],
+                      features.semanticCosine < floor else { return false }
+                return features.lexicalExact < 1
+                    && features.sharedIdentifiers <= 0
+                    && features.messageCoverage < 0.5
+                    && features.activation < 0.5
+            }.map(\.draft.id))
+            : []
+
+        // SHORT-MESSAGE ROW CAP. "Hey" is not a request for eight memories.
+        // Below the coverage damp's own threshold the message cannot evidence
+        // what it is about, so the memory lane narrows instead of filling.
+        //
+        // `memorySemanticFloor == 0` turns the WHOLE 2026-09-02 precision pass
+        // off, this cap included: one switch, one claim, byte-identical to the
+        // pre-floor selector. The cap also has its own off value (0).
+        let effectiveMemoryRowLimit: Int? = {
+            guard floor > 0, configuration.shortMessageMemoryRowCap > 0,
+                  scoreContext.messageTokens.count
+                    <= ContextSelectionConfiguration.shortMessageTokenCount else {
+                return need.memoryAtomRowLimit
+            }
+            let short = configuration.shortMessageMemoryRowCap
+            return min(need.memoryAtomRowLimit ?? short, short)
+        }()
+
+        // Admission, not candidacy: `candidateIDs` (score receipts, conflict
+        // receipts) keeps every ranked atom, while unit construction sees only
+        // what may actually enter the packet. Feeding the broader set to
+        // `makeSelectionUnits` let a floored atom ride back in as a member of
+        // an unresolved conflict unit, which bypasses the quotas by design.
+        // Conflict completeness holds among ADMITTED atoms; a sub-floor memory
+        // row is not evidence of a contradiction worth spending a row on.
+        let admittedCandidates = boundedCandidates.filter {
+            !flooredMemoryIDs.contains($0.draft.id)
+        }
         var units = makeSelectionUnits(
-            candidates: boundedCandidates.filter { $0.draft.injectionPolicy != .onDemand },
+            candidates: admittedCandidates.filter { $0.draft.injectionPolicy != .onDemand },
             groups: groups,
             atomByID: atomByID,
-            candidateIDs: candidateIDs,
+            candidateIDs: Set(admittedCandidates.map(\.draft.id)),
             mandatoryIDs: mandatoryIDs
         )
         var selectedDynamicCount = 0
         var usedCharacters = mandatoryCharacters
         var sourceCounts: [ContextSourceID: Int] = [:]
         var kindCounts: [ContextAtomKind: Int] = [:]
+        let reservedPlan = reservedRolePlan(in: units, scores: baseScores)
+        let reservedSlots = reservedPlan.slots
+        var reservedRoleCounts: [ContextAtomKind: Int] = [:]
+        // Corrections admitted this turn that the message is NOT about, and
+        // the ones the cap turned away. Exempt corrections (this message is
+        // about them) never consume the cap and never appear in the drop
+        // count — the cap exists to stop ambient self-reproach, not to make a
+        // relevant correction unreachable.
+        var cappedCorrectionCount = 0
+        var correctionCapDropped = 0
         var omittedConflictIDs = Set<String>()
         let selectedTokenSets = selectedItems.map { Self.tokens($0.text) }
         var redundancyByAtom = Dictionary(uniqueKeysWithValues: boundedCandidates.map { atom in
@@ -1057,16 +1332,80 @@ public struct ContextSelector: Sendable {
             let remainingAtomSlots = configuration.maximumDynamicAtoms - selectedDynamicCount
             var examinedKeys = Set<String>()
             var selectedPlan: [ContextPacketItem]?
+            // The floor, made real. Capping other roles only frees slots; it
+            // does not hand them to the reserved role, because the ranked scan
+            // below runs out of dynamic budget long before it reaches a
+            // qualifying atom that scores 30-50 places down. While a kind's
+            // reserve is outstanding, its best qualifying unit is considered
+            // FIRST. The gate in `reservedRolePlan` is what keeps this a floor
+            // for the skill this message is about rather than a free ride for
+            // any pointer that cleared the global relevance threshold.
+            let outstandingReserve = reservedSlots.contains { kind, slots in
+                reservedRoleCounts[kind, default: 0] < slots
+            }
+            if outstandingReserve {
+                for candidate in reranked
+                where reservedPlan.qualifyingKeys.contains(candidate.unit.stableKey) {
+                    let unit = candidate.unit
+                    guard unit.atoms.contains(where: { atom in
+                        guard let slots = reservedSlots[atom.draft.kind] else { return false }
+                        return reservedRoleCounts[atom.draft.kind, default: 0] < slots
+                    }) else { continue }
+                    guard unit.atoms.count <= remainingAtomSlots,
+                          correctionCapAllows(
+                            unit,
+                            admittedCorrections: cappedCorrectionCount,
+                            scores: baseScores
+                          ),
+                          quotaAllows(
+                            unit,
+                            sourceCounts: sourceCounts,
+                            kindCounts: kindCounts,
+                            reservedSlots: reservedSlots,
+                            reservedRoleCounts: reservedRoleCounts,
+                            memoryAtomRowLimit: effectiveMemoryRowLimit
+                          ),
+                          let planned = plannedItems(
+                            for: unit,
+                            generationID: generation.generation.id,
+                            remainingCharacters: need.characterBudget - usedCharacters
+                          ) else { continue }
+                    examinedKeys.insert(unit.stableKey)
+                    selectedPlan = planned
+                    break
+                }
+            }
             // Rejecting a unit changes no diversity, redundancy, quota, or
             // budget input. Its successors therefore keep this exact scored
             // order until an actual selection lands. Re-sorting after each
             // full-quota/oversized candidate made a saturated memory lane
             // quadratic while producing the same scores and receipts.
-            for candidate in reranked {
+            for candidate in reranked where selectedPlan == nil {
                 let unit = candidate.unit
                 examinedKeys.insert(unit.stableKey)
+                // Counted separately from the ordinary quota so the receipt can
+                // say how much of her correction backlog this rule held back.
+                // A unit is examined at most once per selection pass (rejects
+                // are removed with `examinedKeys`), so this cannot double-count.
+                if !correctionCapAllows(
+                    unit,
+                    admittedCorrections: cappedCorrectionCount,
+                    scores: baseScores
+                ) {
+                    correctionCapDropped += unit.atoms
+                        .filter { $0.draft.kind == .correction }.count
+                    if let conflictID = unit.conflictID { omittedConflictIDs.insert(conflictID) }
+                    continue
+                }
                 guard unit.atoms.count <= remainingAtomSlots,
-                      quotaAllows(unit, sourceCounts: sourceCounts, kindCounts: kindCounts),
+                      quotaAllows(
+                        unit,
+                        sourceCounts: sourceCounts,
+                        kindCounts: kindCounts,
+                        reservedSlots: reservedSlots,
+                        reservedRoleCounts: reservedRoleCounts,
+                        memoryAtomRowLimit: effectiveMemoryRowLimit
+                      ),
                       let planned = plannedItems(
                     for: unit,
                     generationID: generation.generation.id,
@@ -1089,6 +1428,14 @@ public struct ContextSelector: Sendable {
                 selectionOrdinals[item.pointer.atomID] = selectedItems.count
                 sourceCounts[item.pointer.sourceID, default: 0] += 1
                 kindCounts[item.pointer.kind, default: 0] += 1
+                if item.pointer.kind == .correction,
+                   !Self.correctionIsAboutMessage(baseScores[item.pointer.atomID]) {
+                    cappedCorrectionCount += 1
+                }
+                if let reservation = configuration.reservedRoleSlotsPerKind[item.pointer.kind],
+                   atomByID[item.pointer.atomID]?.draft.contentRole == reservation.role {
+                    reservedRoleCounts[item.pointer.kind, default: 0] += 1
+                }
                 let selectedTokens = Self.tokens(item.text)
                 for remainingUnit in units {
                     for remainingAtom in remainingUnit.atoms {
@@ -1106,11 +1453,35 @@ public struct ContextSelector: Sendable {
             }
         }
 
-        let pointers = boundedCandidates
+        let onDemandPointers = boundedCandidates
             .filter { $0.draft.injectionPolicy == .onDemand }
             .sorted { rankedBefore($0, $1, scores: scores) }
             .prefix(configuration.maximumPointers)
             .map { ContextAtomPointer(atom: $0, generationID: generation.generation.id) }
+        // TRUNCATION POINTERS (NORTHSTAR clause 6). When the caller's renderer
+        // cuts a long atom down to a lead, the rest of that atom must stay
+        // REACHABLE — otherwise the lead is not "fingertips", it is loss. The
+        // selector is the only place that knows which items were selected, so
+        // it publishes one expandable pointer per item the renderer will
+        // truncate. `ContextExpander` admits exactly these (same threshold,
+        // same NeedSignal) despite their non-`.onDemand` injection policy.
+        //
+        // THE NEW BOUND: the on-demand lane keeps `configuration
+        // .maximumPointers` unchanged; this lane adds AT MOST one pointer per
+        // selected item, and `selectedItems` is itself bounded by the mandatory
+        // set plus `configuration.maximumDynamicAtoms`. So
+        //   expandablePointers.count
+        //     <= maximumPointers + mandatoryAtomIDs.count + maximumDynamicAtoms
+        // and it is still a bounded packet, not a search bypass.
+        var pointers = onDemandPointers
+        if need.packetAtomExpandThresholdChars > 0 {
+            var published = Set(pointers.map(\.atomID))
+            for item in selectedItems
+            where item.text.count > need.packetAtomExpandThresholdChars {
+                guard published.insert(item.pointer.atomID).inserted else { continue }
+                pointers.append(item.pointer)
+            }
+        }
 
         let conflicts = groups.map { group in
             conflictSet(
@@ -1186,7 +1557,9 @@ public struct ContextSelector: Sendable {
             degradedSources: degraded,
             cacheState: need.cacheState,
             measuredSelectionMicroseconds: latency.microseconds,
-            selectionLatencyProvenance: latency.provenance
+            selectionLatencyProvenance: latency.provenance,
+            memoryFloorDroppedCount: flooredMemoryIDs.count,
+            correctionCapDropped: correctionCapDropped
         )
 
         return ContextPacket(
@@ -1304,7 +1677,18 @@ private extension ContextSelector {
             guard let queryFingerprint = need.queryEmbeddingModelFingerprint,
                   let atomEmbedding = atom.draft.embedding,
                   queryFingerprint == atomEmbedding.modelFingerprint else { return 0 }
-            return Self.cosine(need.queryEmbedding, atomEmbedding.values)
+            // User, 2026-09-06: the better of the question's two voices, the way
+            // the legacy recall lane keeps the better of a row's two scores.
+            // The packet lane scored the raw question only, so an atom written
+            // in the third person ("User uses different names for Agent…") was
+            // nowhere near a question asked in the first ("what does User call
+            // me") and never reached the packet. `alternateQueryEmbedding` is
+            // nil when the question reads the same in both voices, and cosine
+            // against nil is 0, so this is the old value in that case.
+            return max(
+                Self.cosine(need.queryEmbedding, atomEmbedding.values),
+                Self.cosine(need.alternateQueryEmbedding, atomEmbedding.values)
+            )
         }()
         let shared = sharedIdentifierScore(atom.draft, context: context)
         let activation = max(
@@ -1522,7 +1906,10 @@ private extension ContextSelector {
     func quotaAllows(
         _ unit: SelectionUnit,
         sourceCounts: [ContextSourceID: Int],
-        kindCounts: [ContextAtomKind: Int]
+        kindCounts: [ContextAtomKind: Int],
+        reservedSlots: [ContextAtomKind: Int],
+        reservedRoleCounts: [ContextAtomKind: Int],
+        memoryAtomRowLimit: Int?
     ) -> Bool {
         // An unresolved conflict is atomic: completeness takes precedence over
         // diversity caps, while the character and atom budgets still apply.
@@ -1530,10 +1917,100 @@ private extension ContextSelector {
         for atom in unit.atoms {
             if sourceCounts[atom.draft.sourceID, default: 0] + 1
                 > configuration.maximumAtomsPerSource { return false }
-            if kindCounts[atom.draft.kind, default: 0] + 1
-                > configuration.maximumAtoms(forKind: atom.draft.kind) { return false }
+            let kind = atom.draft.kind
+            var cap = configuration.maximumAtoms(forKind: kind)
+            // ONE owner for the memory row count. Before this, the caller's
+            // `recallRowLimit` bounded only the legacy recall lane — empty on
+            // ContextFlow turns — while the packet's memory lane answered to
+            // the selector's per-kind quota alone (20 rows observed against a
+            // 12-row limit). The limit is applied to `.memory` atoms ONLY:
+            // identity, correction and instruction atoms are authority, not
+            // recall breadth, and mandatory atoms never reach this loop.
+            if kind == .memory, let memoryAtomRowLimit {
+                cap = min(cap, memoryAtomRowLimit)
+            }
+            // Shrink the cap for OTHER roles by whatever is still owed to the
+            // reserved role. Once the reserve is filled (or was never claimable
+            // this turn) the cap is the ordinary one.
+            if let reservation = configuration.reservedRoleSlotsPerKind[kind],
+               reservation.role != atom.draft.contentRole,
+               let reserved = reservedSlots[kind] {
+                cap -= max(0, reserved - reservedRoleCounts[kind, default: 0])
+            }
+            if kindCounts[kind, default: 0] + 1 > cap { return false }
         }
         return true
+    }
+
+    /// Per-turn correction cap. Returns false when admitting `unit` would push
+    /// the turn past `configuration.maximumCorrectionAtomsPerTurn` corrections
+    /// the message is not about.
+    ///
+    /// WHY: her store is nine-tenths corrections, so a recall for "memory"
+    /// handed back twelve `[correction]` rows and two facts — the person she
+    /// remembers being was mostly someone who got things wrong. The cap is on
+    /// AMBIENT corrections only. A correction the current message is actually
+    /// about is exempt and rides in on its score like any other atom, and a
+    /// mandatory/pinned correction never reaches the dynamic quota loop at all.
+    /// An unresolved conflict is atomic but NOT exempt: `quotaAllows` waives the
+    /// diversity caps for a conflict because a half-shown conflict misleads, and
+    /// the honest way to keep that property under a correction cap is to admit
+    /// the whole unit or none of it. A four-claim correction conflict therefore
+    /// stays out entirely rather than smuggling four ambient corrections past a
+    /// cap of three.
+    func correctionCapAllows(
+        _ unit: SelectionUnit,
+        admittedCorrections: Int,
+        scores: [ContextAtomID: ContextCandidateScoreFeatures]
+    ) -> Bool {
+        var admitted = admittedCorrections
+        for atom in unit.atoms where atom.draft.kind == .correction {
+            if Self.correctionIsAboutMessage(scores[atom.draft.id]) { continue }
+            admitted += 1
+            if admitted > configuration.maximumCorrectionAtomsPerTurn { return false }
+        }
+        return true
+    }
+
+    /// Is THIS message about that correction? `messageCoverage` is the one
+    /// score feature carried context cannot dilute, and `lexicalExact` is 1
+    /// only when the normalized message appears verbatim in the atom — both are
+    /// "the user just raised this", not "this scored well overall".
+    static func correctionIsAboutMessage(_ score: ContextCandidateScoreFeatures?) -> Bool {
+        guard let score else { return false }
+        return score.messageCoverage >= 0.5 || score.lexicalExact == 1
+    }
+
+    /// The reserved-role units this turn actually qualifies, and how many slots
+    /// they can claim per kind.
+    ///
+    /// Qualification is per atom: the reserved role AND the reservation's
+    /// message-coverage gate. A turn with no qualifying atom reserves nothing
+    /// and takes no promotion, so selection is byte-identical to having no
+    /// reservation configured at all.
+    func reservedRolePlan(
+        in units: [SelectionUnit],
+        scores: [ContextAtomID: ContextCandidateScoreFeatures]
+    ) -> (slots: [ContextAtomKind: Int], qualifyingKeys: Set<String>) {
+        guard !configuration.reservedRoleSlotsPerKind.isEmpty else { return ([:], []) }
+        var available: [ContextAtomKind: Int] = [:]
+        var keys = Set<String>()
+        for unit in units where unit.conflictID == nil {
+            for atom in unit.atoms {
+                guard let reservation = configuration.reservedRoleSlotsPerKind[atom.draft.kind],
+                      reservation.role == atom.draft.contentRole,
+                      (scores[atom.draft.id]?.messageCoverage ?? 0)
+                        >= reservation.minimumMessageCoverage else { continue }
+                available[atom.draft.kind, default: 0] += 1
+                keys.insert(unit.stableKey)
+            }
+        }
+        let slots: [ContextAtomKind: Int] = available.reduce(into: [:]) { result, entry in
+            guard let reservation = configuration.reservedRoleSlotsPerKind[entry.key] else { return }
+            let value = min(reservation.slots, entry.value)
+            if value > 0 { result[entry.key] = value }
+        }
+        return (slots, slots.isEmpty ? [] : keys)
     }
 
     func plannedItems(
@@ -1545,7 +2022,8 @@ private extension ContextSelector {
         if bodyCount <= remainingCharacters {
             return unit.atoms.map {
                 ContextPacketItem(
-                    pointer: ContextAtomPointer(atom: $0, generationID: generationID),
+                    atom: $0,
+                    generationID: generationID,
                     text: $0.draft.body,
                     representation: .body,
                     mandatory: false
@@ -1558,7 +2036,8 @@ private extension ContextSelector {
         guard summaryCount <= remainingCharacters else { return nil }
         return zip(unit.atoms, summaries).map { atom, summary in
             ContextPacketItem(
-                pointer: ContextAtomPointer(atom: atom, generationID: generationID),
+                atom: atom,
+                generationID: generationID,
                 text: summary ?? "",
                 representation: .deterministicSummary,
                 mandatory: false
@@ -1732,19 +2211,10 @@ private enum ContextLexicalTokenizer {
     /// overlap gate made any prose-heavy resident truth match unrelated chat
     /// through words such as "the" or "is". Identifiers, numbers, domain
     /// terms, explicit triggers, and semantic vectors remain untouched.
-    private static let routingStopWords: Set<String> = [
-        "a", "an", "and", "are", "as", "at", "be", "been", "by", "for",
-        "from", "has", "have", "he", "her", "hers", "him", "his", "i", "in",
-        "is", "it", "its", "me", "my", "of", "on", "or", "our", "ours", "she",
-        "that", "the", "their", "theirs", "them", "they", "this", "to", "was",
-        "we", "were", "what", "when", "where", "which", "who", "why", "will",
-        "with", "you", "your", "yours",
-        // Auxiliary/modal verbs express the question, not its subject. A
-        // question starting "should the agent ..." must not rank every
-        // unrelated instruction containing "agent should" above the answer.
-        "am", "being", "can", "could", "did", "do", "does", "had",
-        "may", "might", "must", "shall", "should", "would",
-    ]
+    // 2026-09-06: this list now lives beside the stemmer both lanes already
+    // share, because MemoryV2's BM25 lane needed the same one. Same members,
+    // one definition. See RecallLexicalNormalization.stopWords.
+    private static let routingStopWords: Set<String> = RecallLexicalNormalization.stopWords
 
     static func tokens(_ text: String) -> Set<String> {
         Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }.compactMap {

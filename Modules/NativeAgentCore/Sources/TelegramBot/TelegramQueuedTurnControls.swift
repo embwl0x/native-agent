@@ -12,8 +12,14 @@ struct TelegramQueuedTurnControlCallback: Sendable, Equatable {
     let action: TelegramQueuedTurnControlAction
     let updateId: Int
     let chatId: Int
+    /// 2026-09-06: the forum topic the control button lives in.
+    let threadId: Int?
     let messageId: Int
     let fromUserId: Int?
+
+    var destination: TelegramDestination {
+        TelegramDestination(chatId: chatId, threadId: threadId)
+    }
 
     init?(_ raw: JSONValue) {
         guard case .object(let object) = raw,
@@ -35,6 +41,7 @@ struct TelegramQueuedTurnControlCallback: Sendable, Equatable {
         self.action = parsed.action
         self.updateId = parsed.updateId
         self.chatId = chatId
+        self.threadId = TelegramDestination.topicThreadId(inMessageObject: message)
         self.messageId = messageId
         self.fromUserId = fromUserId
     }

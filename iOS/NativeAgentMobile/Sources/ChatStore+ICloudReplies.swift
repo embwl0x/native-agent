@@ -34,6 +34,14 @@ extension ChatStore {
             receiveICloudProgress(msg)
             return
         }
+        // 2026-09-06: in-turn notices (provider reconnect, context compaction)
+        // arrive on their own key with their kind intact. They drive the same
+        // status line as progress — the text is already the sentence to show,
+        // exactly as Telegram renders provider_retry and context_compaction.
+        if msg.metadata?["kind"] == "notice" {
+            receiveICloudProgress(msg)
+            return
+        }
         // PATCH-2026-05-30: in-flight text streaming. text_delta events carry
         // accumulated text-so-far; iOS updates the placeholder bubble in place
         // without finalizing. Final reply still arrives as a plain BridgeMessage
@@ -486,23 +494,38 @@ extension ChatStore {
     /// Updates `lastRefreshAt` so throttled callers are debounced afterwards.
     func forceRefresh(using client: MacBridgeClient, fallbackMessages: [ChatMessage]?) async {
         await forceRefresh(
-            loadHistory: { await client.refreshChatHistory(sessionID: $0) },
+            loadTranscript: { await client.readChatTranscript(sessionID: $0) },
+            fallbackMessages: fallbackMessages
+        )
+    }
+
+    /// The pre-2026-09-06 array-shaped loader: nil is an unavailable read and
+    /// an empty array carries no transcript version, so it can never clear.
+    func forceRefresh(
+        loadHistory: (String?) async -> [ChatMessage]?,
+        fallbackMessages: [ChatMessage]?
+    ) async {
+        await forceRefresh(
+            loadTranscript: { sessionID in
+                guard let messages = await loadHistory(sessionID) else { return .unavailable }
+                return .published(messages, generation: nil)
+            },
             fallbackMessages: fallbackMessages
         )
     }
 
     func forceRefresh(
-        loadHistory: (String?) async -> [ChatMessage]?,
+        loadTranscript: (String?) async -> MacTranscriptRead,
         fallbackMessages: [ChatMessage]?
     ) async {
         lastRefreshAt = Date()
         let sessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
         let generation = sessionSwitchGeneration
-        let macMessages = await loadHistory(sessionID)
+        let read = await loadTranscript(sessionID)
         guard !Task.isCancelled,
               generation == sessionSwitchGeneration,
               sessionID == Self.cleanSessionID(selectedSessionID ?? mainSessionID) else { return }
-        guard let macMessages else {
+        guard read != .unavailable else {
             if messages.isEmpty, let fallbackMessages, !fallbackMessages.isEmpty {
                 messages = fallbackMessages
             }
@@ -510,7 +533,7 @@ extension ChatStore {
         }
         // Push, foreground refresh, and missed-reply recovery share one merge
         // owner, including same-ID text updates and timed-out reply recovery.
-        applyMacTranscriptSnapshot(macMessages, sessionID: sessionID)
+        applyMacTranscriptRead(read, sessionID: sessionID)
     }
 
     private func fireTimeout(pendingId: String, placeholderId: UUID) {

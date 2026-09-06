@@ -20,7 +20,11 @@ final class RemotePushProcessingEvalTests: XCTestCase {
         XCTAssertEqual(deviceSync.recordedEventIDs, [deviceSyncEventID])
         XCTAssertEqual(deviceSync.acknowledgedEventIDs, [deviceSyncEventID])
         XCTAssertEqual(deviceSync.drainedKinds, ["device-sync"])
-        XCTAssertEqual(deviceSync.steps, ["record", "acknowledge", "drain", "inbox", "activity"])
+        // 2026-09-06 (86b9825e): the acknowledgement moved BEHIND the recovery
+        // lanes — its iCloud action write can wait 30 s while the background
+        // push must report at 25 s, so acknowledging first starved reply
+        // recovery on the very push that announced it.
+        XCTAssertEqual(deviceSync.steps, ["record", "drain", "inbox", "activity", "acknowledge"])
 
         let plainEventID = NativeAgentDeviceEventIdentity.notification(
             userInfo: ["itemId": "plain-notification"]

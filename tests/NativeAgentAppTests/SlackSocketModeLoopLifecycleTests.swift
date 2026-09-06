@@ -557,7 +557,7 @@ func slackReceiveLoopReturn_shortSessionIsFailureAndLongSessionIsCompleted() {
 /// hammering a disabled app or piling on more sockets.
 @Test
 func slackSessionClosure_fatalReasonsFailEvenOnALongSession() {
-    for reason in ["link_disabled", "too_many_connections", "LINK_DISABLED"] {
+    for reason in ["link_disabled", "too_many_connections", "too_many_websockets", " TOO_MANY_WEBSOCKETS ", "LINK_DISABLED"] {
         let outcome = SlackSocketModeLoop.classifySessionClosure(
             .disconnect(reason: reason),
             sessionDuration: 3_000,

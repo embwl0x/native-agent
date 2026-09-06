@@ -1,4 +1,5 @@
 import Foundation
+import Dispatcher
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
@@ -73,6 +74,28 @@ enum ToolLoopExhaustion {
     }
 }
 
+/// User, 2026-09-06: the engine REFUSING to start a provider call the turn
+/// cannot pay for.
+///
+/// The loop checks the whole-turn budget at the iteration boundary — before
+/// context assembly, which itself costs real wall time — and the remainder that
+/// bounds the call's wall is not sampled until the provider is about to be
+/// asked. Between those two points the budget can go, and
+/// `ProviderRecoveryPolicy.callWallSeconds` turns a zero remainder into the
+/// 60 s FLOOR: a full minute of provider work started by a turn with nothing
+/// left. `streamTurn` samples the remainder itself now and raises this instead.
+///
+/// It is the BUDGET ending, not a provider failure, so the text-compat loop
+/// takes its exhausted exit on it — the same one the loop head takes — rather
+/// than the reconnect ladder, which would replay a call there is equally no
+/// time for. Typed, because that ladder classifies on the type.
+struct TurnBudgetSpentBeforeProviderCall: Error, LocalizedError, CustomStringConvertible {
+    var description: String {
+        "turn budget spent before the provider call could start"
+    }
+    var errorDescription: String? { description }
+}
+
 // MARK: - Post-tool-effect provider failures (whole-turn retry unsafe)
 
 /// A provider failure thrown AFTER at least one tool dispatch in this turn
@@ -96,9 +119,40 @@ public struct ProviderErrorAfterToolEffects: Error, LocalizedError, CustomString
         return "provider failure after \(dispatchCount) tool dispatch(es) [\(Self.markerPhrase)]: \(inner)"
     }
 
+    /// Tools that read and never write. A provider failure after only these
+    /// leaves nothing to re-execute, so the surface may replay the turn.
+    /// User, 2026-09-04: his "do you still love me on Astra" lost its reply
+    /// because chatgpt.com dropped the connection right after `inner_state`
+    /// (58 ms, read-only) and the turn was refused a retry as if a message
+    /// had been sent. Only names whose dispatch has no side effect belong
+    /// here; when in doubt, leave a tool out.
+    public static let readOnlyToolNames: Set<String> = [
+        "inner_state",
+        "agent_introspect",
+    ]
+
+    /// The dispatches that matter for retry safety: everything except the
+    /// read-only names above.
+    ///
+    /// User, 2026-09-06: and except the slots a Stop reached before they ran.
+    /// Those records exist only to keep the wire pairing valid; counting them
+    /// by NAME made an undispatched `write_file` look like a write that had
+    /// happened, and refused the turn a replay that was safe.
+    ///
+    /// User, 2026-09-06: a call the Stop reached AFTER it started is the other
+    /// way round — it carries `effects_unknown`, and unknown effects are
+    /// effects for retry safety.
+    public static func effectfulCount(_ dispatches: [TurnEngineResult.ToolDispatchRecord]) -> Int {
+        dispatches.filter {
+            guard !readOnlyToolNames.contains($0.name) else { return false }
+            return !ChatToolOutcome.wasCancelled($0.result)
+                || ChatToolOutcome.effectsUnknown($0.result)
+        }.count
+    }
+
     /// Wraps only when wrapping is meaningful: never cancellation (user stops
     /// must keep their type), never double-wraps, and never before the first
-    /// tool dispatch (pre-effect failures stay retryable end-to-end).
+    /// EFFECTFUL tool dispatch (pre-effect failures stay retryable end-to-end).
     static func wrapping(_ error: Error, dispatchCount: Int) -> Error {
         if error is CancellationError { return error }
         if error is ProviderErrorAfterToolEffects { return error }
@@ -156,7 +210,7 @@ public enum ToolLoopBudget {
 ///
 /// It is also PROGRESS-AWARE (2026-08-31): a round that lands at least one
 /// successful tool dispatch re-grants the surface window via `recordProgress()`,
-/// capped at start + the unattended ceiling. So the ceiling a turn actually
+/// capped at start + `progressCeilingSeconds`. So the ceiling a turn actually
 /// feels is "how long since it last got somewhere", not "how long has it run" —
 /// stuck turns still die on schedule, working turns keep working.
 ///
@@ -178,6 +232,14 @@ struct WholeTurnWallClockBudget: Sendable {
     /// interactive now; progress extension does the rest.
     static let defaultTelegramSeconds: TimeInterval = 600
     static let defaultUnattendedSeconds: TimeInterval = 3_900
+    /// 6h, and it bounds the PROGRESS EXTENSION only — never a fresh window.
+    /// The old ceiling was start + defaultUnattendedSeconds, which killed
+    /// turns that were still landing productive rounds an hour in: a turn that
+    /// re-earns its window every round is by definition not the runaway the
+    /// brake exists for, so the only honest ceiling is one long enough to
+    /// outlast a real work session. Surface defaults and the per-round window
+    /// are untouched — a stuck turn still dies at its surface budget.
+    static let progressCeilingSeconds: TimeInterval = 21_600
 
     @TaskLocal static var nowNanoseconds: MonotonicClock = {
         DispatchTime.now().uptimeNanoseconds
@@ -188,8 +250,8 @@ struct WholeTurnWallClockBudget: Sendable {
     private var deadlineNanoseconds: UInt64
     /// The surface (or override) window, re-granted by each productive round.
     private let windowNanoseconds: UInt64
-    /// start + defaultUnattendedSeconds: an extended interactive turn can
-    /// never outlive what an unattended lane gets, no matter how productive.
+    /// start + progressCeilingSeconds: an extended turn can never outlive a
+    /// full work session, no matter how productive.
     private let ceilingNanoseconds: UInt64
     private let clock: MonotonicClock
 
@@ -224,7 +286,7 @@ struct WholeTurnWallClockBudget: Sendable {
             deadlineNanoseconds: deadline,
             windowNanoseconds: duration,
             ceilingNanoseconds: Self.offset(
-                startedAt, by: UInt64(defaultUnattendedSeconds * 1_000_000_000)
+                startedAt, by: UInt64(progressCeilingSeconds * 1_000_000_000)
             ),
             clock: clock
         )
@@ -251,6 +313,16 @@ struct WholeTurnWallClockBudget: Sendable {
 
     var isExhausted: Bool {
         clock() >= deadlineNanoseconds
+    }
+
+    /// Seconds left before the current deadline, floored at zero. Two readers,
+    /// both added 2026-09-06: the per-call provider wall is bounded by this so
+    /// one hung call cannot eat the whole turn, and the reconnect ladders
+    /// refuse a Retry-After longer than what is left.
+    var remainingSeconds: TimeInterval {
+        let now = clock()
+        guard deadlineNanoseconds > now else { return 0 }
+        return TimeInterval(deadlineNanoseconds - now) / 1_000_000_000
     }
 
     /// Whole-turn wall time so far, on the SAME clock isExhausted reads, so
@@ -628,8 +700,19 @@ struct ToolLoopNoProgressGuard {
         return zip(lhs, rhs).allSatisfy { left, right in
             left.name == right.name
                 && left.input == right.input
-                && left.result == right.result
+                && comparableResult(left.result) == comparableResult(right.result)
         }
+    }
+
+    /// User, 2026-09-06: an approval envelope carries a FRESH `approvalId` every
+    /// time one is filed, so two identical CONFIRM requests never compared equal
+    /// and the streak never grew past one — the guard could not see the one loop
+    /// shape it exists to stop. The id is filing bookkeeping, not the result.
+    private static func comparableResult(_ result: JSONValue) -> JSONValue {
+        guard ChatToolOutcome.isWaitingApproval(result),
+              case .object(var object) = result else { return result }
+        object["approvalId"] = nil
+        return .object(object)
     }
 }
 
@@ -664,6 +747,29 @@ private enum SameTurnToolSchemaRefresh {
         return refreshed
     }
 
+    /// PLAN LANE (Anthropic mid-conversation tool changes). The `tools` array
+    /// is TURN-INVARIANT there — growing it mid-turn is exactly the prefix
+    /// rewrite the whole lane exists to stop — so a `tool_load` is expressed
+    /// as a `tool_addition` message instead. Everything the model could load
+    /// is already declared in the array, so this only has to work out which
+    /// declared names became OFFERED, in array order.
+    static func newlyOfferedNames(
+        plan: StructuredToolChangePlan,
+        alreadyOffered: Set<String>,
+        sessionId: String?,
+        activeToolsStore: ActiveToolsStore
+    ) async -> [String] {
+        let session = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !session.isEmpty else { return [] }
+        let persisted = await activeToolsStore.load(sessionId: session).activeTools
+        let active = persisted.union(LLMCallContext.turnActiveTools ?? [])
+        let allowed = SwiftToolDispatcher.normalModelToolNames(activeTools: active)
+        let declared = plan.arrayNames
+        return plan.array.map(\.name).filter {
+            allowed.contains($0) && declared.contains($0) && !alreadyOffered.contains($0)
+        }
+    }
+
     static func wasRequested(
         calls: [ParsedToolCall],
         providerTools: ProviderToolNameMap
@@ -692,11 +798,24 @@ private enum SameTurnToolSchemaRefresh {
 //   2. Full-Mac surface lists (SwiftToolDispatcher.fullMacFileToolNames /
 //      SystemToolNames / AppToolNames / BuilderToolNames / RestartToolNames)
 //      → SERIAL. These are the process-spawn / write-power tools (shell,
-//      bash, git, apply_patch, run_tests, swift_build, swift_test, write_file,
-//      grep, git_status...);
-//      even the "read" git tools can touch .git/index. Referencing the
-//      dispatcher constants directly keeps this list drift-proof, same
-//      pattern as ToolPreloadHeuristics' builder group.
+//      bash, apply_patch, run_tests, swift_build, swift_test, write_file,
+//      mac_focus_app, app_restart...). Referencing the dispatcher constants
+//      directly keeps this list drift-proof, same pattern as
+//      ToolPreloadHeuristics' builder group.
+//      CARVE-OUT (2026-09-01): the READ half of the file surface —
+//      SwiftToolDispatcher.fullMacReadOnlyFileToolNames MINUS
+//      optionalIndexLockWriters, i.e. file_excerpt, grep, git_status, git_log
+//      and repo_dirty_summary — is admitted BEFORE this veto. Vetoing them
+//      cost a code turn four serial round-trips for one read fan-out. The
+//      "even the read git tools can touch .git/index" worry was REAL and is
+//      fixed at the source: FileSystemActions.runGit now runs every git read
+//      with GIT_OPTIONAL_LOCKS=0, git's own switch for read-only callers, so
+//      the opportunistic index refresh is not written at all. `git diff` of
+//      the working tree is the one command git does not apply that switch to,
+//      so it is excluded here (see optionalIndexLockWriters). `write_file`
+//      stays in the veto with the rest of the surface. Effect-time gates are
+//      untouched — Full-Mac access, the autonomy gate and the sandbox still
+//      decide whether any of these run at all.
 //   3. Explicit serial names: session-state mutators (tool_load/tool_unload
 //      write ActiveToolsStore; agent_swarm spawns workers), the agent
 //      subprocess pair (invoke_claude/invoke_codex), and the notify
@@ -713,7 +832,8 @@ private enum SameTurnToolSchemaRefresh {
 //      get) OR sit in the small audited read-only allowlist (time_now,
 //      agent_introspect, web_fetch class...). No signal → SERIAL.
 // Net effect: read_file, list_dir, recall_memory, search_kg, mail_search,
-// x_search etc. parallelize; anything write-class, shell-class,
+// x_search, file_excerpt, grep, git_status, git_log and
+// repo_dirty_summary parallelize; anything write-class, shell-class,
 // Mac-Integration-write, or approval-gated (approval-gated tools are
 // write/shell-class by construction in this catalog — the autonomy-gate
 // dispatch wrapper continues to gate EVERY call regardless) stays serial.
@@ -780,6 +900,29 @@ enum ParallelToolDispatch {
             + SwiftToolDispatcher.fullMacRestartToolNames
     )
 
+    /// `git diff` of the WORKING TREE is the one Full-Mac read that is not
+    /// provably write-free. FileSystemActions runs every git read with
+    /// `GIT_OPTIONAL_LOCKS=0`, which suppresses the opportunistic `.git/index`
+    /// stat-cache write for `git status`, `git log` and `git diff --staged` —
+    /// but git's `builtin/diff.c refresh_index_quietly()` does not consult
+    /// `use_optional_locks()`, so a plain `git diff` still rewrites the index
+    /// (verified on git 2.50.1; pinned by
+    /// RepoIntrospectActionsTests.readOnlyGitReadsLeaveTheIndexUnwritten...).
+    /// A set whose premise is "these mutate nothing" cannot contain it, so it
+    /// stays serial. If a future git honors the flag here, that test fails and
+    /// this entry can be deleted.
+    static let optionalIndexLockWriters: Set<String> = ["git_diff"]
+
+    /// Rule 2 read carve-out — the audited READ half of the Full-Mac file
+    /// surface, admitted before the veto above. Same drift-proofing: the names
+    /// come from the dispatcher constant, so a tool moved between the read and
+    /// write halves changes its dispatch class with it. Anything NOT in this
+    /// half (write_file, and every future addition to the write list or to the
+    /// system/app/builder/restart lists) still falls to the veto.
+    static let fullMacReadOnlyNames: Set<String> = Set(
+        SwiftToolDispatcher.fullMacReadOnlyFileToolNames
+    ).subtracting(optionalIndexLockWriters)
+
     /// Rule 3 — explicit serial names (state mutators, subprocess spawners,
     /// notify channels). claude_message/codex_message also trip the
     /// "message" keyword; listed anyway so the intent is visible.
@@ -834,6 +977,11 @@ enum ParallelToolDispatch {
     static func isParallelSafe(internalToolName name: String) -> Bool {
         // Rule 1: external MCP tools — unknowable side effects.
         if name.hasPrefix("mcp__") { return false }
+        // Rule 2 carve-out: the audited READ half of the Full-Mac file
+        // surface. Consulted before the veto (and before the keyword rules,
+        // which have no positive signal for `grep`/`git_diff`/`git_log`/
+        // `file_excerpt`/`repo_dirty_summary`).
+        if fullMacReadOnlyNames.contains(name) { return true }
         // Rule 2: Full-Mac power surface.
         if fullMacSerialNames.contains(name) { return false }
         // Rule 3: explicit serial names.
@@ -1563,7 +1711,11 @@ extension TurnContext {
             toolSchemas: newSchemas,
             systemSegments: systemSegments,
             imageBlocks: imageBlocks,
-            fluidContextTurn: fluidContextTurn
+            fluidContextTurn: fluidContextTurn,
+            naturalExpressionCue: naturalExpressionCue,
+            historyMessages: historyMessages,
+            turnVolatileBlock: turnVolatileBlock,
+            historyWindowReceipt: historyWindowReceipt
         )
     }
 }
@@ -1581,7 +1733,8 @@ extension SwiftNativeTurnEngine {
     nonisolated func lazyFilteredTurnContext(
         _ ctx: TurnContext,
         sessionId: String?,
-        pinnedActiveTools: Set<String>? = nil
+        pinnedActiveTools: Set<String>? = nil,
+        pinnedContract: SessionToolContract? = nil
     ) async -> TurnContext {
         // pinnedActiveTools (2026-08-13, turn-context-iteration-cache): the
         // text-compat marker lane rebuilds context per tool iteration, and a
@@ -1597,20 +1750,32 @@ extension SwiftNativeTurnEngine {
         // immediately. Callers that need next-iteration list refresh (the
         // kimi native-tools lane, whose provider tools array is the only way
         // its model can call a tool) pass nil and keep the store read.
+        //
+        // The CONTRACT is pinned for the whole turn on a pinned lane, exactly
+        // like the active set. Re-reading the store per iteration was a
+        // mid-turn shrink: `tool_unload(A)` (or an idle drop landing between
+        // iterations) removed A's row, so the next iteration advertised a
+        // SHORTER catalog inside the cache-breakpointed stable segment and
+        // killed the prefix for the rest of the turn. Every contract change —
+        // unloads included — now takes effect at the NEXT turn start.
+        let trimmedSession = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let contract: SessionToolContract?
         let active: Set<String>
         if let pinnedActiveTools {
+            contract = pinnedContract
             active = pinnedActiveTools.union(LLMCallContext.turnActiveTools ?? [])
+        } else if !trimmedSession.isEmpty {
+            let loadout = await activeToolsStore.load(sessionId: trimmedSession)
+            contract = loadout.toolContract
+            active = loadout.activeTools.union(LLMCallContext.turnActiveTools ?? [])
         } else {
-            let trimmedSession = (sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedSession.isEmpty {
-                let persisted = await activeToolsStore.load(sessionId: trimmedSession).activeTools
-                active = persisted.union(LLMCallContext.turnActiveTools ?? [])
-            } else {
-                active = LLMCallContext.turnActiveTools ?? []
-            }
+            contract = nil
+            active = LLMCallContext.turnActiveTools ?? []
         }
         return SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
-            to: ctx, activeTools: active
+            to: ctx,
+            activeTools: active,
+            contract: contract
         ) ?? ctx
     }
 }
@@ -1642,18 +1807,15 @@ extension SwiftNativeTurnEngine {
     /// FIX 1 (B1.1): append an empty-reply nudge as a user turn. An empty reply
     /// leaves no assistant message, so a fresh `.user` message would follow the
     /// previous iteration's tool_result user message — two consecutive user
-    /// turns, which the Anthropic wire rejects. Mirror the native-lane
-    /// `appendNativeUserText` merge: fold the nudge into the trailing user
-    /// message when one is present; otherwise stand it alone.
+    /// turns, which the Anthropic wire rejects.
+    ///
+    /// v2Prefix adds a second fatal adjacency: the seeded array now ENDS with
+    /// the volatile system message, and a user message directly after one is
+    /// also a 400. Both rules live in `ConversationPrefixSeeding.appendUserText`;
+    /// this stays as the call-site name. With no trailing system message its
+    /// behavior is byte-identical to the merge-else-append it replaced.
     static func appendStructuredUserNudge(_ text: String, to conversation: inout [LLMMessage]) {
-        if let last = conversation.last, last.role == .user {
-            conversation[conversation.count - 1] = LLMMessage(
-                role: .user,
-                content: last.content + [.text(text)]
-            )
-        } else {
-            conversation.append(.user(text))
-        }
+        ConversationPrefixSeeding.appendUserText(text, to: &conversation)
     }
 
     /// Shared pre-loop context resolution. Prefer a caller-provided context
@@ -1726,6 +1888,7 @@ extension SwiftNativeTurnEngine {
         await observeMemoryPromotion(
             userMessage: userMessage,
             assistantMessage: reply,
+            toolDispatches: dispatches,
             sessionId: sessionId,
             surface: surface
         )
@@ -1774,7 +1937,10 @@ extension SwiftNativeTurnEngine {
         activeToolSchemas: inout [LLMToolSchema],
         providerTools: inout ProviderToolNameMap,
         noProgressGuard: inout ToolLoopNoProgressGuard,
-        loopRecoveryReply: inout String?
+        loopRecoveryReply: inout String?,
+        toolChangePlan: StructuredToolChangePlan? = nil,
+        offeredToolNames: inout Set<String>,
+        cancelFlagPath: URL? = nil
     ) async -> ToolDispatchRoundOutcome {
         // Append the assistant turn that contained the tool calls. Strip any
         // <tool_use> markers from the surfaced text so the assistant text block
@@ -1820,12 +1986,22 @@ extension SwiftNativeTurnEngine {
             personaID: ctx.personaID,
             fluidContextTurn: ctx.fluidContextTurn,
             tools: tools,
-            progress: progress
+            progress: progress,
+            // OFFERED != AUTHORIZED != DECLARED. The array declares the whole
+            // session catalog; only the offered set may dispatch, and
+            // SwiftToolDispatcher still gates every one of those.
+            offeredToolNames: toolChangePlan == nil ? nil : offeredToolNames,
+            cancelFlagPath: cancelFlagPath
         )
         dispatches.append(contentsOf: iterationRecords)
         // Whole-turn budget extension signal (see ToolDispatchRoundOutcome).
+        // User, 2026-09-06: an approval FILED is not a tool that ran, so it does
+        // not re-earn the surface window. A model stuck re-asking for the same
+        // CONFIRM renewed the budget every round and rode the turn to the
+        // iteration cap.
         let madeProgress = iterationRecords.contains {
             ChatToolOutcome.outputLooksSuccessful($0.result)
+                && !ChatToolOutcome.isWaitingApproval($0.result)
         }
         switch noProgressGuard.observe(iterationRecords) {
         case .none:
@@ -1843,16 +2019,44 @@ extension SwiftNativeTurnEngine {
             toolResultBlocks.append(.text(feedback))
             loopRecoveryReply = feedback
         }
-        conversation.append(LLMMessage(role: .user, content: toolResultBlocks))
+        conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
+        LocalToolImage.boundConversation(&conversation)
         if loopRecoveryReply != nil { return .stopLoop }
         if SameTurnToolSchemaRefresh.wasRequested(calls: providerCalls, providerTools: providerTools) {
-            activeToolSchemas = await SameTurnToolSchemaRefresh.afterLoad(
-                current: activeToolSchemas,
-                sessionId: sessionId,
-                tools: tools,
-                activeToolsStore: activeToolsStore
-            )
-            providerTools = ProviderToolNameMap(activeToolSchemas)
+            if let toolChangePlan {
+                // Same SEMANTICS as the refresh below — a tool loaded mid-turn
+                // is usable on the very next provider call — expressed without
+                // touching the array. The message goes after the tool_result
+                // user message (a legal position for a mid-conversation system
+                // message) and ends the array, so it renders on the next call.
+                let newlyOffered = await SameTurnToolSchemaRefresh.newlyOfferedNames(
+                    plan: toolChangePlan,
+                    alreadyOffered: offeredToolNames,
+                    sessionId: sessionId,
+                    activeToolsStore: activeToolsStore
+                )
+                if !newlyOffered.isEmpty {
+                    offeredToolNames.formUnion(newlyOffered)
+                    // Validated by construction: every name came out of the
+                    // array, and the map was built from that same array.
+                    let providerNames = newlyOffered.compactMap {
+                        providerTools.providerName(forInternalName: $0)
+                    }
+                    if let message = ConversationPrefixSeeding.toolChangeMessage(
+                        additions: providerNames, removals: []
+                    ) {
+                        conversation.append(message)
+                    }
+                }
+            } else {
+                activeToolSchemas = await SameTurnToolSchemaRefresh.afterLoad(
+                    current: activeToolSchemas,
+                    sessionId: sessionId,
+                    tools: tools,
+                    activeToolsStore: activeToolsStore
+                )
+                providerTools = ProviderToolNameMap(activeToolSchemas)
+            }
         }
         // U1 step 5 + item 8 (review fix): the sweep mutates bytes inside the
         // trailing-message cached prefix, so it fires ONLY in compat mode (no
@@ -1885,24 +2089,42 @@ extension SwiftNativeTurnEngine {
         userMessage: String,
         sessionId: String?,
         surface: String,
-        additionalStructuredToolCallSignal: Bool = false
+        additionalStructuredToolCallSignal: Bool = false,
+        /// Prose the user ALREADY WATCHED RENDER this turn, marker-stripped.
+        /// User, 2026-09-06: a streaming turn that hit the whole-turn budget in
+        /// the reconnect ladder took the generic exhaustion reply whenever an
+        /// earlier round had tool calls, and the client persisted THAT as the
+        /// reply — so displayed paragraphs vanished on reload. Empty on the
+        /// non-streaming lane, where nothing was displayed.
+        visiblePartial: String = ""
     ) async -> TurnEngineResult {
         let fallbackText = ToolCallParser.stripToolUseMarkers(lastRawResponse).trimmingCharacters(in: .whitespacesAndNewlines)
         let recalledIds = ctx.resolvedRecalledIds
         let rawWasOnlyStructuredToolCall = additionalStructuredToolCallSignal
             || !ToolCallParser.parse(lastRawResponse).isEmpty
+        // What the user saw stays: the terminal line explains the stop, but it
+        // never REPLACES prose that already rendered.
+        //
+        // User, 2026-09-06: this used to apply on the exhaustion branch alone, so
+        // a turn that ended on the no-progress guard or on a protocol violation
+        // persisted the canned line by itself and the paragraphs the user had
+        // just watched render vanished on reload.
+        let shown = visiblePartial.trimmingCharacters(in: .whitespacesAndNewlines)
+        func keepingVisible(_ terminal: String) -> String {
+            shown.isEmpty ? terminal : shown + "\n\n" + terminal
+        }
         let final: String
         if let loopRecoveryReply {
-            final = loopRecoveryReply
+            final = keepingVisible(loopRecoveryReply)
         } else if let lastProtocolViolation {
-            final = lastProtocolViolation.terminalReply
+            final = keepingVisible(lastProtocolViolation.terminalReply)
         } else if fallbackText.isEmpty || rawWasOnlyStructuredToolCall {
-            final = ToolLoopExhaustion.fallbackReply(
+            final = keepingVisible(ToolLoopExhaustion.fallbackReply(
                 iterationLimit: iterationLimit,
                 dispatchCount: dispatches.count,
                 providerRounds: providerCallCount,
                 wallClockElapsedSeconds: wallClockElapsedSeconds
-            )
+            ))
         } else {
             final = fallbackText
         }
@@ -1911,6 +2133,7 @@ extension SwiftNativeTurnEngine {
         await observeMemoryPromotion(
             userMessage: userMessage,
             assistantMessage: final,
+            toolDispatches: dispatches,
             sessionId: sessionId,
             surface: surface
         )
@@ -1953,7 +2176,8 @@ extension SwiftNativeTurnEngine {
         // to halt a NON-streaming structured turn between provider calls, just
         // like the streaming loop's per-event poll. nil → legacy behavior (no
         // cross-process cancel), so existing callers are byte-identical.
-        cancelFlagPath: URL? = nil
+        cancelFlagPath: URL? = nil,
+        providerAdmission: (@Sendable () async throws -> Void)? = nil
     ) async throws -> TurnEngineResult {
         // P2-3: fold the Workshop surface once at the loop entry (see
         // buildTurnContext) so the whole tool loop threads one vocabulary.
@@ -1978,7 +2202,7 @@ extension SwiftNativeTurnEngine {
         // Shared pre-loop context resolution (C2): prefer preBuiltContext, else
         // build + lazy-filter through the session's active tools, then fire the
         // context-snapshot event.
-        let ctx = try await resolveToolLoopContext(
+        let resolvedTurnContext = try await resolveToolLoopContext(
             surface: surface,
             userMessage: userMessage,
             sessionId: sessionId,
@@ -1995,11 +2219,104 @@ extension SwiftNativeTurnEngine {
         // override to emit canonical wire shape for each provider.
         // Image blocks ride on the CURRENT user message ONLY (per-turn DYNAMIC)
         // — never persisted, never re-sent. Empty → exact pre-multimodal shape.
-        var conversation: [LLMMessage] = ctx.imageBlocks.isEmpty
-            ? [.user(ctx.userMessage)]
-            : [.userWithImages(ctx.userMessage, images: ctx.imageBlocks)]
-        var activeToolSchemas = ctx.toolSchemas
-        var providerTools = ProviderToolNameMap(activeToolSchemas)
+        // v2Prefix (2026-09-01): prior turns become a REAL message prefix and
+        // the per-turn volatile mass moves out of the churning tail of the
+        // system prompt into a message that sits AFTER it. On `.v1Legacy` this
+        // returns the exact single-user-message array built here before —
+        // `ctx` untouched, byte-identical request body.
+        // The BOUND shape, never `.effective`: the adapters read only the
+        // task-local, so resolving a second time here could disagree with what
+        // the outer turn entry bound and with what the context was built under.
+        // Mid-conversation tool changes (Anthropic structured lane). Unbound
+        // on every other lane → nil → nothing below this line changes.
+        //
+        // The provider-name map is built from the ARRAY and then held still
+        // for the whole turn: the array is turn-invariant, so its aliases are
+        // too, and every `tool_reference` name has to be the one THIS map
+        // minted or the request 400s.
+        let toolChangePlan = StructuredToolChangeContext.plan
+        var providerTools = ProviderToolNameMap(
+            toolChangePlan?.array ?? resolvedTurnContext.toolSchemas
+        )
+        let turnToolChanges = toolChangePlan.flatMap { plan in
+            ConversationPrefixSeeding.toolChangeMessage(
+                additions: plan.additions.compactMap {
+                    providerTools.providerName(forInternalName: $0)
+                },
+                removals: plan.removals.compactMap {
+                    providerTools.providerName(forInternalName: $0)
+                }
+            )
+        }
+        let prefixSeed = ConversationPrefixSeeding.seed(
+            resolvedTurnContext,
+            shape: ConversationPrefixShape.override ?? .v1Legacy,
+            toolChanges: turnToolChanges
+        )
+        let ctx = prefixSeed.context
+        // ARCHIVE THIS TURN'S REPLAYABLE TAIL — the tool-change message and the
+        // turn-scoped volatile block, exactly as seeded. The tool-change
+        // message is NOT turn-scoped: removing an already-sent one invalidates
+        // the prefix from that point, so it has the same must-stay contract as
+        // the volatile block and the same failure if dropped.
+        if let sessionId, !sessionId.isEmpty, let runId, !runId.isEmpty {
+            let replayable = Array(prefixSeed.messages.dropFirst(prefixSeed.currentUserIndex + 1))
+            if !replayable.isEmpty {
+                await TurnVolatileArchiveRegistry.shared
+                    .archive(dataRoot: remPinsDataRoot)
+                    .record(sessionId: sessionId, runId: runId, messages: replayable)
+            }
+        }
+        if prefixSeed.shape == .v2Prefix {
+            ConversationPrefixTelemetry.sink?.set(ConversationPrefixSeeding.telemetry(
+                prefixSeed,
+                shape: prefixSeed.shape,
+                // On a plan lane the cacheable tool contribution is the ARRAY,
+                // not the offered set: hashing the offered set would report a
+                // moved prefix on exactly the loads this lane stopped moving.
+                toolSchemaFingerprint: Self.toolSchemaFingerprint(
+                    toolChangePlan?.array ?? ctx.toolSchemas
+                ),
+                toolChangePlan: toolChangePlan
+            ))
+        }
+        var conversation: [LLMMessage] = prefixSeed.messages
+        // Context-overflow survival (2026-09-05): the model's REAL window,
+        // resolved once per turn, plus the working-notes writer the compactor
+        // folds with. Nothing at or before `compactionTurnStart` is ever folded
+        // — that index is the last message the SEED produced, so it covers this
+        // turn's user message (the request) and the volatile tail after it,
+        // both of which the replayed prefix requires. See
+        // IntraTurnContextCompaction.
+        let turnWindowTokens = ContextBudgetPolicy.windowTokens(
+            forModel: ctx.modelId,
+            providerID: ctx.providerId ?? LLMCallContext.providerId,
+            dataRoot: remPinsDataRoot
+        )
+        let compactionTurnStart = prefixSeed.messages.count - 1
+        let compactionClient = llm
+        let compactionModel = ctx.modelId
+        let compactionSurface = surface
+        let distillWorkingNotes: @Sendable (String) async throws -> String? = { rendered in
+            await IntraTurnContextCompaction.withDeadline(
+                seconds: IntraTurnContextCompaction.distillDeadlineSeconds
+            ) {
+                // A plain prompt with no replayed prefix: say v1 outright rather
+                // than inheriting whatever shape the turn bound.
+                try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+                    try await compactionClient.complete(
+                        prompt: rendered,
+                        system: IntraTurnContextCompaction.workingNotesSystem,
+                        model: compactionModel,
+                        surface: compactionSurface
+                    )
+                }
+            }
+        }
+        var activeToolSchemas = toolChangePlan?.array ?? ctx.toolSchemas
+        // Offered-so-far, so a mid-turn `tool_load` only ever adds what is not
+        // already on the table.
+        var offeredToolNames = Set(toolChangePlan?.offered ?? [])
         var dispatches: [TurnEngineResult.ToolDispatchRecord] = []
         var lastRawResponse: String = ""
         var lastProtocolViolation: ToolCallProtocolViolation?
@@ -2022,10 +2339,15 @@ extension SwiftNativeTurnEngine {
         var noProgressGuard = ToolLoopNoProgressGuard()
         var loopRecoveryReply: String?
         var providerCallCount = 0
+        // In-loop provider recovery (2026-09-05): how many times THIS turn has
+        // re-issued a provider call after a recoverable drop. Bounded so a
+        // provider that fails every round cannot ride the per-call budget
+        // forever. See ProviderRecoveryPolicy.
+        var turnRecoveries = 0
         var wallClockElapsedSeconds: Int?
         let iterationLimit = ToolLoopBudget.resolve(surface: surface, requested: maxIterations)
 
-        for _ in 0..<iterationLimit {
+        iterations: for _ in 0..<iterationLimit {
             // B7: cross-process Stop between provider calls. A bridge-surface
             // Stop that only WROTE cancelled.flag (no Task handle) halts the
             // turn here instead of running to iterationLimit burning tokens.
@@ -2048,18 +2370,85 @@ extension SwiftNativeTurnEngine {
             // U1 step 2b/3b: thread the stable/dynamic system split the same
             // way so the Anthropic adapters can place the sys cache
             // breakpoint at the stable-segment end (nil = combined block).
-            providerCallCount += 1
             let providerRoute = ctx.providerId ?? LLMCallContext.providerId
             let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
-            let raw: String
+            var raw = ""
+            // Context-overflow survival, PROACTIVE half: measure the whole
+            // in-flight conversation against the real window BEFORE spending a
+            // round trip on a body that cannot fit. Over the pressure line we
+            // trim first, so no provider call is ever wasted on a 400.
+            if IntraTurnContextCompaction.estimatedChars(conversation)
+                > IntraTurnContextCompaction.pressureChars(windowTokens: turnWindowTokens) {
+                let receipt = await IntraTurnContextCompaction.compact(
+                    conversation: &conversation,
+                    turnStartIndex: compactionTurnStart,
+                    windowTokens: turnWindowTokens,
+                    distill: distillWorkingNotes
+                )
+                if receipt.mode != "none" {
+                    TurnTraceBus.fireFromContext(
+                        kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
+                        surface: surface,
+                        payload: IntraTurnContextCompaction.tracePayload(
+                            receipt, trigger: "pressure", turnRecoveries: turnRecoveries
+                        )
+                    )
+                    await progress?(.notice(
+                        kind: IntraTurnContextCompaction.noticeKind,
+                        text: IntraTurnContextCompaction.noticeText
+                    ))
+                }
+                // User, 2026-09-06: compaction can distill through the model, so
+                // it spends real wall time. Re-check the budget it may have
+                // just exhausted — otherwise the round below samples a
+                // remainder of zero for its per-call wall and starts a provider
+                // call the turn has no time for.
+                if wholeTurnBudget.isExhausted {
+                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                    break
+                }
+            }
+            // User, 2026-09-06: counted HERE, after the last exit above it. The
+            // increment used to sit at the top of the round, so a compaction
+            // that exhausted the budget left behind a provider round the turn
+            // never made — and the exhaustion line quoted that inflated count
+            // back to the user.
+            providerCallCount += 1
+            // The provider call is retried IN PLACE on a recoverable failure:
+            // `conversation` already holds every tool result, so a retry
+            // re-issues the identical request and re-executes nothing. Only
+            // when the budget is spent does the turn die the old way.
+            var callAttempt = 1
+            // Overflow recoveries burnt on THIS provider call (step A, then
+            // step B). Bounded separately from the retry ladder because each
+            // one changes the body rather than repeating it.
+            var overflowRecoveries = 0
+            while true {
             do {
-            raw = try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
+            // Seeding may have fallen back to the v1 message array (no
+            // replayed history). Re-bind what was ACTUALLY produced so the
+            // adapter's wire layout and this body cannot disagree.
+            raw = try await ConversationPrefixShape.$override.withValue(prefixSeed.shape) {
+            // Where THIS turn begins. The adapter cannot re-derive it: replayed
+            // history carries archived `system` blocks of its own, so the old
+            // `lastIndex(.system)` anchor selected one of THOSE and dropped the
+            // cross-turn 1h marker near the start of the conversation — caching
+            // almost nothing, silently. Within-turn rounds only ever APPEND, so
+            // this index stays correct for every round of the turn.
+            try await ConversationPrefixBoundary.$currentUserIndex
+                .withValue(prefixSeed.currentUserIndex) {
+            // User, 2026-09-06: how long the WHOLE turn has left, so the router
+            // can shorten this call's wall to leave the reconnect ladder room.
+            try await LLMCallContext.$remainingTurnSeconds
+                .withValue(wholeTurnBudget.remainingSeconds) {
+            try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
             try await LLMCallContext.$providerId.withValue(providerRoute) {
             try await LLMCallContext.$serviceTier.withValue(serviceTier) {
             try await LLMCallContext.$systemSegments.withValue(ctx.systemSegments) {
                 try await LLMCallContext.$sessionId.withValue(sessionId) {
                     try await LLMCallContext.$reasoningEffort.withValue(ctx.reasoningEffort) {
-                    try await llm.completeMessages(
+                    try await providerAdmission?()
+                    return try await llm.completeMessages(
                         messages: conversation,
                         system: ctx.systemPrompt,
                         model: ctx.modelId,
@@ -2072,10 +2461,153 @@ extension SwiftNativeTurnEngine {
             }
             }
             }
+            }
+            }
+            }
+            break
             } catch {
+                // Context-overflow survival, REACTIVE half: the provider refused
+                // the body as TOO LONG. Re-issuing it verbatim gets the identical
+                // 400, so trim the conversation and ask again with a smaller one.
+                // Bounded per call and counted against the turn's recovery
+                // budget; a receipt of "none" means there is nothing left to give
+                // back, and the failure falls through to the throw below.
+                if callAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
+                   overflowRecoveries < IntraTurnContextCompaction.maxOverflowRecoveriesPerCall,
+                   turnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
+                   ProviderRecoveryPolicy.isContextOverflow(error) {
+                    let receipt = await IntraTurnContextCompaction.compact(
+                        conversation: &conversation,
+                        turnStartIndex: compactionTurnStart,
+                        windowTokens: turnWindowTokens,
+                        pressure: .overflow,
+                        distill: distillWorkingNotes
+                    )
+                    if receipt.mode != "none" {
+                        overflowRecoveries += 1
+                        turnRecoveries += 1
+                        TurnTraceBus.fireFromContext(
+                            kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
+                            surface: surface,
+                            payload: IntraTurnContextCompaction.tracePayload(
+                                receipt, trigger: "overflow", turnRecoveries: turnRecoveries
+                            )
+                        )
+                        // Cancellation outranks recovery — same two signals, same
+                        // ordering as the retry ladder below. No backoff: the body
+                        // CHANGED, so asking again immediately is the right move.
+                        try Task.checkCancellation()
+                        if let flag = cancelFlagPath,
+                           FileManager.default.fileExists(atPath: flag.path) {
+                            throw CancellationError()
+                        }
+                        await progress?(.notice(
+                            kind: IntraTurnContextCompaction.noticeKind,
+                            text: IntraTurnContextCompaction.noticeText
+                        ))
+                        // User, 2026-09-06: same rule as the retry ladder below
+                        // and as the streaming overflow path — no attempt
+                        // starts after the whole-turn budget is spent.
+                        if wholeTurnBudget.isExhausted {
+                            wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                            break iterations
+                        }
+                        callAttempt += 1
+                        providerCallCount += 1
+                        continue
+                    }
+                }
+                if callAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
+                   turnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
+                   ProviderRecoveryPolicy.isRecoverableTurnFailure(error) {
+                    // User, 2026-09-06: honor the provider's own Retry-After when
+                    // it asked for a longer wait than the ladder's backoff, and
+                    // refuse a wait the turn cannot afford — sleeping past the
+                    // budget only converts a rate limit into a bare exhaustion.
+                    let retryAfter = ProviderRecoveryPolicy.retryAfterSeconds(in: error)
+                    let delaySeconds = ProviderRecoveryPolicy.retryDelaySeconds(
+                        forRetry: callAttempt, error: error
+                    )
+                    let remainingBudget = wholeTurnBudget.remainingSeconds
+                    if delaySeconds >= remainingBudget {
+                        // Only say it when the PROVIDER asked for the long wait;
+                        // an ordinary backoff that outlasts the last second of
+                        // the budget is just the budget ending.
+                        if let retryAfter, retryAfter >= remainingBudget {
+                            await progress?(.notice(
+                                kind: "provider_retry",
+                                text: ProviderRecoveryPolicy.retryAfterBeyondBudgetStatus(
+                                    delaySeconds: retryAfter,
+                                    remainingSeconds: remainingBudget
+                                )
+                            ))
+                        }
+                        wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                        break iterations
+                    }
+                    turnRecoveries += 1
+                    TurnTraceBus.fireFromContext(
+                        kind: TurnLifecycleMilestone.providerRetry.rawValue,
+                        surface: surface,
+                        payload: .object([
+                            "attempt": .int(Int64(callAttempt)),
+                            "delaySeconds": .double(delaySeconds),
+                            "reason": .string(String(ProviderRecoveryPolicy.describe(error).prefix(200))),
+                            "mode": .string("replay"),
+                            "turnRecoveries": .int(Int64(turnRecoveries)),
+                        ])
+                    )
+                    // Cancellation outranks recovery, by Task state and by the
+                    // cross-process flag the loop already polls at this grain.
+                    try Task.checkCancellation()
+                    if let flag = cancelFlagPath,
+                       FileManager.default.fileExists(atPath: flag.path) {
+                        throw CancellationError()
+                    }
+                    // A silent reconnect looks identical to a hang. Emitted
+                    // AFTER the cancellation checks so a Stop never leaves a
+                    // "reconnecting" line as the last thing the surface said,
+                    // and BEFORE the backoff so it stands for the whole wait.
+                    // The kind carries "retry", which is what both surfaces
+                    // match on to show the retrying phase.
+                    await progress?(.notice(
+                        kind: "provider_retry",
+                        text: ProviderRecoveryPolicy.reconnectStatus(attemptsMade: callAttempt)
+                    ))
+                    try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                    // A Stop written during the backoff must not start one more
+                    // provider call: re-check both signals after the wait.
+                    try Task.checkCancellation()
+                    if let flag = cancelFlagPath,
+                       FileManager.default.fileExists(atPath: flag.path) {
+                        throw CancellationError()
+                    }
+                    // The retry ladder is not exempt from the whole-turn budget:
+                    // an expired budget ends the turn on the exhausted path
+                    // instead of starting one more attempt (Codex review
+                    // 2026-09-05).
+                    if wholeTurnBudget.isExhausted {
+                        wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                        break iterations
+                    }
+                    callAttempt += 1
+                    providerCallCount += 1
+                    continue
+                }
                 // A provider failure after this turn already dispatched tools
                 // must not be whole-turn-replayed by surface retry ladders.
-                throw ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: dispatches.count)
+                throw ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
+            }
+            }
+            // User, 2026-09-06: a Stop that landed WHILE this non-streaming call
+            // was in flight was only read before the request, so the tool calls
+            // it came back with were parsed and dispatched anyway. Re-check both
+            // stop signals before touching the response — the streaming lane
+            // already does exactly this at stream EOF.
+            try Task.checkCancellation()
+            if let flag = cancelFlagPath,
+               FileManager.default.fileExists(atPath: flag.path) {
+                throw CancellationError()
             }
             lastRawResponse = raw
             if let violation = ToolCallParser.formattedToolCallViolation(in: raw) {
@@ -2161,12 +2693,26 @@ extension SwiftNativeTurnEngine {
                 activeToolSchemas: &activeToolSchemas,
                 providerTools: &providerTools,
                 noProgressGuard: &noProgressGuard,
-                loopRecoveryReply: &loopRecoveryReply
+                loopRecoveryReply: &loopRecoveryReply,
+                toolChangePlan: toolChangePlan,
+                offeredToolNames: &offeredToolNames,
+                cancelFlagPath: cancelFlagPath
             )
             // A6 progress extension: a round that actually landed a tool result
             // re-earns the surface window (capped at the unattended ceiling).
             if case .continueLoop(let madeProgress) = outcome, madeProgress {
                 wholeTurnBudget.recordProgress()
+            }
+            // User, 2026-09-06: a Stop that landed during the LAST batch used to
+            // fall out of the loop and leave through `finishExhaustedTurn`,
+            // which records `.abandoned` and hands back the generic "ran out of
+            // iterations" reply — the user's Stop reported as ordinary
+            // exhaustion. Decide cancellation right after the round, on the
+            // same two signals the dispatch runner polls.
+            try Task.checkCancellation()
+            if let flag = cancelFlagPath,
+               FileManager.default.fileExists(atPath: flag.path) {
+                throw CancellationError()
             }
             if case .stopLoop = outcome { break }
         }
@@ -2226,7 +2772,7 @@ extension SwiftNativeTurnEngine {
         // Shared pre-loop context resolution (C2): same build + lazy-filter +
         // snapshot as the non-streaming path so the streaming surface doesn't
         // ship the full eager catalog either.
-        let ctx = try await resolveToolLoopContext(
+        let resolvedTurnContext = try await resolveToolLoopContext(
             surface: surface,
             userMessage: userMessage,
             sessionId: sessionId,
@@ -2234,11 +2780,104 @@ extension SwiftNativeTurnEngine {
             preBuiltContext: preBuiltContext
         )
 
-        var conversation: [LLMMessage] = ctx.imageBlocks.isEmpty
-            ? [.user(ctx.userMessage)]
-            : [.userWithImages(ctx.userMessage, images: ctx.imageBlocks)]
-        var activeToolSchemas = ctx.toolSchemas
-        var providerTools = ProviderToolNameMap(activeToolSchemas)
+        // v2Prefix (2026-09-01): prior turns become a REAL message prefix and
+        // the per-turn volatile mass moves out of the churning tail of the
+        // system prompt into a message that sits AFTER it. On `.v1Legacy` this
+        // returns the exact single-user-message array built here before —
+        // `ctx` untouched, byte-identical request body.
+        // The BOUND shape, never `.effective`: the adapters read only the
+        // task-local, so resolving a second time here could disagree with what
+        // the outer turn entry bound and with what the context was built under.
+        // Mid-conversation tool changes (Anthropic structured lane). Unbound
+        // on every other lane → nil → nothing below this line changes.
+        //
+        // The provider-name map is built from the ARRAY and then held still
+        // for the whole turn: the array is turn-invariant, so its aliases are
+        // too, and every `tool_reference` name has to be the one THIS map
+        // minted or the request 400s.
+        let toolChangePlan = StructuredToolChangeContext.plan
+        var providerTools = ProviderToolNameMap(
+            toolChangePlan?.array ?? resolvedTurnContext.toolSchemas
+        )
+        let turnToolChanges = toolChangePlan.flatMap { plan in
+            ConversationPrefixSeeding.toolChangeMessage(
+                additions: plan.additions.compactMap {
+                    providerTools.providerName(forInternalName: $0)
+                },
+                removals: plan.removals.compactMap {
+                    providerTools.providerName(forInternalName: $0)
+                }
+            )
+        }
+        let prefixSeed = ConversationPrefixSeeding.seed(
+            resolvedTurnContext,
+            shape: ConversationPrefixShape.override ?? .v1Legacy,
+            toolChanges: turnToolChanges
+        )
+        let ctx = prefixSeed.context
+        // ARCHIVE THIS TURN'S REPLAYABLE TAIL — the tool-change message and the
+        // turn-scoped volatile block, exactly as seeded. The tool-change
+        // message is NOT turn-scoped: removing an already-sent one invalidates
+        // the prefix from that point, so it has the same must-stay contract as
+        // the volatile block and the same failure if dropped.
+        if let sessionId, !sessionId.isEmpty, let runId, !runId.isEmpty {
+            let replayable = Array(prefixSeed.messages.dropFirst(prefixSeed.currentUserIndex + 1))
+            if !replayable.isEmpty {
+                await TurnVolatileArchiveRegistry.shared
+                    .archive(dataRoot: remPinsDataRoot)
+                    .record(sessionId: sessionId, runId: runId, messages: replayable)
+            }
+        }
+        if prefixSeed.shape == .v2Prefix {
+            ConversationPrefixTelemetry.sink?.set(ConversationPrefixSeeding.telemetry(
+                prefixSeed,
+                shape: prefixSeed.shape,
+                // On a plan lane the cacheable tool contribution is the ARRAY,
+                // not the offered set: hashing the offered set would report a
+                // moved prefix on exactly the loads this lane stopped moving.
+                toolSchemaFingerprint: Self.toolSchemaFingerprint(
+                    toolChangePlan?.array ?? ctx.toolSchemas
+                ),
+                toolChangePlan: toolChangePlan
+            ))
+        }
+        var conversation: [LLMMessage] = prefixSeed.messages
+        // Context-overflow survival (2026-09-05): the model's REAL window,
+        // resolved once per turn, plus the working-notes writer the compactor
+        // folds with. Nothing at or before `compactionTurnStart` is ever folded
+        // — that index is the last message the SEED produced, so it covers this
+        // turn's user message (the request) and the volatile tail after it,
+        // both of which the replayed prefix requires. See
+        // IntraTurnContextCompaction.
+        let turnWindowTokens = ContextBudgetPolicy.windowTokens(
+            forModel: ctx.modelId,
+            providerID: ctx.providerId ?? LLMCallContext.providerId,
+            dataRoot: remPinsDataRoot
+        )
+        let compactionTurnStart = prefixSeed.messages.count - 1
+        let compactionClient = llm
+        let compactionModel = ctx.modelId
+        let compactionSurface = surface
+        let distillWorkingNotes: @Sendable (String) async throws -> String? = { rendered in
+            await IntraTurnContextCompaction.withDeadline(
+                seconds: IntraTurnContextCompaction.distillDeadlineSeconds
+            ) {
+                // A plain prompt with no replayed prefix: say v1 outright rather
+                // than inheriting whatever shape the turn bound.
+                try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+                    try await compactionClient.complete(
+                        prompt: rendered,
+                        system: IntraTurnContextCompaction.workingNotesSystem,
+                        model: compactionModel,
+                        surface: compactionSurface
+                    )
+                }
+            }
+        }
+        var activeToolSchemas = toolChangePlan?.array ?? ctx.toolSchemas
+        // Offered-so-far, so a mid-turn `tool_load` only ever adds what is not
+        // already on the table.
+        var offeredToolNames = Set(toolChangePlan?.offered ?? [])
         var dispatches: [TurnEngineResult.ToolDispatchRecord] = []
         var lastRawResponse = ""
         // #5: visible prose accumulated across iterations (text deltas only, no
@@ -2281,17 +2920,19 @@ extension SwiftNativeTurnEngine {
         // One streamMessages call per iteration; count it like the non-streaming
         // loop does, and thread it into both TurnEngineResult returns below.
         var providerCallCount = 0
+        // In-loop provider recovery (2026-09-05): sibling of the non-streaming
+        // loop's counter. Bounds the recoveries across the WHOLE turn.
+        var turnRecoveries = 0
         var wallClockElapsedSeconds: Int?
         let iterationLimit = ToolLoopBudget.resolve(surface: surface, requested: maxIterations)
 
-        for _ in 0..<iterationLimit {
+        streamingIterations: for _ in 0..<iterationLimit {
             // A6: do not interrupt an active provider stream or dispatch. At
             // this boundary, expiry falls through to the one exhaustion tail.
             if wholeTurnBudget.isExhausted {
                 wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
                 break
             }
-            providerCallCount += 1
             var iterAccumulated = ""
             // Bytes this iteration actually handed to the surface (marker-safe
             // slices only). Folded into `turnInterstitialProse` when the
@@ -2299,6 +2940,65 @@ extension SwiftNativeTurnEngine {
             var iterEmittedProse = ""
             var streamedCalls: [ParsedToolCall] = []
             var pendingProtocolDelta = ""
+            // Context-overflow survival, PROACTIVE half: measure the whole
+            // in-flight conversation against the real window BEFORE spending a
+            // round trip on a body that cannot fit. Over the pressure line we
+            // trim first, so no provider call is ever wasted on a 400.
+            if IntraTurnContextCompaction.estimatedChars(conversation)
+                > IntraTurnContextCompaction.pressureChars(windowTokens: turnWindowTokens) {
+                let receipt = await IntraTurnContextCompaction.compact(
+                    conversation: &conversation,
+                    turnStartIndex: compactionTurnStart,
+                    windowTokens: turnWindowTokens,
+                    distill: distillWorkingNotes
+                )
+                if receipt.mode != "none" {
+                    TurnTraceBus.fireFromContext(
+                        kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
+                        surface: surface,
+                        payload: IntraTurnContextCompaction.tracePayload(
+                            receipt, trigger: "pressure", turnRecoveries: turnRecoveries
+                        )
+                    )
+                    await progress?(.notice(
+                        kind: IntraTurnContextCompaction.noticeKind,
+                        text: IntraTurnContextCompaction.noticeText
+                    ))
+                }
+                // User, 2026-09-06: compaction can distill through the model, so
+                // it spends real wall time. Re-check the budget it may have
+                // just exhausted — otherwise the round below samples a
+                // remainder of zero for its per-call wall and starts a provider
+                // call the turn has no time for.
+                if wholeTurnBudget.isExhausted {
+                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                    break
+                }
+            }
+            // User, 2026-09-06: counted HERE, after the last exit above it — the
+            // sibling of the non-streaming loop's move. A compaction that
+            // exhausted the budget used to leave a counted round that was never
+            // made.
+            providerCallCount += 1
+            // In-loop provider recovery (2026-09-05). A recoverable mid-stream
+            // drop no longer kills the turn: the tool results already sit in
+            // `conversation`, so the stream is re-issued in place. `retryAfterDrop`
+            // is how the catch (which lives INSIDE the task-local nest below)
+            // reports the drop out to the retry block after the nest closes —
+            // the stream has to be rebuilt under freshly-entered bindings.
+            // `attemptBase*` are the per-turn accumulators as they stood BEFORE
+            // this attempt, so a replay can discard the attempt whole.
+            var callAttempt = 1
+            var retryAfterDrop: Error?
+            // Context-overflow survival: `overflowAfterDrop` is the sibling of
+            // `retryAfterDrop` — the compaction receipt reported out of the nest
+            // so the block after it can announce and re-issue.
+            var overflowRecoveries = 0
+            var overflowAfterDrop: IntraTurnContextCompaction.Receipt?
+            var attemptMessages = conversation
+            let attemptBaseVisibleText = visibleText
+            let attemptBaseRawResponse = lastRawResponse
+            while true {
             // U1 step 4: thread the session id task-locally so the OpenAI
             // Responses adapter gets a stable prompt_cache_key. U1 step 2b/3b:
             // same for the stable/dynamic system split (Anthropic adapters'
@@ -2320,6 +3020,17 @@ extension SwiftNativeTurnEngine {
             // so wrapping only construction+consumption needs no re-indent.
             let providerRoute = ctx.providerId ?? LLMCallContext.providerId
             let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
+            // See the non-streaming sibling: bind the shape the seed actually
+            // produced, not the one that was asked for.
+            try await ConversationPrefixShape.$override.withValue(prefixSeed.shape) {
+            // See the non-streaming sibling: the authoritative current-turn
+            // seam, so a replayed archived system block cannot hijack it.
+            try await ConversationPrefixBoundary.$currentUserIndex
+                .withValue(prefixSeed.currentUserIndex) {
+            // User, 2026-09-06: see the non-streaming sibling — the router
+            // shortens this call's wall to fit inside the turn's remainder.
+            try await LLMCallContext.$remainingTurnSeconds
+                .withValue(wholeTurnBudget.remainingSeconds) {
             try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
             try await LLMCallContext.$providerId.withValue(providerRoute) {
             try await LLMCallContext.$serviceTier.withValue(serviceTier) {
@@ -2327,7 +3038,7 @@ extension SwiftNativeTurnEngine {
             try await LLMCallContext.$sessionId.withValue(sessionId) {
             try await LLMCallContext.$reasoningEffort.withValue(ctx.reasoningEffort) {
             let stream = llm.streamMessages(
-                messages: conversation,
+                messages: attemptMessages,
                 system: ctx.systemPrompt,
                 model: ctx.modelId,
                 surface: surface,
@@ -2435,6 +3146,46 @@ extension SwiftNativeTurnEngine {
                     underlying: CancellationError()
                 )
             } catch {
+                // Context-overflow survival, REACTIVE half: the provider refused
+                // the body as TOO LONG. The 400 lands BEFORE any delta, so the
+                // attempt is discarded whole (replay) and nothing the user
+                // watched render is lost. Compaction runs HERE and mutates the
+                // REAL `conversation`, not the attempt copy, so every later round
+                // of the turn keeps the room it gave back; the block after the
+                // nest does the announcing and the re-issue.
+                if callAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
+                   overflowRecoveries < IntraTurnContextCompaction.maxOverflowRecoveriesPerCall,
+                   turnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
+                   // Replay is only honest when the attempt produced NOTHING: a
+                   // provider that streamed text and then reported overflow has
+                   // already put prose on the surface, and that case belongs to
+                   // the interrupted-stream continuation path below.
+                   iterAccumulated.isEmpty, iterEmittedProse.isEmpty, streamedCalls.isEmpty,
+                   ProviderRecoveryPolicy.isContextOverflow(error) {
+                    let receipt = await IntraTurnContextCompaction.compact(
+                        conversation: &conversation,
+                        turnStartIndex: compactionTurnStart,
+                        windowTokens: turnWindowTokens,
+                        pressure: .overflow,
+                        distill: distillWorkingNotes
+                    )
+                    // "none" means nothing left to trim — fall through to the
+                    // throw below and die the old way.
+                    if receipt.mode != "none" {
+                        overflowAfterDrop = receipt
+                        return
+                    }
+                }
+                // A recoverable drop is a RETRY, not a death: report it out of
+                // the task-local nest and let the block after the nest back off
+                // and re-issue. Only an unrecoverable failure — or a spent
+                // budget — falls through to the throw below.
+                if callAttempt < ProviderRecoveryPolicy.maxAttemptsPerCall,
+                   turnRecoveries < ProviderRecoveryPolicy.maxRecoveriesPerTurn,
+                   ProviderRecoveryPolicy.isRecoverableTurnFailure(error) {
+                    retryAfterDrop = error
+                    return
+                }
                 // #5 (2026-06-14): a mid-stream provider failure must not silently
                 // DROP the prose the user already watched render. Carry the visible
                 // partial across the throw so the orchestration catch can persist
@@ -2455,7 +3206,7 @@ extension SwiftNativeTurnEngine {
                 // through to surface retry ladders.
                 throw TurnEngineError.streamInterrupted(
                     partial: safePartial,
-                    underlying: ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: dispatches.count)
+                    underlying: ProviderErrorAfterToolEffects.wrapping(error, dispatchCount: ProviderErrorAfterToolEffects.effectfulCount(dispatches))
                 )
             }
             } // LLMCallContext.$reasoningEffort.withValue
@@ -2464,6 +3215,175 @@ extension SwiftNativeTurnEngine {
             } // LLMCallContext.$serviceTier.withValue
             } // LLMCallContext.$providerId.withValue
             } // LLMCallContext.$admittedModel.withValue
+            } // LLMCallContext.$remainingTurnSeconds.withValue
+            } // ConversationPrefixBoundary.$currentUserIndex.withValue
+            } // ConversationPrefixShape.$override.withValue
+
+            // Context-overflow survival, second act: the conversation was
+            // already trimmed inside the nest. Announce it and re-issue in
+            // REPLAY mode — the 400 arrived before any delta, so discarding the
+            // attempt whole loses nothing. No backoff: the body CHANGED.
+            // A Stop that lands between attempts carries the prose the user
+            // already watched, exactly as one inside the stream does (Codex
+            // review 2026-09-05: a bare CancellationError here skipped the
+            // partial persistence).
+            func stopCarryingPartial() -> Error {
+                let safePartial: String
+                if let r = ToolCallParser.earliestPotentialProtocolMarker(in: visibleText) {
+                    safePartial = String(visibleText[..<r.lowerBound])
+                } else {
+                    safePartial = visibleText
+                }
+                return TurnEngineError.streamCancelled(partial: safePartial, underlying: CancellationError())
+            }
+            if let overflowReceipt = overflowAfterDrop {
+                overflowAfterDrop = nil
+                overflowRecoveries += 1
+                turnRecoveries += 1
+                TurnTraceBus.fireFromContext(
+                    kind: TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue,
+                    surface: surface,
+                    payload: IntraTurnContextCompaction.tracePayload(
+                        overflowReceipt, trigger: "overflow", turnRecoveries: turnRecoveries
+                    )
+                )
+                // Cancellation outranks recovery — the same two signals the
+                // stream body polls, checked before anything is re-issued.
+                if Task.isCancelled { throw stopCarryingPartial() }
+                if let flag = cancelFlagPath,
+                   FileManager.default.fileExists(atPath: flag.path) {
+                    throw stopCarryingPartial()
+                }
+                await progress?(.notice(
+                    kind: IntraTurnContextCompaction.noticeKind,
+                    text: IntraTurnContextCompaction.noticeText
+                ))
+                if wholeTurnBudget.isExhausted {
+                    wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                    break streamingIterations
+                }
+                callAttempt += 1
+                providerCallCount += 1
+                streamedCalls.removeAll(keepingCapacity: true)
+                pendingProtocolDelta = ""
+                iterAccumulated = ""
+                iterEmittedProse = ""
+                visibleText = attemptBaseVisibleText
+                lastRawResponse = attemptBaseRawResponse
+                attemptMessages = conversation
+                continue
+            }
+            guard let droppedStream = retryAfterDrop else { break }
+            retryAfterDrop = nil
+            // Prose the user ALREADY WATCHED RENDER decides the recovery shape.
+            // Nothing emitted → replay: discard the attempt whole and re-issue
+            // the identical call. Something emitted → continuation: keep those
+            // bytes as the prefix and ask the provider to resume after them,
+            // because re-issuing would render the same paragraph twice.
+            let recoveryMode = iterEmittedProse.isEmpty ? "replay" : "continuation"
+            // User, 2026-09-06: see the non-streaming sibling — Retry-After wins
+            // over the ladder's backoff, and a wait longer than the turn's
+            // remainder ends the ladder with a notice instead of a dead sleep.
+            let retryAfter = ProviderRecoveryPolicy.retryAfterSeconds(in: droppedStream)
+            let delaySeconds = ProviderRecoveryPolicy.retryDelaySeconds(
+                forRetry: callAttempt, error: droppedStream
+            )
+            let remainingBudget = wholeTurnBudget.remainingSeconds
+            if delaySeconds >= remainingBudget {
+                if let retryAfter, retryAfter >= remainingBudget {
+                    await progress?(.notice(
+                        kind: "provider_retry",
+                        text: ProviderRecoveryPolicy.retryAfterBeyondBudgetStatus(
+                            delaySeconds: retryAfter,
+                            remainingSeconds: remainingBudget
+                        )
+                    ))
+                }
+                wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                break streamingIterations
+            }
+            turnRecoveries += 1
+            TurnTraceBus.fireFromContext(
+                kind: TurnLifecycleMilestone.providerRetry.rawValue,
+                surface: surface,
+                payload: .object([
+                    "attempt": .int(Int64(callAttempt)),
+                    "delaySeconds": .double(delaySeconds),
+                    "reason": .string(String(ProviderRecoveryPolicy.describe(droppedStream).prefix(200))),
+                    "mode": .string(recoveryMode),
+                    "turnRecoveries": .int(Int64(turnRecoveries)),
+                ])
+            )
+            // Cancellation outranks recovery — same two signals the stream body
+            // polls, checked before the backoff so a Stop lands immediately.
+            if Task.isCancelled { throw stopCarryingPartial() }
+            if let flag = cancelFlagPath,
+               FileManager.default.fileExists(atPath: flag.path) {
+                throw stopCarryingPartial()
+            }
+            // Same status line as the non-streaming loop, same ordering rules:
+            // after the cancellation checks, before the backoff. On this path
+            // the user may already be watching prose render, so the notice
+            // rides the surface's status lane and never the reply text.
+            await progress?(.notice(
+                kind: "provider_retry",
+                text: ProviderRecoveryPolicy.reconnectStatus(attemptsMade: callAttempt)
+            ))
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            } catch is CancellationError {
+                throw stopCarryingPartial()
+            }
+            // A Stop written during the backoff must not start one more
+            // provider call: re-check both signals after the wait.
+            if Task.isCancelled { throw stopCarryingPartial() }
+            if let flag = cancelFlagPath,
+               FileManager.default.fileExists(atPath: flag.path) {
+                throw stopCarryingPartial()
+            }
+            // Same rule as the non-streaming ladder: no attempt starts after
+            // the whole-turn budget is spent.
+            if wholeTurnBudget.isExhausted {
+                wallClockElapsedSeconds = wholeTurnBudget.elapsedSeconds
+                break streamingIterations
+            }
+            callAttempt += 1
+            providerCallCount += 1
+            // Streamed tool calls from the dropped attempt are DISCARDED in both
+            // modes: they were never dispatched, and the re-issued call emits
+            // its own. Same for the held-back marker tail, which never reached
+            // the surface.
+            streamedCalls.removeAll(keepingCapacity: true)
+            pendingProtocolDelta = ""
+            if recoveryMode == "replay" {
+                iterAccumulated = ""
+                iterEmittedProse = ""
+                visibleText = attemptBaseVisibleText
+                lastRawResponse = attemptBaseRawResponse
+                attemptMessages = conversation
+            } else {
+                // Marker-strip exactly as the interrupted path does — emitted
+                // slices are marker-safe by construction, so this is a no-op in
+                // practice and a guard if that ever stops being true.
+                let seen: String
+                if let r = ToolCallParser.earliestPotentialProtocolMarker(in: iterEmittedProse) {
+                    seen = String(iterEmittedProse[..<r.lowerBound])
+                } else {
+                    seen = iterEmittedProse
+                }
+                iterAccumulated = seen
+                iterEmittedProse = seen
+                visibleText = attemptBaseVisibleText + seen
+                lastRawResponse = attemptBaseRawResponse + seen
+                // A LOCAL copy: the continuation nudge is scaffolding for one
+                // re-issue, never appended to the real `conversation` and never
+                // persisted. The next iteration builds from `conversation`.
+                attemptMessages = conversation + [
+                    .assistantText(seen),
+                    .user("[Your reply was interrupted by a connection drop right after the text above. Continue exactly where you stopped. Do not repeat anything already written.]"),
+                ]
+            }
+            }
 
             if let violation = ToolCallParser.formattedToolCallViolation(in: iterAccumulated) {
                 lastProtocolViolation = violation
@@ -2616,12 +3536,33 @@ extension SwiftNativeTurnEngine {
                 activeToolSchemas: &activeToolSchemas,
                 providerTools: &providerTools,
                 noProgressGuard: &noProgressGuard,
-                loopRecoveryReply: &loopRecoveryReply
+                loopRecoveryReply: &loopRecoveryReply,
+                toolChangePlan: toolChangePlan,
+                offeredToolNames: &offeredToolNames,
+                cancelFlagPath: cancelFlagPath
             )
             // A6 progress extension (same rule as the non-streaming sibling —
             // streamed TEXT is never progress; a landed tool result is).
             if case .continueLoop(let madeProgress) = outcome, madeProgress {
                 wholeTurnBudget.recordProgress()
+            }
+            // User, 2026-09-06: same as the non-streaming sibling — a Stop during
+            // the last batch left through the exhaustion tail as `.abandoned`
+            // instead of as a cancel. Here the cancellation carries the prose
+            // the user already watched render, exactly like a Stop inside the
+            // stream does.
+            if Task.isCancelled || cancelFlagPath.map({
+                FileManager.default.fileExists(atPath: $0.path)
+            }) == true {
+                let safePartial: String
+                if let r = ToolCallParser.earliestPotentialProtocolMarker(in: visibleText) {
+                    safePartial = String(visibleText[..<r.lowerBound])
+                } else {
+                    safePartial = visibleText
+                }
+                throw TurnEngineError.streamCancelled(
+                    partial: safePartial, underlying: CancellationError()
+                )
             }
             if case .stopLoop = outcome { break }
         }
@@ -2642,7 +3583,13 @@ extension SwiftNativeTurnEngine {
             userMessage: userMessage,
             sessionId: sessionId,
             surface: surface,
-            additionalStructuredToolCallSignal: lastProviderHadToolCalls
+            additionalStructuredToolCallSignal: lastProviderHadToolCalls,
+            visiblePartial: {
+                if let r = ToolCallParser.earliestPotentialProtocolMarker(in: visibleText) {
+                    return String(visibleText[..<r.lowerBound])
+                }
+                return visibleText
+            }()
         )
     }
 
@@ -2677,6 +3624,16 @@ extension SwiftNativeTurnEngine {
     /// throwing tool yields that slot's {"error": ...} result exactly as the
     /// serial path would, and never cancels siblings. Turn cancellation
     /// cancels all in-flight children (structured task group).
+    ///
+    /// `offeredToolNames` is the OFFERED/authorized set for this turn on the
+    /// mid-conversation tool-change lane. The provider `tools` array there
+    /// DECLARES the whole session catalog — most of it `defer_loading: true` —
+    /// so the name map, which exists to translate wire aliases, is a superset
+    /// of what the model is allowed to call. A `tool_use` naming a declared but
+    /// NOT-offered tool is refused here and answered with an error
+    /// `tool_result`: it never reaches a dispatch, never touches
+    /// SwiftToolDispatcher's gates, and stays paired on the wire. nil (every
+    /// other lane) means "no narrowing", i.e. today's behavior exactly.
     func dispatchIterationCalls(
         providerCalls: [ParsedToolCall],
         pairedIds: [String],
@@ -2687,21 +3644,26 @@ extension SwiftNativeTurnEngine {
         personaID: String? = nil,
         fluidContextTurn: ContextPreparedTurn? = nil,
         tools: any ToolDispatchClient,
-        progress: ChatOrchestrationProgressHandler?
+        progress: ChatOrchestrationProgressHandler?,
+        offeredToolNames: Set<String>? = nil,
+        cancelFlagPath: URL? = nil
     ) async -> (blocks: [LLMContentBlock], records: [TurnEngineResult.ToolDispatchRecord]) {
-        let prepared: [PreparedToolCall] = providerCalls.enumerated().compactMap { i, call in
-            guard !ToolCallParser.isIgnorableToolName(call.name) else { return nil }
-            let internalName = providerTools.internalName(forProviderName: call.name)
-            return PreparedToolCall(
-                pairedId: i < pairedIds.count ? pairedIds[i] : call.id,
-                internalName: internalName,
-                dispatchInput: Self.inputWithSessionIfNeeded(
-                    toolName: internalName,
-                    input: call.input,
-                    sessionId: sessionId
+        let planned: [(call: PreparedToolCall, offered: Bool)] = providerCalls
+            .enumerated().compactMap { i, call in
+                guard !ToolCallParser.isIgnorableToolName(call.name) else { return nil }
+                let internalName = providerTools.internalName(forProviderName: call.name)
+                let prepared = PreparedToolCall(
+                    pairedId: i < pairedIds.count ? pairedIds[i] : call.id,
+                    internalName: internalName,
+                    dispatchInput: Self.inputWithSessionIfNeeded(
+                        toolName: internalName,
+                        input: call.input,
+                        sessionId: sessionId
+                    )
                 )
-            )
-        }
+                return (prepared, offeredToolNames?.contains(internalName) ?? true)
+            }
+        let prepared = planned.filter(\.offered).map(\.call)
         let slots = await Self.runIterationDispatchGroups(
             prepared: prepared,
             modelId: modelId,
@@ -2710,6 +3672,7 @@ extension SwiftNativeTurnEngine {
             fluidContextTurn: fluidContextTurn,
             tools: tools,
             progress: progress,
+            cancelFlagPath: cancelFlagPath,
             onToolUse: { p in
                 await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
             },
@@ -2718,21 +3681,102 @@ extension SwiftNativeTurnEngine {
             }
         )
 
+        // Re-interleave in ORIGINAL INDEX ORDER: dispatched slots come back in
+        // `prepared` order, refused calls are synthesized in place. Every
+        // tool_use still gets exactly one tool_result, which is what keeps the
+        // wire pairing valid.
+        var slotIterator = slots.makeIterator()
         var blocks: [LLMContentBlock] = []
         var records: [TurnEngineResult.ToolDispatchRecord] = []
-        blocks.reserveCapacity(slots.count)
-        records.reserveCapacity(slots.count)
-        for slot in slots {
-            let out = await Self.makeSlotOutputs(
-                prepared: slot.prepared,
-                result: slot.result,
-                isError: slot.isError,
-                sessionId: sessionId
-            )
+        var images: [LLMContentBlock] = []
+        blocks.reserveCapacity(planned.count)
+        records.reserveCapacity(planned.count)
+        for entry in planned {
+            let out: (record: TurnEngineResult.ToolDispatchRecord, block: LLMContentBlock)
+            if entry.offered {
+                guard let slot = slotIterator.next() else { continue }
+                images.append(contentsOf: slot.images)
+                out = await Self.makeSlotOutputs(
+                    prepared: slot.prepared,
+                    result: slot.result,
+                    isError: slot.isError,
+                    sessionId: sessionId
+                )
+            } else {
+                out = await Self.makeSlotOutputs(
+                    prepared: entry.call,
+                    result: Self.notOfferedToolResult(entry.call.internalName),
+                    isError: true,
+                    sessionId: sessionId
+                )
+            }
             records.append(out.record)
             blocks.append(out.block)
         }
+        // Keep all paired results first; pixels belong to the same user
+        // continuation, not the persisted/tool-result text representation.
+        blocks.append(contentsOf: images)
         return (blocks, records)
+    }
+
+    /// User, 2026-09-06: Stop must stop the REST of the batch too. Both cancel
+    /// signals the streaming/non-streaming ladders poll (the turn task's own
+    /// cancellation and the on-disk Stop flag), in one place so the dispatch
+    /// runner reads exactly what the loops read.
+    nonisolated static func dispatchCancelSignalled(_ cancelFlagPath: URL?) -> Bool {
+        if Task.isCancelled { return true }
+        if let flag = cancelFlagPath,
+           FileManager.default.fileExists(atPath: flag.path) { return true }
+        return false
+    }
+
+    /// User, 2026-09-06: what a tool call that never ran because the turn was
+    /// stopped reports. Shaped like the other slot outcomes so the wire pairing
+    /// stays valid (every `tool_use` still gets its `tool_result`), but it says
+    /// CANCELLED, not failed — the model must not read a Stop as a tool that
+    /// tried and broke.
+    nonisolated static func cancelledToolResult(_ name: String) -> JSONValue {
+        let message = "tool '\(name)' was not run: the turn was stopped."
+        return .object([
+            "status": .string("cancelled"),
+            "cancelled": .bool(true),
+            "error": .string(message),
+            "reason": .string(message),
+        ])
+    }
+
+    /// User, 2026-09-06: what a tool call that HAD ALREADY STARTED when the Stop
+    /// landed reports. It is still not a failure — a Stop is not a tool that
+    /// tried and broke — but it is not the "was not run" receipt either: the
+    /// dispatch reached the tool, so whatever it wrote before it unwound stands.
+    /// `effects_unknown` is what retry safety reads; the failure counters keep
+    /// ignoring it on the `status: cancelled` bit.
+    nonisolated static func interruptedToolResult(_ name: String) -> JSONValue {
+        let message = "tool '\(name)' was interrupted: the turn was stopped after "
+            + "the call had already started, so whether it took effect is unknown. "
+            + "Check before repeating it."
+        return .object([
+            "status": .string("cancelled"),
+            "cancelled": .bool(true),
+            "effects_unknown": .bool(true),
+            "error": .string(message),
+            "reason": .string(message),
+        ])
+    }
+
+    /// The refusal a declared-but-not-offered `tool_use` gets back. Shaped
+    /// exactly like a dispatch error so the loop, the no-progress guard and
+    /// the transcript treat it as one — the model reads it as feedback and can
+    /// `tool_load` the tool for real.
+    nonisolated static func notOfferedToolResult(_ name: String) -> JSONValue {
+        .object([
+            "error": .string(
+                "tool '\(name)' is declared but not currently offered in this "
+                + "conversation, so it was not run. Call tool_load([\"\(name)\"]) "
+                + "first, then call it."
+            ),
+            "not_offered": .bool(true),
+        ])
     }
 
     /// One slot's dispatch outcome, carried back to the caller in ORIGINAL
@@ -2745,6 +3789,7 @@ extension SwiftNativeTurnEngine {
         let prepared: PreparedToolCall
         let result: JSONValue
         let isError: Bool
+        let images: [LLMContentBlock]
     }
 
     /// Plan and execute ONE iteration's tool calls under the fail-closed
@@ -2761,6 +3806,14 @@ extension SwiftNativeTurnEngine {
     /// onOutcome. Errors never escape a slot and never cancel siblings; turn
     /// cancellation cancels all in-flight children (structured task group).
     ///
+    /// STOP (User, 2026-09-06): both cancel signals are polled before EVERY
+    /// dispatch — the in-flight children were already cancelled by the task
+    /// group, but the batch used to keep starting the calls behind them, so a
+    /// Stop still ran the remaining `write_file`s. A slot the Stop reaches is
+    /// reported CANCELLED without ever touching `tools.dispatch`; it still
+    /// emits its onToolUse/onOutcome pair and still produces a slot, because
+    /// dropping it would leave a `tool_use` with no `tool_result` on the wire.
+    ///
     /// Task-local bindings the caller installs around this call (the tool
     /// loop's `LLMCallContext.$turnActiveTools`, for one) propagate into the
     /// task-group children, so per-call re-binding is unnecessary.
@@ -2772,6 +3825,8 @@ extension SwiftNativeTurnEngine {
         fluidContextTurn: ContextPreparedTurn? = nil,
         tools: any ToolDispatchClient,
         progress: ChatOrchestrationProgressHandler?,
+        imagesEnabled: Bool = true,
+        cancelFlagPath: URL? = nil,
         onToolUse: @Sendable (PreparedToolCall) async -> Void,
         onOutcome: @Sendable (PreparedToolCall, JSONValue, Bool) async -> Void
     ) async -> [DispatchedSlot] {
@@ -2789,21 +3844,34 @@ extension SwiftNativeTurnEngine {
 
         var slots: [DispatchedSlot] = []
         slots.reserveCapacity(prepared.count)
+        // Only native image reads can mint pixels. Bound each iteration to
+        // four image-capable reads, including parallel dispatches.
+        let imageIndices = Set(prepared.indices.filter { imagesEnabled && prepared[$0].internalName == "read_file" }.prefix(4))
 
         for group in groups {
             switch group {
             case .sequential(let idx):
                 let p = prepared[idx]
                 await onToolUse(p)
+                if Self.dispatchCancelSignalled(cancelFlagPath) {
+                    let cancelled = Self.cancelledToolResult(p.internalName)
+                    await onOutcome(p, cancelled, true)
+                    slots.append(DispatchedSlot(
+                        index: idx, prepared: p, result: cancelled, isError: true, images: []
+                    ))
+                    continue
+                }
+                let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink() : nil
                 let (result, isError) = await Self.runSingleDispatch(
                     prepared: p, modelId: modelId, surface: surface,
                     personaID: personaID,
                     fluidContextTurn: fluidContextTurn,
-                    tools: tools, progress: progress
+                    tools: tools, progress: progress, imageSink: imageSink
                 )
                 await onOutcome(p, result, isError)
                 slots.append(DispatchedSlot(
-                    index: idx, prepared: p, result: result, isError: isError
+                    index: idx, prepared: p, result: result, isError: isError,
+                    images: imageSink?.finish(success: !isError && !Task.isCancelled) ?? []
                 ))
 
             case .concurrent(let indices):
@@ -2813,32 +3881,42 @@ extension SwiftNativeTurnEngine {
                 for idx in indices {
                     await onToolUse(prepared[idx])
                 }
-                var outcomes: [Int: (result: JSONValue, isError: Bool)] = [:]
+                var outcomes: [Int: (result: JSONValue, isError: Bool, images: [LLMContentBlock])] = [:]
                 // Window of maxConcurrentPerIteration: refill on completion.
                 await withTaskGroup(
-                    of: (Int, JSONValue, Bool).self
+                    of: (Int, JSONValue, Bool, [LLMContentBlock]).self
                 ) { taskGroup in
                     var iterator = indices.makeIterator()
                     func addNext() -> Bool {
-                        guard let idx = iterator.next() else { return false }
-                        let p = prepared[idx]
-                        taskGroup.addTask {
-                            let (result, isError) = await Self.runSingleDispatch(
-                                prepared: p, modelId: modelId, surface: surface,
-                                personaID: personaID,
-                                fluidContextTurn: fluidContextTurn,
-                                tools: tools, progress: progress
-                            )
-                            return (idx, result, isError)
+                        while let idx = iterator.next() {
+                            let p = prepared[idx]
+                            // Stop reached this slot before it started: record the
+                            // cancelled outcome and keep draining, so no further
+                            // dispatch is ever handed to `tools`.
+                            if Self.dispatchCancelSignalled(cancelFlagPath) {
+                                outcomes[idx] = (Self.cancelledToolResult(p.internalName), true, [])
+                                continue
+                            }
+                            taskGroup.addTask {
+                                let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink() : nil
+                                let (result, isError) = await Self.runSingleDispatch(
+                                    prepared: p, modelId: modelId, surface: surface,
+                                    personaID: personaID,
+                                    fluidContextTurn: fluidContextTurn,
+                                    tools: tools, progress: progress, imageSink: imageSink
+                                )
+                                return (idx, result, isError, imageSink?.finish(success: !isError && !Task.isCancelled) ?? [])
+                            }
+                            return true
                         }
-                        return true
+                        return false
                     }
                     var started = 0
                     while started < ParallelToolDispatch.maxConcurrentPerIteration, addNext() {
                         started += 1
                     }
-                    while let (idx, result, isError) = await taskGroup.next() {
-                        outcomes[idx] = (result, isError)
+                    while let (idx, result, isError, images) = await taskGroup.next() {
+                        outcomes[idx] = (result, isError, images)
                         _ = addNext()
                     }
                 }
@@ -2850,13 +3928,13 @@ extension SwiftNativeTurnEngine {
                         result: JSONValue.object([
                             "error": .string("parallel dispatch produced no result"),
                         ]),
-                        isError: true
+                        isError: true, images: [LLMContentBlock]()
                     )
                     let p = prepared[idx]
                     await onOutcome(p, outcome.result, outcome.isError)
                     slots.append(DispatchedSlot(
                         index: idx, prepared: p,
-                        result: outcome.result, isError: outcome.isError
+                        result: outcome.result, isError: outcome.isError, images: outcome.images
                     ))
                 }
             }
@@ -2925,6 +4003,15 @@ extension SwiftNativeTurnEngine {
         return String(pathSafe.prefix(2_000))
     }
 
+    /// One dispatch's outcome carried out of the deadline race, so a thrown
+    /// error stays tellable apart from the ceiling winning (`nil`). `@unchecked`
+    /// only because `any Error` is not `Sendable`; the value crosses one
+    /// resume-once gate and is rethrown on the same lane.
+    enum SingleDispatchRace: @unchecked Sendable {
+        case value(JSONValue)
+        case thrown(any Error)
+    }
+
     nonisolated static func runSingleDispatch(
         prepared: PreparedToolCall,
         modelId: String,
@@ -2932,7 +4019,8 @@ extension SwiftNativeTurnEngine {
         personaID: String? = nil,
         fluidContextTurn: ContextPreparedTurn? = nil,
         tools: any ToolDispatchClient,
-        progress: ChatOrchestrationProgressHandler?
+        progress: ChatOrchestrationProgressHandler?,
+        imageSink: LocalToolImage.Sink? = nil
     ) async -> (JSONValue, Bool) {
         let deadlineNanos = ToolDispatchDeadline.timeoutNanos(
             toolName: prepared.internalName,
@@ -2940,7 +4028,8 @@ extension SwiftNativeTurnEngine {
             surface: surface
         )
         do {
-            let result = try await FluidContextToolScope.$current.withValue(fluidContextTurn) {
+            let result = try await LocalToolImage.$sink.withValue(imageSink) {
+            try await FluidContextToolScope.$current.withValue(fluidContextTurn) {
             try await ChatTurnRuntimeContext.$current.withValue(
                 .init(
                     model: modelId,
@@ -2959,30 +4048,41 @@ extension SwiftNativeTurnEngine {
                             surface: surface
                         )
                     }
-                    return try await withThrowingTaskGroup(of: JSONValue.self) { group in
-                        group.addTask {
-                            try await tools.dispatch(
+                    // User, 2026-09-06: the deadline used to be a throwing task
+                    // group, and leaving a group waits for its cancelled
+                    // children — so a connector that ignores cancellation held
+                    // the turn open past the very ceiling this exists to
+                    // enforce. Same resume-once shape as the provider wall.
+                    let seconds = Double(deadlineNanos) / 1_000_000_000
+                    let raced = await IntraTurnContextCompaction.withDeadline(
+                        seconds: seconds
+                    ) { () -> SingleDispatchRace in
+                        do {
+                            return .value(try await tools.dispatch(
                                 tool: prepared.internalName,
                                 input: prepared.dispatchInput,
                                 surface: surface
-                            )
+                            ))
+                        } catch {
+                            return .thrown(error)
                         }
-                        group.addTask {
-                            try await Task.sleep(nanoseconds: deadlineNanos)
-                            throw ToolDispatchDeadline.ToolDispatchTimedOut(
-                                tool: prepared.internalName,
-                                seconds: Double(deadlineNanos) / 1_000_000_000
-                            )
-                        }
-                        guard let first = try await group.next() else {
-                            // Unreachable: two tasks were added. Treat an empty
-                            // group as a benign null result rather than crash.
-                            return .null
-                        }
-                        group.cancelAll()
-                        return first
+                    }
+                    switch raced {
+                    case .value(let result):
+                        return result
+                    case .thrown(let error):
+                        throw error
+                    case nil:
+                        // A Stop resolves the gate with the same nil the ceiling
+                        // does; keep cancellation its own outcome.
+                        if Task.isCancelled { throw CancellationError() }
+                        throw ToolDispatchDeadline.ToolDispatchTimedOut(
+                            tool: prepared.internalName,
+                            seconds: seconds
+                        )
                     }
                 }
+            }
             }
             }
             // A nonthrowing transport can still carry a canonical failure
@@ -2990,6 +4090,18 @@ extension SwiftNativeTurnEngine {
             // the provider tool-result bit, persisted progress, and traces on
             // the same shared classification.
             return (result, !ChatToolOutcome.outputLooksSuccessful(result))
+        } catch is CancellationError {
+            // User, 2026-09-06: a Stop is not a tool failure. Reporting it as
+            // one told the model the tool tried and broke, and left the
+            // transcript claiming a failed write that never happened.
+            //
+            // User, 2026-09-06: but this catch is reached only AFTER the
+            // dispatch was handed to `tools` — the never-started slots take
+            // the pre-dispatch path in `runIterationDispatchGroups`. Using the
+            // "was not run" receipt here told every counter the call had no
+            // effects, so a `write_file` a Stop interrupted mid-write let a
+            // surface ladder replay the whole turn and write it again.
+            return (Self.interruptedToolResult(prepared.internalName), true)
         } catch {
             let message = Self.projectedToolDispatchError(error)
             return (.object([

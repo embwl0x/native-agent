@@ -34,9 +34,17 @@ struct OrganismBodyLineTests {
     @Test func stressLineStillWinsOverPositive() {
         // Regression: a stress signal (high vigilance) must still pre-empt the
         // positive region even when warmth is high — the warning is load-bearing.
+        //
+        // 2026-09-06 (8e68a4e0): vigilance ALONE no longer speaks in the
+        // provider's name. Anticipatory dread adds vigilance, and reading that
+        // raw put "provider or tool path feels brittle" into the prompt on no
+        // provider or tool evidence at all. Bracing took the same first-match
+        // position vigilance used to occupy, so what this test pins — a stress
+        // line pre-empting the positive region on a healthy body — is unchanged;
+        // only the sentence it earns moved.
         let c = ChemicalState(warmth: 0.60, vigilance: 0.30)
         let p = OrganismChemistry.projection(at: Date(timeIntervalSince1970: 0), chemicalState: c, bodySchema: .neutral)
-        #expect(p.bodyLine == "- Body: provider or tool path feels brittle; be careful before claiming completion.")
+        #expect(p.bodyLine == "- Body: something ahead has the guard up; check before committing to it.")
     }
 
     @Test func unknownProviderEvidenceDoesNotClaimABrittlePath() {

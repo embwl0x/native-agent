@@ -39,9 +39,39 @@ extension SwiftToolDispatcher {
     static let chatHistoryCurrentSessionFloor = 0.3
 
     func impl_search_chat_history(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
-        let rawQuery = try requireString(input, "query")
+        let requestedScope = (jsonString(input["scope"]) ?? "auto")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let scope: String = {
+            switch requestedScope {
+            case "", "auto", "current_session_first", "current_session", "all_sessions":
+                return requestedScope.isEmpty ? "auto" : requestedScope
+            case "previous_session", "last_session":
+                // The other half of the /new carry-over anchor. See the
+                // resolution branch below.
+                return "previous_session"
+            case "all", "global", "all_session":
+                // Honor the obvious spellings of "search everything" — an
+                // explicit all-scope silently degrading to auto cost Agent
+                // three blocked global searches during the memory backfill
+                // (caught by her, 2026-06-11).
+                return "all_sessions"
+            default:
+                return "auto"
+            }
+        }()
+        // `previous_session` pins exactly ONE session by resolution, so it is
+        // the one scope that is complete WITHOUT a query: "pull my last
+        // session back" is a whole-session request, and the anchor's pointer
+        // would otherwise name a call she cannot actually make. Empty query
+        // means "no relevance filter" — every row is admitted at score 0 and
+        // the sort falls through to recency, i.e. the tail of that session.
+        let wholeSession = scope == "previous_session"
+        let rawQuery = wholeSession
+            ? (jsonString(input["query"]) ?? "")
+            : try requireString(input, "query")
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else {
+        guard !query.isEmpty || wholeSession else {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty chat-history search query")
         }
         let requestedLimit = optionalInt(input, "limit") ?? 8
@@ -63,23 +93,6 @@ extension SwiftToolDispatcher {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let currentSessionId = jsonString(input["current_session_id"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let requestedScope = (jsonString(input["scope"]) ?? "auto")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let scope: String = {
-            switch requestedScope {
-            case "", "auto", "current_session_first", "current_session", "all_sessions":
-                return requestedScope.isEmpty ? "auto" : requestedScope
-            case "all", "global", "all_session":
-                // Honor the obvious spellings of "search everything" — an
-                // explicit all-scope silently degrading to auto cost Agent
-                // three blocked global searches during the memory backfill
-                // (caught by her, 2026-06-11).
-                return "all_sessions"
-            default:
-                return "auto"
-            }
-        }()
 
         let messagesDir = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
@@ -123,14 +136,31 @@ extension SwiftToolDispatcher {
                           !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                         continue
                     }
+                    // Agent, 2026-09-06: the bridge routing prefix and the
+                    // wake-receipt slip are plumbing, not things anyone said.
+                    // Matching inside them buried real answers under hundreds
+                    // of "[from: claude, via bridge]" / "Automated completion
+                    // event … Do NOT auto-fire …" hits. Score and preview the
+                    // substantive text; a row that is nothing BUT plumbing
+                    // scores zero and drops out through the guard below.
+                    //
+                    // 2026-09-06: gated on the row's PERSISTED bridge
+                    // provenance, not on the syntax of its text, so a person
+                    // who quotes that syntax keeps every word.
+                    let searchable = ChatTranscriptBoilerplate.substantiveText(
+                        content,
+                        bridgeRouted: ChatTranscriptBoilerplate.isBridgeRouted(
+                            rowMetadata: obj["metadata"]
+                        )
+                    )
                     let score = chatHistoryScore(
-                        content: content,
-                        sessionTitle: meta?.title,
+                        content: searchable,
+                        sessionTitle: meta?.title.map(ChatTranscriptBoilerplate.stripBridgePrefix),
                         query: query,
                         tokens: tokens,
                         exactMode: exactMode
                     )
-                    guard score > 0 else { continue }
+                    guard score > 0 || query.isEmpty else { continue }
                     let timestamp = jsonString(obj["createdAt"]) ?? jsonString(obj["timestamp"]) ?? ""
                     hits.append(ChatHistorySearchHit(
                         score: score,
@@ -143,7 +173,10 @@ extension SwiftToolDispatcher {
                         messageId: jsonString(obj["id"]),
                         messageIndex: messageIndex,
                         preview: String(Self.chatHistoryDisplayEvidence(
-                            chatHistoryPreview(content: content, query: query, tokens: tokens),
+                            chatHistoryPreview(
+                                content: searchable.isEmpty ? content : searchable,
+                                query: query, tokens: tokens
+                            ),
                             role: role, row: obj
                         ).prefix(368)),
                         continuity: continuityMode ? Self.continuityNeighbors(
@@ -163,10 +196,29 @@ extension SwiftToolDispatcher {
         let selected: (hits: [ChatHistorySearchHit], sessions: Set<String>)
         let phase: String
         let fallbackSkipped: String?
+        var resolvedPreviousSessionId: String? = nil
         if let sessionFilter, !sessionFilter.isEmpty {
+            // An explicit id stays the most specific instruction there is.
             selected = scan(try files(forSessionId: sessionFilter))
             phase = "explicit_session"
             fallbackSkipped = nil
+        } else if wholeSession {
+            // Resolved through the SAME surface-scoped, bridge-excluding
+            // resolver the /new anchor used, so the session this opens is
+            // always the session the anchor named — which is why the anchor
+            // never has to carry a UUID.
+            if let currentSessionId, !currentSessionId.isEmpty,
+               let prior = PriorChatSession.latest(
+                   excluding: currentSessionId, dataRoot: dataRoot
+               ) {
+                selected = scan(try files(forSessionId: prior.id))
+                resolvedPreviousSessionId = prior.id
+                phase = "previous_session"
+            } else {
+                selected = ([], [])
+                phase = "previous_session_unavailable"
+            }
+            fallbackSkipped = "all_sessions"
         } else if scope == "current_session" {
             if let currentSessionId, !currentSessionId.isEmpty {
                 selected = scan(try files(forSessionId: currentSessionId))
@@ -262,6 +314,9 @@ extension SwiftToolDispatcher {
         }
         if let fallbackSkipped {
             response["fallback_skipped"] = .string(fallbackSkipped)
+        }
+        if let resolvedPreviousSessionId {
+            response["previous_session_id"] = .string(resolvedPreviousSessionId)
         }
         return .object(response)
     }
@@ -429,5 +484,130 @@ extension SwiftToolDispatcher {
         if startOffset > 0 { snippet = "... " + snippet }
         if end < compact.endIndex { snippet += " ..." }
         return snippet
+    }
+}
+
+// MARK: - Read one chat message in full
+
+/// Agent, 2026-09-06: `search_chat_history` returns a 368-character preview and
+/// `mode:"continuity"` adds bounded NEIGHBOURS — but the matched message itself
+/// was never available whole. Reading past the preview meant re-phrasing the
+/// query until a different fragment happened to be the anchor. This tool takes
+/// the `message_id` search already returns and pages the complete stored text.
+///
+/// The text is returned VERBATIM — no boilerplate stripping, no evidence
+/// rendering. Search hides plumbing so matches stay honest; this is the tool
+/// for seeing exactly what the row says, plumbing included.
+extension SwiftToolDispatcher {
+    /// Characters per page. A page is a bounded read, not a whole transcript.
+    static let readChatMessageDefaultPageCharacters = 8_000
+    static let readChatMessageMaximumPageCharacters = 16_000
+
+    func impl_read_chat_message(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
+        let messageId = (jsonString(input["message_id"]) ?? jsonString(input["id"]) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !messageId.isEmpty else {
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: read_chat_message needs the 'message_id' search_chat_history returned"
+            )
+        }
+        let offset = max(0, optionalInt(input, "offset") ?? 0)
+        let limit = max(
+            1,
+            min(
+                optionalInt(input, "limit") ?? Self.readChatMessageDefaultPageCharacters,
+                Self.readChatMessageMaximumPageCharacters
+            )
+        )
+        let requestedSession = jsonString(input["session_id"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let messagesDir = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("messages", isDirectory: true)
+        // The session ids to look in, most recently written first. An explicit
+        // id is the most specific instruction there is; without one this walks
+        // the same file set search_chat_history walks and stops at the match.
+        let sessionIds: [String]
+        if let requestedSession, !requestedSession.isEmpty {
+            sessionIds = [try validatedChatSessionId(requestedSession)]
+        } else {
+            sessionIds = chatMessageFiles(messagesDir: messagesDir).map(sessionIdForMessageFile)
+        }
+
+        // The canonical transcript reader — the same one prompt assembly uses.
+        // No second JSONL parser lives here.
+        let reader = SessionHistoryReader(dataRoot: dataRoot)
+        // 2026-09-06: a FORK copies the source transcript's rows byte for byte,
+        // ids included (`NativeClient+SessionLineage.forkChatSession`), so one
+        // message id can live in several sessions. This used to stop at the
+        // first file and say nothing, which could hand back a different copy
+        // than the search hit came from. Every session is checked now: the
+        // newest-written copy is returned (the file list is mtime-ordered) and
+        // the others are named so the caller can ask for one by session_id.
+        var found: (sessionId: String, index: Int, message: ChatMessage)?
+        var alsoIn: [String] = []
+        for sessionId in sessionIds {
+            guard let messages = try? await reader.messages(forSessionId: sessionId) else { continue }
+            guard let index = messages.firstIndex(where: { message in
+                guard case .object(let row)? = message.extras,
+                      case .string(let id)? = row["id"] else { return false }
+                return id == messageId
+            }) else { continue }
+            if found == nil {
+                found = (sessionId, index, messages[index])
+            } else {
+                alsoIn.append(sessionId)
+            }
+        }
+        guard let found else {
+            return .object([
+                "status": .string("not_found"),
+                "runtime": .string("swift-native"),
+                "tool": .string(invokedAs),
+                "message_id": .string(messageId),
+                "searched_session_count": .int(Int64(sessionIds.count)),
+                "reason": .string(requestedSession?.isEmpty == false
+                    ? "No message with that id in that session. Drop session_id to search every transcript."
+                    : "No message with that id in any transcript. Ids come from search_chat_history hits."),
+            ])
+        }
+
+        let characters = Array(found.message.content)
+        let start = min(offset, characters.count)
+        let end = min(start + limit, characters.count)
+        let page = String(characters[start..<end])
+        var response: [String: JSONValue] = [
+            "status": .string("ok"),
+            "runtime": .string("swift-native"),
+            "tool": .string(invokedAs),
+            "source": .string("chat_history_jsonl"),
+            "message_id": .string(messageId),
+            "session_id": .string(found.sessionId),
+            "role": .string(found.message.role),
+            "timestamp": .string(found.message.timestamp),
+            "message_index": .int(Int64(found.index)),
+            "total_characters": .int(Int64(characters.count)),
+            "offset": .int(Int64(start)),
+            "returned_characters": .int(Int64(end - start)),
+            "has_more": .bool(end < characters.count),
+            "text": .string(page),
+        ]
+        if end < characters.count {
+            response["next_offset"] = .int(Int64(end))
+        }
+        if !alsoIn.isEmpty {
+            response["also_in_sessions"] = .array(alsoIn.map { .string($0) })
+            response["session_ambiguous"] = .bool(true)
+            response["note"] = .string(
+                "This id also exists in \(alsoIn.count) other session(s) — forks copy rows verbatim. "
+                + "Returned the most recently written copy, from session_id '\(found.sessionId)'. "
+                + "Pass session_id to read a named copy."
+            )
+        }
+        if let title = readChatHistorySessionMetadata()[found.sessionId]?.title, !title.isEmpty {
+            response["session_title"] = .string(title)
+        }
+        return .object(response)
     }
 }

@@ -94,6 +94,60 @@ private struct EmptyErrorLoop: LoopRunner {
     #expect(first["lastAt"] != nil)
 }
 
+// MARK: - FIX-13, append-only receipts for a flapping loop
+
+@Test func flappingLoopReceiptsStayAppendOnlyAndReadTheSameCoalescedRow() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("FlappingReceiptIO-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let receipts = root.appendingPathComponent("failures.jsonl")
+
+    // A feed with history already in it — the case that used to cost a full
+    // read + two full rewrites PER receipt, under the lock, while the loop was
+    // flapping fastest.
+    let seeded = (0..<500).map { i in
+        "{\"id\":\"seed-\(i)\",\"kind\":\"background_loop.failure\",\"loopId\":\"other\","
+            + "\"status\":\"failed\",\"error\":\"old\",\"createdAt\":\"2026-01-01T00:00:00Z\","
+            + "\"firstAt\":\"2026-01-01T00:00:00Z\",\"lastAt\":\"2026-01-01T00:00:00Z\","
+            + "\"occurrences\":1}"
+    }.joined(separator: "\n") + "\n"
+    try Data(seeded.utf8).write(to: receipts)
+
+    let sched = SwiftNativeLoopScheduler(failureReceiptsPath: receipts)
+    let flaps = 50
+    for _ in 0..<flaps {
+        await sched.recordFailure(loopId: "flapper", error: "boom")
+    }
+
+    // Same coalesced read result readers have always seen: ONE row for the
+    // incident, carrying the full occurrence count.
+    let rows = await sched._testFailureReceiptRows()
+    #expect(rows.count == seeded.split(separator: "\n").count + 1)
+    guard case .object(let last) = rows.last,
+          case .string("flapper")? = last["loopId"],
+          case .int(let occurrences)? = last["occurrences"] else {
+        Issue.record("expected one coalesced flapper row, got \(String(describing: rows.last))")
+        return
+    }
+    #expect(occurrences == flaps)
+    #expect(last["firstAt"] != nil)
+    #expect(last["lastAt"] != nil)
+
+    // Bounded I/O: the 500 seeded rows were never rewritten. Byte-identical
+    // prefix proves the appends touched only the tail; a stable inode proves no
+    // whole-file atomic replacement happened on ANY of the 50 receipts (the old
+    // path minted a new inode per receipt via temp-write + rename).
+    let text = try String(contentsOf: receipts, encoding: .utf8)
+    #expect(text.hasPrefix(seeded))
+    let inode = (try FileManager.default.attributesOfItem(atPath: receipts.path)[.systemFileNumber]) as? Int
+
+    await sched.recordFailure(loopId: "flapper", error: "boom")
+    let inodeAfter = (try FileManager.default.attributesOfItem(atPath: receipts.path)[.systemFileNumber]) as? Int
+    #expect(inode != nil)
+    #expect(inode == inodeAfter)
+}
+
 // MARK: - L4-15, the retirement tombstone
 
 @Test func retiredLoopStampsAreDroppedOnLoadAndAbsentFromTheNextFlush() async throws {

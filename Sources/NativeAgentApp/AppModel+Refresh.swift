@@ -133,7 +133,6 @@ extension AppModel {
         let fetchedTools = await refreshPreserving("getTools", current: tools) { try await api.getTools() }
         let fetchedCapabilitySummary = await refreshPreserving("getCapabilities", current: capabilitySummary) { try await api.getCapabilities() }
         let fetchedWorkflows = await refreshPreserving("getWorkflows", current: workflows) { try await api.getWorkflows() }
-        let fetchedWorkflowRuns = await refreshPreserving("getWorkflowRuns", current: workflowRuns) { try await api.getWorkflowRuns() }
         let fetchedApprovals = await refreshPreserving("getApprovals", current: approvals) { try await api.getApprovals() }
         // An unavailable inbox read is not an honest empty inbox. Keep the
         // last model snapshot on failure so InboxView receives `[]` only when
@@ -155,7 +154,6 @@ extension AppModel {
         setIfChanged(\.tools, fetchedTools)
         setIfChanged(\.capabilitySummary, fetchedCapabilitySummary)
         setIfChanged(\.workflows, fetchedWorkflows)
-        setIfChanged(\.workflowRuns, fetchedWorkflowRuns)
         setIfChanged(\.approvals, fetchedApprovals)
         setIfChanged(\.inboxItems, fetchedInboxItems)
         setIfChanged(\.mcpServers, fetchedMCPServers)

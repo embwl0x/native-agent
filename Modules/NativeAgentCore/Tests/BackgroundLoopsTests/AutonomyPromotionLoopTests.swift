@@ -297,7 +297,7 @@ private final class ThrowingStagePort: AutonomyPromotionInboxPort, @unchecked Se
     // — flipping self_install to auto would make the app-self-modification
     // install trigger approval-free ("nothing self-grants"). Both the explicit
     // names AND a future `evolution_*` alias are excluded.
-    for tool in ["evolution_propose", "evolution_status", "self_install",
+    for tool in ["evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
                  "evolution_apply", "mac.evolution_propose"] {
         #expect(AutonomyPromotionLoop.isPromotableTarget(tool: tool, tier: "confirm") == false,
                 "\(tool) is a self-evolution surface and must never be a promotion candidate")
@@ -527,6 +527,33 @@ private final class ThrowingStagePort: AutonomyPromotionInboxPort, @unchecked Se
     await loop.tick()
     #expect(apply.count == 0)         // no reconcile
     #expect(port.staged.isEmpty)      // no propose
+}
+
+// MARK: - Honest no-op outcome (FIX 4)
+
+@Test func tick_with_nothing_to_apply_or_stage_skips_rather_than_completing() async {
+    // No approved cards and no qualifying history: the overwhelmingly common
+    // tick. It used to stamp `.completed`, so lastSuccessfulWorkAt advanced on
+    // every idle tick and the dormancy rule could never see this lane idle.
+    let loop = makeLoop(port: FakePort(), tiers: [:])
+    let outcome = await loop.tickOutcome()
+    guard case .skipped(let reason, _) = outcome else {
+        Issue.record("expected .skipped, got \(outcome)")
+        return
+    }
+    #expect(reason.contains("no approved promotions"))
+}
+
+@Test func tick_that_stages_a_candidate_still_completes() async {
+    let port = FakePort(resolved: cleanHistory(tool: "weather.lookup"))
+    let loop = makeLoop(port: port, tiers: ["weather.lookup": "confirm"])
+    let outcome = await loop.tickOutcome()
+    #expect(port.staged.count == 1)
+    guard case .completed(let result) = outcome else {
+        Issue.record("expected .completed, got \(outcome)")
+        return
+    }
+    #expect(result?.contains("staged 1") == true)
 }
 
 @Test func loopId_is_stable() {

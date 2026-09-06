@@ -103,6 +103,9 @@ function baseEnv(ctx, claudeBin, extra = {}) {
     NATIVE_AGENT_CLAUDE_WAKE_CWD: ctx.cwd,
     NATIVE_AGENT_CLAUDE_WAKE_INLINE: "1",
     NATIVE_AGENT_CLAUDE_WAKE_DRY_RUN: "1",
+    // The runner spawns nothing while an interactive Claude is open on the
+    // Mac; the harness must still exercise the spawn path on a developer's Mac.
+    NATIVE_AGENT_CLAUDE_WAKE_IGNORE_INTERACTIVE: "1",
     ...extra,
   };
 }
@@ -1377,7 +1380,11 @@ test("an earlier same-ID rejection cannot confirm delivery of the later result",
 for (const scenario of [
   { name: "nonzero", body: 'echo "partial failure evidence"; exit 7', status: "failed", reason: "claude_exit_7", evidence: /partial failure evidence/ },
   { name: "aborted", body: 'echo "partial interrupted evidence"; kill -TERM $$', status: "failed", reason: "claude_exit_null", evidence: /partial interrupted evidence/ },
-  { name: "timeout", body: 'echo "partial timed out evidence"; sleep 20', status: "failed", reason: "timeout_after_1s", evidence: /partial timed out evidence/, env: { NATIVE_AGENT_CLAUDE_WAKE_TIMEOUT_SECONDS: "1" } },
+  // runs:2 — a timed-out run spends its ONE automatic re-arm inside the same
+  // wake (see the re-arm block in performWake). The point of this test is
+  // still that DELIVERY reconciliation never reruns the worker: the count is
+  // taken once and must not move across the three duplicate arrivals below.
+  { name: "timeout", runs: 2, body: 'echo "partial timed out evidence"; sleep 20', status: "failed", reason: "timeout_after_1s", evidence: /partial timed out evidence/, env: { NATIVE_AGENT_CLAUDE_WAKE_TIMEOUT_SECONDS: "1" } },
   { name: "empty", body: 'exit 0', status: "completed_without_reply", reason: "empty_stdout", evidence: /produced NO output/ },
 ]) {
   test(`unknown delivery retains and reconciles ${scenario.name} result without rerunning work`, async () => {
@@ -1400,9 +1407,12 @@ for (const scenario of [
       assert.match(retained.completionText, scenario.evidence);
       assert.ok(retained.startedAt, "execution has been admitted; result replay must not rerun it");
 
+      const runsAfterWake = markerLines(marker).length;
+      assert.equal(runsAfterWake, scenario.runs || 1);
       const unresolved = await runHelperAsync(env, payload);
       assert.equal(unresolved.note, "unknown_unresolved");
       assert.equal(posts, 1);
+      assert.equal(markerLines(marker).length, runsAfterWake, "a duplicate never reruns the worker");
       assert.equal(readJob(ctx, payload.messageId).completionText, retained.completionText);
 
       fs.mkdirSync(storeDirFor(ctx), { recursive: true });
@@ -1413,7 +1423,7 @@ for (const scenario of [
       assert.equal(readJob(ctx, payload.messageId).completionText, null);
       assert.equal(readJob(ctx, payload.messageId).status, scenario.status, "delivery cannot rewrite execution status");
       assert.equal(posts, 1);
-      assert.equal(markerLines(marker).length, 1);
+      assert.equal(markerLines(marker).length, scenario.runs || 1);
     } finally {
       await bridge.close();
     }
@@ -1788,6 +1798,8 @@ const FIXTURES_DIR = path.join(__dirname, "fixtures", "wake-delivery-classificat
 for (const fixtureName of ["armed-replay-99D377A5.fixture.json", "armed-replay-7253CCEC.fixture.json"]) {
   test(`fixture ${fixtureName}: armed replay of a delivered completion is REFUSED`, async () => {
     const fixture = JSON.parse(fs.readFileSync(path.join(FIXTURES_DIR, fixtureName), "utf8"));
+    // The incident copies predate the key rename and are kept as they landed.
+    fixture.agentSessionId = fixture.agentSessionId || fixture.agentSessionId;
     assert.equal(fixture.deliveryLost, true, "fixture must arrive armed");
     assert.ok(fixture.completionText, "fixture must carry the stored completion");
 
@@ -2320,5 +2332,364 @@ test("canonical transcript path is cwd- and session-bound", () => {
   } finally {
     if (previousRoot == null) delete process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_PROJECTS_DIR;
     else process.env.NATIVE_AGENT_CLAUDE_WAKE_CLAUDE_PROJECTS_DIR = previousRoot;
+  }
+});
+
+// ------------------------------------------- terminal-undelivered recovery (A)
+//
+// The defect these close: a completed reply the bridge PROVABLY never delivered
+// sat on its job file forever, because `replayLostDelivery` only ran when the
+// same messageId happened to be re-sent. Nobody re-sends a message they don't
+// know was stranded, so 34 of 156 live jobs never got a second chance.
+//
+// The counter-defect they also close: re-posting anything AMBIGUOUS. An
+// `unknown` delivery may already have landed, and a duplicate completion in
+// Agent's thread is strictly worse than a stranded one.
+
+function runRecover(env, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [HELPER, "--recover"], {
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const killer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, options.timeoutMs || 30_000);
+    child.on("close", () => {
+      clearTimeout(killer);
+      let parsed = null;
+      try { parsed = JSON.parse(stdout.trim().split("\n").filter(Boolean).pop() || "null"); } catch {}
+      if (!parsed) { reject(new Error(`--recover produced no envelope. stdout=${stdout} stderr=${stderr}`)); return; }
+      resolve(parsed);
+    });
+  });
+}
+
+/// Write a settled job record straight onto the store, the way a finished
+/// runner would have left it.
+function writeSettledJob(ctx, messageId, fields) {
+  const file = jobFileFor(ctx, messageId);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const job = {
+    schemaVersion: 2,
+    messageId,
+    createdAt: "2026-08-01T00:00:00.000Z",
+    completedAt: "2026-08-01T00:10:00.000Z",
+    state: "settled",
+    status: "completed",
+    topicSlug: "recovery",
+    payload: { messageId, text: "prior work", topic: "recovery" },
+    ...fields,
+  };
+  fs.writeFileSync(file, JSON.stringify(job, null, 2), { mode: 0o600 });
+  return job;
+}
+
+test("a PROVEN-undelivered completion re-posts on the next bridge contact, exactly once", async () => {
+  const ctx = makeRoot("recovery-repost");
+  fs.writeFileSync(path.join(ctx.bridgeDir, "token"), "test-token\n", { mode: 0o600 });
+  writeSettledJob(ctx, "stranded-1", {
+    bridgeStatus: "failed",
+    bridgeReason: "connect ECONNREFUSED 127.0.0.1:8771",
+    deliveryLost: false,
+    completionText: "stranded terminal evidence",
+    agentSessionId: "SESS-RECOVER",
+  });
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "ok", `echo ran >> "${marker}"\necho "fresh wake answer"`);
+  const bridge = await startRespondingBridge(200, { status: "ok", ack: "enqueued" });
+  try {
+    const env = unknownEnv(ctx, bin, bridge.url);
+    // A NORMAL wake. Nothing about it mentions the stranded job — the sweep on
+    // its tail is the whole mechanism.
+    const wake = await runHelperAsync(env, payloadFor({ messageId: "live-1", sessionId: "SESS-LIVE" }));
+    assert.equal(wake.status, "completed");
+    assert.equal(wake.bridge.status, "delivered");
+    assert.equal(wake.recovery.eligible, 1);
+    assert.equal(wake.recovery.results[0].posted, true);
+
+    const texts = bridge.requests.map((r) => r && r.text);
+    assert.equal(texts.filter((t) => /stranded terminal evidence/.test(t)).length, 1);
+    assert.equal(bridge.requests.find((r) => /stranded terminal evidence/.test(r.text)).sessionId, "SESS-RECOVER");
+
+    const recovered = readJob(ctx, "stranded-1");
+    assert.equal(recovered.bridgeStatus, "delivered");
+    assert.equal(recovered.deliveryLost, false);
+    assert.equal(recovered.completionText, null, "a delivered completion is not kept for a second replay");
+    assert.ok(recovered.deliveryRecoveryAt, "the once-only marker must be durable");
+    assert.equal(recovered.deliveryRecoveryOutcome, "redelivered");
+    assert.equal(receipts(ctx).filter((r) => r.kind === "redelivery").length, 1);
+
+    // The second bridge contact must NOT post it again.
+    const again = await runHelperAsync(env, payloadFor({ messageId: "live-2", sessionId: "SESS-LIVE" }));
+    assert.equal(again.recovery, undefined, "nothing is eligible on the second pass");
+    assert.equal(bridge.requests.filter((r) => /stranded terminal evidence/.test(r.text)).length, 1);
+    assert.equal(markerLines(marker).length, 2, "recovery re-posts a reply; it never reruns the worker");
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("recovery refuses everything that is not PROVEN undelivered", async () => {
+  const ctx = makeRoot("recovery-refuses");
+  fs.writeFileSync(path.join(ctx.bridgeDir, "token"), "test-token\n", { mode: 0o600 });
+  // Ambiguous: may already have landed. Re-posting is the double-delivery.
+  writeSettledJob(ctx, "amb-1", {
+    bridgeStatus: "unknown", bridgeReason: "http_504",
+    completionText: "ambiguous evidence", agentSessionId: "SESS-AMB",
+  });
+  // An operator decision, not a transport fault.
+  writeSettledJob(ctx, "sup-1", {
+    status: "canceled", bridgeStatus: "suppressed",
+    bridgeReason: "operator_cleanup_no_completion_delivery",
+    completionText: "suppressed evidence", agentSessionId: "SESS-SUP",
+  });
+  // Delivered, text already cleared.
+  writeSettledJob(ctx, "ok-1", { bridgeStatus: "delivered", completionText: null, agentSessionId: "SESS-OK" });
+  // Proven-failed but the reply is not on the record: nothing to re-post. This
+  // is the shape of the four legacy failures in the live store.
+  writeSettledJob(ctx, "textless-1", {
+    bridgeStatus: "failed", bridgeReason: "bridge_message_timeout",
+    completionText: null, agentSessionId: "SESS-TEXTLESS",
+  });
+  const bridge = await startRespondingBridge(200, { status: "ok", ack: "enqueued" });
+  try {
+    const bin = fakeClaude(ctx.root, "never", "echo unused");
+    const recovery = await runRecover(unknownEnv(ctx, bin, bridge.url));
+    assert.equal(recovery.eligible, 0);
+    assert.equal(recovery.attempted, 0);
+    assert.equal(bridge.requests.length, 0, "not one post may leave for an unproven loss");
+    assert.equal(readJob(ctx, "amb-1").completionText, "ambiguous evidence");
+    assert.equal(readJob(ctx, "amb-1").deliveryRecoveryAt, undefined);
+    assert.equal(readJob(ctx, "sup-1").deliveryLost, undefined);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("a stranded completion with no origin session is carded, never posted or rerun", async () => {
+  const ctx = makeRoot("recovery-no-origin");
+  fs.writeFileSync(path.join(ctx.bridgeDir, "token"), "test-token\n", { mode: 0o600 });
+  writeSettledJob(ctx, "no-origin-1", {
+    bridgeStatus: "blocked",
+    bridgeReason: "missing_origin_session",
+    completionText: "retained result with nowhere to go",
+    agentSessionId: null,
+    payload: { messageId: "no-origin-1", text: "prior work", topic: "recovery" },
+  });
+  const bridge = await startRespondingBridge(200, { status: "ok", ack: "enqueued" });
+  try {
+    const bin = fakeClaude(ctx.root, "never", "echo unused");
+    const recovery = await runRecover(unknownEnv(ctx, bin, bridge.url));
+    assert.equal(recovery.eligible, 1);
+    assert.equal(recovery.results[0].status, "carded");
+    assert.equal(recovery.results[0].posted, false);
+    assert.equal(bridge.requests.length, 0);
+
+    const job = readJob(ctx, "no-origin-1");
+    // The record must still present as BLOCKED — that is the outcome class the
+    // delegation-outcome card reports it under, and arming deliveryLost here
+    // would silently reclassify it.
+    assert.equal(job.bridgeStatus, "blocked");
+    assert.notEqual(job.deliveryLost, true);
+    assert.equal(job.completionText, "retained result with nowhere to go", "the reply stays on the record");
+    assert.equal(job.deliveryRecoveryOutcome, "carded_origin_unresolvable");
+    assert.match(job.deliveryRecoveryNote, /no-origin-1\.json/);
+    assert.match(job.deliveryRecoveryNote, /Do not rerun the worker/);
+
+    // Once only.
+    const second = await runRecover(unknownEnv(ctx, bin, bridge.url));
+    assert.equal(second.eligible, 0);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("one recovery pass is bounded and drains oldest-first", async () => {
+  const ctx = makeRoot("recovery-bounded");
+  fs.writeFileSync(path.join(ctx.bridgeDir, "token"), "test-token\n", { mode: 0o600 });
+  for (const [id, at] of [["old", "2026-08-01"], ["mid", "2026-08-02"], ["new", "2026-08-03"]]) {
+    writeSettledJob(ctx, `bounded-${id}`, {
+      completedAt: `${at}T00:00:00.000Z`,
+      bridgeStatus: "failed", bridgeReason: "ECONNREFUSED",
+      completionText: `evidence ${id}`, agentSessionId: "SESS-BOUND",
+    });
+  }
+  const bridge = await startRespondingBridge(200, { status: "ok", ack: "enqueued" });
+  try {
+    const bin = fakeClaude(ctx.root, "never", "echo unused");
+    const env = unknownEnv(ctx, bin, bridge.url, { NATIVE_AGENT_CLAUDE_WAKE_RECOVERY_MAX: "2" });
+    const recovery = await runRecover(env);
+    assert.equal(recovery.eligible, 3);
+    assert.equal(recovery.attempted, 2);
+    assert.deepEqual(bridge.requests.map((r) => r.text), ["evidence old", "evidence mid"]);
+    assert.equal(readJob(ctx, "bounded-new").deliveryRecoveryAt, undefined);
+    await runRecover(env);
+    assert.deepEqual(bridge.requests.map((r) => r.text), ["evidence old", "evidence mid", "evidence new"]);
+  } finally {
+    await bridge.close();
+  }
+});
+
+// ------------------------------------------------------- stalled re-arm (B)
+
+test("a timed-out run re-arms exactly ONCE and records the attempt durably", async () => {
+  const ctx = makeRoot("rearm-timeout");
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "slow", `echo ran >> "${marker}"\nexec sleep 30`);
+  const env = baseEnv(ctx, bin, { NATIVE_AGENT_CLAUDE_WAKE_TIMEOUT_SECONDS: "1" });
+  const payload = payloadFor({ messageId: "rearm-1", topic: "rearm timeout" });
+  const result = await runHelperAsync(env, payload, { timeoutMs: 60_000 });
+  assert.equal(result.status, "failed");
+  assert.equal(result.reason, "timeout_after_1s");
+  assert.equal(result.autoRearms, 1);
+  assert.equal(markerLines(marker).length, 2, "exactly one retry — not zero, not two");
+  const job = readJob(ctx, "rearm-1");
+  assert.equal(job.autoRearms, 1);
+  assert.equal(job.autoRearmReason, "timeout_after_1s");
+  assert.ok(job.autoRearmAt);
+  assert.equal(job.state, "settled");
+  assert.equal(job.status, "failed", "past the budget the honest end state is a failure card");
+});
+
+test("CONTROL: the re-arm budget is honoured — 0 disables it, and a clean run never re-arms", async () => {
+  const ctx = makeRoot("rearm-control");
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "slow", `echo ran >> "${marker}"\nexec sleep 30`);
+  const off = await runHelperAsync(
+    baseEnv(ctx, bin, {
+      NATIVE_AGENT_CLAUDE_WAKE_TIMEOUT_SECONDS: "1",
+      NATIVE_AGENT_CLAUDE_WAKE_MAX_REARMS: "0",
+    }),
+    payloadFor({ messageId: "rearm-off", topic: "rearm off" }),
+    { timeoutMs: 60_000 }
+  );
+  assert.equal(off.reason, "timeout_after_1s");
+  assert.equal(off.autoRearms, 0);
+  assert.equal(markerLines(marker).length, 1);
+
+  const cleanMarker = path.join(ctx.root, "clean.txt");
+  const cleanBin = fakeClaude(ctx.root, "clean", `echo ran >> "${cleanMarker}"\necho "answered"`);
+  const clean = await runHelperAsync(
+    baseEnv(ctx, cleanBin),
+    payloadFor({ messageId: "rearm-clean", topic: "rearm clean" })
+  );
+  assert.equal(clean.status, "completed");
+  assert.equal(clean.autoRearms, 0);
+  assert.equal(markerLines(cleanMarker).length, 1);
+});
+
+// ------------------------------------------------- wedged runner re-arm (B2)
+//
+// Before this, a runner that was alive but wedged past its own deadline held
+// its messageId hostage until the process died: every retry returned
+// "duplicate" forever. The kill is admissible ONLY because the runner stamps
+// `delivering` before it posts, so a pre-delivery job cannot have delivered.
+
+function spawnWedgedRunner() {
+  const child = spawn("/bin/sh", ["-c", "exec sleep 300"], { detached: true, stdio: "ignore" });
+  child.unref();
+  return child.pid;
+}
+
+function writeWedgedJob(ctx, messageId, pid, fields = {}) {
+  const file = jobFileFor(ctx, messageId);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const past = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const job = {
+    schemaVersion: 2,
+    messageId,
+    createdAt: past,
+    claimedAt: past,
+    heartbeatAt: new Date().toISOString(),
+    startedAt: past,
+    deadlineAt: past,
+    state: "running",
+    claimId: "wedged-claim",
+    pid,
+    runnerPid: pid,
+    attemptSessionId: "wedged-session",
+    topicSlug: "wedged",
+    timeoutSeconds: 60,
+    payload: { messageId, text: "the wedged work", topic: "wedged" },
+    ...fields,
+  };
+  fs.writeFileSync(file, JSON.stringify(job, null, 2), { mode: 0o600 });
+  return job;
+}
+
+test("a wedged runner past its deadline is TERMINATED and the wake re-arms once", async () => {
+  const ctx = makeRoot("wedged-rearm");
+  const pid = spawnWedgedRunner();
+  writeWedgedJob(ctx, "wedged-1", pid);
+  const marker = path.join(ctx.root, "invocations.txt");
+  const bin = fakeClaude(ctx.root, "ok", `echo ran >> "${marker}"\necho "the re-armed answer"`);
+  const result = await runHelperAsync(
+    baseEnv(ctx, bin, { NATIVE_AGENT_CLAUDE_WAKE_WEDGED_MARGIN_MS: "0" }),
+    payloadFor({ messageId: "wedged-1", topic: "wedged" }),
+    { timeoutMs: 60_000 }
+  );
+  assert.equal(result.status, "completed", `expected the re-armed run to answer, got ${JSON.stringify(result)}`);
+  assert.equal(result.takeover.reason, "wedged_runner_terminated");
+  assert.ok(result.takeover.wedge.overdueMs > 0);
+  // A field saying "terminated" proves nothing; the process must be gone.
+  let alive = true;
+  try { process.kill(pid, 0); } catch { alive = false; }
+  assert.equal(alive, false, `wedged pid ${pid} is STILL ALIVE — the re-arm ran beside a live runner`);
+  assert.equal(markerLines(marker).length, 1);
+  const job = readJob(ctx, "wedged-1");
+  assert.equal(job.autoRearms, 1);
+  assert.equal(job.state, "settled");
+  assert.match(job.autoRearmReason, /^wedged_runner_terminated_overdue_/);
+});
+
+test("a wedged runner whose re-arm budget is spent is terminated and CARDED as failed", async () => {
+  const ctx = makeRoot("wedged-exhausted");
+  const pid = spawnWedgedRunner();
+  writeWedgedJob(ctx, "wedged-2", pid, { autoRearms: 1 });
+  const marker = path.join(ctx.root, "must-not-run");
+  const bin = fakeClaude(ctx.root, "never", `echo ran >> "${marker}"\necho hi`);
+  const result = await runHelperAsync(
+    baseEnv(ctx, bin, { NATIVE_AGENT_CLAUDE_WAKE_WEDGED_MARGIN_MS: "0" }),
+    payloadFor({ messageId: "wedged-2", topic: "wedged" }),
+    { timeoutMs: 60_000 }
+  );
+  assert.equal(result.status, "skipped");
+  assert.equal(result.note, "wedged_runner_rearm_exhausted");
+  assert.equal(result.wedgedRunnerTerminated, true);
+  let alive = true;
+  try { process.kill(pid, 0); } catch { alive = false; }
+  assert.equal(alive, false, "the hostage-holding runner must still be released");
+  assert.equal(fs.existsSync(marker), false, "past the budget nothing reruns");
+  const job = readJob(ctx, "wedged-2");
+  assert.equal(job.state, "settled");
+  assert.equal(job.status, "failed");
+  assert.equal(job.reason, "wedged_runner_terminated_after_1_rearm");
+  assert.equal(job.bridgeStatus, "suppressed");
+  assert.equal(job.deliveryLost, false);
+});
+
+test("CONTROL: a runner that reached DELIVERING is never killed, however overdue", async () => {
+  const ctx = makeRoot("wedged-delivering");
+  const pid = spawnWedgedRunner();
+  writeWedgedJob(ctx, "wedged-3", pid, { state: "delivering", runStatus: "completed" });
+  const marker = path.join(ctx.root, "must-not-run");
+  const bin = fakeClaude(ctx.root, "never", `echo ran >> "${marker}"\necho hi`);
+  try {
+    const result = await runHelperAsync(
+      baseEnv(ctx, bin, { NATIVE_AGENT_CLAUDE_WAKE_WEDGED_MARGIN_MS: "0" }),
+      payloadFor({ messageId: "wedged-3", topic: "wedged" }),
+      { timeoutMs: 60_000 }
+    );
+    assert.equal(result.status, "skipped");
+    assert.equal(result.reason, "duplicate");
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch {}
+    assert.equal(alive, true, "a job at or past `delivering` may already have posted — killing it risks a double completion");
+    assert.equal(fs.existsSync(marker), false);
+  } finally {
+    try { process.kill(pid, "SIGKILL"); } catch {}
   }
 });

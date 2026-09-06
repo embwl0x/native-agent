@@ -131,9 +131,38 @@ extension AppModel {
     @discardableResult
     func refreshModelCatalog() async -> Bool {
         do {
-            modelCatalog = try await client.getModelCatalog(refresh: true)
-            statusText = "Model catalog refreshed"
-            return true
+            let catalog = try await client.getModelCatalog(refresh: true)
+            modelCatalog = catalog
+            // User, 2026-09-06: a refresh that never reached the provider used
+            // to report success — the catalog read now says where its rows came
+            // from, and this says the same thing out loud instead of claiming a
+            // network round trip that did not happen. The RETURN VALUE means
+            // the same thing: true only for a live read, because the callers
+            // that render "refreshed" have nothing else to go on. A catalog
+            // that reports no freshness at all is not a failure signal, so it
+            // keeps the old answer. User, 2026-09-06: "live" here means the read
+            // REACHED the provider — a partial page did, and calling it a
+            // failed refresh was a lie; only pruning needs a complete list.
+            let freshness = catalog.catalogFreshness
+                .flatMap(ModelCatalogFreshness.init(rawValue:))
+            switch freshness {
+            case .staleAfterFailedRefresh:
+                statusText = "Model catalog refresh failed — showing the cached list"
+            case .builtInAfterFailedRefresh:
+                statusText = "Model catalog refresh failed — showing the built-in list"
+            case .cached:
+                statusText = "Model catalog unchanged (cached)"
+            case .builtIn:
+                statusText = "Model catalog showing the built-in list"
+            case .liveIncomplete:
+                // User, 2026-09-06: a partial page used to be labelled `cached`
+                // and reported as a refresh that could not reach the provider.
+                // It did reach it; what it cannot claim is the whole list.
+                statusText = "Model catalog refreshed; the provider's list may be partial"
+            case .live, .none:
+                statusText = "Model catalog refreshed"
+            }
+            return freshness?.reachedProvider ?? true
         } catch {
             statusText = "Model refresh failed: \(error.localizedDescription)"
             return false

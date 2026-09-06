@@ -12,9 +12,40 @@ extension MacAppleScriptBridge {
     private static let appleScriptTimeoutSeconds: TimeInterval = 15
     private static let appleScriptQueue = DispatchQueue(label: "NativeAgent.MacAppleScriptBridge.appleScript")
 
+    /// 2026-09-06: the code a timeout carries when the script had ALREADY
+    /// begun executing. `appleScriptQueue` is serial, so a caller's 15s can
+    /// expire while an earlier script still holds the queue — and the script
+    /// this call queued then ran anyway, after the caller had been told the
+    /// tool failed. A retry on that word duplicates an external send.
+    static let appleScriptOutcomeUnknownCode = -1002
+
     private final class AppleScriptContinuationGate: @unchecked Sendable {
         private let lock = NSLock()
         private var didResume = false
+        private var started = false
+        private var abandoned = false
+
+        /// Claim the right to run. False means the caller's deadline passed
+        /// before this script reached the head of the queue, so it must not
+        /// execute at all — nothing external has happened yet, and the caller
+        /// has already been told so.
+        func claimStart() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !abandoned else { return false }
+            started = true
+            return true
+        }
+
+        /// Called on the deadline. True means the script was already running,
+        /// so its outcome is unknown; false means it was abandoned unstarted.
+        func markTimedOut() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !started else { return true }
+            abandoned = true
+            return false
+        }
 
         func resume(
             _ continuation: CheckedContinuation<String, any Error>,
@@ -34,14 +65,22 @@ extension MacAppleScriptBridge {
             DispatchQueue.global(qos: .userInitiated).asyncAfter(
                 deadline: .now() + appleScriptTimeoutSeconds
             ) {
+                let wasRunning = gate.markTimedOut()
                 gate.resume(continuation, result: .failure(NSError(
                     domain: "NativeAgentAppleScript",
-                    code: -1001,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "AppleScript timed out after \(Int(appleScriptTimeoutSeconds))s"]
+                    code: wasRunning ? appleScriptOutcomeUnknownCode : -1001,
+                    userInfo: [NSLocalizedDescriptionKey: wasRunning
+                        ? "AppleScript was still executing after \(Int(appleScriptTimeoutSeconds))s; "
+                            + "its outcome is unknown. Observe before retrying — a retry may repeat it."
+                        : "AppleScript timed out after \(Int(appleScriptTimeoutSeconds))s before it "
+                            + "started; it was abandoned and never ran."]
                 )))
             }
             appleScriptQueue.async {
+                // 2026-09-06: the deadline may have passed while this block sat
+                // behind an earlier script. Refuse to run rather than perform an
+                // action the caller was already told did not happen.
+                guard gate.claimStart() else { return }
                 var error: NSDictionary?
                 guard let script = NSAppleScript(source: source) else {
                     gate.resume(continuation, result: .failure(NSError(
@@ -129,6 +168,19 @@ extension MacAppleScriptBridge {
 
     static func failedEnvelope(integration: String, error: Error) -> JSONValue {
         let ns = error as NSError
+        // 2026-09-06: a script that timed out while ALREADY RUNNING may still
+        // complete — the send may have gone out. Calling that "failed" invites
+        // a retry that duplicates it, so it gets its own status here, at the
+        // single funnel every AppleScript catch already goes through.
+        if ns.domain == "NativeAgentAppleScript", ns.code == appleScriptOutcomeUnknownCode {
+            return .object([
+                "status": .string("unknown"),
+                "reason": .string("outcome_unknown"),
+                "integration": .string(integration),
+                "error_code": .int(Int64(ns.code)),
+                "error": .string(ns.localizedDescription),
+            ])
+        }
         return .object([
             "status": .string("failed"),
             "integration": .string(integration),
@@ -156,6 +208,9 @@ extension MacAppleScriptBridge {
 
     static let mailNotConfiguredSentinel = "__NATIVEAGENT_MAIL_NOT_CONFIGURED__"
     static let notesNotConfiguredSentinel = "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
+    /// 2026-09-06: `notes_create` answering that the folder the caller asked
+    /// for does not exist, followed by the folder names that do.
+    static let notesFolderMissingSentinel = "__NATIVEAGENT_NOTES_FOLDER_MISSING__"
 
     /// Converts only explicit setup sentinels. An empty script result remains
     /// a legitimate zero-result read and TCC errors stay owned by the caller's
@@ -220,15 +275,20 @@ extension MacAppleScriptBridge {
 
     /// Escape a user-supplied string for safe injection into an AppleScript
     /// string literal. Backslashes first (so we don't double-escape our own
-    /// inserted backslashes), then double quotes, then strip control chars
-    /// that would terminate the literal (CR/LF — AppleScript string literals
-    /// can't span lines without explicit `& return &` concatenation).
+    /// inserted backslashes), then double quotes, then the line breaks.
+    ///
+    /// 2026-09-06: CR/LF used to be replaced with a SPACE, so an approved
+    /// multiline body — a mail send, a Messages send, a note — went out
+    /// reflowed onto one line, which is not what the operator approved. An
+    /// AppleScript string literal cannot span source lines, but it does accept
+    /// `\n` and `\r` escapes inside itself, so the break survives as a break
+    /// and the literal still cannot be terminated early.
     static func escapeForAppleScript(_ s: String) -> String {
         var out = s.replacingOccurrences(of: "\\", with: "\\\\")
         out = out.replacingOccurrences(of: "\"", with: "\\\"")
-        out = out.replacingOccurrences(of: "\r\n", with: " ")
-        out = out.replacingOccurrences(of: "\n", with: " ")
-        out = out.replacingOccurrences(of: "\r", with: " ")
+        out = out.replacingOccurrences(of: "\r\n", with: "\\n")
+        out = out.replacingOccurrences(of: "\n", with: "\\n")
+        out = out.replacingOccurrences(of: "\r", with: "\\r")
         return out
     }
 

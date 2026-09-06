@@ -45,16 +45,26 @@ struct ChatDarkModeAppearanceEvalTests {
     }
 
     @MainActor
-    @Test("only Bool true forces dark AppKit chrome; absent, false, and malformed values follow system")
+    // 2026-09-06: 1a35d953 ("Appearance: dark is the default; only an explicit
+    // off follows the system") inverted the default. preferredAppearance now
+    // reads `(object(forKey:) as? Bool) ?? true` — absent means dark, and only
+    // a real persisted Bool(false) hands the panel to the system appearance.
+    // The honesty this pins is unchanged: `as? Bool` still refuses to coerce a
+    // malformed value, so a junk string cannot flip the chrome — it falls back
+    // to the default like an absent key does.
+    @Test("only an explicit Bool false follows the system; absent and malformed values keep the dark default")
     func appearanceMappingIsHonestForStoredValues() throws {
         let (defaults, suite) = try isolatedDefaults()
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        #expect(DetachedChatWindowController.preferredAppearance(defaults: defaults) == nil)
+        // 2026-09-06 (1a35d953): absent used to mean "follow system", now dark.
+        #expect(DetachedChatWindowController.preferredAppearance(defaults: defaults)?.name == .darkAqua)
         defaults.set(false, forKey: key)
         #expect(DetachedChatWindowController.preferredAppearance(defaults: defaults) == nil)
+        // 2026-09-06 (1a35d953): a non-Bool is still not coerced — it is not an
+        // opt-out, so it lands on the default (now dark) rather than on system.
         defaults.set("not-a-boolean", forKey: key)
-        #expect(DetachedChatWindowController.preferredAppearance(defaults: defaults) == nil)
+        #expect(DetachedChatWindowController.preferredAppearance(defaults: defaults)?.name == .darkAqua)
         defaults.set(true, forKey: key)
         #expect(DetachedChatWindowController.preferredAppearance(defaults: defaults)?.name == .darkAqua)
     }
@@ -100,19 +110,35 @@ struct ChatDarkModeAppearanceEvalTests {
 
         controller.open(sessionId: sessionID)
         let handle = try #require(handles[sessionID])
+        // 2026-09-06: the opening paint does NOT come from the injected suite —
+        // open() builds the request with `Self.preferredAppearance()`, the
+        // no-argument reader over .standard (DetachedChatPanel.swift:350). That
+        // used to be invisible because an unset preference mapped to nil on both
+        // authorities; since 1a35d953 made dark the default, the first frame is
+        // dark on a stock machine. Pin it against the same reader instead of a
+        // literal so the eval does not depend on the host's real preference.
+        #expect(handle.appearance == DetachedChatWindowController.preferredAppearance())
+
+        // With the opening paint no longer a known value, drive the panel to a
+        // known state first and count only the writes that follow, so the
+        // one-write-per-real-change and nothing-after-teardown pins stay exact.
+        defaults.set(false, forKey: key)
+        center.post(name: UserDefaults.didChangeNotification, object: defaults)
+        await Task.yield()
         #expect(handle.appearance == nil)
+        let baselineWrites = handle.appearanceWrites
 
         defaults.set(true, forKey: key)
         center.post(name: UserDefaults.didChangeNotification, object: defaults)
         await Task.yield()
         #expect(handle.appearance?.name == .darkAqua)
-        #expect(handle.appearanceWrites == 1)
+        #expect(handle.appearanceWrites == baselineWrites + 1)
 
         defaults.set(false, forKey: key)
         center.post(name: UserDefaults.didChangeNotification, object: defaults)
         await Task.yield()
         #expect(handle.appearance == nil)
-        #expect(handle.appearanceWrites == 2)
+        #expect(handle.appearanceWrites == baselineWrites + 2)
 
         observer.stop()
         #expect(!observer.isObserving)
@@ -120,6 +146,6 @@ struct ChatDarkModeAppearanceEvalTests {
         center.post(name: UserDefaults.didChangeNotification, object: defaults)
         await Task.yield()
         #expect(handle.appearance == nil)
-        #expect(handle.appearanceWrites == 2)
+        #expect(handle.appearanceWrites == baselineWrites + 2)
     }
 }

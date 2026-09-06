@@ -262,9 +262,15 @@ struct MigrationTests {
         try approved.write(to: propDir.appendingPathComponent("candidate-approved-legacy.json"))
 
         let store = try MemoryStorage(dataRoot: root)
+        // 2026-09-06 (35521816): importLegacyMemory decides inside the write —
+        // absent INSERTS, existing-and-EMPTY refreshes, existing-with-content
+        // is left alone. The repair path this test covers is the empty row: a
+        // blank or half-written import that the old existence-only gate left
+        // broken forever behind the one-way completion sentinel. A row that
+        // already holds content is no longer overwritten from legacy.
         _ = try await store.insertMemory(StoredMemory(
             id: "approved-legacy",
-            content: "stale approved fact",
+            content: "",
             embedding: [0, 0, 0]
         ))
 
@@ -274,7 +280,10 @@ struct MigrationTests {
             embedder: MockEmbeddingProvider(dimensions: 4)
         ).migrate()
 
-        #expect(report.memoriesImported == 0)
+        // A refresh LANDS, so it counts as an import — importLegacyMemory
+        // reports .refreshedEmpty and .insert alike as landed, and the repair
+        // really did write the canonical row.
+        #expect(report.memoriesImported == 1)
         #expect(report.errors.isEmpty)
         let mem = try await store.memory(id: "approved-legacy")
         #expect(mem?.content == "approved fact refreshed")

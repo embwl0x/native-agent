@@ -38,7 +38,10 @@ struct WorkshopSynthesizeReadOnlyToolDispatcher: ToolDispatchClient {
     /// deliberately adds it (no silent privilege creep).
     static let allowed: Set<String> = [
         "read_file", "list_dir",
-        "search_chat_history", "session_search",
+        // 2026-09-06: read_chat_message pages one already-found message
+        // whole. Same read-only reach as search_chat_history, which returns a
+        // 368-character preview and the id this tool takes.
+        "search_chat_history", "session_search", "read_chat_message",
         "recall_memory", "recall_search", "search_kg", "context_lookup",
         "read_skill", "list_skills",
         "tool_catalog", "list_tools",

@@ -298,6 +298,17 @@ public protocol DeviceSyncTransport: Sendable {
     /// Observe a status key. Mirrors `iCloudBridge.observeStatusKey`.
     func observeStatus(key: String, onChange: @escaping @Sendable (String) async -> Void) async
 
+    /// 2026-09-06: the ACKNOWLEDGING form. The handler returns true only once
+    /// the value has been durably applied; a false result leaves the peer's
+    /// record eligible for a later drain, exactly as `observePairing` already
+    /// works. The unacknowledged form above claims the record's modification
+    /// date BEFORE the handler runs, so a snapshot the phone failed to store
+    /// was never redelivered.
+    ///
+    /// Defaulted onto the unacknowledged form so a transport that cannot tell
+    /// keeps today's behaviour.
+    func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async
+
     /// iCloud account availability: "available" | "noAccount" | "restricted" |
     /// "temporarilyUnavailable" | "unknown". Defaulted for transports (KVS)
     /// that don't model an account.
@@ -315,9 +326,23 @@ public protocol DeviceSyncTransport: Sendable {
     @discardableResult
     func drainPairing() async -> Bool
 
+    /// 2026-09-06: read the peer's published pairing secret WITHOUT applying it
+    /// — the material a manually pasted recovery key is verified against on a
+    /// build whose only pairing channel is this transport. Transports with no
+    /// readable pairing record return nil via the default.
+    func peekPairingSecret() async -> Data?
+
     /// Pull the peer's status singletons now; returns the number of handlers fired.
     @discardableResult
     func drainStatus() async -> Int
+
+    /// 2026-09-06: delete device-sync records past the retention window and
+    /// return how many went. Nothing else ever deletes a chat/notification
+    /// record, so without this the store grows for the life of the account.
+    /// Only the always-on Mac owner calls (and performs) this; the phone never
+    /// deletes. Transports with no server-side store no-op via the default.
+    @discardableResult
+    func sweepExpiredRecords() async -> Int
 }
 
 public extension DeviceSyncTransport {
@@ -326,12 +351,35 @@ public extension DeviceSyncTransport {
 
     func accountStatus() async -> String { "available" }
 
+    /// 2026-09-06: the adapter of last resort, and it says so. A transport that
+    /// implements only the unacknowledged form has ALREADY claimed the peer's
+    /// record before the handler runs, so a `false` here cannot be honoured by
+    /// redelivery — the one thing this default can still do is refuse to hide
+    /// it. `_ = await onApply(value)` dropped the answer on the floor, so a
+    /// snapshot the peer failed to store looked exactly like one it stored.
+    /// Every transport whose records are claimed on delivery implements this
+    /// method itself (CloudKit does); inheriting this default is a conformer
+    /// saying it has no redelivery to offer.
+    func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async {
+        await observeStatus(key: key) { value in
+            guard await onApply(value) else {
+                NSLog(
+                    "[device-sync] status %@ was NOT applied and this transport cannot redeliver it — the value is lost",
+                    key
+                )
+                return
+            }
+        }
+    }
+
     // Default no-ops: a push-driven transport that delivers via observe* alone
     // (e.g. a future KVS/ubiquity impl) needs no explicit pull. The CloudKit
     // transport and the mock override these with real pulls.
     @discardableResult func drainIncoming() async -> Int { 0 }
     @discardableResult func drainPairing() async -> Bool { false }
+    func peekPairingSecret() async -> Data? { nil }
     @discardableResult func drainStatus() async -> Int { 0 }
+    @discardableResult func sweepExpiredRecords() async -> Int { 0 }
 }
 
 // MARK: - Build/runtime flag + resolver (deliverable 4)

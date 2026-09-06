@@ -1083,140 +1083,105 @@ extension NativeClient {
         )
     }
 
-    // DAEMON-DEAD PORT (2026-06-02): read the approvals file, mark the matching
-    // step record approved, write back under a flock. Then return the current
-    // execution detail (native read).
+    // DAEMON-DEAD PORT (2026-06-02), REWRITTEN 2026-09-06.
     //
-    // R5 (eval E06 fix-3): canonical path is `<root>/workflows/approvals/requests.json`
-    // — matches the ApprovalInbox list reader source-of-truth
-    // (ApprovalInbox.approvalsPath) and the daemon's notification-status reader.
-    // Any pre-existing rows at the legacy `<root>/approvals/requests.json` are
-    // migrated once: merged into the canonical file (canonical wins on id-conflict),
-    // then the legacy file is renamed to `requests.json.migrated` so a second boot
-    // skips the merge.
-    func approveStep(executionId: String, stepId: String) async throws -> WorkshopExecution.WorkshopExecutionRecord {
-        let root = PersistenceCore.defaultDataRoot()
-        let approvalsPath = root
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        let legacyApprovalsPath = root
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        let persistence = SwiftNativePersistenceCore()
-        let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
-        try await persistence.withFileLock(approvalsPath) {
-            // One-time migrate: if legacy path exists and has rows, merge into
-            // the canonical file (canonical wins on id-conflict), then rename
-            // the legacy file so subsequent boots skip the merge.
-            if FileManager.default.fileExists(atPath: legacyApprovalsPath.path) {
-                let legacyRaw = await persistence.readJSON(legacyApprovalsPath, defaultValue: .array([]))
-                if case .array(let legacyRows) = legacyRaw, !legacyRows.isEmpty {
-                    let canonicalRaw = await persistence.readJSON(approvalsPath, defaultValue: .array([]))
-                    var canonicalRows: [JSONValue] = {
-                        if case .array(let a) = canonicalRaw { return a }
-                        return []
-                    }()
-                    func rowKey(_ v: JSONValue) -> String? {
-                        guard case .object(let obj) = v else { return nil }
-                        let m: String? = { if case .string(let s) = obj["executionId"] ?? obj["execution_id"] ?? obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
-                        let s: String? = { if case .string(let s) = obj["stepId"] ?? obj["step_id"] ?? obj["id"] ?? .null { return s }; return nil }()
-                        guard let m = m, let s = s else { return nil }
-                        return "\(m)#\(s)"
-                    }
-                    let existing: Set<String> = Set(canonicalRows.compactMap(rowKey))
-                    for row in legacyRows {
-                        if let k = rowKey(row), !existing.contains(k) {
-                            canonicalRows.append(row)
-                        }
-                    }
-                    try await persistence.writeJSON(.array(canonicalRows), to: approvalsPath)
-                }
-                let migratedPath = legacyApprovalsPath
-                    .deletingLastPathComponent()
-                    .appendingPathComponent("requests.json.migrated")
-                try? FileManager.default.removeItem(at: migratedPath)
-                try? FileManager.default.moveItem(at: legacyApprovalsPath, to: migratedPath)
-            }
-            let raw = await persistence.readJSON(approvalsPath, defaultValue: .array([]))
-            var rows: [JSONValue] = {
-                if case .array(let a) = raw { return a }
-                return []
-            }()
-            var matched = false
-            for i in rows.indices {
-                guard case .object(var obj) = rows[i] else { continue }
-                let rowWorkshopExecution: String? = { if case .string(let s) = obj["executionId"] ?? obj["execution_id"] ?? obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
-                let rowStep: String? = { if case .string(let s) = obj["stepId"] ?? obj["step_id"] ?? obj["id"] ?? .null { return s }; return nil }()
-                if rowWorkshopExecution == executionId && rowStep == stepId {
-                    obj["status"] = .string("approved")
-                    obj["decision"] = .string("approved")
-                    obj["resolvedAt"] = .string(nowISO)
-                    rows[i] = .object(obj)
-                    matched = true
-                }
-            }
-            if !matched {
-                rows.append(.object([
-                    "executionId": .string(executionId),
-                    "stepId": .string(stepId),
-                    "status": .string("approved"),
-                    "decision": .string("approved"),
-                    "resolvedAt": .string(nowISO),
-                ]))
-            }
-            try await persistence.writeJSON(.array(rows), to: approvalsPath)
-        }
-        guard let record = await makeWorkshopExecutionRunner().getWorkshopExecution(executionId) else {
-            throw DaemonError.notFound("workshop execution \(executionId)")
-        }
-        return record
+    // These two routes used to do their own read-modify-write on the canonical
+    // approvals file, and both ways they touched it were corrupting:
+    //
+    //   * the read was `readJSON(defaultValue: .array([]))`, so an unreadable
+    //     or malformed store became `[]` and was then WRITTEN BACK — every
+    //     pending approval in it destroyed;
+    //   * the write set `status` to "approved"/"rejected", which are outside
+    //     the store's valid status set, and for an execution/step nobody
+    //     staged it APPENDED a skeletal row with no id and no authority
+    //     fields. Either row makes `loadApprovalRowsChecked` throw for the
+    //     WHOLE file, so one tap on the phone took the entire approval inbox
+    //     offline for every reader;
+    //   * the "workshop execution not found" check ran only AFTER that write,
+    //     so a request naming a nonexistent execution poisoned the store and
+    //     then reported not-found.
+    //
+    // And nothing ever read those rows. A blocked step is resumed from a
+    // RESOLVED `execution.step` ApprovalRecord (NativeClient+ApprovalExecutors
+    // .applyResolvedWorkshopStep), so the write was pure corruption with no
+    // effect — approving a step from the phone never resumed anything.
+    //
+    // Both routes now go through the inbox owner: the execution is resolved
+    // before anything is written, a damaged store throws instead of being
+    // overwritten, and the decision is minted down the same checked path the
+    // Approvals panel uses (which also makes the phone's approve actually
+    // resume the execution).
+    func approveStep(
+        executionId: String,
+        stepId: String,
+        provenance: ApprovalResolutionProvenance = .local(decidedBy: "mac_ui")
+    ) async throws -> WorkshopExecution.WorkshopExecutionRecord {
+        try await resolveWorkshopStepApproval(
+            executionId: executionId,
+            stepId: stepId,
+            decision: "approve",
+            provenance: provenance
+        )
     }
 
-    func rejectStep(executionId: String, stepId: String, reason: String = "Rejected by user") async throws -> WorkshopExecution.WorkshopExecutionRecord {
-        // residue/R6: daemon step-reject route retired. Mirror approveStep's
-        // canonical-path R-M-W under flock; flip decision to "rejected" + carry
-        // the reason. Same approvals.json file the ApprovalInbox reads.
-        let root = PersistenceCore.defaultDataRoot()
-        let approvalsPath = root
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        let persistence = SwiftNativePersistenceCore()
-        let nowISO = SwiftNativeManifestSigner.isoTimestamp(Date())
-        try await persistence.withFileLock(approvalsPath) {
-            let raw = await persistence.readJSON(approvalsPath, defaultValue: .array([]))
-            var rows: [JSONValue] = {
-                if case .array(let a) = raw { return a }
-                return []
-            }()
-            var matched = false
-            for i in rows.indices {
-                guard case .object(var obj) = rows[i] else { continue }
-                let rowWorkshopExecution: String? = { if case .string(let s) = obj["executionId"] ?? obj["execution_id"] ?? obj["missionId"] ?? obj["mission_id"] ?? .null { return s }; return nil }()
-                let rowStep: String? = { if case .string(let s) = obj["stepId"] ?? obj["step_id"] ?? obj["id"] ?? .null { return s }; return nil }()
-                if rowWorkshopExecution == executionId && rowStep == stepId {
-                    obj["status"] = .string("rejected")
-                    obj["decision"] = .string("rejected")
-                    obj["reason"] = .string(reason)
-                    obj["resolvedAt"] = .string(nowISO)
-                    rows[i] = .object(obj)
-                    matched = true
-                }
-            }
-            if !matched {
-                rows.append(.object([
-                    "executionId": .string(executionId),
-                    "stepId": .string(stepId),
-                    "status": .string("rejected"),
-                    "decision": .string("rejected"),
-                    "reason": .string(reason),
-                    "resolvedAt": .string(nowISO),
-                ]))
-            }
-            try await persistence.writeJSON(.array(rows), to: approvalsPath)
+    func rejectStep(
+        executionId: String,
+        stepId: String,
+        provenance: ApprovalResolutionProvenance = .local(decidedBy: "mac_ui")
+    ) async throws -> WorkshopExecution.WorkshopExecutionRecord {
+        try await resolveWorkshopStepApproval(
+            executionId: executionId,
+            stepId: stepId,
+            decision: "reject",
+            provenance: provenance
+        )
+    }
+
+    private func resolveWorkshopStepApproval(
+        executionId: String,
+        stepId: String,
+        decision: String,
+        provenance: ApprovalResolutionProvenance
+    ) async throws -> WorkshopExecution.WorkshopExecutionRecord {
+        let runner = makeWorkshopExecutionRunner()
+        // Refused BEFORE any write: an unknown execution now costs one read.
+        guard await runner.getWorkshopExecution(executionId) != nil else {
+            throw DaemonError.notFound("workshop execution \(executionId)")
         }
-        guard let record = await makeWorkshopExecutionRunner().getWorkshopExecution(executionId) else {
+        let root = dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
+        let inbox = SwiftNativeApprovalInbox(root: root)
+        // 2026-09-06: the pre-R5 merge runs INSIDE the inbox owner now — it
+        // used to read and rewrite the canonical queue from here, outside the
+        // actor's mutation chain and the file lock, so a concurrent create or
+        // resolve was overwritten by the migration's stale copy.
+        try await inbox.mergeLegacyApprovalRows()
+        // A throwing list IS the damaged-store signal, and it propagates —
+        // nothing below writes over a store this call could not read.
+        let pending = try await inbox.list(filter: ApprovalFilter(status: "pending"))
+        // The action is matched through the shared vocabulary so a card staged
+        // by a 0.3.x binary (`mission.step`) still resolves.
+        guard let staged = pending.first(where: { record in
+            guard ExecutionEventVocabulary.matches(
+                      record.action, WorkshopStepApprovalAction.canonical),
+                  case .object(let payload) = record.payload,
+                  let rowExecutionId = WorkshopStepApprovalPayload.executionId({ key in
+                      if case .string(let value)? = payload[key] { return value }
+                      return nil
+                  }),
+                  case .string(let rowStepId)? = payload["step_id"] else { return false }
+            return rowExecutionId == executionId && rowStepId == stepId
+        }) else {
+            throw DaemonError.notFound(
+                "pending \(WorkshopStepApprovalAction.canonical) approval for "
+                    + "\(executionId)/\(stepId)"
+            )
+        }
+        _ = try await resolveApproval(
+            id: staged.id,
+            decision: decision,
+            provenance: provenance
+        )
+        guard let record = await runner.getWorkshopExecution(executionId) else {
             throw DaemonError.notFound("workshop execution \(executionId)")
         }
         return record

@@ -3249,6 +3249,71 @@ struct ContextFlowCoordinatorTests {
         }
     }
 
+    /// NORTHSTAR clause 6. Measured 2026-09-01: `persona.docChars` = 22,278
+    /// while `system.stableChars` = 4,601 — in `.active` mode the kernel is
+    /// SOUL/VOICE only, so every other required persona document was precovered
+    /// by NOTHING and rode the per-turn packet, uncached, on every single turn.
+    ///
+    /// `stableSegmentCarriesRequiredDocuments` is the caller's promise that its
+    /// STABLE segment now carries those bytes verbatim. On that promise the
+    /// coordinator precovers EVERY persona-owned source, and the packet stops
+    /// mirroring identity into the volatile block. Default `false` reproduces
+    /// today's kernel-only precoverage exactly — the assertion pair below is
+    /// what proves the flag, and only the flag, moved the document.
+    @Test
+    func stableSegmentFlagKeepsRequiredPersonaDocumentsOutOfThePacket() async throws {
+        let growth = compiledSource(
+            id: "growth",
+            owner: "nativeagent.persona",
+            locator: "persona/Agent/GROWTH.md",
+            kind: .identity,
+            body: "Approved drift is curated, never inferred; growth is User-gated.",
+            authority: .identity,
+            policy: .always
+        )
+        let fixture = try await makeFixture(
+            mode: .active,
+            body: "# Core\nStable identity.",
+            projectedSources: [growth]
+        )
+        defer { fixture.cleanup() }
+        await fixture.coordinator.start()
+
+        func request(stableCarriesDocuments: Bool) -> ContextTurnRequest {
+            ContextTurnRequest(
+                surface: .chat,
+                origin: .localAuthenticated,
+                userMessage: "How does approved drift work?",
+                personaIDHint: "Agent",
+                allowedPrivacy: [.localPrivate],
+                stableSegmentCarriesRequiredDocuments: stableCarriesDocuments
+            )
+        }
+
+        let growthSourceID = growth.descriptor.id
+
+        // Today's behavior, untouched: the kernel carries SOUL only, so GROWTH
+        // is not precovered and the packet is its carrier.
+        let unflagged = try await fixture.coordinator
+            .prepareFrozenTurn(request(stableCarriesDocuments: false))
+        #expect(!unflagged.need.precoveredSourceIDs.contains(growthSourceID))
+        #expect(unflagged.packet.selectedItems.contains {
+            $0.pointer.sourceID == growthSourceID
+        })
+
+        // With the promise: precovered, and absent from the packet entirely —
+        // not in the selected items, and not smuggled back as a pointer.
+        let flagged = try await fixture.coordinator
+            .prepareFrozenTurn(request(stableCarriesDocuments: true))
+        #expect(flagged.need.precoveredSourceIDs.contains(growthSourceID))
+        #expect(!flagged.packet.selectedItems.contains {
+            $0.pointer.sourceID == growthSourceID
+        })
+        #expect(!flagged.packet.expandablePointers.contains {
+            $0.sourceID == growthSourceID
+        })
+    }
+
     private func makeFixture(
         mode: ContextFlowMode,
         body: String,

@@ -1,5 +1,6 @@
 import AppKit
 import Context
+import DreamREMCycle
 import Foundation
 import MemoryV2
 import NativeAgentCore
@@ -34,7 +35,7 @@ actor PersonaContextFlowProvider:
         let allowedRoots: [URL]
     }
 
-    private static let owner = "nativeagent.persona"
+    private static let owner = ContextPersonaSourceNaming.owner
     private static let surfaces: [ContextSurface] = [
         .chat, .telegram, .ios, .slack, .workshop, .bridge,
     ]
@@ -183,12 +184,22 @@ actor PersonaContextFlowProvider:
             .filter { !$0.surfaceOverride }
             .sorted { $0.canonicalOrder < $1.canonicalOrder }
         let documents = try canonicalDocuments.map { source in
-            try RequiredDocument(
+            // PROVENANCE, derived from the SAME descriptor inputs `makeBuild`
+            // registers this document's context source with — the locator and
+            // the permitted-surface set. Carrying it on the mirror is what lets
+            // the stable-prefix renderer prove a surface permission instead of
+            // re-deriving one from a locator string. A canonical (non-override)
+            // document permits every surface; a surface override is not a
+            // required document and never reaches this map.
+            let locator = Self.locator(personaID: personaID, document: source)
+            return try RequiredDocument(
                 id: RequiredDocumentID(rawValue: "\(source.id).md"),
                 canonicalOrder: source.canonicalOrder,
                 sourceHash: ContextStableID.digest(parts: [source.content]),
                 text: source.content,
-                tokenCount: estimatedTokenCount(source.content)
+                tokenCount: estimatedTokenCount(source.content),
+                sourceID: ContextStableID.source(owner: Self.owner, locator: locator),
+                permittedSurfaces: Set(Self.surfaces)
             )
         }
         let fingerprint = ContextStableID.digest(parts: documents.flatMap {
@@ -444,14 +455,21 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
                     memory: memory,
                     provenanceIndex: memoryProvenanceIndex,
                     dataRoot: dataRoot
-                ), NativeResidentWorkContextProjection(dataRoot: dataRoot)]
+                ),
+                NativeResidentWorkContextProjection(dataRoot: dataRoot),
+                NativeKnowledgeGraphContextProjection(dataRoot: dataRoot),
+                NativeStudioContextProjection(dataRoot: dataRoot)]
             )
             memoryRuntime = memory
             personaProvider = provider
             self.coordinator = coordinator
             startResidentWorkObservationIfNeeded()
             if usesLiveAppBody {
-                await DerivedStateInvalidationCenter.shared.install(coordinator)
+                // 2026-09-06: the installed sink is the pin sink, put in place
+                // at app launch and independent of this runtime. Context Flow
+                // subscribes to it here instead of owning it, so a GROWTH.md
+                // write retires its pins with Context Flow off too.
+                await ContextFlowInvalidationRelay.shared.set(coordinator)
             }
             installMemoryPressureSource()
             await coordinator.start()
@@ -465,7 +483,9 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
             )
         } catch {
             if usesLiveAppBody {
-                await DerivedStateInvalidationCenter.shared.install(nil)
+                // Only Context Flow's subscription goes; the pin sink stays
+                // installed, so pins still rebuild after a failed startup.
+                await ContextFlowInvalidationRelay.shared.set(nil)
             }
             coordinator = nil
             personaProvider = nil
@@ -491,7 +511,7 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
         residentWorkObservationTask?.cancel()
         residentWorkObservationTask = nil
         if usesLiveAppBody {
-            await DerivedStateInvalidationCenter.shared.install(nil)
+            await ContextFlowInvalidationRelay.shared.set(nil)
         }
         await coordinator?.stop()
         coordinator = nil
@@ -651,19 +671,38 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
         let normalized = query.split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
             .lowercased()
+        // User, 2026-09-06: the same question in the other voice ("me" → the
+        // agent's name, "you" → the user's). The legacy recall lane has always
+        // asked both and kept the better score per row; the packet lane
+        // embedded the raw question only, so an atom written in the third
+        // person never surfaced for a question asked in the first. Both
+        // voices go through ONE embed call, so the second vector costs no
+        // extra round trip and lands in the same space. Part of the cache key
+        // as well: a changed agent/user name changes the rewrite.
+        let alternateQuery = MemoryRecallQueryExpansion.rewrite(
+            query,
+            names: MemoryRecallQueryExpansion.names(
+                storeDirectory: dataRoot.appendingPathComponent("memory", isDirectory: true)
+            )
+        )
         // The runtime snapshot already carries the exact usable vector-space
         // identity. A second MemoryV2 getter would make ManagedEmbeddingProvider
         // reread the same backend/mode JSON files on every active turn.
         guard let embeddingEpoch = runtime.embeddingEpoch else { return nil }
         let key = ContextStableID.digest(parts: [
-            "semantic-query-v1",
+            "semantic-query-v2",
             embeddingEpoch,
             normalized,
+            alternateQuery ?? "",
         ])
         if let cached = semanticQueryCache[key] {
             touchSemanticQueryCacheKey(key)
             let ticket = ContextQueryEmbeddingTicket()
-            ticket.publish(cached.values, modelFingerprint: cached.modelFingerprint)
+            ticket.publish(
+                cached.values,
+                alternate: cached.alternateValues,
+                modelFingerprint: cached.modelFingerprint
+            )
             return ticket
         }
         if let pending = semanticQueryTickets[key] { return pending }
@@ -677,10 +716,12 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
         semanticQueryTasks[key] = Task(priority: .utility) { [weak self, memory] in
             let value: ContextQueryEmbeddingValue?
             do {
-                let batch = try await memory.embedForDerivedContextWithEpoch([query])
+                let texts = alternateQuery.map { [query, $0] } ?? [query]
+                let batch = try await memory.embedForDerivedContextWithEpoch(texts)
                 value = batch.vectors.first.map {
                     ContextQueryEmbeddingValue(
                         values: $0,
+                        alternateValues: batch.vectors.count > 1 ? batch.vectors[1] : nil,
                         modelFingerprint: batch.epoch.rawValue
                     )
                 }
@@ -718,7 +759,16 @@ actor NativeContextFlowRuntime: ContextTurnPreparing {
             let evicted = semanticQueryCacheOrder.removeFirst()
             semanticQueryCache[evicted] = nil
         }
-        ticket?.publish(value.values, modelFingerprint: value.modelFingerprint)
+        // User, 2026-09-06: the FIRST request for a query is the one holding
+        // this ticket, and publishing only the primary vector dropped the
+        // other voice for it — every later turn hit the cache path above,
+        // which does carry both, so automatic recall asked in both voices
+        // everywhere except the turn that computed them.
+        ticket?.publish(
+            value.values,
+            alternate: value.alternateValues,
+            modelFingerprint: value.modelFingerprint
+        )
     }
 
     private func touchSemanticQueryCacheKey(_ key: String) {
@@ -1009,5 +1059,91 @@ extension NativeContextFlowRuntime {
             headingPath: [],
             blockAnchor: "memory-record"
         )
+    }
+}
+
+/// 2026-09-06 — REM PIN RETRACTION LATENCY.
+///
+/// `rem_pins.json` reconciles every approved lesson against the live persona
+/// document, so removing or rewording a lesson in GROWTH.md is supposed to
+/// retire its pin. But the index was only rebuilt on approve/deny and on a REM
+/// tick, so a retracted lesson kept riding into every chat turn until the next
+/// weekly cycle. Saving GROWTH.md already publishes a persona invalidation;
+/// this sink is what turns that into a rebuild.
+///
+/// A FAN-OUT rather than a second center: `DerivedStateInvalidationCenter`
+/// holds one sink, and this is it — installed once at app launch and never
+/// removed. Context Flow's coordinator is forwarded first, exactly as before,
+/// but it is now a SUBSCRIBER (through `ContextFlowInvalidationRelay`) rather
+/// than the owner of the installation.
+///
+/// 2026-09-06: this sink used to be installed only when Context Flow built a
+/// coordinator, so with Context Flow off — or after a failed startup — a
+/// GROWTH.md edit left retracted pins riding into every turn until the next
+/// weekly REM cycle, which is the very latency the sink exists to remove.
+struct DerivedPersonaPinInvalidationSink: DerivedStateInvalidationSink {
+    let dataRoot: URL
+
+    func sourceDidChange(_ changes: [DerivedSourceChange]) async {
+        if let primary = await ContextFlowInvalidationRelay.shared.current() {
+            await primary.sourceDidChange(changes)
+        }
+        // Only the document REM can pin into. `stableID` is a filename from
+        // the persona doc writers and a bare doc id from the scaffolder;
+        // `supportsProposalTarget` normalises both.
+        guard changes.contains(where: {
+            $0.namespace == "persona"
+                && REMProposalStore.supportsProposalTarget($0.stableID)
+        }) else { return }
+        await REMPinRebuildCoalescer.shared.requestRebuild(dataRoot: dataRoot)
+    }
+}
+
+/// The Context Flow coordinator's subscription to the invalidation center,
+/// held apart from the installation itself (2026-09-06). `current()` hands the
+/// sink back rather than forwarding through this actor, so a slow coordinator
+/// delivery never serialises behind the relay's isolation.
+actor ContextFlowInvalidationRelay {
+    static let shared = ContextFlowInvalidationRelay()
+
+    private var coordinator: (any DerivedStateInvalidationSink)?
+
+    func set(_ sink: (any DerivedStateInvalidationSink)?) {
+        coordinator = sink
+    }
+
+    func current() -> (any DerivedStateInvalidationSink)? {
+        coordinator
+    }
+}
+
+/// Collapses a burst of GROWTH.md writes into one rebuild, and a write that
+/// arrives DURING a rebuild into exactly one more afterwards. No timer: the
+/// invalidation center already coalesces its deliveries, and a rebuild that is
+/// already running is the debounce window.
+actor REMPinRebuildCoalescer {
+    static let shared = REMPinRebuildCoalescer()
+
+    private var rebuilding = false
+    private var changedAgain = false
+
+    func requestRebuild(dataRoot: URL) async {
+        guard !rebuilding else {
+            changedAgain = true
+            return
+        }
+        rebuilding = true
+        defer { rebuilding = false }
+        repeat {
+            changedAgain = false
+            await Task.detached(priority: .utility) { [dataRoot] in
+                do {
+                    try REMConsolidator.emitREMPinsIndex(dataRoot: dataRoot)
+                } catch {
+                    NSLog("[rem-pins] rebuild after a persona write failed: %@",
+                          String(describing: error))
+                }
+            }.value
+        } while changedAgain
     }
 }

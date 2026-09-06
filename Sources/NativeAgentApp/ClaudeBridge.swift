@@ -15,6 +15,9 @@
 //   POST /claude/message  fire a headless chat turn via ChatOrchestration
 //   POST /claude/tool     dispatch a single tool via SwiftToolDispatcher
 //   POST /claude/organism/debug  TTL-bound in-memory organism body simulation
+//   GET  /standing_views          active/held/proposed standing views (id/status/body head)
+//   POST /standing_views/resolve  approve | reject | retire one, through the
+//                                 same CognitionProposalActions the Observatory calls
 //   GET/POST /codex/*      aliases of the same endpoints, default sender=codex
 //
 // Hardening (gpt-5.5 review fixes 2026-06-07):
@@ -51,6 +54,44 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     private static let maxRequestBodyBytes = 4 * 1024 * 1024
     private static let claudeSurfaceName = "claude-bridge"
     private static let codexSurfaceName = "codex-bridge"
+
+    /// Item 8 (2026-09-02) — LANE → AUTHORSHIP. Who composed the words that
+    /// arrive on each message route, stated per lane rather than assumed once
+    /// for the whole bridge.
+    ///
+    /// This is a trust input: `.agent` is what lets the affect layer treat a
+    /// message as another person moving her instead of as User
+    /// (`CognitiveSubstrate.relationalSource`). Getting it wrong in the
+    /// permissive direction means Claude relaying "User says: ship it" is felt
+    /// as Claude; in the conservative direction it means a peer is felt as
+    /// him. So it is a table, and adding a route means answering the question.
+    ///
+    /// AUDIT (2026-09-02): this bridge has exactly three message routes —
+    /// `/claude/message`, `/codex/message`, `/omp/message` — and every one of
+    /// them is an AGENT lane by construction. `handleMessage` takes its sender
+    /// from the ROUTE (`let sender = defaultSender`, never from the request
+    /// body), the caller is the agent process itself, and the in-band text it
+    /// writes is `[from: <sender>, via bridge]`. There is no route on this
+    /// bridge that carries forwarded human text: `/…/tool`, `/…/state`,
+    /// `/…/events` and `/…/organism/debug` write no transcript rows at all.
+    ///
+    /// If such a route is ever added — a relay endpoint, an SMS or email
+    /// gateway, anything where the human is upstream of the agent — it belongs
+    /// here as `.human`, or absent (which reads as the human anyway). Do not
+    /// let it fall through to the default.
+    private static let laneAuthorship: [String: ChatMessageAuthorship] = [
+        "claude": .agent,
+        "codex": .agent,
+        "omp": .agent,
+    ]
+
+    /// Authorship for a message lane. An unlisted sender is UNSTATED, not
+    /// agent-authored: a new route must claim peer standing on purpose, and
+    /// failing closed here means the worst case is a peer felt as User rather
+    /// than User felt as a peer.
+    static func laneAuthorship(forSender sender: String) -> ChatMessageAuthorship? {
+        laneAuthorship[sender.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
+    }
 
     /// 658.14: map a bridge sender to the surface recorded as message origin.
     /// Every lane gets a distinct, truthful string — including lanes added
@@ -103,12 +144,41 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     private final class WorkLatch: @unchecked Sendable {
         private let lock = NSLock()
         private var claimed = false
-        /// Returns true exactly once.
+        private var deadlineWork: DispatchWorkItem?
+
+        /// Returns true exactly once. The winner also cancels the deadline this
+        /// latch owns, so a burst of requests can no longer stack live timers
+        /// that each retain the bridge (and the connection) until their
+        /// deadline elapses.
         func claim() -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            if claimed { return false }
+            lock.lock()
+            if claimed {
+                lock.unlock()
+                return false
+            }
             claimed = true
+            let pending = deadlineWork
+            deadlineWork = nil
+            lock.unlock()
+            // Cancelling from inside the deadline's own execution is a no-op.
+            pending?.cancel()
             return true
+        }
+
+        /// Arms the single deadline timer this latch owns. If the work already
+        /// claimed the response, nothing is scheduled at all.
+        func arm(
+            afterSeconds seconds: Int,
+            on queue: DispatchQueue = .global(),
+            _ body: @escaping @Sendable () -> Void
+        ) {
+            let work = DispatchWorkItem(block: body)
+            lock.lock()
+            let alreadyClaimed = claimed
+            if !alreadyClaimed { deadlineWork = work }
+            lock.unlock()
+            guard !alreadyClaimed else { return }
+            queue.asyncAfter(deadline: .now() + .seconds(seconds), execute: work)
         }
     }
 
@@ -689,6 +759,18 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 return
             }
             handleEventsStream(conn: conn)
+        case "/standing_views":
+            guard method == "GET" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            handleStandingViewsList(conn: conn)
+        case "/standing_views/resolve":
+            guard method == "POST" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            handleStandingViewResolve(conn: conn, body: body)
         default:
             writeJSON(conn, status: 404, obj: ["error": "unknown_path", "path": path])
         }
@@ -706,9 +788,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             guard workLatch.claim() else { return }
             self.writeJSON(conn, status: 200, obj: payload)
         }
-        DispatchQueue.global().asyncAfter(
-            deadline: .now() + .seconds(Self.readWorkDeadlineSeconds)
-        ) { [weak self] in
+        workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
             workTask.cancel()
             self.writeJSON(conn, status: 504, obj: [
@@ -721,15 +801,16 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
 
     private func statePayload() async -> [String: Any] {
         let dataRoot = NativeAgentPaths.dataRoot
-        let surfaces = readSurfaces(dataRoot: dataRoot)
+        let readErrors = BridgeReadErrors()
+        let surfaces = readSurfaces(dataRoot: dataRoot, errors: readErrors)
         let chatSurface = surfaces["chat"] ?? [:]
         let activeModel = chatSurface["model"] as? String
         // Provider is not persisted per-surface in surfaces.json; infer from
         // model prefix as a best-effort signal.
         let activeProvider = inferProvider(model: activeModel)
         let activePersona = readActivePersona(dataRoot: dataRoot)
-        let (activeSessionId, _) = readBridgeActiveSession(dataRoot: dataRoot)
-        let recentInbox = readRecentInbox(dataRoot: dataRoot, limit: 10)
+        let (activeSessionId, _) = readBridgeActiveSession(dataRoot: dataRoot, errors: readErrors)
+        let recentInbox = readRecentInbox(dataRoot: dataRoot, limit: 10, errors: readErrors)
 
         let uptime = Int(Date().timeIntervalSince(startedAt))
         let buildIdentity = NativeAgentBuildIdentity.current
@@ -747,6 +828,10 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             "activeModel": activeModel ?? NSNull(),
             "activeProvider": activeProvider ?? NSNull(),
             "chatReady": true,
+            // Empty when every state file was readable OR legitimately absent.
+            // A non-empty row means a file exists but could not be read or
+            // decoded — the empty payload above is a failure, not "nothing yet".
+            "readErrors": readErrors.messages,
             "recentInbox": recentInbox,
             "recentToolCalls": recentToolCallsJSON,
             "buildVersion": buildIdentity.version,
@@ -1336,9 +1421,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 ])
             }
         }
-        DispatchQueue.global().asyncAfter(
-            deadline: .now() + .seconds(Self.readWorkDeadlineSeconds)
-        ) { [weak self] in
+        workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
             workTask.cancel()
             self.writeJSON(conn, status: 504, obj: [
@@ -1377,10 +1460,36 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return nil
     }
 
-    private func readSurfaces(dataRoot: URL) -> [String: [String: Any]] {
+    /// Collector for `/claude/state` read failures. The state helpers all fail
+    /// soft (an absent file is a legitimate "nothing here yet"), which used to
+    /// make "no providers / no session / no inbox" indistinguishable from a
+    /// permissions error or a half-written JSON file. Absent stays silent;
+    /// unreadable or undecodable gets a row here and is published as
+    /// `readErrors` so the caller can tell the two apart.
+    private final class BridgeReadErrors {
+        private(set) var messages: [String] = []
+        func note(_ url: URL, _ reason: String) {
+            messages.append("\(url.path): \(reason)")
+        }
+    }
+
+    /// Returns nil for BOTH absent (silent) and unreadable (noted).
+    private func readStateFile(_ url: URL, errors: BridgeReadErrors?) -> Data? {
+        do {
+            return try Data(contentsOf: url)
+        } catch let error as NSError {
+            let absent = error.domain == NSCocoaErrorDomain
+                && (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError)
+            if !absent { errors?.note(url, "read failed: \(error.localizedDescription)") }
+            return nil
+        }
+    }
+
+    private func readSurfaces(dataRoot: URL, errors: BridgeReadErrors? = nil) -> [String: [String: Any]] {
         let url = dataRoot.appendingPathComponent("providers/surfaces.json")
-        guard let data = try? Data(contentsOf: url),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let data = readStateFile(url, errors: errors) else { return [:] }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            errors?.note(url, "decode failed: not a JSON object")
             return [:]
         }
         var out: [String: [String: Any]] = [:]
@@ -1415,10 +1524,14 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return nil
     }
 
-    private func readBridgeActiveSession(dataRoot: URL) -> (id: String?, updatedAt: String?) {
+    private func readBridgeActiveSession(
+        dataRoot: URL,
+        errors: BridgeReadErrors? = nil
+    ) -> (id: String?, updatedAt: String?) {
         let url = dataRoot.appendingPathComponent("chat/sessions.json")
-        guard let data = try? Data(contentsOf: url),
-              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+        guard let data = readStateFile(url, errors: errors) else { return (nil, nil) }
+        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            errors?.note(url, "decode failed: not a JSON array of objects")
             return (nil, nil)
         }
         return Self.bridgeActiveSession(
@@ -1446,18 +1559,30 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         return (top["id"] as? String, top["updatedAt"] as? String)
     }
 
-    private func readRecentInbox(dataRoot: URL, limit: Int) -> [[String: Any]] {
+    private func readRecentInbox(
+        dataRoot: URL,
+        limit: Int,
+        errors: BridgeReadErrors? = nil
+    ) -> [[String: Any]] {
         // A5.2 (2026-07-23): read the LIVE inbox the UI/getInboxItems/iOS read,
         // not the retired `inbox/items.jsonl` silo (last written Jun 12, dead).
         let url = dataRoot
             .appendingPathComponent("notifications", isDirectory: true)
             .appendingPathComponent("inbox.jsonl")
-        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        guard let data = readStateFile(url, errors: errors) else { return [] }
+        guard let raw = String(data: data, encoding: .utf8) else {
+            errors?.note(url, "decode failed: not UTF-8")
+            return []
+        }
         var items: [[String: Any]] = []
+        var malformedLines = 0
         let lines = raw.split(separator: "\n", omittingEmptySubsequences: true)
         for line in lines.suffix(limit * 2) {
             guard let lineData = String(line).data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                malformedLines += 1
+                continue
+            }
             items.append([
                 "id": obj["id"] ?? NSNull(),
                 "kind": obj["source"] ?? NSNull(),
@@ -1465,6 +1590,9 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 "body": obj["summary"] ?? NSNull(),
                 "createdAt": obj["created_at"] ?? NSNull(),
             ])
+        }
+        if malformedLines > 0 {
+            errors?.note(url, "decode failed: \(malformedLines) undecodable JSONL line(s)")
         }
         return Array(items.suffix(limit))
     }
@@ -1482,6 +1610,16 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         }
         let isCodexCompletion = defaultSender == "codex" && json["completion"] is [String: Any]
         let requestedSessionId = json["sessionId"] as? String
+        // Real artifacts over the bridge (2026-09-02): a studio consult needs
+        // the image, not a description of it. `image_paths` are local files
+        // the caller already has; each becomes a chat attachment exactly as a
+        // pasted image in the Mac composer would. Bounded: image types only,
+        // 8 MB each, four per message; anything else is skipped, never a 400.
+        let attachments = Self.bridgeImageAttachments(json["image_paths"] as? [String] ?? [])
+        // Agent, 2026-09-02: an image that could not be attached used to
+        // vanish; the message now says so, so a header without pixels is
+        // never a mystery on her side.
+        let imageSkips = Self.bridgeImageSkips(json["image_paths"] as? [String] ?? [])
         // Plain bridge messages are documented as turns in the current chat.
         // The state route already publishes the selected live session as
         // `activeSessionId`, but the message route historically passed nil
@@ -1550,7 +1688,16 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // claude] tag so her system context + chat history show it.
         // Human transcript readers also get a durable metadata.origin record;
         // the model still reads the prefix as prose context.
-        let sender = defaultSender
+        // Agent, 2026-09-02: a script's receipt must not wear a person's
+        // name. A small allowlist of non-human senders may name themselves in
+        // the body; everything else stays the route's default.
+        let sender: String = {
+            if let named = (json["sender"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               Self.scriptSenders.contains(named) {
+                return named
+            }
+            return defaultSender
+        }()
         // 658.14: the durable, out-of-band twin of the in-band prefix below.
         // The prefix is prose the model reads and ANYONE can type; this is the
         // server-recorded route field a transcript reader can distinguish from
@@ -1563,9 +1710,15 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // wrong lane is strictly worse than no indicator, so unknown senders
         // get their own surface string and fall through the render
         // allowlist's default to the honest, unattributed "Automated".
+        // Item 8 (2026-09-02): authorship comes from the LANE TABLE above, not
+        // from a blanket assumption about this bridge. The sender is the route,
+        // never the request body, so the table is being asked exactly the
+        // question it exists to answer: did an agent compose these words, or is
+        // this lane carrying the human's?
         let origin = ChatMessageOrigin(
             surface: Self.bridgeSurfaceName(forSender: sender),
-            agent: sender
+            agent: sender,
+            authored: Self.laneAuthorship(forSender: sender)
         )
         let text: String
         if sender == "claude" {
@@ -1602,7 +1755,12 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             handleMessageAckOnEnqueue(
                 conn: conn,
                 client: client,
-                text: text,
+                // 2026-09-06: this lane used to drop `image_paths` on the
+                // floor — attachments and their skip note reached the legacy
+                // lane only, so an enqueued studio consult arrived with a
+                // header and no pixels.
+                text: Self.withImageSkipNote(text, imageSkips),
+                attachments: attachments,
                 sessionId: sessionId,
                 persona: persona,
                 origin: origin,
@@ -1672,12 +1830,12 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                                         )
                                     ) {
                                         try await client.chat(
-                                            message: text,
+                                            message: Self.withImageSkipNote(text, imageSkips),
                                             sessionId: sessionId,
                                             model: "",
                                             reasoningEffort: "",
                                             fileAccess: "auto",
-                                            attachments: [],
+                                            attachments: attachments,
                                             persona: persona,
                                             // Keep local bridge trust semantics. The
                                             // TaskLocal above carries only the immutable
@@ -1737,12 +1895,12 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                     resp = try await ChatPersistenceContext
                         .$originProvenance.withValue(origin) {
                             try await client.chat(
-                                message: text,
+                                message: Self.withImageSkipNote(text, imageSkips),
                                 sessionId: sessionId,
                                 model: "",
                                 reasoningEffort: "",
                                 fileAccess: "auto",
-                                attachments: [],
+                                attachments: attachments,
                                 persona: persona,
                                 surface: "chat",
                                 suppressUserAppend: false
@@ -1922,18 +2080,25 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         // Task (best-effort — the durable persist path above still runs if
         // the turn eventually completes) and answer 504 so the peer's slot
         // and our connection don't leak on a hung turn.
-        DispatchQueue.global().asyncAfter(
-            deadline: .now() + .seconds(Self.messageWorkDeadlineSeconds)
-        ) { [weak self] in
+        workLatch.arm(afterSeconds: Self.messageWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
-            workTask.cancel()
-            self.publishEvent(kind: "message_timeout", payload: [
+            // User, 2026-09-05: "her turn shouldn't be dying on her while she's
+            // working." This deadline used to cancel the work task, and the
+            // work task IS the turn: a bridge message that started a long
+            // curation turn had that turn killed ten minutes in, silently, at
+            // the next tool boundary (10:00:24 -> 10:10:24 -> died 10:12:15).
+            // The deadline now releases only the HTTP caller. The turn runs
+            // to its own end; its reply still lands in the transcript and in
+            // the bridge's reply record, and the caller reads it from there.
+            self.publishEvent(kind: "message_deadline_released", payload: [
                 "seconds": Self.messageWorkDeadlineSeconds,
                 "sessionId": sessionId ?? NSNull(),
             ])
-            self.writeJSON(conn, status: 504, obj: [
-                "error": "work_timeout",
+            self.writeJSON(conn, status: 202, obj: [
+                "status": "still_working",
                 "seconds": Self.messageWorkDeadlineSeconds,
+                "sessionId": sessionId ?? NSNull(),
+                "detail": "The turn is still running; the reply lands in the transcript and in message-replies.jsonl when it ends.",
             ])
         }
     }
@@ -1967,6 +2132,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
         conn: NWConnection,
         client: any ChatOrchestrationClient,
         text: String,
+        attachments: [ChatOrchestration.MultimodalAttachment],
         sessionId: String?,
         persona: String?,
         origin: ChatMessageOrigin,
@@ -1979,11 +2145,16 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
             do {
                 enqueued = try await ChatPersistenceContext.$originProvenance
                     .withValue(origin) {
+                        // 2026-09-06: the enqueued row is the ONLY durable user
+                        // message on this lane — the turn below runs with
+                        // suppressUserAppend, so images that reached the model
+                        // left no trace in the transcript at all.
                         try await client.enqueueUserMessage(
                             message: text,
                             sessionId: sessionId,
                             persona: persona,
-                            surface: "chat"
+                            surface: "chat",
+                            attachments: attachments
                         )
                     }
             } catch {
@@ -2031,7 +2202,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                                     model: "",
                                     reasoningEffort: "",
                                     fileAccess: "auto",
-                                    attachments: [],
+                                    attachments: attachments,
                                     persona: persona,
                                     surface: "chat",
                                     suppressUserAppend: true
@@ -2093,9 +2264,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 ])
             }
         }
-        DispatchQueue.global().asyncAfter(
-            deadline: .now() + .seconds(Self.enqueueAckDeadlineSeconds)
-        ) { [weak self] in
+        enqueueLatch.arm(afterSeconds: Self.enqueueAckDeadlineSeconds) { [weak self] in
             guard let self, enqueueLatch.claim() else { return }
             // Cancel BEFORE the turn can start: the work task only proceeds
             // past the enqueue when ITS latch claim succeeds, so a claimed
@@ -2127,6 +2296,50 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
     /// base64 image bytes in the HTTP response or durable reply JSONL. Generated
     /// image attachments are already constrained to data/generated_images by
     /// ChatGeneratedImageArtifacts; the local path is the useful bridge handle.
+    /// Local image files named by a bridge message, as chat attachments.
+    /// One reason per image the bridge could not attach: a type it does not
+    /// take, a file it could not read, an empty file, or one over 8 MB.
+    /// Non-human senders allowed to name themselves in a bridge message.
+    static let scriptSenders: Set<String> = ["install_app.sh"]
+
+    static func bridgeImageSkips(_ paths: [String]) -> [String] {
+        let mimes: Set<String> = ["png", "jpg", "jpeg", "webp", "gif"]
+        var out: [String] = []
+        for (index, raw) in paths.enumerated() {
+            let url = URL(fileURLWithPath: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+            let name = url.lastPathComponent
+            if index >= 4 { out.append("\(name): past the four-image limit"); continue }
+            guard mimes.contains(url.pathExtension.lowercased()) else { out.append("\(name): not an image type the bridge takes"); continue }
+            guard FileManager.default.fileExists(atPath: url.path) else { out.append("\(name): not found"); continue }
+            guard let data = try? Data(contentsOf: url) else { out.append("\(name): could not be read"); continue }
+            if data.isEmpty { out.append("\(name): empty file (still being written?)"); continue }
+            if data.count > 8 * 1024 * 1024 { out.append("\(name): over 8 MB"); continue }
+        }
+        return out
+    }
+
+    static func withImageSkipNote(_ text: String, _ skips: [String]) -> String {
+        guard !skips.isEmpty else { return text }
+        let noun = skips.count == 1 ? "image" : "images"
+        return text + "\n\n[\(skips.count) \(noun) not attached: " + skips.joined(separator: "; ") + "]"
+    }
+
+    static func bridgeImageAttachments(_ paths: [String]) -> [ChatOrchestration.MultimodalAttachment] {
+        let mimes = ["png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"]
+        var out: [ChatOrchestration.MultimodalAttachment] = []
+        for raw in paths.prefix(4) {
+            let url = URL(fileURLWithPath: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard let mime = mimes[url.pathExtension.lowercased()],
+                  let data = try? Data(contentsOf: url),
+                  !data.isEmpty, data.count <= 8 * 1024 * 1024 else { continue }
+            out.append(ChatOrchestration.MultimodalAttachment(
+                type: "image", base64: data.base64EncodedString(), mime: mime,
+                name: url.lastPathComponent, byteSize: data.count, path: url.path
+            ))
+        }
+        return out
+    }
+
     static func bridgeAttachmentPayload(
         _ attachments: [ChatOrchestration.MultimodalAttachment]?
     ) -> [[String: Any]] {
@@ -2285,9 +2498,7 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 ])
             }
         }
-        DispatchQueue.global().asyncAfter(
-            deadline: .now() + .seconds(Self.toolWorkDeadlineSeconds)
-        ) { [weak self] in
+        workLatch.arm(afterSeconds: Self.toolWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
             workTask.cancel()
             self.publishEvent(kind: "tool_timeout", payload: [
@@ -2415,6 +2626,218 @@ final class ClaudeBridge: NSObject, @unchecked Sendable, BridgeHTTPServer {
                 removed?.deadlineWork.cancel()
             default: break
             }
+        }
+    }
+
+    // MARK: - /standing_views
+    //
+    // The Observatory (Activity › Cognition Proposals) was the ONLY way to
+    // approve, reject or retire one of Agent's standing views; the bridge could
+    // read `standingViewProposals` and nothing more. These two routes reach the
+    // same two functions the buttons call — `CognitionProposalActions
+    // .resolveWithOutcome` and `.retireWithOutcome` — so the boundary recheck,
+    // the runtime microcycle, and the durable receipts are exactly the UI's.
+    // Nothing here touches the substrate or the standing-view table directly.
+
+    /// The three decisions the bridge accepts. They map onto exactly the two
+    /// Observatory actions: `approve`/`reject` resolve a `.proposed` view,
+    /// `retire` ends one she is already leaning on (`.active` or `.held`).
+    enum StandingViewBridgeAction: String, Sendable, CaseIterable {
+        case approve, reject, retire
+
+        var approved: Bool { self == .approve }
+    }
+
+    /// What one `/standing_views/resolve` request turns into, decided against
+    /// the live view list BEFORE any mutation. A refusal carries the spoken
+    /// reason the caller reads back; the applied path speaks with the outcome
+    /// prose `CognitionProposalActions` already returns.
+    enum StandingViewRequestDecision: Sendable, Equatable {
+        case proceed(StandingViewBridgeAction, CognitiveStandingView)
+        case refused(status: Int, code: String, reason: String)
+    }
+
+    static let standingViewBodyPreviewLimit = 80
+
+    /// First 80 characters of the body — enough to say WHICH view was acted on
+    /// without shipping her whole disposition over the socket.
+    static func standingViewBodyPreview(_ body: String) -> String {
+        String(body.prefix(standingViewBodyPreviewLimit))
+    }
+
+    static func standingViewJSON(_ view: CognitiveStandingView) -> [String: Any] {
+        [
+            "id": view.id.uuidString,
+            "status": view.status.rawValue,
+            "body": standingViewBodyPreview(view.body),
+        ]
+    }
+
+    /// The three statuses the list route reports, in the order a reviewer wants
+    /// them: what she is leaning on hardest first, the queue last. `.retired` is
+    /// deliberately absent — this route exists to act, and nothing acts on a
+    /// retired view.
+    static let standingViewListedStatuses: [CognitiveStandingView.Status] = [.active, .held, .proposed]
+
+    static func standingViewListJSON(_ views: [CognitiveStandingView]) -> [[String: Any]] {
+        standingViewListedStatuses.flatMap { status in
+            views.filter { $0.status == status }.map(standingViewJSON)
+        }
+    }
+
+    static func standingViewDecision(
+        rawId: String,
+        rawAction: String,
+        views: [CognitiveStandingView]
+    ) -> StandingViewRequestDecision {
+        let actionText = rawAction.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !actionText.isEmpty else {
+            return .refused(
+                status: 400,
+                code: "missing_action",
+                reason: "Say which action you want: approve, reject, or retire."
+            )
+        }
+        guard let action = StandingViewBridgeAction(rawValue: actionText) else {
+            return .refused(
+                status: 400,
+                code: "unknown_action",
+                reason: "\"\(actionText)\" is not a standing-view action. Use approve, reject, or retire."
+            )
+        }
+        let idText = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !idText.isEmpty else {
+            return .refused(
+                status: 400,
+                code: "missing_id",
+                reason: "Say which standing view to \(actionText), by id."
+            )
+        }
+        guard let uuid = UUID(uuidString: idText),
+              let view = views.first(where: { $0.id == uuid })
+        else {
+            return .refused(
+                status: 404,
+                code: "unknown_standing_view",
+                reason: "No standing view with id \(idText)."
+            )
+        }
+        switch action {
+        case .approve, .reject:
+            guard view.status == .proposed else {
+                return .refused(
+                    status: 409,
+                    code: "not_awaiting_review",
+                    reason: "That standing view is \(view.status.rawValue), not proposed — approve and reject only answer a proposal. Retire ends one the agent is already leaning on."
+                )
+            }
+        case .retire:
+            guard view.isLeaning else {
+                return .refused(
+                    status: 409,
+                    code: "not_leaning",
+                    reason: "That standing view is \(view.status.rawValue), not one the agent is leaning on — retire only ends an active or held view."
+                )
+            }
+        }
+        return .proceed(action, view)
+    }
+
+    private func handleStandingViewsList(conn: NWConnection) {
+        let workLatch = WorkLatch()
+        let workTask = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let detail = await CognitionObservatoryActions.refresh()
+            guard workLatch.claim() else { return }
+            let views = detail.standingViews
+            self.writeJSON(conn, status: 200, obj: [
+                "standingViews": Self.standingViewListJSON(views),
+                "counts": Dictionary(
+                    uniqueKeysWithValues: Self.standingViewListedStatuses.map { status in
+                        (status.rawValue, views.filter { $0.status == status }.count)
+                    }
+                ),
+            ])
+        }
+        workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
+            guard let self, workLatch.claim() else { return }
+            workTask.cancel()
+            self.writeJSON(conn, status: 504, obj: [
+                "error": "work_timeout",
+                "path": "/standing_views",
+                "seconds": Self.readWorkDeadlineSeconds,
+            ])
+        }
+    }
+
+    private func handleStandingViewResolve(conn: NWConnection, body: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            writeJSON(conn, status: 400, obj: ["error": "invalid_json"])
+            return
+        }
+        let rawId = (json["id"] as? String) ?? ""
+        let rawAction = (json["action"] as? String) ?? ""
+
+        // Same WorkLatch + asyncAfter bound as handleState/handleOrganismDebug:
+        // exactly one of the work Task and the deadline writes the response.
+        let workLatch = WorkLatch()
+        let workTask = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            func respond(_ status: Int, _ obj: [String: Any]) {
+                guard workLatch.claim() else { return }
+                self.writeJSON(conn, status: status, obj: obj)
+            }
+            let before = await CognitionObservatoryActions.refresh()
+            switch Self.standingViewDecision(rawId: rawId, rawAction: rawAction, views: before.standingViews) {
+            case .refused(let status, let code, let reason):
+                respond(status, ["error": code, "reason": reason])
+            case .proceed(let action, let view):
+                // THROUGH the Observatory actions, never around them: same
+                // recheck, same runtime mutation, same receipts as a click.
+                let result = action == .retire
+                    ? await CognitionProposalActions.retireWithOutcome(id: view.id)
+                    : await CognitionProposalActions.resolveWithOutcome(id: view.id, approved: action.approved)
+                let after = result.detail.standingViews.first(where: { $0.id == view.id }) ?? view
+                switch result.status {
+                case .applied(let applied):
+                    respond(200, [
+                        "status": "applied",
+                        "action": action.rawValue,
+                        "id": view.id.uuidString,
+                        "viewStatus": applied.rawValue,
+                        "body": Self.standingViewBodyPreview(after.body),
+                    ])
+                case .unavailable(let reason):
+                    respond(409, [
+                        "error": "not_applied",
+                        "reason": reason,
+                        "action": action.rawValue,
+                        "id": view.id.uuidString,
+                        "viewStatus": after.status.rawValue,
+                        "body": Self.standingViewBodyPreview(after.body),
+                    ])
+                case .notSaved(let reason):
+                    // Changed in memory, never written (2026-09-06). Reported as
+                    // a failure, not an application: it reverts on restart.
+                    respond(500, [
+                        "error": "not_saved",
+                        "reason": reason,
+                        "action": action.rawValue,
+                        "id": view.id.uuidString,
+                        "viewStatus": after.status.rawValue,
+                        "body": Self.standingViewBodyPreview(after.body),
+                    ])
+                }
+            }
+        }
+        workLatch.arm(afterSeconds: Self.readWorkDeadlineSeconds) { [weak self] in
+            guard let self, workLatch.claim() else { return }
+            workTask.cancel()
+            self.writeJSON(conn, status: 504, obj: [
+                "error": "work_timeout",
+                "path": "/standing_views/resolve",
+                "seconds": Self.readWorkDeadlineSeconds,
+            ])
         }
     }
 
@@ -2589,6 +3012,13 @@ final class ClaudeBridgeDenyDispatcher: ToolDispatchClient, @unchecked Sendable 
             }
             if out["active_tool_count"] != nil, case .array(let a)? = out["active_tools"] {
                 out["active_tool_count"] = .int(Int64(a.count))
+            }
+            // Same rule for the session-pinned pair agent_introspect now emits:
+            // its array is scrubbed above like any other, so the count must be
+            // re-derived or it betrays the removals.
+            if out["session_pinned_tool_count"] != nil,
+               case .array(let a)? = out["session_pinned_tools"] {
+                out["session_pinned_tool_count"] = .int(Int64(a.count))
             }
             return .object(out)
         default:

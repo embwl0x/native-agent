@@ -67,7 +67,8 @@ extension BackgroundLoopsAssembly {
     }
 
     /// Self-healing hook (U2b wave 3 item 2). Watches the auto-doctor loop's
-    /// latest.json for a healthy→fail transition and errors.jsonl for a burst;
+    /// latest.json for a healthy→fail transition and the live error sinks
+    /// (`SelfHealingHook.errorFeeds`) for a burst;
     /// on either, runs a diagnostic LLM pass (diagnostics surface picker) and
     /// files a `needs_diff` evolution proposal with redacted evidence. The
     /// proposal filing is injected so the module gains no SelfImprovement dep
@@ -114,9 +115,7 @@ extension BackgroundLoopsAssembly {
                 paths: [
                     dataRoot.appendingPathComponent("doctor", isDirectory: true)
                         .appendingPathComponent("latest.json"),
-                    dataRoot.appendingPathComponent("logs", isDirectory: true)
-                        .appendingPathComponent("errors.jsonl"),
-                ],
+                ] + SelfHealingHook.errorFeeds.map { $0.url(dataRoot: dataRoot) },
                 loopId: loopId
             )
         }
@@ -173,6 +172,28 @@ extension BackgroundLoopsAssembly {
         return closed
     }
 
+    /// Drop the rows an UNATTENDED sweep is not allowed to judge.
+    ///
+    /// 2026-09-02 incident: two new Doctor-only diagnostic rows graded a
+    /// rolling history window, went red on pre-fix history, and this sweep
+    /// pushed "Doctor has 2 failing checks" to User's phone. Those rows are for
+    /// a person LOOKING at Doctor. The exclusion list is derived from the real
+    /// check registry (`DoctorHeartbeatPolicy`), never restated here, so a
+    /// check's own `heartbeatEligible` flag is the single source of truth.
+    ///
+    /// Returns the rows the heartbeat may judge plus how many it skipped, so
+    /// the signal line can SAY it looked at fewer rows than Doctor shows
+    /// rather than silently narrowing.
+    static func heartbeatEligibleDoctorRows(
+        _ rows: [[String: Any]]
+    ) -> (eligible: [[String: Any]], skipped: Int) {
+        let eligible = rows.filter { row in
+            guard let id = row["id"] as? String else { return true }
+            return DoctorHeartbeatPolicy.isEligible(id)
+        }
+        return (eligible, rows.count - eligible.count)
+    }
+
     private static func currentDoctorSnapshotHealthy(dataRoot: URL) -> Bool? {
         let doctorPath = dataRoot.appendingPathComponent("doctor", isDirectory: true)
             .appendingPathComponent("latest.json")
@@ -184,7 +205,12 @@ extension BackgroundLoopsAssembly {
         guard let checks = obj["checks"] as? [[String: Any]] else {
             return nil
         }
-        return !checks.contains { ($0["status"] as? String) == "fail" }
+        // Self-heal decisions are unattended too: a Doctor-only row must not
+        // hold a resolved proposal open, exactly as it must not raise an alert.
+        let judged = heartbeatEligibleDoctorRows(checks).eligible
+        // Every row excluded ⇒ nothing was judged. Unknown, not healthy.
+        guard !judged.isEmpty else { return nil }
+        return !judged.contains { ($0["status"] as? String) == "fail" }
     }
 
     private static func isResolvedDoctorSelfHealProposal(_ proposal: EvolutionProposal) -> Bool {
@@ -253,7 +279,6 @@ extension BackgroundLoopsAssembly {
     /// behind later, healthy proposals.
     private static let heartbeatCandidateFailedAge: TimeInterval = 6 * 60 * 60
     private static let heartbeatInstalledUnverifiedAge: TimeInterval = 60 * 60
-    private static let heartbeatErrorLogTailBytes = 256 * 1024
 
     /// Composes the heartbeat's live signal block and deterministic verdict.
     /// Clean facts return `.clean` so the loop does not spend an LLM call.
@@ -379,12 +404,32 @@ extension BackgroundLoopsAssembly {
                 )
             )
         }
-        let fails = checks.filter { ($0["status"] as? String) == "fail" }
-        let warns = checks.filter { ($0["status"] as? String) == "warn" }
-        var line = "Doctor: \(fails.count) failing, \(warns.count) warning, \(checks.count) total."
+        // Doctor-only rows are skipped ENTIRELY here: not counted in the
+        // totals, not eligible to raise an alert, not part of the health
+        // verdict. They stay fully visible in the Doctor UI.
+        let (judged, skipped) = heartbeatEligibleDoctorRows(checks)
+        let skippedNote = skipped > 0
+            ? " \(skipped) Doctor-only row(s) excluded from the heartbeat by design."
+            : ""
+
+        // Nothing left to judge is UNVERIFIABLE, not "healthy" — the same rule
+        // the malformed-snapshot branch above follows.
+        guard !judged.isEmpty else {
+            return (
+                "Doctor: \(checks.count) check(s) in the snapshot, none heartbeat-eligible."
+                    + skippedNote,
+                nil,
+                nil
+            )
+        }
+
+        let fails = judged.filter { ($0["status"] as? String) == "fail" }
+        let warns = judged.filter { ($0["status"] as? String) == "warn" }
+        var line = "Doctor: \(fails.count) failing, \(warns.count) warning, \(judged.count) total."
         if !fails.isEmpty {
             line += " Failing: " + fails.compactMap { $0["id"] as? String }.joined(separator: ", ") + "."
         }
+        line += skippedNote
         guard !fails.isEmpty else { return (line, true, nil) }
         let failedIDs = fails.compactMap { $0["id"] as? String }.joined(separator: ", ")
         return (
@@ -582,48 +627,41 @@ extension BackgroundLoopsAssembly {
         dataRoot: URL,
         now: Date
     ) -> (line: String, issue: HeartbeatIssue?) {
-        let path = dataRoot.appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("errors.jsonl")
-        guard let handle = try? FileHandle(forReadingFrom: path) else {
-            return ("Errors: no recent error burst (no errors.jsonl).", nil)
-        }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let start = size > UInt64(heartbeatErrorLogTailBytes)
-            ? size - UInt64(heartbeatErrorLogTailBytes)
-            : 0
-        try? handle.seek(toOffset: start)
-        guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else {
-            return ("Errors: errors.jsonl unreadable.", HeartbeatIssue(
-                id: "errors-log-unreadable",
-                summary: "Error log could not be read.",
-                detail: "Heartbeat could not read data/logs/errors.jsonl.",
+        let statuses = SelfHealingHook.scanErrorFeeds(dataRoot: dataRoot, now: now)
+        let windowMinutes = Int(SelfHealingHook.errorBurstWindow / 60)
+        let perFeed = statuses
+            .map { "\($0.feed.label) \($0.summary(now: now))" }
+            .joined(separator: ", ")
+        let total = statuses.reduce(0) { $0 + $1.recentCount }
+        let line = "Errors (last \(windowMinutes)m): \(perFeed)."
+
+        // A feed nobody has written in a week proves nothing. When EVERY
+        // watched sink is silent the heartbeat is blind, and reporting that as
+        // "0 recent errors … ok" is the lie this guard exists to stop — for
+        // three months `logs/errors.jsonl` was the only watched feed and it had
+        // no writer at all.
+        guard statuses.contains(where: { !$0.silent }) else {
+            let days = Int(SelfHealingHook.feedSilentAfter / 86_400)
+            return (line, HeartbeatIssue(
+                id: "error-feeds-silent",
+                summary: "No error feed has been written in \(days)d — error signal is dark.",
+                detail: "Heartbeat watches "
+                    + SelfHealingHook.errorFeeds.map { $0.relativePath }.joined(separator: ", ")
+                    + ". Every one of them is silent, so \"no recent errors\" means "
+                    + "\"nothing is reporting\", not \"nothing is wrong\".\n\(perFeed)",
                 priority: 30,
                 actions: []
             ))
         }
 
-        let cutoff = now.addingTimeInterval(-SelfHealingHook.errorBurstWindow)
-        var kept: [String] = []
-        for line in text.split(separator: "\n").reversed() {
-            guard let lineData = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let rawTs = obj["createdAt"] as? String
-                    ?? obj["at"] as? String
-                    ?? obj["ts"] as? String
-                    ?? obj["timestamp"] as? String,
-                  let ts = parseHeartbeatISO(rawTs) else { continue }
-            if ts < cutoff { continue }
-            kept.append(line.prefix(280).description)
-        }
-
-        let line = "Errors: \(kept.count) recent row(s) in the last \(Int(SelfHealingHook.errorBurstWindow / 60))m."
-        guard kept.count >= SelfHealingHook.errorBurstThreshold else { return (line, nil) }
-        let samples = kept.prefix(3).joined(separator: "\n")
+        guard total >= SelfHealingHook.errorBurstThreshold else { return (line, nil) }
+        let samples = statuses
+            .flatMap { status in status.recentLines.map { "[\(status.feed.label)] \($0)" } }
+            .suffix(3)
+            .joined(separator: "\n")
         return (line, HeartbeatIssue(
             id: "error-burst",
-            summary: "\(kept.count) errors logged in \(Int(SelfHealingHook.errorBurstWindow / 60))m.",
+            summary: "\(total) errors logged in \(windowMinutes)m.",
             detail: "A recent error burst crossed the \(SelfHealingHook.errorBurstThreshold)-row threshold. Recent samples:\n\(samples)",
             priority: 18,
             actions: []

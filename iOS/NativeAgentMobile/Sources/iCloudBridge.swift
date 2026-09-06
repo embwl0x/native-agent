@@ -411,22 +411,35 @@ final class iCloudBridge: ObservableObject {
             }
         }
         Task {
+            // 2026-09-06: `onApply` — the catalog is claimed only once it has
+            // been applied. The non-acknowledging overload threw the applied
+            // result away, so a catalog the phone could not decode was marked
+            // seen and the phone kept the old provider list until the Mac
+            // happened to publish a different one.
             await transport.observeStatus(
-                key: NAProviderCatalogStatusCodec.statusKey
-            ) { value in
-                await MainActor.run {
-                    _ = iCloudSyncEngine.shared.applyProviderCatalogStatus(value)
+                key: NAProviderCatalogStatusCodec.statusKey,
+                onApply: { value in
+                    await MainActor.run {
+                        iCloudSyncEngine.shared.applyProviderCatalogStatus(value)
+                    }
                 }
-            }
+            )
         }
         Task {
             for group in NAMobileSnapshotGroup.allCases {
-                await transport.observeStatus(key: group.statusKey) { value in
-                    await iCloudSyncEngine.shared.applyCloudKitSnapshotStatus(
-                        value,
-                        group: group
-                    )
-                }
+                // 2026-09-06: `onApply` — the transport claims this generation
+                // only once the files are on disk. A failed apply leaves the
+                // record eligible for the next drain instead of being marked
+                // seen and lost.
+                await transport.observeStatus(
+                    key: group.statusKey,
+                    onApply: { value in
+                        await iCloudSyncEngine.shared.applyCloudKitSnapshotStatus(
+                            value,
+                            group: group
+                        )
+                    }
+                )
             }
         }
     }
@@ -492,6 +505,7 @@ final class iCloudBridge: ObservableObject {
     // MARK: - Send chat message (Drive + KVS trigger)
 
     func sendChatMessage(
+        id: String = UUID().uuidString,
         text: String,
         sessionID: String? = nil,
         correlationID: String? = nil,
@@ -499,6 +513,7 @@ final class iCloudBridge: ObservableObject {
         attachments: [MultimodalAttachment] = []
     ) async throws -> BridgeMessage {
         let unsigned = BridgeMessage.make(
+            id: id,
             sender: "ios",
             text: text,
             sessionID: sessionID,
@@ -572,7 +587,8 @@ final class iCloudBridge: ObservableObject {
         messageHandlers[id] = onMessage
         // KVS progress channel stays on KVS for now (progress-over-CK is a
         // follow-up); only the message data-plane cuts over in CK-3b.
-        dispatchLatestKVSChatProgress()
+        dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
+        dispatchLatestKVSChatProgress(key: KVSKey.chatNoticeLatest)
         // CK-3b: with CloudKit active, the forwarder is already registered (at
         // transport birth); re-drain to pull anything that arrived before this
         // handler existed. Legacy Drive scan runs otherwise.
@@ -819,6 +835,15 @@ final class iCloudBridge: ObservableObject {
         return true
     }
 
+    /// 2026-09-06: the Mac's currently published pairing material, read without
+    /// applying it. A build whose Mac has no KVS entitlement publishes pairing
+    /// only through this transport, so without this a manually pasted recovery
+    /// key had nothing to verify against and Re-pair could strand the phone.
+    func publishedPairingSecretFromTransport() async -> Data? {
+        guard let ck = deviceTransport else { return nil }
+        return await ck.peekPairingSecret()
+    }
+
     /// CK-3c: drain the CloudKit transport (incoming + pairing + status) if it is
     /// active; no-op when nil (flag-off). Called from the APNs silent-push
     /// handler. Single-flight — overlapping pushes/re-drains coalesce into at
@@ -899,9 +924,16 @@ final class iCloudBridge: ObservableObject {
         let changedKeys = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
         Task { @MainActor in
             let progressChanged = changedKeys == nil || changedKeys?.contains(KVSKey.chatProgressLatest) == true
+            // 2026-09-06: notices (provider reconnect, context compaction) have
+            // their own latest-value key so a tool event cannot overwrite one
+            // before this device reads it.
+            let noticeChanged = changedKeys == nil || changedKeys?.contains(KVSKey.chatNoticeLatest) == true
             let driveChanged = changedKeys == nil || changedKeys?.contains(KVSKey.newMessageInDrive) == true
             if progressChanged {
-                self.dispatchLatestKVSChatProgress()
+                self.dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
+            }
+            if noticeChanged {
+                self.dispatchLatestKVSChatProgress(key: KVSKey.chatNoticeLatest)
             }
             // CK-5: drain ONLY on the once-per-message nudge (newMessageInDrive),
             // NEVER on progressChanged. The stream fires chatProgressLatest on every
@@ -919,10 +951,10 @@ final class iCloudBridge: ObservableObject {
         }
     }
 
-    private func dispatchLatestKVSChatProgress() {
+    private func dispatchLatestKVSChatProgress(key: String) {
         guard !messageHandlers.isEmpty else { return }
         guard let secret = pairingStore?.iCloudPairingSecret else { return }
-        guard let data = kvs.data(forKey: KVSKey.chatProgressLatest) else { return }
+        guard let data = kvs.data(forKey: key) else { return }
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -937,7 +969,8 @@ final class iCloudBridge: ObservableObject {
         }
         guard abs(Date().timeIntervalSince(msg.timestamp)) <= 24 * 60 * 60 else { return }
         guard let kind = msg.metadata?["kind"],
-              kind == "progress" || kind == "tool_use" || kind == "tool_result" else {
+              kind == "progress" || kind == "tool_use" || kind == "tool_result"
+                || kind == "notice" else {
             return
         }
         if let targetSourceKey = msg.metadata?["targetSourceKey"],

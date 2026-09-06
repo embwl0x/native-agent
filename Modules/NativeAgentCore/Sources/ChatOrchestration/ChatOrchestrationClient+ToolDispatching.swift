@@ -42,6 +42,10 @@ extension SwiftNativeChatOrchestrationClient {
             // approval ids against the canonical inbox on this data root.
             injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot)
         )
-        return ChatToolDispatchTracer(inner: gated, dataRoot: dataRoot)
+        // 2026-09-06: dotted aliases are canonicalized outside every gate —
+        // see CanonicalToolNameDispatcher.
+        return CanonicalToolNameDispatcher(
+            inner: ChatToolDispatchTracer(inner: gated, dataRoot: dataRoot)
+        )
     }
 }

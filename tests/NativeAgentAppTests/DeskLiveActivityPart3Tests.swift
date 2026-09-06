@@ -126,7 +126,16 @@ struct DeskLiveActivityPart3Tests {
 
         #expect(scoped.count > 300, "the source guard must cover the intended render seams")
         #expect(writeAffordanceLeaks(in: scoped).isEmpty)
-        #expect(!presentation.contains("SwiftNativeDeskStore"))
+        // 2026-09-06: scrape the EXECUTABLE source, not the comments.
+        // 7df7a4cd ("Fable 5.1 sweep wave 2 ... desk veto controls") moved the
+        // owner's Veto off the Diagnostics observatory and onto the Desk row,
+        // and the DeskPursuitVetoControl doc comment names where the mutation
+        // still lives ("WorkshopObservatoryVetoHandler → SwiftNativeDeskStore
+        // .vetoPursuit", DeskPresentation.swift:627). That is a POINTER to the
+        // store, not a dependency on it; a raw substring check read the prose
+        // as a leak. The pin is unchanged and still the real one: the
+        // presentation layer holds no store reference in code.
+        #expect(!executableSource(presentation).contains("SwiftNativeDeskStore"))
 
         // Negative control for the scoped detector.
         #expect(writeAffordanceLeaks(in: scoped + "\nButton(\"Set status\") {}") == ["Button("])
@@ -191,6 +200,16 @@ struct DeskLiveActivityPart3Tests {
               let upper = source.range(of: end, range: lower.upperBound..<source.endIndex)
         else { return "" }
         return String(source[lower.lowerBound..<upper.lowerBound])
+    }
+
+    /// 2026-09-06: the source with whole-line `//` and `///` comments removed,
+    /// so a scrape can tell a symbol a file USES from one it merely names in
+    /// prose.
+    private func executableSource(_ source: String) -> String {
+        source
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
+            .joined(separator: "\n")
     }
 
     private func writeAffordanceLeaks(in source: String) -> [String] {

@@ -61,9 +61,6 @@ extension NativeClient {
                 followup: "vault://nativeagent/zombie_stub_audit#runNativeAction"
             )
         }
-        if actionId == "workflow.launch" {
-            return try await runWorkflowNativeAction(action: action, dryRun: dryRun, input: input)
-        }
         if actionId.hasPrefix("browser.") {
             return try await runBrowserNativeAction(action: action, dryRun: dryRun, input: input)
         }
@@ -114,14 +111,6 @@ extension NativeClient {
                 kind: "dispatcher",
                 risk: "low",
                 requiresApproval: false,
-                dryRunAvailable: true
-            ),
-            NativeActionRecord(
-                id: "workflow.launch",
-                name: "Launch Workflow",
-                kind: "workflow",
-                risk: "medium",
-                requiresApproval: true,
                 dryRunAvailable: true
             ),
             NativeActionRecord(
@@ -275,32 +264,9 @@ extension NativeClient {
         )
     }
 
-    func runWorkflowNativeAction(
-        action: NativeActionRecord,
-        dryRun: Bool,
-        input: [String: Any]
-    ) async throws -> NativeActionReceipt {
-        let workflowId = Self.stringInput(input, "workflowId")
-            ?? Self.stringInput(input, "workflow_id")
-            ?? Self.stringInput(input, "id")
-            ?? ""
-        let objective = Self.stringInput(input, "objective") ?? ""
-        guard !workflowId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "NativeAgentNativeActions", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "workflow.launch requires workflowId"
-            ])
-        }
-        let run = try await runWorkflow(id: workflowId, objective: objective, execute: !dryRun)
-        let data = try JSONEncoder().encode(run)
-        let output = try JSONValue.parse(data)
-        return try await Self.appendNativeActionReceipt(
-            action: action,
-            status: dryRun ? "dry_run" : run.status,
-            dryRun: dryRun,
-            output: output,
-            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        )
-    }
+    // 2026-09-01: `workflow.launch` and `runWorkflowNativeAction` were retired
+    // with the workflow run engine (User authorized). The action's only job was
+    // to start a run.
 
     func runBrowserNativeAction(
         action: NativeActionRecord,

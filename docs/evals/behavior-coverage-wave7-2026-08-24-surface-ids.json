@@ -2,7 +2,6 @@
   "surfaces": [
     { "fence": "core.chat.tools", "id": "chat.tools.sys10" },
     { "fence": "core.context", "id": "app.personaContextFlowProvider" },
-    { "fence": "core.maccontrol", "id": "ui.remoteNodesPage" },
     { "fence": "core.misc", "id": "cli.chatDrive.env.embeddingMock" },
     { "fence": "core.misc", "id": "cli.chatDrive.env.publicSafeMode" },
     { "fence": "core.substrate.affect", "id": "instrument.SUB.affectMatrixRows" },

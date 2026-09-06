@@ -163,7 +163,7 @@ MINILM_SWIFTPM_BUNDLE_NAME="NativeAgentCore_MemoryV2.bundle"
 # Required byte sizes and SHA-256 hashes are the release resource manifest.
 # Updating the model requires an intentional manifest change in this script.
 MINILM_REQUIRED_FILES=(
-  $'minilm_vocab.txt\t231509\tc181487132822450ea37c30773b02f68a98c26e761ba487a42c7a36231a82453'
+  $'minilm_vocab.txt\t231508\t07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3'
   $'minilm.mlpackage/Manifest.json\t617\t911f501a4c3f06b795ddced1606dca39f1b6c3f2bd88a06455a65a04cda4c3a3'
   $'minilm.mlpackage/Data/com.apple.CoreML/model.mlmodel\t71688\t8ce9abd3d498444303732974cdc7e9d959d9463e18e240f6d22f81502fe86318'
   $'minilm.mlpackage/Data/com.apple.CoreML/weights/weight.bin\t44939136\tf6d040d94a3a476264c26cb3b6d260aa695784121667e6bff6690f56de558d41'

@@ -279,6 +279,13 @@ public let macControlAccessibilityReadActions: Set<String> = [
     // notices coarse physical input and scene changes while active, never key
     // contents, and returns a fresh redacted fused view on start/next.
     "attention",
+    // fable51 item 29 — the MENU BAR walk. Read tier for the same reason as the
+    // five above: one bounded descent of `AXMenuBar`, no CGEvent, no
+    // AXUIElementPerformAction, no attribute write. It does not even OPEN a
+    // menu — the AX tree publishes the items whether or not they are on screen,
+    // which is exactly why the menu bar is the cheapest deterministic route to
+    // an app's functionality.
+    "menu",
 ]
 
 /// Swift-native INJECTION actions with no daemon ancestor (W2/W3). Same
@@ -308,6 +315,12 @@ public let macControlAccessibilityActActions: Set<String> = [
     // screen in one call. The nudge is the smallest injection in the module and
     // it is still injection: it goes in the act set, not the read set.
     "wake",
+    // fable51 item 29 — `menu_press`. It AXPresses a menu item, which runs the
+    // app's own handler: File › Close, File › Quit, Edit › Delete are all one
+    // press away. Injection by mechanism and by consequence, through the same
+    // actuator `ax_act` uses. The READ half (`menu`) is a separate action in
+    // the read set, so listing the menu never carries pressing authority.
+    "menu_press",
 ]
 
 /// App navigation with no daemon ancestor. It does not synthesize input, so it
@@ -343,6 +356,11 @@ public let macControlAccessibilityInjectionActions: Set<String> = [
     // body-bound single-use capability like every one of its neighbours.
     "act",
     "hand",
+    // fable51 item 29 — `menu_press` clears the SAME three gates as `ax_act`:
+    // accessibility category, an ACTIVE Full Mac window, and a live body-bound
+    // single-use capability. A menu path is a REFERENCE that names a better
+    // target, never an authority that lowers a tier.
+    "menu_press",
 ]
 
 /// W7 — `nudge`, and it is deliberately in NEITHER of the two sets above.
@@ -369,6 +387,68 @@ public let macControlAccessibilityNudgeActions: Set<String> = [
     "nudge",
 ]
 
+/// fable51 item 30 — THE CLIPBOARD ORGAN, in two sets because the two halves
+/// are two different contracts and folding them together would let the write
+/// inherit the read's tier.
+///
+/// `clipboard_read` is perception: it emits no event, mutates no app, and
+/// returns text that has been through `MacScreenViewTextRedaction`. It is NOT
+/// in `macControlAccessibilityReadActions` because that set's contract is
+/// specifically the AX walk; the clipboard is a different surface reached
+/// through the same Full Mac accessibility category (the same category that
+/// already lets her press ⌘C to FILL it — gating the read behind a second
+/// toggle would be a fence with no gate beside it).
+public let macControlClipboardReadActions: Set<String> = [
+    "clipboard_read",
+]
+
+/// The WRITE half. It synthesizes no input and mutates no other app's UI
+/// state, so it is deliberately not in `macControlAccessibilityInjectionActions`
+/// (it needs no `MacInjectionCapability`) — but it does change the world: the
+/// next ⌘V in any app pastes what it put there. So it goes through the durable
+/// motor-operation lane like every other action that changes something, and
+/// the tool layer gates it on app-control authority rather than on read.
+public let macControlClipboardWriteActions: Set<String> = [
+    "clipboard_write",
+]
+
+public let macControlClipboardActions: Set<String> =
+    macControlClipboardReadActions.union(macControlClipboardWriteActions)
+
+/// fable51 item 33 — THE READ ORGAN, and it is in its OWN set for the same
+/// reason `nudge` is in its own set: it is neither neighbour, and folding it
+/// into either would make that neighbour's contract lie.
+///
+/// It is NOT in `macControlAccessibilityReadActions`, whose contract is
+/// literally "perception only, no CGEvent": the accumulate route posts scroll
+/// wheel events to move a viewport, so claiming that contract for it would be
+/// false.
+///
+/// It is NOT in `macControlAccessibilityInjectionActions` either, and that is
+/// the deliberate line. That set is "everything that synthesizes input or
+/// MUTATES ANOTHER APP'S UI STATE" — the predicate that demands a
+/// `MacInjectionCapability`. A vertical wheel scroll aimed at the centre of a
+/// resolved scroll container cannot press, cannot type, cannot activate and
+/// cannot commit anything: it moves which part of a document is drawn, and the
+/// handler scrolls back by the same amount when it is done. That is the same
+/// class as `nudge`'s bare mouse move, and the same class this codebase already
+/// grades `browser.chrome_scroll` at (`safe_read`/low in
+/// `SecurityCenter+ToolProfiles`).
+///
+/// What a FUTURE edit must do: the moment this handler grows a press, a
+/// keystroke, an AX action or a horizontal/arbitrary scroll the caller can aim,
+/// it belongs in the injection set. The guard that keeps that honest is not
+/// this comment — it is `MacDocumentReadTests`, which greps every event the
+/// sink received and fails on anything that is not a vertical scroll or the
+/// cursor move that aims it.
+///
+/// GATE: identical to the AX reads — `accessibility` category + an ACTIVE Full
+/// Mac window. The tool layer adds one more for the explicit-`path` route: a
+/// named file is a FILESYSTEM read and clears `file_ops` as well.
+public let macControlDocumentReadActions: Set<String> = [
+    "read",
+]
+
 /// Everything `SwiftNativeMacControl.dispatch` will accept: the daemon-parity
 /// inventory plus the Swift-native accessibility reads, acts and the nudge.
 public let macControlDispatchableActions: Set<String> =
@@ -379,6 +459,10 @@ public let macControlDispatchableActions: Set<String> =
         // W7 — `nudge` must be here or the HTTP/iOS-remote bridge route in
         // NativeClient+CutoverSeams 404s it as an unknown action.
         .union(macControlAccessibilityNudgeActions)
+        // fable51 item 30 — the clipboard organ, for the same reason.
+        .union(macControlClipboardActions)
+        // fable51 item 33 — the read organ, for the same reason.
+        .union(macControlDocumentReadActions)
 
 // MARK: - W6 login-session state (the mac_wake safety line)
 
@@ -739,9 +823,24 @@ public func macControlGateCategory(forAction action: String) -> String? {
     // native-look item 3 — `act` (the closed-loop verb) is accessibility
     // mediated exactly like `ax_act`, which it performs through.
     case "act", "hand":                                   return "accessibility"
+    // fable51 item 29 — the menu organ. The read walks the app's AX menu bar;
+    // the press goes through the same actuator every other act uses.
+    case "menu", "menu_press":                            return "accessibility"
     // W7 `nudge` — same category as the AX reads it is gated like. A bare
     // cursor move is accessibility-mediated whether or not it is injection.
     case "nudge":                                         return "accessibility"
+    // fable51 item 30 — the clipboard organ. Same category as the AX reads and
+    // the keystroke that fills the pasteboard: she can already put a credential
+    // on the clipboard with ⌘C under `accessibility`, so reading it back is the
+    // same authority, and writing it is weaker than the keystroke that would
+    // otherwise type the same characters.
+    case "clipboard_read", "clipboard_write":             return "accessibility"
+    // fable51 item 33 — the read organ. Accessibility, like every other organ
+    // that perceives a window: the screen route walks the AX tree and moves a
+    // viewport, and the file route only ever opens a document the window in
+    // front of her already has open. The tool layer adds the `file_ops` check
+    // on top when a caller names a path of its own.
+    case "read":                                          return "accessibility"
     case "system":                                        return "system"
     case "file/read", "file/write", "file/list",
          "file/move", "file/trash":                       return "file_ops"
@@ -763,6 +862,14 @@ public func macControlFilePolicyPathKeys(forAction action: String) -> [String] {
     switch action {
     case "file/read", "file/write", "file/list", "file/trash": return ["path"]
     case "file/move": return ["src", "dst"]
+    // fable51 item 33 — `read` with an explicit `path` OPENS A FILE, so the
+    // workspace-root policy that governs `file/read` governs it too. Naming the
+    // key here is what makes that true; without it a document read would be the
+    // one door into the filesystem that the file policy never saw. (The
+    // sensitive-path fence runs in `handleRead`'s own extraction path, matching
+    // the "sensitive wins over file-policy" precedence documented at the
+    // pre-flight call site.)
+    case "read": return ["path"]
     default: return []
     }
 }

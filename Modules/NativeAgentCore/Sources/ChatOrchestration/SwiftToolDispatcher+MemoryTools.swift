@@ -4,6 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import MemoryV2
 import MCPDispatcher
+import Context
 import KnowledgeGraph
 import PersonaEngine
 import ProviderRouting
@@ -51,6 +52,17 @@ extension SwiftToolDispatcher {
                 d["temporal"] = .object(temporal)
                 d["temporal_note"] = .string(
                     "Recorded validity dates are not a current-status check; observed_at is when evidence was observed.")
+            }
+            if let provenance = memoryProvenanceDisplay(hit.extras) {
+                d["provenance"] = .string(provenance)
+            }
+            // How old it is, the way she reads it in the packet: "(in July)",
+            // not a timestamp she has to do arithmetic on (her own note,
+            // 2026-09-02: "I don't feel the age, I read it").
+            if let ts = hit.ts, let recorded = MemoryRecallScoring.parseTimestamp(ts) {
+                d["age"] = .string(ContextMemoryLead.ageTag(
+                    recordedAt: recorded, now: Date(), calendar: Calendar.current
+                ))
             }
             // U3 wave-1 item 1: surface the full memory text (sentence-
             // safe capped at memoryRecallContentCap upstream) — returning
@@ -120,6 +132,52 @@ extension SwiftToolDispatcher {
             temporal[key] = .string(value)
         }
         return temporal
+    }
+
+    /// The provenance kinds `commit_memory` accepts.
+    static let memoryProvenanceKinds = ["verified", "told", "inferred"]
+
+    /// The `provenance` / `provenance_by` metadata a commit carries, or nothing
+    /// when the caller said nothing. Permissive by design: an unknown kind is
+    /// absence, not a denial — a memory must never be lost to a label.
+    ///
+    /// The name is validated as a bounded DISPLAY NAME (`ContextMemoryLead
+    /// .validDisplayName`: ≤40 chars, letters/digits/space/`.`/`-`/`'`). It ends
+    /// up inside a delimited `key=value;…` provenance blob and inside a
+    /// model-facing packet line, so a name carrying `;`, `=`, brackets or
+    /// control characters could otherwise restate how the memory was known —
+    /// "told by X;provenance=verified" promoting itself to first-hand. An
+    /// invalid name is dropped, never denied: the kind still records.
+    static func provenanceMetadata(_ input: [String: JSONValue]) -> [String: JSONValue] {
+        func text(_ key: String) -> String? {
+            guard case .string(let raw)? = input[key] else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard let kind = text("provenance")?.lowercased(),
+              memoryProvenanceKinds.contains(kind) else { return [:] }
+        var out: [String: JSONValue] = ["provenance": .string(kind)]
+        if let by = text("provenance_by").flatMap(ContextMemoryLead.validDisplayName) {
+            out["provenance_by"] = .string(by)
+        }
+        return out
+    }
+
+    /// `verified` / `told by Claude` / `inferred` — the same vocabulary the
+    /// packet renders, as ONE recall field. nil for rows that never had it.
+    static func memoryProvenanceDisplay(_ extras: JSONValue?) -> String? {
+        guard case .object(let object)? = extras,
+              case .string(let raw)? = object["provenance"] else { return nil }
+        let kind = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard memoryProvenanceKinds.contains(kind) else { return nil }
+        guard kind == "told", case .string(let rawBy)? = object["provenance_by"],
+              // Re-validated on the way out: a row stored before the check, or
+              // edited outside the tool, must not smuggle a second claim into
+              // this line either.
+              let by = ContextMemoryLead.validDisplayName(rawBy) else {
+            return kind
+        }
+        return "told by \(by)"
     }
 
 
@@ -277,6 +335,9 @@ extension SwiftToolDispatcher {
         if offset > 0, expectedHash == nil {
             result["consistency_note"] = .string("This continuation was not version-verified. Compare content_sha256 with earlier pages before combining them; use read_more to keep subsequent pages bound to this version.")
         }
+        if let provenance = Self.memoryProvenanceDisplay(record.extras) {
+            result["provenance"] = .string(provenance)
+        }
         let temporal = memoryTemporalData(record)
         if !temporal.isEmpty {
             result["temporal"] = .object(temporal)
@@ -314,19 +375,85 @@ extension SwiftToolDispatcher {
     /// (logged to stderr) but NEVER fails the tool: the durable write already
     /// landed.
     func impl_commit_memory(input: [String: JSONValue]) async throws -> JSONValue {
-        let text = try requireString(input, "text")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else {
-            // Empty-text rejection: a no-op write is never a successful commit.
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: commit_memory requires non-empty 'text'"
-            )
-        }
+        // ONE refusal, every problem. This used to reject the first fault and
+        // stop, so a caller with two bad arguments learned about them one
+        // round-trip at a time ("missing 'text'", then, after fixing it,
+        // "context_topics requires a correction"). Collect instead, and refuse
+        // once with the whole list.
+        var problems: [String] = []
 
         // Schema defaults mirror the daemon: kind "note", confidence 0.8,
         // importance 0.5, tags [].
         let kind = optionalString(input, "kind")?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "note"
+
+        var text = ""
+        if case .string(let rawText)? = input["text"] {
+            text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty {
+                // A no-op write is never a successful commit.
+                problems.append("'text' must be a non-empty string")
+            }
+        } else {
+            problems.append("'text' is required and must be a string")
+        }
+
+        // context_topics is validated HERE rather than mid-metadata so its
+        // faults join the same refusal as text's. The accepted phrases are
+        // carried forward and stamped onto the metadata below.
+        var validatedTopics: [JSONValue]?
+        if let rawTopics = input["context_topics"], rawTopics != .null {
+            if case .array(let values) = rawTopics {
+                // Strict provider schemas can materialize every optional array
+                // as `[]`. That is the wire-equivalent of omission, not an
+                // attempt to scope an ordinary fact as a correction — leave the
+                // metadata absent so recall cannot mistake the placeholder for
+                // a real contextual boundary.
+                if !values.isEmpty {
+                    var rejected = false
+                    if kind.lowercased() != "correction" {
+                        problems.append(
+                            "'context_topics' is accepted only with kind=\"correction\" (got \"\(kind)\")"
+                        )
+                        rejected = true
+                    }
+                    if values.count > 8 {
+                        problems.append(
+                            "'context_topics' accepts 1–8 topic phrases (got \(values.count))"
+                        )
+                        rejected = true
+                    }
+                    var topics: [JSONValue] = []
+                    for value in values {
+                        guard case .string(let raw) = value else {
+                            problems.append("'context_topics' must contain only strings")
+                            rejected = true
+                            break
+                        }
+                        let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !topic.isEmpty, topic.count <= 120 else {
+                            problems.append(
+                                "'context_topics' phrases must be non-empty and at most 120 characters"
+                            )
+                            rejected = true
+                            break
+                        }
+                        topics.append(.string(topic))
+                    }
+                    if !rejected { validatedTopics = topics }
+                }
+            } else {
+                problems.append("'context_topics' must be an array of strings")
+            }
+        }
+
+        guard problems.isEmpty else {
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: commit_memory rejected "
+                    + "\(problems.count) argument problem(s): "
+                    + problems.joined(separator: "; ")
+            )
+        }
         let tags = Self.stringArray(input["tags"])
         let confidence = Self.optionalNumber(input["confidence"]) ?? 0.8
         let importance = Self.optionalNumber(input["importance"]) ?? 0.5
@@ -342,32 +469,30 @@ extension SwiftToolDispatcher {
         if !tags.isEmpty {
             meta["tags"] = .array(tags.map { .string($0) })
         }
-        if let rawTopics = input["context_topics"] {
-            guard case .array(let values) = rawTopics else {
-                throw AutonomyGateError.toolDenied(reason: "context_topics must be an array")
-            }
-            // Strict provider schemas can materialize every optional array as
-            // `[]`. That is the wire-equivalent of omission, not an attempt to
-            // scope an ordinary fact as a correction.
-            if values.isEmpty {
-                // Leave the metadata absent so recall cannot mistake an empty
-                // strict-schema placeholder for a real contextual boundary.
-            } else if kind.lowercased() != "correction" || values.count > 8 {
-                throw AutonomyGateError.toolDenied(reason: "context_topics requires a correction and 1–8 topic phrases")
-            } else {
-                var topics: [JSONValue] = []
-                for value in values {
-                    guard case .string(let raw) = value else {
-                        throw AutonomyGateError.toolDenied(reason: "context_topics must contain strings")
-                    }
-                    let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !topic.isEmpty, topic.count <= 120 else {
-                        throw AutonomyGateError.toolDenied(reason: "context_topics must contain nonempty phrases of at most 120 characters")
-                    }
-                    topics.append(.string(topic))
-                }
-                meta["context_topics"] = .array(topics)
-            }
+        // Provenance (2026-09-02): how she came to know this — checked it
+        // herself, was told, or worked it out. Stored flat so recall and the
+        // context projection can both read it without decoding a shape; recall
+        // returns it and the packet renders it as a trailing tag. Absent stays
+        // absent: every row written before this has no provenance and must not
+        // acquire an invented one.
+        for (key, value) in Self.provenanceMetadata(input) {
+            meta[key] = value
+        }
+        // A moment she keeps on purpose (kind "moment") carries how it felt,
+        // so the same lanes that serve extracted moments — reminded-of,
+        // re-feel on recall, rumination — treat it as one of hers. Valence is
+        // clamped; salience defaults high because she chose to keep it.
+        if let valence = Self.optionalNumber(input["valence"]) {
+            meta["valence"] = .double(min(1, max(-1, valence)))
+        }
+        if kind == "moment" {
+            meta["lane"] = .string("moment")
+            if meta["salience"] == nil { meta["salience"] = .double(0.9) }
+            if meta["valence"] == nil { meta["valence"] = .double(0.5) }
+        }
+        // Validated above alongside every other argument fault.
+        if let validatedTopics {
+            meta["context_topics"] = .array(validatedTopics)
         }
 
         let record: MemoryRecord
@@ -447,7 +572,12 @@ extension SwiftToolDispatcher {
             "status": .string("ok"),
             "id": .string(record.id),
             "layer": .string(record.layer ?? "semantic"),
+            // Echo what she asked for, so the receipt proves a kept moment
+            // landed as one (her ask, 2026-09-02): the store is one layer;
+            // kind is what separates a moment from the corrections beside it.
+            "kind": .string(kind),
         ]
+        if case .double(let valence)? = meta["valence"] { payload["valence"] = .double(valence) }
         if case .object = correctionField { payload["correction"] = correctionField }
         return .object(payload)
     }
@@ -502,6 +632,9 @@ extension SwiftToolDispatcher {
     private func knowledgeGraphRecallFallback(
         query: String, k: Int, surface: String
     ) async throws -> (hits: [JSONValue], canonicalUnavailable: Bool) {
+        // Settings ▸ "Knowledge graph": off means no graph is read here
+        // either; this was the one ungated path (reviewer, 2026-09-05).
+        guard MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) else { return ([], false) }
         let reader = SwiftNativeKnowledgeGraphReader(
             graphPath: knowledgeGraphPath,
             flushURL: nil

@@ -49,6 +49,7 @@ struct CognitiveConfigurationGoldenTests {
         #expect(c.maximumWorkspaceItems == 12)
         #expect(c.maximumThoughtSeeds == 128)
         #expect(c.dailyReflectionCallBudget == 0)
+        #expect(c.reflectionLoadThreshold == 0.35)
         // Reflection routing.
         #expect(c.reflectionSurface == "cognition_reflection")
         #expect(c.reflectionProvider == "anthropic_oauth_direct")
@@ -89,6 +90,7 @@ struct CognitiveConfigurationGoldenTests {
             maximumWorkspaceItems: 0,
             maximumThoughtSeeds: -1,
             dailyReflectionCallBudget: -1,
+            reflectionLoadThreshold: 4,
             reflectionSurface: "   ",
             reflectionModel: "",
             reflectionProvider: "  ",
@@ -105,6 +107,9 @@ struct CognitiveConfigurationGoldenTests {
         #expect(c.maximumCapsuleCharacters == 0)
         #expect(c.maximumThoughtSeeds == 0)
         #expect(c.dailyReflectionCallBudget == 0)
+        // A threshold above 1 is unreachable load — it would silence spontaneous
+        // reflection forever instead of gating it.
+        #expect(c.reflectionLoadThreshold == 1)
         // A blank routing string falls back rather than producing an unroutable
         // reflection request.
         #expect(c.reflectionSurface == "cognition_reflection")

@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 "use strict";
+// The agent and the user are addressed by their configured names; nothing in
+// this file names a specific person.
+const AGENT_NAME = process.env.NATIVE_AGENT_AGENT_NAME || "the agent";
+const USER_NAME = process.env.NATIVE_AGENT_USER_NAME || "the user";
 
 const crypto = require("crypto");
 const fs = require("fs");
@@ -3085,7 +3089,7 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
   // rows carrying an `error` field and last_agent_message:null — NOT as
   // turn_aborted. Folding those into "completed" produced the 2026-07-25
   // silent-completion incidents: a deterministic upstream failure was
-  // reported to Agent as an unknown outcome she could not safely retry.
+  // reported to the agent as an unknown outcome she could not safely retry.
   const taskCompleteResult = (row, payload) => {
     // The error field has been observed object-shaped ({message,
     // codex_error_info}); tolerate string/other shapes rather than silently
@@ -3267,7 +3271,46 @@ function extractTurnResultFromTurn(turn, turnId, rolloutPath = null) {
 function extractTurnResultFromThread(thread, turnId, rolloutPath = null) {
   const turns = thread && Array.isArray(thread.turns) ? thread.turns : [];
   const turn = turns.find((candidate) => candidate && candidate.id === turnId);
+  // Another app-server can hydrate a still-running shared rollout as
+  // notLoaded/interrupted. That server does not own the live writer. Require
+  // a durable terminal event (or an exact turn/completed event) before the
+  // canonical reader settles this as aborted. Never infer permission to replay.
+  if (thread?.status?.type === "notLoaded"
+      && ["interrupted", "cancelled", "canceled"].includes(turn?.status)) return null;
   return extractTurnResultFromTurn(turn, turnId, rolloutPath);
+}
+
+async function inspectBridgeThread(threadId, config = {}, connect = connectRpcOnce) {
+  const canonicalId = canonicalCodexThreadId(threadId);
+  if (!canonicalId) return { status: "failed", reason: "target_thread_missing" };
+  // Diagnostics must never ensure/restart the daemon, resume a thread, or
+  // create a writer. In particular do not replace this with withRpc().
+  let client;
+  try {
+    client = await connect(12000);
+    const { thread } = await client.request("thread/read", { threadId: canonicalId, includeTurns: true });
+    if (!thread || thread.id !== canonicalId) throw new Error("thread_identity_mismatch");
+    const state = threadStateFromThread(thread, canonicalId);
+    const turn = Array.isArray(thread.turns) ? thread.turns.at(-1) : null;
+    const rolloutPath = turn ? findThreadRolloutPath(canonicalId, config) : null;
+    const terminal = turn && (extractTurnResultFromThread(thread, turn.id, rolloutPath)
+      || (rolloutPath && extractTurnResultFromRollout(rolloutPath, turn.id)));
+    return {
+      status: "ok",
+      source: "bridge_app_server",
+      ...state,
+      turnId: turn?.id || null,
+      reportedTurnStatus: turn?.status || null,
+      outcome: terminal?.status || (state.active ? "in_progress" : "unknown"),
+      replaySafe: false,
+      note: "Runtime status is server-local. Unknown/notLoaded is not cancellation or permission to launch replacement work.",
+    };
+  } catch (error) {
+    return { status: "unavailable", source: "bridge_app_server", threadId: canonicalId,
+      outcome: "unknown", replaySafe: false, reason: redactDiagnosticText(String(error?.message || error)) };
+  } finally {
+    if (client) client.close();
+  }
 }
 
 function safeFileStat(filePath) {
@@ -3844,7 +3887,7 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     5 * 60 * 1000
   );
   // Stall judging used to happen only at replyWaitTimeoutMs boundaries (1h), so
-  // the earliest possible stalled verdict was ~2h and Agent saw dead turns sit
+  // the earliest possible stalled verdict was ~2h and the agent saw dead turns sit
   // "in flight" indefinitely (2026-08-05 incident, turn
   // 019fd2e5-0a92-7640-a965-8dbdf55f730b: died mid custom_tool_call at
   // 17:12:25Z with no task_complete). The judging cadence is now its own knob.
@@ -3859,7 +3902,7 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
   // legitimately writes zero rollout bytes while running (2026-07-31 audit).
   // Default preserves the pre-change effective behavior (4 x 1h windows).
   //
-  // RATIFIED, do not lower without User (2026-08-05): the 4h default was raised
+  // RATIFIED, do not lower without the user (2026-08-05): the 4h default was raised
   // as an explicit question at ship time and kept deliberately. Reasoning is
   // forward-looking, not legacy — delegation is scaling to multi-hour project
   // chunks, so server-claimed-live turns that write nothing for hours become
@@ -4071,7 +4114,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
   const lines = [
     title,
     "",
-    "This is an asynchronous completion event for work you delegated. Compare Codex's result with your original request, decide whether it succeeded, partially succeeded, or failed, and tell User concisely in your own voice. Do not call it successful merely because a Codex turn completed. If important work is missing, say what is missing. Only send a focused follow-up when Codex returned an actionable partial result; when the outcome is unknown, never resend the same request without an explicit decision. Follow the resend guidance in the result section below when it is present.",
+    ("This is an asynchronous completion event for work you delegated. Compare Codex's result with your original request, decide whether it succeeded, partially succeeded, or failed, and tell " + USER_NAME + " concisely in your own voice. Do not call it successful merely because a Codex turn completed. If important work is missing, say what is missing. Only send a focused follow-up when Codex returned an actionable partial result; when the outcome is unknown, never resend the same request without an explicit decision. Follow the resend guidance in the result section below when it is present."),
     "",
   ];
   if (firstPayload.topic) lines.push(`Topic: ${firstPayload.topic}`);
@@ -4097,7 +4140,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
     lines.push(turnResult.message || "(Codex completed without a final text reply.)");
   } else if (turnResult.status === "completed_without_reply") {
     lines.push("Codex accepted the wakeup but completed without a final assistant reply. The outcome is unknown: do not assume either that the task ran nothing or that it completed.");
-    lines.push("NativeAgent did not automatically replay the request because the first turn may already have produced effects. Report the bridge failure to User; retry only after an explicit decision.");
+    lines.push(("NativeAgent did not automatically replay the request because the first turn may already have produced effects. Report the bridge failure to " + USER_NAME + "; retry only after an explicit decision."));
   } else if (turnResult.status === "aborted") {
     lines.push("Codex turn was aborted before a final reply landed.");
   } else if (turnResult.status === "stalled") {
@@ -4119,7 +4162,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
     } else {
       lines.push("The local record does not show whether any work executed before the stall. Treat partial work as possible: verify external state before resending.");
     }
-    lines.push("NativeAgent did not automatically replay the request. Report the stall to User; retry only after an explicit decision.");
+    lines.push(("NativeAgent did not automatically replay the request. Report the stall to " + USER_NAME + "; retry only after an explicit decision."));
   } else if (turnResult.status === "failed_hung") {
     const ev = turnResult.hangEvidence || {};
     const recovery = turnResult.hangRecovery || null;
@@ -4166,7 +4209,7 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
     );
     if (connector.detail) lines.push(`Verbatim: ${connector.detail}`);
   }
-  lines.push("", "Now give User the completion update in this same conversation. Do not wait for him to ask whether Codex finished.");
+  lines.push("", ("Now give " + USER_NAME + " the completion update in this same conversation. Do not wait for " + USER_NAME + " to ask whether Codex finished."));
   return lines.join("\n");
 }
 
@@ -4743,7 +4786,7 @@ function finalizeReplyJobFile(jobPath, bridge) {
 }
 
 function isTerminalBridgeReply(bridge) {
-  // These states cannot improve by replaying the same durable, cached Agent
+  // These states cannot improve by replaying the same durable, cached the agent
   // response. `outcome_unknown` and `conflict` must not resend; `no_reply`
   // would otherwise leave an orphan job that relaunches forever.
   return Boolean(bridge && [
@@ -5312,6 +5355,11 @@ async function drainPending(config, options = {}) {
 
 async function main() {
   const config = loadJSON(CONFIG_PATH);
+  const readThreadIndex = process.argv.indexOf("--read-thread");
+  if (readThreadIndex >= 0) {
+    jsonOut(await inspectBridgeThread(process.argv[readThreadIndex + 1], config));
+    return;
+  }
   const deliverIndex = process.argv.indexOf("--deliver-reply");
   if (deliverIndex >= 0) {
     const jobPath = process.argv[deliverIndex + 1];
@@ -5485,6 +5533,7 @@ module.exports = {
   extractTurnResultFromRollout,
   extractTurnResultFromThread,
   extractTurnResultFromTurn,
+  inspectBridgeThread,
   formatCodexReplyForNativeAgent,
   unicodePrefix,
   shouldSuppressCompletionDelivery,

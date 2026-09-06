@@ -19,7 +19,10 @@ struct ProviderOAuthConfig: @unchecked Sendable {
     let tokenBodyFormat: TokenBodyFormat
     /// Function that takes the parsed token response dict and writes it to
     /// the right on-disk shape for `LLMCredentialResolver` / the adapter.
-    let persistTokens: ([String: Any]) throws -> Void
+    /// User, 2026-09-06: takes the selected data root. It used to write to the
+    /// DEFAULT root unconditionally, so a sign-in under an override root landed
+    /// in the wrong install and the status read that followed found nothing.
+    let persistTokens: ([String: Any], URL) throws -> Void
     /// Function building the token-exchange body params (extras vary).
     let extraTokenParams: (_ state: String) -> [String: String]
 
@@ -97,14 +100,14 @@ struct ProviderOAuthConfig: @unchecked Sendable {
             "originator":                 OpenAIOAuthDirectAdapter.codexBackendOriginator,
         ],
         tokenBodyFormat: .form,
-        persistTokens: { tokens in
+        persistTokens: { tokens, dataRoot in
             // Persist to the APP-OWNED auth path, never the resolved active
             // path: with CLI-session adoption allowed, the resolved path is
             // ~/.codex/auth.json, and an in-app re-auth must not overwrite
             // the Codex CLI's own session file (gpt-5.5 review 2026-08-06).
             // The app-owned candidate precedes the shared one in resolution,
             // so freshly written tokens win on the next turn.
-            let authPath = NativeOAuthFlow.openAIAppOwnedAuthPath()
+            let authPath = NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot)
             var existing = (try? loadJSONObject(authPath)) ?? [:]
             if existing["auth_mode"] == nil { existing["auth_mode"] = "chatgpt" }
             if existing["OPENAI_API_KEY"] == nil { existing["OPENAI_API_KEY"] = NSNull() }
@@ -120,6 +123,28 @@ struct ProviderOAuthConfig: @unchecked Sendable {
             }
             existing["tokens"] = merged
             existing["last_refresh"] = isoNow()
+            // User, 2026-09-06: this merge kept the PREVIOUS credential's
+            // top-level `expires_at`, and the adapter takes the EARLIER of the
+            // persisted stamp and the JWT's own `exp` — so a fresh sign-in
+            // could read as already expired and force a refresh on its very
+            // first call. A new sign-in replaces the stamp, and drops it
+            // entirely when the response carries no expiry at all.
+            if let seconds = (tokens["expires_in"] as? Int)
+                ?? (tokens["expires_in"] as? Double).map({ Int($0) }) {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                existing["expires_at"] = formatter.string(
+                    from: Date().addingTimeInterval(TimeInterval(seconds))
+                )
+            } else if let access = tokens["access_token"] as? String,
+                      let payload = jwtPayload(access),
+                      let exp = (payload["exp"] as? Double) ?? (payload["exp"] as? Int).map(Double.init) {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                existing["expires_at"] = formatter.string(from: Date(timeIntervalSince1970: exp))
+            } else {
+                existing.removeValue(forKey: "expires_at")
+            }
             try writeJSONObject(existing, to: authPath)
         },
         extraTokenParams: { _ in [:] }
@@ -136,8 +161,8 @@ struct ProviderOAuthConfig: @unchecked Sendable {
         stateEqualsVerifier:   true,
         extraAuthParams: ["code": "true"],   // pi-ai-required extra
         tokenBodyFormat: .json,
-        persistTokens: { tokens in
-            try NativeOAuthFlow.persistAnthropicOAuthTokens(tokens)
+        persistTokens: { tokens, dataRoot in
+            try NativeOAuthFlow.persistAnthropicOAuthTokens(tokens, dataRoot: dataRoot)
         },
         extraTokenParams: { state in ["state": state] }
     )

@@ -688,7 +688,11 @@ struct ContextSelectionTests {
             })
         )
         let need = signal("Atlas continuity memory", generation: fixture, budget: 32_000)
-        let selector = ContextSelector()
+        // This pin measures quota SATURATION; the three-token message would
+        // otherwise take the short-message memory lane (6 rows, 2026-09-02).
+        let selector = ContextSelector(
+            configuration: ContextSelectionConfiguration(shortMessageMemoryRowCap: 0)
+        )
         let packet = try selector.select(need, from: fixture, pinnedTo: snapshot)
         let expectedIDs = (0..<8).map {
             ContextAtomID(rawValue: String(format: "atom:memory-%03d", $0))

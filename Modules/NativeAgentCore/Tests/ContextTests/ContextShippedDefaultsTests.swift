@@ -31,10 +31,37 @@ struct ContextShippedDefaultsTests {
         #expect(configuration.maximumPointers == 8)
         #expect(configuration.maximumAtomsPerSource == 2)
         #expect(configuration.maximumAtomsPerKind == 4)
-        #expect(configuration.maximumAtomsPerKindOverrides == [.memory: 8])
+        #expect(configuration.maximumAtomsPerKindOverrides == [.memory: 8, .relationship: 4])
         #expect(configuration.maximumAtoms(forKind: .memory) == 8)
         #expect(configuration.maximumAtoms(forKind: .fact) == 4)
+        // Knowledge-graph relations are reach, not weight: they ride the
+        // uniform per-kind cap, pinned explicitly so a future bump of
+        // `maximumAtomsPerKind` cannot quietly widen the graph's share of a
+        // packet (2026-09-01, sweep item 23).
+        #expect(configuration.maximumAtoms(forKind: .relationship) == 4)
+        // Skill pointers keep the legacy recall lane's max(1, k/3) share of
+        // the memory budget: 8 / 3 == 2 (sweep item 24). The coverage gate is
+        // measured, not guessed — live arena generation 3046 separated the
+        // right skill for a message (0.47-0.63) from every off-topic pointer
+        // (<= 0.19); raising it past ~0.46 makes the floor inert, lowering it
+        // past ~0.19 turns it into unbudgeted clutter.
+        #expect(configuration.reservedRoleSlotsPerKind == [
+            .memory: ContextRoleReservation(role: .procedure, slots: 2),
+        ])
+        #expect(configuration.reservedRoleSlotsPerKind[.memory]?.minimumMessageCoverage == 0.35)
         #expect(configuration.minimumRelevance == 0.05)
+        // The 2026-09-02 precision pass. 0.30 sits in the gap the live warm
+        // turn measured: the one memory worth carrying scored 0.41, the row
+        // that should never have shipped scored 0.24. Raise it past ~0.41 and
+        // real hits start dying; drop it under ~0.24 and it is inert. The row
+        // cap is the same "4" the messageCoverage length damp already uses,
+        // holding a short message to 6 of the 8 memory slots.
+        #expect(configuration.memorySemanticFloor == 0.30)
+        #expect(configuration.shortMessageMemoryRowCap == 6)
+        #expect(ContextSelectionConfiguration.shortMessageTokenCount == 4)
+        // Both knobs are one switch: floor 0 is the whole feature's off.
+        #expect(ContextSelectionConfiguration(memorySemanticFloor: 0)
+            .memorySemanticFloor == 0)
         // The nested weights carry their own pin in ContextSelectionTests; what
         // matters here is that a bare configuration still routes to it rather
         // than to some other default set.

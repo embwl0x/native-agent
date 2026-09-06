@@ -48,6 +48,27 @@ public struct ContextSurfaceVariant: RawRepresentable, Hashable, Comparable, Sen
     }
 }
 
+/// ONE name for the persona source lane, and one way to read a persona
+/// source's locator.
+///
+/// Both the precoverage gate (`ContextFlowCoordinator`) and the stable-prefix
+/// renderer must agree about which sources are persona sources, which document
+/// a source carries, and — the reason this exists — whether that source permits
+/// the CURRENT turn's surface. Three copies of a string literal and a
+/// `split("/").last` is how those two places drift apart.
+public enum ContextPersonaSourceNaming {
+    /// Owner string every persona document source is registered under
+    /// (`NativeContextFlowRuntime.owner`).
+    public static let owner = "nativeagent.persona"
+
+    /// `persona/<personaID>/` — the locator prefix scoping a source to one
+    /// persona slot.
+    public static func locatorPrefix(for personaID: ContextPersonaID) -> String {
+        "persona/\(personaID.rawValue)/"
+    }
+
+}
+
 /// The live PersonaCompiler full-document contract. Custom personas may still
 /// supply arbitrary declarations; this is the default order for personas that
 /// use the standard NativeAgent document set.
@@ -105,13 +126,43 @@ public struct RequiredDocument: Sendable, Equatable {
     public let characterCount: Int
     public let utf8ByteCount: Int
     public let logicalByteCount: Int
+    /// PROVENANCE, carried with the bytes. The context source this document was
+    /// mirrored from, and the surfaces that source permits.
+    ///
+    /// A renderer that wants to put this document in the CACHED stable prefix
+    /// must be able to prove the current surface is allowed. Proving it by
+    /// re-deriving a source id from a locator string was a permission check
+    /// that a naming-convention change could silently switch off; carrying the
+    /// descriptor's own answer next to the text cannot drift from it.
+    ///
+    /// `nil` means UNPROVEN, not "permitted": a document built without
+    /// provenance is unavailable to the stable prefix and falls back to the
+    /// packet's own surface rules. Every production mirror populates these
+    /// (`NativeContextFlowRuntime.makeMirror`); only fixtures leave them nil.
+    public let sourceID: ContextSourceID?
+    public let permittedSurfaces: Set<ContextSurface>?
+
+    public var hasSurfaceProvenance: Bool {
+        sourceID != nil && permittedSurfaces != nil
+    }
+
+    /// The single question the stable prefix asks of a document. Unproven
+    /// answers `false` — the deny direction is the safe one, because a document
+    /// wrongly withheld from the prefix is still reachable through the packet,
+    /// while one wrongly admitted has escaped a permission entirely.
+    public func permitsStablePrefix(on surface: ContextSurface) -> Bool {
+        guard let permittedSurfaces, sourceID != nil else { return false }
+        return permittedSurfaces.contains(surface)
+    }
 
     public init(
         id: RequiredDocumentID,
         canonicalOrder: Int,
         sourceHash: String,
         text: String,
-        tokenCount: Int
+        tokenCount: Int,
+        sourceID: ContextSourceID? = nil,
+        permittedSurfaces: Set<ContextSurface>? = nil
     ) throws {
         guard !id.rawValue.isEmpty else {
             throw RequiredDocumentMirrorError.emptyDocumentID
@@ -131,10 +182,25 @@ public struct RequiredDocument: Sendable, Equatable {
         self.sourceHash = sourceHash
         self.text = text
         self.tokenCount = tokenCount
+        self.sourceID = sourceID
+        self.permittedSurfaces = permittedSurfaces
         self.characterCount = text.count
         self.utf8ByteCount = text.utf8.count
+        // Provenance contributes 0 bytes when absent, so the accounting of a
+        // document without it is byte-identical to before this field existed.
+        let provenanceBytes = try ContextLogicalByteAccounting.checkedSum(
+            [sourceID?.rawValue.utf8.count ?? 0]
+                + (permittedSurfaces?.map { $0.rawValue.utf8.count } ?? []),
+            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
+        )
         self.logicalByteCount = try ContextLogicalByteAccounting.checkedSum(
-            [48, id.rawValue.utf8.count, sourceHash.utf8.count, text.utf8.count],
+            [
+                48,
+                id.rawValue.utf8.count,
+                sourceHash.utf8.count,
+                text.utf8.count,
+                provenanceBytes,
+            ],
             overflowError: RequiredDocumentMirrorError.logicalByteOverflow
         )
     }
@@ -143,14 +209,18 @@ public struct RequiredDocument: Sendable, Equatable {
         kind: RequiredPersonaDocumentKind,
         sourceHash: String,
         text: String,
-        tokenCount: Int
+        tokenCount: Int,
+        sourceID: ContextSourceID? = nil,
+        permittedSurfaces: Set<ContextSurface>? = nil
     ) throws {
         try self.init(
             id: kind.id,
             canonicalOrder: kind.canonicalOrder,
             sourceHash: sourceHash,
             text: text,
-            tokenCount: tokenCount
+            tokenCount: tokenCount,
+            sourceID: sourceID,
+            permittedSurfaces: permittedSurfaces
         )
     }
 }

@@ -27,7 +27,8 @@ extension SwiftNativeChatOrchestrationClient {
         serviceTierOverride: String? = nil,
         verifiedSessionId: String? = nil,
         requireCompleted: Bool = false,
-        surface: String
+        surface: String,
+        providerAdmission: (@Sendable () async throws -> Void)? = nil
     ) async throws -> ChatResponse {
         // P2-3: fold before anything derives from it (projection session id,
         // autonomy resolution, the provider-facing surface).
@@ -38,10 +39,15 @@ extension SwiftNativeChatOrchestrationClient {
         }
 
         let runId = UUID().uuidString
-        let imageBlocks = Self.imageBlocksFromAttachments(attachments)
+        // 2026-09-06: the Trust ▸ Multimodal gates apply on every lane that can
+        // carry an attachment, not just the chat ones — otherwise "Allow vision
+        // API calls" off is defeated by an execution turn.
+        let attachmentInput = Self.turnAttachmentInput(
+            message: message, attachments: attachments, dataRoot: dataRoot)
+        let imageBlocks = attachmentInput.imageBlocks
         let baseContext = try await engine.buildTurnContext(
             surface: surface,
-            userMessage: message,
+            userMessage: attachmentInput.userMessage,
             personaOverride: persona,
             imageBlocks: imageBlocks,
             sessionID: nil
@@ -117,7 +123,9 @@ extension SwiftNativeChatOrchestrationClient {
                 // a weaker approval root.
                 injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot)
             )
-            gated = ChatToolDispatchTracer(inner: autonomyGated, dataRoot: dataRoot)
+            gated = CanonicalToolNameDispatcher(
+                inner: ChatToolDispatchTracer(inner: autonomyGated, dataRoot: dataRoot)
+            )
         } else {
             gated = makeTracedGatedDispatcher(
                 fileAccess: fileAccess,
@@ -139,7 +147,8 @@ extension SwiftNativeChatOrchestrationClient {
                 maxIterations: toolLoopMaxIterations(for: surface),
                 llm: llm,
                 tools: gated,
-                preBuiltContext: projectedContext
+                preBuiltContext: projectedContext,
+                providerAdmission: providerAdmission
             )
         }
         }

@@ -8,11 +8,27 @@
 // existing presentation into a shared modifier — no new staleness rules.
 import SwiftUI
 
+/// Sweep 2026-09-01 item 2: a snapshot age is not the only way a screen lies.
+/// The Mac publishes the groups it could NOT rebuild, and a screen whose group
+/// is named there is showing old rows no matter how recently the phone synced.
+enum MacSnapshotGroupStaleness {
+    static let title = "STALE — the Mac could not rebuild this"
+
+    /// The Mac's reason for this screen's group, or nil when the group built.
+    static func reason(in markers: [String: String], group: String?) -> String? {
+        guard let group, !group.isEmpty, let raw = markers[group] else { return nil }
+        let reason = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return reason.isEmpty ? "The Mac could not rebuild this snapshot." : reason
+    }
+}
+
 /// Renders nothing while the snapshot is fresh; a compact honest banner
 /// otherwise. Time-based text is re-evaluated on a slow timeline so "4m old"
 /// does not itself go stale on screen.
 struct MacSnapshotFreshnessBadge: View {
     let lastSyncedAt: Date?
+    /// The Mac's reason this screen's snapshot group was skipped, if it was.
+    var staleGroupReason: String? = nil
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 15)) { context in
@@ -20,15 +36,21 @@ struct MacSnapshotFreshnessBadge: View {
                 lastSyncedAt: lastSyncedAt,
                 now: context.date
             )
-            if StatusConnectionPresentation.needsAttention(state) {
+            // A named group failure outranks age: a Mac that published five
+            // seconds ago can still have failed to rebuild THIS group.
+            let title = staleGroupReason == nil
+                ? StatusConnectionPresentation.cardValue(for: state)
+                : MacSnapshotGroupStaleness.title
+            let detail = staleGroupReason ?? StatusConnectionPresentation.detail(for: state)
+            if staleGroupReason != nil || StatusConnectionPresentation.needsAttention(state) {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "clock.badge.exclamationmark")
                         .foregroundStyle(.orange)
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(StatusConnectionPresentation.cardValue(for: state))
+                        Text(title)
                             .font(AppFont.label.weight(.semibold))
-                        if let detail = StatusConnectionPresentation.detail(for: state) {
+                        if let detail {
                             Text(detail)
                                 .font(AppFont.label)
                                 .foregroundStyle(.secondary)
@@ -42,10 +64,7 @@ struct MacSnapshotFreshnessBadge: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.ultraThinMaterial)
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel(
-                    "Mac snapshot freshness: "
-                        + StatusConnectionPresentation.cardValue(for: state)
-                )
+                .accessibilityLabel("Mac snapshot freshness: " + title)
             }
         }
     }
@@ -53,18 +72,27 @@ struct MacSnapshotFreshnessBadge: View {
 
 private struct MacSnapshotFreshnessModifier: ViewModifier {
     @ObservedObject private var sync = iCloudSyncEngine.shared
+    /// The Mac snapshot group this screen renders, when it has exactly one.
+    let group: String?
 
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .top, spacing: 0) {
-            MacSnapshotFreshnessBadge(lastSyncedAt: sync.lastSyncAt)
+            MacSnapshotFreshnessBadge(
+                lastSyncedAt: sync.lastSyncAt,
+                staleGroupReason: MacSnapshotGroupStaleness.reason(
+                    in: sync.staleSnapshotGroups,
+                    group: group
+                )
+            )
         }
     }
 }
 
 extension View {
     /// Pin this screen's contents to the age of the Mac snapshot that produced
-    /// them. Apply to the root content of any screen reading `iCloudSyncEngine`.
-    func macSnapshotFreshnessBadge() -> some View {
-        modifier(MacSnapshotFreshnessModifier())
+    /// them, and — when `group` names the snapshot group this screen renders —
+    /// to whether the Mac could rebuild that group at all.
+    func macSnapshotFreshnessBadge(group: String? = nil) -> some View {
+        modifier(MacSnapshotFreshnessModifier(group: group))
     }
 }

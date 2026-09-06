@@ -275,17 +275,39 @@ private func withTailTransitions(
     for i in 0..<20 {
         _ = await sensor.observe(sample: sample("kimi-code", at: Double(i), durationMs: 800))
     }
-    // Oscillate hard: alternate 3x-baseline and baseline samples for 200 calls.
+    // 2026-09-06 (a4321450): the baseline now learns ONLY from nominal-band
+    // samples — "a provider that stayed slow taught the baseline its own
+    // degradation, and the sensor announced a recovery that never happened".
+    // This test used to alternate 2400/800 straight off the healthy baseline
+    // and pass because the baseline chased the load back to ratio ~1 and the
+    // band never moved: it asserted 0 transitions while measuring the defect,
+    // not the hysteresis. Under the fixed sensor that same 3x swing crosses
+    // BOTH the sluggish and degraded lines every sample (195 transitions),
+    // which is a real band change, not boundary noise.
+    //
+    // So: step in decisively first, which enters sluggish and freezes the
+    // baseline near 800 ms...
+    for i in 20..<30 {
+        _ = await sensor.observe(sample: sample("kimi-code", at: Double(i), durationMs: 2_000))
+    }
+    // ...then feed the boundary NOISE this test is about. Strain from latency
+    // is (ratio - 1)/0.6, so enterSluggish 1.0 is ratio 1.6 and exitSluggish
+    // 0.6 is ratio 1.36 — a hysteresis gap the fast ema (alpha 0.4) must sit
+    // inside. Alternating 1610/1170 swings that ema roughly 1280..1500 ms:
+    // over the enter line and back into the gap on every pair, never to the
+    // exit line and nowhere near degraded. Without hysteresis this is 200
+    // transitions.
     var transitions = 0
-    for i in 20..<220 {
-        let ms: Double = i % 2 == 0 ? 2_400 : 800
+    for i in 30..<230 {
+        let ms: Double = i % 2 == 0 ? 1_610 : 1_170
         if await sensor.observe(sample: sample("kimi-code", at: Double(i), durationMs: ms)) != nil {
             transitions += 1
         }
     }
     // Hysteresis: entering a band once (and possibly settling back once) is
     // fine; per-sample chatter is the failure. Bound: at most 4 transitions
-    // across 200 oscillating samples (observed: 1-2).
+    // across 200 oscillating samples (observed: 1 — the step's entry into
+    // sluggish, after which the band stays latched through every swing).
     #expect(transitions <= 4, "oscillation chattered \(transitions) transitions")
 }
 

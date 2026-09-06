@@ -272,7 +272,16 @@ struct HealthPillPopoverPresentationTests {
 
         // The developer-gated jump survives only behind the developer gate.
         #expect(source.contains("if showDeveloperSurfaces {"))
-        #expect(SidebarItem.developerItems.contains(.diagnostics))
+        // 2026-09-06: ab1e2ace put Diagnostics on the rail and df974e5f emptied
+        // the gate outside the classic shell (SidebarModels.swift:182), so the
+        // jump's destination is only a developer surface in classic. Either way
+        // the pill's jump lands on a Diagnostics destination that exists.
+        if NativeAgentShellPreference.isClassic() {
+            #expect(SidebarItem.diagnostics.isDeveloperSurface)
+        } else {
+            #expect(SidebarItem.shellPrimaryItems.contains(.diagnostics))
+            #expect(!SidebarItem.diagnostics.isDeveloperSurface)
+        }
     }
 
     @Test("'Checking' now requires a run in flight; a cold pill says it has no answer")
@@ -321,7 +330,13 @@ struct ChatStreamingRenderCostTests {
         #expect(source.contains("var sidebarProjection: ChatSidebarProjection"))
         #expect(source.contains("sidebarProjectionCache.project("))
         #expect(AppSourceScraping.occurrences(of: "ChatSidebarSections.split(", in: source) == 1)
-        #expect(source.contains("let pinnedTabs = sidebarProjection.pinnedTabs"))
+        // 2026-09-06: 3ccfb925 ("the tab strip is gone from the new shell — the
+        // sessions ARE the tabs") wrapped the binding in the classic-shell
+        // check at ChatView.swift:988. The D4 invariant is unchanged: the strip
+        // reads the projection ONCE and both the emptiness test and the rows
+        // use that binding.
+        #expect(source.contains("let pinnedTabs = classicShell ? sidebarProjection.pinnedTabs : []"))
+        #expect(AppSourceScraping.occurrences(of: "sidebarProjection.pinnedTabs", in: source) == 1)
         #expect(AppSourceScraping.occurrences(of: "sessions: pinnedTabs", in: source) == 1)
     }
 
@@ -334,13 +349,13 @@ struct ChatStreamingRenderCostTests {
         let pins = try MacPinnedChatSessionStore.save(["c", "a"])
         let cache = ChatSidebarProjectionCache()
 
-        let first = cache.project(sessions: [a, b, c], pinnedRaw: pins, search: "")
-        let second = cache.project(sessions: [a, b, c], pinnedRaw: pins, search: "")
+        let first = cache.project(sessions: [a, b, c], pinnedRaw: pins, anchorSessionId: nil, search: "")
+        let second = cache.project(sessions: [a, b, c], pinnedRaw: pins, anchorSessionId: nil, search: "")
         #expect(cache.rebuildCount == 1)
         #expect(first.pinnedTabs.map(\.id) == ["c", "a"])
         #expect(second.sections.unpinned.map(\.id) == ["b"])
 
-        let searched = cache.project(sessions: [a, b, c], pinnedRaw: pins, search: "B")
+        let searched = cache.project(sessions: [a, b, c], pinnedRaw: pins, anchorSessionId: nil, search: "B")
         #expect(cache.rebuildCount == 2)
         #expect(searched.sections.pinned.isEmpty)
         #expect(searched.sections.unpinned.map(\.id) == ["b"])

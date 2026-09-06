@@ -68,6 +68,18 @@ private func writeDoctor(_ dir: URL, statuses: [String]) {
     try? body.data(using: .utf8)!.write(to: doctorDir.appendingPathComponent("latest.json"))
 }
 
+/// Write doctor/latest.json with explicit check ids, so a test can name the
+/// Doctor-only diagnostic rows the hook must ignore.
+private func writeDoctorRows(_ dir: URL, rows: [(id: String, status: String)]) {
+    let checks = rows.map { row in
+        "{\"id\":\"\(row.id)\",\"title\":\"\(row.id)\",\"status\":\"\(row.status)\"}"
+    }.joined(separator: ",")
+    let body = "{\"checks\":[\(checks)],\"runAt\":\"2026-09-02T00:00:00Z\"}"
+    let doctorDir = dir.appendingPathComponent("doctor", isDirectory: true)
+    try? FileManager.default.createDirectory(at: doctorDir, withIntermediateDirectories: true)
+    try? body.data(using: .utf8)!.write(to: doctorDir.appendingPathComponent("latest.json"))
+}
+
 /// Write errors.jsonl with `count` rows stamped at `now` (within the window).
 private func writeErrors(_ dir: URL, count: Int, now: Date, extraLine: String? = nil) {
     let logsDir = dir.appendingPathComponent("logs", isDirectory: true)
@@ -406,6 +418,124 @@ private func makeHook(
     #expect(llm.calls == 0)
 }
 
+// MARK: - FIX 3: the watched feeds are the LIVE ones, and a dead one says so
+
+/// Write `rows` to `relative` under `dir`, optionally back-dating the file's
+/// modification time (that is what makes a feed "silent").
+private func writeFeed(
+    _ dir: URL, relative: String, rows: [String], modified: Date? = nil
+) {
+    let url = relative.split(separator: "/").reduce(dir) {
+        $0.appendingPathComponent(String($1))
+    }
+    try? FileManager.default.createDirectory(
+        at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? rows.joined(separator: "\n").data(using: .utf8)!.write(to: url)
+    if let modified {
+        try? FileManager.default.setAttributes(
+            [.modificationDate: modified], ofItemAtPath: url.path)
+    }
+}
+
+@Test func selfHeal_burst_in_the_live_telegram_feed_fires() async {
+    // The firehose the detector was NOT watching: `telegram/errors.jsonl` takes
+    // a row on every failed poll while `logs/errors.jsonl` has had no writer
+    // since the Python daemon was retired.
+    let dir = tempDir("telegramBurst"); defer { try? FileManager.default.removeItem(at: dir) }
+    let clock = ClockBox(Date(timeIntervalSince1970: 1_700_000_000))
+    let collector = ProposalCollector()
+    let hook = makeHook(dir: dir, clock: clock, llm: DiagLLM(), collector: collector)
+    writeDoctor(dir, statuses: ["ok"])
+    let ts = SelfHealingHook.isoString(clock.now)
+    writeFeed(dir, relative: "telegram/errors.jsonl",
+              rows: (0..<SelfHealingHook.errorBurstThreshold).map {
+                  "{\"at\":\"\(ts)\",\"context\":\"poll\",\"error\":\"unavailable \($0)\"}"
+              })
+
+    await hook.tick()
+
+    #expect(collector.items.count == 1)
+    #expect(collector.items.first?.evidence.contains("[telegram]") == true)
+}
+
+@Test func selfHeal_burst_counts_across_every_watched_feed() async {
+    // Neither feed alone crosses the threshold; together they do. A per-file
+    // detector would have missed a machine failing on two surfaces at once.
+    let dir = tempDir("splitBurst"); defer { try? FileManager.default.removeItem(at: dir) }
+    let clock = ClockBox(Date(timeIntervalSince1970: 1_700_000_000))
+    let collector = ProposalCollector()
+    let hook = makeHook(dir: dir, clock: clock, llm: DiagLLM(), collector: collector)
+    writeDoctor(dir, statuses: ["ok"])
+    let ts = SelfHealingHook.isoString(clock.now)
+    let half = SelfHealingHook.errorBurstThreshold / 2
+    writeFeed(dir, relative: "slack/errors.jsonl",
+              rows: (0..<half).map { "{\"at\":\"\(ts)\",\"error\":\"socket \($0)\"}" })
+    writeFeed(dir, relative: "logs/background_loop_failures.jsonl",
+              rows: (0..<(SelfHealingHook.errorBurstThreshold - half)).map {
+                  "{\"createdAt\":\"\(ts)\",\"loopId\":\"telegram_poll\",\"error\":\"502 \($0)\"}"
+              })
+
+    await hook.tick()
+
+    #expect(collector.items.count == 1)
+    let evidence = collector.items.first?.evidence ?? ""
+    #expect(evidence.contains("[slack]"))
+    #expect(evidence.contains("[loops]"))
+}
+
+@Test func selfHeal_deadFeed_is_no_signal_never_clean() async {
+    // A feed full of rows that nobody has WRITTEN in three months. Its rows are
+    // not current, and its emptiness-of-recent-rows is not health.
+    let dir = tempDir("deadFeed"); defer { try? FileManager.default.removeItem(at: dir) }
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    let ts = SelfHealingHook.isoString(now)
+    writeFeed(dir, relative: "logs/errors.jsonl",
+              rows: (0..<(SelfHealingHook.errorBurstThreshold + 5)).map {
+                  "{\"ts\":\"\(ts)\",\"msg\":\"stale row \($0)\"}"
+              },
+              modified: now.addingTimeInterval(-90 * 24 * 60 * 60))
+
+    let statuses = SelfHealingHook.scanErrorFeeds(dataRoot: dir, now: now)
+    guard let legacy = statuses.first(where: { $0.feed.label == "legacy" }) else {
+        Issue.record("legacy feed missing from the watch list")
+        return
+    }
+    #expect(legacy.silent)
+    #expect(legacy.recentCount == 0)   // a dead file's rows are never "current"
+    #expect(legacy.summary(now: now).contains("no signal"))
+    #expect(!legacy.summary(now: now).contains("0 row(s)"))
+    // Every other feed is absent → also no signal, never "clean".
+    #expect(statuses.allSatisfy { $0.silent })
+    #expect(statuses.first(where: { $0.feed.label == "telegram" })?
+        .summary(now: now).contains("never written") == true)
+
+    // And it does not manufacture a burst.
+    let clock = ClockBox(now)
+    let collector = ProposalCollector()
+    let llm = DiagLLM()
+    let hook = makeHook(dir: dir, clock: clock, llm: llm, collector: collector)
+    writeDoctor(dir, statuses: ["ok"])
+    await hook.tick()
+    #expect(collector.items.isEmpty)
+    #expect(llm.calls == 0)
+}
+
+@Test func selfHeal_liveButQuietFeed_reports_a_row_count_not_no_signal() async {
+    let dir = tempDir("quietLive"); defer { try? FileManager.default.removeItem(at: dir) }
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+    // Written just now, but with only old rows in it: a working feed with
+    // nothing recent to say. That IS evidence of health.
+    let old = SelfHealingHook.isoString(now.addingTimeInterval(-3 * 60 * 60))
+    writeFeed(dir, relative: "telegram/errors.jsonl",
+              rows: ["{\"at\":\"\(old)\",\"error\":\"an hour-old blip\"}"])
+
+    let statuses = SelfHealingHook.scanErrorFeeds(dataRoot: dir, now: now)
+    let telegram = statuses.first { $0.feed.label == "telegram" }
+    #expect(telegram?.silent == false)
+    #expect(telegram?.recentCount == 0)
+    #expect(telegram?.summary(now: now) == "0 row(s)")
+}
+
 @Test func selfHeal_redactSecrets_patterns() {
     let cases = [
         "Authorization: Bearer abcdef1234567890",
@@ -417,4 +547,61 @@ private func makeHook(
         let out = SelfHealingHook.redactSecrets(c)
         #expect(out.contains("[REDACTED]"), "expected redaction in: \(c) → \(out)")
     }
+}
+
+
+// MARK: - Doctor-only rows never drive an unattended decision
+//
+// 2026-09-02 live incident: two new Doctor rows (`prompt_prefix_health`,
+// `subconscious_vitals`) grade a measurement window and went red on pre-fix
+// history. The heartbeat pushed an alert about them; this hook would have
+// filed an evolution proposal about them. Filing a proposal is an unattended
+// decision, so the same exclusion applies here — the rows stay fully visible
+// in the Doctor UI and are invisible to every robot.
+
+@Test func selfHeal_doctorOnlyFailingRow_neverFlipsTheVerdict() async {
+    let dir = tempDir("doctoronly"); defer { try? FileManager.default.removeItem(at: dir) }
+    let clock = ClockBox(Date(timeIntervalSince1970: 1_700_000_000))
+    let collector = ProposalCollector()
+    let hook = makeHook(dir: dir, clock: clock, llm: DiagLLM(), collector: collector)
+
+    // Baseline: everything green.
+    writeDoctorRows(dir, rows: [("storage", "ok"), ("memory_store", "ok")])
+    await hook.tick()
+    #expect(collector.items.isEmpty)
+
+    // Both Doctor-only rows go red. This is the exact snapshot that woke User.
+    writeDoctorRows(dir, rows: [
+        ("storage", "ok"),
+        ("memory_store", "ok"),
+        ("prompt_prefix_health", "fail"),
+        ("subconscious_vitals", "fail"),
+    ])
+    await hook.tick()
+    // No transition, because neither row is one this hook may judge.
+    #expect(collector.items.isEmpty)
+    #expect(hook.loadDoctorSnapshot()?.healthy == true)
+
+    // A REAL check failing still fires — the filter narrows what is judged,
+    // it does not switch the detector off.
+    writeDoctorRows(dir, rows: [
+        ("storage", "fail"),
+        ("prompt_prefix_health", "fail"),
+    ])
+    await hook.tick()
+    #expect(collector.items.count == 1)
+    #expect(collector.items.first?.title.contains("Doctor failure") == true)
+}
+
+@Test func selfHeal_snapshotOfOnlyDoctorOnlyRows_isUnavailableNotHealthy() {
+    let dir = tempDir("allexcluded"); defer { try? FileManager.default.removeItem(at: dir) }
+    let hook = makeHook(dir: dir, clock: ClockBox(Date(timeIntervalSince1970: 1_700_000_000)),
+                        llm: DiagLLM(), collector: ProposalCollector())
+    writeDoctorRows(dir, rows: [
+        ("prompt_prefix_health", "fail"),
+        ("subconscious_vitals", "warn"),
+    ])
+    // Nothing judgeable was observed. That is UNKNOWN, never a clean bill of
+    // health — the same rule the malformed-snapshot branch follows.
+    #expect(hook.loadDoctorSnapshot() == nil)
 }

@@ -91,7 +91,12 @@ struct AppChatReportOnlyTruthSeamsTests {
         #expect(ToolPillPresentation.outcome(ok: nil) == .pending)
         #expect(ToolPillPresentation.outcome(ok: true) == .succeeded)
         #expect(ToolPillPresentation.outcome(ok: false) == .failed)
-        #expect(ToolPillPresentation.durationText(nil) == "unknown duration")
+        // 2026-09-06: an absent duration renders NOTHING, not the words
+        // "unknown duration" (ui-simplify 2026-09-02, ChatMessageListView.swift
+        // :177). The contract this test guards is unchanged: absence must stay
+        // distinguishable from a measured zero, which still prints "0ms".
+        #expect(ToolPillPresentation.durationText(nil) == "")
+        #expect(ToolPillPresentation.durationText(nil) != ToolPillPresentation.durationText(0))
         #expect(ToolPillPresentation.durationText(0) == "0ms")
         #expect(ToolPillPresentation.durationText(19) == "19ms")
     }

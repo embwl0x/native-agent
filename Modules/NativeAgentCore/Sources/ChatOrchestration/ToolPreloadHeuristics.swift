@@ -795,12 +795,12 @@ public enum ToolPreloadHeuristics {
 
     // MARK: Orchestration (turn-scoped union + one trace row, match turns only)
 
-    /// Returns the active set to feed applyLazyToolFilter: unchanged on
-    /// no-match, `activeTools ∪ preloaded` on a confident match. This is
-    /// intentionally request-scoped: callers bind the returned set through
-    /// `LLMCallContext.turnActiveTools` so first-call schemas and dispatch
-    /// agree without growing `ActiveToolsStore`. Explicit `tool_load` remains
-    /// the only durable session load path.
+    /// Returns the DISPATCH set: unchanged on no-match, `activeTools ∪
+    /// preloaded` on a confident match. Callers bind it through
+    /// `LLMCallContext.turnActiveTools`. Prefer `preloadOutcome` on a turn-start
+    /// path — it additionally reports which names should be promoted into the
+    /// session load order so the preload is ADVERTISED, not merely
+    /// dispatchable.
     public static func preloadIfConfident(
         userMessage: String,
         sessionId: String,
@@ -823,6 +823,81 @@ public enum ToolPreloadHeuristics {
         )
     }
 
+    /// The two halves of a turn's preload, kept apart because they decay
+    /// differently.
+    ///
+    /// `activeTools` is the union that authorizes DISPATCH for this turn.
+    ///
+    /// `promotable` is the CONFIDENT ROUTE PREDICTION only — the part that
+    /// varies with what the user just said. It is promoted into the session
+    /// load order at turn start (`ActiveToolsStore.commitTurnStartContract`) so
+    /// it is ADVERTISED in the appended run: docs/ANATOMY_OF_A_TURN.md §3
+    /// promises a GitHub URL prepares the GitHub read tools with no discovery
+    /// round, and that only holds if the schemas are in the prefix the model
+    /// is about to read. Once promoted it is byte-stable like any other loaded
+    /// tool, and the 2-idle-turn rule retires it when she is done with it.
+    ///
+    /// The Full-Mac resident family is deliberately NOT promotable: it is ~30
+    /// names derived purely from the catalog and the Trust Center posture, so
+    /// it is already identical turn to turn and needs no session row. Writing
+    /// it into the store would consume the whole persisted budget and starve
+    /// real loads. `applyLazyToolFilter` advertises it from the catalog.
+    public struct PreloadOutcome: Sendable, Equatable {
+        public let activeTools: Set<String>
+        public let promotable: Set<String>
+
+        public init(activeTools: Set<String>, promotable: Set<String>) {
+            self.activeTools = activeTools
+            self.promotable = promotable
+        }
+    }
+
+    public static func preloadOutcome(
+        prediction: Prediction?,
+        sessionId: String,
+        activeTools: Set<String>,
+        availableToolNames: Set<String>,
+        surface: String,
+        store: ActiveToolsStore = .shared,
+        permissions: MacIntegrationPermissionStore = .shared,
+        dataRoot: URL
+    ) async -> PreloadOutcome {
+        // Full Mac YOLO means native operator tools are resident immediately,
+        // not hidden behind a model-decided tool_catalog/tool_load detour.
+        // This union is request-scoped and deliberately does not grow the
+        // session store or add an I/O trace on every Full-Mac turn.
+        let immediatelyReady = immediateFullMacTools(
+            availableToolNames: availableToolNames
+        )
+        let effectiveActiveTools = activeTools.union(immediatelyReady)
+        guard let prediction else {
+            return PreloadOutcome(activeTools: effectiveActiveTools, promotable: [])
+        }
+        let catalogGated = preloadableNames(
+            prediction: prediction,
+            availableToolNames: availableToolNames,
+            alreadyActive: effectiveActiveTools
+        )
+        // Dispatch-gate mirror: Mac Integration policy denials drop out here
+        // so a policy-denied tool is never preloaded (see header invariant).
+        let names = await filterByMacIntegrationPolicy(catalogGated, permissions: permissions)
+        guard !names.isEmpty else {
+            return PreloadOutcome(activeTools: effectiveActiveTools, promotable: [])
+        }
+        _ = store
+        _ = sessionId
+        await appendPreloadTraceRow(
+            prediction: prediction,
+            tools: names,
+            surface: surface,
+            dataRoot: dataRoot
+        )
+        return PreloadOutcome(
+            activeTools: effectiveActiveTools.union(names),
+            promotable: names
+        )
+    }
+
     public static func preloadIfConfident(
         prediction: Prediction?,
         sessionId: String,
@@ -833,33 +908,16 @@ public enum ToolPreloadHeuristics {
         permissions: MacIntegrationPermissionStore = .shared,
         dataRoot: URL
     ) async -> Set<String> {
-        // Full Mac YOLO means native operator tools are resident immediately,
-        // not hidden behind a model-decided tool_catalog/tool_load detour.
-        // This union is request-scoped and deliberately does not grow the
-        // session store or add an I/O trace on every Full-Mac turn.
-        let immediatelyReady = immediateFullMacTools(
-            availableToolNames: availableToolNames
-        )
-        let effectiveActiveTools = activeTools.union(immediatelyReady)
-        guard let prediction else { return effectiveActiveTools }
-        let catalogGated = preloadableNames(
+        await preloadOutcome(
             prediction: prediction,
+            sessionId: sessionId,
+            activeTools: activeTools,
             availableToolNames: availableToolNames,
-            alreadyActive: effectiveActiveTools
-        )
-        // Dispatch-gate mirror: Mac Integration policy denials drop out here
-        // so a policy-denied tool is never preloaded (see header invariant).
-        let names = await filterByMacIntegrationPolicy(catalogGated, permissions: permissions)
-        guard !names.isEmpty else { return effectiveActiveTools }
-        _ = store
-        _ = sessionId
-        await appendPreloadTraceRow(
-            prediction: prediction,
-            tools: names,
             surface: surface,
+            store: store,
+            permissions: permissions,
             dataRoot: dataRoot
-        )
-        return effectiveActiveTools.union(names)
+        ).activeTools
     }
 
     // MARK: - Helpers

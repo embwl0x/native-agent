@@ -154,6 +154,13 @@ public struct TelegramAPIResponse: Sendable, Codable, Equatable {
     }
 }
 
+/// 2026-09-06: the `getMe` result, for one field only — this bot's username,
+/// so a slash command addressed to a DIFFERENT bot in a group is ignored
+/// instead of executed here.
+public struct TelegramAPIBotIdentity: Sendable, Codable, Equatable {
+    public let username: String
+}
+
 public struct TelegramAPIMessageResult: Sendable, Codable, Equatable {
     public let messageId: Int
 
@@ -305,6 +312,18 @@ func _tgNowString(_ date: Date = Date()) -> String {
     return formatter.string(from: date)
 }
 
+/// 2026-09-06: the inverse of `_tgNowString`, for state stamps that expire.
+/// Accepts the fractional-seconds form this file writes and the plain one.
+func _tgParseDate(_ value: String?) -> Date? {
+    guard let value, !value.isEmpty else { return nil }
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) { return date }
+    let plain = ISO8601DateFormatter()
+    plain.formatOptions = [.withInternetDateTime]
+    return plain.date(from: value)
+}
+
 func _tgPreview(_ text: String?, limit: Int = 240) -> String? {
     guard let text else { return nil }
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -421,6 +440,39 @@ public enum TelegramReplyPromptRenderer {
     }
 }
 
+/// 2026-09-06: a chat plus, when the message lives in a forum topic, that
+/// topic's thread. Telegram forum topics are separate conversations: the
+/// session key is this pair, and every outbound call for a turn answers into
+/// the topic the inbound arrived in. `threadId` is nil for DMs, ordinary
+/// groups, and a forum's General topic — all of which Telegram addresses with
+/// `chat_id` alone.
+public struct TelegramDestination: Sendable, Hashable {
+    public var chatId: Int
+    public var threadId: Int?
+
+    public init(chatId: Int, threadId: Int? = nil) {
+        self.chatId = chatId
+        self.threadId = threadId
+    }
+
+    /// The chat-only destination. Used where there is genuinely no topic to
+    /// answer into: a recovered legacy claim, a config-driven send, a tool
+    /// route that carried no thread.
+    public static func chat(_ chatId: Int) -> TelegramDestination {
+        TelegramDestination(chatId: chatId)
+    }
+
+    /// The forum topic a raw Telegram `Message` object belongs to, or nil.
+    /// Same rule as `TelegramMessage`: `message_thread_id` only counts when
+    /// `is_topic_message` says this really is a topic message. Callback
+    /// queries carry the button's message, so their buttons answer in place.
+    public static func topicThreadId(inMessageObject obj: [String: JSONValue]?) -> Int? {
+        guard let obj else { return nil }
+        guard case .bool(true)? = obj["is_topic_message"] else { return nil }
+        return _tgExtractInt(obj, "message_thread_id")
+    }
+}
+
 public struct TelegramMessage: Sendable, Codable, Equatable {
     public var messageId: Int
     public var chatId: Int
@@ -429,6 +481,11 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
     /// "private" — an allowlisted group chat must never widen who can fire
     /// them. nil for legacy/synthetic shapes that never carried it.
     public var chatType: String?
+    /// 2026-09-06: `message_thread_id`, kept ONLY when the wire also said
+    /// `is_topic_message`. A linked-discussion comment thread carries a
+    /// message_thread_id too, and treating that as a separate conversation
+    /// would split a group that works today.
+    public var messageThreadId: Int?
     public var fromUserId: Int?
     public var text: String?
     public var replyTo: TelegramReplyContext?
@@ -439,6 +496,7 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
         messageId: Int,
         chatId: Int,
         chatType: String? = nil,
+        messageThreadId: Int? = nil,
         fromUserId: Int? = nil,
         text: String? = nil,
         replyTo: TelegramReplyContext? = nil,
@@ -448,6 +506,7 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
         self.messageId = messageId
         self.chatId = chatId
         self.chatType = chatType
+        self.messageThreadId = messageThreadId
         self.fromUserId = fromUserId
         self.text = text
         self.replyTo = replyTo
@@ -455,9 +514,15 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
         self.extras = extras
     }
 
+    /// Where a reply to this message must go.
+    public var destination: TelegramDestination {
+        TelegramDestination(chatId: chatId, threadId: messageThreadId)
+    }
+
     private static let knownKeys: Set<String> = [
         "message_id", "messageId",
         "chat", "chatId", "chatType",
+        "message_thread_id", "messageThreadId", "is_topic_message",
         "from", "fromUserId",
         "text", "reply_to_message", "replyTo",
         "date", "extras",
@@ -495,6 +560,18 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
                 return t
             }()
         }
+        // Forum topic. The wire form only counts when `is_topic_message` says
+        // this really is a topic message; the Swift-encoded round-trip carries
+        // the already-decided value under its own key.
+        if let wireThread = int("message_thread_id") {
+            let isTopic: Bool = {
+                guard let v = jv("is_topic_message"), case .bool(let b) = v else { return false }
+                return b
+            }()
+            self.messageThreadId = isTopic ? wireThread : nil
+        } else {
+            self.messageThreadId = int("messageThreadId")
+        }
         if let from = jv("from"), case .object(let obj) = from {
             self.fromUserId = _tgExtractInt(obj, "id")
         } else {
@@ -525,6 +602,7 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
         try c.encode(messageId, forKey: _TGAnyKey("messageId"))
         try c.encode(chatId, forKey: _TGAnyKey("chatId"))
         try c.encodeIfPresent(chatType, forKey: _TGAnyKey("chatType"))
+        try c.encodeIfPresent(messageThreadId, forKey: _TGAnyKey("messageThreadId"))
         try c.encodeIfPresent(fromUserId, forKey: _TGAnyKey("fromUserId"))
         try c.encodeIfPresent(text, forKey: _TGAnyKey("text"))
         try c.encodeIfPresent(replyTo, forKey: _TGAnyKey("replyTo"))

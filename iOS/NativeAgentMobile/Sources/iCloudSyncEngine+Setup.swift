@@ -24,6 +24,12 @@ extension iCloudSyncEngine {
         static let transactions = "transactions/ios"
     }
 
+    // 2026-09-06: the ephemeral-mailbox retention window and how often the
+    // prune is allowed to run. See `pruneEphemeralDirectoriesIfDue`.
+    static var ephemeralRetentionSeconds: TimeInterval { 14 * 24 * 60 * 60 }
+    static var ephemeralPruneIntervalSeconds: TimeInterval { 24 * 60 * 60 }
+    static var ephemeralPruneStampKey: String { "NativeAgentMobile.ephemeralPrunedAt" }
+
     // MARK: - Setup (called after iCloudBridge.setup() completes)
 
     func setup(docsURL: URL) {
@@ -61,10 +67,126 @@ extension iCloudSyncEngine {
             kvs.synchronize()
         }
 
+        pruneEphemeralDirectoriesIfDue()
+
         // Initial load stays light. Heavy/tab-specific snapshots are loaded
         // by the visible tab on demand so launch cannot hydrate every chat
         // transcript or memory payload into iPhone RAM.
         Task { await refreshLightweightSnapshots() }
+    }
+
+    /// 2026-09-06: `responses/` and `transactions/` are ephemeral mailboxes —
+    /// a response is read once by the poll parked on it, a transaction row
+    /// records one action that has already finished — and NOTHING ever deleted
+    /// from either, so both grew for the life of the install. Prune what is
+    /// past the retention window at setup, and at most once a day after that.
+    ///
+    /// 2026-09-06 (second pass): age alone was the wrong test. A response the
+    /// poll had not read yet, and a transaction still `queued`/`sent`/
+    /// `pending_approval`, were deleted purely for being old — the phone lost
+    /// the answer it was parked on and the ledger row that says an action is
+    /// still outstanding. Only TERMINAL transactions and CONSUMED responses go
+    /// now: a response counts as consumed when a terminal transaction names it
+    /// (by `msgId`, or by id for rows written before that field existed).
+    ///
+    /// Off the main actor, best effort: a file that will not stat or will not
+    /// delete is left alone, and every removal re-stats first so a fresh file
+    /// written into the same name between the scan and the unlink is not
+    /// deleted in place of the old one. Snapshots and the inbox are untouched —
+    /// those are live state with owners of their own.
+    func pruneEphemeralDirectoriesIfDue(force: Bool = false) {
+        let defaults = UserDefaults.standard
+        let now = Date().timeIntervalSince1970
+        let last = defaults.double(forKey: Self.ephemeralPruneStampKey)
+        guard force || last <= 0 || now - last >= Self.ephemeralPruneIntervalSeconds else { return }
+        let responses = responsesDir
+        let transactions = transactionDir
+        guard responses != nil || transactions != nil else { return }
+        defaults.set(now, forKey: Self.ephemeralPruneStampKey)
+        let cutoff = Date(timeIntervalSince1970: now - Self.ephemeralRetentionSeconds)
+        Task.detached(priority: .utility) {
+            // Read the ledger BEFORE deleting anything from it: a response is
+            // only prunable because some terminal row says it was answered.
+            var terminalTransactions: [URL] = []
+            var consumedResponseIDs = Set<String>()
+            var ledgeredResponseIDs = Set<String>()
+            if let transactions {
+                for file in Self.prunableFiles(in: transactions) {
+                    guard let data = try? Data(contentsOf: file),
+                          let record = try? JSONDecoder().decode(
+                              ICloudTransactionRecord.self, from: data
+                          ) else { continue }
+                    ledgeredResponseIDs.insert(record.msgId ?? record.id)
+                    ledgeredResponseIDs.insert(record.id)
+                    guard Self.isTerminalTransactionState(record.state) else { continue }
+                    terminalTransactions.append(file)
+                    consumedResponseIDs.insert(record.msgId ?? record.id)
+                    consumedResponseIDs.insert(record.id)
+                }
+            }
+            if let responses {
+                for file in Self.prunableFiles(in: responses) {
+                    let id = file.deletingPathExtension().lastPathComponent
+                    // Consumed, or so old its terminal transaction was itself
+                    // reaped by an earlier pass — every send writes a `queued`
+                    // row before the response can exist, so a response with no
+                    // ledger row at all is one whose row has already gone.
+                    // Anything still ledgered non-terminally is left alone.
+                    guard consumedResponseIDs.contains(id)
+                            || !ledgeredResponseIDs.contains(id) else { continue }
+                    Self.removeIfUnchanged(file, olderThan: cutoff)
+                }
+            }
+            for file in terminalTransactions {
+                Self.removeIfUnchanged(file, olderThan: cutoff)
+            }
+        }
+    }
+
+    /// Every regular file directly inside `directory`. Never recurses, never
+    /// throws: an unreadable directory prunes nothing.
+    private nonisolated static func prunableFiles(in directory: URL) -> [URL] {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return files.filter { url in
+            (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true
+        }
+    }
+
+    /// The states after which nothing more will happen to a transaction. A row
+    /// in any other state (`queued`, `sent`, `pending_approval`) is still
+    /// outstanding and is never pruned, however old it is.
+    nonisolated static func isTerminalTransactionState(_ state: String) -> Bool {
+        ["completed", "failed", "send_failed", "cancelled", "orphaned"]
+            .contains(state.lowercased())
+    }
+
+    /// Delete `url` only if it is older than `cutoff` AND is still the same
+    /// file it was when that was measured — same inode, same modification date,
+    /// same size. A replacement written into the same name between the two
+    /// stats survives.
+    private nonisolated static func removeIfUnchanged(_ url: URL, olderThan cutoff: Date) {
+        guard let before = Self.fileIdentity(url),
+              before.modified < cutoff,
+              Self.fileIdentity(url) == before else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private struct EphemeralFileIdentity: Equatable {
+        let inode: UInt64
+        let modified: Date
+        let size: Int64
+    }
+
+    private nonisolated static func fileIdentity(_ url: URL) -> EphemeralFileIdentity? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+              let modified = attributes[.modificationDate] as? Date,
+              let size = (attributes[.size] as? NSNumber)?.int64Value else { return nil }
+        return EphemeralFileIdentity(inode: inode, modified: modified, size: size)
     }
 
     func tearDown() {
@@ -72,6 +194,7 @@ extension iCloudSyncEngine {
         snapshotRefreshGeneration &+= 1
         targetedRefreshGeneration &+= 1
         chatTranscriptsRefreshGeneration &+= 1
+        chatSessionListRefreshGeneration &+= 1
         NotificationCenter.default.removeObserver(self)
         snapshotDir = nil
         inboxDir = nil
@@ -91,6 +214,7 @@ extension iCloudSyncEngine {
         snapshotRefreshGeneration &+= 1
         targetedRefreshGeneration &+= 1
         chatTranscriptsRefreshGeneration &+= 1
+        chatSessionListRefreshGeneration &+= 1
         refreshInFlight = false
         refreshQueued = false
         prefersCloudKitSnapshotCache = true
@@ -114,13 +238,21 @@ extension iCloudSyncEngine {
         responsesDir = responses
         transactionDir = transactions
         isSetUp = true
+        pruneEphemeralDirectoriesIfDue()
         Task { await refreshLightweightSnapshots() }
     }
 
+    /// 2026-09-06: returns whether the delivery was durably applied. The
+    /// transport claims the peer's generation only on `true`; a failure — an
+    /// undecodable payload, a write that could not land — now leaves the record
+    /// eligible for the next drain instead of being marked seen and lost.
+    /// A teardown between the decode and the write is not a failure to retry:
+    /// the engine that would have used the files no longer exists.
+    @discardableResult
     func applyCloudKitSnapshotStatus(
         _ value: String,
         group: NAMobileSnapshotGroup
-    ) async {
+    ) async -> Bool {
         let generation = lifecycleGeneration
         do {
             let files = try NAMobileSnapshotStatusCodec.decode(
@@ -138,15 +270,17 @@ extension iCloudSyncEngine {
                     )
                 }
             }.value
-            guard generation == lifecycleGeneration else { return }
+            guard generation == lifecycleGeneration else { return true }
             prefersCloudKitSnapshotCache = true
             snapshotDir = directory
             await refreshSnapshotGroup(group)
-            guard generation == lifecycleGeneration else { return }
+            guard generation == lifecycleGeneration else { return true }
             lastSyncAt = Date()
             syncError = nil
+            return true
         } catch {
             syncError = "CloudKit \(group.rawValue) snapshot failed: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -193,6 +327,9 @@ extension iCloudSyncEngine {
     }
 
     func refreshSnapshotGroup(_ group: NAMobileSnapshotGroup) async {
+        // Every group refresh re-reads the Mac's staleness marker: the group
+        // that went stale is often NOT the group being refreshed.
+        await refreshSnapshotStaleness()
         switch group {
         case .core:
             await refreshLightweightSnapshots()

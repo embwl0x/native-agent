@@ -27,9 +27,22 @@ import PersistenceCore
 /// session receipt. One collector per session (the profile is built per run).
 public actor WorkshopArtifactCollector {
     private var paths: [String] = []
+    private var closed = false
     public init() {}
-    func record(_ path: String) { paths.append(path) }
+    func record(_ path: String) { guard !closed else { return }; paths.append(path) }
     public func written() -> [String] { paths }
+    func isOpen() -> Bool { !closed }
+    /// User, 2026-09-06: seal the session's artifact set and hand back what it
+    /// wrote, in one hop. The deadline racer cancels the turn but cannot stop
+    /// a detached executor that ignores cancellation, so an uncancelled tool
+    /// loop kept writing artifacts after the terminal receipt was built and
+    /// saved — the receipt's `artifactPaths` then described a folder that had
+    /// since grown. Once closed, `workshop_artifact_write` is refused, so the
+    /// receipt stays the truth about what the session produced.
+    public func close() -> [String] {
+        closed = true
+        return paths
+    }
 }
 
 public actor WorkshopProgressCollector {
@@ -86,8 +99,10 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         "read_file", "list_dir",
         // memory / knowledge READS
         "recall_memory", "recall_search", "search_kg", "context_lookup",
-        // prior-conversation READS
-        "search_chat_history", "session_search",
+        // prior-conversation READS. 2026-09-06: read_chat_message pages one
+        // already-found message whole — the same reach as the search that
+        // returns its id and a 368-character preview.
+        "search_chat_history", "session_search", "read_chat_message",
         // bounded skill reads / introspection. Generic tool discovery is
         // intentionally absent: tool_catalog/list_tools describe the inner
         // dispatcher's full surface and are not a workshop capability.
@@ -219,6 +234,11 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         guard case .string(let content)? = input["content"] else {
             throw WorkshopMembraneError.badArtifactArgs("'content' (string) is required")
         }
+        // User, 2026-09-06: the session's receipt is already written once the
+        // deadline passes; a write accepted after that would not be on it.
+        guard await collector.isOpen() else {
+            throw WorkshopMembraneError.sessionClosed
+        }
         let written = try artifactWriter.write(relativePath: rawPath, content: content)
         await collector.record(written.relativePath)
         return .object([
@@ -260,9 +280,13 @@ public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
     case badArtifactArgs(String)
     case pathEscapesRoot(String)
     case unsafeComponent(String)
+    case sessionClosed
 
     public var errorDescription: String? {
         switch self {
+        case .sessionClosed:
+            return "this Desk work session has ended (its deadline passed and its receipt is "
+                + "already filed) — no further artifact writes are accepted."
         case .toolNotPermitted(let tool):
             return "tool '\(tool)' is not permitted in a Desk work session "
                 + "(allowlist: \(WorkshopToolProfile.allowed.sorted().joined(separator: ", ")), "

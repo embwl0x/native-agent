@@ -218,16 +218,15 @@ public enum TelegramTurnPresentationRenderer {
             stalledAfter: stalledAfter
         )
 
-        var lines = [
-            "\(title(for: phase)) · elapsed \(duration(elapsed)) · moved \(duration(sinceMovement)) ago"
-        ]
-        if let action = state.currentAction {
-            lines.append("Action: \(action)")
+        var line = sentence(
+            phase: phase,
+            action: state.currentAction,
+            delegate: state.delegateName
+        )
+        if !phase.isTerminal {
+            line += " (\(duration(elapsed)) so far)"
         }
-        if let delegate = state.delegateName {
-            lines.append("Delegate: \(delegate)")
-        }
-        return lines.joined(separator: "\n")
+        return line
     }
 
     /// A bounded, presentation-only expansion for the same work card. It uses
@@ -247,34 +246,64 @@ public enum TelegramTurnPresentationRenderer {
             stalledAfter: stalledAfter
         )
         var lines = [
-            "Work details",
-            "Phase: \(title(for: phase))",
-            "Elapsed: \(duration(elapsed))",
-            "Last movement: \(duration(sinceMovement)) ago",
+            sentence(
+                phase: phase,
+                action: state.currentAction,
+                delegate: state.delegateName
+            )
         ]
-        if let action = state.currentAction {
-            lines.append("Current action: \(action)")
+        lines.append("Started \(duration(elapsed)) ago; last update \(duration(sinceMovement)) back.")
+        if let action = state.currentAction, !lines[0].contains(action) {
+            lines.append("Right now: \(action)")
         }
-        if let delegate = state.delegateName {
-            lines.append("Delegate: \(delegate)")
+        if let delegate = state.delegateName, !lines[0].contains(delegate) {
+            lines.append("Handed to \(delegate).")
         }
         return lines.joined(separator: "\n")
     }
 
-    private static func title(for phase: TelegramTurnPresentationPhase) -> String {
+    /// What she is doing, in words. The phase enum stays exactly as it is —
+    /// receipts, the card ledger and telemetry still read it — but User never
+    /// sees a state-machine label, because a label makes him translate
+    /// machinery into meaning every time he glances at the card.
+    private static func sentence(
+        phase: TelegramTurnPresentationPhase,
+        action: String?,
+        delegate: String?
+    ) -> String {
+        let detail = action.flatMap { text -> String? in
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
         switch phase {
-        case .acknowledged: return "Acknowledged"
-        case .working: return "Working"
-        case .tool: return "Using tool"
-        case .delegation: return "Delegated work"
-        case .retrying: return "Retrying"
-        case .waiting: return "Waiting"
-        case .blocked: return "Blocked"
-        case .stalled: return "Stalled"
-        case .completed: return "Completed"
-        case .failed: return "Failed"
-        case .canceled: return "Canceled"
-        case .outcomeUnknown: return "Outcome unknown"
+        case .acknowledged:
+            return "Got your message, starting now."
+        case .working, .tool:
+            return detail ?? "Still on it."
+        case .delegation:
+            guard let delegate else { return detail ?? "Handing part of this off." }
+            if let detail { return "\(delegate) is on it: \(detail)" }
+            return "\(delegate) is on part of this."
+        case .retrying:
+            return detail.map { "That hiccuped, trying again: \($0)" }
+                ?? "That hiccuped, trying again."
+        case .waiting:
+            return detail ?? "Waiting on something before I can carry on."
+        case .blocked:
+            return detail.map { "Waiting on an approval from you: \($0)" }
+                ?? "Waiting on an approval from you."
+        case .stalled:
+            return detail.map { "Still on it, but it's been quiet: \($0)" }
+                ?? "Still on it, but it's been quiet for a while."
+        case .completed:
+            return "Done."
+        case .failed:
+            return detail.map { "That didn't work: \($0)" } ?? "That didn't work."
+        case .canceled:
+            return "Stopped."
+        case .outcomeUnknown:
+            return detail.map { "I can't tell how that ended: \($0)" }
+                ?? "I can't tell how that ended."
         }
     }
 

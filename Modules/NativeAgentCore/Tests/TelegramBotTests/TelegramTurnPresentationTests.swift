@@ -233,8 +233,8 @@ struct TelegramTurnPresentationTests {
             at: time(91),
             stalledAfter: 90
         )
-        #expect(before.hasPrefix("Working ·"))
-        #expect(atThreshold.hasPrefix("Stalled ·"))
+        #expect(before == "Thinking (1m 30s so far)")
+        #expect(atThreshold == "Still on it, but it's been quiet: Thinking (1m 31s so far)")
         #expect(working.phase == .working)
 
         let waiting = TelegramTurnPresentationReducer.reduce(
@@ -246,7 +246,7 @@ struct TelegramTurnPresentationTests {
             waiting,
             at: time(1_000),
             stalledAfter: 90
-        ).hasPrefix("Waiting ·"))
+        ).hasPrefix("Waiting for approval"))
     }
 
     @Test func renderingIsDeterministicAndTerminalElapsedFreezes() {
@@ -256,11 +256,7 @@ struct TelegramTurnPresentationTests {
             lifecycle: .delegation(delegate: "Codex", action: "Reviewing tests"),
             at: time(65)
         )
-        let expected = """
-        Delegated work · elapsed 2m 5s · moved 1m 0s ago
-        Action: Reviewing tests
-        Delegate: Codex
-        """
+        let expected = "Codex is on it: Reviewing tests (2m 5s so far)"
         let first = TelegramTurnPresentationRenderer.render(
             delegated,
             at: time(125),
@@ -280,7 +276,7 @@ struct TelegramTurnPresentationTests {
             at: time(130)
         )
         let later = TelegramTurnPresentationRenderer.render(completed, at: time(190))
-        #expect(later.hasPrefix("Completed · elapsed 2m 10s · moved 1m 0s ago"))
+        #expect(later == "Done.")
     }
 
     private func time(_ seconds: TimeInterval) -> Date {

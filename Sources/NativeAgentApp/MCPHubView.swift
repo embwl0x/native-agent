@@ -34,31 +34,23 @@ struct MCPHubConsentSection: View {
     }
 
     var body: some View {
-        Section("Consent log") {
+        MCPSection(label: "Consent log") {
             switch presentation {
             case .loading:
-                Text("Loading MCP consent decisions…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                MCPNote("Reading the consent decisions the agent has been given.")
             case .empty:
-                Text("No MCP consent decisions recorded yet.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                MCPNote("No consent decisions yet. Granting a tool records one here.")
             case .unavailable:
-                Label(
-                    "MCP consent ledger is unavailable. Refresh MCP Hub before relying on tool authority.",
-                    systemImage: "exclamationmark.triangle.fill"
+                MCPNote(
+                    "The consent ledger is unavailable. Refresh MCP Hub before relying on tool authority.",
+                    tone: NativeAgentShell.trouble
                 )
-                .font(.caption)
-                .foregroundStyle(.orange)
                 .accessibilityIdentifier("mcp.consent.unavailable")
             case .stale:
-                Label(
-                    "Showing last loaded MCP consent decisions.",
-                    systemImage: "exclamationmark.triangle.fill"
+                MCPNote(
+                    "Showing the last loaded consent decisions.",
+                    tone: NativeAgentShell.trouble
                 )
-                .font(.caption)
-                .foregroundStyle(.orange)
                 .accessibilityIdentifier("mcp.consent.stale")
                 consentRows
             case .available:
@@ -80,61 +72,59 @@ private struct MCPHubConsentRow: View {
     let consent: MCPConsentRecord
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("\(consent.serverId ?? "?") · \(consent.toolName ?? "?")")
-                    .font(.subheadline.weight(.semibold))
-                Spacer()
-                Text(consent.status ?? "unknown")
-                    .font(.caption.weight(.semibold))
+        MCPCard {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(consent.serverId ?? "Unknown server") · \(consent.toolName ?? "Unknown tool")")
+                    .font(ShellType.labelSemibold.monospaced())
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: 8)
+                Text(MCPHubWords.consentStatus(consent.status))
+                    .font(ShellType.captionSemibold)
                     .foregroundStyle(color(consent.status))
             }
             HStack(spacing: 12) {
                 if let granted = consent.grantedAt, !granted.isEmpty {
-                    Label("granted \(granted)", systemImage: "checkmark.seal")
+                    Text("Granted \(granted)")
                 }
                 if let revoked = consent.revokedAt, !revoked.isEmpty {
-                    Label("revoked \(revoked)", systemImage: "xmark.seal")
+                    Text("Revoked \(revoked)")
                 }
                 if let risk = consent.risk, !risk.isEmpty {
-                    Label(risk, systemImage: "exclamationmark.shield")
+                    Text("Risk: \(risk)")
                 }
-                Spacer()
+                Spacer(minLength: 0)
             }
-            .font(.caption)
-            .foregroundStyle(.tertiary)
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.tertiary)
             if (consent.status ?? "") == "granted" {
                 HStack {
-                    Spacer()
+                    Spacer(minLength: 0)
                     Button("Revoke", role: .destructive) {
                         Task { await appModel.revokeMCPConsent(consent) }
                     }
-                    .font(.caption)
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("mcp.consent.revoke.\(consent.id)")
                 }
             }
         }
-        .padding(.vertical, 4)
     }
 
     private func color(_ status: String?) -> Color {
         switch status {
-        case "granted": .green
-        case "revoked": .orange
-        case "denied": .red
-        default: .secondary
+        case "granted": NativeAgentShell.calm
+        case "revoked", "denied": NativeAgentShell.trouble
+        default: NativeAgentShell.tertiary
         }
     }
 }
 
-// MCP server control hub — a sidebar tab that surfaces all connected MCP
-// servers, their tools, the consent log, and the most recent tool call. The
-// backend (AppModel + NativeClient) is fully wired; this view is purely the
-// SwiftUI layer. Style matches ConnectorsView (Sources/NativeAgentApp/
-// ContentView.swift around line 7754) — same List/Section/Label idioms,
-// `.font(.headline / .caption / .caption2)`, `.foregroundStyle(.secondary /
-// .tertiary)`, `.buttonStyle(.bordered)`.
+// MCP server control hub — the page that surfaces all connected MCP servers,
+// their tools, the consent log, and the most recent tool call. The backend
+// (AppModel + NativeClient) is fully wired; this view is purely the SwiftUI
+// layer. Dressed 2026-09-03 in the Advanced page kit: the room's sheet under
+// eyebrow-and-card sections (`MCPSection` / `MCPCard` / `MCPNote` at the foot
+// of this file), type from `ShellType`, colour from `NativeAgentShell`. No
+// List, no Section chrome, no material of its own — the frame owns the room.
 struct MCPHubView: View {
     @Environment(AppModel.self) private var appModel
 
@@ -146,6 +136,8 @@ struct MCPHubView: View {
     @State private var perToolValues: [String: [String: JSONValue]] = [:]
     @State private var expandedTool: Set<String> = []
     @State private var inputValidationErrors: [String: String] = [:]
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     private func valuesKey(for tool: MCPToolRecord) -> String {
         "\(tool.name)|\(schemaFingerprint(tool.inputSchema))"
@@ -176,16 +168,22 @@ struct MCPHubView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            List {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
                 serversSection
                 toolsSection
                 resourcesSection
                 consentSection
                 recentCallSection
             }
+            .padding(.bottom, 32)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            // The new shell's `ShellPageFrame` already insets the column; the
+            // classic shell hands a page the bare pane, so the page keeps its
+            // own margin there.
+            .padding(.horizontal, classicShell ? 20 : 0)
+            .padding(.top, classicShell ? 20 : 0)
         }
-        .padding()
         .navigationTitle("MCP Hub")
         .toolbar {
             Button("Refresh", systemImage: "arrow.clockwise") {
@@ -211,31 +209,23 @@ struct MCPHubView: View {
     // MARK: - Servers
 
     private var serversSection: some View {
-        Section("Servers") {
+        MCPSection(label: "Servers") {
             switch MCPHubCollectionPresentation.resolve(
                 recordCount: appModel.mcpServers.count,
                 endpoint: "mcp servers",
                 refresh: appModel.panelRefreshStatus[.mcp]
             ) {
             case .loading:
-                Label("Loading MCP servers…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                MCPNote("Reading the tool servers the agent can call.")
                     .accessibilityIdentifier("mcp.servers.loading")
             case .unavailable:
-                Label("MCP servers are unavailable. Refresh MCP Hub to retry.", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                MCPNote("The servers are unavailable. Refresh MCP Hub to retry.", tone: NativeAgentShell.trouble)
                     .accessibilityIdentifier("mcp.servers.unavailable")
             case .empty:
-                Text("No MCP servers configured.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                MCPNote("No tool servers yet. A server added to the MCP config appears here.")
                     .accessibilityIdentifier("mcp.servers.empty")
             case .stale:
-                Label("Showing last loaded MCP servers; the latest refresh failed.", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                MCPNote("Showing the last loaded servers; the latest refresh failed.", tone: NativeAgentShell.trouble)
                     .accessibilityIdentifier("mcp.servers.stale")
                 serverRows
             case .available:
@@ -265,45 +255,46 @@ struct MCPHubView: View {
             visibleCount: appModel.mcpResources.count,
             reportedCount: server.resourceCount
         )
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack {
+        return MCPCard(selected: isSelected) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(server.name)
-                    .font(.headline)
-                Spacer()
-                Text(server.healthStatus ?? "unknown")
-                    .font(.caption.weight(.semibold))
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: 8)
+                Text(MCPHubWords.health(server.healthStatus))
+                    .font(ShellType.captionSemibold)
                     .foregroundStyle(healthColor(server.healthStatus))
             }
 
             HStack(spacing: 12) {
-                Label(toolCount.label(noun: "tool"), systemImage: "wrench.and.screwdriver")
+                Text(toolCount.label(noun: "tool"))
                     .help(toolCount.help)
-                Label(resourceCount.label(noun: "resource"), systemImage: "doc.on.doc")
+                Text(resourceCount.label(noun: "resource"))
                     .help(resourceCount.help)
-                Label(server.transport ?? "transport?", systemImage: "bolt.horizontal")
+                Text(server.transport ?? "Transport unknown")
                 if let risk = server.riskClass, !risk.isEmpty {
-                    Label("risk: \(risk)", systemImage: "exclamationmark.shield")
+                    Text("Risk: \(risk)")
                 }
-                Spacer()
+                Spacer(minLength: 0)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.secondary)
 
             if let endpoint = server.endpoint, !endpoint.isEmpty {
                 Text(endpoint)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(ShellType.caption.monospaced())
+                    .foregroundStyle(NativeAgentShell.tertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             } else if let command = server.command, !command.isEmpty {
                 Text(command)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(ShellType.caption.monospaced())
+                    .foregroundStyle(NativeAgentShell.tertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
 
-            HStack {
+            HStack(spacing: 8) {
                 Button("Warm") {
                     Task { await appModel.warmMCPServer(server) }
                 }
@@ -325,22 +316,17 @@ struct MCPHubView: View {
                         }
                     }
                 }
-                Spacer()
+                Spacer(minLength: 0)
                 if let updated = server.updatedAt, !updated.isEmpty {
                     Text(updated)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
             }
-            .font(.caption)
             .buttonStyle(.bordered)
         }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 6)
-        .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .contentShape(Rectangle())
-        .naInteractive(radius: 6)
+        .naInteractive(radius: TodayMetrics.cardRadius)
         .onTapGesture {
             appModel.selectedMCPServerId = server.id
             Task { await appModel.loadMCPDetails(server) }
@@ -353,29 +339,26 @@ struct MCPHubView: View {
         // codepath produced the health row; without this, an "error" state
         // showed as muted secondary instead of red.
         switch status {
-        case "ok": return .green
-        case "fail", "error": return .red
-        case "needs_setup": return .orange
-        default: return .secondary
+        case "ok": return NativeAgentShell.calm
+        case "fail", "error", "needs_setup": return NativeAgentShell.trouble
+        default: return NativeAgentShell.tertiary
         }
     }
 
     // MARK: - Tools
 
     private var toolsSection: some View {
-        Section("Tools — \(appModel.selectedMCPServer?.name ?? "no server selected")") {
+        MCPSection(label: "Tools — \(appModel.selectedMCPServer?.name ?? "no server selected")") {
             let notice = MCPHubInventoryPresentation.notice(
                 state: appModel.mcpToolReadState,
                 selectedServerName: appModel.selectedMCPServer?.name,
                 toolCount: appModel.mcpTools.count
             )
             if !notice.text.isEmpty {
-                Label(
+                MCPNote(
                     notice.text,
-                    systemImage: notice.isFailure ? "exclamationmark.triangle" : "arrow.triangle.2.circlepath"
+                    tone: notice.isFailure ? NativeAgentShell.trouble : NativeAgentShell.secondary
                 )
-                .font(.caption)
-                .foregroundStyle(notice.isFailure ? .orange : .secondary)
                 .accessibilityIdentifier(notice.isFailure ? "mcp.tools.unavailable" : "mcp.tools.empty-or-loading")
             }
             if notice.showsTools {
@@ -388,22 +371,30 @@ struct MCPHubView: View {
 
     private func toolRow(_ tool: MCPToolRecord) -> some View {
         let isExpanded = expandedTool.contains(tool.name)
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top) {
+        return MCPCard {
+            HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(tool.name)
-                        .font(.subheadline.weight(.semibold))
+                        .font(ShellType.labelSemibold.monospaced())
+                        .foregroundStyle(NativeAgentShell.text)
                     if let description = tool.description, !description.isEmpty {
                         Text(description)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                Spacer()
+                Spacer(minLength: 8)
                 Button(isExpanded ? "Hide" : "Edit") {
-                    if isExpanded { expandedTool.remove(tool.name) } else { expandedTool.insert(tool.name) }
+                    withAnimation(
+                        NativeAgentMotion.respecting(
+                            ShellFoldMotion.open,
+                            reduceMotion: reduceMotion
+                        )
+                    ) {
+                        if isExpanded { expandedTool.remove(tool.name) } else { expandedTool.insert(tool.name) }
+                    }
                 }
-                .font(.caption)
                 .buttonStyle(.bordered)
             }
             if isExpanded {
@@ -434,69 +425,63 @@ struct MCPHubView: View {
                         inputValidationErrors.removeValue(forKey: key)
                         Task { await appModel.callMCPToolWithInput(server: server, tool: tool, input: input) }
                     }
-                    .buttonStyle(.borderedProminent)
-                    Spacer()
+                    Spacer(minLength: 0)
                 }
-                .font(.caption)
                 .buttonStyle(.bordered)
                 if let validation = inputValidationErrors[key] {
-                    Label(validation, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
+                    Text(validation)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                         .accessibilityIdentifier("mcp.tool.input.invalid.\(tool.name)")
                 }
             }
         }
-        .padding(.vertical, 4)
         .contentShape(Rectangle())
     }
 
     // MARK: - Resources
 
     private var resourcesSection: some View {
-        Section("Resources — \(appModel.selectedMCPServer?.name ?? "no server selected")") {
+        MCPSection(label: "Resources — \(appModel.selectedMCPServer?.name ?? "no server selected")") {
             switch appModel.mcpResourceReadState {
             case .notLoaded, .loading:
-                Label(MCPHubResourcesPresentation.notice(
+                MCPNote(MCPHubResourcesPresentation.notice(
                     state: appModel.mcpResourceReadState,
                     resourceCount: appModel.mcpResources.count
-                )!.text, systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                )!.text)
             case .unavailable(let detail):
-                Label(MCPHubResourcesPresentation.notice(
+                MCPNote(MCPHubResourcesPresentation.notice(
                     state: .unavailable(detail),
                     resourceCount: appModel.mcpResources.count
-                )!.text, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                )!.text, tone: NativeAgentShell.trouble)
             case .current where appModel.mcpResources.isEmpty:
-                Text(MCPHubResourcesPresentation.notice(
+                MCPNote(MCPHubResourcesPresentation.notice(
                     state: .current,
                     resourceCount: appModel.mcpResources.count
                 )!.text)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             case .current:
                 ForEach(appModel.mcpResources) { resource in
-                    VStack(alignment: .leading, spacing: 3) {
+                    MCPCard {
                         Text(resource.name ?? resource.uri)
-                            .font(.subheadline.weight(.semibold))
+                            .font(resource.name == nil
+                                  ? ShellType.labelSemibold.monospaced()
+                                  : ShellType.bodySemibold)
+                            .foregroundStyle(NativeAgentShell.text)
                         if resource.name != nil {
                             Text(resource.uri)
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
+                                .font(ShellType.caption.monospaced())
+                                .foregroundStyle(NativeAgentShell.tertiary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
                         if let mime = resource.mimeType, !mime.isEmpty {
                             Text(mime)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .font(ShellType.caption)
+                                .foregroundStyle(NativeAgentShell.secondary)
                         }
                     }
-                    .padding(.vertical, 4)
                 }
             }
         }
@@ -511,7 +496,7 @@ struct MCPHubView: View {
     // MARK: - Recent call
 
     private var recentCallSection: some View {
-        Section("Recent call") {
+        MCPSection(label: "Recent call") {
             switch appModel.mcpRecentCallState {
             case .durable(let call):
                 recentCallRow(call, provenance: "Recorded in Activity; available after relaunch.")
@@ -522,12 +507,10 @@ struct MCPHubView: View {
                         provenance: "Recorded in Activity; \(rejectedRows) malformed receipt row\(rejectedRows == 1 ? "" : "s") ignored."
                     )
                 } else {
-                    Label(
-                        "MCP call history is partially unreadable (\(rejectedRows) malformed receipt row\(rejectedRows == 1 ? "" : "s")).",
-                        systemImage: "exclamationmark.triangle"
+                    MCPNote(
+                        "The call history is partly unreadable (\(rejectedRows) malformed receipt row\(rejectedRows == 1 ? "" : "s")).",
+                        tone: NativeAgentShell.trouble
                     )
-                    .font(.caption)
-                    .foregroundStyle(.orange)
                 }
             case .sessionOnly(let call):
                 recentCallRow(
@@ -535,82 +518,180 @@ struct MCPHubView: View {
                     provenance: "This app session only — durable Activity evidence was not recorded."
                 )
             case .latestAttemptFailed(let detail):
-                Label(
-                    "Latest MCP call failed this app session: \(detail). No durable call receipt was recorded.",
-                    systemImage: "exclamationmark.triangle"
+                MCPNote(
+                    "The latest call failed this app session: \(detail). No durable call receipt was recorded.",
+                    tone: NativeAgentShell.trouble
                 )
-                .font(.caption)
-                .foregroundStyle(.red)
             case .unavailable(let detail):
-                Label("Recorded MCP call history unavailable: \(detail)", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                MCPNote("The recorded call history is unavailable: \(detail)", tone: NativeAgentShell.trouble)
             case .notLoaded:
-                Label("Reading recorded MCP call history…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                MCPNote("Reading the recorded call history.")
             case .absent:
-                Text("No recorded MCP tool call yet.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                MCPNote("No tool call recorded yet. Running a tool above records one here.")
             }
         }
     }
 
     @ViewBuilder
     private func recentCallRow(_ call: MCPCallResult, provenance: String) -> some View {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("\(call.serverId) · \(call.toolName)")
-                        .font(.headline)
-                    Label(provenance, systemImage: "checkmark.seal")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text(call.status)
-                        .font(.caption)
-                        .foregroundStyle(callStatusColor(call.status))
-                    if let duration = call.durationSeconds {
-                        Text("\(duration, specifier: "%.2f")s")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                    if let createdAt = call.createdAt, !createdAt.isEmpty {
-                        Text(createdAt)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                    if let preview = call.resultPreview, !preview.isEmpty {
-                        Text(preview)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .lineLimit(12)
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
-                    }
-                    if call.resultTruncated == true {
-                        Label("Result preview truncated · \(call.resultByteCount ?? 0) bytes", systemImage: "scissors")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    if call.evidenceStatus == "recorded" {
-                        Label("Evidence recorded", systemImage: "checkmark.seal")
-                            .font(.caption2)
-                            .foregroundStyle(.green)
-                    } else if call.evidenceStatus == "failed" {
-                        Label("Call completed; evidence write failed", systemImage: "exclamationmark.triangle")
-                            .font(.caption2)
-                            .foregroundStyle(.orange)
-                            .help(call.evidenceError ?? "The MCP result could not be appended to Activity.")
-                    }
+        MCPCard {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(call.serverId) · \(call.toolName)")
+                    .font(ShellType.labelSemibold.monospaced())
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: 8)
+                Text(MCPHubWords.callStatus(call.status))
+                    .font(ShellType.captionSemibold)
+                    .foregroundStyle(callStatusColor(call.status))
+            }
+            HStack(spacing: 12) {
+                if let createdAt = call.createdAt, !createdAt.isEmpty {
+                    Text(createdAt)
                 }
-                .padding(.vertical, 4)
+                if let duration = call.durationSeconds {
+                    Text("\(duration, specifier: "%.2f")s")
+                }
+                Spacer(minLength: 0)
+            }
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.tertiary)
+            Text(provenance)
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let preview = call.resultPreview, !preview.isEmpty {
+                Text(preview)
+                    .font(ShellType.label.monospaced())
+                    .foregroundStyle(NativeAgentShell.text)
+                    .textSelection(.enabled)
+                    .lineLimit(12)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(NativeAgentShell.quietFill)
+                    )
+            }
+            if call.resultTruncated == true {
+                Text("Result preview truncated · \(call.resultByteCount ?? 0) bytes")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            if call.evidenceStatus == "recorded" {
+                Text("Evidence recorded")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.calm)
+            } else if call.evidenceStatus == "failed" {
+                Text("Call completed; evidence write failed")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .help(call.evidenceError ?? "The MCP result could not be appended to Activity.")
+            }
+        }
     }
 
     private func callStatusColor(_ status: String) -> Color {
         switch status {
-        case "ok", "success": return .green
-        case "error", "failed": return .red
-        default: return .secondary
+        case "ok", "success": return NativeAgentShell.calm
+        case "error", "failed": return NativeAgentShell.trouble
+        default: return NativeAgentShell.tertiary
         }
+    }
+}
+
+// MARK: - The kit
+
+/// Words for the states the daemon spells as slugs. A person never reads
+/// `needs_setup` off this page.
+private enum MCPHubWords {
+    static func health(_ status: String?) -> String {
+        switch status {
+        case "ok": "Ready"
+        case "fail", "error": "Not responding"
+        case "needs_setup": "Needs setup"
+        default: "Unknown"
+        }
+    }
+
+    static func consentStatus(_ status: String?) -> String {
+        switch status {
+        case "granted": "Granted"
+        case "revoked": "Revoked"
+        case "denied": "Denied"
+        default: "Unknown"
+        }
+    }
+
+    static func callStatus(_ status: String) -> String {
+        switch status {
+        case "ok", "success": "Succeeded"
+        case "error", "failed": "Failed"
+        default: "Unknown"
+        }
+    }
+}
+
+/// An eyebrow over its run of cards — the shape every group on an Advanced
+/// page takes.
+private struct MCPSection<Content: View>: View {
+    let label: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        // Lazy because a server's tool list can run to dozens of rows, and the
+        // `List` this page used to be built them lazily too.
+        LazyVStack(alignment: .leading, spacing: 8) {
+            Text(label)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .padding(.horizontal, 2)
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// One card: a group of controls or one row of a list.
+private struct MCPCard<Content: View>: View {
+    var selected: Bool = false
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            content
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .fill(selected ? NativeAgentShell.softFill : NativeAgentShell.quietFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+        )
+    }
+}
+
+/// A sentence on the sheet: a state, an empty list, or something that went
+/// wrong. Plain text, no plate.
+private struct MCPNote: View {
+    let text: String
+    var tone: Color = NativeAgentShell.secondary
+
+    init(_ text: String, tone: Color = NativeAgentShell.secondary) {
+        self.text = text
+        self.tone = tone
+    }
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.label)
+            .foregroundStyle(tone)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 2)
     }
 }

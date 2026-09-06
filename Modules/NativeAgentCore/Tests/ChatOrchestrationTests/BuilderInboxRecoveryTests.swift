@@ -166,7 +166,7 @@ struct BuilderInboxRecoveryTests {
 
         let result = try await fixture.send()
 
-        #expect(result["status"] == .string("queued"))
+        #expect(result["status"] == .string(agent == "claude" ? "failed" : "queued"))
         #expect(await fixture.recorder.payloads.count == 1)
 
         // The receipt must NAME the quarantine — a recovered send that looks
@@ -204,7 +204,7 @@ struct BuilderInboxRecoveryTests {
         // And the bridge stays healthy afterwards: the next send dedupes off
         // the fresh inbox instead of tripping the malformed guard again.
         let second = try await fixture.send()
-        #expect(second["status"] == .string("queued"))
+        #expect(second["status"] == .string(agent == "claude" ? "accepted" : "queued"))
         #expect(second["deduplicated"] == .bool(true))
         #expect(second["inboxQuarantined"] == nil)
     }

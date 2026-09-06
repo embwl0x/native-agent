@@ -80,9 +80,24 @@ extension NativeCognitionRuntime {
         for decision in decisions {
             switch decision {
             case .stage(let providerId, let transition):
-                await stageProviderVitalsNotice(providerId: providerId, transition: transition)
+                // User, 2026-09-06: the sensor flips its card latch BEFORE this
+                // write, and the write can fail (a lock or disk error is logged
+                // and swallowed). That permanently consumed the transition: the
+                // latch said a card was up, none existed, and it was never
+                // re-staged. Put the latch back so the next sweep retries.
+                if await !stageProviderVitalsNotice(
+                    providerId: providerId, transition: transition
+                ) {
+                    await providerVitalsSensor.revertCardLatch(
+                        providerId: providerId, to: false
+                    )
+                }
             case .expire(let providerId):
-                await postProviderVitalsRecoveryNotice(providerId: providerId)
+                if await !postProviderVitalsRecoveryNotice(providerId: providerId) {
+                    await providerVitalsSensor.revertCardLatch(
+                        providerId: providerId, to: true
+                    )
+                }
             }
         }
     }
@@ -111,10 +126,13 @@ extension NativeCognitionRuntime {
         }
     }
 
+    /// Returns false ONLY when the inbox write itself failed — a gate that
+    /// declines the append (the state is already on disk) is a success.
+    @discardableResult
     func stageProviderVitalsNotice(
         providerId: String,
         transition: ProviderVitalsTransition
-    ) async {
+    ) async -> Bool {
         // Disk-derived idempotency: if the latest vitals row for this provider
         // is already an unrecovered degradation notice — this run or any prior
         // run — nothing to do. The check runs INSIDE the inbox lock together
@@ -129,15 +147,27 @@ extension NativeCognitionRuntime {
         )
     }
 
-    func postProviderVitalsRecoveryNotice(providerId: String) async {
+    @discardableResult
+    func postProviderVitalsRecoveryNotice(providerId: String) async -> Bool {
+        // User, 2026-09-06: the card expires as soon as the band drops BELOW
+        // degraded, and that includes `sluggish` — so a provider that was still
+        // measurably slow got a card announcing it was "back to normal speed".
+        // The wording follows the band the sensor actually reads now.
+        let band = await providerVitalsSensor.vitals(for: providerId)?.band
+        let message: String = band == .sluggish
+            ? "\(providerId) is no longer degraded, but is still slower than usual — no action needed."
+            : "\(providerId) is back to normal speed — no action needed."
+        let title = band == .sluggish
+            ? "\(providerId) no longer degraded"
+            : "\(providerId) recovered"
         // Only meaningful when the latest row is an open degradation notice —
         // checked under the same lock as the append.
-        await appendProviderVitalsNotice(
+        return await appendProviderVitalsNotice(
             providerId: providerId,
             kind: "recovered",
             severity: "info",
-            title: "\(providerId) recovered",
-            message: "\(providerId) is back to normal speed — no action needed.",
+            title: title,
+            message: message,
             gateOnLatestKind: { $0 == "degraded" }
         )
     }
@@ -145,6 +175,8 @@ extension NativeCognitionRuntime {
     /// Append one vitals notice iff `gateOnLatestKind` accepts the provider's
     /// latest on-disk state. Gate, retirement of the prior active state, and
     /// append run as one canonical inbox transaction.
+    /// Returns false only when the transaction THREW; a gate refusal is a
+    /// success (the disk already carries the state the caller wanted).
     private func appendProviderVitalsNotice(
         providerId: String,
         kind: String,
@@ -152,7 +184,7 @@ extension NativeCognitionRuntime {
         title: String,
         message: String,
         gateOnLatestKind: @escaping @Sendable (String?) -> Bool
-    ) async {
+    ) async -> Bool {
         let stamp = ISO8601DateFormatter().string(from: now())
         let cardID = "provider-vitals-\(kind)-\(providerId)-\(UUID().uuidString.lowercased())"
         let row: JSONValue = .object([
@@ -185,12 +217,14 @@ extension NativeCognitionRuntime {
                     transitionAt: stamp,
                     ifLatestStateAllows: gateOnLatestKind
                 )
+            return true
         } catch {
             // A read/lock/write failure ABORTS the notice — no card is better
             // than a duplicate `degraded` card the recovery gate can't clear.
             FileHandle.standardError.write(
                 Data("ProviderVitals: inbox notice (\(kind)) failed for \(providerId): \(error)\n".utf8)
             )
+            return false
         }
     }
 

@@ -174,6 +174,22 @@ struct SlackHistoryPaginationTests {
         task.cancel()
         do { try await task.value; Issue.record("Cancelled collection must throw") }
         catch { #expect(error is CancellationError || (error as? URLError)?.code == .cancelled) }
+        // 2026-09-06: the pin is unchanged — exactly one held request must be
+        // stopped, i.e. cancelling the poll task really does reach the URL load
+        // that is still in flight. What moved is only WHEN it is observable.
+        // historyMessages still awaits `session.data(for:)` inside the task
+        // (SlackSocketModeLoop.swift:1890), and nothing since 2a2fa5b4 (which
+        // added this suite) changed that path; but URLSession resumes that
+        // await with the cancellation error on its own queue, so `stopLoading`
+        // on the held URLProtocol can land just after the throw — reading the
+        // counter in the same instant sampled 0. Wait for it on the same
+        // bounded-deadline idiom this test already uses above for the second
+        // request. A production path that never cancelled the load would still
+        // fail here, at the same assertion.
+        let stopDeadline = Date().addingTimeInterval(2)
+        while SlackPagingProtocol.heldStops < 1 && Date() < stopDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
         #expect(SlackPagingProtocol.heldStops == 1)
         #expect(await harness.recorder.generated.isEmpty)
         try SlackPagingProtocol.reset([historyPage(["2.000000"])])

@@ -155,7 +155,17 @@ struct MacChatTranscriptSearchTests {
     }
 
     @Test func mainAndDetachedWindowsUseTheSameSearchAndTranscriptOwners() throws {
+        // 2026-09-06: 3ccfb925 ("The new shell: five places, one room, one
+        // status dot") split ChatView across two files and lifted the
+        // transcript owner's call site into `var transcriptList` in the
+        // ChatView+ShellColumn extension (for the same type-checker reason as
+        // the latest pill beside it). ChatView is one view over two files now,
+        // so read both: what this pins is that the MAIN window mounts the same
+        // search bar and the same transcript owner as the detached panel, not
+        // which of ChatView's files the call happens to sit in.
         let main = try AppSourceScraping.appSource("ChatView.swift")
+            + "\n"
+            + AppSourceScraping.appSource("ChatView+ShellColumn.swift")
         let detached = try AppSourceScraping.appSource("DetachedChatPanelView.swift")
         let list = try AppSourceScraping.appSource("ChatMessageListView.swift")
 

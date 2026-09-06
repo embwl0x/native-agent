@@ -40,11 +40,14 @@ import Browser
 
 enum ChatMessageClearError: Error, LocalizedError {
     case transcriptClearedMetadataNotSaved(String)
+    case transcriptVersionExhausted
 
     var errorDescription: String? {
         switch self {
         case .transcriptClearedMetadataNotSaved(let reason):
             return "Messages were cleared, but conversation metadata could not be saved: \(reason)"
+        case .transcriptVersionExhausted:
+            return "This conversation's transcript version cannot advance any further, so clearing it could not be published to your other devices. Nothing was deleted."
         }
     }
 }
@@ -144,7 +147,18 @@ extension NativeClient {
         // Keep locks separate: other writers have their own transcript/index
         // ordering, so clear must not add a nested cross-file lock dependency.
         _ = try await persistence.withFileLock(sessionsPath) {
-            try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+            // 2026-09-06: a row whose transcript counter has hit the ceiling
+            // can never prove the empty this clear is about to publish is the
+            // newest state, so the phone would refuse it and keep showing the
+            // conversation the Mac just deleted. Refuse here, before any
+            // transcript byte is gone, rather than half-clear the pair.
+            if let row = rows.first(where: { $0["id"] == .string(safeSessionId) }),
+               ChatSessionIndexFile.isTranscriptGenerationExhausted(in: row) {
+                NSLog("NativeClient.clearChatMessages: refusing to clear \(safeSessionId) — its transcript version is at Int64.max and cannot advance")
+                throw ChatMessageClearError.transcriptVersionExhausted
+            }
+            return rows
         }
         try await persistence.withFileLock(messagesPath) {
             let parent = messagesPath.deletingLastPathComponent()
@@ -166,6 +180,14 @@ extension NativeClient {
                 rows[index]["messageCount"] = .int(0)
                 rows[index]["lastMessagePreview"] = .null
                 rows[index]["updatedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
+                // 2026-09-06: the clear is what makes the published transcript
+                // EMPTY, and an empty transcript is the one publication a
+                // remote reader is allowed to wipe a chat for. It may only do
+                // that when it can prove the empty is newer than what it
+                // shows, and this counter is that proof — the wall clock above
+                // is not, since it can step back and it moves for reasons that
+                // are not transcript writes.
+                ChatSessionIndexFile.bumpTranscriptGeneration(in: &rows[index])
                 try await persistence.writeJSON(.array(rows.map(JSONValue.object)), to: sessionsPath)
             }
         } catch {

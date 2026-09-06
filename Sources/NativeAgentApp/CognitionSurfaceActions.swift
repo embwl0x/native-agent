@@ -84,6 +84,10 @@ enum CognitionProposalActions {
     enum ResolveStatus: Sendable, Equatable {
         case applied(CognitiveStandingView.Status)
         case unavailable(String)
+        /// The transition happened in memory but its store write failed
+        /// (2026-09-06) — it will not survive a restart, and a click must never
+        /// report that as saved.
+        case notSaved(String)
     }
 
     struct ResolveOutcome: Sendable {
@@ -114,17 +118,54 @@ enum CognitionProposalActions {
                 detail: before
             )
         }
-        let resolved = await runtime.resolveStandingView(id: id, approved: approved)
+        let resolved = await runtime.resolveStandingViewChecked(id: id, approved: approved)
         let detail = await runtime.observatoryDetail()
         let expected: CognitiveStandingView.Status = approved ? .active : .retired
-        guard resolved?.status == expected,
+        guard resolved.view?.status == expected,
               detail.standingViews.first(where: { $0.id == id })?.status == expected else {
             return ResolveOutcome(
                 status: .unavailable("The standing view changed before the review could be saved."),
                 detail: detail
             )
         }
+        // The in-memory recheck above cannot see a failed store write, so the
+        // review used to report success and then reappear as pending on the
+        // next launch (2026-09-06).
+        if let failure = resolved.persistenceFailure {
+            return ResolveOutcome(status: .notSaved(failure), detail: detail)
+        }
         return ResolveOutcome(status: .applied(expected), detail: detail)
+    }
+
+    /// RETIRE a view she is already leaning on — active (signed) or held
+    /// (self-adopted). Same shape as `resolveWithOutcome`, including the
+    /// recheck at the mutation boundary, so a second click or a maintenance
+    /// race reports itself instead of looking like a success.
+    static func retireWithOutcome(
+        runtime: NativeCognitionRuntime = .shared,
+        id: UUID
+    ) async -> ResolveOutcome {
+        let before = await runtime.observatoryDetail()
+        guard let current = before.standingViews.first(where: { $0.id == id }),
+              current.isLeaning else {
+            return ResolveOutcome(
+                status: .unavailable("That standing view is not one you're leaning on."),
+                detail: before
+            )
+        }
+        let retired = await runtime.retireStandingViewChecked(id: id)
+        let detail = await runtime.observatoryDetail()
+        guard retired.view?.status == .retired,
+              detail.standingViews.first(where: { $0.id == id })?.status == .retired else {
+            return ResolveOutcome(
+                status: .unavailable("The standing view changed before it could be retired."),
+                detail: detail
+            )
+        }
+        if let failure = retired.persistenceFailure {
+            return ResolveOutcome(status: .notSaved(failure), detail: detail)
+        }
+        return ResolveOutcome(status: .applied(.retired), detail: detail)
     }
 }
 
@@ -180,10 +221,17 @@ enum CognitionObservatoryPresentation {
     }
 
     static func standingViewStatus(_ view: CognitiveStandingView) -> String {
-        if view.status == .active {
+        switch view.status {
+        case .active:
             return "active lens since \(view.updatedAt.formatted(date: .abbreviated, time: .omitted)) — \(view.evidenceNodeIds.count) felt moments"
+        case .held:
+            // Named for what it IS: the agent's, unsigned, and yours to end.
+            return "held by \(AgentVoice.live.object) since \(view.updatedAt.formatted(date: .abbreviated, time: .omitted)) — no signature needed, retire any time"
+        case .retired:
+            return "retired"
+        case .proposed:
+            return "proposed — waiting for your call"
         }
-        return "proposed — waiting for your call"
     }
 
     static func timelineDateLabel(_ event: CognitiveDevelopmentalTimelineEvent) -> String {

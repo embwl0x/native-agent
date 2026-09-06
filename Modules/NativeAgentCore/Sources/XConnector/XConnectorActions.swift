@@ -51,7 +51,13 @@ public enum XConnectorActions {
             guard !query.isEmpty else {
                 throw XActionError("missing_input", detail: "x.search_recent requires a non-empty query.")
             }
-            let maxResults = clampedInt(input["max"], defaultValue: 10, min: 1, max: 100)
+            // /2/tweets/search/recent rejects max_results below 10 with a 400.
+            // Clamp to the provider's real floor instead of forwarding a value
+            // it will refuse; the advertised schema states the same bound.
+            let maxResults = clampedInt(input["max"], defaultValue: 10, min: 10, max: 100)
+            // Agent, 2026-09-02: a clamp the receipt does not mention reads as
+            // twice what was asked for. Say it.
+            let requestedMax = inputInt(input["max"])
             let bearer = try await currentBearer()
             let url = apiURL("/2/tweets/search/recent")
             let (status, data) = try await httpGET(url, bearer: bearer, query: [
@@ -63,7 +69,11 @@ public enum XConnectorActions {
                 return httpFailureEnvelope(actionId: "x.search_recent", statusCode: status, data: data)
             }
             let payload = try parseJSONObject(data)
-            return completedEnvelope(actionId: "x.search_recent", fields: tweetsAndMetaFields(payload))
+            var fields = tweetsAndMetaFields(payload)
+            if let requestedMax, requestedMax != maxResults {
+                fields["clamped"] = .string("\(requestedMax)→\(maxResults)")
+            }
+            return completedEnvelope(actionId: "x.search_recent", fields: fields)
         }
     }
 
@@ -529,7 +539,12 @@ public enum XConnectorActions {
 
     static func userTweetsQuery(input: [String: JSONValue]) -> [(String, String)] {
         var query: [(String, String)] = [
-            ("max_results", String(clampedInt(input["max"], defaultValue: 25, min: 1, max: 100))),
+            // /2/users/:id/tweets rejects max_results below 5 with a 400. Its
+            // floor is 5, NOT the 10 that /2/tweets/search/recent enforces and
+            // NOT the 1 that reverse_chronological allows — the three endpoints
+            // genuinely differ, so this clamp must not be shared with
+            // timelineQuery above.
+            ("max_results", String(clampedInt(input["max"], defaultValue: 25, min: 5, max: 100))),
             ("tweet.fields", tweetFields)
         ]
         if let exclude = inputString(input["exclude"])?.trimmingCharacters(in: .whitespacesAndNewlines), !exclude.isEmpty {

@@ -113,6 +113,14 @@ final class VoiceOutputController: NSObject, ObservableObject {
         isSpeaking = playbackState.isSpeaking
     }
 
+    /// 2026-09-06: `enabled` was only consulted when an utterance STARTS, so
+    /// tapping the speaker off mid-reply left the agent talking to the end.
+    /// Turning it off silences what is already playing.
+    func setEnabled(_ on: Bool) {
+        enabled = on
+        if !on { stop() }
+    }
+
     func stop() {
         _synthesizer?.stopSpeaking(at: .immediate)
         finishPlayback()

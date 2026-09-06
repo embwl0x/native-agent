@@ -266,16 +266,21 @@ struct MindKGPaginationTests {
 @Suite("Mind KG — status header claims")
 struct MindKGHeaderTests {
 
-    /// `KGNativeStackStatus.load` assigns `embeddingDim = 384` as a CONSTANT and
-    /// the header renders it as "384d MiniLM" as if it were measured. If the
-    /// bundled embedder's dimension ever changes, the header lies with no other
-    /// signal. This ties the header's literal to the bundled MiniLM epoch the
-    /// memory store actually writes vectors at.
+    /// `KGNativeStackStatus.load` used to assign `embeddingDim = 384` as a
+    /// CONSTANT and render it as "384d MiniLM" as if it were measured, so a
+    /// changed embedder made the header lie with no other signal. 2026-09-06:
+    /// cba66673 lets an installed extras model win over the bundled MiniLM, so
+    /// the header now READS the live embedder's dimension and names no model.
+    /// The lie is gone by construction — pin the construction, then pin the
+    /// bundled epoch a stock install therefore measures.
     @Test func theHeadersEmbeddingDimensionMatchesTheBundledMiniLMEpoch() throws {
         let header = try AppSourceScraping.appSource("KnowledgeGraphStatusHeader.swift")
-        #expect(header.contains("status.embeddingDim = 384"),
-                "the header's hard-coded dimension moved — update this eval with it")
-        #expect(header.contains("d MiniLM"), "the header still claims a MiniLM embedder")
+        #expect(header.contains("(await SwiftNativeMemoryV2.shared.embedderDimensions())"),
+                "the header must measure the live embedder, never hard-code a dimension")
+        #expect(!header.contains("status.embeddingDim = 384"),
+                "the hard-coded dimension is back — the header can lie again")
+        #expect(!header.contains("MiniLM"),
+                "the header must not name a model it no longer knows is loaded")
 
         let repo = try AppSourceScraping.repositoryRoot()
         let embedding = try String(
@@ -284,11 +289,12 @@ struct MindKGHeaderTests {
             encoding: .utf8
         )
         // The bundled epoch is the one the memory store stamps onto stored
-        // vectors: dimensions 384, model all-MiniLM-L6-v2.
+        // vectors on a stock install — the value the measured header therefore
+        // shows when no extras model is present: 384 dims, all-MiniLM-L6-v2.
         #expect(embedding.contains("dimensions: 384,"),
-                "the bundled embedder no longer declares 384 dimensions — the KG header now lies")
+                "the bundled embedder no longer declares 384 dimensions")
         #expect(embedding.contains("\"all-MiniLM-L6-v2\""),
-                "the bundled embedder is no longer MiniLM — the KG header now lies")
+                "the bundled embedder is no longer MiniLM")
     }
 }
 

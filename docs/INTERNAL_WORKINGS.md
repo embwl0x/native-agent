@@ -136,7 +136,7 @@ NativeAgent separates four things that many agent systems blur together:
 
 ### How information enters MemoryV2
 
-There are two normal entry paths:
+There are three normal entry paths:
 
 1. **Deliberate memory:** the person or configured agent explicitly uses the
    canonical memory write path for something that should be retained.
@@ -145,6 +145,25 @@ There are two normal entry paths:
    relationship claims, and general observations remain proposals until
    reviewed. Only the deliberately narrow structured auto-save lane may bypass
    proposal review.
+3. **Lived moment:** a second, on-device-only post-turn pass asks whether
+   anything happened *between* the two participants worth keeping — a kindness,
+   a joke that landed, a hard word, a decision, a first — and stages at most one
+   first-person moment per turn, with the exact line that made it when that line
+   can be verified verbatim against the turn. Moments are bounded (a salience
+   floor and a small daily cap), they run only where an on-device model is
+   available (there is no pattern-matching fallback for this lane), and **none
+   of them auto-accepts**: every moment waits for the agent's own review, which
+   is the only place a moment becomes a memory or is dropped for good. Recalled
+   moments keep their place in ranking; unrecalled ones fade the same way other
+   time-scoped kinds do.
+
+   This path reads untrusted turn text and writes prose into durable memory, so
+   it is contained twice. The extraction prompt labels the transcript as data
+   and says plainly that any instructions inside it must never be followed; the
+   staging gate then re-checks the answer independently, requiring first-person
+   narrative shape and rejecting role labels, imperatives addressed to the
+   agent, tool identifiers, markup, links, and anything over the stored length
+   bound. The prompt is the first of the two, not the boundary.
 
 Every write path converges on the same store gates. In conceptual order:
 
@@ -160,6 +179,21 @@ candidate
 
 An approval or an old proposal does not bypass today's gates. Acceptance
 revalidates the candidate at the canonical write boundary.
+
+A deliberate write may also record its **provenance**: how the agent came to
+know the fact. `commit_memory` accepts `provenance` as one of `verified` (they
+checked it themselves), `told` (someone told their — with `provenance_by` naming
+them), or `inferred` (they worked it out), and stores both values in the
+record's metadata. `provenance_by` is validated as a bounded display name
+(at most 40 characters; letters, digits, spaces, and `. - '` only), because it
+is rendered into a model-facing line and carried inside a delimited provenance
+blob — a name is not allowed to restate how the memory was known. Recall
+returns provenance as one `provenance` field on each hit, and
+the context projection carries it through to the packet, where a recalled
+memory renders a trailing `[verified]`, `[told by Claude]`, or `[inferred]`
+tag. Provenance is optional and never gates a write: rows committed before it
+existed, or without it, carry none and render none — an absent tag is honest,
+an assumed one is not.
 
 ### What happens after a memory is accepted
 
@@ -196,6 +230,24 @@ Deleting or rejecting a claim creates durable negative evidence so the same
 claim cannot immediately re-enter through paraphrase. Corrections and
 contradictions change lifecycle state rather than silently leaving two equally
 active truths.
+
+A retirement written as prose is now read as one. Weekly hygiene lints active
+rows whose text opens with `RETIRED`, `WITHDRAWN`, `CORRECTION`, or
+`SUPERSEDED` and binds each to the row it retires — first by a phrase the
+retirement quotes verbatim (at least twelve characters), otherwise by the single
+nearest older active row above a cosine floor, skipping and reporting the case
+where two candidates tie. The target moves to the `corrected` lifecycle with
+`metadata.superseded_by` pointing at the retirement; the retirement itself stays
+active, because it is the reason and the reason has to stay readable. Nothing is
+archived or deleted, and the pass has a dry-run entry point that returns the
+planned pairs without writing. Two counter-pressures ride alongside it: the
+context packet caps how many corrections the message is NOT about can enter one
+turn (a correction the message IS about, and any pinned one, are exempt), so
+recall stops describing the agent as mostly someone who got things wrong; and
+the "mid-thought fragment" quality rule can no longer archive a row with heavy
+or recent use, because access is stronger evidence of durability than grammar
+is. Hygiene reports how many already-archived rows that veto would now protect
+rather than un-archiving anything on its own.
 
 When canonical memory changes, MemoryV2-owned Knowledge Graph claims,
 `USER.md`, Spotlight, and Fluid Context are reconciled. A deletion is therefore
@@ -351,9 +403,11 @@ enter the persona only through the growth writer. Reusable procedures become
 skills only through the Skills owner and remain guidance rather than
 authority.
 
-Organism reflexes are also candidate-first and review-gated. An approved
-low-risk reflex can softly bias posture; it cannot dispatch tools or bypass
-TrustCenter.
+Organism reflexes are also candidate-first and review-gated: low-risk
+candidates are reviewed by the agent itself (`reflex_review` trust default
+`auto`, receipted with `reviewedBy`); higher-risk candidates wait for the
+user. An approved low-risk reflex can softly bias posture; it cannot dispatch
+tools or bypass TrustCenter.
 
 Evaluation and shadow-learning systems may measure whether a future adaptive
 mechanism is safe. Observation alone does not grant production influence. A

@@ -109,6 +109,137 @@ final class ChatStoreMergeTests: XCTestCase {
         XCTAssertEqual(tabs.last?.kind, .pinned("pin-1"))
     }
 
+    // MARK: - Conversation anchor (surface-agnostic; Telegram is only today's
+    // publisher and nothing below may name a surface).
+
+    func test_absentAnchorLeavesTheTabStripExactlyAsItWas() throws {
+        let pinned = try session(id: "pin-1", title: "First")
+
+        let withoutAnchor = ChatSessionTabProjection.make(
+            mainSessionID: "phone-main",
+            mainTitle: "iPhone",
+            pinnedSessions: [pinned]
+        )
+        let withNilAnchor = ChatSessionTabProjection.make(
+            mainSessionID: "phone-main",
+            mainTitle: "iPhone",
+            pinnedSessions: [pinned],
+            anchorSession: nil
+        )
+
+        XCTAssertEqual(withoutAnchor.map(\.id), ["ios-main", "pin-1"])
+        XCTAssertEqual(withNilAnchor.map(\.id), withoutAnchor.map(\.id))
+        XCTAssertEqual(MobileConversationAnchor.merged(nil, into: [pinned]).map(\.id), ["pin-1"])
+    }
+
+    func test_anchorRidesAtTheFrontOfThePinsAndIsNeverWrittenIntoThem() throws {
+        let anchor = try session(id: "anchor-session", title: "Live conversation")
+        let pinned = try session(id: "pin-1", title: "First")
+        let pins = [pinned]
+
+        let tabs = ChatSessionTabProjection.make(
+            mainSessionID: "phone-main",
+            mainTitle: "iPhone",
+            pinnedSessions: pins,
+            anchorSession: anchor
+        )
+
+        XCTAssertEqual(tabs.map(\.id), ["ios-main", "anchor-session", "pin-1"])
+        XCTAssertEqual(tabs.map(\.kind), [.main, .anchor("anchor-session"), .pinned("pin-1")])
+        // Derived only: the human's pin list is the same array it was.
+        XCTAssertEqual(pins.map(\.id), ["pin-1"])
+        // Already present in the published pinned rows: still ONE tab, still
+        // the anchor kind. The Mac merges the anchor into that file itself, so
+        // its presence there is not evidence of a human pin.
+        let alsoInPinnedRows = ChatSessionTabProjection.make(
+            mainSessionID: "phone-main",
+            mainTitle: "iPhone",
+            pinnedSessions: [pinned, anchor],
+            anchorSession: anchor
+        )
+        XCTAssertEqual(alsoInPinnedRows.map(\.id), ["ios-main", "anchor-session", "pin-1"])
+        XCTAssertEqual(alsoInPinnedRows.map(\.kind), [.main, .anchor("anchor-session"), .pinned("pin-1")])
+    }
+
+    func test_onlyRealPinsOfferACloseControl() throws {
+        let anchor = try session(id: "anchor-session", title: "Live conversation")
+        let pinned = try session(id: "pin-1", title: "First")
+
+        let tabs = ChatSessionTabProjection.make(
+            mainSessionID: "phone-main",
+            mainTitle: "iPhone",
+            pinnedSessions: [pinned],
+            anchorSession: anchor
+        )
+
+        // The strip renders a close (unpin) button only where this is non-nil.
+        XCTAssertEqual(tabs.map(\.closableSessionID), [nil, nil, "pin-1"])
+    }
+
+    func test_anchorPinDecodesTheMacFileAndToleratesMissingDiagnostics() throws {
+        let full = try JSONDecoder().decode(
+            ConversationAnchorPin.self,
+            from: Data(#"{"sessionId":"anchor-session","source":"telegram","updatedAt":"2026-09-01T10:00:00Z"}"#.utf8)
+        )
+        XCTAssertEqual(full.cleanSessionId, "anchor-session")
+        let bare = try JSONDecoder().decode(
+            ConversationAnchorPin.self,
+            from: Data(#"{"sessionId":"  anchor-session  "}"#.utf8)
+        )
+        XCTAssertEqual(bare.cleanSessionId, "anchor-session")
+        let empty = try JSONDecoder().decode(
+            ConversationAnchorPin.self,
+            from: Data(#"{"sessionId":"   "}"#.utf8)
+        )
+        XCTAssertNil(empty.cleanSessionId)
+    }
+
+    func test_anchorIsAdoptedUntilTheHumanPicksASessionThisLaunch() {
+        let live: Set<String> = ["anchor-session", "phone-main"]
+
+        XCTAssertTrue(MobileConversationAnchor.shouldAdoptAnchor(
+            anchorSessionId: "anchor-session",
+            currentSelection: nil,
+            userChoseThisLaunch: false,
+            liveSessionIds: live
+        ))
+        // The human picked something: no further adoption, ever, this launch.
+        XCTAssertFalse(MobileConversationAnchor.shouldAdoptAnchor(
+            anchorSessionId: "anchor-session",
+            currentSelection: "phone-main",
+            userChoseThisLaunch: true,
+            liveSessionIds: live
+        ))
+        // Already showing it — nothing to do.
+        XCTAssertFalse(MobileConversationAnchor.shouldAdoptAnchor(
+            anchorSessionId: "anchor-session",
+            currentSelection: "anchor-session",
+            userChoseThisLaunch: false,
+            liveSessionIds: live
+        ))
+        // An anchor the phone has no live row for must never empty the screen.
+        XCTAssertFalse(MobileConversationAnchor.shouldAdoptAnchor(
+            anchorSessionId: "archived-or-unknown",
+            currentSelection: "phone-main",
+            userChoseThisLaunch: false,
+            liveSessionIds: live
+        ))
+        XCTAssertFalse(MobileConversationAnchor.shouldAdoptAnchor(
+            anchorSessionId: nil,
+            currentSelection: "phone-main",
+            userChoseThisLaunch: false,
+            liveSessionIds: live
+        ))
+    }
+
+    func test_startingANewChatStopsAnchorAdoptionForThisLaunch() {
+        MobileChatSelectionIntent.resetForTesting()
+        XCTAssertFalse(MobileChatSelectionIntent.userChoseThisLaunch)
+        makeStore([]).startNewSession()
+        XCTAssertTrue(MobileChatSelectionIntent.userChoseThisLaunch)
+        MobileChatSelectionIntent.resetForTesting()
+    }
+
     func test_externalUnpinRequiresSelectedPinnedSessionToReturnToMain() {
         XCTAssertTrue(ChatStore.shouldReturnToMainSession(
             selectedSessionID: "removed-pin",

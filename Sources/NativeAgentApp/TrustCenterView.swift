@@ -168,7 +168,7 @@ struct TrustCenterView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 24) {
                 // 2026-07-22 trust-tighten: 16 stacked panels → 4 + one
                 // collapsed Advanced group. Guardrail Summary deleted (its
                 // five tiles restated the very controls the Access & Policy
@@ -201,14 +201,14 @@ struct TrustCenterView: View {
                     FullMacSessionPanel()
                 }
 
-                NativePanel(title: "Feature Permissions", systemImage: "checklist") {
+                TrustSection(title: "Feature permissions", carded: false) {
                     // Taste pass 2026-07-24: alignment .top — default cell
                     // alignment vertically centers each card against the
                     // tallest in its row, so the four cards floated at four
                     // different heights.
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 380), spacing: 14, alignment: .top)], alignment: .leading, spacing: 14) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 380), spacing: 16, alignment: .top)], alignment: .leading, spacing: 16) {
                         ForEach(TrustFeaturePermissionCards.all) { card in
-                            featureGroup(title: card.title, systemImage: card.systemImage, tint: card.tint) {
+                            featureGroup(title: card.title) {
                                 card.content()
                             }
                         }
@@ -222,9 +222,9 @@ struct TrustCenterView: View {
                 // and per-surface read/write toggles have their one home in the
                 // Mac Integration tab — cross-linked here so a user answering
                 // "what can it do on my Mac" knows where each control lives.
-                Label("Per-app system permission grants (Calendar, Mail, Messages…) and per-surface read/write toggles live in the Mac Integration tab.", systemImage: "macbook.and.iphone")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("Per-app system permission grants (Calendar, Mail, Messages…) and per-surface read and write toggles live on the Mac integration page.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -244,27 +244,26 @@ struct TrustCenterView: View {
                 if let outcome = appModel.trustCenterActionOutcome {
                     let status = TrustCenterActionPresentation.state(for: outcome)
                     HStack(alignment: .top, spacing: 8) {
-                        StatusBadge(text: status.badgeText, status: status.badgeStatus)
+                        TrustStatusChip(text: status.badgeText, tone: TrustTone.named(status.badgeStatus))
                         VStack(alignment: .leading, spacing: 2) {
-                            Label(status.label, systemImage: status.systemImage)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(status.label)
+                                .font(ShellType.captionSemibold)
+                                .foregroundStyle(NativeAgentShell.secondary)
                             Text(status.text)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
                                 .textSelection(.enabled)
                         }
                     }
                     .accessibilityLabel("\(status.label): \(status.text)")
                 }
             }
-            .padding()
             // Taste pass 2026-08-11 (User: "spread out... not centered with
-            // eachother... sloppy"): pin the page to one readable column and
-            // center it, so every panel shares the same left/right edges
-            // instead of stretching controls across the full window width.
-            .frame(maxWidth: 1040, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
+            // eachother... sloppy"): the page frame pins one readable column,
+            // so every section shares the same left edge instead of
+            // stretching controls across the full window width.
+            .padding(.bottom, 32)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("Trust")
         .task {
@@ -279,9 +278,9 @@ struct TrustCenterView: View {
         }
         .alert(item: $pendingRestore) { backup in
             Alert(
-                title: Text("Restore Backup?"),
+                title: Text("Restore backup?"),
                 message: Text(restoreConfirmationMessage(for: backup)),
-                primaryButton: .destructive(Text("Restore Backup")) {
+                primaryButton: .destructive(Text("Restore backup")) {
                     beginRestore(backup)
                 },
                 secondaryButton: .cancel()
@@ -294,28 +293,27 @@ struct TrustCenterView: View {
     // disclosure — it documents the modes rather than controlling anything).
 
     private var accessAndPolicyPanel: some View {
-        NativePanel(title: "Access & Policy", systemImage: "switch.2", tint: agentAccessMode == "full" ? .red : .blue) {
+        TrustSection(title: "Access and policy") {
             VStack(alignment: .leading, spacing: 12) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
-                    TrustPresetButton(title: "Safe", subtitle: "Read only", systemImage: "lock", tint: .green) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], spacing: 8) {
+                    TrustPresetButton(title: "Safe", subtitle: "Read only") {
                         applyTrustPreset(.safe)
                     }
-                    TrustPresetButton(title: "Work Mode", subtitle: "Workspace writes", systemImage: "folder.badge.gearshape", tint: .blue) {
+                    TrustPresetButton(title: "Work mode", subtitle: "Workspace writes") {
                         applyTrustPreset(.work)
                     }
-                    TrustPresetButton(title: "Builder", subtitle: "Power tools gated", systemImage: "hammer", tint: .orange) {
+                    TrustPresetButton(title: "Builder", subtitle: "Power tools gated") {
                         applyTrustPreset(.builder)
                     }
-                    TrustPresetButton(title: "Full Mac YOLO", subtitle: "Full Mac access", systemImage: "flame", tint: .red) {
+                    TrustPresetButton(title: "Full Mac", subtitle: "Full Mac access") {
                         applyTrustPreset(.fullMac)
                     }
                 }
                 if isApplyingPolicy {
-                    ProgressView("Applying policy...")
+                    ProgressView("Applying policy…")
                         .controlSize(.small)
+                        .font(ShellType.label)
                 }
-
-                Divider()
 
                 Picker("Agent access", selection: agentAccessBinding) {
                     Text("Auto").tag("auto")
@@ -324,59 +322,64 @@ struct TrustCenterView: View {
                     Text("Full Mac").tag("full")
                 }
                 .pickerStyle(.segmented)
+                .padding(.top, 8)
                 Text(agentAccessDetail)
-                    .font(.caption)
-                    .foregroundStyle(agentAccessMode == "full" ? .red : .secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(agentAccessMode == "full" ? NativeAgentShell.trouble : NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                DisclosureGroup(isExpanded: $showPolicyMap) {
-                    PolicyMapView(policy: appModel.trustPolicy, activeMode: agentAccessMode)
-                        .padding(.top, 8)
-                } label: {
+                TrustFold(isExpanded: $showPolicyMap) {
                     Text("What each mode allows")
-                        .togglesDisclosure($showPolicyMap)
+                        .font(ShellType.labelSemibold)
+                        .foregroundStyle(NativeAgentShell.text)
+                } content: {
+                    PolicyMapView(policy: appModel.trustPolicy, activeMode: agentAccessMode)
                 }
-
-                Divider()
 
                 Picker("Permission level", selection: $permissionLevel) {
                     Text("Balanced").tag("balanced")
                     Text("Strict").tag("strict")
-                    Text("Wide Open With Receipts").tag("wide_open_receipts")
-                    Text("Full Mac YOLO").tag("full_mac_os")
+                    Text("Wide open with receipts").tag("wide_open_receipts")
+                    Text("Full Mac").tag("full_mac_os")
                 }
+                .padding(.top, 8)
                 Picker("Autonomy", selection: $autonomyDefault) {
                     Text("Supervised").tag("supervised")
-                    Text("Autonomous App Data").tag("app_data_autonomous")
-                    Text("Autonomous Workspaces").tag("workspace_autonomous")
+                    Text("Autonomous app data").tag("app_data_autonomous")
+                    Text("Autonomous workspaces").tag("workspace_autonomous")
                 }
-                HStack {
+                HStack(spacing: 8) {
                     Toggle("Backup before workspace writes", isOn: $requireBackups)
                     EffectTimingTag(timing: .nextRun)
-                    Spacer()
+                    Spacer(minLength: 8)
                 }
                 Picker("Outside workspaces", selection: $outsideDefault) {
                     Text("Deny").tag("deny")
                     Text("Ask").tag("ask")
                     Text("Allow").tag("allow")
                 }
-                HStack {
-                    Toggle("Developer Mode", isOn: developerModeBinding)
-                        .padding(.top, 8)
+                HStack(spacing: 8) {
+                    Toggle("Developer mode", isOn: developerModeBinding)
                         .disabled(savingDeveloperMode)
-                    EffectTimingTag(timing: .restart)
-                        .padding(.top, 8)
-                    Spacer()
+                    // User, 2026-09-05: the gate reads the saved policy on
+                    // every action (MacControl+Client currentPolicy()), so
+                    // this applies now; "restart" was the daemon era's rule.
+                    EffectTimingTag(timing: .now)
+                    Spacer(minLength: 8)
                 }
-                Text("Saves immediately; restart NativeAgent to apply. Operator-only escalation for destructive/system-level actions, including shell, system control, and file move/trash.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .padding(.top, 8)
+                Text("Applies now. Operator-only escalation for destructive and system-level actions, including shell, system control, and moving or trashing files.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if savingDeveloperMode {
-                    ProgressView("Saving Developer Mode…")
+                    ProgressView("Saving developer mode…")
                         .controlSize(.small)
+                        .font(ShellType.label)
                 }
-                HStack {
+                HStack(spacing: 8) {
                     // PATCH-2026-05-06: bug-2 guard wide-open / outside-allow with confirmation alert
-                    Button("Save Policy", systemImage: "checkmark.shield") {
+                    Button("Save policy") {
                         // Full Mac and outside-Mac write permission require explicit confirmation.
                         let needsConfirm = (permissionLevel == "wide_open_receipts" || permissionLevel == "full_mac_os" || outsideDefault == "allow")
                         if needsConfirm {
@@ -399,8 +402,11 @@ struct TrustCenterView: View {
                             }
                         }
                     }
-                    .alert("Enable Full Mac access?", isPresented: $showFullMacAlert) {
-                        Button("Enable Full Mac", role: .destructive) {
+                    .alert(
+                        fullMacSaveIsAlreadyFullMac ? "Save these settings?" : "Enable Full Mac access?",
+                        isPresented: $showFullMacAlert
+                    ) {
+                        Button(fullMacSaveIsAlreadyFullMac ? "Save policy" : "Enable Full Mac", role: .destructive) {
                             confirmPendingFullMacPolicy()
                         }
                         Button("Cancel", role: .cancel) {
@@ -413,6 +419,17 @@ struct TrustCenterView: View {
                         // the "Backup before workspace writes" toggle shown on this
                         // same page. What the action does is unchanged; every field
                         // it changes is now stated here.
+                        //
+                        // User, 2026-09-06: when Full Mac is ALREADY on, this save
+                        // changes nothing but the fields on the page, so the
+                        // preset disclosure below would be a false promise.
+                        if fullMacSaveIsAlreadyFullMac {
+                        Text("""
+                        Full Mac access is already on. This saves the settings on this page as they are shown — Autonomy, "Backup before workspace writes" and "Outside workspaces" keep the values you chose.
+
+                        Full Mac does not bypass macOS itself. Documents, Desktop, Downloads, and other protected folders still need their own approval in System Settings → Privacy & Security → Files and Folders (or Full Disk Access) before anything can read them.
+                        """)
+                        } else {
                         Text("""
                         The agent will be able to read and modify files outside workspaces across app surfaces. Shell, system control, and file move/trash still require Developer Mode.
 
@@ -426,8 +443,9 @@ struct TrustCenterView: View {
 
                         You can turn any of these back on here afterwards.
                         """)
+                        }
                     }
-                    Button("Create Backup", systemImage: "externaldrive.badge.timemachine") {
+                    Button("Create backup") {
                         Task { await appModel.createBackup(reason: "manual Trust Center backup") }
                     }
                 }
@@ -439,19 +457,17 @@ struct TrustCenterView: View {
 
     private func featureGroup<Content: View>(
         title: String,
-        systemImage: String,
-        tint: Color,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label(title, systemImage: systemImage)
-                .font(NativeAgentFont.section)
-                .foregroundStyle(tint)
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
             content()
         }
-        .padding(NativeAgentSpacing.md)
+        .padding(16)
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(tint.opacity(0.05), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
+        .trustCard()
     }
 
     // MARK: - Advanced group (2026-07-22 trust-tighten: power-user panels
@@ -471,50 +487,40 @@ struct TrustCenterView: View {
     }
 
     private var advancedSection: some View {
-        DisclosureGroup(isExpanded: $showAdvancedTrust) {
-            VStack(alignment: .leading, spacing: 16) {
+        TrustFold(isExpanded: $showAdvancedTrust) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Advanced")
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Text("Safety boundaries, privacy map, policy simulator, and backups.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+        } trailing: {
+            if !showAdvancedTrust, let badge = advancedPresentation.collapsedBadge {
+                TrustStatusChip(text: badge.text, tone: TrustTone.named(badge.status))
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 24) {
                 safetyBoundariesPanel
                 privacyMapPanel
                 simulatorPanel
                 backupsPanel
             }
-            .padding(.top, 12)
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "slider.horizontal.3")
-                    .foregroundStyle(.secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Advanced")
-                        .font(NativeAgentFont.section)
-                    Text("Safety boundaries, privacy map, policy simulator, and backups.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if !showAdvancedTrust, let badge = advancedPresentation.collapsedBadge {
-                    StatusBadge(text: badge.text, status: badge.status)
-                }
-            }
-            .togglesDisclosure($showAdvancedTrust)
-        }
-        .padding(NativeAgentSpacing.lg)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
         }
     }
 
     private var safetyBoundariesPanel: some View {
-        NativePanel(title: "Safety Boundaries", systemImage: "exclamationmark.shield", tint: .orange) {
+        TrustSection(title: "Safety boundaries") {
             let state = TrustSafetyBoundariesPresentation.state(
                 policy: appModel.trustPolicy,
                 accessMode: agentAccessMode
             )
             if let unavailable = state.unavailableMessage {
-                Label(unavailable, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Text(unavailable)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(state.rows) { boundary in
                     TrustBoundaryRow(
@@ -536,90 +542,99 @@ struct TrustCenterView: View {
     }
 
     private var simulatorPanel: some View {
-        NativePanel(title: "Simulator", systemImage: "play.circle") {
-            HStack {
+        TrustSection(title: "Policy simulator") {
+            HStack(spacing: 8) {
                 TextField("Path", text: $simulationPath)
                     .textFieldStyle(.roundedBorder)
-                Button("Simulate Write", systemImage: "play.circle") {
+                    .font(ShellType.label)
+                Button("Simulate write") {
                     Task { await appModel.simulatePolicy(action: "file_write", path: simulationPath) }
                 }
             }
             if let failure = appModel.policySimulationFailure {
-                Label("Simulation Unavailable", systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
+                Text("Simulation unavailable")
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.trouble)
                 Text(failure)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } else if let simulation = appModel.policySimulation {
                 let verdict = PolicySimulationVerdict(simulation: simulation)
-                HStack {
-                    Label(
-                        verdict.title,
-                        systemImage: verdict.systemImage
+                HStack(spacing: 8) {
+                    Text(verdict.title)
+                        .font(ShellType.labelSemibold)
+                        .foregroundStyle(verdictColor(verdict))
+                    TrustStatusChip(
+                        text: "Risk \(simulation.risk.lowercased())",
+                        tone: TrustTone.named(simulation.risk)
                     )
-                    .foregroundStyle(
-                        verdict == .allowed ? .green
-                            : verdict == .approvalRequired ? .orange
-                            : verdict == .unavailable ? .orange
-                            : .red
-                    )
-                    StatusBadge(text: "Risk \(simulation.risk)", status: simulation.risk)
                 }
                 ForEach(simulation.reasons, id: \.self) { reason in
                     Text(reason)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Text("This is a saved-policy decision only. It does not execute a write or verify macOS privacy/TCC access.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("This is a saved-policy decision only. It does not execute a write or verify macOS privacy access.")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
     private var backupsPanel: some View {
-        NativePanel(title: "Backups", systemImage: "externaldrive.badge.timemachine") {
+        TrustSection(title: "Backups") {
             if appModel.backups.isEmpty {
-                NativeEmptyState(
-                    title: "No Backups Yet",
-                    detail: "Manual and pre-write backups will appear here.",
-                    systemImage: "externaldrive",
-                    actionTitle: nil,
-                    actionImage: nil,
-                    action: nil
-                )
-                .frame(minHeight: 180)
+                Text("No backups yet. Backups made here, and the ones taken before a workspace write, will be listed with their date and what they covered.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(appModel.backups.prefix(8)) { backup in
-                    HStack {
+                    HStack(spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(backup.reason)
-                                .font(.subheadline.weight(.semibold))
+                                .font(ShellType.bodySemibold)
+                                .foregroundStyle(NativeAgentShell.text)
                             Text("\(UserDisplayFormatters.humanizeISOTimestamp(backup.createdAt)) · \(backup.scope.joined(separator: ", "))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
                                 .lineLimit(2)
                         }
-                        Spacer()
+                        Spacer(minLength: 8)
                         if restoringBackupID == backup.id {
                             ProgressView()
                                 .controlSize(.small)
                                 .accessibilityLabel("Restoring backup")
                         }
-                        Button("Restore", systemImage: "arrow.counterclockwise") {
+                        Button("Restore") {
                             pendingRestore = backup
                         }
                         .disabled(restoringBackupID != nil)
                     }
+                    .frame(minHeight: 48)
                     .textSelection(.enabled)
                 }
             }
         }
     }
 
+    /// The simulator's verdict in the room's three state colours: the teal is
+    /// worn only where the decision actually waits on a person.
+    private func verdictColor(_ verdict: PolicySimulationVerdict) -> Color {
+        switch verdict {
+        case .allowed: NativeAgentShell.calm
+        case .approvalRequired: NativeAgentShell.needsYou
+        case .denied, .unavailable: NativeAgentShell.trouble
+        }
+    }
+
     private func restoreConfirmationMessage(for backup: BackupRecord) -> String {
         let scopes = backup.scope.isEmpty ? "no recorded scopes" : backup.scope.joined(separator: ", ")
-        return "Reason: \(backup.reason)\nDate: \(backup.createdAt)\nAffected scopes: \(scopes)\n\nCurrent data in those scopes will be overwritten. NativeAgent will create a pre-restore safety backup before changing current data."
+        let created = UserDisplayFormatters.humanizeISOTimestamp(backup.createdAt)
+        return "Reason: \(backup.reason)\nDate: \(created)\nAffected scopes: \(scopes)\n\nCurrent data in those scopes will be overwritten. NativeAgent will create a pre-restore safety backup before changing current data."
     }
 
     private func beginRestore(_ backup: BackupRecord) {
@@ -725,8 +740,8 @@ struct TrustCenterView: View {
                 appModel.applySavedTrustPolicy(
                     savedPolicy,
                     status: enabled
-                        ? "Developer Mode saved. Restart NativeAgent to apply."
-                        : "Developer Mode turned off. Restart NativeAgent to apply."
+                        ? "Developer Mode on."
+                        : "Developer Mode off."
                 )
             } catch {
                 if developerMode == enabled {
@@ -738,8 +753,24 @@ struct TrustCenterView: View {
         }
     }
 
+    /// True when the pending confirmation is a save made while Full Mac is
+    /// ALREADY on with a live grant — i.e. the level is not changing.
+    /// (User, 2026-09-06: the preset belongs to the transition, not to every
+    /// save afterwards.)
+    private var fullMacSaveIsAlreadyFullMac: Bool {
+        guard pendingPermissionLevel == "full_mac_os" else { return false }
+        return appModel.trustPolicy.map {
+            accessMode(from: $0) == "full" && $0.permissionLevel == "full_mac_os"
+        } ?? false
+    }
+
     private func confirmPendingFullMacPolicy() {
-        if pendingPermissionLevel == "full_mac_os" {
+        // User, 2026-09-06: applying the Full Mac preset on every confirmation
+        // meant a save that only changed Autonomy, "Backup before workspace
+        // writes" or "Outside workspaces" threw those edits away and rewrote
+        // them to the preset — the controls stayed editable and the edits
+        // never landed. When the level is unchanged, save what the page shows.
+        if pendingPermissionLevel == "full_mac_os", !fullMacSaveIsAlreadyFullMac {
             isApplyingPolicy = true
             agentAccessMode = "full"
             permissionLevel = "full_mac_os"
@@ -910,23 +941,24 @@ struct PrivacyMapPanel: View {
     }
 
     var body: some View {
-        NativePanel(title: "Privacy Map", systemImage: "map") {
+        TrustSection(title: "Privacy map") {
             switch presentation {
             case .pending:
-                Text("Privacy map has not loaded yet.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("The privacy map has not loaded yet. It lists what the agent keeps on this Mac and which of it can leave.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             case .loaded(let map):
                 Text(UserDisplayFormatters.tildifyPath(map.root))
-                    .font(NativeAgentFont.mono)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.code)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
                     .help(map.root)
-                Text("Generated \(map.generatedAt)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("Generated \(UserDisplayFormatters.humanizeISOTimestamp(map.generatedAt))")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
                 ForEach(map.categories) { category in
                     PrivacyMapPanelCategoryRow(category: category)
                 }
@@ -939,27 +971,27 @@ private struct PrivacyMapPanelCategoryRow: View {
     let category: PrivacyMapPanelPresentation.Category
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: category.source.exportable ? "square.and.arrow.up" : "lock.fill")
-                .foregroundStyle(category.source.exportable ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack {
-                    Text(category.source.title)
-                        .font(.subheadline.weight(.semibold))
-                    StatusBadge(text: category.protectionLabel, status: category.protectionStatus)
-                }
-                Text(category.source.contains)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(category.source.path)
-                    .font(NativeAgentFont.mono)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Text(category.source.title)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                TrustStatusChip(
+                    text: category.protectionLabel,
+                    tone: category.source.exportable ? .quiet : .trouble
+                )
             }
-            Spacer()
+            Text(category.source.contains)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(UserDisplayFormatters.tildifyPath(category.source.path))
+                .font(ShellType.code)
+                .foregroundStyle(NativeAgentShell.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
     }
 }
@@ -1076,23 +1108,22 @@ private struct FullMacSessionPanel: View {
     var body: some View {
         let policy = appModel.trustPolicy
         let state = FullMacExpiry.state(policy)
-        NativePanel(title: "Full Mac Session", systemImage: "clock.badge.exclamationmark", tint: panelTint(state)) {
-            VStack(alignment: .leading, spacing: 10) {
+        TrustSection(title: "Full Mac session") {
+            VStack(alignment: .leading, spacing: 12) {
                 // 1. Live expiry line — visible without hovering.
                 TimelineView(.periodic(from: .now, by: 60)) { timeline in
                     let liveState = FullMacExpiry.state(policy, now: timeline.date)
-                    Label(
-                        FullMacExpiry.statusLine(liveState, now: timeline.date),
-                        systemImage: statusIcon(liveState)
-                    )
-                    .font(NativeAgentFont.section)
-                    .foregroundStyle(statusColor(liveState, now: timeline.date))
+                    Text(FullMacExpiry.statusLine(liveState, now: timeline.date))
+                        .font(ShellType.bodySemibold)
+                        .foregroundStyle(statusColor(liveState, now: timeline.date))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 // 2. Duration picker with an explicit, always-visible label
                 // (taste gate: no anonymous segmented control).
                 Text("Full Mac duration")
-                    .font(.subheadline.weight(.semibold))
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                 Picker("Full Mac duration", selection: durationBinding) {
                     ForEach(FullMacDurationOption.allCases) { option in
                         Text(option.label).tag(option)
@@ -1101,17 +1132,18 @@ private struct FullMacSessionPanel: View {
                 .pickerStyle(.segmented)
                 .labelsHidden() // label rendered explicitly above
                 Text("Counted from the last Full Mac confirmation. When the window closes, file tools are swept from the agent's catalog until you reconfirm.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 // 3. Reconfirm — restamps fullMacConfirmedAt as now.
-                HStack {
-                    Button(reconfirmTitle(state), systemImage: "arrow.clockwise.circle") {
+                HStack(spacing: 8) {
+                    Button(reconfirmTitle(state)) {
                         showReconfirmAlert = true
                     }
                     .disabled(policy == nil)
                     EffectTimingTag(timing: .now)
-                    Spacer()
+                    Spacer(minLength: 8)
                 }
             }
         }
@@ -1152,39 +1184,22 @@ private struct FullMacSessionPanel: View {
 
     private func reconfirmTitle(_ state: FullMacExpiryState) -> String {
         switch state {
-        case .off: return "Confirm Full Mac Now"
+        case .off: return "Confirm Full Mac now"
         default: return "Reconfirm Full Mac"
-        }
-    }
-
-    private func panelTint(_ state: FullMacExpiryState) -> Color {
-        switch state {
-        case .expired, .unreadable: return .red
-        case .active, .never: return .orange
-        case .off: return .blue
-        }
-    }
-
-    private func statusIcon(_ state: FullMacExpiryState) -> String {
-        switch state {
-        case .never: return "infinity.circle"
-        case .active: return "clock.badge.checkmark"
-        case .expired, .unreadable: return "exclamationmark.octagon.fill"
-        case .off: return "circle.slash"
         }
     }
 
     private func statusColor(_ state: FullMacExpiryState, now: Date) -> Color {
         switch state {
         case .expired, .unreadable:
-            return .red
+            return NativeAgentShell.trouble
         case .active(let expiresAt):
             return expiresAt.timeIntervalSince(now) <= FullMacExpiry.warningWindow
-                ? .orange : .green
+                ? NativeAgentShell.trouble : NativeAgentShell.calm
         case .never:
-            return .green
+            return NativeAgentShell.calm
         case .off:
-            return .secondary
+            return NativeAgentShell.secondary
         }
     }
 }
@@ -1192,28 +1207,29 @@ private struct FullMacSessionPanel: View {
 private struct TrustPresetButton: View {
     var title: String
     var subtitle: String
-    var systemImage: String
-    var tint: Color
     var action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: systemImage)
-                    .foregroundStyle(tint)
-                    .frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(NativeAgentFont.section)
-                        .foregroundStyle(.primary)
-                    Text(subtitle)
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Text(subtitle)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
-            .padding(NativeAgentSpacing.md)
-            .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(NativeAgentShell.quietFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+            )
         }
         .buttonStyle(.naFeel)
     }
@@ -1229,14 +1245,12 @@ private struct PolicyMapView: View {
     var body: some View {
         switch TrustPolicyMapPresentation.resolve(policy: policy, activeMode: activeMode) {
         case .policyUnavailable:
-            Label(
-                "Current policy is unavailable, so NativeAgent cannot safely describe what these modes allow yet.",
-                systemImage: "exclamationmark.triangle.fill"
-            )
-            .font(.caption)
-            .foregroundStyle(.orange)
+            Text("The current policy is unavailable, so NativeAgent cannot safely describe what these modes allow yet.")
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.trouble)
+                .fixedSize(horizontal: false, vertical: true)
         case let .rows(rows):
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 12) {
                 ForEach(rows) { row in
                     PolicyMapRow(row: row)
                 }
@@ -1248,33 +1262,184 @@ private struct PolicyMapView: View {
 private struct PolicyMapRow: View {
     let row: TrustPolicyMapRow
 
-    private var tint: Color { row.mode == "full" ? .red : (row.isActive ? .blue : .secondary) }
-
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 4) {
             GridRow {
-                Label(row.title, systemImage: row.isActive ? "largecircle.fill.circle" : "circle")
-                    .font(NativeAgentFont.section)
-                    .foregroundStyle(tint)
+                Text(row.title)
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(row.isActive ? NativeAgentShell.text : NativeAgentShell.secondary)
                     .gridColumnAlignment(.leading)
-                policyChip(row.files, systemImage: "folder")
-                policyChip(row.shellAllowed ? "shell" : "no shell", systemImage: "terminal", enabled: row.shellAllowed)
-                policyChip(row.macControlAllowed ? "mac" : "no mac", systemImage: "macbook", enabled: row.macControlAllowed)
-                policyChip(row.iosRemoteAllowed ? "iOS" : "no iOS", systemImage: "iphone", enabled: row.iosRemoteAllowed)
-                policyChip(row.autonomy, systemImage: "wand.and.stars")
+                policyChip(row.files)
+                policyChip(row.shellAllowed ? "shell" : "no shell", enabled: row.shellAllowed)
+                policyChip(row.macControlAllowed ? "mac" : "no mac", enabled: row.macControlAllowed)
+                policyChip(row.iosRemoteAllowed ? "iOS" : "no iOS", enabled: row.iosRemoteAllowed)
+                policyChip(row.autonomy)
             }
         }
-        .padding(10)
-        .background(row.isActive ? tint.opacity(0.09) : Color.clear, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .fill(row.isActive ? NativeAgentShell.softFill : Color.clear)
+        )
     }
 
-    private func policyChip(_ text: String, systemImage: String, enabled: Bool = true) -> some View {
-        Label(text, systemImage: systemImage)
-            .font(NativeAgentFont.tag)
-            .foregroundStyle(enabled ? .primary : .secondary)
+    private func policyChip(_ text: String, enabled: Bool = true) -> some View {
+        Text(text)
+            .font(ShellType.caption)
+            .foregroundStyle(enabled ? NativeAgentShell.text : NativeAgentShell.tertiary)
             .lineLimit(1)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background((enabled ? tint : Color.secondary).opacity(0.10), in: Capsule())
+            .background(NativeAgentShell.quietFill, in: Capsule())
+    }
+}
+
+// MARK: - Page kit (2026-09-03 Advanced refinement)
+//
+// Trust used to be a stack of `NativePanel`s: a thin-material slab each, an
+// icon and a tint per title, and rules drawn between the controls inside. On
+// the shell's one sheet that read as a dozen plates dropped on the glass. A
+// section is now the Advanced list's own shape — an eyebrow, then one card —
+// and the only colours left are the room's four roles.
+
+/// The tone a status word carries. Three states and a quiet default, no raw
+/// colours.
+private enum TrustTone {
+    case calm
+    case trouble
+    case needsYou
+    case quiet
+
+    var color: Color {
+        switch self {
+        case .calm: NativeAgentShell.calm
+        case .trouble: NativeAgentShell.trouble
+        case .needsYou: NativeAgentShell.needsYou
+        case .quiet: NativeAgentShell.secondary
+        }
+    }
+
+    /// The tone behind one of the status words the Trust presentations return.
+    static func named(_ status: String?) -> TrustTone {
+        switch status?.lowercased() {
+        case "ok", "done", "passed", "active", "valid", "ready", "low", "saved":
+            return .calm
+        case "warn", "warning", "blocked", "needs_setup", "medium", "high",
+             "fail", "failed", "error", "critical", "timeout":
+            return .trouble
+        default:
+            return .quiet
+        }
+    }
+}
+
+/// One section of the page: the eyebrow the Advanced list uses, and the
+/// controls under it on one card.
+private struct TrustSection<Content: View>: View {
+    let title: String
+    /// A section whose content is already a grid of cards carries no card of
+    /// its own — a card inside a card is the plate this pass removed.
+    var carded: Bool = true
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .padding(.horizontal, 2)
+            if carded {
+                VStack(alignment: .leading, spacing: 12) { content }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .trustCard()
+            } else {
+                VStack(alignment: .leading, spacing: 12) { content }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+}
+
+/// A short status word beside the thing it describes.
+private struct TrustStatusChip: View {
+    let text: String
+    let tone: TrustTone
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.captionSemibold)
+            .foregroundStyle(tone.color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(tone.color.opacity(0.16), in: Capsule())
+    }
+}
+
+/// A bare fold: a chevron, the words, and one gesture. No plate, no material,
+/// and the shell's one fold animation with Reduce Motion honoured.
+private struct TrustFold<Label: View, Trailing: View, Content: View>: View {
+    @Binding var isExpanded: Bool
+    @ViewBuilder var label: Label
+    @ViewBuilder var trailing: Trailing
+    @ViewBuilder var content: Content
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                withAnimation(NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(ShellType.captionSemibold)
+                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    label
+                    Spacer(minLength: 8)
+                    trailing
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+
+            if isExpanded {
+                content
+                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+            }
+        }
+    }
+}
+
+extension TrustFold where Trailing == EmptyView {
+    init(
+        isExpanded: Binding<Bool>,
+        @ViewBuilder label: () -> Label,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.init(isExpanded: isExpanded, label: label, trailing: { EmptyView() }, content: content)
+    }
+}
+
+private extension View {
+    /// The room's one content card: a quiet fill, one hairline, radius 12.
+    func trustCard() -> some View {
+        self
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(TodayPalette.cardFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+            )
     }
 }

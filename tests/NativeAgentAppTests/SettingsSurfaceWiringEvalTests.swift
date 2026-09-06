@@ -49,11 +49,18 @@ struct SettingsSurfaceWiringEvalTests {
             if source.contains("\"\(key)\"") { keyReaders.insert(file) }
         }
 
-        // The writer (SlimSettingsView) plus the three window hosts.
+        // The writers (SlimSettingsView, and SetupView since 2e29b8c9 put the
+        // same toggle on the Setup page) plus the three window hosts and, since
+        // 69fd1891, AppearanceController — the one object that answers "is the
+        // window dark?" for both the SwiftUI and AppKit layers.
+        // 2026-09-06: set widened for those two commits; the eval's claim is
+        // unchanged — one key, and nobody sets an appearance without reading it.
         #expect(keyReaders == [
+            "AppearanceController.swift",
             "DetachedChatPanel.swift",
             "DetachedChatPanelView.swift",
             "NativeAgentApp.swift",
+            "SetupView.swift",
             "SlimSettingsView.swift",
         ], "dark-mode key readers drifted: \(keyReaders.sorted())")
 
@@ -63,11 +70,18 @@ struct SettingsSurfaceWiringEvalTests {
 
         // And each host derives the appearance FROM the preference, not from a
         // literal — flipping any of these to a constant fails here.
-        for file in ["NativeAgentApp.swift", "DetachedChatPanelView.swift"] {
-            let source = try AppSourceScraping.appSource(file)
-            #expect(source.contains("preferredColorScheme(preferDarkAppearance ? .dark : nil)"),
-                    "\(file) must derive its color scheme from the shared preference")
-        }
+        let detached = try AppSourceScraping.appSource("DetachedChatPanelView.swift")
+        #expect(detached.contains("preferredColorScheme(preferDarkAppearance ? .dark : nil)"),
+                "DetachedChatPanelView.swift must derive its color scheme from the shared preference")
+        // 2026-09-06: 69fd1891 — the app's own scenes stopped handing SwiftUI a
+        // nil scheme (that left the title bar and rail dark against a white
+        // page) and now derive dark-or-light from AppearanceController, which
+        // is itself driven by this preference (NativeAgentApp.swift:250, :339).
+        // Still derived, never a literal.
+        let app = try AppSourceScraping.appSource("NativeAgentApp.swift")
+        #expect(app.contains("preferredColorScheme(appearance.colorScheme)"),
+                "NativeAgentApp.swift must derive its color scheme from the shared preference")
+        #expect(app.contains("appearance.setPreferDark(dark)"))
         let panel = try AppSourceScraping.appSource("DetachedChatPanel.swift")
         #expect(panel.contains("defaults.object(forKey: \"\(key)\") as? Bool"))
         #expect(panel.contains("NSAppearance(named: .darkAqua)"))
@@ -210,13 +224,16 @@ struct SettingsSurfaceWiringEvalTests {
     /// enforcement read site is decoration, and a screen-capture grant that
     /// does nothing is a privacy claim the user believes.
     ///
-    /// TWO of the five are live (`screen_capture`, `image_generation_openai`)
-    /// plus the voice key (`tts_openai`). THREE — `vision_api_calls`,
-    /// `file_ingestion_pdf`, `file_ingestion_docx` — have ZERO consumers
-    /// today: they are written, defaulted, and rendered, and nothing gates on
-    /// them. That gap is recorded here (and reported as a production seam);
-    /// this eval fails if a live key loses its gate OR if a dead key gains one
-    /// without the ledger being updated.
+    /// FOUR of the six are live: `screen_capture`, `image_generation_openai`,
+    /// the voice key (`tts_openai`), and — since a6feb944, 2026-09-06,
+    /// "Attachments: 'Allow vision API calls' stops images, and an attached PDF
+    /// is finally read" — `vision_api_calls` and `file_ingestion_pdf`, both
+    /// enforced per turn in ChatOrchestrationClient+MessagePersistence.swift
+    /// (:729, :777). ONE remains dead: `file_ingestion_docx` has ZERO
+    /// consumers — nothing extracts a DOCX, so the toggle is disabled in the UI
+    /// and its stored key is left alone. That gap is recorded here (and
+    /// reported as a production seam); this eval fails if a live key loses its
+    /// gate OR if the dead key gains one without the ledger being updated.
     @Test func multimodalPolicyKeysAreEnforcedWhereTheToggleClaimsTheyAre() throws {
         let repoRoot = try AppSourceScraping.repositoryRoot()
         let appRoot = try AppSourceScraping.appSourcesRoot()
@@ -242,11 +259,14 @@ struct SettingsSurfaceWiringEvalTests {
             }
         }
 
-        for live in ["screen_capture", "image_generation_openai", "tts_openai"] {
+        // 2026-09-06: a6feb944 closed the gap for vision and PDF — both are
+        // read fresh per turn, on every lane that can carry an attachment.
+        for live in ["screen_capture", "image_generation_openai", "tts_openai",
+                     "vision_api_calls", "file_ingestion_pdf"] {
             #expect(!(enforcement[live] ?? []).isEmpty,
                     "DEAD CONTROL: `\(live)` lost every enforcement read site — the toggle is now decoration")
         }
-        for dead in ["vision_api_calls", "file_ingestion_pdf", "file_ingestion_docx"] {
+        for dead in ["file_ingestion_docx"] {
             let sites = (enforcement[dead] ?? []).sorted()
             #expect(sites.isEmpty,
                     "GAP CLOSED? `\(dead)` gained a gate at \(sites) — move it to the live list and flip ledger row `setting.trust.multimodalPolicy`.")

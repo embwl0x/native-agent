@@ -124,9 +124,31 @@ extension ChatStore {
         }
         streamingHintsByMessageId[placeholderId] = reusePlaceholderId == nil ? "Sending" : "Retrying"
         let targetSessionID = selectedSessionID
+        // 2026-09-06: mint the correlation id HERE, before the transport await.
+        // It used to be learned only from the send's return value, so a Stop
+        // pressed while the send was still crossing to the Mac carried no run
+        // id at all and the Mac treated it as a legacy unscoped cancel.
+        let correlationID = UUID().uuidString
 
         sendTask?.cancel()
+        inFlightSendIDs.insert(correlationID)
+        // 2026-09-06: install the correlation → placeholder mapping BEFORE the
+        // transport await. The Mac can answer while `sendMessage` is still
+        // crossing; a reply that found no mapping was appended as a second
+        // bubble and left the placeholder streaming forever.
+        let pendingArgs = PendingSendArgs(
+            text: text,
+            sessionID: targetSessionID,
+            controls: controls,
+            attachments: attachments,
+            appendedUserId: appendedUserId
+        )
+        pendingICloudPlaceholders[correlationID] = placeholderId
+        pendingSendArgs[correlationID] = pendingArgs
+        canceledPendingIds.remove(correlationID)
+        timedOutPendingIds.removeValue(forKey: correlationID)
         sendTask = Task {
+            defer { inFlightSendIDs.remove(correlationID) }
             do {
                 let result = try await client.sendMessage(
                     text,
@@ -134,25 +156,37 @@ extension ChatStore {
                     controls: controls,
                     attachments: attachments,
                     suppressRemoteUserAppend: suppressRemoteUserAppend,
-                    replacementAssistantMessageID: replacementAssistantMessageID
+                    replacementAssistantMessageID: replacementAssistantMessageID,
+                    messageID: correlationID
                 )
                 guard !Task.isCancelled else { return }
                 switch result {
                 case .queuedMessageId(let messageId):
+                    // 2026-09-06: the mapping is installed before the transport
+                    // await precisely because the Mac can answer first — and
+                    // when it does, the reply path removes it, finishes the
+                    // bubble and drops `isLoading`. Reinstalling it here made
+                    // that finished turn pending again and armed a timeout that
+                    // later failed a reply the user had already read. Only a
+                    // correlation still waiting is re-armed.
+                    guard pendingICloudPlaceholders[correlationID] != nil,
+                          !resolvedICloudReplyIds.contains(messageId) else { return }
+                    if messageId != correlationID {
+                        // The transport named the run something else: move the
+                        // pre-installed mapping rather than leaving two.
+                        pendingICloudPlaceholders.removeValue(forKey: correlationID)
+                        pendingSendArgs.removeValue(forKey: correlationID)
+                    }
                     pendingICloudPlaceholders[messageId] = placeholderId
                     streamingHintsByMessageId[placeholderId] = "Sending"
                     canceledPendingIds.remove(messageId)
                     timedOutPendingIds.removeValue(forKey: messageId)
-                    pendingSendArgs[messageId] = PendingSendArgs(
-                        text: text,
-                        sessionID: targetSessionID,
-                        controls: controls,
-                        attachments: attachments,
-                        appendedUserId: appendedUserId
-                    )
+                    pendingSendArgs[messageId] = pendingArgs
                     armTimeout(for: messageId, placeholderId: placeholderId)
                     armReplyPoll(for: messageId, client: client)
                 case .reply(let reply, let responseSessionID):
+                    pendingICloudPlaceholders.removeValue(forKey: correlationID)
+                    pendingSendArgs.removeValue(forKey: correlationID)
                     if let responseSessionID, !responseSessionID.isEmpty {
                         if targetSessionID == nil {
                             migrateQueuedSends(from: nil, to: responseSessionID)
@@ -167,7 +201,14 @@ extension ChatStore {
                     onReply?(reply)
                 }
             } catch {
-                if !Task.isCancelled, let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
+                pendingICloudPlaceholders.removeValue(forKey: correlationID)
+                pendingSendArgs.removeValue(forKey: correlationID)
+                // 2026-09-06: a cancelled send no longer owns `isLoading` —
+                // whoever cancelled it (Stop, Steer, a newer send) does. This
+                // used to clear the loading state of the turn that replaced it,
+                // which also drained the queue on top of a live turn.
+                guard !Task.isCancelled else { return }
+                if let idx = messages.firstIndex(where: { $0.id == placeholderId }) {
                     // A reused (retry) bubble is the user's surviving context —
                     // never delete it on a failed replay; retry()'s onFailure
                     // restores its timed-out state + Retry affordance instead
@@ -191,11 +232,20 @@ extension ChatStore {
         if !queuedSendsForSelectedSession.isEmpty {
             pausedQueueSessionKeys.insert(queueSessionKey(selectedSessionID))
         }
+        // 2026-09-06: name the runs being stopped and freeze the session id
+        // BEFORE the local state is cleared. The cancel is asynchronous and a
+        // fresh send is admissible the moment isLoading drops; without both,
+        // that new turn could be the one the Mac cancels.
+        let stoppedSessionID = selectedSessionID
+        // 2026-09-06: a send whose transport call has not returned yet is a run
+        // the Mac may already be executing. Name it too, or this Stop goes out
+        // unscoped and cancels whatever holds the session.
+        let stoppedRunIDs = Array(Set(pendingICloudPlaceholders.keys).union(inFlightSendIDs))
         cancelActiveSendLocally()
         isLoading = false
         Task {
             do {
-                try await client.cancelChat(sessionID: selectedSessionID)
+                try await client.cancelChat(sessionID: stoppedSessionID, runIDs: stoppedRunIDs)
             } catch {
                 await MainActor.run {
                     errorBanner = "Stop requested, but the Mac did not confirm cancellation: \(error.localizedDescription)"
@@ -207,6 +257,7 @@ extension ChatStore {
     private func cancelActiveSendLocally() {
         sendTask?.cancel()
         sendTask = nil
+        inFlightSendIDs.removeAll()
         for pendingId in pendingICloudPlaceholders.keys {
             canceledPendingIds.insert(pendingId)
             // Retire the old correlation immediately. A late cancel/error/final
@@ -251,11 +302,15 @@ extension ChatStore {
         // confirmed. This prevents the steered message from racing the old
         // provider turn through the independent iCloud chat data plane.
         pausedQueueSessionKeys.insert(key)
+        let steeredSessionID = selectedSessionID
+        // Same window as Stop: a send still crossing to the Mac is a run this
+        // steer is replacing, so it belongs in the scope.
+        let steeredRunIDs = Array(Set(pendingICloudPlaceholders.keys).union(inFlightSendIDs))
         cancelActiveSendLocally()
         Task { @MainActor [weak self, weak client] in
             guard let self, let client else { return }
             do {
-                try await client.cancelChat(sessionID: selectedSessionID)
+                try await client.cancelChat(sessionID: steeredSessionID, runIDs: steeredRunIDs)
                 pausedQueueSessionKeys.remove(key)
                 isLoading = false
                 scheduleQueuedSendDrain()
@@ -331,14 +386,37 @@ extension ChatStore {
         }
     }
 
-    func regenerateLast(client: MacBridgeClient, controls: ChatRuntimeControls = .defaults) {
+    /// 2026-09-06: regenerate names the row the Mac must replace, and the Mac
+    /// requires that id to match exactly one persisted message. A reply
+    /// resolved over the bridge keeps the phone's placeholder UUID
+    /// (finishPlaceholder), which the Mac has never seen — regenerating on one
+    /// deleted the answer here and failed there. Only an id carried by a Mac
+    /// transcript snapshot can name the row, so the control waits for it.
+    var canRegenerateLast: Bool {
         guard !isLoading, !isSwitchingSession,
+              let assistantIndex = messages.lastIndex(where: { $0.role == .assistant }),
+              let user = messages[..<assistantIndex].last(where: { $0.role == .user }),
+              !user.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        return macPublishedMessageIDs.contains(messages[assistantIndex].id)
+    }
+
+    func regenerateLast(client: MacBridgeClient, controls: ChatRuntimeControls = .defaults) {
+        guard canRegenerateLast,
               let assistantIndex = messages.lastIndex(where: { $0.role == .assistant }),
               let user = messages[..<assistantIndex].last(where: { $0.role == .user })
         else { return }
         let prompt = user.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
         let replaced = messages.remove(at: assistantIndex)
+        // 2026-09-06: this answer is deliberately absent locally until the
+        // Mac's replacement lands, which is exactly what
+        // newestMacAssistantReply's fallback reads as "the reply we are
+        // waiting for". Without naming it, a snapshot built before the
+        // regeneration completed the turn with the answer being replaced and
+        // the real one was dropped as a straggler. One regenerate can be in
+        // flight at a time, so the set holds at most this id.
+        regeneratedAwayAssistantIDs = [replaced.id]
         let disposition = send(
             text: prompt,
             client: client,
@@ -347,14 +425,17 @@ extension ChatStore {
             suppressRemoteUserAppend: true,
             replacementAssistantMessageID: replaced.id,
             onFailure: { [weak self] in
-                guard let self,
-                      self.messages.contains(where: { $0.id == replaced.id }) == false else { return }
+                guard let self else { return }
+                self.regeneratedAwayAssistantIDs.remove(replaced.id)
+                guard self.messages.contains(where: { $0.id == replaced.id }) == false else { return }
                 self.messages.insert(replaced, at: min(assistantIndex, self.messages.count))
             }
         )
-        if disposition == .rejected,
-           messages.contains(where: { $0.id == replaced.id }) == false {
-            messages.insert(replaced, at: min(assistantIndex, messages.count))
+        if disposition == .rejected {
+            regeneratedAwayAssistantIDs.remove(replaced.id)
+            if messages.contains(where: { $0.id == replaced.id }) == false {
+                messages.insert(replaced, at: min(assistantIndex, messages.count))
+            }
         }
     }
 

@@ -589,6 +589,20 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
     #expect(ok, "KEY FINDING: COMPOSED PERSONAL shell must auto-dispatch with NO approval (reached_inner). It did not.")
 }
 
+/// THE ONE ASSERTION IN THIS FILE THAT MOVED, and only in its INPUT.
+///
+/// This case used to prove trust by handing the chain `verifiedSessionId:
+/// "telegram:12345"` and letting `resolvedChatId` parse "12345" back out of
+/// that string. One-thread-many-surfaces §1.2 deleted that parse from all five
+/// sites: a session id is a storage key, and anything able to choose one could
+/// choose its own trust with it.
+///
+/// The GATE'S DECISION is unchanged and that is exactly what this still pins —
+/// a trusted Telegram origin under active yolo reaches inner with no approval.
+/// The chat identity now arrives the way the live transport has bound it since
+/// 2026-06-09 (BackgroundLoopsAssembly+ChatSurfaces binds `verifiedChatId`),
+/// which is also how the sibling `allowedTelegramUser` case below has always
+/// worked. Inputs re-plumbed, verdict re-asserted, not re-decided.
 @Test func AutonomyGuardCharacterization_COMPOSED_trustedTelegram_yoloInstall_dispatchesNoApproval() async throws {
     let chain = try await composedChain(
         policy: yoloInstallConfirmPolicy(),
@@ -596,12 +610,14 @@ private func yoloInstallConfirmPolicy(developerMode: Bool = false) -> JSONValue 
         verifiedSessionId: "telegram:12345"
     )
 
-    let ok = await dispatched(
-        chain,
-        "install_app",
-        input: ["reason": .string("apply tested Swift build")],
-        surface: "telegram"
-    )
+    let ok = await ChatToolSessionContext.$verifiedChatId.withValue("12345") {
+        await dispatched(
+            chain,
+            "install_app",
+            input: ["reason": .string("apply tested Swift build")],
+            surface: "telegram"
+        )
+    }
 
     #expect(ok, "COMPOSED trusted Telegram install_app must reach inner without confirm/no-filer under active yolo")
 }

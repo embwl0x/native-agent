@@ -73,25 +73,43 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     public init(
         dataRoot: URL,
         dimensions: Int = 384,
-        loader: @escaping Loader = { lowMemory in
-            try CoreMLEmbeddingProvider.bundled(lowMemory: lowMemory)
-        },
-        availabilityProbe: @escaping AvailabilityProbe = { CoreMLEmbeddingProvider.bundledResourcesAvailable() }
+        loader: Loader? = nil,
+        availabilityProbe: AvailabilityProbe? = nil
     ) {
         self.dataRoot = dataRoot
-        self.loader = loader
-        self.availabilityProbe = availabilityProbe
+        // The defaults see the data root so an installed extras model
+        // (`extras/coreml/embedding.json`) wins over the bundled one.
+        self.loader = loader ?? { lowMemory in
+            try CoreMLEmbeddingProvider.bundled(extrasRoot: dataRoot, lowMemory: lowMemory)
+        }
+        self.availabilityProbe = availabilityProbe ?? {
+            CoreMLEmbeddingProvider.bundledResourcesAvailable(extrasRoot: dataRoot)
+        }
         self.mock = MockEmbeddingProvider(dimensions: dimensions)
     }
 
+    /// The id of the CoreML model that would load: the installed extras model
+    /// when present, else the bundled one.
+    private var resolvedModelID: String {
+        CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)?.modelID
+            ?? CoreMLEmbeddingProvider.bundledModelID
+    }
+
     public var dimensions: Int {
-        lock.withLock { state.coreMLProvider?.dimensions ?? mock.dimensions }
+        if let loaded = lock.withLock({ state.coreMLProvider?.dimensions }) { return loaded }
+        // Not resident yet: report the model that WOULD load, not the mock's
+        // width, so status surfaces do not read "384d" beside a 1024-d model.
+        if Self.readConfig(dataRoot: dataRoot).backend != Self.mockBackend,
+           let installed = CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
+            return installed.dimensions
+        }
+        return mock.dimensions
     }
 
     public var modelId: String {
         let config = Self.readConfig(dataRoot: dataRoot)
         guard config.backend != Self.mockBackend else { return mock.modelId }
-        return lock.withLock { state.coreMLProvider?.modelId ?? "all-MiniLM-L6-v2" }
+        return lock.withLock { state.coreMLProvider?.modelId ?? resolvedModelID }
     }
 
     public var embeddingEpoch: MemoryEmbeddingEpoch {
@@ -104,7 +122,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
            !availabilityProbe() {
             return mock.embeddingEpoch
         }
-        return (try? CoreMLEmbeddingProvider.bundledEmbeddingEpoch())
+        return (try? CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: dataRoot))
             ?? FailClosedEmbeddingProvider(dimensions: mock.dimensions).embeddingEpoch
     }
 
@@ -217,7 +235,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             let modelId: String = {
                 if !requestedCoreML { return mock.modelId }
                 if let loadedProvider { return loadedProvider.modelId }
-                return resourcesAvailable ? "all-MiniLM-L6-v2" : mock.modelId
+                return resourcesAvailable ? resolvedModelID : mock.modelId
             }()
             return EmbeddingRuntimeSnapshot(
                 requestedBackend: config.backend,

@@ -9,6 +9,12 @@ struct MemoryView: View {
     @StateObject private var store = MemoryStore()
     @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var segment: MemorySegment
+    /// Sweep 2026-09-01 item 36 — local filter over the memory snapshot the
+    /// phone has ALREADY synced. The Mac's semantic recall runs in-process
+    /// against SwiftNativeMemoryV2 and is not exposed on the action channel,
+    /// so there is no Mac search API to prefer here; inventing one would be a
+    /// new remote surface, not a search box.
+    @State private var searchQuery = ""
     /// `false` when pushed as a navigationDestination from another
     /// NavigationStack (e.g. ActivityView → Memory Proposals). Nesting
     /// NavigationStacks causes the destination to render and immediately
@@ -18,6 +24,17 @@ struct MemoryView: View {
     enum MemorySegment: String, CaseIterable {
         case memories = "Memories"
         case proposals = "Proposals"
+    }
+
+    /// The Mac snapshot group behind each tab. They fail INDEPENDENTLY —
+    /// `memories` and `memory_proposals` are separate fetches on the Mac — so a
+    /// badge pinned to one group leaves the other tab looking fresh while the
+    /// Mac already knows its rows are old.
+    static func snapshotGroup(for segment: MemorySegment) -> String {
+        switch segment {
+        case .memories: return "memories"
+        case .proposals: return "memory_proposals"
+        }
     }
 
     init(initialSegment: MemorySegment = .memories, embedInNavigationStack: Bool = true) {
@@ -56,13 +73,23 @@ struct MemoryView: View {
             Group {
                 switch segment {
                 case .memories:
-                    MemoryListView(store: store)
+                    MemoryListView(store: store, searchQuery: searchQuery)
+                        .searchable(
+                            text: $searchQuery,
+                            placement: .navigationBarDrawer(displayMode: .always),
+                            prompt: "Search memories"
+                        )
                 case .proposals:
                     ProposalsListView(store: store)
                 }
             }
         }
         .navigationTitle("Memory")
+        // Sweep 2026-09-01 item 2: Memory renders Mac-owned rows and had no
+        // freshness badge at all, so a group the Mac failed to rebuild read as
+        // current memory. The badge follows the visible tab, because Memories
+        // and Proposals come from two independently-failing Mac groups.
+        .macSnapshotFreshnessBadge(group: Self.snapshotGroup(for: segment))
         .macSyncErrorBanner()
         .toolbar {
             // Sweep R4 C11.4. SyncBadge only appears once the snapshot is
@@ -283,10 +310,54 @@ final class MemoryStore: ObservableObject {
 
 // MARK: - Memories list
 
+/// Sweep 2026-09-01 item 36. Memory was delete-only with no way to find the
+/// row you meant to delete. This is a pure local filter over rows the phone
+/// has already synced — it never claims to have searched anything the Mac
+/// holds and the phone has not received.
+enum MemorySearchPresentation {
+    /// Empty means "no filter", never "no rows". Whitespace is not a query.
+    static func normalizedQuery(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    static func matches(_ memory: MemoryRecord, query: String) -> Bool {
+        let needle = normalizedQuery(query)
+        guard !needle.isEmpty else { return true }
+        if memory.text.lowercased().contains(needle) { return true }
+        if memory.layer.lowercased().contains(needle) { return true }
+        return memory.tags?.contains { $0.lowercased().contains(needle) } ?? false
+    }
+
+    static func filter(_ memories: [MemoryRecord], query: String) -> [MemoryRecord] {
+        let needle = normalizedQuery(query)
+        guard !needle.isEmpty else { return memories }
+        return memories.filter { matches($0, query: needle) }
+    }
+
+    /// Why the list is empty. A filtered-to-nothing list must never borrow the
+    /// "waiting for iCloud" copy — that would blame the sync for the query.
+    enum EmptyState: Equatable {
+        case noSyncedMemories
+        case noMatches(String)
+    }
+
+    static func emptyState(visibleCount: Int, syncedCount: Int, query: String) -> EmptyState? {
+        guard visibleCount == 0 else { return nil }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, syncedCount > 0 { return .noMatches(trimmed) }
+        return .noSyncedMemories
+    }
+}
+
 struct MemoryListView: View {
     @ObservedObject var store: MemoryStore
+    var searchQuery: String = ""
     @State private var selectedMemory: MemoryRecord?
     @State private var pendingDeleteMemory: MemoryRecord?
+
+    private var visibleMemories: [MemoryRecord] {
+        MemorySearchPresentation.filter(store.memories, query: searchQuery)
+    }
 
     private var isDeleteConfirmationPresented: Binding<Bool> {
         Binding(
@@ -299,18 +370,34 @@ struct MemoryListView: View {
 
     var body: some View {
         List {
-            if store.memories.isEmpty {
-                AppEmptyState(
-                    title: "No memories",
-                    systemImage: "brain.head.profile",
-                    kind: .unavailable,
-                    description: "Memories will appear here after iCloud sync."
-                )
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
+            if let emptyState = MemorySearchPresentation.emptyState(
+                visibleCount: visibleMemories.count,
+                syncedCount: store.memories.count,
+                query: searchQuery
+            ) {
+                switch emptyState {
+                case .noSyncedMemories:
+                    AppEmptyState(
+                        title: "No memories",
+                        systemImage: "brain.head.profile",
+                        kind: .unavailable,
+                        description: "Memories will appear here after iCloud sync."
+                    )
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                case .noMatches(let query):
+                    AppEmptyState(
+                        title: "No matches",
+                        systemImage: "magnifyingglass",
+                        kind: .empty,
+                        description: "No synced memory matches \u{201c}\(query)\u{201d}."
+                    )
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                }
             } else {
                 // PATCH-2026-05-07: polish-MemoryView importance-tinted layer badge, richer tag pills
-                ForEach(store.memories) { memory in
+                ForEach(visibleMemories) { memory in
                     let importance = memory.importance
                     let importanceTint: Color = importance > 0.7 ? .orange : importance > 0.4 ? .blue : .secondary
                     let isDeleting = store.deletingMemoryIDs.contains(memory.id)

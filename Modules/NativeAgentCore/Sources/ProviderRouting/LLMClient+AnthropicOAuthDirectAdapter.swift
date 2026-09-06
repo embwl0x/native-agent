@@ -22,7 +22,7 @@ import PersistenceCore
 //   anthropic-beta: claude-code-20250219,oauth-2025-04-20,
 //                   fine-grained-tool-streaming-2025-05-14
 //   x-app: cli
-//   user-agent: claude-cli/1.0.0
+//   user-agent: claude-cli/2.1.257
 //   anthropic-dangerous-direct-browser-access: true
 //
 // Token storage shape (matches NativeOAuthFlow.persistTokens for anthropic):
@@ -101,7 +101,50 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         "oauth-2025-04-20",
         "fine-grained-tool-streaming-2025-05-14",
     ]
-    private static let claudeCLIVersion = "1.0.0"
+    /// Rides ONLY on requests that actually carry a `clear_at` message.
+    static let midConversationSystemClearAtBeta =
+        "mid-conversation-system-clear-at-2026-08-21"
+
+    /// ONE beta-assembly rule for every Anthropic transport (OAuth headers
+    /// below, and both api-key lanes, which otherwise send no
+    /// `anthropic-beta` header at all): the clear_at beta is present IFF a
+    /// message in THIS request carries the flag. A lane that emitted
+    /// `clear_at` in the body without this header would 400.
+    static func clearAtBeta(for messages: [LLMMessage]) -> String? {
+        messages.contains { $0.turnScopedClearAtNextUserMessage }
+            ? midConversationSystemClearAtBeta
+            : nil
+    }
+
+    /// Rides ONLY on requests that actually carry a `tool_addition` /
+    /// `tool_removal` block.
+    static let midConversationToolChangesBeta =
+        "mid-conversation-tool-changes-2026-07-01"
+
+    /// Same rule as `clearAtBeta`, for the tool-change blocks: present IFF a
+    /// message in THIS request carries one. A body with tool-change blocks and
+    /// no header is a 400; a header with no blocks would opt every ordinary
+    /// request into a beta it does not use.
+    static func toolChangeBeta(for messages: [LLMMessage]) -> String? {
+        messages.contains { !$0.toolChanges.isEmpty }
+            ? midConversationToolChangesBeta
+            : nil
+    }
+
+    /// The full comma-joined `anthropic-beta` value the MID-CONVERSATION
+    /// features need for this request, or nil when it needs none. One
+    /// assembly rule for every Anthropic transport: both api-key lanes send
+    /// this header ONLY when it is non-nil, so a request that uses neither
+    /// feature stays byte-identical to the pre-2026-09 wire.
+    static func midConversationBetas(for messages: [LLMMessage]) -> String? {
+        let betas = [clearAtBeta(for: messages), toolChangeBeta(for: messages)]
+            .compactMap { $0 }
+        return betas.isEmpty ? nil : betas.joined(separator: ",")
+    }
+    // Anthropic gates newer models (Fable 5.1: "version 2.1.251 or newer is
+    // required", error_code claude_code_version_too_old) on this version. Keep it
+    // at the Claude Code release actually installed on this Mac.
+    private static let claudeCLIVersion = "2.1.257"
     /// Anthropic's API gates OAuth-mode on this EXACT string being the first
     /// system block.
     private static let claudeCodeIdentity =
@@ -136,11 +179,29 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         return parsed
     }
 
-    private static func apiHeaders(accessToken: String) -> [String: String] {
+    /// Per-request header assembly. The STATIC beta list is unchanged; the
+    /// mid-conversation-system clear_at beta is added ONLY when a message in
+    /// THIS request actually carries the flag, so every existing request stays
+    /// byte-identical on the wire.
+    ///
+    /// `model` is accepted so the call site reads as a per-request tuple and a
+    /// future model-conditional beta has a home. The capability gate itself
+    /// (`supportsMidConversationSystemClearAt`) is enforced UPSTREAM, where the
+    /// flag is set: an adapter that silently dropped the beta while the body
+    /// still carried `clear_at` would turn a builder bug into a 400.
+    static func apiHeaders(
+        accessToken: String,
+        model: String? = nil,
+        messages: [LLMMessage] = []
+    ) -> [String: String] {
+        var betas = oauthBetaFeatures
+        if let midConversation = midConversationBetas(for: messages) {
+            betas.append(midConversation)
+        }
         return [
             "Authorization":      "Bearer \(accessToken)",
             "anthropic-version":  anthropicVersion,
-            "anthropic-beta":     oauthBetaFeatures.joined(separator: ","),
+            "anthropic-beta":     betas.joined(separator: ","),
             "x-app":              "cli",
             "user-agent":         "claude-cli/\(claudeCLIVersion)",
             "anthropic-dangerous-direct-browser-access": "true",
@@ -446,28 +507,144 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     // non-Sendable mutable global under Swift 6 strict concurrency.
     static var ephemeralCacheControl: [String: Any] { ["type": "ephemeral"] }
 
-    /// Mark the current append-only request boundary and, when budget permits,
-    /// retain the preceding request boundary. Each loop/turn appends an
-    /// assistant response and a user/tool-result message, so the prior request
-    /// ended at `count - 3`. Retaining that exact marker lets Anthropic read
-    /// the established prefix before creating only the newly appended delta.
+    /// `cache_control` with an explicit TTL. `nil` ttl → the plain 5-minute
+    /// ephemeral dict, BYTE-IDENTICAL to `ephemeralCacheControl` (the `ttl`
+    /// key is absent, not `"5m"`, so no legacy body changes). `"1h"` is the
+    /// GA extended TTL — no beta header required.
+    static func ephemeralCacheControl(ttl: String?) -> [String: Any] {
+        guard let ttl, !ttl.isEmpty else { return ephemeralCacheControl }
+        return ["type": "ephemeral", "ttl": ttl]
+    }
+
+    // MESSAGE-ORDER CONTRACT (live 400, 2026-09-01): a mid-conversation
+    // system message must IMMEDIATELY FOLLOW a user turn and either end the
+    // array or precede an assistant turn. The seeded v2 shape is therefore
+    //     [ history… , assistant(N-1), user(N), system(volatile) ]
+    // with the system message LAST, and within-turn rounds append AFTER it
+    // (assistant tool_use, user tool_result, …). The three index helpers
+    // below all read that shape; none of them may ever return a `.system`
+    // index, because a system message must never carry cache_control.
+
+    /// The CURRENT TURN's user message.
+    ///
+    /// AUTHORITATIVE SOURCE: `ConversationPrefixBoundary.currentUserIndex`,
+    /// bound per turn by the seeding layer, which knows the answer exactly.
+    /// Validated before use (in range, and actually a `.user` message) so a
+    /// stale binding degrades to the fallback instead of mis-marking.
+    ///
+    /// FALLBACK — anchor on the TRAILING SYSTEM RUN, never on
+    /// `lastIndex(.system)`. Replayed history carries ARCHIVED system blocks
+    /// of its own, positioned after their own user messages. When the turn's
+    /// volatile block is not delivered as a system message — it was empty, or
+    /// the model has no mid-conversation system support — `lastIndex(.system)`
+    /// selects one of those archived blocks, and the cross-turn 1h marker
+    /// lands near the START of the conversation, caching almost nothing. That
+    /// is a silent, expensive miss, so this reads only a system run that ENDS
+    /// the array (the seeded shape) and otherwise answers nil: no cross-turn
+    /// marker at all beats one in the wrong place.
+    static func currentTurnUserIndex(_ messages: [LLMMessage]) -> Int? {
+        if let bound = ConversationPrefixBoundary.currentUserIndex,
+           messages.indices.contains(bound),
+           messages[bound].role == .user {
+            return bound
+        }
+        guard let last = messages.indices.last, messages[last].role == .system
+        else { return nil }
+        var runStart = last
+        while runStart > 0, messages[runStart - 1].role == .system { runStart -= 1 }
+        return messages[..<runStart].lastIndex { $0.role == .user }
+    }
+
+    /// Where the CURRENT (5m) boundary marker goes: the newest message that
+    /// is NOT a system message. In the seeded shape that is exactly the
+    /// current user message (the system message is last); once a within-turn
+    /// round has appended past the trailing system it is the newest appended
+    /// message, so the next round still reads the whole established prefix.
+    static func currentBoundaryIndex(_ messages: [LLMMessage]) -> Int? {
+        messages.lastIndex { $0.role != .system }
+    }
+
+    /// The v2 PREVIOUS-TURN boundary: the last ASSISTANT message strictly
+    /// before the current turn's user message — the end of the transcript
+    /// prefix this turn re-sends verbatim, so a marker there is the read the
+    /// next turn is built on. Anchored on the current USER message, not on
+    /// the system message and not on the current boundary: anchoring on
+    /// either would let a within-turn round stamp THIS turn's own assistant
+    /// tool_use with the cross-turn 1h TTL. Unlike the v1 `count - 3`
+    /// arithmetic it stays correct however many messages the turn appended.
+    static func previousTurnBoundaryIndex(_ messages: [LLMMessage]) -> Int? {
+        guard let userIndex = currentTurnUserIndex(messages) else { return nil }
+        return messages[..<userIndex].lastIndex { $0.role == .assistant }
+    }
+
+    /// Completed prior turns visible in this request, counted as assistant
+    /// messages — which on v2 includes every assistant message the history
+    /// projection REPLAYED, so a resumed session is credited with the turns
+    /// it actually carries rather than restarting from zero. Gates the
+    /// speculative 1h write: a one-shot (0 or 1 prior turns) would pay the
+    /// 2x extended-TTL write premium with no expected reader (1h needs three
+    /// reads to break even, against two for 5m).
+    static func priorTurnCount(_ messages: [LLMMessage]) -> Int {
+        messages.reduce(0) { $0 + ($1.role == .assistant ? 1 : 0) }
+    }
+
+    /// ONE extended-TTL decision for the WHOLE request.
+    ///
+    /// ORDERING RULE (Anthropic): entries with the longer TTL must appear
+    /// BEFORE shorter ones — a 1h entry may not sit behind a 5m entry in the
+    /// tools → system → messages render order. The tools breakpoint is always
+    /// FIRST, so it can never be shorter than the system or message markers;
+    /// deciding the TTL once, here, and handing the same value to
+    /// `makeToolList`, `makeSystemBlocks` and the previous-turn boundary is
+    /// what makes that structural instead of a rule three call sites have to
+    /// remember. The current-turn boundary is always LAST and always 5m, which
+    /// the rule permits.
+    ///
+    /// Returns nil (plain 5m ephemeral, no `ttl` key on the wire) unless the
+    /// request is a v2 prefix turn carrying at least two completed turns.
+    static func requestLongTTL(
+        usesPrefixShape: Bool,
+        messages: [LLMMessage]
+    ) -> String? {
+        guard usesPrefixShape, priorTurnCount(messages) >= 2 else { return nil }
+        return "1h"
+    }
+
+    /// Mark the current append-only request boundary and, when a previous
+    /// boundary index is supplied, the preceding one. Both indices are
+    /// explicit: v1 passes `count - 3` / `count - 1`; v2 passes
+    /// `previousTurnBoundaryIndex` / `currentBoundaryIndex`. TTLs are
+    /// explicit too — the previous boundary is the CROSS-TURN read (1h), the
+    /// current boundary is re-read within this turn's own loop (5m — `nil`,
+    /// i.e. no `ttl` key on the wire, byte-identical to the legacy marker).
+    ///
+    /// INVARIANT, enforced HERE because this is the one place message markers
+    /// are written: a `system` message NEVER receives cache_control. The
+    /// volatile mid-conversation system message is turn-scoped (it may even
+    /// carry `clear_at`), so caching it is meaningless at best and pins
+    /// disappearing bytes into the prefix at worst.
     static func addConversationCacheControls(
         _ messages: inout [[String: Any]],
-        retainPreviousBoundary: Bool
+        previousBoundaryIndex: Int?,
+        currentBoundaryIndex: Int?,
+        previousBoundaryTTL: String? = nil,
+        currentBoundaryTTL: String? = nil
     ) {
-        func mark(_ index: Int) {
+        func mark(_ index: Int, ttl: String?) {
             guard messages.indices.contains(index),
+                  messages[index]["role"] as? String != "system",
                   var content = messages[index]["content"] as? [[String: Any]],
                   var lastBlock = content.last else { return }
-            lastBlock["cache_control"] = ephemeralCacheControl
+            lastBlock["cache_control"] = ephemeralCacheControl(ttl: ttl)
             content[content.count - 1] = lastBlock
             messages[index]["content"] = content
         }
-        if retainPreviousBoundary, messages.count >= 3 {
-            mark(messages.count - 3)
+        if let previousBoundaryIndex,
+           previousBoundaryIndex != currentBoundaryIndex {
+            mark(previousBoundaryIndex, ttl: previousBoundaryTTL)
         }
-        if !messages.isEmpty {
-            mark(messages.count - 1)
+        if let currentBoundaryIndex {
+            mark(currentBoundaryIndex, ttl: currentBoundaryTTL)
         }
     }
 
@@ -530,23 +707,76 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     /// cache-write premium with ~zero read probability, hence the gate.
     /// (Unsegmented fallback: the combined sys block already carries the
     /// end-of-system breakpoint; nothing extra to add.)
+    ///
+    /// V2 PREFIX SHAPE (`ConversationPrefixShape.v2Prefix`, production default,
+    /// engaged only when the segments are present and reassemble):
+    ///   [identity — NO cache_control] [stable] [stableSuffix?] [dynamic?]
+    /// The identity block is a strict PREFIX of the stable mass, so a
+    /// breakpoint at the end of the stable mass already caches it; its own
+    /// breakpoint bought nothing and spent one of the four slots. The freed
+    /// slot funds the previous-turn conversation boundary marker. The LAST
+    /// stable block (stableSuffix when present, else stable) carries the
+    /// single system breakpoint, at the GA 1h TTL when `longTTL` says so —
+    /// see `requestLongTTL`, which also keeps the tools breakpoint at the
+    /// same TTL so the render order never puts 5m ahead of 1h. An empty `dynamic`
+    /// emits no dynamic block at all.
+    /// Byte faithfulness is unchanged: separators ride as SUFFIXES on the
+    /// preceding block, so the emitted non-identity block texts concatenate to
+    /// `sys` exactly.
     static func makeSystemBlocks(
         _ system: String?,
         segments: SystemPromptSegments? = LLMCallContext.systemSegments,
-        toolCapable: Bool = false
+        toolCapable: Bool = false,
+        longTTL: String? = nil
     ) -> [[String: Any]] {
+        let usesPrefixShape = usesV2PrefixShape(system, segments: segments)
         var blocks: [[String: Any]] = [
-            [
-                "type": "text",
-                "text": claudeCodeIdentity,
-                "cache_control": ephemeralCacheControl,
-            ],
+            usesPrefixShape
+                ? [
+                    "type": "text",
+                    "text": claudeCodeIdentity,
+                ]
+                : [
+                    "type": "text",
+                    "text": claudeCodeIdentity,
+                    "cache_control": ephemeralCacheControl,
+                ],
         ]
         guard let sys = system, !sys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return blocks
         }
+        if usesPrefixShape, let seg = segments {
+            // Separator suffixes: each emitted block carries the "\n\n" that
+            // joins it to the NEXT emitted block, so the concatenation of the
+            // block texts is `sys` byte-for-byte.
+            let hasSuffix = !seg.stableSuffix.isEmpty
+            let hasDynamic = !seg.dynamic.isEmpty
+            let stableTTL: String? = longTTL
+            var stableBlock: [String: Any] = [
+                "type": "text",
+                "text": seg.stable + ((hasSuffix || hasDynamic) ? "\n\n" : ""),
+            ]
+            if !hasSuffix {
+                stableBlock["cache_control"] = ephemeralCacheControl(ttl: stableTTL)
+            }
+            blocks.append(stableBlock)
+            if hasSuffix {
+                blocks.append([
+                    "type": "text",
+                    "text": seg.stableSuffix + (hasDynamic ? "\n\n" : ""),
+                    "cache_control": ephemeralCacheControl(ttl: stableTTL),
+                ])
+            }
+            if hasDynamic {
+                blocks.append([
+                    "type": "text",
+                    "text": seg.dynamic,
+                ])
+            }
+            return blocks
+        }
         if let seg = segments,
-           !seg.stable.isEmpty, !seg.dynamic.isEmpty,
+           !seg.stable.isEmpty, !seg.dynamic.isEmpty, seg.stableSuffix.isEmpty,
            seg.reassembles(into: sys)
         {
             // Stable block carries the "\n\n" separator as its suffix so
@@ -581,10 +811,88 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         return blocks
     }
 
+    /// Every `cache_control` marker present on a finished request body, in
+    /// Anthropic's render order (tools → system → messages). Derived from the
+    /// BODY, not from the placement code, so the telemetry row proves what
+    /// actually shipped. Positions and TTLs only — no prompt bytes.
+    static func cacheMarkers(in body: [String: Any]) -> [LLMCacheMarker] {
+        func ttl(_ container: [String: Any]) -> String? {
+            guard let cc = container["cache_control"] as? [String: Any] else { return nil }
+            // The 5m default is the ABSENT `ttl` key on the wire.
+            return (cc["ttl"] as? String) ?? "5m"
+        }
+        var out: [LLMCacheMarker] = []
+        for (i, tool) in (body["tools"] as? [[String: Any]] ?? []).enumerated() {
+            if let t = ttl(tool) { out.append(.init(position: "tools[\(i)]", ttl: t)) }
+        }
+        for (i, block) in (body["system"] as? [[String: Any]] ?? []).enumerated() {
+            if let t = ttl(block) { out.append(.init(position: "system[\(i)]", ttl: t)) }
+        }
+        for (i, message) in (body["messages"] as? [[String: Any]] ?? []).enumerated() {
+            for block in (message["content"] as? [[String: Any]] ?? []) {
+                if let t = ttl(block) { out.append(.init(position: "messages[\(i)]", ttl: t)) }
+            }
+        }
+        return out
+    }
+
+    /// Three-way wire role. `.system` is the MID-CONVERSATION system message
+    /// (Anthropic accepts it inside `messages`); the turn-level system prompt
+    /// still travels in the top-level `system` blocks.
+    static func wireRole(_ role: LLMMessage.Role) -> String {
+        switch role {
+        case .user: return "user"
+        case .assistant: return "assistant"
+        case .system: return "system"
+        }
+    }
+
+    /// Which prefix shape this REQUEST actually emits.
+    ///
+    /// READS THE BOUND TASK-LOCAL ONLY — never `ConversationPrefixShape
+    /// .effective`. The shape is decided ONCE per turn, at the history
+    /// builder's seeding boundary, and bound around the whole call: a turn
+    /// that seeded no replayed history seeds the v1 shape and binds
+    /// `.v1Legacy`, and the adapter must then emit the v1 bytes exactly.
+    /// If the adapter re-derived the shape from `.effective` it would answer
+    /// `.v2Prefix` on that turn — dropping the identity breakpoint and adding
+    /// a current-message breakpoint to a request the builder shaped as v1.
+    /// Unbound (every non-chat caller: dream, REM, executions, tests) →
+    /// `.v1Legacy`, i.e. byte-identical to the pre-v2 wire.
+    ///
+    /// v2 additionally needs the compat lever off AND segments that
+    /// make it representable: a non-empty stable segment that reassembles
+    /// byte-for-byte into the combined `system` string. Same safety guard as
+    /// v1 — a stale or caller-mutated binding falls back to the legacy arm
+    /// rather than changing model-visible content — but it tolerates an EMPTY
+    /// `dynamic` (the cross-turn shape legitimately has none once history has
+    /// moved into the message array).
+    static func usesV2PrefixShape(
+        _ system: String?,
+        segments: SystemPromptSegments?
+    ) -> Bool {
+        guard ConversationPrefixShape.override == .v2Prefix,
+              !GrownPromptCompat.effective,
+              let sys = system,
+              !sys.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let seg = segments,
+              !seg.stable.isEmpty,
+              seg.reassembles(into: sys)
+        else { return false }
+        return true
+    }
+
     /// Anthropic Messages-API tools list with a cache_control breakpoint on
     /// the LAST definition. Returns nil for nil/empty input so the no-tools
     /// request body stays byte-identical to the no-tools overload.
-    static func makeToolList(_ tools: [LLMToolSchema]?) -> [[String: Any]]? {
+    /// `ttl` MUST match the request's system/message TTL decision — the
+    /// tools block renders FIRST, and a 5m entry there would sit ahead of a
+    /// 1h entry, which Anthropic rejects as an ordering violation. Defaults
+    /// to nil (plain 5m) so every non-v2 caller is byte-identical.
+    static func makeToolList(
+        _ tools: [LLMToolSchema]?,
+        ttl: String? = nil
+    ) -> [[String: Any]]? {
         guard let tools, !tools.isEmpty else { return nil }
         var toolList: [[String: Any]] = []
         for t in tools {
@@ -602,7 +910,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             }
             toolList.append(entry)
         }
-        toolList[toolList.count - 1]["cache_control"] = ephemeralCacheControl
+        toolList[toolList.count - 1]["cache_control"] = ephemeralCacheControl(ttl: ttl)
         return toolList
     }
 
@@ -644,19 +952,40 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // pre-item-8 body byte-identical (no trailing breakpoint, no
         // dynamic-end — single-shot turns have no within-turn reuse).
         let toolCapable = !(tools?.isEmpty ?? true)
+        // V2: EVERY turn is a prefix-reuse turn — the transcript is re-sent
+        // as a cached prefix across turns, not only inside one tool loop — so
+        // the conversation breakpoints are unconditional (still subject to
+        // trailing-eligibility and the compat lever). The v2 system-block
+        // shape only engages when the segments actually reassemble; when it
+        // does not, the identity block keeps its own breakpoint and there is
+        // no free slot, so no previous-turn boundary is marked.
+        let usesPrefixShape = Self.usesV2PrefixShape(
+            system, segments: LLMCallContext.systemSegments
+        )
         // Prove a conversation breakpoint CAN ship before
         // suppressing dynamic-end — an empty messages
         // array (or an empty last content) would otherwise lose BOTH
         // breakpoints silently. Eligibility on the source LLMMessages
         // mirrors the encoder exactly (every content block encodes to
         // one Anthropic block).
-        let trailingEligible = !(messages.last?.content.isEmpty ?? true)
+        // Eligibility is about the message the CURRENT marker would land on
+        // — the newest NON-system message, not `messages.last` (which is the
+        // volatile system message in the seeded v2 shape and can never be
+        // marked). An empty content array there would silently lose both
+        // markers.
+        let boundaryIndex = Self.currentBoundaryIndex(messages)
+        let trailingEligible = boundaryIndex.map { !messages[$0].content.isEmpty } ?? false
         let useConversationCache =
-            (toolCapable || MessagesCacheHint.withinTurnReuse)
+            (usesPrefixShape || toolCapable || MessagesCacheHint.withinTurnReuse)
             && trailingEligible
             && !Self.GrownPromptCompat.effective
+        let longTTL = Self.requestLongTTL(
+            usesPrefixShape: usesPrefixShape, messages: messages
+        )
         let systemBlocks = Self.makeSystemBlocks(
-            system, toolCapable: toolCapable && !useConversationCache
+            system,
+            toolCapable: toolCapable && !useConversationCache,
+            longTTL: longTTL
         )
 
         // Encode each LLMMessage as an Anthropic message with structured
@@ -701,17 +1030,55 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     ])
                 }
             }
-            anthropicMessages.append([
-                "role": m.role == .user ? "user" : "assistant",
+            var entry: [String: Any] = [
+                "role": Self.wireRole(m.role),
                 "content": blocks,
-            ])
+            ]
+            // Mid-conversation system message the provider drops as soon as
+            // the next user message arrives. The `clear_at` key rides on the
+            // MESSAGE, and its beta is added per-request in apiHeaders.
+            if m.turnScopedClearAtNextUserMessage {
+                entry["clear_at"] = "next_user_message"
+            }
+            anthropicMessages.append(entry)
         }
         if useConversationCache {
-            Self.addConversationCacheControls(
-                &anthropicMessages,
+            // v2: the previous boundary is the last assistant message before
+            // the volatile system message (funded by the identity block's
+            // freed slot) and reads at the request's long TTL. v1: the historical
+            // `count - 3` arithmetic, plain 5m, byte-identical.
+            // The CURRENT marker index is the same rule on both arms: the
+            // newest NON-system message. On v1 that is `count - 1` (v1 never
+            // carries a mid-conversation system message), so the legacy body
+            // stays byte-identical; the rule simply also holds the
+            // never-mark-a-system-message invariant if one ever appears.
+            let currentIndex = boundaryIndex
+            let previousBoundaryIndex: Int?
+            let previousBoundaryTTL: String?
+            if usesPrefixShape {
+                // Indices are computed on the SOURCE messages and applied to
+                // `anthropicMessages`: this encoder is 1:1 (every LLMMessage
+                // yields exactly one wire entry, empty content included), so
+                // the two arrays share indices.
+                previousBoundaryIndex = Self.previousTurnBoundaryIndex(messages)
+                previousBoundaryTTL = longTTL
+                // Budget: stable-end + previous + current + last tool = 4.
+                // Nothing else can ship a marker on v2, so this is closed.
+            } else {
                 // The text lane has one free fourth slot. Structured tools
                 // already spend it on the last tool definition.
-                retainPreviousBoundary: !toolCapable && MessagesCacheHint.withinTurnReuse
+                let retain = !toolCapable && MessagesCacheHint.withinTurnReuse
+                previousBoundaryIndex =
+                    (retain && anthropicMessages.count >= 3)
+                    ? anthropicMessages.count - 3
+                    : nil
+                previousBoundaryTTL = nil
+            }
+            Self.addConversationCacheControls(
+                &anthropicMessages,
+                previousBoundaryIndex: previousBoundaryIndex,
+                currentBoundaryIndex: currentIndex,
+                previousBoundaryTTL: previousBoundaryTTL
             )
         }
         var body: [String: Any] = [
@@ -723,7 +1090,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         if stream {
             body["stream"] = true
         }
-        if let toolList = Self.makeToolList(tools) {
+        if let toolList = Self.makeToolList(tools, ttl: longTTL) {
             body["tools"] = toolList
         }
         // Turn Inspector W2 — GATED summarized-thinking lane. The `thinking`
@@ -763,18 +1130,27 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     ) async throws -> String {
         let coercedModel = try Self.coerceToClaudeModel(model)
         let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
+        // User, 2026-09-06: the token the last attempt actually sent, handed to
+        // the forced refresh so a rotation another caller already performed is
+        // taken instead of burning a second single-use refresh_token — N
+        // simultaneous 401s otherwise rotated N times and signed the user out.
+        var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
             let accessToken: String
             do {
-                accessToken = try await ensureFreshAccessToken(forceRefresh: attempt == 1)
+                accessToken = try await ensureFreshAccessToken(
+                    forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+                lastSentAccessToken = accessToken
             } catch is CancellationError { throw CancellationError() }
             catch let err as LLMError { throw err }
             catch { throw LLMError.notConfigured(provider: "anthropic_oauth_direct") }
 
             var req = URLRequest(url: endpoint)
             req.httpMethod = "POST"
-            for (k, v) in Self.apiHeaders(accessToken: accessToken) {
+            for (k, v) in Self.apiHeaders(
+                accessToken: accessToken, model: coercedModel, messages: messages
+            ) {
                 req.setValue(v, forHTTPHeaderField: k)
             }
 
@@ -871,7 +1247,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
                 ttftMs: nil,
                 durationMs: durationMs,
-                substitutedFrom: substitutedFrom
+                substitutedFrom: substitutedFrom,
+                cacheMarkers: Self.cacheMarkers(in: body)
             )
             return pieces.joined(separator: "\n")
         }
@@ -890,11 +1267,18 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         // 401 once. Avoids the wave-27 double-rotate bug by NOT also
         // refreshing inline on the first 401 — just loops with
         // forceRefresh=true on the second pass.
+        // User, 2026-09-06: the token the last attempt actually sent, handed to
+        // the forced refresh so a rotation another caller already performed is
+        // taken instead of burning a second single-use refresh_token — N
+        // simultaneous 401s otherwise rotated N times and signed the user out.
+        var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
             let accessToken: String
             do {
-                accessToken = try await ensureFreshAccessToken(forceRefresh: attempt == 1)
+                accessToken = try await ensureFreshAccessToken(
+                    forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+                lastSentAccessToken = accessToken
             } catch is CancellationError {
                 throw CancellationError()
             } catch let err as LLMError {
@@ -1015,7 +1399,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
                 ttftMs: nil,
                 durationMs: durationMs,
-                substitutedFrom: substitutedFrom
+                substitutedFrom: substitutedFrom,
+                cacheMarkers: Self.cacheMarkers(in: body)
             )
             return pieces.joined(separator: "\n")
         }
@@ -1064,9 +1449,16 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         substitutedFrom: String?,
         continuation: AsyncThrowingStream<String, Error>.Continuation
     ) async throws {
+        // User, 2026-09-06: the token the last attempt actually sent, handed to
+        // the forced refresh so a rotation another caller already performed is
+        // taken instead of burning a second single-use refresh_token — N
+        // simultaneous 401s otherwise rotated N times and signed the user out.
+        var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
-            let accessToken = try await ensureFreshAccessToken(forceRefresh: attempt == 1)
+            let accessToken = try await ensureFreshAccessToken(
+                forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+            lastSentAccessToken = accessToken
 
             var req = URLRequest(url: endpoint)
             req.httpMethod = "POST"
@@ -1159,7 +1551,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                         usage: usage.isEmpty ? nil : usage,
                         ttftMs: ttftMs,
                         durationMs: durationMs,
-                        substitutedFrom: substitutedFrom
+                        substitutedFrom: substitutedFrom,
+                        cacheMarkers: Self.cacheMarkers(in: body)
                     )
                     if !yieldedAnyText {
                         throw FirstPartyExecutionControls.anthropicEmptyStreamError(
@@ -1246,13 +1639,22 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         substitutedFrom: String?,
         continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation
     ) async throws {
+        // User, 2026-09-06: the token the last attempt actually sent, handed to
+        // the forced refresh so a rotation another caller already performed is
+        // taken instead of burning a second single-use refresh_token — N
+        // simultaneous 401s otherwise rotated N times and signed the user out.
+        var lastSentAccessToken: String?
         for attempt in 0...1 {
             try Task.checkCancellation()
-            let accessToken = try await ensureFreshAccessToken(forceRefresh: attempt == 1)
+            let accessToken = try await ensureFreshAccessToken(
+                forceRefresh: attempt == 1, staleToken: lastSentAccessToken)
+            lastSentAccessToken = accessToken
 
             var req = URLRequest(url: endpoint)
             req.httpMethod = "POST"
-            for (k, v) in Self.apiHeaders(accessToken: accessToken) {
+            for (k, v) in Self.apiHeaders(
+                accessToken: accessToken, model: model, messages: messages
+            ) {
                 req.setValue(v, forHTTPHeaderField: k)
             }
             req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -1368,7 +1770,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             usage: usage.isEmpty ? nil : usage,
                             ttftMs: ttftMs,
                             durationMs: durationMs,
-                            substitutedFrom: substitutedFrom
+                            substitutedFrom: substitutedFrom,
+                            cacheMarkers: Self.cacheMarkers(in: body)
                         )
                         if !yieldedSemanticOutput {
                             throw FirstPartyExecutionControls.anthropicEmptyStreamError(
@@ -1505,7 +1908,10 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
     /// actor if the on-disk `expires_at` is within
     /// `tokenExpiryBufferSec` of now (or in the past), or if forceRefresh
     /// is set. Mirrors OpenAIOAuthDirectAdapter.ensureFreshAccessToken.
-    func ensureFreshAccessToken(forceRefresh: Bool = false) async throws -> String {
+    func ensureFreshAccessToken(
+        forceRefresh: Bool = false,
+        staleToken: String? = nil
+    ) async throws -> String {
         let path = resolveAuthPath()
         // Fast path — no refresh needed.
         if !forceRefresh, let (token, exp) = Self.loadAccessTokenAndExpiry(from: path) {
@@ -1526,6 +1932,17 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         return try await actor.run { [self] in
             // Re-read inside the critical section in case another waiter
             // already refreshed.
+            // User, 2026-09-06: the reread was skipped entirely on a forced
+            // refresh, so N simultaneous 401s each rotated in turn and every
+            // rotation invalidated the single-use refresh_token the next
+            // waiter was about to spend — a burst of parallel requests signed
+            // the user out. A forced refresh whose on-disk token has already
+            // moved past the one the failing request sent takes the new token.
+            if forceRefresh, let staleToken, !staleToken.isEmpty,
+               let (token, _) = Self.loadAccessTokenAndExpiry(from: path),
+               token != staleToken {
+                return token
+            }
             if !forceRefresh, let (token, exp) = Self.loadAccessTokenAndExpiry(from: path) {
                 if let exp = exp, exp.timeIntervalSinceNow > Self.tokenExpiryBufferSec {
                     return token
@@ -1534,6 +1951,12 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             }
             return try await self.refreshTokens()
         }
+    }
+
+    /// True when a signed-in Anthropic OAuth credential is on disk at this
+    /// adapter's own path (User, 2026-09-06 — see `OAuthCredentialPresence`).
+    var hasStoredOAuthCredential: Bool {
+        Self.loadAccessTokenAndExpiry(from: resolveAuthPath()) != nil
     }
 
     /// Read `(access_token, expires_at)` from the JSON. Returns nil if the
@@ -1614,6 +2037,11 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         ]
         var req = URLRequest(url: refreshEndpoint)
         req.httpMethod = "POST"
+        // User, 2026-09-06: the refresh holds the shared serial refresh actor,
+        // so it needs a bound of its own rather than the session's chat-sized
+        // request timeout — a hung token endpoint otherwise blocks every later
+        // turn's token read for minutes.
+        req.timeoutInterval = 30
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -1629,7 +2057,17 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             // A3.5: a 429/5xx during refresh is a provider-side hiccup, NOT a
             // dead token — surface transient so the session survives without a
             // needless "reconnect" prompt (the misreported-as-revoked bug).
-            if status == 429 || (500..<600).contains(status) {
+            // User, 2026-09-06: a refresh 429 folded into `.transient` threw
+            // the provider's own `Retry-After` away, so the reconnect ladder
+            // backed off on its own schedule and re-asked into the same limit.
+            // The chat call path already carries the header through
+            // `.rateLimited`; the refresh does now too.
+            if status == 429 {
+                throw LLMError.rateLimited(
+                    message: "anthropic_oauth_direct refresh HTTP 429 (temporary)",
+                    retryAfterSeconds: parseRetryAfterSeconds(from: response))
+            }
+            if (500..<600).contains(status) {
                 throw LLMError.transient(
                     message: "anthropic_oauth_direct refresh HTTP \(status) (temporary)")
             }
@@ -1647,13 +2085,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
 
         // Merge: keep client_id / scope / token_type / user_info; replace
         // access_token, refresh_token (if rotated), recompute expires_at.
-        var merged = obj
-        if let access = payload["access_token"] as? String, !access.isEmpty {
-            merged["access_token"] = access
-        }
-        if let newRefresh = payload["refresh_token"] as? String, !newRefresh.isEmpty {
-            merged["refresh_token"] = newRefresh
-        }
+        let rotatedAccess = (payload["access_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let rotatedRefresh = (payload["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         // expires_in is seconds-from-now. Compute an absolute timestamp.
         let expiresIn: Int = {
             if let i = payload["expires_in"] as? Int { return i }
@@ -1666,10 +2099,48 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(secondsFromGMT: 0)
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-        merged["expires_at"] = f.string(from: exp)
+        let rotatedExpiresAt = f.string(from: exp)
 
+        // User, 2026-09-06: sign-out (which deletes this file) and a fresh
+        // sign-in (which replaces it) both land while a refresh is in flight,
+        // and neither goes through the adapter's refresh queue. Writing the
+        // merged blob unconditionally resurrected a credential the user had
+        // just removed, or clobbered a newer one with the older account's
+        // tokens. The bytes read before the network call are the generation:
+        // if they moved, this refresh is stale and its write is skipped. The
+        // access token it minted is still valid, so the in-flight call is
+        // served from whatever credential now owns the file.
+        // User, 2026-09-06: the comparison and the write it guards now sit in
+        // ONE critical section on the credential path's shared lock, which the
+        // app's sign-in and sign-out take too — a compare followed by an
+        // unguarded write still lost every sign-out that landed between them.
+        // User, 2026-09-06: the generation is a digest of the TOKEN keys, not
+        // the file's bytes. `configureProvider` writes `default_model` into
+        // this same file, so saving provider settings during a refresh moved
+        // the bytes and made the refresh discard the token it had just
+        // rotated — burning the single-use refresh_token on disk. For the same
+        // reason the merge happens against what is on disk NOW, so a
+        // concurrent settings save survives the refresh's write.
+        let generation = CredentialFileLock.credentialGeneration(ofFileContents: data)
+        enum RefreshWrite { case wrote, superseded(String), supersededAndGone }
+        let outcome: RefreshWrite
         do {
-            try saveAuthBlob(merged, to: path)
+            outcome = try CredentialFileLock.withLock(path) { () -> RefreshWrite in
+                guard CredentialFileLock.credentialGeneration(ofFileAt: path) == generation else {
+                    guard let (current, _) = Self.loadAccessTokenAndExpiry(from: path) else {
+                        return .supersededAndGone
+                    }
+                    return .superseded(current)
+                }
+                var blob = (try? Data(contentsOf: path))
+                    .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                    ?? obj
+                if let rotatedAccess { blob["access_token"] = rotatedAccess }
+                if let rotatedRefresh { blob["refresh_token"] = rotatedRefresh }
+                blob["expires_at"] = rotatedExpiresAt
+                try saveAuthBlob(blob, to: path)
+                return .wrote
+            }
         } catch {
             // Single-use refresh_token already rotated server-side — a
             // swallowed persist failure burns the on-disk credential and
@@ -1682,7 +2153,18 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
             )
         }
 
-        guard let newAccess = merged["access_token"] as? String, !newAccess.isEmpty else {
+        switch outcome {
+        case .superseded(let current):
+            // Another writer owns the file now. Its credential is the live one.
+            return current
+        case .supersededAndGone:
+            throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
+        case .wrote:
+            break
+        }
+
+        guard let newAccess = rotatedAccess ?? (obj["access_token"] as? String),
+              !newAccess.isEmpty else {
             throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
         }
         return newAccess

@@ -262,18 +262,15 @@ struct DreamsView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 16) {
             controlBar
-            Divider()
 
             if let banner = DreamErrorBannerPresentation.banner(for: appModel.dreamError) {
-                Label(banner.text, systemImage: "exclamationmark.triangle.fill")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(NativeAgentTheme.fail)
+                Text(banner.text)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, NativeAgentSpacing.lg)
-                    .padding(.vertical, NativeAgentSpacing.sm)
-                    .background(NativeAgentTheme.fail.opacity(0.08))
                     .accessibilityLabel("Dreams error: \(banner.text)")
             }
 
@@ -299,118 +296,110 @@ struct DreamsView: View {
 
     // ── Controls ──────────────────────────────────────────────────────────────
     private var controlBar: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-            HStack(spacing: NativeAgentSpacing.md) {
-                Button {
-                    runDream()
-                } label: {
-                    if isRunningDream {
-                        Label("Dreaming…", systemImage: "hourglass")
-                    } else {
-                        Label("Run Dream Now", systemImage: "moon.stars")
+        VStack(alignment: .leading, spacing: 12) {
+            AdvancedCard {
+                HStack(spacing: 8) {
+                    Button {
+                        runDream()
+                    } label: {
+                        Text(isRunningDream ? "Dreaming…" : "Run a dream pass")
                     }
-                }
-                .disabled(isRunningDream || !canRunDream)
-                .help(dreamRunHelp)
+                    .disabled(isRunningDream || !canRunDream)
+                    .help(dreamRunHelp)
 
-                Button {
-                    runRem()
-                } label: {
-                    if isRunningRem {
-                        Label("Consolidating…", systemImage: "hourglass")
-                    } else {
-                        Label("Run REM Now", systemImage: "sparkles")
+                    Button {
+                        runRem()
+                    } label: {
+                        Text(isRunningRem ? "Consolidating…" : "Run a REM pass")
                     }
-                }
-                .disabled(isRunningRem || !remRunAvailability.canRun)
-                .help(remRunAvailability.help)
+                    .disabled(isRunningRem || !remRunAvailability.canRun)
+                    .help(remRunAvailability.help)
 
-                Spacer()
+                    Spacer()
 
-                Button {
-                    refresh()
-                } label: {
-                    if isLoadingDiary {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
+                    Button {
+                        refresh()
+                    } label: {
+                        if isLoadingDiary {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Refresh")
+                        }
                     }
+                    .help("Refresh the dream diary")
+                    .disabled(isLoadingDiary)
                 }
-                .help("Refresh the dream diary")
-                .disabled(isLoadingDiary)
-            }
 
-            HStack(spacing: NativeAgentSpacing.xl) {
-                Toggle("Dream cycle enabled", isOn: Binding(
-                    get: { dreamCycleOn },
-                    set: { newValue in
-                        guard !savingDream else { return }
-                        dreamCycleOn = newValue          // optimistic — no snap-back
-                        savingDream = true
-                        Task {
-                            let ok = await appModel.setDreamCycleEnabled(newValue)
-                            if ok {
-                                // Both gates moved together; re-read the composite.
-                                await loadDiary(selectLatest: false)
-                            } else {
-                                // Save failed — revert the optimistic flip and keep
-                                // the error visible (don't reload, which clears it).
-                                dreamCycleOn = !newValue
+                HStack(spacing: 24) {
+                    Toggle("Dream cycle enabled", isOn: Binding(
+                        get: { dreamCycleOn },
+                        set: { newValue in
+                            guard !savingDream else { return }
+                            dreamCycleOn = newValue          // optimistic — no snap-back
+                            savingDream = true
+                            Task {
+                                let ok = await appModel.setDreamCycleEnabled(newValue)
+                                if ok {
+                                    // Both gates moved together; re-read the composite.
+                                    await loadDiary(selectLatest: false)
+                                } else {
+                                    // Save failed — revert the optimistic flip and keep
+                                    // the error visible (don't reload, which clears it).
+                                    dreamCycleOn = !newValue
+                                }
+                                savingDream = false
                             }
-                            savingDream = false
                         }
-                    }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .disabled(savingDream)
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .disabled(savingDream)
 
-                Toggle("REM cycle enabled", isOn: Binding(
-                    get: { remCycleOn },
-                    set: { newValue in
-                        guard !savingRem else { return }
-                        remCycleOn = newValue            // optimistic — no snap-back
-                        savingRem = true
-                        Task {
-                            let ok = await appModel.setRemCycleEnabled(newValue)
-                            // On success reconcile from the saved policy; on failure
-                            // revert the optimistic flip (error stays visible).
-                            remCycleOn = ok ? remEnabled : !newValue
-                            savingRem = false
+                    Toggle("REM cycle enabled", isOn: Binding(
+                        get: { remCycleOn },
+                        set: { newValue in
+                            guard !savingRem else { return }
+                            remCycleOn = newValue            // optimistic — no snap-back
+                            savingRem = true
+                            Task {
+                                let ok = await appModel.setRemCycleEnabled(newValue)
+                                // On success reconcile from the saved policy; on failure
+                                // revert the optimistic flip (error stays visible).
+                                remCycleOn = ok ? remEnabled : !newValue
+                                savingRem = false
+                            }
                         }
-                    }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .disabled(savingRem)
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .disabled(savingRem)
 
-                Spacer()
+                    Spacer()
+                }
+                .font(ShellType.label)
             }
-            .font(NativeAgentFont.label)
 
             if let banner = diaryRefreshPresentation.banner {
-                Label(banner, systemImage: "exclamationmark.triangle")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(NativeAgentTheme.fail)
+                Text(banner)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
             }
             if let remRunFeedback {
-                Label(remRunFeedback.message, systemImage: remRunFeedback.systemImage)
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(remRunFeedback.isSuccess ? Color.secondary : NativeAgentTheme.fail)
+                Text(remRunFeedback.message)
+                    .font(ShellType.label)
+                    .foregroundStyle(remRunFeedback.isSuccess ? NativeAgentShell.secondary : NativeAgentShell.trouble)
             }
             if let diaryTotalEntries, diaryTotalEntries > entries.count {
                 Text("Showing \(entries.count) of \(diaryTotalEntries) dreams. Narrowing is not available in this view yet.")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             if let label = DreamDiaryListPresentation.unreadableLabel(diaryUnreadableEntries) {
-                Label(label, systemImage: "exclamationmark.triangle")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.orange)
+                Text(label)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
             }
         }
-        .padding(.horizontal, NativeAgentSpacing.lg)
-        .padding(.vertical, NativeAgentSpacing.md)
     }
 
     // ── Content (master/detail, with empty + loading states) ────────────────────
@@ -418,35 +407,26 @@ struct DreamsView: View {
     private var content: some View {
         if entries.isEmpty {
             if isLoadingDiary {
-                ProgressView("Loading dream diary…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                AdvancedWaitingLine("Reading the dream diary…")
             } else if diaryRefreshPresentation.unavailableEmptyState {
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "Dream diary unavailable",
                     detail: "The diary could not be read, so this is not evidence that no dreams have been recorded.",
-                    systemImage: "exclamationmark.triangle",
                     actionTitle: "Retry",
-                    actionImage: "arrow.clockwise",
                     action: { refresh() }
                 )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if case .incomplete(let unreadableEntries) = diaryListPresentation {
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "Dream diary incomplete",
                     detail: "\(unreadableEntries) diary file\(unreadableEntries == 1 ? "" : "s") could not be read, so this is not evidence that no dreams have been recorded.",
-                    systemImage: "exclamationmark.triangle",
                     actionTitle: "Retry",
-                    actionImage: "arrow.clockwise",
                     action: { refresh() }
                 )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                NativeEmptyState(
+                AdvancedEmptyState(
                     title: "No dreams yet",
-                    detail: emptyDiaryDetail,
-                    systemImage: "moon.zzz"
+                    detail: emptyDiaryDetail
                 )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else {
             HSplitView {
@@ -468,7 +448,8 @@ struct DreamsView: View {
                     DreamDateRow(entry: entry)
                         .tag(entry.date)
                 }
-                .listStyle(.sidebar)
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
                 .frame(minWidth: 200, idealWidth: 240)
 
                 // Right: selected entry, rendered readably.
@@ -481,30 +462,26 @@ struct DreamsView: View {
     @ViewBuilder
     private var detailPanel: some View {
         if case .loading = entryDetailPresentation {
-            ProgressView("Loading entry…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            AdvancedWaitingLine("Reading this dream…")
         } else if case .entry = entryDetailPresentation, let entry = selectedEntry {
             ScrollView {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                    HStack(spacing: NativeAgentSpacing.sm) {
-                        Image(systemName: "moon.stars")
-                            .foregroundStyle(.purple)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 8) {
                         Text(entry.date)
-                            .font(NativeAgentFont.title)
+                            .font(ShellType.bodySemibold)
+                            .foregroundStyle(NativeAgentShell.text)
                         Spacer()
                         if let modified = entry.modified_at {
                             Text(shortTimestamp(modified))
-                                .font(NativeAgentFont.tag)
-                                .foregroundStyle(.tertiary)
+                                .font(ShellType.caption)
+                                .foregroundStyle(NativeAgentShell.tertiary)
                         }
                     }
 
-                    Divider()
-
                     if entry.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Text("This entry is empty.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
                     } else {
                         ForEach(Array(entry.content.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
                             dreamLine(line)
@@ -512,28 +489,25 @@ struct DreamsView: View {
                     }
                 }
                 .textSelection(.enabled)
-                .padding(NativeAgentSpacing.lg)
+                .padding(.horizontal, 16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else if case let .failed(entryLoadError) = entryDetailPresentation {
-            NativeEmptyState(
+            AdvancedEmptyState(
                 title: "Couldn't load this dream",
                 detail: entryLoadError,
-                systemImage: "exclamationmark.triangle",
                 actionTitle: "Retry",
-                actionImage: "arrow.clockwise",
                 action: {
                     if let selectedDate { loadEntry(date: selectedDate) }
                 }
             )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, 16)
         } else {
-            NativeEmptyState(
+            AdvancedEmptyState(
                 title: "Select a dream",
-                detail: "Pick a date on the left to read that night's entry.",
-                systemImage: "hand.tap"
+                detail: "Pick a date on the left to read that night's entry."
             )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, 16)
         }
     }
 
@@ -542,28 +516,35 @@ struct DreamsView: View {
     private func dreamLine(_ raw: String) -> some View {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty {
-            Spacer().frame(height: 4)
+            Spacer().frame(height: 8)
         } else if trimmed.hasPrefix("# ") {
             Text(LocalizedStringKey(String(trimmed.dropFirst(2))))
-                .font(.title3.weight(.bold))
-                .padding(.top, 4)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
+                .padding(.top, 8)
         } else if trimmed.hasPrefix("## ") {
             Text(LocalizedStringKey(String(trimmed.dropFirst(3))))
-                .font(.headline)
-                .padding(.top, 2)
+                .font(ShellType.labelSemibold)
+                .foregroundStyle(NativeAgentShell.text)
+                .padding(.top, 8)
         } else if trimmed.hasPrefix("### ") {
             Text(LocalizedStringKey(String(trimmed.dropFirst(4))))
-                .font(.subheadline.weight(.semibold))
+                .font(ShellType.labelSemibold)
+                .foregroundStyle(NativeAgentShell.secondary)
         } else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
-            HStack(alignment: .top, spacing: 6) {
-                Text("•").foregroundStyle(.secondary)
+            HStack(alignment: .top, spacing: 8) {
+                Text("•")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.tertiary)
                 Text(LocalizedStringKey(String(trimmed.dropFirst(2))))
-                    .font(.callout)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.text)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else {
             Text(LocalizedStringKey(raw))
-                .font(.callout)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -746,21 +727,17 @@ private struct DreamDateRow: View {
     let entry: DreamEntry
 
     var body: some View {
-        HStack(spacing: NativeAgentSpacing.sm) {
-            Image(systemName: "moon.stars.fill")
-                .font(.caption)
-                .foregroundStyle(.purple.opacity(0.7))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(entry.date)
-                    .font(NativeAgentFont.body)
-                if let size = entry.size {
-                    Text("\(size) bytes")
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.tertiary)
-                }
+        VStack(alignment: .leading, spacing: 2) {
+            Text(entry.date)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
+            if let size = entry.size {
+                Text("\(size) bytes")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
             }
-            Spacer()
         }
-        .padding(.vertical, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 48)
     }
 }

@@ -656,28 +656,49 @@ struct DetachedPanelScrollThrottleTests {
         #expect(detachedCapture.contains("case .rejected(let message)"))
     }
 
-    /// Throttle-only. The panel must route streaming deltas through the shared
-    /// coordinator AND must not gain the `autoFollow` disarm, which is the held
-    /// NEEDS-USER behavior change.
-    @Test func panel_throttles_streaming_deltas_without_adding_disarm() throws {
+    /// Throttle, and follow control. The panel must route streaming deltas
+    /// through the shared coordinator, and it must disarm auto-follow from the
+    /// same sources the main window does.
+    ///
+    /// 2026-09-06: this used to hold the disarm OUT of the panel as a
+    /// NEEDS-USER behaviour change. e54cae49 ("Chat shell: drafts, dictation and
+    /// tool receipts stay with their conversation; failure copy says only what
+    /// is known") landed it on purpose — its body: "Detached panel: it never
+    /// disarmed scroll-follow, so a reader could not get out of the way of a
+    /// streaming reply. It installs the main window's scroll-wheel and drag
+    /// handling and stops scrolling on append while follow is disarmed." So the
+    /// pin flips from ABSENCE to SYMMETRY: the panel must reach the disarm
+    /// through the same shared decision owner the main window uses, and must
+    /// re-arm, or a reader who scrolls back is stranded off the stream.
+    @Test func panel_throttles_streaming_deltas_and_disarms_follow_like_the_main_window() throws {
         let source = try AppSourceScraping.appSource("DetachedChatPanelView.swift")
         #expect(source.contains("@State private var scrollCoordinator = ChatScrollCoordinator()"))
         #expect(source.contains("scrollCoordinator.scrollToBottom("),
                 "streaming deltas must go through the coordinator")
         #expect(source.contains("scrollCoordinator.markViewDisappeared()"),
                 "a scheduled scroll must be invalidated when the panel closes")
-        // Executable calls only — the file's own doc comment NAMES the held
-        // behavior ("nothing in this panel ever calls disarmFollow()"), so a
-        // raw substring check would fail on the explanation of the rule.
-        #expect(AppSourceScraping.executableCalls(named: "disarmFollow", in: source).isEmpty,
-                "autoFollow disarm is a behavior change held as NEEDS-USER — it must not land here")
-        #expect(AppSourceScraping.executableCalls(named: "forceFollow", in: source).isEmpty,
-                "forceFollow is part of the same held disarm/rearm behavior")
+        // Executable calls only — the file's own comments NAME both calls while
+        // explaining why they are there, so a raw substring check would match
+        // the prose.
+        #expect(!AppSourceScraping.executableCalls(named: "disarmFollow", in: source).isEmpty,
+                "a reader must be able to get out of the way of a streaming reply")
+        #expect(!AppSourceScraping.executableCalls(named: "forceFollow", in: source).isEmpty,
+                "scrolling back to the bottom must re-arm, or the panel never follows again")
+        // The two input sources the main window disarms on (ChatView.swift:1187
+        // and :1197), installed here verbatim rather than reinvented.
+        #expect(source.contains("DragGesture(minimumDistance: 4).onChanged"),
+                "a drag on the transcript disarms follow, as in the main window")
+        #expect(source.contains("ChatViewportPresentation.scrollFollowAction("),
+                "the wheel's disarm/re-arm decision stays in the one shared owner")
+        #expect(source.contains("case .disarm:") && source.contains("case .rearm:"),
+                "both halves of that decision must be handled, not just the disarm")
     }
 
-    /// The coordinator's `autoFollow` gate is a no-op in the panel only because
-    /// it starts armed and nothing there disarms it. If that default ever
-    /// flips, the panel silently stops following the stream.
+    /// The coordinator's `autoFollow` gate starts armed, so a panel that is
+    /// only ever appended to follows the stream from its first delta.
+    /// 2026-09-06: it is no longer a no-op there — e54cae49 gave the panel the
+    /// main window's disarm — but the armed DEFAULT is still what makes the
+    /// untouched case follow. If it ever flips, both windows silently stop.
     @MainActor
     @Test func coordinator_starts_armed_so_the_gate_is_a_noop_for_the_panel() {
         #expect(ChatScrollCoordinator().autoFollow == true)

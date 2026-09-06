@@ -71,13 +71,6 @@ extension SwiftNativeSecurityCenter {
             .filter { !$0.isEmpty }
     }
 
-    static func telegramChatId(fromSessionId sessionId: String?) -> String? {
-        guard let sessionId else { return nil }
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("telegram:") else { return nil }
-        return String(trimmed.dropFirst("telegram:".count))
-    }
-
     static func trustedWorkspaceRoots(
         policy: [String: JSONValue],
         filePolicy: [String: JSONValue],

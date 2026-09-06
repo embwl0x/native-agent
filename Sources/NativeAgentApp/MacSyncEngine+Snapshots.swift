@@ -427,7 +427,11 @@ extension MacSyncEngine {
             var providers: [ProviderInfo]?
             if includeHeavySnapshots {
                 do { skills = try await api.getSkills() } catch { recordFetchFailure("skills_snapshot", error) }
-                do { memories = try await api.getMemories() } catch { recordFetchFailure("memories", error) }
+                do {
+                    memories = try await Self.retryingCancelledGroupRead("memories") {
+                        try await api.getMemories()
+                    }
+                } catch { recordFetchFailure("memories", error) }
                 do { connectors = try await api.getConnectors() } catch { recordFetchFailure("connectors", error) }
                 do { toolCatalog = try await api.getChatToolCatalogSnapshot() } catch {
                     recordFetchFailure("tools_snapshot", error)
@@ -646,6 +650,9 @@ extension MacSyncEngine {
                 await write(sessions, to: "sessions.json")
                 let pinnedSessions = pinnedChatSessions(from: sessions)
                 await write(pinnedSessions, to: "pinned_chat_sessions.json")
+                if let anchor = chatAnchorSnapshot() {
+                    await write(anchor, to: "chat_anchor.json")
+                }
                 if includeTranscriptSnapshots {
                     let transcriptSessions = transcriptSnapshotSessions(from: sessions, pinnedSessions: pinnedSessions)
                     let transcripts: [ChatTranscriptSnapshot] = transcriptSessions.isEmpty
@@ -687,6 +694,15 @@ extension MacSyncEngine {
                 attemptedGroups: attemptedSnapshotGroups,
                 dataRoot: NativeAgentPaths.dataRoot
             )
+            // Sweep 2026-09-01 item 2: the skip record above is LOCAL. Publish
+            // the same per-group truth into the bundle so the phone's Memory
+            // and Knowledge Graph screens can say they are holding old rows
+            // instead of rendering them as current.
+            if let stalenessMarker = Self.snapshotStalenessMarkerData(
+                unresolvedGroups: unresolvedSnapshotGroups
+            ) {
+                await writeData(stalenessMarker, to: Self.snapshotStalenessFilename)
+            }
             if snapshotFetchFailures.isEmpty, unresolvedSnapshotGroups.isEmpty {
                 syncError = nil
             } else {
@@ -721,6 +737,7 @@ extension MacSyncEngine {
                 guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
                 if !published, iCloudBridge.shared.usesCloudKitDeviceTransport {
                     syncError = "iPhone snapshot publication failed for \(changedGroups.map(\.rawValue).sorted().joined(separator: ", ")). The last proven phone data was retained."
+                    forgetSnapshotDigests(for: changedSnapshotFilenames)
                 }
                 if !iCloudBridge.shared.usesCloudKitDeviceTransport {
                     let snapshotStamp = ISO8601DateFormatter().string(from: Date())
@@ -796,6 +813,9 @@ extension MacSyncEngine {
 
         await write(sessions, filename: "sessions.json")
         await write(pinnedSessions, filename: "pinned_chat_sessions.json")
+        if let anchor = chatAnchorSnapshot() {
+            await write(anchor, filename: "chat_anchor.json")
+        }
         if includeTranscripts {
             let selected = transcriptSnapshotSessions(
                 from: sessions,
@@ -819,6 +839,7 @@ extension MacSyncEngine {
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         if !published, iCloudBridge.shared.usesCloudKitDeviceTransport {
             syncError = "iPhone chat snapshot publication failed. The last proven phone conversation was retained."
+            forgetSnapshotDigests(for: changedFilenames)
         } else if writeFailures.isEmpty {
             syncError = nil
         }
@@ -837,8 +858,30 @@ extension MacSyncEngine {
         saveSnapshotDigests()
     }
 
+    /// The human's own pins, with the conversation anchor merged in FRONT.
+    ///
+    /// The anchor is the remote conversation User is currently in, on whichever
+    /// surface published it. Merging rather than WRITING it into
+    /// `pinned_session_ids.json` is deliberate: an auto-write would fight the
+    /// human every time they unpinned it, and would rewrite the file (and
+    /// re-publish the phone snapshot) on every `/new`.
+    ///
+    /// Nothing here knows which surface the anchor came from, and nothing may.
     private func pinnedChatSessionIds() -> [String] {
-        MacPinnedChatSessionStore.load()
+        ConversationAnchor.merged(into: MacPinnedChatSessionStore.load())
+    }
+
+    /// The anchor as the phone consumes it: one small file in the same `.core`
+    /// group as `sessions.json` and `pinned_chat_sessions.json`, so it arrives
+    /// on the same edge as the sessions it refers to.
+    ///
+    /// The phone can already SEE the anchor session (it is first in
+    /// `pinned_chat_sessions.json`), but "first in a list" is an implicit
+    /// contract nobody wrote down. This file states the fact outright, so the
+    /// phone can pin and default to it for the same reason the Mac does rather
+    /// than by inferring it from ordering.
+    private func chatAnchorSnapshot() -> ConversationAnchorPin? {
+        ConversationAnchor.current()
     }
 
     private func pinnedChatSessions(from sessions: [ChatSession]) -> [ChatSession] {
@@ -872,17 +915,166 @@ extension MacSyncEngine {
                 || (($0.source ?? "").lowercased() == "ios" && ($0.sourceKey ?? "").isEmpty))
                 && $0.archived != true
         }))
-        for session in pinnedSessions {
+        // 2026-09-06: the pins used to ride into a flat `prefix(8)` downstream,
+        // so a pin past the eighth entry got no transcript at all — and the
+        // phone, which can only reread this snapshot, opened it as an empty
+        // chat that could never fill. Every pin the phone can select is
+        // published now. Past the ceiling the NEWEST pins win, and an older
+        // one reads as "history not synced" on the phone instead of as empty.
+        let remainingPins = pinnedSessions.filter { !seen.contains($0.id) && $0.archived != true }
+        let room = max(0, Self.transcriptSnapshotSessionCeiling - out.count)
+        // 2026-09-06: newest-first ALWAYS, not only when the count ceiling
+        // bites. `chatTranscriptSnapshots` also drops the tail of this list
+        // when the group's byte budget runs out, so the tail has to be the
+        // oldest pins whichever bound does the dropping.
+        let selectedPins = Array(
+            remainingPins
+                .sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
+                .prefix(room)
+        )
+        for session in selectedPins {
             append(session)
         }
         return out
     }
 
+    /// 2026-09-06: publication is the half that actually reaches the phone, and
+    /// the digest map is what suppresses the next write. The digest was recorded
+    /// on a successful FILE write, so a publication that then failed left the
+    /// phone without the bytes and every later pass reporting `.unchanged` — the
+    /// snapshot was never retried for as long as its content stayed the same.
+    /// Forgetting the digests of the files whose publication failed makes the
+    /// next pass rewrite and republish exactly those files.
+    private func forgetSnapshotDigests(for filenames: Set<String>) {
+        guard !filenames.isEmpty else { return }
+        for filename in filenames {
+            snapshotFileDigests.removeValue(forKey: filename)
+        }
+        saveSnapshotDigests()
+    }
+
+    /// The hard ceiling on published transcripts. Each one is bounded to 80
+    /// rows of at most 6,000 characters (`compactTranscriptMessages`), so the
+    /// worst case stays a small snapshot file.
+    static let transcriptSnapshotSessionCeiling = 16
+
+    /// The byte budget for the `.chat` snapshot group, measured on the encoded
+    /// `chat_transcripts.json` payload.
+    ///
+    /// 2026-09-06: the count ceiling alone is not a size bound. Sixteen
+    /// sessions of eighty 6,000-character rows encode far past the transport's
+    /// contract (`NAMobileSnapshotStatusCodec`: 8 MiB uncompressed, 800 KiB for
+    /// the published status value), and breaching either throws — which fails
+    /// the WHOLE chat publication, so the phone gets no transcript for ANY
+    /// session instead of a smaller set. Budget under the contract, publish
+    /// newest-first until it is spent, and let the omitted sessions read as
+    /// "History not synced" on the phone.
+    ///
+    /// Sized against what the codec really produces, not against the raw file:
+    /// the payload carries the file base64-expanded (×4/3), and zlib over
+    /// base64 text recovers only ~6×, so the 800 KiB status cap is the binding
+    /// half. Measured on hard-to-compress prose, a 3 MiB file already reaches
+    /// 682 KiB of status value and a 4 MiB one breaches it. 2 MiB lands near
+    /// 455 KiB — headroom for content that compresses worse, and still every
+    /// transcript in any ordinary chat.
+    static let chatTranscriptGroupByteBudget = 2 * 1024 * 1024
+
     private func chatTranscriptSnapshots(for sessions: [ChatSession], api: NativeClient) async -> [ChatTranscriptSnapshot] {
         var out: [ChatTranscriptSnapshot] = []
-        for session in sessions.prefix(8) {
-            guard let messages = try? await api.getChatMessages(sessionId: session.id) else { continue }
-            out.append(ChatTranscriptSnapshot(sessionId: session.id, messages: compactTranscriptMessages(messages)))
+        var retained: [String: ChatTranscriptBlock] = [:]
+        // The array framing the blocks ride in: "[" + "]".
+        var used = 2
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .sortedKeys
+        // 2026-09-06: the selection above is already bounded by
+        // `transcriptSnapshotSessionCeiling` and knows which rows are mains and
+        // which are pins. The flat `prefix(8)` that used to live here did not,
+        // so it dropped pinned sessions the phone could still select.
+        for session in sessions {
+            let block: ChatTranscriptBlock
+            // 2026-09-06: a transcript only changes when its generation moves,
+            // so reuse the block published for that generation instead of
+            // re-reading history. Without this every completion edge cost up to
+            // sixteen sequential history reads to republish fifteen unchanged
+            // transcripts.
+            if let generation = session.transcriptGeneration,
+               let cached = chatTranscriptBlockCache[session.id],
+               cached.generation == generation {
+                block = cached
+            } else {
+                guard let messages = try? await api.getChatMessages(sessionId: session.id) else { continue }
+                let snapshot = ChatTranscriptSnapshot(
+                    sessionId: session.id,
+                    messages: compactTranscriptMessages(messages),
+                    transcriptGeneration: session.transcriptGeneration
+                )
+                // An unencodable block is treated as unaffordable rather than
+                // free, so it can never be the one that breaches the contract.
+                let encodedBytes = (try? encoder.encode(snapshot))?.count
+                    ?? Self.chatTranscriptGroupByteBudget
+                block = ChatTranscriptBlock(
+                    generation: session.transcriptGeneration,
+                    snapshot: snapshot,
+                    encodedBytes: encodedBytes
+                )
+            }
+            // Each block after the first also carries its separating comma.
+            let cost = block.encodedBytes + (out.isEmpty ? 0 : 1)
+            guard used + cost <= Self.chatTranscriptGroupByteBudget else { break }
+            used += cost
+            out.append(block.snapshot)
+            if block.generation != nil {
+                retained[session.id] = block
+            }
+        }
+        // Only what was published this pass stays cached, so the cache is bound
+        // by the same budget the file is.
+        chatTranscriptBlockCache = retained
+        // 2026-09-06: the version above came from the session list read BEFORE
+        // these transcripts. A write landing in between shipped newer bytes
+        // under an older counter, and the phone orders published transcripts by
+        // that counter — so the genuinely newer publish that followed looked no
+        // newer and was refused. Read the counter a second time now that every
+        // transcript is in hand: a session whose counter did not move was not
+        // written during the whole window, so its bytes and its version are the
+        // same state. Anything that moved is dropped from THIS pass — the write
+        // that moved it publishes a consistent pair on the next one.
+        //
+        // 2026-09-06: a session MISSING from the reread is not a match. The map
+        // used to omit both a row that had vanished and a legacy row carrying
+        // no counter, and `nil == nil` passed the filter for both — so a
+        // session whose index row was removed mid-pass still shipped. Absence
+        // now means "the row moved": drop it. A row that is present but has no
+        // counter (an older Mac build) still publishes, exactly as before.
+        guard let generationsAfter = Self.currentTranscriptGenerations() else { return out }
+        return out.filter { snapshot in
+            guard let after = generationsAfter[snapshot.sessionId] else { return false }
+            return after == snapshot.transcriptGeneration
+        }
+    }
+
+    /// The transcript version each session's index row carries right now, or nil
+    /// when the index could not be read (in which case the caller keeps today's
+    /// behaviour rather than publishing nothing).
+    ///
+    /// EVERY row present in the index gets an entry, with a nil value for a row
+    /// that carries no counter — a missing KEY therefore means the row itself
+    /// is gone, which is not the same answer as "this row has no counter".
+    private nonisolated static func currentTranscriptGenerations() -> [String: Int?]? {
+        let path = NativeAgentPaths.dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
+        guard let rows = try? ChatSessionIndexFile.loadObjectRowsForMutation(at: path) else {
+            return nil
+        }
+        var out: [String: Int?] = [:]
+        for row in rows {
+            guard case .string(let id)? = row["id"] else { continue }
+            out.updateValue(
+                ChatSessionIndexFile.transcriptGeneration(in: row).map { Int(clamping: $0) },
+                forKey: id
+            )
         }
         return out
     }
@@ -1022,7 +1214,9 @@ extension MacSyncEngine {
 
     private func nativeKnowledgeGraphSnapshotData() async -> SnapshotGroupBuild {
         do {
-            return .built(try await NativeClient.canonicalKnowledgeGraphSnapshotData())
+            return .built(try await Self.retryingCancelledGroupRead("knowledge_graph") {
+                try await NativeClient.canonicalKnowledgeGraphSnapshotData()
+            })
         } catch {
             NSLog(
                 "[MacSyncEngine] canonical knowledge graph unreadable — keeping last good snapshot: %@",
@@ -1174,6 +1368,59 @@ extension MacSyncEngine {
 }
 
 extension MacSyncEngine {
+    /// Sweep 2026-09-01 item 2: the phone's Memory and Knowledge Graph screens
+    /// held yesterday's rows because those two group reads lost a race and threw
+    /// `Swift.CancellationError` — a lost race, not a decision, and the pass
+    /// recorded a durable skip on the first one.
+    nonisolated static func snapshotReadWasCancelled(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        let nsError = error as NSError
+        return nsError.domain.contains("CancellationError")
+    }
+
+    /// Read a snapshot group, retrying EXACTLY once when the first attempt was
+    /// cancelled while this pass itself is still live. A pass that is genuinely
+    /// cancelled retries nothing — the second read would fail identically and
+    /// the caller must still record the skip.
+    static func retryingCancelledGroupRead<T>(
+        _ label: String,
+        _ read: () async throws -> T
+    ) async throws -> T {
+        do {
+            return try await read()
+        } catch {
+            guard snapshotReadWasCancelled(error), !Task.isCancelled else { throw error }
+            NSLog(
+                "[MacSyncEngine] snapshot group %@ read was cancelled — retrying once before calling the phone stale",
+                label
+            )
+            return try await read()
+        }
+    }
+
+    /// The staleness marker the phone renders per screen.
+    ///
+    /// `snapshot_skips.json` is LOCAL Mac bookkeeping (Doctor reads it), so a
+    /// skipped group was invisible on the device that was showing the stale
+    /// rows. This publishes the same group→reason map into the snapshot bundle
+    /// iOS already decodes.
+    ///
+    /// Deliberately carries NO timestamp: the file's digest drives snapshot
+    /// publication, and a per-pass timestamp would wake the phone with a
+    /// changed core group on every single tick. A healthy pass publishes `{}`
+    /// rather than deleting the file, because the phone's CloudKit cache only
+    /// ever gains files — a deleted marker would badge Memory as stale forever.
+    nonisolated static let snapshotStalenessFilename = "snapshot_staleness.json"
+
+    nonisolated static func snapshotStalenessMarkerData(
+        unresolvedGroups: [String: String]
+    ) -> Data? {
+        let groups = unresolvedGroups.filter { !$0.key.hasPrefix("_") }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(groups)
+    }
+
     /// Reconcile one pass with durable stale-state truth. A lightweight pass
     /// must not clear a heavyweight group's prior failure merely because that
     /// group was not attempted. Successfully attempted groups are cleared;

@@ -25,7 +25,7 @@ extension TelegramPollLoop {
             return true
         }
         guard let card = await turnCoordinator.controlCard(
-            chatId: parsed.chatId,
+            destination: parsed.destination,
             turnId: parsed.turnId
         ) else {
             await answerTurnControlCallback(
@@ -78,15 +78,15 @@ extension TelegramPollLoop {
                 update: update
             )
             _ = await requestLiveTurnStop(
-                chatId: parsed.chatId,
+                destination: parsed.destination,
                 turnId: parsed.turnId
             )
         }
         return true
     }
 
-    func refreshLiveTurnCard(chatId: Int) async -> Bool {
-        guard let card = await turnCoordinator.activeCard(chatId: chatId) else {
+    func refreshLiveTurnCard(destination: TelegramDestination) async -> Bool {
+        guard let card = await turnCoordinator.activeCard(destination: destination) else {
             return false
         }
         await card.showStatus()
@@ -94,11 +94,11 @@ extension TelegramPollLoop {
     }
 
     func requestLiveTurnStop(
-        chatId: Int,
+        destination: TelegramDestination,
         turnId: UUID? = nil
     ) async -> TelegramTurnCoordinator.StopOutcome {
         await turnCoordinator.requestStop(
-            chatId: chatId,
+            destination: destination,
             turnId: turnId,
             confirmationTimeoutNanoseconds: turnStopConfirmationNanoseconds,
             sleeper: turnCardSleeper

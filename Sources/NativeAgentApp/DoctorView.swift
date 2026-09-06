@@ -339,7 +339,10 @@ struct DoctorView: View {
 
     private var groupedChecks: [(String, [DoctorCheck])] {
         guard let checks = appModel.doctorReport?.checks else { return [] }
-        let order = ["Provider", "Runtime", "Connectors", "Data", "Tools", "Autonomy", "Release"]
+        let order = [
+            "Provider", "Runtime", "Cognition", "Connectors", "Data", "Tools",
+            "Autonomy", "Release",
+        ]
         let grouped = Dictionary(grouping: checks, by: category)
         return order.compactMap { key in
             guard let values = grouped[key], !values.isEmpty else { return nil }
@@ -692,9 +695,15 @@ struct DoctorView: View {
     static func categoryID(for id: String) -> String {
         switch id {
         case "codex_login", "llm", "codex_login_helper", "live.providers": "Provider"
-        case "daemon_lifecycle", "legacy_launch_agent", "launch_agent": "Runtime"
+        case "daemon_lifecycle", "legacy_launch_agent", "launch_agent", "live.background_loops",
+             // Per-turn prompt-prefix cache health is a property of the running
+             // app, not of stored data.
+             "prompt_prefix_health": "Runtime"
+        // Her subconscious is not a subsystem of the body — it gets its own
+        // group so a capsule that stopped arriving reads as what it is.
+        case "subconscious_vitals": "Cognition"
         case "searxng", "telegram", "connectors", "live.telegram", "live.search": "Connectors"
-        case "storage", "chat_sessions", "persona_engine", "backups", "write_test": "Data"
+        case "storage", "chat_sessions", "session_identity", "persona_engine", "backups", "write_test": "Data"
         case "tools", "live.tools": "Tools"
         case "autonomy", "live.autonomy": "Autonomy"
         default: "Release"
@@ -787,6 +796,7 @@ enum DoctorPlainCopy {
         switch group {
         case "Provider": return "AI provider"
         case "Runtime": return "App runtime"
+        case "Cognition": return "\(AgentVoice.live.possessive) inner state"
         case "Connectors": return "Connected services"
         case "Data": return "Your data"
         case "Tools": return "Tools"

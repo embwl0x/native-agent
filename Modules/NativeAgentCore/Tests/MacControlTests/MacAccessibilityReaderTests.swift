@@ -491,7 +491,12 @@ private func _bool(_ value: JSONValue?) -> Bool? {
     // mutation, no approval — just structure plus a picture of it.
     // native-look item 2 added `look` at that SAME read tier: it distills the
     // very tree `ax_tree` returns and emits nothing.
-    #expect(macControlAccessibilityReadActions == ["ax_status", "ax_tree", "ax_find", "view", "attention", "look"])
+    // fable51 item 29 added `menu` at that SAME read tier: one bounded descent
+    // of AXMenuBar, no CGEvent, no AX action, no attribute write — it does not
+    // even open a menu. Its acting counterpart `menu_press` is in the injection
+    // set, never here.
+    #expect(macControlAccessibilityReadActions
+        == ["ax_status", "ax_tree", "ax_find", "view", "attention", "look", "menu"])
 }
 
 @Test func injectionActionsAreImplementedAsOfW2() {

@@ -138,8 +138,9 @@ enum TurnInspectorGrouping {
             let rows = sorted.enumerated().map { offset, ev in
                 makeRow(ev, id: "\(turnId)#\(offset)")
             }
-            let started = sorted.first!.ts
-            let last = sorted.last!.ts
+            // A group is only ever built from at least one event, but an empty
+            // one must skip the turn rather than trap the inspector.
+            guard let started = sorted.first?.ts, let last = sorted.last?.ts else { continue }
             // Surface/session: take the first non-nil we see (they're turn-wide).
             let surface = sorted.lazy.compactMap { $0.surface }.first
             let session = sorted.lazy.compactMap { $0.sessionId }.first

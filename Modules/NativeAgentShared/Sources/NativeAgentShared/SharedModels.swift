@@ -137,6 +137,13 @@ public struct ChatSession: Identifiable, Codable, Hashable, Sendable {
     public var worktreePath: String? = nil
     public var providerId: String? = nil
     public var modelId: String? = nil
+    /// 2026-09-06: monotonic counter bumped on every write to this session's
+    /// transcript and on every clear (see
+    /// `ChatSessionIndexFile.transcriptGenerationKey`). It is what lets a
+    /// remote reader order two published transcripts — in particular decide
+    /// whether an EMPTY one is newer than what it already shows. Never derived
+    /// from the clock; `nil` on rows written before this existed.
+    public var transcriptGeneration: Int? = nil
 }
 
 public extension ChatSession {
@@ -338,6 +345,12 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
     /// approval belong to the conversation in front of me?" without opening a
     /// second approval store of its own.
     public var chatOriginSessionId: String?
+    /// User, 2026-09-06: when a still-pending request was last ASKED FOR. A
+    /// repeated identical request reuses its row rather than piling up
+    /// duplicates, so a surface that fences on `createdAt` alone would hide a
+    /// live question raised again in a later turn. Nil when it was only ever
+    /// asked once.
+    public var lastRequestedAt: String?
 
     public init(
         id: String,
@@ -352,7 +365,8 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
         payloadPreview: String? = nil,
         localOnly: Bool? = nil,
         remoteResolvable: Bool? = nil,
-        chatOriginSessionId: String? = nil
+        chatOriginSessionId: String? = nil,
+        lastRequestedAt: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -367,6 +381,7 @@ public struct ApprovalRequest: Identifiable, Codable, Hashable, Sendable {
         self.localOnly = localOnly
         self.remoteResolvable = remoteResolvable
         self.chatOriginSessionId = chatOriginSessionId
+        self.lastRequestedAt = lastRequestedAt
     }
 }
 

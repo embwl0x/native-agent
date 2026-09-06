@@ -481,23 +481,33 @@ async function waitForPage(payload, actionId) {
   const startedAt = new Date().toISOString();
   const timeoutMs = payload.timeoutMs ?? 5_000;
   if (payload.condition === "navigation_settled") {
+    // 2026-09-06: ONE deadline for the whole action. The settle interval used
+    // to open its own ceiling only after the completion wait had already spent
+    // `timeoutMs`, so this could take twice the time the caller asked for.
+    const deadlineAtMs = Date.now() + timeoutMs;
     try {
       await waitForTabComplete(lease.tabId, timeoutMs, () => leaseManager.requireForPageAction(payload));
-      if ((payload.settleMs ?? 0) > 0) await delay(payload.settleMs);
+      const quiet = await awaitNavigationQuiet(lease.tabId, payload.settleMs ?? 0, deadlineAtMs);
       const tab = await chrome.tabs.get(lease.tabId);
       leaseManager.requireForPageAction(payload);
-      const matched = tab.id === lease.tabId && tab.status === "complete";
+      const complete = tab.id === lease.tabId && tab.status === "complete";
+      // A tab that never went quiet is NOT a settled navigation. Reporting it
+      // as verified claimed evidence nobody had: the page was still moving when
+      // the deadline arrived. `not_quiet` says exactly that, and the Mac reads
+      // it as evidence still owed.
+      const matched = complete && quiet;
       return pageActionResult({
         actionId,
         action: "wait",
         lease,
         payload,
         startedAt,
-        outcome: matched ? "succeeded" : "not_settled",
+        outcome: matched ? "succeeded" : (complete ? "not_quiet" : "not_settled"),
         verification: matched ? "verified" : "not_verified",
         detail: {
           condition: payload.condition,
           matched,
+          quiet,
           url: tab.url ?? "",
           title: tab.title ?? "",
         },
@@ -585,12 +595,26 @@ async function performSnapshotMutation({ lease, route, payload, actionId, action
       detail: { error },
     });
   }
+  // 2026-09-06: judge a type by what the FIELD kept, not by how many characters
+  // the page agent attempted. On a sanitising input every character can be
+  // discarded, and counting attempts called that "partially_completed" with the
+  // field empty. `enteredCharacterCount` is the readback; a page agent that
+  // predates it has none, and the attempted count stands as before.
+  //
+  // 2026-09-06: a rewrite is not a partial success. When the page reformatted
+  // what was already in the field, the readback is not the old value plus our
+  // text, and none of it was entered by us — `valueRewritten` says so, and the
+  // receipt carries both values so the caller can see what happened.
+  const typeResult = action === "type" ? response.result : null;
+  const typeLandedCount = !typeResult || typeResult.valueRewritten === true
+    ? 0
+    : (typeResult.enteredCharacterCount ?? typeResult.characterCount ?? 0);
   return pageActionResult({
     actionId, action, lease, payload, startedAt,
-    outcome: action === "type" && response.result?.completed === false
-      ? (response.result.characterCount > 0 ? "partially_completed" : "refused")
+    outcome: typeResult?.completed === false
+      ? (typeLandedCount > 0 ? "partially_completed" : "refused")
       : "succeeded",
-    verification: action === "type" && response.result?.characterCount === 0 && response.result?.completed === false
+    verification: typeResult?.completed === false && typeLandedCount === 0
       ? "not_verified" : "page_acknowledged",
     detail: {
       ...response.result,
@@ -738,11 +762,50 @@ async function waitForTabComplete(tabId, timeoutMs, requireCurrent = () => {}) {
   });
 }
 
+// 2026-09-06: the settle interval has to be QUIET, not merely elapsed. The old
+// code waited for one `complete`, dropped its listener and slept once, so a
+// redirect chain (complete -> loading -> complete) was sampled mid-flight and
+// reported as settled. Any update for the tab restarts the interval — an update
+// carrying neither `status` nor `url` is still the tab moving, and filtering
+// those out let a page that was plainly busy read as quiet.
+//
+// `deadlineAtMs` is the ONE deadline for the whole wait action, passed in by the
+// caller: this used to start its own ceiling AFTER the completion wait had
+// already spent the caller's timeout, so a wait could run for twice as long as
+// asked. Returns true when the tab actually went quiet, false when the deadline
+// arrived first — a page that never goes quiet must not report as settled.
+async function awaitNavigationQuiet(tabId, quietMs, deadlineAtMs) {
+  if (!(quietMs > 0)) return true;
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    function finish(quiet) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(quiet);
+    }
+    function arm() {
+      clearTimeout(timer);
+      const remainingMs = deadlineAtMs - Date.now();
+      if (remainingMs <= 0) { finish(false); return; }
+      timer = quietMs <= remainingMs
+        ? setTimeout(() => finish(true), quietMs)
+        : setTimeout(() => finish(false), remainingMs);
+    }
+    function listener(updatedTabId) {
+      if (updatedTabId !== tabId) return;
+      arm();
+    }
+    chrome.tabs.onUpdated.addListener(listener);
+    arm();
+  });
+}
+
 function cancelTabWaits(tabId, error) {
   for (const cancel of [...(activeTabWaits.get(tabId) ?? [])]) cancel(error);
 }
-
-function delay(milliseconds) { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
 
 function sendEvent(event, payload) {
   if ((event === "lease.yielded" || event === "lease.released") && Number.isInteger(payload?.tabId)) {

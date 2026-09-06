@@ -256,33 +256,41 @@ public struct TelegramParsedSlashCommand: Sendable, Equatable {
 }
 
 public enum TelegramCommandRegistry {
-    public static let version = "2026-07-09-telegram-command-registry-v4"
+    public static let version = "2026-09-01-telegram-command-registry-v5"
 
+    /// The whole control panel, in one place. Only the first six are a
+    /// SURFACE: they are the Telegram command menu and the whole of /help.
+    /// Everything below `showInMenu: false` is a retired spelling kept
+    /// dispatchable for one release so muscle memory doesn't hit a wall —
+    /// the way to reach those settings now is to say what you want
+    /// ("use opus", "think harder"), which lands on the same writers.
     public static let definitions: [TelegramSlashCommandDefinition] = [
-        .init(name: "help", aliases: ["h"], summary: "Show Telegram command help", handler: .help),
-        .init(name: "status", aliases: ["stats"], summary: "Show runtime, model, session, and task status", handler: .status),
-        .init(name: "model", summary: "Show/select Telegram provider model", args: "[number|provider model]", handler: .model),
-        .init(name: "new", aliases: ["start"], summary: "Start a fresh Telegram chat session", handler: .new),
-        .init(name: "stop", aliases: ["cancel"], summary: "Cancel the current Telegram turn", handler: .stop),
-        .init(name: "retry", aliases: ["again"], summary: "Retry the last Telegram user message", handler: .retry),
-        .init(name: "sessions", aliases: ["recent"], summary: "List recent chat sessions", handler: .sessions),
-        .init(name: "resume", aliases: ["switch"], summary: "Bind this chat to an existing session", args: "<id>", handler: .resume),
+        .init(name: "stop", aliases: ["cancel"], summary: "Stop what I'm doing", handler: .stop),
+        .init(name: "new", aliases: ["start"], summary: "Start a fresh conversation", handler: .new),
+        .init(name: "retry", aliases: ["again"], summary: "Try your last message again", handler: .retry),
         .init(name: "approve", aliases: ["approved", "allow"], summary: "Approve a pending request", args: "<id>", handler: .approve),
         .init(name: "deny", aliases: ["denied", "reject", "rejected"], summary: "Deny a pending request", args: "<id>", handler: .deny),
-        .init(name: "provider", summary: "Show current Telegram provider", handler: .provider),
-        .init(name: "brain", summary: "Show active model and provider", handler: .brain),
-        .init(name: "think", summary: "Set reasoning effort", args: "<low|medium|high|xhigh|max|ultra>", handler: .think),
-        .init(name: "fast", summary: "Toggle provider priority processing", args: "<on|off>", handler: .fast),
-        .init(name: "persona", summary: "Show or set Telegram persona", args: "[name]", handler: .persona),
-        .init(name: "remember", summary: "Save a durable memory", args: "<text>", handler: .remember),
-        .init(name: "note", summary: "Save a note", args: "<text>", handler: .note),
-        .init(name: "scratch", summary: "Write session scratchpad data", args: "<key> <value>", handler: .scratch),
-        .init(name: "tools", summary: "Show tool/progress controls", handler: .tools),
-        .init(name: "session", summary: "Show or change Telegram session state", args: "status|new|reset", handler: .session),
-        .init(name: "reset", summary: "Clear the active Telegram session", handler: .reset),
-        .init(name: "clear", summary: "Clear current session messages", handler: .clear),
-        .init(name: "compact", summary: "Compact current session context", handler: .compact),
-        .init(name: "restart", summary: "Restart NativeAgent app (owner only)", args: "[reason]", handler: .restart),
+        .init(name: "help", aliases: ["h"], summary: "What you can type here", handler: .help),
+
+        // Retired spellings — dispatchable, never advertised.
+        .init(name: "status", aliases: ["stats"], summary: "Show what I'm doing", handler: .status, showInMenu: false),
+        .init(name: "model", summary: "Show/select Telegram provider model", args: "[number|provider model]", handler: .model, showInMenu: false),
+        .init(name: "sessions", aliases: ["recent"], summary: "List recent chat sessions", handler: .sessions, showInMenu: false),
+        .init(name: "resume", aliases: ["switch"], summary: "Bind this chat to an existing session", args: "<id>", handler: .resume, showInMenu: false),
+        .init(name: "provider", summary: "Show current Telegram provider", handler: .provider, showInMenu: false),
+        .init(name: "brain", summary: "Show active model and provider", handler: .brain, showInMenu: false),
+        .init(name: "think", summary: "Set reasoning effort", args: "<low|medium|high|xhigh|max|ultra>", handler: .think, showInMenu: false),
+        .init(name: "fast", summary: "Toggle provider priority processing", args: "<on|off>", handler: .fast, showInMenu: false),
+        .init(name: "persona", summary: "Show or set Telegram persona", args: "[name]", handler: .persona, showInMenu: false),
+        .init(name: "remember", summary: "Save a durable memory", args: "<text>", handler: .remember, showInMenu: false),
+        .init(name: "note", summary: "Save a note", args: "<text>", handler: .note, showInMenu: false),
+        .init(name: "scratch", summary: "Write session scratchpad data", args: "<key> <value>", handler: .scratch, showInMenu: false),
+        .init(name: "tools", summary: "Show tool/progress controls", handler: .tools, showInMenu: false),
+        .init(name: "session", summary: "Show or change Telegram session state", args: "status|new|reset", handler: .session, showInMenu: false),
+        .init(name: "reset", summary: "Clear the active Telegram session", handler: .reset, showInMenu: false),
+        .init(name: "clear", summary: "Clear current session messages", handler: .clear, showInMenu: false),
+        .init(name: "compact", summary: "Compact current session context", handler: .compact, showInMenu: false),
+        .init(name: "restart", summary: "Restart NativeAgent app (owner only)", args: "[reason]", handler: .restart, showInMenu: false),
     ]
 
     public static var commands: [TelegramBotCommand] {
@@ -318,20 +326,33 @@ public enum TelegramCommandRegistry {
         )
     }
 
+    /// /help lists the menu-visible set and nothing else, so it can never
+    /// drift from the command menu Telegram shows.
     public static func helpText() -> String {
-        let lines = definitions.map { definition -> String in
-            let aliasText: String
-            if definition.aliases.isEmpty {
-                aliasText = ""
-            } else {
-                aliasText = " (aliases: " + definition.aliases.map { "/\($0)" }.joined(separator: ", ") + ")"
-            }
-            return "\(definition.usage) - \(definition.summary)\(aliasText)"
-        }
-        return ([
-            "Telegram commands:",
-            "Slash commands are handled locally before chat."
-        ] + lines).joined(separator: "\n")
+        let lines = definitions
+            .filter(\.showInMenu)
+            .map { "\($0.usage) - \($0.summary)" }
+        return (lines + [
+            "",
+            "Anything else, just say it: \"use opus\", \"think harder\", \"go fast\", \"use the default persona\", \"what model are you on\".",
+        ]).joined(separator: "\n")
+    }
+
+    /// 2026-09-06: the `@bot` a slash command is addressed to, if any
+    /// (`/stop@OtherBot` -> "OtherBot"). A group delivers every bot command to
+    /// every bot in the room, so the poll loop compares this against its own
+    /// username before running the command. Nil means the command named no bot
+    /// and is addressed to whoever received it.
+    public static func addressedBotUsername(text raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return nil }
+        guard let first = trimmed
+            .split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
+            .first else { return nil }
+        guard let atIdx = first.firstIndex(of: "@") else { return nil }
+        let suffix = String(first[first.index(after: atIdx)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return suffix.isEmpty ? nil : suffix
     }
 
     private static func normalizeName(_ raw: String) -> String {
@@ -342,6 +363,212 @@ public enum TelegramCommandRegistry {
         }
         return name.lowercased()
     }
+}
+
+// MARK: - Preferences asked for in words
+
+/// A preference User stated in ordinary words instead of a slash command.
+/// Parsing is deliberately narrow: it only fires on a whole message that is
+/// unambiguously a preference change, and a model request must still resolve
+/// against the LIVE model menu before anything is written. Anything else is
+/// ordinary conversation and goes to the chat turn untouched.
+public enum TelegramSpokenPreference: Sendable, Equatable {
+    /// "use opus", "switch to gpt-5.5"
+    case model(query: String)
+    /// "think harder", "think low"
+    case effort(TelegramSpokenEffort)
+    /// "go fast", "turn off fast mode"
+    case fast(Bool)
+    /// "use the Agent persona"
+    case persona(String)
+    /// "what model are you on"
+    case whichModel
+
+    private static let whichModelPhrases: Set<String> = [
+        "what model are you on", "what model are you using", "what model is this",
+        "which model are you on", "which model are you using", "which model is this",
+        "what model", "which model", "what brain are you using", "what brain",
+        "what provider are you on", "which provider are you on",
+    ]
+
+    private static let fastOnPhrases: Set<String> = [
+        "go fast", "be fast", "fast mode", "fast mode on", "use fast mode",
+        "turn on fast", "turn on fast mode", "turn fast mode on", "prioritize speed",
+    ]
+
+    private static let fastOffPhrases: Set<String> = [
+        "fast mode off", "turn off fast", "turn off fast mode", "turn fast mode off",
+        "stop going fast", "normal speed",
+    ]
+
+    private static let thinkHarderPhrases: Set<String> = [
+        "think harder", "think deeper", "think more", "think longer", "think hard",
+        "think really hard", "reason harder", "put more thought into it",
+    ]
+
+    private static let thinkLessPhrases: Set<String> = [
+        "think less", "think faster", "think quicker", "stop thinking so hard",
+        "dont think so hard", "don't think so hard", "less thinking",
+    ]
+
+    /// Canonical low-to-high ladder. Only levels a model actually supports
+    /// are ever written; this is just the ordering.
+    public static let effortLadder = ["low", "medium", "high", "xhigh", "max", "ultra"]
+
+    private static let modelLeadIns = [
+        "set the model to ", "set model to ", "change the model to ", "change model to ",
+        "switch the model to ", "switch model to ", "use the model ", "use model ",
+        "switch to ", "swap to ", "change to ", "run on ", "use ",
+    ]
+
+    private static let personaLeadIns = [
+        "set the persona to ", "set persona to ", "switch the persona to ",
+        "switch persona to ", "change the persona to ", "change persona to ",
+        "use the persona ", "use persona ",
+    ]
+
+    public static func parse(text raw: String) -> TelegramSpokenPreference? {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A short line is a request; a paragraph is a conversation.
+        guard !text.isEmpty, text.count <= 80, !text.contains("\n") else { return nil }
+        text = text.lowercased()
+        while let last = text.last, ".!?,".contains(last) { text.removeLast() }
+        for vocative in ["hey agent ", "ok agent ", "agent ", "hey ", "ok ", "please "] {
+            if text.hasPrefix(vocative) {
+                text.removeFirst(vocative.count)
+                break
+            }
+        }
+        text = text.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return nil }
+
+        if whichModelPhrases.contains(text) { return .whichModel }
+        if fastOnPhrases.contains(text) { return .fast(true) }
+        if fastOffPhrases.contains(text) { return .fast(false) }
+        if thinkHarderPhrases.contains(text) { return .effort(.highest) }
+        if thinkLessPhrases.contains(text) { return .effort(.lowest) }
+
+        for lead in ["think ", "set effort to ", "set the effort to ", "set reasoning to ",
+                     "reasoning effort ", "effort "] where text.hasPrefix(lead) {
+            let level = String(text.dropFirst(lead.count)).trimmingCharacters(in: .whitespaces)
+            if effortLadder.contains(level) { return .effort(.level(level)) }
+        }
+
+        // Persona needs the word "persona" — a bare "be X" is conversation.
+        for lead in personaLeadIns where text.hasPrefix(lead) {
+            let name = String(text.dropFirst(lead.count)).trimmingCharacters(in: .whitespaces)
+            if let name = validName(name) { return .persona(name) }
+        }
+        if text.hasPrefix("use the "), text.hasSuffix(" persona") {
+            let name = String(text.dropFirst(8).dropLast(8)).trimmingCharacters(in: .whitespaces)
+            if let name = validName(name) { return .persona(name) }
+        }
+
+        for lead in modelLeadIns where text.hasPrefix(lead) {
+            var query = String(text.dropFirst(lead.count)).trimmingCharacters(in: .whitespaces)
+            for tail in [" instead", " for now", " model", " please"] where query.hasSuffix(tail) {
+                query = String(query.dropLast(tail.count)).trimmingCharacters(in: .whitespaces)
+            }
+            if query.hasPrefix("the ") { query = String(query.dropFirst(4)) }
+            // A model name is short. Three-plus words is a sentence about
+            // something else ("switch to the branch I pushed").
+            guard query.count >= 3, query.count <= 40,
+                  query.split(separator: " ").count <= 3 else { return nil }
+            return .model(query: query)
+        }
+        return nil
+    }
+
+    private static func validName(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard trimmed.count >= 2, trimmed.count <= 40,
+              trimmed.split(separator: " ").count <= 3 else { return nil }
+        return trimmed
+    }
+}
+
+public enum TelegramSpokenEffort: Sendable, Equatable {
+    case highest
+    case lowest
+    case level(String)
+
+    /// Resolve against what the CURRENT model actually supports; an
+    /// unsupported ask resolves to nil rather than writing a level the
+    /// provider will reject.
+    public func resolved(supported: [String]) -> String? {
+        let ordered = TelegramSpokenPreference.effortLadder.filter { supported.contains($0) }
+        guard !ordered.isEmpty else { return nil }
+        switch self {
+        case .highest: return ordered.last
+        case .lowest: return ordered.first
+        case .level(let level): return ordered.contains(level) ? level : nil
+        }
+    }
+}
+
+/// One resolved model, in the exact shape /model's writer takes.
+public struct TelegramSpokenModelMatch: Sendable, Equatable {
+    public let providerId: String
+    public let modelId: String
+    /// Plain names, for copy User reads back ("Claude Sonnet 4.6 on Anthropic").
+    public let label: String
+    public let providerLabel: String
+
+    public init(providerId: String, modelId: String, label: String, providerLabel: String) {
+        self.providerId = providerId
+        self.modelId = modelId
+        self.label = label
+        self.providerLabel = providerLabel
+    }
+}
+
+public extension TelegramSpokenPreference {
+    /// Resolve a spoken model name against the live menu. Nil means "that
+    /// wasn't a model" — the message stays ordinary conversation.
+    static func resolveModel(query: String, in menu: TelegramModelMenu) -> TelegramSpokenModelMatch? {
+        let needle = telegramCompactKey(query)
+        guard needle.count >= 3 else { return nil }
+        var exact: [TelegramSpokenModelMatch] = []
+        var partial: [TelegramSpokenModelMatch] = []
+        var currentProviderHits: [TelegramSpokenModelMatch] = []
+        for provider in menu.providers {
+            for model in provider.models {
+                let idKey = telegramCompactKey(model.id)
+                let nameKey = telegramCompactKey(model.name)
+                let plainName = model.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let match = TelegramSpokenModelMatch(
+                    providerId: provider.id,
+                    modelId: model.id,
+                    label: plainName.isEmpty ? model.id : plainName,
+                    providerLabel: provider.displayName.isEmpty ? provider.id : provider.displayName
+                )
+                if idKey == needle || nameKey == needle {
+                    exact.append(match)
+                } else if idKey.contains(needle) || nameKey.contains(needle) {
+                    partial.append(match)
+                    if telegramProviderIdsMatch(provider.id, menu.currentProvider) {
+                        currentProviderHits.append(match)
+                    }
+                }
+            }
+        }
+        if let first = exact.first { return first }
+        // A partial match only counts when it is UNAMBIGUOUS. "opus" naming
+        // the one Opus in the menu is a switch; "claude" naming three of them
+        // is not, and picking the first would silently reroute User to a model
+        // he never said. Current-provider hits are PREFERRED (they narrow the
+        // field), but they still have to narrow it to exactly one — otherwise
+        // this returns nil, the message stays ordinary conversation, and the
+        // ordinary reply path asks which one he meant.
+        let pool = currentProviderHits.isEmpty ? partial : currentProviderHits
+        return pool.count == 1 ? pool[0] : nil
+    }
+}
+
+private func telegramCompactKey(_ raw: String) -> String {
+    String(raw.lowercased().unicodeScalars.filter {
+        CharacterSet.alphanumerics.contains($0)
+    }.map(Character.init))
 }
 
 private struct TelegramResolvedModelSelection: Sendable, Equatable {
@@ -621,6 +848,40 @@ extension SwiftNativeTelegramBot {
         }
         let deps = await TelegramBotCompletenessRegistry.shared.deps(for: ObjectIdentifier(self))
         return await deps?.routing?.modelMenuForSurface(surface)
+    }
+
+    /// What the CURRENT model can actually be asked for — the same lookup
+    /// /think and /fast gate on, exposed so spoken phrases ("think harder")
+    /// resolve against the same truth.
+    public func telegramModelCapabilitiesForSurface(
+        _ surface: String = "telegram"
+    ) async -> (reasoningEfforts: [String], supportsFast: Bool)? {
+        guard let routing = await telegramRouting() else { return nil }
+        return await telegramModelCapabilities(routing: routing, surface: surface)
+    }
+
+    /// Current model in plain words ("Claude Opus 5 via anthropic"), for
+    /// copy User reads. Nil when routing isn't wired.
+    public func telegramPlainModelPhrase(_ surface: String = "telegram") async -> String? {
+        guard let routing = await telegramRouting(),
+              let info = await routing.modelForSurface(surface) else { return nil }
+        var name = info.model
+        if let menu = await routing.modelMenuForSurface(surface) {
+            for provider in menu.providers where telegramProviderIdsMatch(provider.id, info.provider) {
+                for model in provider.models
+                where model.id.caseInsensitiveCompare(info.model) == .orderedSame {
+                    let trimmed = model.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { name = trimmed }
+                }
+            }
+        }
+        return TelegramPollLoop._tgRedactToken("\(name) via \(info.provider)")
+    }
+
+    private func telegramRouting() async -> (any ProviderRoutingRef)? {
+        if let routing = completenessDeps?.routing { return routing }
+        return await TelegramBotCompletenessRegistry.shared
+            .deps(for: ObjectIdentifier(self))?.routing
     }
 
     public func saveTelegramModelSelection(

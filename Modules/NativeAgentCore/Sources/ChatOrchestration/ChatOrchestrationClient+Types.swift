@@ -155,11 +155,15 @@ public protocol ChatOrchestrationClient: Sendable {
     /// `suppressUserAppend: true`. This exists so transport-level delivery
     /// acknowledgements can be decoupled from turn completion — a delivery
     /// ack must never block on the very turn the delivery started.
+    /// 2026-09-06: `attachments` is part of the requirement because the row
+    /// this appends IS the durable user message — the turn that follows runs
+    /// with `suppressUserAppend: true` and can never persist them later.
     func enqueueUserMessage(
         message: String,
         sessionId: String?,
         persona: String?,
-        surface: String
+        surface: String,
+        attachments: [MultimodalAttachment]
     ) async throws -> EnqueuedUserMessage
 
     /// Non-streaming chat turn.

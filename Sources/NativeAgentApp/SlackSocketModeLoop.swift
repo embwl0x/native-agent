@@ -245,28 +245,42 @@ private final class SlackSessionRecycleFlag: @unchecked Sendable {
 private final class SlackPingContinuationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var didResume = false
-    private let continuation: CheckedContinuation<Void, Error>
+    private var continuation: CheckedContinuation<Void, Error>?
+    /// An outcome that arrived BEFORE the continuation existed. 2026-09-06:
+    /// cancellation and the ping deadline can both fire between constructing
+    /// this gate and `withCheckedThrowingContinuation` handing over its
+    /// continuation, and an outcome dropped in that window would park the
+    /// caller forever — the exact hang this gate now exists to prevent.
+    private var settled: Result<Void, Error>?
 
-    init(_ continuation: CheckedContinuation<Void, Error>) {
-        self.continuation = continuation
-    }
-
-    func resume() {
-        guard claim() else { return }
-        continuation.resume()
-    }
-
-    func resume(throwing error: Error) {
-        guard claim() else { return }
-        continuation.resume(throwing: error)
-    }
-
-    private func claim() -> Bool {
+    func attach(_ continuation: CheckedContinuation<Void, Error>) {
         lock.lock()
-        defer { lock.unlock() }
-        guard !didResume else { return false }
+        if let settled {
+            didResume = true
+            lock.unlock()
+            continuation.resume(with: settled)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resume() { settle(.success(())) }
+
+    func resume(throwing error: Error) { settle(.failure(error)) }
+
+    private func settle(_ result: Result<Void, Error>) {
+        lock.lock()
+        guard !didResume else { lock.unlock(); return }
+        guard let continuation else {
+            if settled == nil { settled = result }
+            lock.unlock()
+            return
+        }
         didResume = true
-        return true
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume(with: result)
     }
 }
 
@@ -482,6 +496,13 @@ struct SlackInboundMessage: Sendable, Equatable {
 
     var replyThreadTs: String? {
         normalizedThreadTs
+    }
+
+    /// The ts to thread an in-turn notice under when the message is not itself
+    /// in a thread: its own ts, which opens a thread on that message.
+    var threadAnchorTs: String? {
+        let trimmed = ts.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     var normalizedThreadTs: String? {
@@ -784,7 +805,36 @@ enum SlackReceiptErrorFeed {
     }
 }
 
-typealias SlackSocketModeChatHandler = @Sendable (_ message: SlackInboundMessage) async throws -> SlackSocketModeReply
+/// 2026-09-06: in-turn notices (provider reconnect, context compaction).
+/// Slack had no progress lane at all — the loop supplied no callback and waited
+/// for the whole reply — so a turn that spent minutes reconnecting to the
+/// provider or trimming its context looked hung on Slack while Telegram, the
+/// Mac card and iOS all showed it. `kind` is the notice kind
+/// (`provider_retry`, `context_compaction`).
+typealias SlackChatProgressSink = @Sendable (_ kind: String, _ text: String) async -> Void
+
+typealias SlackSocketModeChatHandler = @Sendable (SlackInboundMessage) async throws -> SlackSocketModeReply
+
+/// 2026-09-06: the sink rides a SECOND handler, not a second parameter on the
+/// existing one. A Swift closure type cannot give a parameter a default, so
+/// widening `SlackSocketModeChatHandler` broke every one-argument caller. This
+/// one defaults to nil and the plain handler stays exactly as it was.
+typealias SlackSocketModeProgressChatHandler = @Sendable (
+    _ message: SlackInboundMessage,
+    _ progress: @escaping SlackChatProgressSink
+) async throws -> SlackSocketModeReply
+
+/// One notice per kind per turn. A reconnect ladder emits up to ten
+/// `provider_retry` notices; posting each would bury the channel.
+private actor SlackTurnNoticeMemory {
+    private var announced: Set<String> = []
+    func claim(_ kind: String) -> Bool { announced.insert(kind).inserted }
+    /// 2026-09-06: a claim that never reached Slack announced nothing. Giving
+    /// it back is what keeps ONE failed post from silencing that kind for the
+    /// rest of the turn — the sender would otherwise watch a reconnecting turn
+    /// in total silence because the first notice hit a blip.
+    func release(_ kind: String) { announced.remove(kind) }
+}
 
 struct SlackSocketModeLoop: LoopRunner {
     let loopId = "slack_socket_mode"
@@ -801,7 +851,8 @@ struct SlackSocketModeLoop: LoopRunner {
 
     private let config: SlackSocketModeConfig
     private let dataRoot: URL
-    private let chatHandler: SlackSocketModeChatHandler
+    private let chatHandler: SlackSocketModeChatHandler?
+    private let progressChatHandler: SlackSocketModeProgressChatHandler?
     private let session: URLSession
     private let deduper = SlackEventDeduper()
     private let deliveryJournal: SlackInboundDeliveryJournal
@@ -833,6 +884,10 @@ struct SlackSocketModeLoop: LoopRunner {
     /// tick cancels it. Used after a socket-open failure and after a PLANNED
     /// session teardown; see `teardownGrace`.
     static let inFlightCompletionGrace: TimeInterval = 30
+    /// How long a socket-mode ping may wait for its pong before the wait is
+    /// abandoned. Well inside the 25 s ping interval, so a dead socket is
+    /// declared dead on the tick that found it rather than at the next one.
+    static let pingResponseDeadline: TimeInterval = 10
 
     /// Base reconnect spacing between socket sessions. A tick IS one session,
     /// so `interval` is the reconnect delay after a session that ended without
@@ -851,7 +906,8 @@ struct SlackSocketModeLoop: LoopRunner {
         outbound: SlackSocketModeOutbound? = nil,
         socketConnectionFactory: (@Sendable (URL) -> SlackSocketConnection)? = nil,
         feedRetention: SlackReceiptErrorFeed.Retention = .production,
-        chatHandler: @escaping SlackSocketModeChatHandler
+        chatHandler: SlackSocketModeChatHandler? = nil,
+        progressChatHandler: SlackSocketModeProgressChatHandler? = nil
     ) {
         self.config = config
         self.dataRoot = dataRoot
@@ -862,6 +918,7 @@ struct SlackSocketModeLoop: LoopRunner {
         self.socketConnectionFactory = socketConnectionFactory ?? { .live(session.webSocketTask(with: $0)) }
         self.feedRetention = feedRetention
         self.chatHandler = chatHandler
+        self.progressChatHandler = progressChatHandler
         self.deliveryJournal = SlackInboundDeliveryJournal(dataRoot: dataRoot)
     }
 
@@ -1242,7 +1299,7 @@ struct SlackSocketModeLoop: LoopRunner {
 
     static func disconnectDisposition(forReason reason: String) -> SlackDisconnectDisposition {
         switch reason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "link_disabled", "too_many_connections":
+        case "link_disabled", "too_many_connections", "too_many_websockets":
             return .fatal
         default:
             return .routine
@@ -1616,8 +1673,10 @@ struct SlackSocketModeLoop: LoopRunner {
                 // oldest fixed and require strict movement toward that bound.
                 guard let boundary = page.compactMap({ Self.string($0["ts"]) })
                     .min(by: Self.slackTimestampLessThan),
-                      Self.slackTimestampLessThan(boundary, params["latest"]!),
-                      Self.slackTimestampLessThan(oldest!, boundary) else {
+                      let latestBound = params["latest"],
+                      let oldestBound = oldest,
+                      Self.slackTimestampLessThan(boundary, latestBound),
+                      Self.slackTimestampLessThan(oldestBound, boundary) else {
                     throw SlackSocketModeError.api("conversations.history pagination made no progress; history incomplete")
                 }
                 params["latest"] = boundary
@@ -1771,16 +1830,36 @@ struct SlackSocketModeLoop: LoopRunner {
         }
     }
 
+    /// 2026-09-06: this parked on a checked continuation that ONLY Slack's pong
+    /// handler could resume — no cancellation handling and no deadline. A pong
+    /// that never comes is the precise failure a ping exists to detect, and
+    /// `drainSessionWork` cancels this task and then AWAITS it, so that silence
+    /// held teardown, and therefore reconnection, open forever. Three things
+    /// can now finish the wait — the handler, task cancellation, and a bounded
+    /// deadline — and the gate keeps the first, discarding the rest.
     private func sendPing(socket: SlackSocketConnection) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let gate = SlackPingContinuationGate(continuation)
-            socket.sendPing { error in
-                if let error {
-                    gate.resume(throwing: error)
-                } else {
-                    gate.resume()
+        let gate = SlackPingContinuationGate()
+        let deadline = Task {
+            try? await Task.sleep(for: .seconds(Self.pingResponseDeadline))
+            guard !Task.isCancelled else { return }
+            gate.resume(throwing: SlackSocketModeError.api(
+                "Slack did not answer a socket-mode ping within \(Int(Self.pingResponseDeadline))s"
+            ))
+        }
+        defer { deadline.cancel() }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                gate.attach(continuation)
+                socket.sendPing { error in
+                    if let error {
+                        gate.resume(throwing: error)
+                    } else {
+                        gate.resume()
+                    }
                 }
             }
+        } onCancel: {
+            gate.resume(throwing: CancellationError())
         }
     }
 
@@ -1946,7 +2025,11 @@ struct SlackSocketModeLoop: LoopRunner {
                 // Chat turns may themselves use tools. A restart cannot
                 // blindly regenerate a turn that began but did not durably
                 // publish its prepared reply, or those effects can duplicate.
-                return await recordUnknownDelivery(inbound, detail: "Reply generation was interrupted; prior chat/tool effects require recovery before rerunning the turn")
+                let outcome = await recordUnknownDelivery(inbound, detail: "Reply generation was interrupted; prior chat/tool effects require recovery before rerunning the turn")
+                // Not replaying is right; saying nothing was not. The sender's
+                // message was consumed and only the error log knew (fable51 #9).
+                await notifyLostTurn(inbound)
+                return outcome
             }
             if record.phase == .dispatching || record.phase == .outcomeUnknown {
                 return await reconcileDurableReply(record)
@@ -1961,7 +2044,7 @@ struct SlackSocketModeLoop: LoopRunner {
                 _ = try await deliveryJournal.beginGeneration(eventId: inbound.eventId)
                 let reply: SlackSocketModeReply
                 do {
-                    reply = try await chatHandler(hydrated)
+                    reply = try await generateReply(hydrated, sink: noticeSink(for: inbound))
                 } catch {
                     guard !Task.isCancelled else { return false }
                     await recordError(context: "chat_handler", error: error, inbound: inbound)
@@ -2045,6 +2128,86 @@ struct SlackSocketModeLoop: LoopRunner {
         } catch {
             await recordError(context: "inbound_delivery_journal", error: error, inbound: received)
             return false
+        }
+    }
+
+    /// Post in-turn notices into the same thread the message came from, once
+    /// per kind. A failure to post is not worth failing the turn over — the
+    /// reply itself still has the durable delivery lane.
+    /// Whichever handler this loop was built with. The progress-carrying one
+    /// wins when both are present; the plain one simply never sees the sink.
+    private func generateReply(
+        _ inbound: SlackInboundMessage,
+        sink: @escaping SlackChatProgressSink
+    ) async throws -> SlackSocketModeReply {
+        if let progressChatHandler {
+            return try await progressChatHandler(inbound, sink)
+        }
+        if let chatHandler {
+            return try await chatHandler(inbound)
+        }
+        throw SlackSocketModeError.api("no Slack chat handler configured")
+    }
+
+    private func noticeSink(for inbound: SlackInboundMessage) -> SlackChatProgressSink {
+        let memory = SlackTurnNoticeMemory()
+        let outbound = self.outbound
+        let channelId = inbound.channelId
+        // 2026-09-06: a top-level channel turn has no thread_ts, and posting
+        // the notice without one made it a separate top-level message in the
+        // channel. Thread it under the inbound message itself so the notice
+        // sits with the turn it is about (and the reply, which does the same).
+        let threadTs = inbound.replyThreadTs ?? inbound.threadAnchorTs
+        return { kind, text in
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, await memory.claim(kind) else { return }
+            var input: [String: JSONValue] = [
+                "channel": .string(channelId),
+                "text": .string(trimmed),
+            ]
+            if let threadTs { input["thread_ts"] = .string(threadTs) }
+            let posted = (try? await outbound.postMessage(input)).map(Self.envelopeOK) ?? false
+            if !posted { await memory.release(kind) }
+        }
+    }
+
+    /// The exact words a lost turn gets. One sentence: what happened, and what
+    /// the sender can do about it. It promises no replay, because there is
+    /// none — the turn's tool effects may already have landed.
+    static let lostTurnNotice =
+        "I lost my answer to your last message when I restarted — say it again and I'll pick it up."
+
+    /// Tell the sender, at most once, that their turn died mid-generation
+    /// (fable51 #9).
+    ///
+    /// AT MOST ONCE is structural (a send failure or crash after the durable flip
+    /// means no notice and no retry — the anti-spam trade): `.generating` is the only branch that
+    /// speaks, and `recordUnknownDelivery` has already flipped the durable
+    /// record to `.outcomeUnknown`, which routes every later pass into
+    /// reconciliation instead. Re-reading the record here is the guard for the
+    /// one case that would spam — a flip that failed to persist. Then the
+    /// phase is still `.generating` and the next recovery will speak; better
+    /// once late than every restart.
+    private func notifyLostTurn(_ inbound: SlackInboundMessage) async {
+        guard let stored = try? await deliveryJournal.record(eventId: inbound.eventId),
+              stored.phase == .outcomeUnknown else { return }
+        var input: [String: JSONValue] = [
+            "channel": .string(inbound.channelId),
+            "text": .string(Self.lostTurnNotice),
+        ]
+        if let threadTs = inbound.replyThreadTs { input["thread_ts"] = .string(threadTs) }
+        do {
+            guard Self.envelopeOK(try await outbound.postMessage(input)) else {
+                await recordError(
+                    context: "recover_lost_turn_notice",
+                    error: SlackSocketModeError.api("Slack rejected the interrupted-turn notice"),
+                    inbound: inbound)
+                return
+            }
+        } catch {
+            // The notice failing is itself worth a receipt — the sender is now
+            // silently short one answer AND one explanation.
+            await recordError(context: "recover_lost_turn_notice", error: error, inbound: inbound)
         }
     }
 
@@ -2185,7 +2348,7 @@ struct SlackSocketModeLoop: LoopRunner {
                 )
                 return false
             }
-            let chatReply = try await chatHandler(hydratedInbound)
+            let chatReply = try await generateReply(hydratedInbound, sink: noticeSink(for: inbound))
             let reply = chatReply.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let imageAttachments = Self.uploadableImageAttachments(chatReply.attachments)
             guard !reply.isEmpty || !imageAttachments.isEmpty else {
@@ -2644,15 +2807,26 @@ struct SlackSocketModeLoop: LoopRunner {
         return formatter.string(from: date)
     }
 
-    private static func redact(_ raw: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: #"\bxox[baprs]-[A-Za-z0-9-]{20,}|\bxapp-[A-Za-z0-9-]{20,}\b"#) else {
-            return raw
+    static func redact(_ raw: String) -> String {
+        // Socket errors embed authenticated URLs (sometimes more than once).
+        // Retain the endpoint for diagnosis, never its query or fragment.
+        var safe = raw
+        for pattern in [
+            #"(?i)\b(?:wss?|https?)://[^\s\"<>?#]+[?#][^\s\"<>]*"#,
+            #"\bxox[baprs]-[A-Za-z0-9-]{20,}|\bxapp-[A-Za-z0-9-]{20,}\b"#,
+        ] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let matches = regex.matches(in: safe, range: NSRange(safe.startIndex..., in: safe))
+            for match in matches.reversed() {
+                guard let range = Range(match.range, in: safe) else { continue }
+                let value = String(safe[range])
+                let replacement = value.contains("://")
+                    ? String(value.prefix { $0 != "?" && $0 != "#" }) + "?[REDACTED]"
+                    : "[REDACTED_SLACK_TOKEN]"
+                safe.replaceSubrange(range, with: replacement)
+            }
         }
-        return regex.stringByReplacingMatches(
-            in: raw,
-            range: NSRange(raw.startIndex..., in: raw),
-            withTemplate: "[REDACTED_SLACK_TOKEN]"
-        )
+        return safe
     }
 
     /// Stable diagnostic classes make the bounded feed rankable without

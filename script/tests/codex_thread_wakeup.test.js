@@ -55,16 +55,16 @@ test("per-message brain controls reach thread and turn start params", () => {
   const entries = [entry({
     messageId: "message-1",
     text: "check the bridge",
-    model: "gpt-5.6-terra",
+    model: "gpt-6-astra",
     reasoningEffort: "ultra",
     serviceTier: "priority",
   })];
   const thread = wakeup.freshThreadStartParams({ cwd: "/tmp/repo" }, entries);
   const turn = wakeup.turnStartParams("thread-1", entries, {});
 
-  assert.equal(thread.model, "gpt-5.6-terra");
+  assert.equal(thread.model, "gpt-6-astra");
   assert.equal(thread.serviceTier, "priority");
-  assert.equal(turn.model, "gpt-5.6-terra");
+  assert.equal(turn.model, "gpt-6-astra");
   assert.equal(turn.effort, "ultra");
   assert.equal(turn.serviceTier, "priority");
 });
@@ -242,7 +242,7 @@ test("completion prompt makes Agent assess the result and proactively tell User"
   assert.match(text, /Codex result:\nImplemented and tested the return path\./);
   assert.match(text, /Conversation: codex:thread-continue-1/);
   assert.match(text, /codex_message with conversation_id/);
-  assert.match(text, /Do not wait for him to ask/i);
+  assert.match(text, /Do not wait for the user to ask whether Codex finished/i);
 });
 
 test("receipt-only notes settle completed Codex turns without creating an Agent echo", () => {
@@ -1104,8 +1104,8 @@ fs.writeFileSync(args[outputIndex + 1], "EXEC-FALLBACK-OK\\n");
   try {
     const result = await wakeup.runCodexExecFallback([entry({
       text: "finish the task",
-      model: "gpt-5.6-luna",
-      reasoningEffort: "low",
+      model: "gpt-6-astra",
+      reasoningEffort: "ultra",
       serviceTier: "priority",
     })], {
       cwd: dir,
@@ -1117,8 +1117,8 @@ fs.writeFileSync(args[outputIndex + 1], "EXEC-FALLBACK-OK\\n");
     assert.equal(result.status, "completed");
     assert.equal(result.message, "EXEC-FALLBACK-OK");
     assert.equal(result.execution, "codex_exec_fallback");
-    assert.ok(args.includes("gpt-5.6-luna"));
-    assert.ok(args.includes('model_reasoning_effort="low"'));
+    assert.ok(args.includes("gpt-6-astra"));
+    assert.ok(args.includes('model_reasoning_effort="ultra"'));
     assert.ok(args.includes('service_tier="priority"'));
   } finally {
     if (oldBin == null) delete process.env.CODEX_BIN;
@@ -1237,6 +1237,66 @@ test("app-server turn projection preserves terminal semantics and final answer",
   );
   assert.equal(failed.status, "failed");
   assert.deepEqual(failed.error, { message: "nope" });
+});
+
+test("unloaded interrupted snapshots need durable terminal evidence, not replacement work", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-owner-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const rollout = nonterminalRollout(dir);
+  const thread = { id: "thread-owner", status: { type: "notLoaded" },
+    turns: [completedTurn({ status: "interrupted", completedAt: null, items: [] })] };
+  const client = { request: async (method, params) => {
+    assert.equal(method, "thread/read");
+    assert.deepEqual(params, { threadId: "thread-owner", includeTurns: true });
+    return { thread };
+  } };
+  assert.equal(wakeup.extractTurnResultFromThread(thread, "turn-event"), null);
+  assert.equal(await wakeup.readCanonicalTurnResult(client, "thread-owner", "turn-event", { rolloutPath: rollout }), null);
+  fs.appendFileSync(rollout, JSON.stringify({ type: "event_msg", payload: {
+    type: "task_complete", turn_id: "turn-event", last_agent_message: "Finished by original writer",
+  } }) + "\n");
+  const completed = await wakeup.readCanonicalTurnResult(client, "thread-owner", "turn-event", { rolloutPath: rollout });
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.message, "Finished by original writer");
+  fs.appendFileSync(rollout, JSON.stringify({ type: "event_msg", payload: {
+    type: "turn_aborted", turn_id: "turn-event",
+  } }) + "\n");
+  assert.equal((await wakeup.readCanonicalTurnResult(client, "thread-owner", "turn-event", { rolloutPath: rollout })).status, "aborted");
+  assert.equal(wakeup.extractTurnResultFromThread({ ...thread, status: { type: "idle" } }, "turn-event").status, "aborted");
+});
+
+test("bridge thread inspection is read-only, compact, and never claims replay safety", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nativeagent-codex-inspect-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const rollout = nonterminalRollout(dir);
+  let closed = 0;
+  const thread = { id: "thread-owner", status: { type: "active" },
+    turns: [completedTurn({ status: "inProgress" })] };
+  const connect = async () => ({
+    request: async (method, params) => {
+      assert.equal(method, "thread/read");
+      assert.equal(params.threadId, thread.id);
+      return { thread };
+    },
+    close: () => { closed += 1; },
+  });
+  const live = await wakeup.inspectBridgeThread("codex:thread-owner", { rolloutPath: rollout }, connect);
+  assert.equal(live.outcome, "in_progress");
+  assert.equal(live.active, true);
+  assert.equal(live.replaySafe, false);
+  assert.equal(JSON.stringify(live).includes("EVENT-FIRST-OK"), false);
+  thread.status.type = "notLoaded";
+  thread.turns[0].status = "interrupted";
+  const unknown = await wakeup.inspectBridgeThread("thread-owner", { rolloutPath: rollout }, connect);
+  assert.equal(unknown.outcome, "unknown");
+  assert.equal(unknown.reportedTurnStatus, "interrupted");
+  assert.equal(closed, 2);
+  const unavailable = await wakeup.inspectBridgeThread("thread-owner", {}, async () => { throw new Error("app_server_socket_missing"); });
+  assert.equal(unavailable.status, "unavailable");
+  assert.equal(unavailable.outcome, "unknown");
+  assert.equal(unavailable.replaySafe, false);
+  const invalid = await wakeup.inspectBridgeThread("codex:new", {}, () => assert.fail("must not connect"));
+  assert.equal(invalid.reason, "target_thread_missing");
 });
 
 test("matching turn/completed wakes one canonical reread without polling", async () => {

@@ -78,11 +78,17 @@ struct MacIntegrationBridgeImpl: MacIntegrationToolBridge {
         if let surface = input["surface"]?.stringValue, !surface.isEmpty {
             userInfo["surface"] = surface
         }
-        let receipt = try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+        // Item 26: one exit, through the router. Owner-waiting and PINNED to
+        // the phone — `mobile_notify` names its channel, so it keeps delivering
+        // a real APNS receipt. Payload unchanged.
+        let receipt = try await AttentionRouter.shared.route(
+            eventId: "mobile_notify:\(AttentionRouter.stableDigest(title + "|" + message))",
+            importance: .ownerWaiting,
             title: title,
             body: message,
-            userInfo: userInfo
-        )
+            userInfo: userInfo,
+            pinnedTo: .phone
+        ).requireReceipt()
         var obj = receipt.deliveryFields()
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),

@@ -2,6 +2,7 @@ import Foundation
 import ChatOrchestration
 import CognitiveSubstrate
 import Context
+import MemoryV2
 import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
@@ -428,6 +429,28 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     /// `runReflectionIfDue`. Proof counter mirrors the replay one above.
     var eventDrivenReflectionAttemptCount: UInt64 = 0  // internal for actor extensions
     var reflectionEventTask: Task<Void, Never>?  // internal for actor extensions
+    /// Sleep-pressure dream lane (NORTHSTAR clause 4). Single-flight: the
+    /// organism may only ever have ONE dream in the air, and the dream's own
+    /// provider call must not block signal ingestion, so it rides a detached
+    /// task exactly the way event-driven reflection does. See
+    /// NativeCognitionRuntime+PressureDream.swift.
+    var pressureDreamTask: Task<Void, Never>?  // internal for actor extensions
+    var lastPressureDreamDecision: String?  // internal for actor extensions
+    /// Change-only key for FIRE-path deferral receipts (kind + reason +
+    /// decision), the twin of the quiet-decision suppression `lastPressureDreamDecision`
+    /// provides. Cleared whenever a non-deferral pressure-dream receipt lands.
+    var lastPressureDreamDeferral: String?  // internal for actor extensions
+    var pressureDreamAttemptCount: UInt64 = 0  // internal for actor extensions
+    /// Studio encounter lane (desk 903 phases 1 + 4). Single-flight and rate
+    /// limited: composing an encounter reads the journal, the consults and the
+    /// graph, so it rides the residual-repair deadline the dream lane already
+    /// rides rather than owning a timer, and it does not re-read on every
+    /// somatic signal. See NativeCognitionRuntime+StudioEncounters.swift.
+    var studioEncounterTask: Task<Void, Never>?  // internal for actor extensions
+    var lastStudioEncounterOutcome: String?  // internal for actor extensions
+    var lastStudioEncounterAt: Date?  // internal for actor extensions
+    var lastStudioRelationAuditVerdict: String?  // internal for actor extensions
+    var studioEncounterAttemptCount: UInt64 = 0  // internal for actor extensions
     let eventDrivenReflectionOperationOverride:  // internal for actor extensions
         (@Sendable (String) async -> Void)?
     static let eventDrivenReplayDeadlineSeconds: TimeInterval = 10
@@ -550,6 +573,89 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         nonLiveTurnKindRunOrder.removeAll { $0 == runId }
     }
 
+    /// Real chat-turn lifecycle latch (review 2026-09-01, HIGH).
+    ///
+    /// The coalesced microcycle generation is NOT a turn. `runScheduledMicrocycle`
+    /// clears `pendingMicrocycleGeneration` the moment the settlement it owns
+    /// starts, while the user's turn — provider stream, tool loop, reply
+    /// persistence — keeps running for minutes afterwards. A residual deadline
+    /// landing in that window read "no turn in flight" and could start a
+    /// pressure dream (or a studio encounter) on top of a live turn.
+    ///
+    /// No new app-side hook is needed: the runtime is already handed BOTH edges
+    /// of every chat turn through `observe`. ChatOrchestration stamps a `runId`
+    /// on the admitted `userMessageReceived` row and on that run's terminal
+    /// `assistantTurnCompleted` / `providerFailure` (the same correlation
+    /// `inheritNonLiveTurnKind` already reads). Keying the latch by runId counts
+    /// nested and concurrent turns for free and is idempotent under exact replay.
+    var liveTurnStartedAtByRunId: [String: Date] = [:]  // internal for actor extensions
+    private var liveTurnRunOrder: [String] = []
+    static let maximumLiveTurnRuns = 64
+    /// Safety: a latch older than this is not trusted. ChatOrchestration's
+    /// `WholeTurnWallClockBudget` clamps EVERY turn — interactive, telegram,
+    /// bridge — to `defaultUnattendedSeconds` (3_900), so a latch older than
+    /// that cannot belong to a turn that is still running; it belongs to a
+    /// terminal event that never arrived. Mirrored rather than imported: that
+    /// budget type is internal to the ChatOrchestration module.
+    static let liveTurnLatchWallClockBudget: TimeInterval = 3_900
+
+    /// Admission edge. The user's message row is persisted and observed BEFORE
+    /// the provider call begins, so this is the earliest honest "a turn is
+    /// running" moment the runtime is given.
+    func noteTurnStarted(runId: String) {
+        let key = runId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        let startedAt = now()
+        pruneExpiredLiveTurns(asOf: startedAt)
+        if liveTurnStartedAtByRunId.updateValue(startedAt, forKey: key) == nil {
+            liveTurnRunOrder.append(key)
+        }
+        while liveTurnRunOrder.count > Self.maximumLiveTurnRuns {
+            let stale = liveTurnRunOrder.removeFirst()
+            liveTurnStartedAtByRunId.removeValue(forKey: stale)
+        }
+    }
+
+    /// Terminal settlement edge: the assistant reply (or the run's provider
+    /// failure) has been persisted. Cancelled turns still append their assistant
+    /// row, so they release the latch too.
+    func noteTurnFinished(runId: String) {
+        let key = runId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        liveTurnStartedAtByRunId.removeValue(forKey: key)
+        liveTurnRunOrder.removeAll { $0 == key }
+        pruneExpiredLiveTurns(asOf: now())
+    }
+
+    /// Latch the admission edge off the event the runtime already receives.
+    func noteChatTurnAdmission(_ event: CognitiveEvent) {
+        guard event.kind == .userMessageReceived,
+              case .string(let runId)? = event.metadata["runId"] else { return }
+        noteTurnStarted(runId: runId)
+    }
+
+    /// Turns admitted, not yet terminal, and still inside the wall-clock budget.
+    func liveTurnLatchCount() -> Int {
+        guard !liveTurnStartedAtByRunId.isEmpty else { return 0 }
+        let instant = now()
+        return liveTurnStartedAtByRunId.values.filter {
+            instant.timeIntervalSince($0) <= Self.liveTurnLatchWallClockBudget
+        }.count
+    }
+
+    private func pruneExpiredLiveTurns(asOf instant: Date) {
+        guard !liveTurnStartedAtByRunId.isEmpty else { return }
+        var expired: [String] = []
+        for (key, startedAt) in liveTurnStartedAtByRunId
+        where instant.timeIntervalSince(startedAt) > Self.liveTurnLatchWallClockBudget {
+            expired.append(key)
+        }
+        guard !expired.isEmpty else { return }
+        let expiredKeys = Set(expired)
+        for key in expired { liveTurnStartedAtByRunId.removeValue(forKey: key) }
+        liveTurnRunOrder.removeAll { expiredKeys.contains($0) }
+    }
+
     init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         configurationOverride: CognitiveConfiguration? = nil,
@@ -656,6 +762,16 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
                         creativity: traits.creativity,
                         brevity: traits.brevity
                     ))
+                },
+                // UNBIDDEN RECALL (2026-09-02). The substrate asks with the
+                // words of its own felt line and gets back felt MOMENTS. Local
+                // SQLite + the already-warm embedder — no provider call — and
+                // any failure returns [], which reads as "nothing came to her".
+                // Rooted at THIS runtime's data root and filtered by the turn's
+                // own surface; both are correctness, not hygiene (see below).
+                recallMoments: { feltLine, k, surface in
+                    await NativeCognitionRuntime.recallMoments(
+                        feltLine: feltLine, limit: k, surface: surface, dataRoot: root)
                 }
             ),
             store: store
@@ -740,6 +856,153 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         return name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    // MARK: - Unbidden recall (2026-09-02)
+
+    /// Memory kinds that count as a MOMENT — something that HAPPENED and left a
+    /// feeling, as opposed to a fact she knows. `moment` is the lane's own kind;
+    /// the other three are what episodic rows were called before it, so an
+    /// install whose store predates the lane still has something to be reminded
+    /// of. Everything else (facts, preferences, identity) is excluded: being
+    /// "reminded of" a stored preference is not a memory arriving sideways.
+    nonisolated static let momentMemoryKinds: Set<String> = [
+        "moment", "experience", "episodic", "event",
+    ]
+
+    /// One local recall, mapped into the substrate's vocabulary. Never throws:
+    /// a cold or unavailable store means she is reminded of nothing, which is
+    /// the correct degraded behavior for an enhancer line.
+    ///
+    /// TWO THINGS HERE ARE LOAD-BEARING, and the first cut had neither:
+    ///
+    /// * **The surface**, which is the disclosure boundary. `recall` applies
+    ///   `MemoryRecordDisclosurePolicy` against it; with no surface every record
+    ///   classifies through, so a memory restricted to one surface could arrive
+    ///   unbidden on another. Unbidden is the *worst* place for that leak,
+    ///   because nobody asked and nobody is checking.
+    /// * **The data root.** `SwiftNativeMemoryV2.shared` is the production
+    ///   store; a runtime built on an alternate or test root must never read it.
+    ///   `resolvedOwner(dataRoot:)` is the same rule the chat recall factory
+    ///   uses (`makeChatMemoryRecaller`): the singleton for the default root, a
+    ///   private hermetic actor otherwise.
+    ///
+    /// Persona is deliberately `nil` — the exact value the ordinary chat recall
+    /// passes. `memoryRecallPersonaFilter` returns nil for the resident slot
+    /// and, by policy, for custom slots too: the mask changes the voice, not the
+    /// store. Anything else here would make unbidden recall stricter than the
+    /// recall the same turn already did.
+    nonisolated static func recallMoments(
+        feltLine: String,
+        limit: Int,
+        surface: String,
+        dataRoot: URL
+    ) async -> [CognitiveRecalledMoment] {
+        let query = feltLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        let surface = surface.trimmingCharacters(in: .whitespacesAndNewlines)
+        // No surface means no disclosure boundary to check against, and an
+        // unchecked recall is precisely what this must never do.
+        guard !query.isEmpty, !surface.isEmpty, limit > 0 else { return [] }
+        let response: MemoryV2RecallResponse
+        do {
+            response = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).recall(
+                MemoryV2RecallRequest(
+                    text: query, topK: limit, persona: nil, surface: surface))
+        } catch {
+            return []
+        }
+        return response.scored.compactMap { moment(from: $0.record, score: $0.score) }
+    }
+
+    /// The one mapper, shared by the recall lane and the served-moment lane, so
+    /// "what counts as a moment" cannot come to mean two things.
+    nonisolated static func moment(
+        from record: MemoryV2.MemoryRecord,
+        score: Double
+    ) -> CognitiveRecalledMoment? {
+        guard (record.status ?? "active") == "active" else { return nil }
+        guard let kind = record.memoryKind?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              momentMemoryKinds.contains(kind) else { return nil }
+        // The lane stores the felt weight beside the text; `extras` is the
+        // record's metadata bag verbatim (see `toMemoryRecord`).
+        let text = metadataString(record.extras, "quote") ?? record.text
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return CognitiveRecalledMoment(
+            id: record.id,
+            text: text,
+            valence: metadataDouble(record.extras, "valence") ?? 0,
+            salience: metadataDouble(record.extras, "salience")
+                ?? record.importance
+                ?? 0.5,
+            occurredAt: isoDate(record.observedAt)
+                ?? isoDate(record.createdAt)
+                ?? Date(),
+            score: score)
+    }
+
+    /// How many served ids one turn may look up. The re-feel spends at most
+    /// `refeelNodesPerTurn` of them, so a whole 32-id serve is never worth
+    /// reading; this keeps the lane a few point reads, not a scan.
+    nonisolated static let servedMomentLookupLimit = 8
+
+    /// GIVE THE SERVED MOMENTS THEIR FEELING BEFORE THE EVENT IS INGESTED.
+    ///
+    /// The re-feel runs inside `ingest`, reading `memoryRecordIds` off the
+    /// event. It can only re-feel a moment whose weight the substrate already
+    /// holds, and nothing else fills that ledger for the ORDINARY recall lane —
+    /// so without this hop an ordinary served moment arrived as a bare id and
+    /// was re-felt neutrally, which is the exact complaint this wave answers.
+    ///
+    /// Disclosure: `readMemoryRecord` re-applies the policy against this event's
+    /// own surface. Belt and braces — these ids are what the turn already
+    /// served, and that path filtered them — but the check is local and cheap,
+    /// and a lookup by id with no surface would be a bypass.
+    func noteServedMoments(for event: CognitiveEvent) async {
+        let ids = CognitiveSubstrate.memoryRecordIDs(fromEventMetadata: event.metadata)
+        guard !ids.isEmpty else { return }
+        guard case .string(let rawSurface)? = event.metadata["surface"] else { return }
+        let surface = rawSurface.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !surface.isEmpty else { return }
+        // Only ids whose feeling is not already known — a moment surfaced by the
+        // reminded-of lane this same turn is already in the ledger.
+        let unknown = await substrate.momentIDsMissingFeeling(ids)
+            .prefix(Self.servedMomentLookupLimit)
+        guard !unknown.isEmpty else { return }
+        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+        var moments: [CognitiveRecalledMoment] = []
+        for id in unknown {
+            guard let record = try? await memory.readMemoryRecord(
+                id: id, persona: nil, surface: surface) else { continue }
+            // Served rows are not scored here; the score gates the reminded-of
+            // LINE, and this lane never renders anything.
+            if let moment = Self.moment(from: record, score: 1) { moments.append(moment) }
+        }
+        guard !moments.isEmpty else { return }
+        await substrate.noteServedMoments(moments)
+    }
+
+    private nonisolated static func metadataString(_ value: JSONValue?, _ key: String) -> String? {
+        guard case .object(let object)? = value,
+              case .string(let string)? = object[key] else { return nil }
+        return string
+    }
+
+    private nonisolated static func metadataDouble(_ value: JSONValue?, _ key: String) -> Double? {
+        guard case .object(let object)? = value else { return nil }
+        switch object[key] {
+        case .double(let number): return number
+        case .int(let number): return Double(number)
+        default: return nil
+        }
+    }
+
+    private nonisolated static func isoDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFraction.date(from: raw) { return date }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+
     func bootstrap() async {
         if bootstrapTask == nil {
             bootstrapTask = Task { await self.bootstrapBody() }
@@ -748,6 +1011,24 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     }
 
     private func bootstrapBody() async {
+        // Desk 903 phase 2 — the ONE seam between a filed journal entry and the
+        // cognitive bus. The tool lane that writes the journal holds no
+        // cognition reference by design; whoever owns the live substrate
+        // installs the sink once, and this is that owner. Until this line runs
+        // the bus is inert and says so out loud.
+        //
+        // ROOT-GUARDED. The bus is process-global and a second install REPLACES
+        // the first, so every runtime bootstrapped on an alternate data root —
+        // a test harness, a workshop profile, a second window pointed elsewhere
+        // — used to silently take over the resident mind's sink and feed her
+        // journal entries into a substrate that is not hers. There is one
+        // resident mind, and it is the one on the canonical root; a runtime on
+        // any other root installs nothing and stays out of the way.
+        if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
+            await StudioJournalCognitiveBus.install { [substrate] entry in
+                await substrate.ingestStudioJournalEntry(entry)
+            }
+        }
         startPursuitObservationIfNeeded()
         await ensureReflectionSurfaceSeed()
         await refreshConfiguration()
@@ -838,6 +1119,18 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
                 configuration.reflectionProvider = routingSnapshot.activeProviders[configuration.reflectionSurface]
                     ?? routing.inferProviderForModel(reflection.model)
                     ?? configuration.reflectionProvider
+                // 2026-09-06: the routing row is the ONLY authority for the
+                // reflection mind, and this is where it is resolved — so mirror
+                // it onto the two preference keys the Setup and Settings
+                // pickers display. Changing the reflection row in Providers
+                // writes routing and calls this; without the mirror those
+                // pickers went on showing a stale provider/model forever, with
+                // no way for the person to tell which one actually runs.
+                if usesLiveAppBody {
+                    preferenceDefaults.set(configuration.reflectionModel, forKey: Self.reflectionModelKey)
+                    preferenceDefaults.set(
+                        configuration.reflectionProvider, forKey: Self.reflectionProviderKey)
+                }
             }
             providerRoutingFailure = nil
         } catch {
@@ -862,13 +1155,34 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         let acceptanceStartedAt = ProcessInfo.processInfo.systemUptime
         await bootstrap()
         let inherited = inheritNonLiveTurnKind(for: event)
+        // Chat-turn lifecycle latch opens at admission, BEFORE the provider
+        // call this event's run is about to make (see `noteTurnStarted`).
+        noteChatTurnAdmission(inherited.event)
         let afterInheritance = ProcessInfo.processInfo.systemUptime
+        // BEFORE ingest, because the re-feel happens inside it: a served moment
+        // with no recorded feeling is re-felt neutrally, which is the thing
+        // being fixed. No-op for the overwhelming majority of events (they carry
+        // no `memoryRecordIds` at all).
+        await noteServedMoments(for: inherited.event)
         let substrateAccepted = await substrate.ingestResident(inherited.event)
         let afterSubstrate = ProcessInfo.processInfo.systemUptime
-        let somaticAccepted = await somaticSignalBus.observe(inherited.event) != nil
+        // Item 46's remaining hop (see the header of
+        // CognitiveSubstrate+AppraisalConcerns.swift). Only the appraisal owner
+        // holds standing views, so only it can say a lived concern is at stake
+        // (mint) or how this turn lands on the completion it answers (react);
+        // the organism reads the event's own metadata. This is the one place
+        // that hands the SAME event to both owners. Pure, synchronous, no LLM,
+        // and empty for the overwhelming majority of events. Read AFTER ingest
+        // so a reaction can see the completion this turn is answering.
+        var enriched = inherited.event
+        for (key, value) in await substrate.semanticExpectationMetadata(for: inherited.event) {
+            enriched.metadata[key] = value
+        }
+        let somaticAccepted = await somaticSignalBus.observe(enriched) != nil
         let afterSomatic = ProcessInfo.processInfo.systemUptime
         if let completedRunId = inherited.completedRunId {
             finishNonLiveTurn(runId: completedRunId)
+            noteTurnFinished(runId: completedRunId)
         }
         // Exact replay is inert across both resident owners. It must not create
         // settlement work, persistence, invalidations, prewarm, or telemetry.
@@ -1144,6 +1458,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         let capsuleRequest = requestWithOrganismProjection(
             request,
             projection: organism.projection,
+            toward: await towardRead(),
             at: fixedAt
         )
         let preparedCapsule = await substrate.prepareFrozenCapsulePresentation(
@@ -1456,6 +1771,10 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
         // LLM call cannot outlive the terminal snapshot.
         reflectionEventTask?.cancel()
         reflectionEventTask = nil
+        // Same latch for the pressure-fired dream: 03:30 remains the integrity
+        // fallback, so a dream cancelled at termination is simply not owed.
+        pressureDreamTask?.cancel()
+        pressureDreamTask = nil
         let sleepAt = now()
         let sleepEvent = CognitiveEvent(
             id: "app-sleep:\(Int(sleepAt.timeIntervalSince1970))",
@@ -1508,6 +1827,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
                 maximumCharacters: min(1_200, configuration.maximumCapsuleCharacters)
             ),
             projection: await organismKernel.projection(),
+            toward: await towardRead(),
             at: inspectFixedAt
         )
         // Pass the workspace already snapshotted above: feltModeReading must not
@@ -1703,9 +2023,16 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     private func requestWithOrganismProjection(
         _ request: CognitiveCapsuleRequest,
         projection initialProjection: OrganismProjection,
+        toward: OrganismTowardRead? = nil,
         at fixedAt: Date
     ) -> CognitiveCapsuleRequest {
         var projection = initialProjection
+        // The horizon rides BEFORE the neutral-projection early return: it
+        // comes from the prediction ledger, not from chemistry, so a body with
+        // nothing to say is no reason for her to stop looking forward to
+        // Friday.
+        var request = request
+        request.toward = toward
         guard !projection.isNeutral else { return request }
         // Suppress-when-unchanged: only for REAL injections (.inject). If the same
         // line is still fresh, drop it so a held mood goes quiet instead of
@@ -1775,11 +2102,35 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     /// User's approval seam for Wave E standing views — a view she formed in reflection
     /// only reaches her capsule after this says approved.
     func resolveStandingView(id: UUID, approved: Bool) async -> CognitiveStandingView? {
-        let resolved = await substrate.resolveStandingView(id: id, approved: approved)
-        guard resolved != nil else { return nil }
+        await resolveStandingViewChecked(id: id, approved: approved).view
+    }
+
+    /// Same seam, carrying the persistence outcome (2026-09-06) so the review
+    /// surfaces can tell "saved" from "changed in memory only".
+    func resolveStandingViewChecked(id: UUID, approved: Bool) async -> StandingViewTransition {
+        let resolved = await substrate.resolveStandingViewChecked(id: id, approved: approved)
+        guard resolved.view != nil else { return resolved }
         scheduleDirtyMicrocycle(reason: "standing_view_resolution")
         publishRuntimeChange(reason: "proposal:standing_view_resolved")
         return resolved
+    }
+
+    /// The user's RETIREMENT seam — the way out of `.active` that
+    /// `resolveStandingView` never had (Agent, 2026-09-02: three of her five
+    /// active views were three drafts of one phrasing view and nothing could
+    /// retire them but a sixth approval pushing one off the LRU). Also the
+    /// route for letting go of a `.held` view she adopted herself.
+    func retireStandingView(id: UUID) async -> CognitiveStandingView? {
+        await retireStandingViewChecked(id: id).view
+    }
+
+    /// Same seam, carrying the persistence outcome (2026-09-06).
+    func retireStandingViewChecked(id: UUID) async -> StandingViewTransition {
+        let retired = await substrate.retireStandingViewChecked(id: id)
+        guard retired.view != nil else { return retired }
+        scheduleDirtyMicrocycle(reason: "standing_view_retirement")
+        publishRuntimeChange(reason: "proposal:standing_view_retired")
+        return retired
     }
 
     func setAblation(_ key: String, enabled: Bool) async {
@@ -1893,6 +2244,19 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     }
 
 
+    /// True while a chat turn is running, or while a settlement is still
+    /// pending. The sleep-pressure dream lane and the studio-encounter lane read
+    /// this so neither can land on top of a turn in flight.
+    ///
+    /// The turn latch is the authority (admission → terminal settlement, counted
+    /// by runId, wall-clock-bounded). The coalescer generation is kept as the
+    /// second term: it still covers non-chat sensory work and any turn admitted
+    /// without a runId, and it is what this property used to mean.
+    var liveTurnInFlight: Bool {  // internal for actor extensions
+        if liveTurnLatchCount() > 0 { return true }
+        return pendingMicrocycleGeneration != nil
+    }
+
     func backgroundCognitionGate(reason: String) async -> CognitiveBackgroundGate {  // internal for actor extensions (move-only Wave C)
         let process = ProcessInfo.processInfo
         if process.isLowPowerModeEnabled {
@@ -1970,9 +2334,12 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             defaults.bool(forKey: reflectionKey)
                 || env["NATIVE_AGENT_COGNITION_REFLECTION_ENABLED"] == "1"
         )
+        // The old daily quota is now the HARD cost ceiling per rolling 24h —
+        // same number, so nothing spends more by default; admission is load.
         let budgetDefault = reflectionEnabled ? 2 : 0
         let storedBudget = defaults.object(forKey: reflectionBudgetKey) as? Int
         let budget = max(0, storedBudget ?? budgetDefault)
+        let storedLoadThreshold = defaults.object(forKey: reflectionLoadThresholdKey) as? Double
         let reflectionModel = configuredReflectionModel(env: env)
         let reflectionProvider = configuredReflectionProvider(for: reflectionModel)
         return CognitiveConfiguration(
@@ -1992,6 +2359,7 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
             maximumWorkspaceItems: 12,
             maximumThoughtSeeds: 64,
             dailyReflectionCallBudget: budget,
+            reflectionLoadThreshold: storedLoadThreshold ?? CognitiveConfiguration().reflectionLoadThreshold,
             reflectionSurface: "cognition_reflection",
             reflectionModel: reflectionModel,
             reflectionProvider: reflectionProvider,
@@ -2091,6 +2459,9 @@ actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProvidin
     private static let backgroundKey = "cognitiveSubstrateBackgroundEnabled"
     private static let reflectionKey = "cognitiveSubstrateReflectionEnabled"
     private static let reflectionBudgetKey = "cognitiveSubstrateDailyReflectionBudget"
+    /// Unresolved-load admission threshold for spontaneous reflection. No UI
+    /// knob: the ceiling is what User steers; this is the shape's tuning seam.
+    private static let reflectionLoadThresholdKey = "cognitiveSubstrateReflectionLoadThreshold"
     static let organismKernelEnabledKey = "organismKernelEnabled"  // internal for actor extensions (move-only Wave C)
     static let reflectionModelKey = "cognitiveSubstrateReflectionModel"
     static let reflectionProviderKey = "cognitiveSubstrateReflectionProvider"

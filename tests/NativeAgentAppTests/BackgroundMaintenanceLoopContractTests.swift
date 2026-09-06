@@ -124,26 +124,30 @@ struct BackgroundMaintenanceLoopContractTests {
         #expect(!after.contains("\(expired[0]).jsonl.lock"), "the orphaned lock sidecar must go with its day")
         #expect(after.contains("README.txt"), "an unparseable filename is never guessed at")
 
-        // Idempotence: a second tick removes nothing more and still completes.
+        // Idempotence: a second tick removes nothing more — and says so.
+        // (Sweep FIX 4: a no-op sweep is `.skipped`, never `.completed`; the
+        // old `.completed` advanced the dormancy clock on every idle tick.)
         let second = await loop.tickOutcome()
-        guard case .completed = second else {
-            Issue.record("second tick was not .completed: \(second)")
+        guard case .skipped(let reason, _) = second else {
+            Issue.record("second tick was not .skipped: \(second)")
             return
         }
+        #expect(reason.contains("nothing past any retention cutoff"))
         #expect(Set(try FileManager.default.contentsOfDirectory(atPath: traces.path)) == after)
     }
 
     @Test("turn-trace retention is bound to the passed root, not the default one")
     func turnTraceRetentionLoopIsRootScoped() async throws {
-        // The whole silent-failure mode is "wrong root → clean .completed, nothing
-        // pruned". An empty temp root has no turn_traces dir at all: the tick must
-        // still complete without reaching for any other root.
+        // The whole silent-failure mode is "wrong root → clean success, nothing
+        // pruned". An empty temp root has no turn_traces dir at all: the tick
+        // must run without reaching for any other root, and report the honest
+        // no-op (`.skipped`) rather than claiming a sweep it did not do.
         let root = try maintenanceTempRoot("turntrace-empty")
         defer { try? FileManager.default.removeItem(at: root) }
         let loop: any LoopRunner = BackgroundLoopsAssembly.makeTurnTraceRetentionLoop(dataRoot: root)
         let outcome = await loop.tickOutcome()
-        guard case .completed = outcome else {
-            Issue.record("empty-root tick was not .completed: \(outcome)")
+        guard case .skipped = outcome else {
+            Issue.record("empty-root tick was not .skipped: \(outcome)")
             return
         }
         #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("turn_traces").path))
@@ -208,9 +212,14 @@ struct BackgroundMaintenanceLoopContractTests {
         #expect(live?["evidence"] as? String == "evidence-expired-live")
         #expect(live?["status"] as? String == "proposed")
 
-        // Idempotent re-tick: nothing left to remove, count reports zero.
+        // Idempotent re-tick: nothing left to remove, so the lane says it did
+        // nothing (sweep FIX 4) instead of booking a success for "removed 0".
         let second = await loop.tickOutcome()
-        #expect(second == .completed(result: "evolution proposal sweep removed 0"))
+        guard case .skipped(let reason, _) = second else {
+            Issue.record("second tick was not .skipped: \(second)")
+            return
+        }
+        #expect(reason.contains("no terminal proposals"))
     }
 
     // MARK: - self_improvement_sweep + its enable gate
@@ -223,13 +232,19 @@ struct BackgroundMaintenanceLoopContractTests {
         let view = try AppSourceScraping.appSource("SelfImprovementView.swift")
         #expect(factory.contains("UserDefaults.standard.bool(forKey: \"selfImprovementEnabled\")"))
         #expect(view.contains("@AppStorage(\"selfImprovementEnabled\")"))
-        // And there is exactly one writer of that key.
+        // And the writers of that key are exactly the audited surfaces. 2026-09-06:
+        // 7531524f gave Setup a per-feature switch card that binds the SAME
+        // literal on purpose ("Same keys the Subconscious section and the
+        // Observatory bind, so no two surfaces can show different truth",
+        // SetupFeatureRows.swift:19). The pin still fails on a rename (a drifted
+        // key drops that file out of the set) and on an unaudited new writer.
         let appRoot = try AppSourceScraping.appSourcesRoot()
         let writers = try AppSourceScraping.swiftSourceContents(under: appRoot)
             .filter { $0.source.contains("@AppStorage(\"selfImprovementEnabled\")") }
             .map(\.file)
             .sorted()
-        #expect(writers == ["SelfImprovementView.swift"], "found unexpected writers: \(writers)")
+        #expect(writers == ["SelfImprovementView.swift", "SetupFeatureRows.swift"],
+                "found unexpected writers: \(writers)")
     }
 
     @Test("self-improvement sweep: gate off never calls the LLM, gate on surfaces a provider failure")

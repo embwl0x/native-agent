@@ -404,18 +404,25 @@ struct TelegramBotCompletenessTests {
         #expect(status.sessionId == "existing-session-123")
     }
 
-    @Test func TelegramCommandRegistry_contains_control_surface() {
-        let names = Set(TelegramCommandRegistry.commands.map(\.command))
-        for expected in [
-            "status", "new", "reset", "session", "clear", "compact",
-            "stop", "retry", "sessions", "resume",
-            "provider", "model", "think", "brain", "persona",
-            "remember", "note", "scratch", "tools", "restart", "help",
-            "approve", "deny",
+    /// The command menu IS the surface. It carries the kept set and nothing
+    /// else — every plumbing spelling is a retired alias that still
+    /// dispatches for one release but is never advertised.
+    @Test func TelegramCommandRegistry_menu_is_only_the_kept_set() {
+        let names = TelegramCommandRegistry.commands.map(\.command)
+        #expect(Set(names) == ["stop", "new", "retry", "approve", "deny", "help"])
+        #expect(names.count == 6)
+
+        for retired in [
+            "status", "model", "provider", "brain", "think", "fast", "persona",
+            "remember", "note", "scratch", "tools", "session", "reset", "clear",
+            "compact", "sessions", "resume", "restart",
         ] {
-            #expect(names.contains(expected))
+            #expect(!names.contains(retired), "\(retired) is still advertised")
+            #expect(
+                TelegramCommandRegistry.definition(for: retired) != nil,
+                "\(retired) must stay dispatchable as a hidden alias"
+            )
         }
-        #expect(TelegramCommandRegistry.commands.count == TelegramCommandRegistry.definitions.count)
     }
 
     @Test func TelegramCommandRegistry_parses_aliases_and_args() throws {
@@ -438,19 +445,16 @@ struct TelegramBotCompletenessTests {
         let bot = await makeBotWithDeps()
         let reply = await dispatchSwiftSlashCommand(bot: bot, command: "/help", args: [])
         let text = try #require(reply)
-        #expect(text.contains("/status"))
-        #expect(text.contains("/provider"))
-        #expect(text.contains("/model"))
-        #expect(text.contains("/think"))
-        #expect(text.contains("/fast <on|off>"))
-        #expect(text.contains("/brain"))
-        #expect(text.contains("/stop"))
-        #expect(text.contains("/retry"))
-        #expect(text.contains("/sessions"))
-        #expect(text.contains("/resume <id>"))
-        #expect(text.contains("/restart"))
-        #expect(text.contains("/help"))
-        #expect(text.contains("Slash commands are handled locally before chat."))
+        for kept in ["/stop", "/new", "/retry", "/approve <id>", "/deny <id>", "/help"] {
+            #expect(text.contains(kept))
+        }
+        for retired in ["/status", "/provider", "/model", "/think", "/fast",
+                        "/brain", "/persona", "/sessions", "/resume", "/scratch",
+                        "/restart", "/tools", "/compact"] {
+            #expect(!text.contains(retired), "/help still advertises \(retired)")
+        }
+        #expect(text.contains("just say it"))
+        #expect(text.contains("use opus"))
     }
 
     // MARK: /restart

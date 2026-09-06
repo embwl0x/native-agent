@@ -95,6 +95,19 @@ enum TriggerNotifierBinding {
         }
     }
 
+    /// Item 26 classification for a fired trigger.
+    ///
+    /// A CLOCK trigger (the morning brief) fires on the hour, not on a fact User
+    /// is blocked on — informational, so it lands on the PHONE, once, and the
+    /// mirrored card is its receipt. It is never a chat message (NORTHSTAR
+    /// clause 6; User's explicit call). An event trigger whose card came out
+    /// `important` (urgency "high") is Agent reaching for User — owner-waiting,
+    /// routed to the surface he is actually on.
+    static func importance(for note: TriggerNotification) -> AttentionImportance {
+        if note.kind == "time" { return .informational }
+        return note.urgency == "high" ? .ownerWaiting : .informational
+    }
+
     static let pairedDevicePush: TriggerNotifier = { note in
         // A card the seam couldn't carry (empty id / non-object) is rebuilt from
         // the push-truncated fields rather than dropped.
@@ -138,7 +151,19 @@ enum TriggerNotifierBinding {
         // head start so the tap lands on a synced inbox.
         await MacSyncEngine.shared.writeSnapshots()
         do {
-            let receipt = try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+            // Item 26. A CLOCK trigger (the morning brief) fires on the hour,
+            // not on a fact User is blocked on — informational, so it lands on
+            // the PHONE, once, and the card written above is its receipt. It is
+            // never a chat message (NORTHSTAR clause 6; User's explicit call).
+            // An event trigger that built an `important` card is Agent reaching
+            // for User: owner-waiting, routed to the surface he is on.
+            // Payload unchanged.
+            let importance = Self.importance(for: note)
+            let outcome = try await AttentionRouter.shared.route(
+                eventId: note.itemId.isEmpty
+                    ? "trigger:\(note.triggerName):\(AttentionRouter.stableDigest(note.title + "|" + note.body))"
+                    : "trigger:\(note.itemId)",
+                importance: importance,
                 title: note.title,
                 body: note.body,
                 userInfo: [
@@ -149,6 +174,18 @@ enum TriggerNotifierBinding {
                     "trigger": note.triggerName,
                 ]
             )
+            guard let receipt = outcome.receipt else {
+                // Routed to Telegram, or already delivered for this card. The
+                // card IS in the inbox either way, so this is a delivered fire
+                // with no APNS receipt — never `.null`, which means "the card
+                // never landed" and would make the scheduler re-mirror.
+                return .object([
+                    "delivered": .bool(!outcome.suppressed),
+                    "mirrored": .bool(true),
+                    "routedTo": .string(outcome.delivery.rawValue),
+                    "suppressed": .bool(outcome.suppressed),
+                ])
+            }
             return .object(receipt.deliveryFields())
         } catch {
             NSLog("trigger_notify: paired-device push failed for \(note.triggerName): \(error)")

@@ -18,6 +18,14 @@ struct TelegramTranscriptTermCorrectionTests {
         #expect(result.text.contains("Codex"))
     }
 
+    /// 2026-09-06 (23e1d8de): the agent's own name is no longer shipped in the
+    /// built-in table — it is whatever the user configured, so its manglings
+    /// live per-install in `<dataRoot>/config/transcript_terms.json` and reach
+    /// `correct` through `extra:` (see `installTerms`). These cases therefore
+    /// supply the install term the way production does.
+    private static let installAgentName: [(heard: String, canonical: String)] =
+        [("ayla", "Agent")]
+
     @Test func eachManglingCorrectsToCanonicalSpelling() {
         let cases: [(String, String)] = [
             ("tell kodex to look at it", "tell Codex to look at it"),
@@ -32,7 +40,8 @@ struct TelegramTranscriptTermCorrectionTests {
             ("did sparkle ship the update", "did Sparkle ship the update"),
         ]
         for (heard, expected) in cases {
-            let result = TelegramTranscriptTermCorrection.correct(heard)
+            let result = TelegramTranscriptTermCorrection.correct(
+                heard, extra: Self.installAgentName)
             #expect(result.text.lowercased() == expected.lowercased(),
                     "\(heard) -> \(result.text)")
             #expect(result.correctedCount >= 1, "no correction counted for: \(heard)")
@@ -42,7 +51,8 @@ struct TelegramTranscriptTermCorrectionTests {
 
     @Test func caseInsensitiveAndCanonicalCasingIsFree() {
         #expect(TelegramTranscriptTermCorrection.correct("KODEX broke").text == "Codex broke")
-        #expect(TelegramTranscriptTermCorrection.correct("Ayla and Kodex").text == "Agent and Codex")
+        #expect(TelegramTranscriptTermCorrection.correct(
+            "Ayla and Kodex", extra: Self.installAgentName).text == "Agent and Codex")
         // Already-canonical text corrects nothing and counts nothing.
         let clean = TelegramTranscriptTermCorrection.correct("Codex opened a GitHub PR for NativeAgent")
         #expect(clean.text == "Codex opened a GitHub PR for NativeAgent")
@@ -70,7 +80,8 @@ struct TelegramTranscriptTermCorrectionTests {
     }
 
     @Test func markerCountsOccurrencesAndStaysOutOfVisibleText() {
-        let result = TelegramTranscriptTermCorrection.correct("kodex and kodak and ayla")
+        let result = TelegramTranscriptTermCorrection.correct(
+            "kodex and kodak and ayla", extra: Self.installAgentName)
         #expect(result.correctedCount == 3)
         #expect(result.marker == "[transcript corrected: 3 terms]")
         #expect(!result.text.contains("[transcript corrected"))

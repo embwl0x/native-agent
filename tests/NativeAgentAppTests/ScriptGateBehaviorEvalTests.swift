@@ -476,6 +476,36 @@ struct ScriptGateBehaviorEvalTests {
         #expect(result.stdout.contains("command exit: 0"))
     }
 
+    /// Selections after the first in a package reuse that package's build via
+    /// --skip-build. The build reuse must not weaken the per-selection proof:
+    /// a later selection whose ledger filter now matches nothing still fails
+    /// its own step and names its own surfaces.
+    @Test func changedModeSkipBuildReuseStillProvesEachSelectionRanTests() throws {
+        let fixture = try makeEvalsFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        // Two root selections in stable order: DirectEvalTests then
+        // ZetaEvalTests. The FIRST owns the build; the SECOND is the one that
+        // resolves to zero tests while running with --skip-build.
+        let result = try runEvals(fixture, args: ["--changed", "deadbee"], extraEnv: [
+            "STUB_CHANGED_FILES": "Sources/Alpha.swift\nTests/DirectEvalTests.swift",
+            "STUB_ZERO_TEST_PATTERN": "ZetaEvalTests",
+        ])
+        #expect(result.status == 1, Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("no non-zero executed-test count found"),
+                Comment(rawValue: result.combined))
+        #expect(result.stdout.contains("BROKE: fixture.alpha"), Comment(rawValue: result.combined))
+        #expect(!result.stdout.contains("WE'RE GOOD"), Comment(rawValue: result.combined))
+        // And the reuse actually happened: only the first root selection built.
+        let invocations = try String(contentsOf: fixture.swiftLog, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+            .filter { $0.hasPrefix("test ") }
+        #expect(invocations.count == 4, Comment(rawValue: invocations.joined(separator: "\n")))
+        #expect(!invocations[0].contains("--skip-build"), Comment(rawValue: invocations[0]))
+        for later in invocations.dropFirst() {
+            #expect(later.contains("--skip-build"), Comment(rawValue: later))
+        }
+    }
+
     @Test func changedModePreservesMappedFailureDiagnosticsAndReportsUnmappedGateFailure() throws {
         let mapped = try makeEvalsFixture()
         defer { try? FileManager.default.removeItem(at: mapped.root) }

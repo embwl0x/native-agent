@@ -22,7 +22,7 @@ actor TelegramTurnProgressCardDriver {
     typealias Sleeper = @Sendable (_ nanoseconds: UInt64) async throws -> Void
     typealias SendCard = @Sendable (
         _ token: String,
-        _ chatId: Int,
+        _ destination: TelegramDestination,
         _ text: String,
         _ replyMarkup: JSONValue
     ) async throws -> Int
@@ -38,7 +38,7 @@ actor TelegramTurnProgressCardDriver {
     typealias RemovePersistedCard = @Sendable (_ turnId: UUID) async throws -> Void
 
     private let token: String
-    private let chatId: Int
+    private let destination: TelegramDestination
     private let turnId: UUID
     private let minimumEditInterval: TimeInterval
     private let heartbeatNanoseconds: UInt64
@@ -61,6 +61,7 @@ actor TelegramTurnProgressCardDriver {
     private var editInFlight = false
     private var pendingFlush = false
     private var pendingForcedFlush = false
+    private var terminalLedgerRowRemoved = false
     private var detailsVisible = false
     private var terminalWaiters: [
         UUID: CheckedContinuation<TelegramTurnPresentationPhase?, Never>
@@ -68,7 +69,7 @@ actor TelegramTurnProgressCardDriver {
 
     init(
         token: String,
-        chatId: Int,
+        destination: TelegramDestination,
         turnId: UUID,
         minimumEditInterval: TimeInterval = defaultMinimumEditInterval,
         heartbeatNanoseconds: UInt64 = defaultHeartbeatNanoseconds,
@@ -82,7 +83,7 @@ actor TelegramTurnProgressCardDriver {
         removePersistedCard: @escaping RemovePersistedCard = { _ in }
     ) {
         self.token = token
-        self.chatId = chatId
+        self.destination = destination
         self.turnId = turnId
         self.minimumEditInterval = max(0, minimumEditInterval)
         self.heartbeatNanoseconds = heartbeatNanoseconds
@@ -107,7 +108,7 @@ actor TelegramTurnProgressCardDriver {
         do {
             let sentMessageId = try await sendCard(
                 token,
-                chatId,
+                destination,
                 rendered,
                 TelegramTurnControlCallback.replyMarkup(turnId: turnId)
             )
@@ -163,14 +164,13 @@ actor TelegramTurnProgressCardDriver {
                 await settleUntrackedCard()
                 return
             }
+            // 2026-09-06: the ledger row is this card's only restart-repair
+            // evidence, and it is dropped by the flush that actually sends the
+            // terminal edit — never here. `flushIfDue` returns immediately
+            // while another edit is in flight, so removing the row on return
+            // deleted the evidence for an edit that had not happened yet and
+            // might still fail.
             await flushIfDue(force: true, bypassThrottle: true)
-            if !transportFailed, messageId != nil {
-                do {
-                    try await removePersistedCard(turnId)
-                } catch {
-                    await reportFailure(step: "terminal persistence cleanup", error: error)
-                }
-            }
         } else {
             guard !transportFailed else { return }
             _ = await persistIdentity(at: clock(), terminalText: nil)
@@ -277,10 +277,16 @@ actor TelegramTurnProgressCardDriver {
             }
         }
         let rendered = renderedText(at: now)
+        // Whether THIS text is the terminal card, captured with the render:
+        // the state can move to terminal while an earlier edit is in flight,
+        // and that edit's text is not the terminal one.
+        let renderedIsTerminal = state.isTerminal
         guard rendered != lastRenderedText else {
             editInFlight = false
             pendingFlush = false
             pendingForcedFlush = false
+            // The card already shows this text, terminal text included.
+            await removeTerminalLedgerRow(ifSentTerminal: renderedIsTerminal)
             return
         }
 
@@ -289,7 +295,7 @@ actor TelegramTurnProgressCardDriver {
             : TelegramTurnControlCallback.replyMarkup(turnId: turnId)
 
         do {
-            try await editCard(token, chatId, messageId, rendered, markup)
+            try await editCard(token, destination.chatId, messageId, rendered, markup)
             lastRenderedText = rendered
             lastEditAt = now
         } catch {
@@ -313,7 +319,7 @@ actor TelegramTurnProgressCardDriver {
                 return
             }
             do {
-                try await editCard(token, chatId, messageId, rendered, markup)
+                try await editCard(token, destination.chatId, messageId, rendered, markup)
                 lastRenderedText = rendered
                 lastEditAt = clock()
             } catch {
@@ -325,11 +331,28 @@ actor TelegramTurnProgressCardDriver {
             }
         }
         editInFlight = false
+        await removeTerminalLedgerRow(ifSentTerminal: renderedIsTerminal)
         guard pendingFlush else { return }
         let forcePending = pendingForcedFlush || state.isTerminal
         pendingFlush = false
         pendingForcedFlush = false
         await flushIfDue(force: forcePending)
+    }
+
+    /// 2026-09-06: drop the restart-repair ledger row only once the terminal
+    /// card text has actually been sent. A failed terminal edit keeps the row,
+    /// so a restart can still repair the card it left behind.
+    private func removeTerminalLedgerRow(ifSentTerminal sentTerminal: Bool) async {
+        guard sentTerminal,
+              !terminalLedgerRowRemoved,
+              !transportFailed,
+              messageId != nil else { return }
+        terminalLedgerRowRemoved = true
+        do {
+            try await removePersistedCard(turnId)
+        } catch {
+            await reportFailure(step: "terminal persistence cleanup", error: error)
+        }
     }
 
     private func renderedText(at instant: Date) -> String {
@@ -370,7 +393,7 @@ actor TelegramTurnProgressCardDriver {
         let safe = TelegramPollLoop._tgRedactToken(
             TurnTraceRedactor.redactText(String(describing: error))
         )
-        let detail = "Telegram turn card \(step) failed for chat \(chatId): \(safe)"
+        let detail = "Telegram turn card \(step) failed for chat \(destination.chatId): \(safe)"
         FileHandle.standardError.write(Data("\(detail)\n".utf8))
         await recordFailure(detail)
     }
@@ -383,7 +406,7 @@ actor TelegramTurnProgressCardDriver {
         do {
             try await persistCard(TelegramPersistedTurnCard(
                 turnId: turnId,
-                chatId: chatId,
+                chatId: destination.chatId,
                 messageId: messageId,
                 phase: state.phase,
                 updatedAt: instant.timeIntervalSince1970,
@@ -405,7 +428,7 @@ actor TelegramTurnProgressCardDriver {
         do {
             try await editCard(
                 token,
-                chatId,
+                destination.chatId,
                 messageId,
                 notice,
                 TelegramTurnControlCallback.clearedReplyMarkup
@@ -429,6 +452,19 @@ enum TelegramTurnReplyDeliveryFailure {
     }
 
     static func isAmbiguous(_ error: Error) -> Bool {
+        // 2026-09-06: Telegram answered 2xx and this side could not read the
+        // body. The send was accepted — the message very likely exists — so a
+        // create that fails this way is ambiguous, not a clean failure. Only
+        // transport timeouts were treated as ambiguous before, and a garbled
+        // 200 therefore led to a second, duplicate send.
+        if let failure = error as? TelegramAPIFailure {
+            switch failure.kind {
+            case .malformedResponse, .malformedResult:
+                if let status = failure.httpStatus { return (200..<300).contains(status) }
+            case .httpStatus, .rejected:
+                break
+            }
+        }
         let nsError = error as NSError
         if nsError.domain == NSURLErrorDomain {
             return nsError.code == URLError.timedOut.rawValue

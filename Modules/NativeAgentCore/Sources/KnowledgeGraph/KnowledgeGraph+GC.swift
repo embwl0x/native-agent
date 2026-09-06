@@ -137,8 +137,15 @@ extension SwiftNativeKnowledgeGraphIndexer {
         // indexer writes with (deterministic on content).
         var liveKeys = Set<String>()
         for fact in active {
+            // 2026-09-06: the SAME knownPeople the indexer extracts with. GC
+            // used to rebuild the live key set without it, so a surviving
+            // memory's "CODEX" fell to the short-acronym filter here while the
+            // indexer had filed it as a person — the node's last_memory_id
+            // pointed at a just-deleted memory, nothing claimed it, and GC
+            // deleted the person plus the surviving memory's edge to it.
             let extracted = Self.extractEntities(
-                from: fact.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                from: fact.content.trimmingCharacters(in: .whitespacesAndNewlines),
+                knownPeople: knownPeople
             )
             for e in extracted {
                 liveKeys.insert("\(e.type.lowercased())|\(e.name.lowercased())")

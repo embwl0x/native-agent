@@ -3,7 +3,30 @@ import Testing
 import NativeAgentCore
 @testable import ProviderRouting
 
-@Test func currentFirstPartyCatalogsExposeClaudeSonnet5AndGrok45Capabilities() throws {
+@Test func astraAccountCatalogAndRoutingKeepTransportCapabilitiesDistinct() throws {
+    for provider in ["codex", "openai_oauth_direct"] {
+        let model = try #require(FirstPartyModelCatalog.descriptor(for: "gpt-6-astra", providerID: provider))
+        #expect(model.name == "GPT-6-Astra")
+        #expect(model.contextLength == 272_000)
+        #expect(model.defaultReasoningEffort == "medium")
+        #expect(model.supportsTools && model.supportsVision && model.supportsFast)
+        #expect(model.supportedReasoningEfforts == ["low", "medium", "high", "xhigh", "max", "ultra"])
+        #expect(SwiftNativeProviderRouting.normalizeReasoningEffortStatic(
+            "ultra", fallback: "medium", model: model.id, providerID: provider
+        ) == "ultra")
+        #expect(SwiftNativeProviderRouting.normalizeReasoningEffortStatic(
+            "none", fallback: "medium", model: model.id, providerID: provider
+        ) == "medium")
+    }
+    // Do not expose tool-capable Astra on the legacy public Chat Completions lane.
+    #expect(FirstPartyModelCatalog.descriptor(for: "gpt-6-astra", providerID: "openai") == nil)
+    #expect(FirstPartyModelCatalog.descriptor(for: "gpt-6") == nil)
+    #expect(FirstPartyModelCatalog.descriptor(for: "Astra 6") == nil)
+    #expect(FirstPartyModelCatalog.descriptor(for: "gpt-6-astra")?.contextLength == 272_000)
+    #expect(FirstPartyModelCatalog.chatGPTAccountFallbackModels.first?.id == "gpt-5.6-sol")
+}
+
+@Test func currentFirstPartyCatalogsExposeClaudeAndGrokCapabilities() throws {
     #expect(nativeAgentPrimaryModel == "gpt-5.6-sol")
     #expect(!FirstPartyModelCatalog.publicOpenAIModels.contains { $0.id == "gpt-5.5" })
     #expect(!FirstPartyModelCatalog.chatGPTAccountFallbackModels.contains { $0.id == "gpt-5.5" })
@@ -37,7 +60,6 @@ import NativeAgentCore
         for: "grok-4.5",
         providerID: "xai_oauth_direct"
     ))
-
     #expect(publicSol.supportedReasoningEfforts.contains("none"))
     #expect(!publicSol.supportedReasoningEfforts.contains("ultra"))
     #expect(accountSol.supportedReasoningEfforts.contains("ultra"))
@@ -124,6 +146,12 @@ import NativeAgentCore
     ) == "none")
     #expect(SwiftNativeProviderRouting.normalizeReasoningEffortStatic(
         "ultra", fallback: "medium", model: "gpt-5.6-sol", providerID: "openai_oauth_direct"
+    ) == "ultra")
+    #expect(SwiftNativeProviderRouting.normalizeReasoningEffortStatic(
+        "none", fallback: "medium", model: "gpt-6-astra", providerID: "openai"
+    ) == "medium")
+    #expect(SwiftNativeProviderRouting.normalizeReasoningEffortStatic(
+        "ultra", fallback: "medium", model: "gpt-6-astra", providerID: "codex"
     ) == "ultra")
 }
 

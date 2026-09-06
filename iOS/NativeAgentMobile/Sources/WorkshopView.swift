@@ -11,10 +11,36 @@ struct WorkshopView: View {
     @ObservedObject private var sync = iCloudSyncEngine.shared
     @State private var showNewWorkshopTask = false
     @State private var selectedWorkshopTask: WorkshopTaskRecord?
+    /// `false` when pushed as a NavigationLink destination from another
+    /// NavigationStack (the More hub). Nesting NavigationStacks makes the
+    /// destination render and immediately pop back — the same trap
+    /// SkillsToolsView and MemoryView already avoid this way.
+    private let embedInNavigationStack: Bool
+
+    init(embedInNavigationStack: Bool = true) {
+        self.embedInNavigationStack = embedInNavigationStack
+    }
 
     var body: some View {
-        NavigationStack {
-            Group {
+        if embedInNavigationStack {
+            NavigationStack { workshopContent }
+                .alert("Error", isPresented: .constant(store.error != nil), actions: {
+                    Button("OK") { store.error = nil }
+                }, message: {
+                    Text(store.error ?? "")
+                })
+        } else {
+            workshopContent
+                .alert("Error", isPresented: .constant(store.error != nil), actions: {
+                    Button("OK") { store.error = nil }
+                }, message: {
+                    Text(store.error ?? "")
+                })
+        }
+    }
+
+    private var workshopContent: some View {
+        Group {
                 switch WorkshopContentPresentation.state(
                     tasks: store.tasks,
                     isLoading: store.isLoading,
@@ -65,12 +91,6 @@ struct WorkshopView: View {
             .sheet(item: $selectedWorkshopTask) { task in
                 WorkshopTaskDetailSheet(task: task, store: store)
             }
-        }
-        .alert("Error", isPresented: .constant(store.error != nil), actions: {
-            Button("OK") { store.error = nil }
-        }, message: {
-            Text(store.error ?? "")
-        })
     }
 
     private var workshopList: some View {
@@ -282,7 +302,10 @@ final class WorkshopCompletionNotificationTracker {
             content.title = "Workshop task completed"
             content.body = task.title
             content.sound = .default
-            var userInfo = ["screen": "activity", "source": "workshop", "taskId": task.id]
+            // Routes to the tab that actually hosts Workshop (More). Before
+            // the screen was mounted this said "activity", which opened a tab
+            // with no Workshop on it.
+            var userInfo = ["screen": "workshop", "source": "workshop", "taskId": task.id]
             let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
             userInfo["eventId"] = eventID
             content.userInfo = userInfo

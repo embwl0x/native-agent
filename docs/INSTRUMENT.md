@@ -367,8 +367,8 @@ A bench that cannot catch a lobotomy is theater. Two checks keep it honest:
 The reach walker inventories the entire data root; **any feed without a reader
 appears in NOT COVERED automatically** — new subsystems announce themselves as
 blind spots the day they ship. To close one:
-1. add a reader in `script/agent_instrument.swift` (copy-before-query for
-   sqlite, streamed read-only for JSONL),
+1. add a reader in `script/agent_instrument.swift` (SQLite transactional backup
+   from a read-only source, query only the private snapshot; streamed read-only for JSONL),
 2. if it is part of the cognitive system, add/upgrade its row in the coverage
    matrix (the in-code inventory mirroring `docs/SUBCONSCIOUS.md`),
 3. add a fixture case to `tests/scripts/agent_instrument_test.sh` — including

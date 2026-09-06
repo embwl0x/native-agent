@@ -95,14 +95,36 @@ struct DiskHygieneDirectoryTierTests {
         #expect(report.largeDirectories.map(\.relativePath) == ["big", "small"])
     }
 
-    /// The MiniLM model cache is a wanted permanent store; flagging it would
-    /// recreate the daily false alarm the file tier already had to fix.
+    /// Sweep item 21 (2026-09-01), the exact inversion of the old contract: the
+    /// MiniLM HuggingFace cache was EXEMPT from this tier on the claim that it
+    /// was a wanted permanent store. The CoreML cutover made that false — the
+    /// live embedder loads `Bundle.module/minilm.mlpackage` — so the store is
+    /// residue and must be reported no matter how small it is.
     @Test
-    func protectedStoresAreExcludedFromTheDirectoryTier() throws {
+    func residueIsReportedAtAnySizeAndAtItsRoot() throws {
         let root = try makeRoot()
-        for index in 0..<40 {
-            try write(50_000, to: root.appendingPathComponent("extras/hf_cache/hub/blob\(index)"))
+        for index in 0..<4 {
+            try write(1_000, to: root.appendingPathComponent("extras/hf_cache/hub/blob\(index)"))
         }
+        let report = DataRootDiskHygiene.scan(
+            dataRoot: root,
+            singleFileThreshold: 10_000_000,
+            totalThreshold: 100_000_000,
+            // Two orders of magnitude above the whole residue tree: nothing
+            // here is "large", which is precisely the point.
+            directoryThreshold: 500_000
+        )
+        #expect(report.largeDirectories.map(\.relativePath) == ["extras/hf_cache"])
+        #expect(report.largeDirectories.first?.sizeBytes == 4_000)
+        #expect(report.tripped)
+    }
+
+    /// …and a root without the residue store stays quiet. Absence of the
+    /// tripwire's subject is the healthy state, not a missing check.
+    @Test
+    func aRootWithoutResidueDoesNotTripTheResidueTier() throws {
+        let root = try makeRoot()
+        try write(1_000, to: root.appendingPathComponent("extras/other/blob"))
         let report = DataRootDiskHygiene.scan(
             dataRoot: root,
             singleFileThreshold: 10_000_000,
@@ -113,14 +135,18 @@ struct DiskHygieneDirectoryTierTests {
         #expect(report.tripped == false)
     }
 
-    /// APFS is typically case-insensitive, so the exclusion must be too — the
-    /// same reasoning the cleanup pass already carries.
+    /// APFS is typically case-insensitive, so residue matching must be too —
+    /// the same reasoning the old protected-prefix compare carried.
     @Test
-    func protectedExclusionIsCaseFolded() throws {
-        #expect(DataRootDiskHygiene.isProtected(relativePath: "Extras/HF_Cache/hub"))
-        #expect(DataRootDiskHygiene.isProtected(relativePath: "extras/hf_cache"))
-        #expect(DataRootDiskHygiene.isProtected(relativePath: "extras/hf_cache_other") == false)
-        #expect(DataRootDiskHygiene.isProtected(relativePath: "extras") == false)
+    func residueMatchIsCaseFolded() throws {
+        #expect(DataRootDiskHygiene.isResidue(relativePath: "Extras/HF_Cache"))
+        #expect(DataRootDiskHygiene.isResidue(relativePath: "extras/hf_cache"))
+        // The root is the finding; descendants are folded into it, not listed.
+        #expect(DataRootDiskHygiene.isResidue(relativePath: "extras/hf_cache/hub") == false)
+        #expect(DataRootDiskHygiene.isResidueDescendant(relativePath: "Extras/HF_Cache/hub"))
+        #expect(DataRootDiskHygiene.isResidue(relativePath: "extras/hf_cache_other") == false)
+        #expect(DataRootDiskHygiene.isResidueDescendant(relativePath: "extras/hf_cache_other") == false)
+        #expect(DataRootDiskHygiene.isResidue(relativePath: "extras") == false)
     }
 
     @Test

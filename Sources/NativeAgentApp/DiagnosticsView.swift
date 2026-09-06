@@ -49,8 +49,13 @@ struct DiagnosticsView: View {
     /// Landing segment. The retired Cognition and Inspector tabs alias into
     /// Diagnostics (fence-A routing) by opening on their own segment:
     /// `DiagnosticsView(initialMode: .cognition)` / `.inspector`.
-    init(initialMode: DiagnosticsMode = .doctor) {
+    /// Off when a rail page owns the tabs (DiagnosticsRailPage) and hands the
+    /// mode in; on for the classic shell, which has no tab row.
+    var showsModePicker: Bool = true
+
+    init(initialMode: DiagnosticsMode = .doctor, showsModePicker: Bool = true) {
         _mode = State(initialValue: initialMode)
+        self.showsModePicker = showsModePicker
     }
 
     enum DiagnosticsMode: String, CaseIterable, Identifiable {
@@ -62,19 +67,45 @@ struct DiagnosticsView: View {
         // B2.6: Turn Inspector folded in from its own advanced tab as a segment.
         case inspector = "Inspector"
         var id: String { rawValue }
+
+        /// The word a person reads. The raw values are the persisted route
+        /// keys, so the segment's label is spelled here in sentence case
+        /// rather than taken from the stored string.
+        var title: String {
+            switch self {
+            case .doctor: "Doctor"
+            case .status: "Status"
+            case .runs: "Runs log"
+            case .cognition: "Cognition"
+            case .inspector: "Inspector"
+            }
+        }
     }
 
     var body: some View {
-        VStack(spacing: 12) {
-            Picker("Diagnostics", selection: $mode) {
-                ForEach(DiagnosticsMode.allCases) { item in
-                    Text(item.rawValue).tag(item)
+        VStack(alignment: .leading, spacing: 16) {
+            if showsModePicker {
+                Picker("Diagnostics", selection: $mode) {
+                    ForEach(DiagnosticsMode.allCases) { item in
+                        Text(item.title).tag(item)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding(.horizontal)
-            .padding(.top)
+
+            // ui-simplify 2026-09-02 (Lane A): the two readouts that used to
+            // stand between a stranger and their first message — the system
+            // health / "N warnings" pill and the session token meter — live
+            // here now. Nothing was deleted; they just stopped being furniture
+            // in the room. Chat keeps one status dot instead.
+            HStack(spacing: 12) {
+                HealthPill()
+                if !appModel.activeChatSessionId.isEmpty {
+                    ContextFillBar(sessionId: appModel.activeChatSessionId)
+                }
+                Spacer(minLength: 0)
+            }
 
             Group {
                 switch mode {
@@ -95,7 +126,9 @@ struct DiagnosticsView: View {
                 case .inspector: InspectorView()
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .navigationTitle("Diagnostics")
         .task {
             guard mode == .status || mode == .runs else { return }

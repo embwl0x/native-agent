@@ -371,6 +371,50 @@ extension BackgroundLoopsAssembly {
         }
     }
 
+    /// Provenance for the felt tone above (desk 903 phase 2): WHERE the day's
+    /// feelings came from, so a dream that felt a journal entry can cite it.
+    /// Reads the substrate's `feltDayOrigins(at:)` — the SAME last-24h felt
+    /// population `feltDaySummary` integrates over, subject/metadata only, and
+    /// the same pure read through the `substrateForIntegration()` seam.
+    ///
+    /// Empty is the ordinary answer (cognition/affect off, nothing felt, or
+    /// nothing felt that came from the journal) and is never a gap: the runner
+    /// treats a missing origin as "cite nothing" and still dreams.
+    ///
+    /// `static` for the same reason as the providers above — the scheduler-driven
+    /// path builds its own runner and must wire the identical provider.
+    static func makeDreamFeltOriginProvider(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        cognitionRuntime: NativeCognitionRuntime? = nil
+    ) -> DreamFeltOriginProvider {
+        let runtime = cognitionRuntime ?? self.cognitionRuntime(for: dataRoot)
+        return { @Sendable in
+            let substrate = await runtime.substrateForIntegration()
+            return await substrate.feltDayOrigins(at: Date()).map {
+                DreamFeltOrigin(
+                    subjectType: $0.subjectType,
+                    subjectID: $0.subjectID,
+                    metadata: $0.metadata
+                )
+            }
+        }
+    }
+
+    /// Receipt channel for the dream lane. DreamREMCycle holds no substrate
+    /// reference by design, so the receipt it owns is handed out here to whoever
+    /// does — the substrate's own best-effort ledger write, which keeps every
+    /// existing gate (cognition/persistence off → silent no-op).
+    static func makeDreamReceiptSink(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        cognitionRuntime: NativeCognitionRuntime? = nil
+    ) -> DreamReceiptSink {
+        let runtime = cognitionRuntime ?? self.cognitionRuntime(for: dataRoot)
+        return { @Sendable kind, payload in
+            let substrate = await runtime.substrateForIntegration()
+            await substrate.recordReceipt(kind: kind, payload: payload)
+        }
+    }
+
     /// The return channel of the felt dream (U2a, 2026-07-09): the dream's own mood
     /// line nudges her SLOW disposition layer — the day's considered conclusion, not
     /// just the day's events. `feltDaySummary` carries the day's feeling into the
@@ -387,11 +431,29 @@ extension BackgroundLoopsAssembly {
     static func makeDreamMoodSink(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         cognitionRuntime: NativeCognitionRuntime? = nil
-    ) -> DreamMoodSink {
+    ) -> DreamDatedMoodSink {
         let runtime = cognitionRuntime ?? self.cognitionRuntime(for: dataRoot)
-        return { @Sendable mood in
+        return { @Sendable mood, dateKey in
             let substrate = await runtime.substrateForIntegration()
-            await substrate.integrateDreamDisposition(moodLine: mood, at: Date())
+            return await substrate.integrateDreamDisposition(
+                moodLine: mood,
+                at: Date(),
+                // Item 7 (2026-09-02): the night's residue is claimed PER
+                // COMMITTED DREAM. Without this the substrate falls back to the
+                // local calendar day, and that is not the same thing — a
+                // scheduled 03:30 dream keys to the PREVIOUS day
+                // (`DreamREMSchedule.dreamEntryDateKey`), so a day-keyed residue
+                // would let one night mint twice and another not at all.
+                //
+                // 2026-09-06: the key comes from the RUNNER now, not from a
+                // scan of the `.mood_integrated_*` markers on disk. Those
+                // markers accumulate, and the scan took the greatest one — so
+                // whenever any newer marker existed (a pressure-fired dream
+                // stamped today beside a 03:30 scheduled one keyed to
+                // yesterday) it named a different night, and the mint's
+                // one-night-one-residue guard suppressed the real one.
+                dreamId: "dream:\(dateKey)"
+            )
         }
     }
 }

@@ -128,18 +128,18 @@ private struct MacIntegrationPermissionLoadErrorPanel: View {
     let retry: () -> Void
 
     var body: some View {
-        Section {
-            Label("Permission controls unavailable", systemImage: "exclamationmark.shield.fill")
-                .font(.headline)
-                .foregroundStyle(.red)
+        MacSection(title: "Permissions") {
+            Text("Permission controls unavailable")
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.trouble)
             Text(detail)
-                .font(.callout)
-                .foregroundStyle(.secondary)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("mac-integration.permissions.load-error.detail")
-            Text("All Mac Integration tool gates remain closed until the saved permission file is repaired. NativeAgent preserved the existing bytes.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("Every Mac integration tool gate stays closed until the saved permission file is repaired. NativeAgent preserved the existing bytes.")
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button {
                 retry()
@@ -149,14 +149,12 @@ private struct MacIntegrationPermissionLoadErrorPanel: View {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    Text(retrying ? "Rechecking saved permissions…" : "Retry Permission Load")
+                    Text(retrying ? "Rechecking saved permissions…" : "Retry permission load")
                 }
             }
             .disabled(retrying)
             .accessibilityIdentifier("mac-integration.permissions.load-error.retry")
             .help("Re-read the saved permission file after it has been repaired. This does not replace or rewrite it.")
-        } header: {
-            Text("Permissions")
         }
         .accessibilityIdentifier("mac-integration.permissions.load-error")
     }
@@ -200,8 +198,8 @@ enum MacIntegrationFrameworkPermission: String, CaseIterable {
 /// The save alert and a TCC-request failure are different user actions and
 /// remain separately gated even when both errors exist at once.
 enum MacIntegrationPermissionFailurePresentation {
-    static let saveAlertTitle = "Permission Save Failed"
-    static let requestAlertTitle = "Permission Request Failed"
+    static let saveAlertTitle = "Permission save failed"
+    static let requestAlertTitle = "Permission request failed"
 
     static func saveAlertIsPresented(
         persistenceError: String?,
@@ -262,18 +260,14 @@ struct MacIntegrationView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    Text("Choose which Mac apps and surfaces the assistant can read from or act on. Sensitive surfaces (Contacts, Mail, Messages, Notes) default to READ ON / WRITE OFF — flip the write toggle to give permission to send or modify. Changes take effect immediately.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } header: {
-                    Text("Mac Integration")
-                }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                Text("Choose which Mac apps and surfaces the agent can read from or act on. Sensitive surfaces — Contacts, Mail, Messages, Notes — start with read on and write off; turn on write to allow sending or changing anything. Changes take effect immediately.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
-                Section {
+                MacSection(title: "System permissions") {
                     // 2026-06-07 the user caught "only 4 system permission rows but
                     // way more tabs underneath." The collapsed "AppleEvents"
                     // row hid 4 distinct per-app TCC grants (Mail / Messages
@@ -297,10 +291,10 @@ struct MacIntegrationView: View {
                     // granted, a prominent "Grant All" CTA is a dead button and
                     // the page's focal point — collapse it to a status line.
                     if allSystemPermissionsGranted {
-                        Label("All system permissions granted", systemImage: "checkmark.seal.fill")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
+                        Text("Every system permission is granted.")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.calm)
+                            .padding(.top, 4)
                     } else {
                         Button {
                             Task { await grantAllPermissions() }
@@ -310,37 +304,31 @@ struct MacIntegrationView: View {
                                     ProgressView()
                                         .controlSize(.small)
                                 }
-                                Text(isRequestingAll ? "Requesting…" : "Grant All Permissions Now")
-                                    .fontWeight(.semibold)
+                                Text(isRequestingAll ? "Requesting…" : "Grant every permission now")
                             }
-                            .frame(maxWidth: .infinity)
                         }
-                        .buttonStyle(.borderedProminent)
                         .disabled(isRequestingAll)
-                        .help("Fires every macOS TCC prompt that hasn't been answered yet. For permissions you've previously denied, opens System Settings → Privacy & Security to the right pane.")
+                        .padding(.top, 4)
+                        .help("Fires every macOS privacy prompt that has not been answered yet. For permissions previously denied, opens System Settings to the right pane.")
                     }
-                } header: {
-                    Text("System Permissions")
-                } footer: {
-                    Text("These are macOS-level (TCC) permissions, separate from the assistant's read/write toggles below. Notifications, Spotlight, and Scheduler don't need TCC grants. Mail / Messages / Notes / Music are Automation grants — each app's first probe triggers its own prompt.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
+
+                Text("These are macOS privacy permissions, separate from the read and write toggles below. Notifications, Spotlight and the scheduler need none of them. Mail, Messages, Notes and Music are automation grants — each app's first probe triggers its own prompt.")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 switch MacIntegrationPermissionLoadPresentation.resolve(
                     isLoading: isLoading,
                     loadError: permissionLoadError
                 ) {
                 case .loading:
-                    Section {
-                        HStack {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Loading current permissions…")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading current permissions…")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
                 case .unavailable(let detail, let retrying):
                     MacIntegrationPermissionLoadErrorPanel(
@@ -349,8 +337,8 @@ struct MacIntegrationView: View {
                         retry: { Task { await loadPermissions() } }
                     )
                 case .controlsAvailable:
-                    ForEach(MacIntegrationID.all, id: \.self) { id in
-                        Section {
+                    MacSection(title: "Apps and surfaces") {
+                        ForEach(MacIntegrationID.all, id: \.self) { id in
                             integrationRow(for: id)
                         }
                     }
@@ -362,26 +350,20 @@ struct MacIntegrationView: View {
                 // ops, iOS remote) and the assistant watch live in the Trust
                 // tab — pointed to here so each control has one discoverable
                 // home instead of the old two-tab split.
-                Section {
-                    Label("Mac Control capabilities — shell, AppleScript, Accessibility, file operations, iOS remote, and the assistant watch — live in the Trust tab under Mac Control.", systemImage: "checkmark.shield")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                MacSection(title: "Mac control capabilities") {
+                    Text("Mac control capabilities — shell, AppleScript, accessibility, file operations, iOS remote and the assistant watch — live on the Trust page under Mac control.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                } header: {
-                    Text("Mac Control Capabilities")
                 }
 
-                Section {
-                    Text("Permissions persist to `<dataRoot>/security/mac_integration_permissions.json`. NativeAgent tools consult this store before reading from or writing to any of the surfaces above.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                } header: {
-                    Text("About")
-                }
+                Text("Permissions are saved with the agent's own security files, and every NativeAgent tool consults that store before reading from or writing to any surface above.")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .formStyle(.grouped)
-            .navigationTitle("Mac Integration")
+            .padding(.bottom, 32)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .task {
             await loadPermissions()
@@ -444,51 +426,52 @@ struct MacIntegrationView: View {
 
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: Self.iconName(for: id))
-                .font(.title2)
-                .frame(width: 28, height: 28)
-                .foregroundStyle(.secondary)
+                .font(ShellType.body)
+                .frame(width: 24, height: 24)
+                .foregroundStyle(NativeAgentShell.tertiary)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(MacIntegrationID.displayName(for: id))
-                    .font(.headline)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                 Text(MacIntegrationID.description(for: id))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             Spacer(minLength: 12)
 
-            VStack(alignment: .trailing, spacing: 6) {
+            VStack(alignment: .trailing, spacing: 8) {
                 Toggle(isOn: binding(for: id, mode: .read)) {
                     Text("Read")
-                        .font(.caption)
-                        .foregroundStyle(supportsRead ? .secondary : .tertiary)
+                        .font(ShellType.label)
+                        .foregroundStyle(supportsRead ? NativeAgentShell.secondary : NativeAgentShell.tertiary)
                 }
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .disabled(!supportsRead)
                 .accessibilityLabel("\(MacIntegrationID.displayName(for: id)) read permission")
                 .help(supportsRead
-                      ? "Allow the assistant to read from \(MacIntegrationID.displayName(for: id))."
+                      ? "Allow the agent to read from \(MacIntegrationID.displayName(for: id))."
                       : "\(MacIntegrationID.displayName(for: id)) does not expose a read surface.")
 
                 Toggle(isOn: binding(for: id, mode: .write)) {
                     Text("Write")
-                        .font(.caption)
-                        .foregroundStyle(supportsWrite ? .secondary : .tertiary)
+                        .font(ShellType.label)
+                        .foregroundStyle(supportsWrite ? NativeAgentShell.secondary : NativeAgentShell.tertiary)
                 }
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 .disabled(!supportsWrite)
                 .accessibilityLabel("\(MacIntegrationID.displayName(for: id)) write permission")
                 .help(supportsWrite
-                      ? "Allow the assistant to send or modify on \(MacIntegrationID.displayName(for: id))."
+                      ? "Allow the agent to send or change things in \(MacIntegrationID.displayName(for: id))."
                       : "\(MacIntegrationID.displayName(for: id)) does not expose a write surface.")
             }
             .frame(width: 104, alignment: .trailing)
         }
-        .padding(.vertical, 2)
+        .frame(minHeight: 48)
     }
 
     // MARK: - State
@@ -578,12 +561,13 @@ struct MacIntegrationView: View {
         let status = tccStatuses[statusKey] ?? "unknown"
         return HStack(spacing: 12) {
             Image(systemName: icon)
-                .font(.title3)
+                .font(ShellType.body)
                 .frame(width: 24, height: 24)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(NativeAgentShell.tertiary)
             Text(label)
-                .font(.body)
-            Spacer()
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
+            Spacer(minLength: 8)
             if let permission = frameworkPermission {
                 if status == "not_determined" || status == "unknown"
                     || (permission == .calendar && status == "limited") {
@@ -593,14 +577,14 @@ struct MacIntegrationView: View {
                         if requestingFramework == permission {
                             ProgressView().controlSize(.small)
                         } else {
-                            Text(status == "limited" ? "Grant Full" : "Grant")
+                            Text(status == "limited" ? "Grant full" : "Grant")
                         }
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .disabled(requestingFramework != nil || requestingApp != nil)
                 } else if status == "denied" || status == "restricted" || status == "limited" {
-                    Button("Open Settings") {
+                    Button("Open settings") {
                         openSystemSettings(permission.capability)
                     }
                     .buttonStyle(.bordered)
@@ -630,26 +614,26 @@ struct MacIntegrationView: View {
                     .controlSize(.small)
                     .disabled(requestingApp != nil)
                 } else if status == "denied" || status == "restricted" {
-                    Button("Open Settings") {
+                    Button("Open settings") {
                         openSystemSettings(.automation)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
             }
-            HStack(spacing: 6) {
+            HStack(spacing: 4) {
                 Circle()
                     .fill(Self.statusBadgeColor(status))
                     .frame(width: 8, height: 8)
                 Text(Self.statusBadgeText(status))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.captionMedium)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(Self.statusBadgeColor(status).opacity(0.12), in: Capsule())
+            .padding(.vertical, 4)
+            .background(NativeAgentShell.quietFill, in: Capsule())
         }
-        .padding(.vertical, 2)
+        .frame(minHeight: 48)
     }
 
     // 2026-06-07: persist AppleEvents per-app probe results across app
@@ -959,10 +943,10 @@ struct MacIntegrationView: View {
 
     private static func statusBadgeColor(_ status: String) -> Color {
         switch status {
-        case "granted", "authorized", "limited", "granted_offline": return .green
-        case "denied", "restricted": return .red
-        case "not_determined", "unknown": return .gray
-        default: return .gray
+        case "granted", "authorized", "granted_offline": return NativeAgentShell.calm
+        case "limited": return NativeAgentShell.trouble
+        case "denied", "restricted": return NativeAgentShell.trouble
+        default: return NativeAgentShell.tertiary
         }
     }
 
@@ -973,7 +957,7 @@ struct MacIntegrationView: View {
         case "limited": return "Limited"
         case "denied": return "Denied"
         case "restricted": return "Restricted"
-        case "not_determined": return "Not Set"
+        case "not_determined": return "Not set"
         case "unknown": return "Unknown"
         default: return status.capitalized
         }
@@ -1098,6 +1082,41 @@ struct MacIntegrationView: View {
         case MacIntegrationID.spotlight:    return "magnifyingglass"
         case MacIntegrationID.scheduler:    return "clock"
         default:                            return "square.grid.2x2"
+        }
+    }
+}
+
+// MARK: - Page kit (2026-09-03 Advanced refinement)
+//
+// The page was a grouped `Form`: every row sat on its own inset slab, and on
+// the shell's one sheet that read as a stack of plates rather than a page.
+// A section is now the Advanced list's shape — an eyebrow, then one card.
+
+/// One section of the page: the eyebrow the Advanced list uses, and the rows
+/// under it on one card.
+private struct MacSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .padding(.horizontal, 2)
+            VStack(alignment: .leading, spacing: 12) { content }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .fill(TodayPalette.cardFill)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                )
         }
     }
 }

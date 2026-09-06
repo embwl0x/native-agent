@@ -231,19 +231,36 @@ public struct MacFourVerbs: Sendable {
     private let supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)?
     private let options: MacScreenRender.Options
     private let namedLocationRoots: [URL]
+    /// fable51 item 31 — the two subscriptions `wait` ends on. They are seams
+    /// here rather than inside the client because `wait` is the only caller and
+    /// because the WAITING is paced by `clock`, which is a seam of this type:
+    /// a host that blocked on real time would take the fake clock out of the
+    /// loop and make a 60-second budget cost 60 real seconds in a test.
+    ///
+    /// AUTHORITY, explicitly: subscribing is not perception. Nothing is
+    /// installed until the first `sight()` has SUCCEEDED, and that sight goes
+    /// through `host.dispatch("look")`, which runs the full gate pre-flight
+    /// (accessibility category + an active Full Mac window). A refused look
+    /// returns blind before a single observer exists.
+    private let effectObserverSource: any MacAXEffectObserverSource
+    private let appActivationSource: any MacAppActivationObserverSource
 
     public init(
         host: any MacFourVerbsHost,
         clock: any MacFourVerbsClock = SystemMacFourVerbsClock(),
         supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)? = nil,
         options: MacScreenRender.Options = .default,
-        namedLocationRoots: [URL]? = nil
+        namedLocationRoots: [URL]? = nil,
+        effectObserverSource: any MacAXEffectObserverSource = defaultMacAXEffectObserverSource(),
+        appActivationSource: any MacAppActivationObserverSource = defaultMacAppActivationObserverSource()
     ) {
         self.host = host
         self.clock = clock
         self.supplementalSource = supplementalSource
         self.options = options
         self.namedLocationRoots = namedLocationRoots ?? Self.commonHomeLocationRoots()
+        self.effectObserverSource = effectObserverSource
+        self.appActivationSource = appActivationSource
     }
 
     // MARK: 1 — EYES
@@ -257,14 +274,25 @@ public struct MacFourVerbs: Sendable {
     /// class of bookkeeping trap the handles were. So a zoom onto content shows
     /// the section WHOLE (its cap raised) and names which rows matched; a zoom
     /// onto controls, which carry no ordinals, filters them.
-    public func screen(part: String? = nil) async -> MacFourVerbsReply {
-        switch await sight(part: part) {
+    ///
+    /// fable51 item 32a — `app` GLANCES SIDEWAYS. Naming a running app reads
+    /// ITS front window without activating it: no focus steal, no window flip
+    /// on User's screen, no three-call `go there / look / go back` dance. What
+    /// comes back says plainly that the window is not in front, because whether
+    /// it is in front decides whether she may act on it: `act` and `go` are
+    /// still frontmost verbs, and a background sighting is a LOOK, not a
+    /// license.
+    public func screen(part: String? = nil, app: String? = nil) async -> MacFourVerbsReply {
+        switch await sight(part: part, app: app) {
         case .blind(let reply):
             return reply
         case .seen(let sighting):
             var lead = "Looking at " + sighting.place + "."
             if let part, let note = sighting.zoomNote {
                 lead = "Zoomed on \"\(part)\" in " + sighting.place + ". " + note
+            }
+            if app != nil {
+                lead += " I read it where it sits — nothing was brought to the front."
             }
             return MacFourVerbsReply(
                 ok: true,
@@ -289,6 +317,9 @@ public struct MacFourVerbs: Sendable {
         target: String,
         text: String? = nil,
         to destination: String? = nil,
+        /// fable51 item 32b — WHOSE window `to` lives in. Absent (the ordinary
+        /// case) is the single-window drag, byte-for-byte as it was.
+        toApp destinationApp: String? = nil,
         seconds: Double? = nil,
         repeat requestedRepeat: Int? = nil,
         interval: Double? = nil,
@@ -311,6 +342,7 @@ public struct MacFourVerbs: Sendable {
                 target: target,
                 text: text,
                 to: destination,
+                toApp: destinationApp,
                 seconds: seconds,
                 holding: holding,
                 button: button,
@@ -346,6 +378,7 @@ public struct MacFourVerbs: Sendable {
                 target: target,
                 text: text,
                 to: destination,
+                toApp: destinationApp,
                 seconds: seconds,
                 holding: holding,
                 button: button,
@@ -489,6 +522,7 @@ public struct MacFourVerbs: Sendable {
         target: String,
         text: String?,
         to destination: String?,
+        toApp destinationApp: String?,
         seconds: Double?,
         holding: String?,
         button rawButton: String?,
@@ -496,6 +530,29 @@ public struct MacFourVerbs: Sendable {
         attention: BurstAttention?
     ) async -> MacFourVerbsReply {
         let (verbName, parsedDirection) = Self.parseVerb(rawVerb)
+        // fable51 item 32b — `to_app` says whose window the DROP lands in, so
+        // it is meaningless anywhere but a drag. Refused before a look, because
+        // silently ignoring it would let the model believe a cross-app act
+        // happened when a same-window one did.
+        let namedDestinationApp = destinationApp
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        if let namedDestinationApp {
+            guard verbName == PhysicalVerb.drag.rawValue else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.verbNotDraggableWords(verbName),
+                    detail: ["error": .string(MacCrossAppDrag.verbNotDraggableReason)]
+                )
+            }
+            guard let destination, !destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.missingDestinationWords(namedDestinationApp),
+                    detail: ["error": .string(MacCrossAppDrag.missingDestinationReason)]
+                )
+            }
+        }
         let amount = scrollAmount ?? 0
         guard (0...120).contains(amount), amount == 0 || verbName == "scroll" else {
             return MacFourVerbsReply(ok: false,
@@ -531,6 +588,7 @@ public struct MacFourVerbs: Sendable {
                 physical,
                 target: target,
                 destination: destination,
+                destinationApp: namedDestinationApp,
                 seconds: seconds,
                 holding: holding,
                 button: button,
@@ -846,6 +904,7 @@ public struct MacFourVerbs: Sendable {
         _ verb: PhysicalVerb,
         target: String,
         destination: String?,
+        destinationApp: String? = nil,
         seconds: Double?,
         holding: String?,
         button: String?,
@@ -914,6 +973,10 @@ public struct MacFourVerbs: Sendable {
         }
         if !reobservedAfterTransientMiss,
            verb == .drag,
+           // fable51 item 32b — a cross-app destination is NOT expected in this
+           // window, so "it dropped out of the frontmost sighting" is not a
+           // transient miss to chase. Its own anchored sight resolves it.
+           destinationApp == nil,
            let destination,
            case .hit = resolution,
            case .none = Self.resolve(destination, among: before.targets),
@@ -978,6 +1041,26 @@ public struct MacFourVerbs: Sendable {
         }
         let spokenSource = Self.spokenName(source, requestedAs: target)
 
+        // fable51 item 32b — TWO ANCHORS. The source has just been resolved in
+        // the frontmost window; when `to_app` names somebody else's window the
+        // destination is resolved THERE, without focus, and the whole drag is
+        // handled below. Nothing above this line changed, and with `to_app`
+        // absent nothing below it runs.
+        if verb == .drag, let destinationApp, let destination {
+            return await performCrossAppDrag(
+                source: source,
+                spokenSource: spokenSource,
+                start: start,
+                destination: destination,
+                destinationApp: destinationApp,
+                seconds: seconds,
+                holding: holding,
+                button: button,
+                attention: attention,
+                before: before
+            )
+        }
+
         var body: [String: JSONValue] = [
             "gesture": .string(verb.rawValue),
             "x": .double(start.x),
@@ -1041,6 +1124,377 @@ public struct MacFourVerbs: Sendable {
         )
         var detail = reply.detail
         if reobservedAfterTransientMiss { detail["dynamic_reobserved"] = .bool(true) }
+        if let button { detail["button"] = .string(button) }
+        return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
+    }
+
+    // MARK: - fable51 item 32b — the two-anchor drag
+
+    /// `act(drag, target:, to:, to_app:)` — the source in the window in front,
+    /// the destination in a NAMED app's front window, and one drag across the
+    /// two. The order of operations is the whole design:
+    ///
+    ///   1. RESOLVE the destination through the background sight. No focus
+    ///      moves for a resolution, so a refusal here — not running, ambiguous,
+    ///      our own process, no such thing in that window — costs User nothing
+    ///      and leaves his screen exactly as it was.
+    ///   2. REFUSE what must not be dragged: a password field at either end of
+    ///      the line, or on it.
+    ///   3. RAISE, once, only if the drop needs it, and SAY SO. A window behind
+    ///      another cannot receive a drop; that is the reason focus moved, it
+    ///      goes in the sentence and on the receipt, and if raising would bury
+    ///      the source instead this refuses before anything moves.
+    ///   4. DRAG, once.
+    ///
+    /// The pre-drag reading of the DESTINATION window is what the post-act look
+    /// is compared against — so "did the drop land" is judged against the
+    /// window that received it, not against the source window we left behind.
+    private func performCrossAppDrag(
+        source: ActTarget,
+        spokenSource: String,
+        start: MacPointerPosition,
+        destination: String,
+        destinationApp: String,
+        seconds: Double?,
+        holding: String?,
+        button: String?,
+        attention: BurstAttention?,
+        before: Sighting
+    ) async -> MacFourVerbsReply {
+        // 1. THE SECOND ANCHOR. `sight(app:)` walks that app's front window and
+        //    activates nothing; the look handler already answers not-running,
+        //    ambiguous and self-process in MacBackgroundSight's own words.
+        let anchored: Sighting
+        switch await sight(part: nil, app: destinationApp) {
+        case .seen(let seen): anchored = seen
+        case .blind(let reply):
+            let why = Self.string(reply.detail["message"])
+            return MacFourVerbsReply(
+                ok: false,
+                text: "I can't drop into \(destinationApp). "
+                    + (why ?? reply.text)
+                    + " I haven't raised anything or sent input.",
+                detail: reply.detail
+            )
+        }
+        let destinationAppName = anchored.appName ?? destinationApp
+
+        // gpt-5.5 review — EVERY refusal below is about a window User did not
+        // bring forward. None of them may print `anchored.render`: that is the
+        // whole background window — its rows, its readouts, its values — and
+        // appending it to "there is nothing called X here" made a target that
+        // cannot match into a way to read any running app's front window.
+        // `MacCrossAppDrag` owns the bound; these say the app, the window, and
+        // at most a capped list of names.
+        let endTarget: ActTarget
+        switch Self.resolve(destination, among: anchored.targets) {
+        case .hit(let hit): endTarget = hit
+        case .none(let nearest):
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.unresolvedDestinationWords(
+                    destination, in: destinationAppName, nearest: nearest
+                ),
+                detail: [
+                    "error": .string(MacCrossAppDrag.unresolvedDestinationReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            )
+        case .ambiguous(let candidates):
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.ambiguousDestinationWords(
+                    destination, in: destinationAppName,
+                    candidates: candidates.map(Self.recoveryName)
+                ),
+                detail: [
+                    "error": .string(MacCrossAppDrag.ambiguousDestinationReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            )
+        }
+        guard let endFrame = Self.visiblePortion(of: endTarget.frame, within: anchored.visibleFrame) else {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationNoPointWords(
+                    Self.spokenName(endTarget, requestedAs: destination), in: destinationAppName
+                ),
+                detail: [
+                    "error": .string(MacCrossAppDrag.destinationNoPointReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            )
+        }
+        let exactDestinationAlias = endTarget.aliases.contains {
+            Self.normalize($0) == Self.normalize(destination)
+        }
+        guard let end = Self.safeAimPoint(for: endTarget, in: endFrame,
+            describedBy: exactDestinationAlias ? "" : destination) else {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationObstructedWords(in: destinationAppName),
+                detail: [
+                    "error": .string(MacCrossAppDrag.destinationObstructedReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            )
+        }
+
+        // 2. SECURE INPUT. Dropping into a credential box is the same boundary
+        //    `type` refuses at, and a drag that merely CROSSES one can
+        //    spring-load it open on the way past. Both ends and the line
+        //    between them, before anything is raised.
+        if MacCrossAppDrag.isSecureKind(endTarget.kind) {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationIsSecureWords(
+                    destination: Self.spokenName(endTarget, requestedAs: destination)
+                ),
+                detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
+            )
+        }
+        let secureFrames = (before.targets + anchored.targets)
+            .filter { MacCrossAppDrag.isSecureKind($0.kind) }
+            .compactMap(\.frame)
+        guard MacRegionAim.pathIsClear(from: start, to: end, excluding: secureFrames) else {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: destinationAppName),
+                detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
+            )
+        }
+        guard MacRegionAim.pathIsClear(from: start, to: end,
+            excluding: source.excludedFrames + endTarget.excludedFrames) else {
+            return MacFourVerbsReply(
+                ok: false,
+                text: MacCrossAppDrag.destinationObstructedWords(in: destinationAppName),
+                detail: [
+                    "error": .string(MacCrossAppDrag.destinationObstructedReason),
+                    "destination_app": .string(destinationAppName),
+                ]
+            )
+        }
+
+        // 3. THE RAISE. Measured, not assumed: `anchored.isFront` is the fact
+        //    the look published about the window it actually read.
+        let raise = MacCrossAppDrag.raise(
+            destinationApp: destinationAppName,
+            destinationIsFront: anchored.isFront
+        )
+        var raiseDetail: [String: JSONValue] = [
+            "cross_app_drag": .bool(true),
+            "destination_app": .string(destinationAppName),
+            "destination_resolved_without_focus": .bool(true),
+            "raise_reason": .string(raise.reason),
+        ]
+        if let bundle = anchored.bundleIdentifier {
+            raiseDetail["destination_app_bundle"] = .string(bundle)
+        }
+        // What the drag actually lets go of, and where. Re-derived after the
+        // raise (below) because raising re-lays a window: the pre-raise point
+        // is a resolution, not yet an aim.
+        var dropPoint = end
+        var dropTarget = endTarget
+        var anchoredAfterRaise = anchored
+        if raise.needed {
+            // gpt-5.5 review — WHAT COVERS THE SOURCE IS THE WINDOW, not the
+            // union of the elements read inside it. A window whose title bar,
+            // toolbar or blank body sits over `start` publishes no target there,
+            // so the union missed it, this guard passed, and the post-raise
+            // mouse-down landed on the destination window instead of on the
+            // thing being picked up. Ask the window's own frame first.
+            guard !MacCrossAppDrag.raiseWouldCoverSource(
+                start,
+                destinationBounds: MacCrossAppDrag.coverageBounds(
+                    windowFrame: anchored.windowFrame,
+                    targetFrames: anchored.targets.compactMap(\.frame)
+                )
+            ) else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.coveredSourceWords(
+                        source: spokenSource, destinationApp: destinationAppName
+                    ),
+                    detail: raiseDetail.merging([
+                        "raised": .bool(false),
+                        "error": .string(MacCrossAppDrag.coveredSourceReason),
+                    ]) { current, _ in current }
+                )
+            }
+            let focused: MacControlResult
+            do {
+                focused = try await host.dispatch(
+                    action: "focus_app",
+                    body: ["app": .string(destinationAppName)]
+                )
+            } catch {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: "\(error)"),
+                    detail: raiseDetail.merging([
+                        "raised": .bool(false),
+                        "error": .string(MacCrossAppDrag.raiseFailedReason),
+                    ]) { current, _ in current }
+                )
+            }
+            guard focused.ok else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.raiseFailedWords(destinationAppName, because: focused.error),
+                    detail: raiseDetail.merging([
+                        "raised": .bool(false),
+                        "error": .string(MacCrossAppDrag.raiseFailedReason),
+                    ]) { current, _ in current }
+                )
+            }
+
+            // gpt-5.5 review — LOOK AGAIN BEFORE AIMING. Everything above was
+            // resolved against a window that was BEHIND another one. Bringing it
+            // forward is a layout event: the window can move, resize, or arrive
+            // somewhere it was not, and a point computed before that is a point
+            // about a screen that no longer exists. So the destination window is
+            // re-read once, the endpoint re-resolved in it, and the coverage
+            // question asked again of the frame it actually landed on — and if
+            // any of those answers changed, this stops rather than pressing the
+            // mouse down on a guess. Focus has moved by then, and each refusal
+            // says so.
+            let reread: Sighting
+            switch await sight(part: nil, app: destinationAppName) {
+            case .seen(let seen): reread = seen
+            case .blind(let reply):
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.destinationMovedWords(destination, in: destinationAppName),
+                    detail: raiseDetail.merging([
+                        "raised": .bool(true),
+                        "raised_app": .string(destinationAppName),
+                        "reread_after_raise": .bool(true),
+                        "error": .string(MacCrossAppDrag.destinationMovedReason),
+                        "reread_error": reply.detail["error"] ?? .string("look_failed"),
+                    ]) { current, _ in current }
+                )
+            }
+            anchoredAfterRaise = reread
+
+            func movedRefusal() -> MacFourVerbsReply {
+                MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.destinationMovedWords(destination, in: destinationAppName),
+                    detail: raiseDetail.merging([
+                        "raised": .bool(true),
+                        "raised_app": .string(destinationAppName),
+                        "reread_after_raise": .bool(true),
+                        "error": .string(MacCrossAppDrag.destinationMovedReason),
+                    ]) { current, _ in current }
+                )
+            }
+
+            guard case .hit(let rereadTarget) = Self.resolve(destination, among: reread.targets) else {
+                return movedRefusal()
+            }
+            guard let rereadFrame = Self.visiblePortion(
+                of: rereadTarget.frame, within: reread.visibleFrame
+            ) else { return movedRefusal() }
+            let rereadExactAlias = rereadTarget.aliases.contains {
+                Self.normalize($0) == Self.normalize(destination)
+            }
+            guard let rereadPoint = Self.safeAimPoint(
+                for: rereadTarget, in: rereadFrame,
+                describedBy: rereadExactAlias ? "" : destination
+            ) else { return movedRefusal() }
+
+            // The window is in front NOW. If its real frame covers the pick-up
+            // point, the mouse-down would land on it — the exact failure the
+            // pre-raise guard exists to prevent, asked again of the truth.
+            guard !MacCrossAppDrag.raiseWouldCoverSource(
+                start,
+                destinationBounds: MacCrossAppDrag.coverageBounds(
+                    windowFrame: reread.windowFrame,
+                    targetFrames: reread.targets.compactMap(\.frame)
+                )
+            ) else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.coveredSourceAfterRaiseWords(
+                        source: spokenSource, destinationApp: destinationAppName
+                    ),
+                    detail: raiseDetail.merging([
+                        "raised": .bool(true),
+                        "raised_app": .string(destinationAppName),
+                        "reread_after_raise": .bool(true),
+                        "error": .string(MacCrossAppDrag.coveredSourceAfterRaiseReason),
+                    ]) { current, _ in current }
+                )
+            }
+
+            // The secure boundary is re-drawn on the line that will actually be
+            // travelled: a raise can bring a password field onto it.
+            let rereadSecureFrames = (before.targets + reread.targets)
+                .filter { MacCrossAppDrag.isSecureKind($0.kind) }
+                .compactMap(\.frame)
+            if MacCrossAppDrag.isSecureKind(rereadTarget.kind) {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.destinationIsSecureWords(
+                        destination: Self.spokenName(rereadTarget, requestedAs: destination)
+                    ),
+                    detail: raiseDetail.merging([
+                        "raised": .bool(true),
+                        "raised_app": .string(destinationAppName),
+                        "reread_after_raise": .bool(true),
+                        "error": .string(MacCrossAppDrag.secureCrossingReason),
+                    ]) { current, _ in current }
+                )
+            }
+            guard MacRegionAim.pathIsClear(
+                from: start, to: rereadPoint, excluding: rereadSecureFrames
+            ) else {
+                return MacFourVerbsReply(
+                    ok: false,
+                    text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: destinationAppName),
+                    detail: raiseDetail.merging([
+                        "raised": .bool(true),
+                        "raised_app": .string(destinationAppName),
+                        "reread_after_raise": .bool(true),
+                        "error": .string(MacCrossAppDrag.secureCrossingReason),
+                    ]) { current, _ in current }
+                )
+            }
+
+            dropTarget = rereadTarget
+            dropPoint = rereadPoint
+            raiseDetail["reread_after_raise"] = .bool(true)
+        }
+        raiseDetail["raised"] = .bool(raise.needed)
+        if raise.needed { raiseDetail["raised_app"] = .string(destinationAppName) }
+
+        // 4. ONE DRAG.
+        var body: [String: JSONValue] = [
+            "gesture": .string(PhysicalVerb.drag.rawValue),
+            "x": .double(start.x),
+            "y": .double(start.y),
+            "to_x": .double(dropPoint.x),
+            "to_y": .double(dropPoint.y),
+            "travel_seconds": .double(seconds ?? 0),
+        ]
+        if let holding { body["holding"] = .string(holding) }
+        if let button { body["button"] = .string(button) }
+        let spokenDestination = Self.spokenName(dropTarget, requestedAs: destination)
+        let description = "\(button == "right" ? "Right-dragged" : "Dragged") \(spokenSource) "
+            + "into \(destinationAppName) — onto \(spokenDestination). \(raise.words)"
+        // The pre-act reading passed here is the DESTINATION window's, taken
+        // after the raise when there was one: the post-act look lands on that
+        // same window, so the comparison is drop evidence rather than the noise
+        // of the window order having changed underneath it.
+        let reply = await performHand(
+            body: body,
+            description: description,
+            attention: attention,
+            before: anchoredAfterRaise,
+            allowGenericScreenChangeVerification: !dropTarget.physicalOnly
+        )
+        var detail = reply.detail
+        for (key, value) in raiseDetail { detail[key] = value }
         if let button { detail["button"] = .string(button) }
         return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
     }
@@ -1486,61 +1940,180 @@ public struct MacFourVerbs: Sendable {
 
     // MARK: 4 — PATIENCE
 
-    /// Bounded waiting. Polls `screen()`; returns early when the render CONTAINS
-    /// `until`, or when the screen stops changing (two identical renders in a
-    /// row), or when the budget runs out — and says WHICH of the three it was.
-    /// A timeout is never dressed up as a settle.
+    /// Bounded waiting, ended by a SIGNAL rather than by a stopwatch
+    /// (fable51 item 31; NORTHSTAR clause 4).
+    ///
+    /// Same three outcomes and the same words as before — matched, settled,
+    /// timeout, and a timeout is never dressed up as a settle. What changed is
+    /// what it costs. The old loop re-rendered every 500 ms, and each render is
+    /// a full AX walk plus a screen capture plus (conditionally) OCR: a 60 s
+    /// wait was up to 120 captures, nearly all of them of a screen that had not
+    /// moved. Now:
+    ///
+    ///   1. ONE render up front — the baseline it compares against.
+    ///   2. Then it SUBSCRIBES (`MacWaitSignals`: the same `AXObserver` the act
+    ///      loop already ends on, plus NSWorkspace activation for the app-switch
+    ///      signal an AX observer installed on one pid structurally cannot
+    ///      carry) and renders again only when a signal actually arrives. A
+    ///      burst of notifications is ONE episode and ONE render.
+    ///   3. SILENCE IS THE SETTLE. When the subscription is live and nothing
+    ///      fires for `settleQuietSeconds`, the screen has stopped changing —
+    ///      so the render already in hand is the answer, and a settled wait
+    ///      costs one capture instead of two.
+    ///
+    /// THE SAFETY NET, and exactly what it is for: when NO observer could be
+    /// installed (the app publishes nothing subscribable, the look could not
+    /// name a pid, or the platform has no observer at all), silence proves
+    /// nothing — so this must not report a settle it cannot see. In that case
+    /// and only that case, `wait` degrades to a coarse re-render every
+    /// `fallbackPollSeconds` and decides settle the old way, by comparing two
+    /// renders. That is ten times cheaper than the old poll and still honest.
     public func wait(until: String? = nil, seconds: Double? = nil) async -> MacFourVerbsReply {
         let budget = min(max(seconds ?? Self.defaultWaitSeconds, 0), Self.maxWaitSeconds)
         let needle = until?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let startedAt = clock.now()
-        var previous: String?
-        var last: Sighting?
-        var budgetLeft = true
 
-        while budgetLeft {
-            let hit: Sighting
-            switch await sight(part: nil) {
-            case .blind(let reply): return reply
-            case .seen(let seen): hit = seen
-            }
-            last = hit
-            let elapsed = clock.now().timeIntervalSince(startedAt)
-            if let needle, !needle.isEmpty, hit.render.lowercased().contains(needle) {
-                return MacFourVerbsReply(
-                    ok: true,
-                    text: "\"\(until ?? "")\" appeared after \(Self.seconds(elapsed)).\n" + hit.render,
-                    detail: ["outcome": .string("matched"), "seconds": .double(elapsed)]
-                )
-            }
-            if previous == hit.render {
-                return MacFourVerbsReply(
-                    ok: true,
-                    text: (needle?.isEmpty == false
-                           ? "Settled after \(Self.seconds(elapsed)) and \"\(until ?? "")\" never appeared."
-                           : "Settled after \(Self.seconds(elapsed)).") + "\n" + hit.render,
-                    detail: ["outcome": .string("settled"), "seconds": .double(elapsed)]
-                )
-            }
-            previous = hit.render
-            budgetLeft = elapsed + Self.pollSeconds <= budget
-            if budgetLeft { await clock.sleep(seconds: Self.pollSeconds) }
+        func elapsedNow() -> Double { clock.now().timeIntervalSince(startedAt) }
+
+        func matched(_ hit: Sighting, _ elapsed: Double) -> MacFourVerbsReply {
+            MacFourVerbsReply(
+                ok: true,
+                text: "\"\(until ?? "")\" appeared after \(Self.seconds(elapsed)).\n" + hit.render,
+                detail: ["outcome": .string("matched"), "seconds": .double(elapsed)]
+            )
+        }
+        func settled(_ hit: Sighting, _ elapsed: Double, quiet: Bool) -> MacFourVerbsReply {
+            MacFourVerbsReply(
+                ok: true,
+                text: (needle?.isEmpty == false
+                       ? "Settled after \(Self.seconds(elapsed)) and \"\(until ?? "")\" never appeared."
+                       : "Settled after \(Self.seconds(elapsed)).") + "\n" + hit.render,
+                detail: [
+                    "outcome": .string("settled"),
+                    "seconds": .double(elapsed),
+                    // How the settle was DECIDED. `quiet` means the
+                    // subscription went silent; `compared` means there was no
+                    // subscription and two renders matched.
+                    "settled_by": .string(quiet ? "quiet" : "compared"),
+                ]
+            )
         }
 
-        let elapsed = clock.now().timeIntervalSince(startedAt)
+        // 1 — the baseline. One render, before anything is subscribed to.
+        let first: Sighting
+        switch await sight(part: nil) {
+        case .blind(let reply): return reply
+        case .seen(let seen): first = seen
+        }
+        var last = first
+        var previous = first.render
+        var lastRenderAt = clock.now()
+        if let needle, !needle.isEmpty, first.render.lowercased().contains(needle) {
+            return matched(first, elapsedNow())
+        }
+
+        // 2 — subscribe. Installed only AFTER a look succeeded, so the gate has
+        // already run; removed on every exit, including a thrown cancellation.
+        let signals = MacWaitSignals(
+            effects: effectObserverSource,
+            activation: appActivationSource,
+            pid: first.pid
+        )
+        defer { signals.stop() }
+
+        while true {
+            let remaining = budget - elapsedNow()
+            if remaining <= 0 { break }
+            let window = min(
+                remaining,
+                signals.isObserving ? Self.settleQuietSeconds : Self.fallbackPollSeconds
+            )
+            // THE CAPTURE-RATE FLOOR. A screen that fires notifications
+            // continuously (a progress bar, a live log) would otherwise wake
+            // this loop on every one and render as fast as the machine can walk
+            // and capture — a hot loop, strictly worse than the poll it
+            // replaced. So a signal never causes a render sooner than
+            // `settleQuietSeconds` after the last one: the old poll's cadence
+            // becomes the WORST case instead of the only case.
+            let fired = await awaitSignal(
+                signals,
+                window: window,
+                notBefore: lastRenderAt.addingTimeInterval(Self.settleQuietSeconds)
+            )
+            if !fired, signals.isObserving {
+                // Nothing fired for a full quiet window: the screen has stopped
+                // changing, and the render in hand already describes it.
+                if window >= Self.settleQuietSeconds {
+                    return settled(last, elapsedNow(), quiet: true)
+                }
+                // The budget ran out inside a short final window.
+                break
+            }
+            // 3 — render ONCE, because something happened (or, with no
+            // subscription, because the coarse fallback said to look again).
+            switch await sight(part: nil) {
+            case .blind(let reply): return reply
+            case .seen(let seen): last = seen
+            }
+            lastRenderAt = clock.now()
+            let elapsed = elapsedNow()
+            if let needle, !needle.isEmpty, last.render.lowercased().contains(needle) {
+                return matched(last, elapsed)
+            }
+            if previous == last.render {
+                // A signal that changed nothing visible, or the fallback's two
+                // identical renders. Either way the screen has settled.
+                return settled(last, elapsed, quiet: false)
+            }
+            previous = last.render
+        }
+
+        let elapsed = elapsedNow()
         let ending = needle?.isEmpty == false
             ? "Timed out after \(Self.seconds(elapsed)) — \"\(until ?? "")\" never appeared and the screen is still changing."
             : "Timed out after \(Self.seconds(elapsed)) — the screen is still changing."
         return MacFourVerbsReply(
             ok: false,
-            text: ending + (last.map { "\n" + $0.render } ?? ""),
+            text: ending + "\n" + last.render,
             detail: ["outcome": .string("timeout"), "seconds": .double(elapsed)]
         )
     }
 
+    /// Wait until a signal arrives or `window` elapses. The granularity is a
+    /// lock-guarded read of an in-process collector — no AX walk, no capture —
+    /// which is what makes it affordable at 50 ms while the old loop was
+    /// unaffordable at 500 ms. It is paced through `clock` so a 60-second
+    /// budget stays a 60-second budget in production and costs nothing in a
+    /// test.
+    private func awaitSignal(
+        _ signals: MacWaitSignals,
+        window: Double,
+        notBefore: Date
+    ) async -> Bool {
+        let deadline = clock.now().addingTimeInterval(window)
+        var fired = false
+        while clock.now() < deadline {
+            if signals.consume() { fired = true }
+            // Latched, but held until the capture-rate floor passes. Holding
+            // rather than dropping is what keeps a fast signal from being lost:
+            // the wake still happens, it just happens on the floor.
+            if fired, clock.now() >= notBefore { return true }
+            await clock.sleep(seconds: min(Self.signalPollSeconds, window))
+        }
+        if signals.consume() { fired = true }
+        return fired
+    }
+
     static let defaultWaitSeconds: Double = 10
     static let maxWaitSeconds: Double = 60
-    static let pollSeconds: Double = 0.5
+    /// Silence this long, with a live subscription, IS a settle. The same
+    /// half-second the old loop encoded as "two identical renders 500 ms
+    /// apart" — the meaning is unchanged, only the evidence got cheaper.
+    static let settleQuietSeconds: Double = 0.5
+    /// The SAFETY NET cadence, used only when no observer could be installed.
+    static let fallbackPollSeconds: Double = 5.0
+    /// How often the wait drains the collector. A lock read, not a look.
+    static let signalPollSeconds: Double = 0.05
 
     // MARK: - One sighting
 
@@ -1562,7 +2135,24 @@ public struct MacFourVerbs: Sendable {
         let place: String
         let appName: String?
         let bundleIdentifier: String?
+        /// fable51 item 31 — the process `wait` installs its AX observer on.
+        /// nil when the look could not name one, which the wait reports as "no
+        /// observer" rather than installing on a guess.
+        let pid: Int32?
+        /// fable51 item 32a/b — whether the window this sighting DESCRIBES is
+        /// the one in front. Always true for an unanchored look; a measured
+        /// fact for an anchored one, and the fact the cross-app drag's raise
+        /// decision turns on.
+        let isFront: Bool
         let visibleFrame: MacAXFrame?
+        /// fable51 item 32b (gpt-5.5 review) — the frame of the WINDOW this
+        /// sighting describes, as the look's own anchor reported it. nil when
+        /// the host published none. Distinct from `visibleFrame`, which is the
+        /// screen's usable area, and from the union of `targets` frames, which
+        /// is only what was READ inside the window: a window's title bar,
+        /// toolbar and blank areas belong to the window and to neither of
+        /// those. The cross-app drag's coverage guard turns on this.
+        let windowFrame: MacAXFrame?
         let targets: [ActTarget]
         let frameId: String
         let zoomNote: String?
@@ -1642,18 +2232,25 @@ public struct MacFourVerbs: Sendable {
 
     // Module-internal so paired perception fixtures can inspect the same
     // private target/render compilation used by screen and act.
-    func sight(part: String?) async -> Sighted {
-        await sight(part: part, wakeAttemptsRemaining: 2)
+    func sight(part: String?, app: String? = nil) async -> Sighted {
+        await sight(part: part, app: app, wakeAttemptsRemaining: 2)
     }
 
     /// A screen saver is an obstruction to perception, not a destination Agent
     /// should reason about. Clear it with the already-gated wake organ and then
     /// start the read again. Two attempts cover the observed macOS teardown
     /// delay without creating an unbounded input loop.
-    private func sight(part: String?, wakeAttemptsRemaining: Int) async -> Sighted {
+    private func sight(part: String?, app: String?, wakeAttemptsRemaining: Int) async -> Sighted {
         let result: MacControlResult
         do {
-            result = try await host.dispatch(action: "look", body: ["grade": .string("look")])
+            // fable51 item 32a — when `app` is named, the look is ANCHORED to
+            // that app's front window and nothing is activated. The dispatch
+            // body is the only difference; everything downstream reads the same
+            // percept shape, and `front` in the output tells the renderer the
+            // truth about what it is describing.
+            var body: [String: JSONValue] = ["grade": .string("look")]
+            if let app { body["app"] = .string(app) }
+            result = try await host.dispatch(action: "look", body: body)
         } catch {
             return .blind(MacFourVerbsReply(
                 ok: false,
@@ -1668,7 +2265,13 @@ public struct MacFourVerbs: Sendable {
             return .blind(MacFourVerbsReply(
                 ok: false,
                 text: "I can't see the screen right now. " + why,
-                detail: ["error": .string(result.error ?? "look_failed")]
+                // The refusal's own words, unwrapped. A caller with a different
+                // lead sentence (the cross-app drag: "I can't drop into Mail")
+                // must not have to strip this one's off the front.
+                detail: [
+                    "error": .string(result.error ?? "look_failed"),
+                    "message": .string(why),
+                ]
             ))
         }
 
@@ -1696,7 +2299,7 @@ public struct MacFourVerbs: Sendable {
             let wakeOutput = Self.object(wake.output)
             let wakeReceipt = Self.object(wakeOutput["wake"] ?? .null)
             if wake.ok || wakeReceipt["still_obstructed"] == .bool(true) {
-                return await sight(part: part, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
+                return await sight(part: part, app: app, wakeAttemptsRemaining: wakeAttemptsRemaining - 1)
             }
             return .blind(MacFourVerbsReply(
                 ok: false,
@@ -1707,11 +2310,19 @@ public struct MacFourVerbs: Sendable {
             ))
         }
 
-        // The look is frontmost-anchored by construction, so FRONT is a fact
-        // here rather than a guess; how many OTHER windows exist is not
+        // An UNANCHORED look is frontmost-anchored by construction, so FRONT is
+        // a fact there rather than a guess; how many OTHER windows exist is not
         // something this read can tell, and an unknown is omitted, never zeroed
         // into a claim.
-        var full = MacScreenRender.screen(from: percept, isFront: true)
+        //
+        // fable51 item 32a — an ANCHORED look is a different case: the window
+        // it describes is usually BEHIND whatever User is using, and printing
+        // "in front" over it would be the render lying about the one fact that
+        // decides whether she may act on it. The handler publishes `front`;
+        // this reads it, and only falls back to `true` when the field is absent
+        // (an older host, where every look really was frontmost).
+        let isFront = Self.bool(output["front"]) ?? true
+        var full = MacScreenRender.screen(from: percept, isFront: isFront)
         let (rows, controls) = Self.partition(percept)
         var targets: [ActTarget] = []
         var rowRoleOrdinals: [String: Int] = [:]
@@ -2004,7 +2615,10 @@ public struct MacFourVerbs: Sendable {
             place: Self.place(percept),
             appName: percept.app?.name,
             bundleIdentifier: percept.app?.bundleIdentifier,
+            pid: percept.app.map(\.processIdentifier).flatMap { $0 == 0 ? nil : $0 },
+            isFront: isFront,
             visibleFrame: visibleFrame,
+            windowFrame: Self.frame(output["window_frame"]),
             targets: targets,
             frameId: frameId,
             zoomNote: zoom?.note,

@@ -264,7 +264,8 @@ extension NativeClient {
                 payloadPreview: rec.payloadPreview,
                 localOnly: rec.localOnly,
                 remoteResolvable: rec.remoteResolvable,
-                chatOriginSessionId: NativeClient.chatApprovalOriginSessionId(rec.payload)
+                chatOriginSessionId: NativeClient.chatApprovalOriginSessionId(rec.payload),
+                lastRequestedAt: rec.lastRequestedAt
             )
         }
     }

@@ -79,6 +79,15 @@ struct DeviceCKLandmineTimeout: LocalizedError, Sendable {
     }
 }
 
+/// 2026-09-06: the container rejected a sort on the server modificationDate
+/// (no sortable `___modTime` index). Signals the pull to retry once in the
+/// legacy client-`createdAt` order rather than surfacing a sync failure.
+struct DeviceCKUnsortableField: LocalizedError, Sendable {
+    var errorDescription: String? {
+        "CloudKit rejected the modificationDate sort for this record type."
+    }
+}
+
 private func withDeviceCKTimeout<T: Sendable>(
     _ label: String,
     seconds: TimeInterval = 5,
@@ -168,6 +177,49 @@ private func withDeviceCKTimeoutThrowing<T: Sendable>(
     }
 }
 
+/// Thread-safe accumulator for the retention sweep's recordMatchedBlock. Holds
+/// record NAMES (not `CKRecord.ID`s) so the page crosses the continuation as a
+/// plain Sendable value; the delete op rebuilds the ids in the default zone,
+/// which is the zone every send writes into.
+private final class DeviceCKRecordNameHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var names: [String] = []
+    // 2026-09-06: every record the page returned, eligible or not. The backlog
+    // signal is "the page came back full", which the deleted count cannot tell
+    // us — in the createdAt fallback order most of a full page is often still
+    // inside the retention window.
+    private var fetched = 0
+    func noteFetched() { lock.lock(); fetched += 1; lock.unlock() }
+    func add(_ name: String) { lock.lock(); names.append(name); lock.unlock() }
+    func snapshot() -> (names: [String], fetched: Int) {
+        lock.lock(); defer { lock.unlock() }; return (names, fetched)
+    }
+}
+
+/// One page of the retention sweep's query: the eligible record names, how many
+/// records the page actually returned, and the server-side resume position.
+/// `@unchecked Sendable` because a `CKQueryOperation.Cursor` is an opaque
+/// position we only ever hand back to CloudKit — never read, never mutated.
+private final class DeviceCKSweepPage: @unchecked Sendable {
+    let names: [String]
+    let fetched: Int
+    let cursor: CKQueryOperation.Cursor?
+    init(names: [String], fetched: Int, cursor: CKQueryOperation.Cursor?) {
+        self.names = names
+        self.fetched = fetched
+        self.cursor = cursor
+    }
+}
+
+/// What one record type's sweep achieved. `deleted` counts CONFIRMED deletions
+/// only: a delete batch that timed out may or may not have been applied by the
+/// server, so it is reported as unknown rather than as zero.
+private struct DeviceCKSweepOutcome {
+    var deleted = 0
+    var backlog = false
+    var deleteTimedOut = false
+}
+
 /// Thread-safe per-page accumulator for pull's recordMatchedBlock. The CK
 /// callback runs on CloudKit's own queue, so the holder locks its own appends.
 private final class DeviceCKPullPageHolder: @unchecked Sendable {
@@ -198,7 +250,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private let lock = NSLock()
     private var incomingHandler: (@Sendable (BridgeMessage) async -> Bool)?
     private var pairingHandler: (@Sendable (Data) async -> Bool)?
-    private var statusHandlers: [String: @Sendable (String) async -> Void] = [:]
+    private var statusHandlers: [String: @Sendable (String) async -> Bool] = [:]
     private var visibleNotificationSubscriptionReady = false
     private var lastPullDate: Date?
     private var lastPullCursorPersistenceAt: Date?
@@ -209,12 +261,45 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     // re-runs once to service them.
     private var drainInFlight = false
     private var drainAgain = false
+    // 2026-09-06: the status lane needs the same slot, for the same reason.
+    // Two overlapping status drains could each claim a DIFFERENT generation of
+    // the same key and then run their handlers concurrently, so the older
+    // delivery could finish last and overwrite the newer bytes it raced.
+    private var statusDrainInFlight = false
+    private var statusDrainAgain = false
+    // 2026-09-06: record types whose container index rejected a
+    // modificationDate sort, so we stop paying for a rejected query every drain
+    // and use the legacy createdAt order instead. PER RECORD TYPE: the sortable
+    // `___modTime` index is declared per record type, and iOS pulls two of them
+    // (chatMessage and notification) — one type's missing index must not demote
+    // the other's pull to the createdAt order that the paging stop cannot trust.
+    // Accepted as is (2026-09-06): the set lives on the transport instance, so a
+    // teardown/setup cycle in the same process re-probes the rejected sort once
+    // per type. That costs one rejected query and immediately re-latches.
+    private var serverModDateSortRejected: Set<String> = []
     // LWW/dedup cursors for the pairing + status singletons. Pairing is one
     // mutable record per peer role; status is one record per (peer role, key).
     // We only re-dispatch when the server modificationDate advances, so a redraw
     // triggered by a redundant push does not re-fire the same value.
     private var lastPairingModDate: Date?
     private var lastStatusModDates: [String: Date] = [:]
+    // 2026-09-06: when the last retention sweep ran, so a Mac that drains every
+    // eight seconds does not pay for a housekeeping query on every drain. In
+    // memory only — a relaunch simply sweeps once more, which is harmless.
+    private var lastRetentionSweepAt: Date?
+    // True while the last sweep's query page came back full, i.e. there is more
+    // of the collection to walk; the next sweep then comes back in a minute
+    // instead of an hour.
+    private var retentionBacklog = false
+    // 2026-09-06: the resume position of the createdAt-order sweep, per record
+    // type. In that fallback order the page is NOT sorted by the eligibility
+    // clock, so the hundred oldest by createdAt can contain nothing older than
+    // the cutoff — and with no resume position that same hundred came back on
+    // every sweep, forever, deleting nothing. The cursor advances past each page
+    // that has been examined; storing nil (a page that returned nothing, or a
+    // cursor CloudKit did not hand back because the walk reached the end)
+    // restarts the walk from the oldest record on the next sweep.
+    private var retentionFallbackCursors: [String: CKQueryOperation.Cursor] = [:]
     // Insertion-ordered seen-id dedup, capped, mirroring iCloudBridge.
     private var seenMessageIDs: Set<String> = []
     private var seenMessageIDsOrdered: [String] = []
@@ -337,9 +422,42 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             throw DeviceSyncError.transient(message: "CloudKit send timed out")
         } catch let error as DeviceSyncError {
             if case .conflict = error, await existingMessageRecordMatches(fields) {
+                // 2026-09-06: the caller is told this send succeeded, but the
+                // server record still carries its ORIGINAL modificationDate —
+                // the only clock the retention sweep judges eligibility by. A
+                // replay of a record already past the window (stable ids come
+                // from AgentBridgeCompletionRouter's idempotencyKey) was swept
+                // away moments after the send reported success. Touch the
+                // record so the replay is fresh for another full window.
+                await touchExistingRecord(named: fields.recordName)
                 return
             }
             throw error
+        }
+    }
+
+    /// Re-save the server record unchanged so its `___modTime` advances. Only
+    /// the retention clock moves — no field is written, and
+    /// `.ifServerRecordUnchanged` means a record the peer changed underneath us
+    /// is left alone. Best effort: a failed touch costs the record its
+    /// refreshed clock, never the send's success.
+    private func touchExistingRecord(named recordName: String) async {
+        _ = await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayTouch") {
+            let record = try await self.database.record(
+                for: CKRecord.ID(recordName: recordName)
+            )
+            let op = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: nil)
+            op.savePolicy = .ifServerRecordUnchanged
+            op.qualityOfService = .userInitiated
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                op.modifyRecordsResultBlock = { result in
+                    switch result {
+                    case .success: cont.resume()
+                    case .failure(let err): cont.resume(throwing: Self.mapError(err))
+                    }
+                }
+                self.database.add(op)
+            }
         }
     }
 
@@ -547,6 +665,288 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return max(previousCursor, candidate)
     }
 
+    // MARK: retention sweep
+
+    /// 2026-09-06: every `send` wrote an `NAChatMessage`/`NANotification`
+    /// record and nothing ever deleted one — draining advances a cursor and
+    /// remembers seen ids, but acknowledged records stayed in the private
+    /// database forever. The Mac is the deleting device (it is the always-on
+    /// owner); the phone never sweeps.
+    ///
+    /// A record is eligible once its SERVER modificationDate is older than the
+    /// window, whether or not the phone drained it. That is accepted: a phone
+    /// offline for two weeks resyncs from the Mac's transcript snapshot, which
+    /// is the source of truth. Pairing and status records are singletons that
+    /// are overwritten in place, so they are never swept.
+    public static let retentionWindow: TimeInterval = 14 * 24 * 60 * 60
+
+    /// Deletions per sweep, per record type. Bounded so a first sweep over a
+    /// large backlog cannot turn one drain into a long CloudKit transaction;
+    /// the backlog clears over successive sweeps.
+    public static let retentionSweepBatch = 100
+
+    /// Minimum spacing between sweeps in the steady state. Drains run as often
+    /// as every eight seconds; retention is housekeeping, not a per-drain cost.
+    static let retentionSweepInterval: TimeInterval = 60 * 60
+
+    /// Spacing while a sweep's page still comes back full. The first sweep on a
+    /// container that has been accumulating since the cutover has a large
+    /// backlog, and at one bounded batch an hour it would take weeks to clear.
+    static let retentionBacklogSweepInterval: TimeInterval = 60
+
+    static func shouldSweepRetention(
+        role: NADeviceRole,
+        lastSweepAt: Date?,
+        backlog: Bool,
+        now: Date
+    ) -> Bool {
+        guard role == .mac else { return false }   // the phone never deletes
+        guard let lastSweepAt else { return true }
+        let interval = backlog ? retentionBacklogSweepInterval : retentionSweepInterval
+        return now.timeIntervalSince(lastSweepAt) >= interval
+    }
+
+    /// Delete chat + notification records past the retention window. Mac-only,
+    /// rate-limited, and bounded per record type. Returns the number deleted.
+    /// Safe to call on every drain — it self-throttles and no-ops on iOS.
+    @discardableResult
+    public func sweepExpiredRecords() async -> Int {
+        guard configured else { return 0 }  // crash-guard: no CKContainer
+        let now = Date()
+        guard claimRetentionSweep(now: now) else { return 0 }
+        let cutoff = now.addingTimeInterval(-Self.retentionWindow)
+        var deleted = 0
+        var backlog = false
+        var timedOut = false
+        for recordType in [
+            NADeviceSyncRecordType.chatMessage,
+            NADeviceSyncRecordType.notification,
+        ] {
+            let outcome = await sweepExpiredRecords(recordType: recordType, cutoff: cutoff)
+            deleted += outcome.deleted
+            // 2026-09-06: the backlog signal is a FULL PAGE, not a full batch of
+            // deletions — a page that fetched a hundred records and deleted two
+            // still means there is more of the collection to walk.
+            if outcome.backlog { backlog = true }
+            if outcome.deleteTimedOut { timedOut = true }
+        }
+        setRetentionBacklog(backlog)
+        // 2026-09-06: a delete batch that timed out may still have been applied
+        // by the server — the timeout is on OUR wait, not on the operation. Say
+        // the count is unknown rather than logging a confident zero.
+        if timedOut {
+            NSLog(
+                "[ck-device] retention sweep: %d confirmed deletion(s) before %@, plus a batch whose delete timed out — that batch's count is unknown",
+                deleted,
+                "\(cutoff)"
+            )
+        } else {
+            NSLog(
+                "[ck-device] retention sweep deleted %d record(s) modified before %@",
+                deleted,
+                "\(cutoff)"
+            )
+        }
+        return deleted
+    }
+
+    /// Claim the sweep slot under the lock. Doubles as the rate limiter and as
+    /// the mutual exclusion between two concurrent drains.
+    private func claimRetentionSweep(now: Date) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard Self.shouldSweepRetention(
+            role: role,
+            lastSweepAt: lastRetentionSweepAt,
+            backlog: retentionBacklog,
+            now: now
+        ) else { return false }
+        lastRetentionSweepAt = now
+        return true
+    }
+
+    private func setRetentionBacklog(_ backlog: Bool) {
+        lock.lock(); retentionBacklog = backlog; lock.unlock()
+    }
+
+    private func sweepExpiredRecords(recordType: String, cutoff: Date) async -> DeviceCKSweepOutcome {
+        var outcome = DeviceCKSweepOutcome()
+        let orderedByServerModDate = serverModDateSortAvailable(recordType: recordType)
+        let page: DeviceCKSweepPage
+        do {
+            page = try await withDeviceCKTimeoutThrowing(
+                "CloudKitDeviceTransport.sweep",
+                seconds: 10
+            ) {
+                if orderedByServerModDate {
+                    do {
+                        return try await self.expiredRecordPage(
+                            recordType: recordType,
+                            cutoff: cutoff,
+                            orderByServerModDate: true,
+                            resumeCursor: nil
+                        )
+                    } catch is DeviceCKUnsortableField {
+                        // Same missing `___modTime` index the pull depends on;
+                        // latch it once so neither lane pays for a rejected
+                        // query again.
+                        self.markServerModDateSortRejected(recordType: recordType)
+                    }
+                }
+                return try await self.expiredRecordPage(
+                    recordType: recordType,
+                    cutoff: cutoff,
+                    orderByServerModDate: false,
+                    resumeCursor: self.retentionFallbackCursor(recordType: recordType)
+                )
+            }
+        } catch {
+            NSLog("[ck-device] retention sweep query failed for %@: %@", recordType, String(describing: error))
+            // A stored cursor can go stale on the server; keeping it would make
+            // every later sweep fail the same way. Drop it and walk again from
+            // the oldest record next time.
+            if !serverModDateSortAvailable(recordType: recordType) {
+                setRetentionFallbackCursor(nil, recordType: recordType)
+            }
+            return outcome
+        }
+        // The order actually used: a first query rejected for its sort
+        // descriptor latched the fallback above.
+        let usedServerModDateOrder = orderedByServerModDate
+            && serverModDateSortAvailable(recordType: recordType)
+        if !usedServerModDateOrder {
+            // Advance (or, on nil, reset) the walk before deleting: a delete
+            // that fails leaves those records for the next full walk rather
+            // than pinning the sweep on a page it cannot clear.
+            setRetentionFallbackCursor(page.fetched == 0 ? nil : page.cursor, recordType: recordType)
+        }
+        // 2026-09-06: a full page means there is more collection to walk. In
+        // modificationDate order the page is sorted by the eligibility clock
+        // itself, so a page that is only partly eligible IS the cutoff boundary
+        // — nothing older remains, and claiming a backlog there would hold the
+        // sweep at its one-minute cadence forever on any busy container.
+        outcome.backlog = page.fetched >= Self.retentionSweepBatch
+            && (!usedServerModDateOrder || page.names.count == page.fetched)
+        let names = page.names
+        guard !names.isEmpty else { return outcome }
+        do {
+            try await withDeviceCKTimeoutThrowing(
+                "CloudKitDeviceTransport.sweepDelete",
+                seconds: 15
+            ) {
+                let op = CKModifyRecordsOperation(
+                    recordsToSave: nil,
+                    recordIDsToDelete: names.map { CKRecord.ID(recordName: $0) }
+                )
+                op.qualityOfService = .utility
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    op.modifyRecordsResultBlock = { result in
+                        switch result {
+                        case .success: cont.resume()
+                        case .failure(let err): cont.resume(throwing: Self.mapError(err))
+                        }
+                    }
+                    self.database.add(op)
+                }
+            }
+        } catch is DeviceCKLandmineTimeout {
+            // 2026-09-06: the timeout is on our WAIT, not on the operation —
+            // cloudd may well apply the delete after we stop listening. Report
+            // the batch as unknown; counting it as zero deletions understated
+            // the sweep and, before the page-based backlog signal, also lied
+            // about whether there was still a backlog.
+            NSLog(
+                "[ck-device] retention sweep delete batch of %d timed out for %@; the server may still have applied it — count unknown",
+                names.count,
+                recordType
+            )
+            outcome.deleteTimedOut = true
+            return outcome
+        } catch {
+            NSLog("[ck-device] retention sweep delete failed for %@: %@", recordType, String(describing: error))
+            return outcome
+        }
+        outcome.deleted = names.count
+        return outcome
+    }
+
+    private func retentionFallbackCursor(recordType: String) -> CKQueryOperation.Cursor? {
+        lock.lock(); defer { lock.unlock() }
+        return retentionFallbackCursors[recordType]
+    }
+
+    private func setRetentionFallbackCursor(_ cursor: CKQueryOperation.Cursor?, recordType: String) {
+        lock.lock()
+        retentionFallbackCursors[recordType] = cursor
+        lock.unlock()
+    }
+
+    /// One bounded page of the OLDEST records of `recordType`, filtered to those
+    /// the cutoff has passed. In modificationDate order, ascending is what makes
+    /// a single page enough: the page is either wholly eligible or contains the
+    /// cutoff boundary, and deleting it moves the next sweep's page forward.
+    /// Eligibility is ALWAYS the server modificationDate — the client
+    /// `createdAt` is only a fallback sort key for a container whose
+    /// `___modTime` index is not sortable. In THAT order the page is not sorted
+    /// by the eligibility clock and nothing on it need be deletable, so the
+    /// caller passes `resumeCursor` to continue past the records this page
+    /// already examined instead of re-reading them forever. `desiredKeys = []`
+    /// keeps the page to system fields, so a sweep never downloads payloads it
+    /// is about to delete.
+    private func expiredRecordPage(
+        recordType: String,
+        cutoff: Date,
+        orderByServerModDate: Bool,
+        resumeCursor: CKQueryOperation.Cursor?
+    ) async throws -> DeviceCKSweepPage {
+        let op: CKQueryOperation
+        // Only a FRESH query carries the sort descriptor, so only a fresh query
+        // can be rejected for it; an `.invalidArguments` on a cursor
+        // continuation is a stale cursor and must not latch the fallback order.
+        let carriesSortDescriptor = resumeCursor == nil
+        if let resumeCursor {
+            op = CKQueryOperation(cursor: resumeCursor)
+        } else {
+            let query = CKQuery(recordType: recordType, predicate: NSPredicate(value: true))
+            query.sortDescriptors = [
+                NSSortDescriptor(key: orderByServerModDate ? "modificationDate" : "createdAt", ascending: true)
+            ]
+            op = CKQueryOperation(query: query)
+        }
+        op.qualityOfService = .utility
+        op.resultsLimit = Self.retentionSweepBatch
+        op.desiredKeys = []
+
+        let holder = DeviceCKRecordNameHolder()
+        op.recordMatchedBlock = { id, result in
+            guard case .success(let ck) = result else { return }
+            holder.noteFetched()
+            guard let modDate = ck.modificationDate, modDate < cutoff else { return }
+            holder.add(id.recordName)
+        }
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<DeviceCKSweepPage, Error>) in
+            op.queryResultBlock = { result in
+                let page = holder.snapshot()
+                switch result {
+                case .success(let cursor):
+                    cont.resume(returning: DeviceCKSweepPage(
+                        names: page.names,
+                        fetched: page.fetched,
+                        cursor: cursor
+                    ))
+                case .failure(let err):
+                    if carriesSortDescriptor,
+                       orderByServerModDate,
+                       (err as? CKError)?.code == .invalidArguments {
+                        cont.resume(throwing: DeviceCKUnsortableField())
+                    } else {
+                        cont.resume(throwing: Self.mapError(err))
+                    }
+                }
+            }
+            self.database.add(op)
+        }
+    }
+
     // MARK: pairing
 
     public func publishPairing(secret: Data) async throws {
@@ -599,6 +999,22 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             NSLog("[ck-device] observePairing: subscription registration FAILED (no live push): \(error)")
         }
         await drainPairing()
+    }
+
+    /// 2026-09-06: read the PEER's currently published pairing secret without
+    /// dispatching it, claiming it, or touching the last-writer-wins clock.
+    /// A manually pasted recovery key has to be verified against the material
+    /// the peer actually published, and on a build with no KVS entitlement
+    /// this record is the only place that material exists.
+    public func peekPairingSecret() async -> Data? {
+        guard configured else { return nil }  // crash-guard: record(for:) touches CKContainer
+        let peerRole: NADeviceRole = role == .mac ? .ios : .mac
+        let recordName = "pairing.\(peerRole.rawValue)"
+        return await withDeviceCKTimeout("CloudKitDeviceTransport.peekPairingSecret") {
+            let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
+            guard let hex = record["secretHex"] as? String else { return nil }
+            return Self.data(fromHex: hex)
+        } ?? nil
     }
 
     /// Pull the PEER's pairing singleton and dispatch to the registered handler
@@ -660,11 +1076,22 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     }
 
     public func observeStatus(key: String, onChange: @escaping @Sendable (String) async -> Void) async {
+        await observeStatus(key: key, onApply: { value in
+            await onChange(value)
+            return true
+        })
+    }
+
+    /// 2026-09-06: the acknowledging registration. `onApply` returns true only
+    /// once the value is durably applied; until it does, the peer's record keeps
+    /// its place in the drain and is redelivered — the same claim/commit split
+    /// the pairing lane has always used.
+    public func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async {
         guard configured else {
             NSLog("[ck-device] observeStatus: CloudKit entitlement absent — not subscribing (notConfigured).")
             return
         }
-        setStatusHandler(key: key, onChange)
+        setStatusHandler(key: key, onApply)
         // Register the durable silent-push subscription for status writes, then
         // do an initial drain across all observed keys (picks up this key's
         // current value). Live push → drain wiring is CK-3.
@@ -682,6 +1109,37 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     @discardableResult
     public func drainStatus() async -> Int {
         guard configured else { return 0 }  // crash-guard: record(for:) touches CKContainer
+        // 2026-09-06: serialized, exactly as drainIncoming is. Unserialized,
+        // two drains could claim two generations of one key and then apply them
+        // concurrently — an older snapshot finishing last overwrites newer bytes.
+        guard beginStatusDrainOrCoalesce() else { return 0 }
+        var total = 0
+        while true {
+            total += await drainStatusBody()
+            if endStatusDrainOrContinue() { continue }
+            break
+        }
+        return total
+    }
+
+    /// Acquire the single status-drain slot. Mirrors `beginDrainOrCoalesce`.
+    private func beginStatusDrainOrCoalesce() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if statusDrainInFlight { statusDrainAgain = true; return false }
+        statusDrainInFlight = true
+        return true
+    }
+
+    /// End a status-drain iteration. Mirrors `endDrainOrContinue`.
+    private func endStatusDrainOrContinue() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if statusDrainAgain { statusDrainAgain = false; return true }
+        statusDrainInFlight = false
+        return false
+    }
+
+    /// The status-drain body — always run serialized by `drainStatus`.
+    private func drainStatusBody() async -> Int {
         let handlers = loadStatusHandlers()
         guard !handlers.isEmpty else { return 0 }
         let peerRole: NADeviceRole = role == .mac ? .ios : .mac
@@ -694,8 +1152,13 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 return PeerStatusHit(value: value, modDate: record.modificationDate)
             } ?? nil
             guard let hit else { continue }
-            guard claimStatusIfNewer(key: key, hit.modDate) else { continue }
-            await handler(hit.value)
+            // 2026-09-06: check WITHOUT consuming, and commit only after the
+            // handler reports the value durably applied. Claiming first meant a
+            // snapshot generation the phone then failed to store was marked seen
+            // and never redelivered.
+            guard statusIsNewer(key: key, hit.modDate) else { continue }
+            guard await handler(hit.value) else { continue }
+            commitStatusDate(key: key, hit.modDate)
             dispatched += 1
         }
         return dispatched
@@ -954,11 +1417,30 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     /// The deployed container does not permit range predicates on either the
     /// private `___modTime` field or our ISO-string `createdAt` field. Filter by
-    /// the indexed direction, sort newest-first by `createdAt`, and page until
-    /// a page crosses the durable server-date watermark. This keeps quiet polls
+    /// the indexed direction, sort newest-first by the server modificationDate
+    /// (the same clock as the watermark — see `pullPages`), and page until a
+    /// page crosses the durable server-date watermark. This keeps quiet polls
     /// to one bounded page while still draining bursts larger than one page.
     static func makePullPredicate(inboundDirection: String) -> NSPredicate {
         NSPredicate(format: "direction == %@", inboundDirection)
+    }
+
+    /// 2026-09-06: the paging stop compares each record's SERVER modificationDate
+    /// against the durable watermark, so the page order has to be that same
+    /// clock. Ordered by the client `createdAt`, a record created while the peer
+    /// was offline and uploaded later sorts BEHIND records the stop already
+    /// matched, so paging halted before reaching it and the advancing watermark
+    /// made the miss permanent. Order by modificationDate; if the deployed
+    /// container has no sortable index on `___modTime` the query is rejected
+    /// once and we fall back to the previous createdAt order for the rest of the
+    /// process, for that record type only.
+    private func serverModDateSortAvailable(recordType: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !serverModDateSortRejected.contains(recordType)
+    }
+
+    private func markServerModDateSortRejected(recordType: String) {
+        lock.lock(); serverModDateSortRejected.insert(recordType); lock.unlock()
     }
 
     private func pull(
@@ -969,83 +1451,131 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
         do {
             return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull") {
-                let query = CKQuery(
+                if self.serverModDateSortAvailable(recordType: recordType) {
+                    do {
+                        return try await self.pullPages(
+                            recordType: recordType,
+                            since: since,
+                            inboundDirection: inboundDirection,
+                            orderByServerModDate: true
+                        )
+                    } catch is DeviceCKUnsortableField {
+                        NSLog("[ck-device] pull: %@ has no sortable ___modTime index; falling back to createdAt order", recordType)
+                        self.markServerModDateSortRejected(recordType: recordType)
+                    }
+                }
+                return try await self.pullPages(
                     recordType: recordType,
-                    predicate: Self.makePullPredicate(inboundDirection: inboundDirection)
+                    since: since,
+                    inboundDirection: inboundDirection,
+                    orderByServerModDate: false
                 )
-                query.sortDescriptors = [NSSortDescriptor(key: "createdAt", ascending: false)]
-
-                var combined: [(fields: NAChatMessageFields, modDate: Date?)] = []
-                var nextCursor: CKQueryOperation.Cursor? = nil
-                var firstPage = true
-
-                repeat {
-                    let op: CKQueryOperation
-                    if firstPage {
-                        op = CKQueryOperation(query: query); firstPage = false
-                    } else if let c = nextCursor {
-                        op = CKQueryOperation(cursor: c)
-                    } else {
-                        break
-                    }
-                    op.qualityOfService = .userInitiated
-                    op.resultsLimit = 200
-
-                    let holder = DeviceCKPullPageHolder()
-                    let modHolder = DeviceCKModDateHolder()
-                    op.recordMatchedBlock = { _, result in
-                        if case .success(let ck) = result {
-                            let fields = NAChatMessageFields(
-                                recordName: ck.recordID.recordName,
-                                direction: (ck["direction"] as? String) ?? "",
-                                sessionId: ck["sessionId"] as? String,
-                                text: (ck["text"] as? String) ?? "",
-                                payloadJSON: (ck["payloadJSON"] as? String) ?? "",
-                                createdAt: (ck["createdAt"] as? String) ?? "",
-                                senderDevice: (ck["senderDevice"] as? String) ?? "",
-                                kind: ck["kind"] as? String,
-                                notificationTitle: ck["notificationTitle"] as? String,
-                                notificationScreen: ck["notificationScreen"] as? String,
-                                notificationEventID: ck["notificationEventId"] as? String
-                            )
-                            holder.add(fields)
-                            modHolder.set(fields.recordName, ck.modificationDate)
-                        }
-                    }
-
-                    // Return BOTH page + cursor through the continuation (mirrors
-                    // MemoryV2's fix): never mutate the captured `nextCursor` from
-                    // inside the @Sendable queryResultBlock — that was a real
-                    // callback data race.
-                    let page: (records: [NAChatMessageFields], cursor: CKQueryOperation.Cursor?) =
-                        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [NAChatMessageFields], cursor: CKQueryOperation.Cursor?), Error>) in
-                            op.queryResultBlock = { result in
-                                switch result {
-                                case .success(let cursor):
-                                    cont.resume(returning: (holder.snapshot(), cursor))
-                                case .failure(let err):
-                                    cont.resume(throwing: Self.mapError(err))
-                                }
-                            }
-                            self.database.add(op)
-                        }
-                    for f in page.records {
-                        combined.append((f, modHolder.get(f.recordName)))
-                    }
-                    let crossedWatermark = since.map { watermark in
-                        page.records.contains { fields in
-                            guard let modDate = modHolder.get(fields.recordName) else { return false }
-                            return modDate <= watermark
-                        }
-                    } ?? false
-                    nextCursor = crossedWatermark ? nil : page.cursor
-                } while nextCursor != nil
-
-                return combined
             }
         } catch is DeviceCKLandmineTimeout {
             throw DeviceSyncError.transient(message: "CloudKit pull timed out")
         }
+    }
+
+    private func pullPages(
+        recordType: String,
+        since: Date?,
+        inboundDirection: String,
+        orderByServerModDate: Bool
+    ) async throws -> [(fields: NAChatMessageFields, modDate: Date?)] {
+        let query = CKQuery(
+            recordType: recordType,
+            predicate: Self.makePullPredicate(inboundDirection: inboundDirection)
+        )
+        query.sortDescriptors = [
+            NSSortDescriptor(key: orderByServerModDate ? "modificationDate" : "createdAt", ascending: false)
+        ]
+
+        var combined: [(fields: NAChatMessageFields, modDate: Date?)] = []
+        var nextCursor: CKQueryOperation.Cursor? = nil
+        var firstPage = true
+
+        repeat {
+            let op: CKQueryOperation
+            // 2026-09-06: only the FIRST operation carries the sort descriptor,
+            // so only the first operation can be rejected for it.
+            let carriesSortDescriptor = firstPage
+            if firstPage {
+                op = CKQueryOperation(query: query); firstPage = false
+            } else if let c = nextCursor {
+                op = CKQueryOperation(cursor: c)
+            } else {
+                break
+            }
+            op.qualityOfService = .userInitiated
+            op.resultsLimit = 200
+
+            let holder = DeviceCKPullPageHolder()
+            let modHolder = DeviceCKModDateHolder()
+            op.recordMatchedBlock = { _, result in
+                if case .success(let ck) = result {
+                    let fields = NAChatMessageFields(
+                        recordName: ck.recordID.recordName,
+                        direction: (ck["direction"] as? String) ?? "",
+                        sessionId: ck["sessionId"] as? String,
+                        text: (ck["text"] as? String) ?? "",
+                        payloadJSON: (ck["payloadJSON"] as? String) ?? "",
+                        createdAt: (ck["createdAt"] as? String) ?? "",
+                        senderDevice: (ck["senderDevice"] as? String) ?? "",
+                        kind: ck["kind"] as? String,
+                        notificationTitle: ck["notificationTitle"] as? String,
+                        notificationScreen: ck["notificationScreen"] as? String,
+                        notificationEventID: ck["notificationEventId"] as? String
+                    )
+                    holder.add(fields)
+                    modHolder.set(fields.recordName, ck.modificationDate)
+                }
+            }
+
+            // Return BOTH page + cursor through the continuation (mirrors
+            // MemoryV2's fix): never mutate the captured `nextCursor` from
+            // inside the @Sendable queryResultBlock — that was a real
+            // callback data race.
+            let page: (records: [NAChatMessageFields], cursor: CKQueryOperation.Cursor?) =
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [NAChatMessageFields], cursor: CKQueryOperation.Cursor?), Error>) in
+                    op.queryResultBlock = { result in
+                        switch result {
+                        case .success(let cursor):
+                            cont.resume(returning: (holder.snapshot(), cursor))
+                        case .failure(let err):
+                            // 2026-09-06: an .invalidArguments on a CURSOR
+                            // continuation is a cursor failure (an expired or
+                            // rejected cursor), NOT a missing sort index — the
+                            // cursor operation never carried the descriptor.
+                            // Classifying it as one restarted the whole pull in
+                            // the createdAt order the paging stop cannot trust,
+                            // and latched that order for the rest of the
+                            // process. A cursor failure is surfaced as itself;
+                            // the watermark has not advanced, so the next drain
+                            // restarts the pull from it.
+                            if carriesSortDescriptor,
+                               orderByServerModDate,
+                               (err as? CKError)?.code == .invalidArguments {
+                                cont.resume(throwing: DeviceCKUnsortableField())
+                            } else {
+                                cont.resume(throwing: Self.mapError(err))
+                            }
+                        }
+                    }
+                    self.database.add(op)
+                }
+            for f in page.records {
+                combined.append((f, modHolder.get(f.recordName)))
+            }
+            let crossedWatermark = since.map { watermark in
+                page.records.contains { fields in
+                    guard let modDate = modHolder.get(fields.recordName) else { return false }
+                    return modDate <= watermark
+                }
+            } ?? false
+            nextCursor = crossedWatermark ? nil : page.cursor
+        } while nextCursor != nil
+
+        return combined
     }
 
     // MARK: helpers
@@ -1061,7 +1591,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         lock.lock(); pairingHandler = h; lock.unlock()
     }
 
-    private func setStatusHandler(key: String, _ h: @escaping @Sendable (String) async -> Void) {
+    private func setStatusHandler(key: String, _ h: @escaping @Sendable (String) async -> Bool) {
         lock.lock(); statusHandlers[key] = h; lock.unlock()
     }
 
@@ -1072,7 +1602,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     /// Snapshot copy of the status handlers so we never hold the lock across the
     /// awaits in drainStatus (matches the never-lock-across-await rule).
-    private func loadStatusHandlers() -> [String: @Sendable (String) async -> Void] {
+    private func loadStatusHandlers() -> [String: @Sendable (String) async -> Bool] {
         lock.lock(); defer { lock.unlock() }
         return statusHandlers
     }
@@ -1096,16 +1626,26 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         lock.unlock()
     }
 
-    /// Per-key LWW claim for status singletons (same rule as pairing).
-    private func claimStatusIfNewer(key: String, _ modDate: Date?) -> Bool {
+    /// Per-key LWW freshness check for status singletons — the same rule as
+    /// pairing, and like pairing it does NOT consume the record. `commitStatusDate`
+    /// is what marks it seen, and only a handler that applied it may call that.
+    private func statusIsNewer(key: String, _ modDate: Date?) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if let modDate, let last = lastStatusModDates[key] {
-            guard modDate > last else { return false }
-            lastStatusModDates[key] = modDate
-            return true
+            return modDate > last
         }
-        if let modDate { lastStatusModDates[key] = modDate }
         return true
+    }
+
+    private func commitStatusDate(key: String, _ modDate: Date?) {
+        guard let modDate else { return }
+        lock.lock()
+        if let last = lastStatusModDates[key] {
+            if modDate > last { lastStatusModDates[key] = modDate }
+        } else {
+            lastStatusModDates[key] = modDate
+        }
+        lock.unlock()
     }
 
     private func loadHandlerAndCursor() -> ((@Sendable (BridgeMessage) async -> Bool)?, Date?) {

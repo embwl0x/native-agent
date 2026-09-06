@@ -523,8 +523,13 @@ final class UIIntegrityContractTests: XCTestCase {
               let end = handler.range(of: "if driveChanged {", range: start.upperBound..<handler.endIndex) else {
             return XCTFail("kvsDidChange no longer has the progress/drive branch shape this guard depends on")
         }
+        // 2026-09-06 (26f85f39): notices got their own latest-value key, so the
+        // dispatcher takes the key to read and the isolated span now covers the
+        // progress AND notice branches. Both are per-event keys the Mac can fire
+        // repeatedly, so the CK-5 no-drain rule below covers exactly the right set.
         let progressBranch = String(handler[start.upperBound..<end.lowerBound])
-        XCTAssertTrue(progressBranch.contains("dispatchLatestKVSChatProgress()"))
+        XCTAssertTrue(progressBranch.contains("dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)"))
+        XCTAssertTrue(progressBranch.contains("dispatchLatestKVSChatProgress(key: KVSKey.chatNoticeLatest)"))
         for drain in ["drainDeviceTransport", "checkMacOutbox", "pollIncomingNow", "refreshSnapshotGroup"] {
             XCTAssertFalse(
                 progressBranch.contains(drain),

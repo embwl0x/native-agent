@@ -213,8 +213,7 @@ func parallelSafe_writeShellMacWriteGatedAndUnknown_areSerial() {
         // shell / process class (Full-Mac surface)
         "shell", "bash", "git", "apply_patch", "run_tests",
         "swift_build", "swift_test",
-        "git_status", "git_diff", "git_log", "repo_dirty_summary",
-        "system_info", "grep", "file_excerpt", "restart_app", "install_app",
+        "system_info", "restart_app", "install_app",
         "mac_focus_app", "mac_quit_app",
         // Mac-Integration write mode (gate-table derived)
         "mail_send", "messages_send", "music_control",
@@ -237,17 +236,72 @@ func parallelSafe_writeShellMacWriteGatedAndUnknown_areSerial() {
 }
 
 @Test
-func parallelSafe_fullMacLists_areEntirelySerial() {
-    // Rule 2 is derived from the dispatcher constants — every member of
-    // every Full-Mac list must classify serial, whatever its name says.
+func parallelSafe_fullMacLists_areSerialExceptTheAuditedReadHalf() {
+    // Rule 2 is derived from the dispatcher constants — every member of every
+    // Full-Mac list must classify serial, whatever its name says, EXCEPT the
+    // audited read half of the file surface (fix 25, 2026-09-01).
     let all = SwiftToolDispatcher.fullMacFileToolNames
         + SwiftToolDispatcher.fullMacSystemToolNames
         + SwiftToolDispatcher.fullMacAppToolNames
         + SwiftToolDispatcher.fullMacBuilderToolNames
         + SwiftToolDispatcher.fullMacRestartToolNames
-    for name in all {
-        #expect(!ParallelToolDispatch.isParallelSafe(internalToolName: name))
+    let parallelReads = ParallelToolDispatch.fullMacReadOnlyNames
+    for name in all where !parallelReads.contains(name) {
+        #expect(!ParallelToolDispatch.isParallelSafe(internalToolName: name),
+                "expected \(name) serial")
     }
+    for name in parallelReads {
+        #expect(ParallelToolDispatch.isParallelSafe(internalToolName: name),
+                "expected \(name) parallel-safe")
+    }
+    // The admitted set is the READ half minus the one command git will not
+    // apply GIT_OPTIONAL_LOCKS=0 to.
+    #expect(parallelReads == Set(SwiftToolDispatcher.fullMacReadOnlyFileToolNames)
+                .subtracting(["git_diff"]))
+    #expect(!ParallelToolDispatch.isParallelSafe(internalToolName: "git_diff"),
+            "git diff still rewrites .git/index; it must not join the concurrent set")
+}
+
+@Test
+func fullMacFileSurface_splitsIntoReadAndWriteHalvesWithoutDrift() {
+    // The split must cover the surface exactly: no tool silently loses its
+    // Full-Mac gating, and none appears in both halves.
+    let read = SwiftToolDispatcher.fullMacReadOnlyFileToolNames
+    let write = SwiftToolDispatcher.fullMacWriteFileToolNames
+    #expect(Set(read).isDisjoint(with: Set(write)))
+    #expect(Set(read).union(write) == Set(SwiftToolDispatcher.fullMacFileToolNames))
+    #expect(read.count + write.count == SwiftToolDispatcher.fullMacFileToolNames.count)
+    // The write half is what the parallel veto must keep holding.
+    #expect(write == ["write_file"])
+}
+
+@Test
+func parallelSafe_readOnlyFullMacFanOut_coalescesIntoOneConcurrentGroup() {
+    // Fix 25's motivating shape: three reads in one round used to cost three
+    // serial round-trips.
+    let names = ["grep", "git_log", "file_excerpt"]
+    let groups = ParallelToolDispatch.plan(
+        parallelSafe: names.map { ParallelToolDispatch.isParallelSafe(internalToolName: $0) },
+        forceSerial: false
+    )
+    #expect(groups == [.concurrent([0, 1, 2])])
+
+    // A write in the same round is still its own serial group, and the
+    // ordering rules keep it from overlapping the reads on either side.
+    let mixed = ["grep", "write_file", "git_status"]
+    #expect(!ParallelToolDispatch.isParallelSafe(internalToolName: "write_file"))
+    let mixedGroups = ParallelToolDispatch.plan(
+        parallelSafe: mixed.map { ParallelToolDispatch.isParallelSafe(internalToolName: $0) },
+        forceSerial: false
+    )
+    #expect(mixedGroups == [.sequential(0), .sequential(1), .sequential(2)])
+
+    // Rollback lever still collapses the fan-out to the old serial path.
+    let rolledBack = ParallelToolDispatch.plan(
+        parallelSafe: names.map { ParallelToolDispatch.isParallelSafe(internalToolName: $0) },
+        forceSerial: true
+    )
+    #expect(rolledBack == [.sequential(0), .sequential(1), .sequential(2)])
 }
 
 @Test

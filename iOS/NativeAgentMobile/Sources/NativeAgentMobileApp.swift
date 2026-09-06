@@ -170,6 +170,61 @@ enum NativeAgentNotificationLaunchIntent {
     }
 }
 
+/// 2026-09-06: the conversation a tapped reply notification came from. Stored
+/// the same way as the screen intent so a cold launch still routes: the view
+/// tree that consumes it may not exist when the tap is handled.
+enum MobileNotifiedChatSessionIntent {
+    private static let key = "NativeAgentMobile.pendingNotificationChatSession"
+
+    static func stage(_ sessionID: String?) {
+        let clean = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let clean, !clean.isEmpty else {
+            UserDefaults.standard.removeObject(forKey: key)
+            return
+        }
+        UserDefaults.standard.set(clean, forKey: key)
+    }
+
+    static func consume() -> String? {
+        guard let value = UserDefaults.standard.string(forKey: key)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        UserDefaults.standard.removeObject(forKey: key)
+        return value
+    }
+}
+
+/// 2026-09-06: a chat-reply push whose answer is already on screen is noise.
+/// `willPresent` has no other way to know, so it asks the chat surface.
+@MainActor
+enum ChatReplyNotificationPresentation {
+    static func isAlreadyDisplayed(userInfo: [AnyHashable: Any]) -> Bool {
+        guard NativeAgentRemoteNotificationPayload.string(
+                directKey: "source",
+                cloudKitRecordKey: "notificationSource",
+                in: userInfo
+              ) == "icloud_chat_reply",
+              let correlationID = NativeAgentRemoteNotificationPayload.string(
+                directKey: "correlationId",
+                cloudKitRecordKey: "notificationCorrelationId",
+                in: userInfo
+              ),
+              let store = ChatStore.visibleStore
+        else { return false }
+        let notifiedSessionID = ChatStore.cleanSessionID(
+            NativeAgentRemoteNotificationPayload.string(
+                directKey: "sessionId",
+                cloudKitRecordKey: "notificationSessionId",
+                in: userInfo
+            )
+        )
+        if let notifiedSessionID,
+           notifiedSessionID != ChatStore.cleanSessionID(store.selectedSessionID) {
+            return false
+        }
+        return store.resolvedICloudReplyIds.contains(correlationID)
+    }
+}
+
 struct NativeAgentPushTokenSyncCache {
     struct PairingIdentity: Codable, Equatable {
         var secretHash: String?
@@ -614,11 +669,6 @@ enum NativeAgentRemotePushProcessor {
         refreshActivity: () async throws -> Void
     ) async -> FetchOutcome {
         let pushReceipt = recordReceipt(userInfo)
-        if let eventID = pushReceipt.eventId {
-            // Receipt acknowledgement is useful but must never prevent the
-            // device-sync and snapshot refresh work from completing.
-            try? await sendReceipt(eventID)
-        }
 
         // Each lane is independently best-effort. A failed CloudKit drain
         // must not suppress the inbox/activity refreshes (and vice versa).
@@ -632,6 +682,14 @@ enum NativeAgentRemotePushProcessor {
             : false
         let inboxLoaded = (try? await refreshInbox()) ?? false
         try? await refreshActivity()
+        // 2026-09-06: the receipt used to be sent BEFORE any of the lanes above.
+        // Its send can wait the full 30 s the iCloud action write allows, while
+        // the background-push callback has to report at 25 s — so a missed reply
+        // was never recovered on the very push that announced it. Recovery runs
+        // first now; the acknowledgement takes whatever budget is left.
+        if let eventID = pushReceipt.eventId {
+            try? await sendReceipt(eventID)
+        }
         return (inboxLoaded || cloudKitDelivered || chatReplyLoaded) ? .newData : .noData
     }
 
@@ -731,6 +789,12 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         let completionGate = NativeAgentRemotePushCompletionGate(completionHandler)
+        // 2026-09-06: the wall clock the whole push has to finish inside. The
+        // receipt lane races it so an acknowledgement can never eat the budget
+        // the reply-recovery lanes need.
+        let deadline = Date().addingTimeInterval(
+            Double(Self.backgroundPushDeadlineNanoseconds) / 1_000_000_000
+        )
         let timeoutTask = Task {
             try? await Task.sleep(nanoseconds: Self.backgroundPushDeadlineNanoseconds)
             guard !Task.isCancelled else { return }
@@ -749,10 +813,17 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
                 // delivered.
                 recordReceipt: PushReceiptLedger.record(userInfo:),
                 sendReceipt: { eventID in
-                    await iCloudSyncEngine.shared.sendNotificationReceipt(
-                        eventID: eventID,
-                        channel: "apns"
-                    )
+                    let remaining = deadline.timeIntervalSinceNow - 1
+                    guard remaining > 0 else { return }
+                    _ = await withCKTimeout(
+                        "NativeAgentMobile.push.notificationReceipt",
+                        seconds: remaining
+                    ) {
+                        await iCloudSyncEngine.shared.sendNotificationReceipt(
+                            eventID: eventID,
+                            channel: "apns"
+                        )
+                    }
                 },
                 drainDeviceSyncPush: { userInfo in
                     await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo)
@@ -783,7 +854,14 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        NativeAgentNotificationDelegatePresentation.foregroundPresentationOptions
+        // 2026-09-06: the reply this alert announces may already be rendered in
+        // the chat the user is looking at. Alerting on top of it is noise.
+        if await ChatReplyNotificationPresentation.isAlreadyDisplayed(
+            userInfo: notification.request.content.userInfo
+        ) {
+            return []
+        }
+        return NativeAgentNotificationDelegatePresentation.foregroundPresentationOptions
     }
 
     func userNotificationCenter(
@@ -795,15 +873,25 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
         ) else { return }
         // F7: route per notification payload's `screen` field instead of always
         // landing on Activity. Allowed values: activity, chat, memories, desk, skills, more.
+        let userInfo = response.notification.request.content.userInfo
         let screen = NativeAgentRemoteNotificationPayload.string(
             directKey: "screen",
             cloudKitRecordKey: "notificationScreen",
-            in: response.notification.request.content.userInfo
+            in: userInfo
+        )
+        // 2026-09-06: a reply notification names the conversation that answered.
+        // Routing on `screen` alone landed the tap on whichever chat was already
+        // selected, which is not the one the user tapped.
+        let sessionID = NativeAgentRemoteNotificationPayload.string(
+            directKey: "sessionId",
+            cloudKitRecordKey: "notificationSessionId",
+            in: userInfo
         )
         await MainActor.run {
             // Persist before posting. ContentView consumes this intent from
             // UserDefaults on appearance, so a cold-launch view tree that has
             // not installed its ephemeral observer yet still receives the tap.
+            MobileNotifiedChatSessionIntent.stage(screen == "chat" ? sessionID : nil)
             NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: screen)
             NotificationCenter.default.post(
                 name: .nativeagentOpenActivity,

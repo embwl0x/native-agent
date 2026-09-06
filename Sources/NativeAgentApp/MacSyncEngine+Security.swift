@@ -153,13 +153,13 @@ extension MacSyncEngine {
         return diff == 0
     }
 
-    /// Validate incoming InboxAction:
-    ///   1. Timestamp must be within ±5 minutes of now.
-    ///   2. HMAC-SHA256 of the canonical body (JSON with keys sorted, signature excluded)
-    ///      must match the "signature" field.
-    /// Returns nil on success, or an error string to log/reject.
-    func validateInboxAction(data: Data, action: InboxAction) async -> String? {
-        // 1. Timestamp freshness check.
+    /// The ±5-minute window on its own, separated from authenticity (2026-09-06)
+    /// so the Drive inbox lane can ask the two questions in the order that lane
+    /// needs: HMAC first, because anything on the account can write into that
+    /// folder, then the ledger, and freshness LAST — an action that already
+    /// executed is answered from its ledger row no matter how long the
+    /// redelivery took, and freshness only ever gates NEW work.
+    func inboxActionFreshnessError(_ action: InboxAction) -> String? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let formatter2 = ISO8601DateFormatter() // without fractional seconds fallback
@@ -169,6 +169,24 @@ extension MacSyncEngine {
         let age = abs(Date().timeIntervalSince(ts))
         if age > 300 {
             return "message too old: \(Int(age))s"
+        }
+        return nil
+    }
+
+    /// Validate incoming InboxAction:
+    ///   1. Timestamp must be within ±5 minutes of now (unless the caller runs
+    ///      the freshness check itself, at its own point in the sequence).
+    ///   2. HMAC-SHA256 of the canonical body (JSON with keys sorted, signature excluded)
+    ///      must match the "signature" field.
+    /// Returns nil on success, or an error string to log/reject.
+    func validateInboxAction(
+        data: Data,
+        action: InboxAction,
+        enforceFreshness: Bool = true
+    ) async -> String? {
+        // 1. Timestamp freshness check.
+        if enforceFreshness, let stale = inboxActionFreshnessError(action) {
+            return stale
         }
 
         // 2. Signature check.

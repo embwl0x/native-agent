@@ -498,12 +498,17 @@ extension NativeClient {
         originalError: Error
     ) throws -> BackupRestoreResult? {
         do {
+            let priorGenerations = Self.transcriptGenerations(in: root)
             try Self.applyBackupSnapshot(
                 safety,
                 destinationRoot: root,
                 requireRestorableAuthority: false
             )
             try Self.verifyAppliedSnapshot(safety, destinationRoot: root)
+            try Self.rollTranscriptGenerationsForward(
+                in: root,
+                priorGenerations: priorGenerations
+            )
             let receipt: JSONValue = .object([
                 "kind": .string("backup_restore_rollback"),
                 "transactionId": .string(intent.transactionID),
@@ -797,6 +802,9 @@ extension NativeClient {
         safety: NativeValidatedBackupSnapshot,
         destinationRoot: URL
     ) throws {
+        // 2026-09-06: read BEFORE the copy overwrites the live index — see
+        // `rollTranscriptGenerationsForward`.
+        let priorGenerations = Self.transcriptGenerations(in: destinationRoot)
         try Self.applyBackupSnapshot(
             target,
             destinationRoot: destinationRoot,
@@ -805,6 +813,10 @@ extension NativeClient {
         // Prove the selected backup exactly before overlaying facts that are
         // intentionally newer than it.
         try Self.verifyAppliedSnapshot(target, destinationRoot: destinationRoot)
+        try Self.rollTranscriptGenerationsForward(
+            in: destinationRoot,
+            priorGenerations: priorGenerations
+        )
         try SwiftNativeApprovalInbox.mergeRestoreFences(
             safetyRoot: safety.dataDirectory,
             destinationRoot: destinationRoot
@@ -903,6 +915,140 @@ extension NativeClient {
                 options: .atomic
             )
         }
+    }
+
+    /// The transcript version each session's index row carries right now.
+    private static func transcriptGenerations(in root: URL) -> [String: Int64] {
+        let path = Self.chatSessionIndexPath(in: root)
+        guard let rows = try? ChatSessionIndexFile.loadObjectRowsForMutation(at: path) else {
+            return [:]
+        }
+        var out: [String: Int64] = [:]
+        for row in rows {
+            guard case .string(let id)? = row["id"],
+                  let generation = ChatSessionIndexFile.transcriptGeneration(in: row) else { continue }
+            out[id] = generation
+        }
+        return out
+    }
+
+    /// 2026-09-06: a restore copies `chat/sessions.json` back wholesale, which
+    /// rolls every session's transcript version BACKWARD to whatever it was
+    /// when the backup was taken. The phone keeps its own watermark across the
+    /// restore, so every restored transcript then looked older than the copy it
+    /// already held and was refused — the two surfaces disagreed about the
+    /// conversation permanently.
+    ///
+    /// Each restored row's version is therefore raised to
+    /// `max(restored, previous + 1)`: strictly newer than anything this Mac
+    /// published before the restore, and never lowered. Runs AFTER
+    /// `verifyAppliedSnapshot` — the snapshot is proven byte-exact first, and
+    /// this is one of the facts deliberately overlaid on top of it.
+    ///
+    /// 2026-09-06: NOT best effort. A restore whose index could not be
+    /// re-stamped leaves the phone refusing every restored transcript as older
+    /// than the copy it holds, and reporting that restore as a success hides
+    /// exactly that. A failed raise now fails the restore step (and the
+    /// rollback path), which preserves the intent for the next launch.
+    ///
+    /// 2026-09-06: the floor is the restore EPOCH, not the per-session prior
+    /// alone. A session absent from the pre-restore index — one the backup has
+    /// and this Mac had already deleted, or one published from another surface
+    /// — had no prior, was skipped outright, and came back carrying the
+    /// backup's old counter. The epoch is a monotonic counter persisted OUTSIDE
+    /// the index (a restore overwrites the index wholesale), raised past every
+    /// generation the pre-restore index carried and bumped once per restore, so
+    /// every restored row lands strictly above anything this Mac published
+    /// before the restore.
+    private static func rollTranscriptGenerationsForward(
+        in root: URL,
+        priorGenerations: [String: Int64]
+    ) throws {
+        let path = Self.chatSessionIndexPath(in: root)
+        let epoch = try Self.bumpTranscriptRestoreEpoch(
+            in: root,
+            atLeast: priorGenerations.values.max() ?? 0
+        )
+        var rows: [[String: JSONValue]]
+        do {
+            rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
+        } catch {
+            throw Self.backupError(
+                code: 500,
+                "The restored session index could not be read to raise its transcript versions: \(error.localizedDescription)"
+            )
+        }
+        var changed = false
+        for index in rows.indices {
+            guard case .string(let id)? = rows[index]["id"] else { continue }
+            let floor = max(priorGenerations[id] ?? 0, epoch)
+            guard floor < Int64.max else { continue }
+            let restored = ChatSessionIndexFile.transcriptGeneration(in: rows[index]) ?? 0
+            let forward = max(restored, floor + 1)
+            guard forward != restored else { continue }
+            rows[index][ChatSessionIndexFile.transcriptGenerationKey] = .int(forward)
+            changed = true
+        }
+        guard changed else { return }
+        do {
+            let data = try ChatSessionIndexFile.serializedData(for: rows)
+            try data.write(to: path, options: [.atomic])
+        } catch {
+            throw Self.backupError(
+                code: 500,
+                "The restored session index could not be re-stamped with newer transcript versions: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// `<root>/chat/transcript_restore_epoch.json` — deliberately NOT one of
+    /// `backupRelativePaths`, so a restore cannot roll it backward with the
+    /// rest of `chat/`. Holds one integer: a floor every restored transcript
+    /// version must clear.
+    private static func transcriptRestoreEpochPath(in root: URL) -> URL {
+        root
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("transcript_restore_epoch.json")
+    }
+
+    /// Raise the epoch past `floor` and past its own last value, persist it,
+    /// and return it. Throws if it cannot be persisted — an epoch that is not
+    /// on disk would be handed out twice.
+    private static func bumpTranscriptRestoreEpoch(
+        in root: URL,
+        atLeast floor: Int64
+    ) throws -> Int64 {
+        let path = Self.transcriptRestoreEpochPath(in: root)
+        var stored: Int64 = 0
+        if let data = try? Data(contentsOf: path),
+           let parsed = try? JSONValue.parse(data),
+           case .object(let object) = parsed,
+           case .int(let value)? = object["epoch"] {
+            stored = value
+        }
+        let raised = max(stored, floor)
+        guard raised < Int64.max else { return raised }
+        let next = raised + 1
+        do {
+            try FileManager.default.createDirectory(
+                at: path.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try JSONValue.object(["epoch": .int(next)]).serialize(pretty: false)
+            try Data(data.utf8).write(to: path, options: [.atomic])
+        } catch {
+            throw Self.backupError(
+                code: 500,
+                "The transcript restore epoch could not be recorded, so the restored transcripts could not be raised above what the phone already holds: \(error.localizedDescription)"
+            )
+        }
+        return next
+    }
+
+    private static func chatSessionIndexPath(in root: URL) -> URL {
+        root
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
     }
 
     private static func verifyAppliedSnapshot(

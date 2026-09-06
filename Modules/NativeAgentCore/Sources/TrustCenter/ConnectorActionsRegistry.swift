@@ -1119,10 +1119,62 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.screen", connectorId: "mac", connector: "mac",
             name: "Screen",
-            description: "The live screen in words: app, position, content as numbered rows, actionable controls, status text. Read-only; nothing held, nothing expires. `part` zooms to a named section.",
+            description: "The live screen in words: app, position, content as numbered rows, actionable controls, status text. Read-only; nothing held, nothing expires. `part` zooms to a named section; `app` reads another running app's front window without activating it.",
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "accessibility",
-            inputSchema: schema([("part", prop("string"))])
+            inputSchema: schema([("part", prop("string")), ("app", prop("string"))])
+        ),
+        // fable51 item 30 — THE CLIPBOARD ORGAN. The read is low risk and
+        // dry-runnable like the perception rows above it; the write is medium,
+        // beside `mac.act_by_name`, because it replaces what the next paste in
+        // any app will produce.
+        ConnectorActionDescriptor(
+            id: "mac.clipboard_read", connectorId: "mac", connector: "mac",
+            name: "Clipboard Read",
+            description: "Read the Mac clipboard as text. Read-only. Lines that are themselves a secret (password, API key, one-time code, card number, recovery phrase) come back redacted with the reason; non-text contents are named by type and size, never returned as bytes.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([("max_chars", prop("integer"))])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.clipboard_write", connectorId: "mac", connector: "mac",
+            name: "Clipboard Write",
+            description: "Replace the Mac clipboard's text. The next paste in any app produces this text and the previous clipboard contents are gone. Posts no keystroke and clicks nothing; the result reports the character count and a read-back check, never the text.",
+            risk: "medium", dryRunAvailable: false, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([("text", prop("string"))])
+        ),
+        // fable51 item 33 — THE READ ORGAN. Low risk and dry-runnable with the
+        // perception rows: it returns what a document says and puts the scroll
+        // position back where it found it. It is not a file tool — the file it
+        // reads is the one already open in front of her, and an explicit path
+        // additionally clears Full Mac file access at dispatch.
+        ConnectorActionDescriptor(
+            id: "mac.read", connectorId: "mac", connector: "mac",
+            name: "Read",
+            description: "Read a document end to end: a PDF or text file the front window is showing (extracted through PDFKit, not scraped), or the front window's own text accumulated across scrolls and merged on the overlap. Scrolls only to see more, and scrolls back afterwards. Secret-shaped lines are redacted with the reason; a password-protected or text-less document refuses in words.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([("path", prop("string"))])
+        ),
+        // fable51 item 29 — the menu bar organ. The walk is low risk and
+        // dry-runnable like the perception rows; the press runs the app's own
+        // handler and sits at medium beside mac.act_by_name.
+        ConnectorActionDescriptor(
+            id: "mac.menu", connectorId: "mac", connector: "mac",
+            name: "Menu Bar",
+            description: "List an app's menu bar as nameable paths (File › Export › PDF…), bounded to three levels. Read-only and it opens no menu — the paths come from the published accessibility tree. Greyed-out items are listed as present-but-disabled, never omitted.",
+            risk: "low", dryRunAvailable: true, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([("app", prop("string"))])
+        ),
+        ConnectorActionDescriptor(
+            id: "mac.menu_press", connectorId: "mac", connector: "mac",
+            name: "Menu Press",
+            description: "Press one named menu path (File › Export › PDF…), running the app's own menu handler through the same actuator mac.act uses. Unknown, ambiguous and disabled paths refuse in words and press nothing.",
+            risk: "medium", dryRunAvailable: false, requiresApproval: false,
+            category: "accessibility",
+            inputSchema: schema([("path", prop("string")), ("app", prop("string"))])
         ),
         ConnectorActionDescriptor(
             id: "mac.act_by_name", connectorId: "mac", connector: "mac",

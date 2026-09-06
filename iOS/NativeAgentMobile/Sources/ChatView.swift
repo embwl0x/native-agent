@@ -60,8 +60,20 @@ struct ChatView: View {
     @State private var photoLoadGeneration = 0
     @State private var suppressNextEmptyPhotoSelection = false
     @State private var closingPinnedSessionIDs: Set<String> = []
+    /// 2026-09-06: the session dictation was started in (nil = not dictating).
+    /// The recognizer keeps running across a session switch and its final
+    /// transcript used to land in whatever composer was selected when the user
+    /// let go, i.e. in the wrong conversation. A switch ends dictation and
+    /// drops what it heard. Keyed, not the raw id, so the main session's nil id
+    /// is still distinguishable from "no dictation in flight".
+    @State private var dictationSessionKey: String?
 
     private let maxPendingPhotos = 4
+    static let preferredModelIDs = [
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
+        "gpt-5.4", "gpt-5.4-mini", "claude-opus-4-8", "claude-fable-5-1",
+        "claude-fable-5", "claude-sonnet-5", "grok-4.5",
+    ]
     // CloudKitDeviceTransport caps the complete encoded BridgeMessage at
     // 800 KiB. Base64 expands image bytes by roughly one third, so reserve
     // ample room for JSON, text, signatures, and controls and keep the
@@ -76,12 +88,66 @@ struct ChatView: View {
         ChatSessionTabProjection.make(
             mainSessionID: effectiveMainSessionID,
             mainTitle: mainSessionTitle,
-            pinnedSessions: sync.pinnedChatSessions
+            pinnedSessions: sync.pinnedChatSessions,
+            anchorSession: anchorSession
         )
     }
 
+    /// The conversation anchor resolved against the rows the Mac published —
+    /// the session User is currently active in on a direct remote surface.
+    ///
+    /// Purely derived on read: it is merged to the front of the pinned run for
+    /// display and defaulted to on launch, and is never written into the
+    /// human's pins nor sent back to the Mac. Nothing here knows which surface
+    /// published it. It is skipped when it is already the phone's main slot —
+    /// that tab is the same conversation under a different name.
+    private var anchorSession: ChatSession? {
+        guard let anchorID = sync.chatAnchor?.cleanSessionId,
+              anchorID != effectiveMainSessionID else { return nil }
+        if let pinned = sync.pinnedChatSessions.first(where: { $0.id == anchorID }) {
+            return pinned.archived == true ? nil : pinned
+        }
+        return sync.sessions.first(where: { $0.id == anchorID && $0.archived != true })
+    }
+
+    /// The pinned ids the strip actually shows: the Mac's pinned snapshot plus
+    /// the derived anchor tab. The externally-removed-pin reconciler judges
+    /// against this, not the raw snapshot, or it would bounce an anchor
+    /// selection straight back to the main tab.
+    private var visiblePinnedSessionIDs: Set<String> {
+        var ids = Set(sync.pinnedChatSessions.map(\.id))
+        if let anchorSession { ids.insert(anchorSession.id) }
+        return ids
+    }
+
+    /// 2026-09-06: the Mac publishes a bounded set of transcripts. A session the
+    /// phone can select that falls outside that set has a session row carrying a
+    /// message count but no transcript, and rendering it as "No messages yet"
+    /// claimed a conversation was empty when the phone simply never received it.
+    private var transcriptNotSynced: Bool {
+        guard let sessionID = store.selectedSessionID ?? effectiveMainSessionID,
+              sync.transcriptRead(for: sessionID) == .unavailable else { return false }
+        return (sync.sessions.first { $0.id == sessionID }?.messageCount ?? 0) > 0
+    }
+
     private var showsChatSessionTabs: Bool {
-        sync.pinnedChatSessions.contains(where: { $0.archived != true })
+        anchorSession != nil || sync.pinnedChatSessions.contains(where: { $0.archived != true })
+    }
+
+    /// Sweep 2026-09-01 item 36 — the pending approvals raised by the chat on
+    /// screen, rendered inline on the turn that raised them. Pure read of the
+    /// approvals `iCloudSyncEngine` already publishes for the Activity tab; no
+    /// second store, no second refresh loop.
+    private var inlineChatApprovals: [ApprovalRequest] {
+        MobileChatApprovalProjection.pendingApprovals(
+            sessionId: store.selectedSessionID,
+            approvals: sync.approvals
+        )
+    }
+
+    private var inlineApprovalAnchorID: UUID? {
+        guard !inlineChatApprovals.isEmpty else { return nil }
+        return MobileChatApprovalProjection.anchorMessageID(in: store.messages)
     }
 
     private var selectedChatSessionTabID: String {
@@ -122,6 +188,10 @@ struct ChatView: View {
             .onChange(of: sync.surfaceModels) { _, _ in
                 adoptSurfaceModelPreferenceFromSync()
             }
+            // 2026-09-06: this fires on a version change as well as a row
+            // change, because both live in the one published value. A cleared
+            // chat republished with a newer version but the same (empty) rows
+            // is a real delivery, and it used to be invisible here.
             .onChange(of: sync.chatTranscripts) { _, _ in
                 applyPublishedTranscriptToVisibleSession()
             }
@@ -130,6 +200,13 @@ struct ChatView: View {
             }
             .onChange(of: sync.pinnedChatSessions) { _, _ in
                 reconcilePublishedChatSessions()
+            }
+            // A new anchor can land while this screen is already up (the Mac
+            // publishes on every remote session change). Without this the
+            // window would only pick it up on the next appear/foreground.
+            // Adoption still stops dead once the human has picked a session.
+            .onChange(of: sync.chatAnchor) { _, _ in
+                adoptConversationAnchorIfNeeded()
             }
             .onChange(of: store.isLoading) { _, isLoading in
                 if !isLoading {
@@ -200,10 +277,14 @@ struct ChatView: View {
                     ScrollView {
                         if store.messages.isEmpty {
                             AppEmptyState(
-                                title: "No messages yet",
-                                systemImage: "bubble.left.and.bubble.right",
+                                title: transcriptNotSynced ? "History not synced" : "No messages yet",
+                                systemImage: transcriptNotSynced
+                                    ? "icloud.slash"
+                                    : "bubble.left.and.bubble.right",
                                 kind: .empty,
-                                description: "Say something to get started."
+                                description: transcriptNotSynced
+                                    ? "The Mac has not published this conversation's transcript to this iPhone."
+                                    : "Say something to get started."
                             )
                         } else {
                             LazyVStack(alignment: .leading, spacing: 12) {
@@ -223,6 +304,15 @@ struct ChatView: View {
 	                                    .transition(.asymmetric(
 	                                        insertion: .opacity.combined(with: .offset(y: 8)),
 	                                        removal: .identity))
+	                                    // Sweep 2026-09-01 item 36: the approval
+	                                    // this turn is waiting on renders right
+	                                    // here instead of only in the Activity
+	                                    // tab. Activity stays canonical.
+	                                    if msg.id == inlineApprovalAnchorID {
+	                                        ForEach(inlineChatApprovals) { approval in
+	                                            InlineChatApprovalCard(approval: approval)
+	                                        }
+	                                    }
 	                                }
                             }
                             .padding()
@@ -347,7 +437,7 @@ struct ChatView: View {
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
-                    .disabled(store.isLoading || store.isSwitchingSession || !store.messages.contains(where: { $0.role == .assistant }))
+                    .disabled(!store.canRegenerateLast)
                     .accessibilityLabel("Regenerate last response")
                     .accessibilityHint("Asks the agent to answer the latest message again")
                 }
@@ -374,6 +464,11 @@ struct ChatView: View {
             // arrive asynchronously when in iCloud pairing mode.
             // observeICloudReplies is a no-op in HTTP mode (useICloud=false guard).
             .onAppear {
+                // 2026-09-06: a reply push must not alert on top of an answer
+                // the user is already reading. This is the only place that
+                // knows a chat surface is on screen.
+                ChatStore.visibleStore = store
+                consumeNotifiedChatSessionIfNeeded()
                 if selectedModel.lowercased() == "gpt-5.5" {
                     selectedModel = "gpt-5.6-sol"
                 }
@@ -381,6 +476,17 @@ struct ChatView: View {
                 // Wire TTS callback into store
                 store.onReply = { [voiceOutput] text in
                     voiceOutput.speak(text)
+                }
+                // 2026-09-06: every session change ends dictation, wired once
+                // here instead of at each switch call site — New Chat, a
+                // removed pin and the conversation anchor all bypassed the
+                // per-call-site stop and delivered the transcript into the
+                // wrong conversation.
+                store.onSessionChange = { [voiceInput, origin = $dictationSessionKey] in
+                    guard voiceInput.isListening || voiceInput.isStarting
+                        || origin.wrappedValue != nil else { return }
+                    origin.wrappedValue = nil
+                    voiceInput.stop()
                 }
                 if iCloudReplyObserverID == nil {
                     iCloudReplyObserverID = bridgeClient.observeICloudReplies { msg in
@@ -419,8 +525,9 @@ struct ChatView: View {
                     await sync.refreshChatSessionListSnapshot()
                     adoptMainSessionFromSnapshots()
                     reconcileExternallyRemovedPinnedSession(
-                        afterPinnedIDs: Set(sync.pinnedChatSessions.map(\.id))
+                        afterPinnedIDs: visiblePinnedSessionIDs
                     )
+                    adoptConversationAnchorIfNeeded()
                     store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
                     await MainActor.run { seedProviderIfNeeded() }
                 }
@@ -434,13 +541,15 @@ struct ChatView: View {
                         await sync.refreshChatSessionListSnapshot()
                         adoptMainSessionFromSnapshots()
                         reconcileExternallyRemovedPinnedSession(
-                            afterPinnedIDs: Set(sync.pinnedChatSessions.map(\.id))
+                            afterPinnedIDs: visiblePinnedSessionIDs
                         )
+                        adoptConversationAnchorIfNeeded()
                         store.refresh(using: bridgeClient, fallbackMessages: currentSnapshotMessages())
                     }
                 }
             }
             .onDisappear {
+                if ChatStore.visibleStore === store { ChatStore.visibleStore = nil }
                 guard !store.hasPendingICloudReplies && !store.isLoading else { return }
                 bridgeClient.removeICloudReplyObserver(iCloudReplyObserverID)
                 bridgeClient.removeICloudReplyRejectionObserver(iCloudRejectionObserverID)
@@ -448,6 +557,18 @@ struct ChatView: View {
                 iCloudReplyObserverID = nil
                 iCloudRejectionObserverID = nil
                 iCloudResyncObserverID = nil
+            }
+            // 2026-09-06: a reply notification names the conversation it came
+            // from. Consume it here too — onAppear only fires when the chat
+            // surface was not already mounted.
+            .onReceive(NotificationCenter.default.publisher(for: .nativeagentOpenActivity)) { _ in
+                consumeNotifiedChatSessionIfNeeded()
+            }
+            // 2026-09-06: a notification that arrived mid-load kept its intent
+            // rather than losing it. Retry the moment the load releases.
+            .onChange(of: store.isSwitchingSession) { _, switching in
+                guard !switching else { return }
+                consumeNotifiedChatSessionIfNeeded()
             }
             // Simulator/process-argument test hook. The release target exposes
             // no URL scheme that can inject a real agent turn.
@@ -461,6 +582,10 @@ struct ChatView: View {
             // Append transcript to input field when user releases mic button
             .onChange(of: voiceInput.lastFinalTranscript) { _, newValue in
                 guard !newValue.isEmpty else { return }
+                // 2026-09-06: only the conversation the user dictated into
+                // receives the words.
+                guard let origin = dictationSessionKey,
+                      origin == store.queueSessionKey(store.selectedSessionID) else { return }
                 if inputText.isEmpty {
                     inputText = newValue
                 } else {
@@ -709,7 +834,7 @@ struct ChatView: View {
                             }
                             .foregroundStyle(selected ? NativeAgentPalette.agentAccent : .primary)
                             .padding(.leading, 10)
-                            .padding(.trailing, tab.kind == .main ? 10 : 30)
+                            .padding(.trailing, tab.closableSessionID == nil ? 10 : 30)
                             .frame(width: tab.kind == .main ? 112 : 156, height: 32)
                             .background {
                                 ZStack {
@@ -745,7 +870,9 @@ struct ChatView: View {
                         .opacity(store.isSwitchingSession && !selected ? 0.55 : 1)
                         .accessibilityLabel(tab.title)
 
-                        if case .pinned(let sessionID) = tab.kind {
+                        // Real pins only. The derived anchor tab has no pin to
+                        // remove, so it gets no close control.
+                        if let sessionID = tab.closableSessionID {
                             Button {
                                 closePinnedChatSession(sessionID)
                             } label: {
@@ -1032,12 +1159,11 @@ struct ChatView: View {
         let previousModel = selectedModel
         let previousEffort = selectedReasoningEffort
         let previousFastMode = selectedFastMode
-        let preferred = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "grok-4.5"]
         guard let selected = ChatRuntimeControlPresentation.selectionForProvider(
             providerID: id,
             current: .init(providerID: previousProvider, model: previousModel, reasoningEffort: previousEffort, fastMode: previousFastMode),
             providers: sync.providers,
-            preferredModels: preferred
+            preferredModels: Self.preferredModelIDs
         ) else {
             iOSSystemToastCenter.shared.push(error: "That provider is not ready on the Mac.")
             return
@@ -1137,11 +1263,10 @@ struct ChatView: View {
     /// already in-provider (so a deliberate pick is preserved).
     private func reconcileSelectedModel(forProviderId id: String) {
         guard let provider = sync.providers.first(where: { $0.provider_id == id }) else { return }
-        let preferred = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "grok-4.5"]
         let reconciledModel = ChatRuntimeControlPresentation.modelForProvider(
             currentModel: selectedModel,
             provider: provider,
-            preferredModels: preferred
+            preferredModels: Self.preferredModelIDs
         )
         guard reconciledModel != selectedModel else { return }
         selectedModel = reconciledModel
@@ -1172,13 +1297,12 @@ struct ChatView: View {
             model: selectedModel,
             readyProviders: ready
         )
-        let preferred = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "claude-opus-4-8", "claude-fable-5", "claude-sonnet-5", "grok-4.5"]
         guard let seededProviderID,
               let selection = ChatRuntimeControlPresentation.selectionForProvider(
                 providerID: seededProviderID,
                 current: .init(providerID: selectedProviderId, model: selectedModel, reasoningEffort: selectedReasoningEffort, fastMode: selectedFastMode),
                 providers: ready,
-                preferredModels: preferred
+                preferredModels: Self.preferredModelIDs
               ) else {
             selectedProviderId = ""
             return
@@ -1303,13 +1427,40 @@ struct ChatView: View {
         return clean.isEmpty ? fallback : clean
     }
 
+    /// 2026-09-06: a tapped reply notification carries the session that
+    /// answered. Open that conversation instead of leaving the user on
+    /// whichever chat happened to be selected.
+    private func consumeNotifiedChatSessionIfNeeded() {
+        // 2026-09-06: `switchSession` refuses silently while another session
+        // load is in flight, and the intent had already been consumed by then
+        // — the tap landed on whichever chat happened to be selected. Hold the
+        // intent until the load finishes; the isSwitchingSession watcher below
+        // calls back in.
+        guard !store.isSwitchingSession else { return }
+        guard let sessionID = MobileNotifiedChatSessionIntent.consume() else { return }
+        // 2026-09-06: the notification chose this conversation even when it was
+        // already the selected one, and the note is what stops the
+        // externally-removed-pin reconciler from reading its absence from the
+        // pinned snapshot as a pin the Mac took away and bouncing the user back
+        // to the main chat. Note first; only the redundant load is skipped.
+        MobileChatSelectionIntent.noteNotifiedSelection(sessionID)
+        guard sessionID != store.selectedSessionID else { return }
+        store.switchSession(
+            to: sessionID,
+            using: bridgeClient,
+            fallbackMessages: snapshotMessages(for: sessionID)
+        )
+    }
+
     private func adoptMainSessionFromSnapshots() {
         store.adoptMainSessionIDIfNeeded(effectiveMainSessionID)
     }
 
+    /// Rows to show while a real read is in flight. 2026-09-06: still nil for an
+    /// empty transcript — this is a fallback provider, and only the store's
+    /// apply path is allowed to treat an empty publication as authority.
     private func snapshotMessages(for sessionID: String?) -> [ChatMessage]? {
-        guard let records = sync.transcriptRecords(for: sessionID) else { return nil }
-        let mapped = MacBridgeClient.projectChatRecords(records)
+        let mapped = sync.transcriptRead(for: sessionID).messages
         return mapped.isEmpty ? nil : mapped
     }
 
@@ -1321,14 +1472,16 @@ struct ChatView: View {
         store.acknowledgePublishedSessions(Set(sync.sessions.map(\.id)))
         adoptMainSessionFromSnapshots()
         reconcileExternallyRemovedPinnedSession(
-            afterPinnedIDs: Set(sync.pinnedChatSessions.map(\.id))
+            afterPinnedIDs: visiblePinnedSessionIDs
         )
     }
 
     private func applyPublishedTranscriptToVisibleSession() {
+        // 2026-09-06: hand the store the read itself. The empty case used to be
+        // dropped here, so a chat cleared on the Mac published its empty
+        // transcript and the phone silently ignored it.
         let sessionID = store.selectedSessionID ?? effectiveMainSessionID
-        guard let messages = snapshotMessages(for: sessionID) else { return }
-        store.applyMacTranscriptSnapshot(messages, sessionID: sessionID)
+        store.applyMacTranscriptRead(sync.transcriptRead(for: sessionID), sessionID: sessionID)
     }
 
     private func reconcileExternallyRemovedPinnedSession(afterPinnedIDs: Set<String>) {
@@ -1336,7 +1489,8 @@ struct ChatView: View {
             selectedSessionID: store.selectedSessionID,
             mainSessionID: effectiveMainSessionID,
             availablePinnedSessionIDs: afterPinnedIDs,
-            locallyCreatedSessionID: store.locallyCreatedSessionID
+            locallyCreatedSessionID: store.locallyCreatedSessionID,
+            explicitlySelectedSessionID: MobileChatSelectionIntent.notifiedSessionID
         ) else { return }
         store.switchToMainSession(
             using: bridgeClient,
@@ -1344,7 +1498,29 @@ struct ChatView: View {
         )
     }
 
+    /// Default the chat to the conversation anchor — but only until the human
+    /// picks something themselves this launch. Same rule and the same guard
+    /// rails as the Mac's `AppModel.performLoadChatState`: a live anchor only,
+    /// and never a yank off a chosen session.
+    private func adoptConversationAnchorIfNeeded() {
+        guard let anchorID = sync.chatAnchor?.cleanSessionId,
+              MobileConversationAnchor.shouldAdoptAnchor(
+                  anchorSessionId: anchorID,
+                  currentSelection: store.selectedSessionID,
+                  userChoseThisLaunch: MobileChatSelectionIntent.userChoseThisLaunch,
+                  liveSessionIds: Set(sync.sessions.filter { $0.archived != true }.map(\.id))
+              ) else { return }
+        store.switchSession(
+            to: anchorID,
+            using: bridgeClient,
+            fallbackMessages: snapshotMessages(for: anchorID)
+        )
+    }
+
     private func selectChatSessionTab(_ tab: ChatSessionTab) {
+        // The human has picked a session. From here on this launch the chat
+        // stops defaulting to the conversation anchor.
+        MobileChatSelectionIntent.noteUserChoice()
         let follow = ChatFollowPresentation.followLatest()
         autoFollowChat = follow.autoFollow
         showLatestButton = follow.showsLatest
@@ -1352,7 +1528,7 @@ struct ChatView: View {
         case .main:
             adoptMainSessionFromSnapshots()
             store.switchToMainSession(using: bridgeClient, fallbackMessages: snapshotMessages(for: tab.sessionID ?? effectiveMainSessionID))
-        case .pinned:
+        case .pinned, .anchor:
             guard let sessionID = tab.sessionID else { return }
             store.switchSession(to: sessionID, using: bridgeClient, fallbackMessages: snapshotMessages(for: sessionID))
         }
@@ -1367,6 +1543,11 @@ struct ChatView: View {
                 // The Mac response is the authority receipt. Remove the
                 // mirrored row immediately; the snapshot/KVS write performed
                 // before that response will then converge the durable mirror.
+                // 2026-09-06: this is a write of the session-list state, so it
+                // invalidates the reads already in flight — otherwise a
+                // session-list read that started before the unpin completes
+                // after it and puts the closed tab straight back.
+                sync.chatSessionListRefreshGeneration &+= 1
                 sync.pinnedChatSessions.removeAll { $0.id == sessionID }
                 if store.selectedSessionID == sessionID {
                     adoptMainSessionFromSnapshots()
@@ -1414,6 +1595,7 @@ struct ChatView: View {
             if micActive {
                 voiceInput.stop()
             } else {
+                dictationSessionKey = store.queueSessionKey(store.selectedSessionID)
                 Task { await voiceInput.start() }
             }
         } label: {
@@ -1448,7 +1630,7 @@ struct ChatView: View {
 
     private var speakerButton: some View {
         Button {
-            voiceOutput.enabled.toggle()
+            voiceOutput.setEnabled(!voiceOutput.enabled)
         } label: {
             Image(systemName: voiceOutput.enabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
                 .font(.system(size: 16, weight: .medium))

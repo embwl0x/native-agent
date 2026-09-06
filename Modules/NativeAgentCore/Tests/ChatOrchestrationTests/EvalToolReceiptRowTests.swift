@@ -121,8 +121,13 @@ struct EvalToolReceiptRowTests {
             Issue.record("persisted metadata must remain an object")
             return
         }
+        // The exact word now survives the clipping too, beside the class, so
+        // the row reports the state the work actually reached instead of
+        // collapsing to "completion unconfirmed". Still not transport success:
+        // "queued" remains a pending class, never an `ok` claim.
+        #expect(metadata["resultStatus"] as? String == "queued")
         #expect(SessionHistoryPromptRenderer.toolSummary(content: "", metadata: fields)
-            .hasPrefix("completion unconfirmed: claude_message:"))
+            .hasPrefix("queued: claude_message:"))
     }
 
     @Test func malformedOutcomeDoesNotCreateAResultClass() async throws {

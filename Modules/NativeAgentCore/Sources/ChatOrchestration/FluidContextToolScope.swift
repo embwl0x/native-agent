@@ -40,7 +40,13 @@ extension SwiftToolDispatcher {
             for: prepared.need,
             from: prepared.generation,
             pinnedTo: prepared.lease.snapshot,
-            maximumCharacters: requestedMaximum
+            maximumCharacters: requestedMaximum,
+            // The expander does not infer which atoms were offered — this is
+            // the packet the model was shown, so this is where the offer is
+            // declared. Same list the pointer lookup above already searched.
+            offeredTruncationAtomIDs: Set(
+                prepared.packet.expandablePointers.map(\.atomID)
+            )
         )
         Task {
             await prepared.recordExpansion(

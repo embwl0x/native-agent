@@ -165,12 +165,26 @@ struct TelegramAPIResponseTests {
             )
         }
 
+        // 2026-09-06 (the per-chat send lane): a 429's retry window becomes a
+        // CHAT-LEVEL cooldown on `TelegramChatSendLane.shared`, so a chat id
+        // shared with another test leaks that window into it. Each send in this
+        // file gets its own chat.
         try await TelegramPollLoop.sendMessage(
-            token: "123:abc", chatId: 77, text: "one message", session: session,
+            token: "123:abc", chatId: 7_701, text: "one message", session: session,
             sleep: { nanos in await waits.record(nanos) }
         )
         #expect(attempts.snapshot() == 2, "the concrete request path must deliver once after one retry")
-        #expect(await waits.snapshot() == [301_000_000_000], "must not shorten Telegram's advertised retry_after")
+        // TWO waits, not one: the retry wrapper sleeps the advertised window,
+        // and the lane — which recorded the same window as a chat-level
+        // cooldown when the 429 came back — waits out what it still believes is
+        // left of it before the second attempt. Under a real clock that
+        // remainder is zero; the injected `sleep` does not advance time, so it
+        // is visible here. Both are the SAME window, which is the property this
+        // test is about: nothing shortens Telegram's advertised retry_after.
+        let recordedWaits = await waits.snapshot()
+        #expect(recordedWaits.count == 2)
+        #expect(recordedWaits.first == 301_000_000_000, "must not shorten Telegram's advertised retry_after")
+        #expect(recordedWaits.allSatisfy { $0 > 300_000_000_000 && $0 <= 301_000_000_000 })
     }
 
     @Test func floodControlDoesNotReplayNon429OrASecondFloodFailure() async throws {
@@ -191,7 +205,7 @@ struct TelegramAPIResponseTests {
             )
         }
         do {
-            try await TelegramPollLoop.sendMessage(token: "123:abc", chatId: 77, text: "no replay", session: non429)
+            try await TelegramPollLoop.sendMessage(token: "123:abc", chatId: 7_702, text: "no replay", session: non429)
             Issue.record("expected non-429 rejection")
         } catch {}
         #expect(non429Attempts.snapshot() == 1)
@@ -207,13 +221,20 @@ struct TelegramAPIResponseTests {
         }
         do {
             try await TelegramPollLoop.sendMessage(
-                token: "123:abc", chatId: 77, text: "one retry only", session: alwaysFlooded,
+                token: "123:abc", chatId: 7_703, text: "one retry only", session: alwaysFlooded,
                 sleep: { nanos in await waits.record(nanos) }
             )
             Issue.record("expected second flood-control rejection")
         } catch {}
         #expect(secondAttempts.snapshot() == 2)
-        #expect(await waits.count == 1)
+        // TWO waits, not one: the retry wrapper sleeps the advertised window,
+        // and then the lane — which recorded the same window as a chat-level
+        // cooldown when the 429 came back — waits out what it still believes is
+        // left of it before the second attempt. Under a real clock that
+        // remainder is zero; the injected `sleep` here does not advance time,
+        // so the lane's wait is visible. What the test is about is unchanged:
+        // exactly two attempts, and no replay of the non-429 rejection above.
+        #expect(await waits.count == 2)
     }
 
     @Test func serverDescriptionCannotLeakBotToken() throws {

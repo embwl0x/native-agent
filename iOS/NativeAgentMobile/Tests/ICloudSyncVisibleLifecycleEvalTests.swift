@@ -171,7 +171,13 @@ final class ICloudSyncVisibleLifecycleEvalTests: XCTestCase {
         }
         XCTAssertLessThan(decode.lowerBound, write.lowerBound)
         XCTAssertLessThan(write.lowerBound, freshness.lowerBound)
-        XCTAssertTrue(apply.contains("guard generation == lifecycleGeneration else { return }"))
+        // 2026-09-06 (ab60f226): applyCloudKitSnapshotStatus now returns Bool so
+        // the transport claims the peer's generation only on a durable apply,
+        // so the lifecycle guard early-exits with `return true` — a teardown
+        // mid-apply is not a delivery to retry, the engine is simply gone. What
+        // this line guards is unchanged: a stale generation must not reach
+        // `lastSyncAt = Date()`.
+        XCTAssertTrue(apply.contains("guard generation == lifecycleGeneration else { return true }"))
         XCTAssertTrue(apply.contains("snapshot failed:"),
                       "a bad snapshot must render an error instead of advancing the visible freshness claim")
     }
@@ -648,7 +654,7 @@ final class IOSSyncTransportBoundaryEvalTests: XCTestCase {
         let updates: [(NAMobileSnapshotGroup, [String: Data], () -> Bool)] = [
             (.core, completeGroup(.core, values: ["providers.json": coreBytes]), { engine.providers.map(\.id) == ["provider-status"] }),
             (.catalog, completeGroup(.catalog, values: ["skills_snapshot.json": catalogBytes]), { engine.skills.map(\.id) == ["skill-status"] }),
-            (.chat, completeGroup(.chat, values: ["chat_transcripts.json": chatBytes]), { engine.chatTranscripts["status-session"]?.map(\.id) == ["status-message"] }),
+            (.chat, completeGroup(.chat, values: ["chat_transcripts.json": chatBytes]), { engine.chatTranscripts["status-session"]?.records.map(\.id) == ["status-message"] }),
             (.desk, completeGroup(.desk, values: ["desk.json": deskBytes]), { engine.deskItems.map(\.handle) == ["desk-status"] }),
             (.activity, completeGroup(.activity, values: ["workshop_tasks.json": activityBytes]), { engine.workshopTasks.map(\.id) == ["workshop-status"] }),
             (.advanced, completeGroup(.advanced, values: [

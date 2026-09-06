@@ -43,7 +43,11 @@ printf 'struct Core { let changed = true }\n' > "$FIXTURE/Modules/Core/Sources/C
 after="$(nativeagent_source_state_digest "$FIXTURE")"
 [[ "$before" != "$after" ]] || fail 'content digest ignored a source edit'
 
-grep -Fq 'core_shard_build_flag=(--skip-build)' "$ROOT/script/test.sh" ||
+# 2026-09-01: the core test bundle is built ONCE up front (--build-tests) and
+# every shard, solo or pooled, runs --skip-build against those products.
+grep -Fq -- '--package-path "$ROOT/Modules/NativeAgentCore" --build-tests' "$ROOT/script/test.sh" ||
+  fail 'the core test bundle is no longer built once up front'
+grep -Fq -- '--skip-build --package-path "$ROOT/Modules/NativeAgentCore"' "$ROOT/script/test.sh" ||
   fail 'test shards do not reuse the first built products'
 grep -Fq 'CORE_TEST_SOURCE_DIGEST_AFTER=' "$ROOT/script/test.sh" ||
   fail 'test shards lack a final source-state guard'

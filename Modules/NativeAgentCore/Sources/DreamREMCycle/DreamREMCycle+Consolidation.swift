@@ -132,13 +132,57 @@ public actor DreamDiaryReader {
             return $0.date < $1.date
         }
         guard let since else { return entries }
-        let dateOnly = ISO8601DateFormatter()
-        dateOnly.formatOptions = [.withFullDate]
+        // 2026-09-06: the window is a range of DIARY DATES in the LOCAL
+        // calendar, INCLUSIVE of the boundary day. It used to parse the stem
+        // with `.withFullDate` (midnight UTC) and require `> since`, where
+        // `since` was `now − 7 days` — a wall-clock instant. The weekly REM
+        // fires Sunday 04:30 local, so the boundary Sunday's own dream (written
+        // that night, hours AFTER the run) parsed to an instant strictly BEFORE
+        // `since` on every following week too: Sunday's dream was never once
+        // consolidated. Comparing calendar days and including the boundary day
+        // closes that permanent hole; a day seen twice is deduped downstream by
+        // proposal id, a day never seen is lost forever.
+        let boundary = Self.startOfLocalDay(since)
         return entries.filter { entry in
-            guard let parsed = dateOnly.date(from: entry.date) else { return false }
-            return parsed > since
+            guard let parsed = Self.localDate(fromDateStem: entry.date) else { return false }
+            return parsed >= boundary
         }
     }
+
+    /// A `YYYY-MM-DD` diary stem as midnight in the LOCAL calendar.
+    static func localDate(fromDateStem stem: String) -> Date? {
+        let parts = stem.split(separator: "-")
+        guard parts.count == 3,
+              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2])
+        else { return nil }
+        var components = DateComponents()
+        components.year = year
+        components.month = month
+        components.day = day
+        return localCalendar.date(from: components)
+    }
+
+    /// Midnight of `date` in the local calendar — the day a wall-clock instant
+    /// belongs to, which is the unit the diary is named in.
+    static func startOfLocalDay(_ date: Date) -> Date {
+        localCalendar.startOfDay(for: date)
+    }
+
+    /// Midnight of the day `days` calendar days before `date`, in the local
+    /// calendar. 2026-09-06: both weekly-window sites derived this by
+    /// subtracting `days * 86_400` seconds, which is not a day across a DST
+    /// transition — a run just after midnight on a 23-hour day landed on the
+    /// wrong boundary date and silently moved the window by one.
+    static func startOfLocalDay(_ date: Date, daysBefore days: Int) -> Date {
+        let start = startOfLocalDay(date)
+        return localCalendar.date(byAdding: .day, value: -days, to: start) ?? start
+    }
+
+    private static let localCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar
+    }()
 }
 
 // MARK: - SwiftNativeREMConsolidator
@@ -163,6 +207,12 @@ public actor SwiftNativeREMConsolidator {
     public var lastParseError: String? { lastParseErrors.last }
     public private(set) var lastTargetMismatchDrops: Int = 0
     public private(set) var lastEvidenceDateDrops: Int = 0
+    /// Count of replies the JSON decode could not read at all (2026-09-06).
+    /// Distinct from `lastParseErrors`, which also carries per-proposal content
+    /// drops: a decode failure means the WEEK'S OUTPUT was lost, not that the
+    /// model had nothing to say, and the caller turns it into a failed run so
+    /// the weekly claim is released and the pass retries.
+    public private(set) var lastDecodeFailures: Int = 0
 
     private let llm: any LLMClient
     private let diary: DreamDiaryReader
@@ -199,6 +249,7 @@ public actor SwiftNativeREMConsolidator {
         lastParseErrors = []
         lastTargetMismatchDrops = 0
         lastEvidenceDateDrops = 0
+        lastDecodeFailures = 0
 
         let entries = try await diary.entriesSince(since)
         if entries.isEmpty { return [] }
@@ -366,6 +417,7 @@ public actor SwiftNativeREMConsolidator {
         let trimmed = candidate ?? stripped
         guard let data = trimmed.data(using: .utf8) else {
             lastParseErrors.append("empty utf8 payload")
+            lastDecodeFailures += 1
             return []
         }
         do {
@@ -404,6 +456,7 @@ public actor SwiftNativeREMConsolidator {
             return result
         } catch {
             lastParseErrors.append("decode failure: \(error)")
+            lastDecodeFailures += 1
             return []
         }
     }

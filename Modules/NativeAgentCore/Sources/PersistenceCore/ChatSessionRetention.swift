@@ -261,6 +261,19 @@ public enum ChatSessionRetention {
         if policy.includeMacPinnedSessions {
             protected.formUnion(macPinnedChatSessionIds(dataRoot: dataRoot))
         }
+        // The anchor is the conversation the human is IN right now, on
+        // whichever surface. Archiving it because 200 other rows happen to be
+        // newer would pick the worst possible moment to enforce a cap.
+        //
+        // Independent of the pin strip on purpose: the Mac auto-INCLUDES the
+        // anchor for visibility, but a human can unpin anything, and an unpin
+        // must not be able to make the live conversation archivable. Surface-
+        // agnostic — nothing here knows which adapter published it.
+        //
+        // We are already inside the caller's sessions lock, which is the same
+        // lock `ConversationAnchor.publish` writes under, so this read cannot
+        // see a half-written pin.
+        protected.formUnion(ConversationAnchor.protectedSessionIds(dataRoot: dataRoot))
         return protected
     }
 
@@ -350,10 +363,36 @@ public enum ChatSessionRetention {
             // check below only chose whether to COPY — it never aborted — so a
             // now-non-empty transcript was copied to the archive and the hot
             // file deleted, losing a live session's first message from the hot
-            // tier. `.activeCap` archival is a size decision, not an emptiness
-            // one, so it is deliberately left unchanged.
+            // tier.
             if reason == .staleEmpty, transcriptIsNonEmpty(messagesPath) {
                 return false
+            }
+            // 2026-09-06: `.activeCap` needs the same premise re-checked, for a
+            // different reason. A writer commits its transcript row and only
+            // then synchronizes `sessions.json`; archiving in that gap deletes
+            // the hot transcript, and the writer's index sync then recreates an
+            // ACTIVE row for the session with none of its history behind it.
+            if reason == .activeCap, let modified = transcriptModifiedDate(messagesPath) {
+                // 2026-09-06: the real invariant, and it does not depend on when
+                // `now` was sampled. `now` is taken by the caller AFTER it holds
+                // `sessions.json.lock` (MessagePersistence), so a writer that
+                // appended, released the transcript lock and is now queued
+                // behind us for the index lock has an mtime EARLIER than `now`
+                // and slipped straight past the pass-start guard. Its index row
+                // still carries the stamp from its previous sync, so a
+                // transcript newer than its own index row is a pending index
+                // sync — never a quiet session, never a victim.
+                if let indexStamp = date(row["updatedAt"]) ?? date(row["createdAt"]),
+                   modified > indexStamp {
+                    return false
+                }
+                // Second line: anything written since this pass began. Two
+                // seconds of slack in the transcript's favour — the mtime comes
+                // off the filesystem and `now` off an in-memory clock, and the
+                // two need not agree to the millisecond.
+                if modified >= now.addingTimeInterval(-transcriptModifiedSlackSeconds) {
+                    return false
+                }
             }
             // Check existence only after locking: a writer may be creating the
             // first row while retention is selecting this session.
@@ -417,6 +456,17 @@ public enum ChatSessionRetention {
         return text.split(separator: "\n").contains {
             !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
+    }
+
+    /// Slack applied when comparing a filesystem mtime against an in-memory
+    /// clock. Always in the transcript's favour: the cost of an unnecessary
+    /// skip is one more retention pass, the cost of a wrong archive is a lost
+    /// transcript.
+    private static let transcriptModifiedSlackSeconds: TimeInterval = 2
+
+    /// The transcript's last-write time, or nil when there is no transcript.
+    private static func transcriptModifiedDate(_ path: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
     }
 
     /// Synchronous, bounded counterpart to `PersistenceCoreProtocol.withFileLock`.

@@ -147,6 +147,14 @@ struct ChatTranscriptSnapshot: Identifiable, Codable, Hashable, Sendable {
     var id: String { sessionId }
     var sessionId: String
     var messages: [ChatMessageRecord]
+    /// 2026-09-06: the Mac session's transcript version at publication (see
+    /// MacSyncEngine.ChatTranscriptSnapshot). A row carrying `messages: []` is
+    /// the Mac stating the transcript is empty; this counter is what makes that
+    /// statement provably newer than whatever the phone already applied. It is
+    /// a counter bumped on every clear and every transcript write, never a
+    /// clock. Absent on pre-2026-09-06 Mac builds, and then an empty row stays
+    /// inert.
+    var transcriptGeneration: Int? = nil
 }
 
 // MARK: - Turn Inspector W4 — iOS decode-side summary models

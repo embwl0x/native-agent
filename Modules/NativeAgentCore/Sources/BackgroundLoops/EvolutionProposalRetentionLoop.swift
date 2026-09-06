@@ -33,9 +33,14 @@ public struct EvolutionProposalRetentionLoop: LoopRunner {
     public func tickOutcome() async -> LoopTickOutcome {
         do {
             let removed = try await sweep()
-            if removed > 0 {
-                NSLog("evolution_proposal_retention: swept %d terminal proposal(s)", removed)
+            // A sweep that removed nothing did nothing. It was reporting
+            // `.completed(result: "…removed 0")` every week, which advanced the
+            // dormancy clock on a lane that had not touched the store in
+            // months — the honest lanes looked dead by comparison.
+            guard removed > 0 else {
+                return .skipped(reason: "no terminal proposals past the retention cutoff")
             }
+            NSLog("evolution_proposal_retention: swept %d terminal proposal(s)", removed)
             return .completed(result: "evolution proposal sweep removed \(removed)")
         } catch {
             NSLog("evolution_proposal_retention: sweep failed: %@", String(describing: error))

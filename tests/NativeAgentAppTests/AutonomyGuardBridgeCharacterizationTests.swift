@@ -127,9 +127,21 @@ struct AutonomyGuardBridgeCharacterizationTests {
         // Synthetic roots have no Mac/iPhone body. Reaching this refusal proves
         // the bridge factory retained AppChatToolDispatcher around the injected
         // fake instead of substituting the fake above that composition seam.
+        //
+        // 2026-09-06: the probe was `mobile.notify`; it is now `browser.status`.
+        // 6d0c7f22 ("Gates judge the canonical tool name") wrapped the bridge
+        // chain in a CanonicalToolNameDispatcher, which rewrites a dotted name
+        // to its underscored twin when that twin is in the core catalog.
+        // `mobile.notify` -> `mobile_notify` is such a pair, so the app
+        // dispatcher no longer sees the spelling its no-body fence matches
+        // (AppChatToolDispatcher.appToolNames is dotted) and the call ran a
+        // REAL iCloud/APNS send. `browser.status` is app-owned by the same
+        // fence and has no catalog twin (`browser_status` is not a core tool),
+        // so it arrives spelled as the fence expects — same seam, same refusal,
+        // no live side effect from a synthetic root.
         let bodyUnavailable = try await tools.dispatch(
-            tool: "mobile.notify",
-            input: ["message": .string("must not notify")],
+            tool: "browser.status",
+            input: [:],
             surface: "claude-bridge"
         )
         guard case .object(let unavailableObject) = bodyUnavailable else {
@@ -137,7 +149,7 @@ struct AutonomyGuardBridgeCharacterizationTests {
             return
         }
         #expect(unavailableObject["reason"] == .string("canonical_body_unavailable"))
-        #expect(await trace.snapshot() == ["trust:mobile.notify"])
+        #expect(await trace.snapshot() == ["trust:browser.status"])
 
         let result = try await tools.dispatch(
             tool: "read_file",
@@ -146,7 +158,8 @@ struct AutonomyGuardBridgeCharacterizationTests {
         )
         #expect(result == .object(["status": .string("reached_inner")]))
         #expect(await trace.snapshot() == [
-            "trust:mobile.notify",
+            // 2026-09-06: follows the probe rename above.
+            "trust:browser.status",
             "trust:read_file",
             "inner:read_file",
         ])
@@ -179,7 +192,7 @@ struct AutonomyGuardBridgeCharacterizationTests {
         "invoke_claude", "invoke_codex",
         // self-evolution — now reaches the backend; self_install still only
         // STAGES a card the user approves (proven in EvolutionChatToolsWiringTests).
-        "evolution_propose", "evolution_status", "self_install",
+        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
         // reads that always passed
         "read_file", "recall_memory", "workshop_status", "task_ledger_list",
     ]

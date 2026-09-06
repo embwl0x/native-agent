@@ -1395,6 +1395,7 @@ func appChatToolDispatcher_exposesVisibleBrowserToolsAndDispatchesStatusAlias() 
     #expect(names.contains("browser.read_links"))
     #expect(names.contains("browser.screenshot"))
     #expect(names.contains("browser.chrome_acquire"))
+    #expect(names.contains("browser.chrome_renew"))
     #expect(names.contains("browser.chrome_navigate"))
     #expect(names.contains("browser.chrome_snapshot"))
     #expect(names.contains("browser.chrome_click"))
@@ -1477,6 +1478,13 @@ func everyRegisteredBrowserToolMapsValidInputToTheAppRunner() async throws {
         ("browser.read_links", ["dry_run": .bool(true)]),
         ("browser.screenshot", ["dry_run": .bool(true)]),
         ("browser.chrome_acquire", ["mode": .string("create"), "initial_url": .string("https://example.com/")]),
+        // 2026-09-06: browser.chrome_renew joined the catalog (c9687dec) — a
+        // lease has a hard 60s ceiling without it.
+        ("browser.chrome_renew", [
+            "lease_id": .string("lease-fixture"),
+            "expected_user_sequence": .int(0),
+            "lease_duration_ms": .int(60000),
+        ]),
         ("browser.chrome_navigate", stable.merging(["url": .string("https://example.com/next")]) { _, new in new }),
         ("browser.chrome_snapshot", ["lease_id": .string("lease-fixture"), "max_nodes": .int(20)]),
         ("browser.chrome_click", stable),
@@ -1676,27 +1684,16 @@ func appChatToolDispatcher_toolLoadBrowserCategorySkipsPersistingTurnActiveTools
         .appendingPathComponent("active_tools", isDirectory: true)
         .appendingPathComponent("\(sessionId).json")
 
-    let browserTurnTools: Set<String> = [
-        "browser.chrome_acquire",
-        "browser.chrome_click",
-        "browser.chrome_fill",
-        "browser.chrome_select",
-        "browser.chrome_keypress",
-        "browser.chrome_set_checked",
-        "browser.chrome_double_click",
-        "browser.chrome_navigate",
-        "browser.chrome_release",
-        "browser.chrome_scroll",
-        "browser.chrome_snapshot",
-        "browser.chrome_type",
-        "browser.chrome_wait",
-        "browser.open_url",
-        "browser.navigate",
-        "browser.read_links",
-        "browser.read_text",
-        "browser.screenshot",
-        "browser.status",
-    ]
+    // 2026-09-06: was a hand-copied list, which went stale the moment
+    // browser.chrome_renew joined the category (c9687dec) — the new tool showed
+    // up in `loaded_now` and the test read as a persistence regression. The
+    // premise being set up is "the whole browser category is ALREADY turn-active",
+    // so take the category from the dispatcher that defines it.
+    let browserTurnTools: Set<String> = Set(
+        AppChatToolDispatcher.catalogRegisteredToolNames.filter {
+            AppChatToolDispatcher.catalogBucket(forRegisteredToolNamed: $0) == .browser
+        }
+    )
     let result = try await LLMCallContext.$turnActiveTools.withValue(browserTurnTools) {
         try await dispatcher.dispatch(
             tool: "tool_load",
@@ -2232,6 +2229,10 @@ func liveProviderList_openAIOAuthVisible_optInOnly() async throws {
     let states = providers.map { "\($0.provider_id)=\($0.auth_status.state)" }.joined(separator: ", ")
     print("live provider states: \(states)")
     let openAI = try #require(providers.first(where: { $0.provider_id == "openai_oauth_direct" }))
+    let astra = try #require(openAI.models.first { $0.id == "gpt-6-astra" })
+    #expect(astra.default_reasoning_effort == "medium")
+    #expect(astra.supported_reasoning_efforts == ["low", "medium", "high", "xhigh", "max", "ultra"])
+    #expect(astra.supports_fast == true)
     #expect(openAI.auth_status.state == "ready")
     let gpt56 = openAI.models.filter { $0.id.hasPrefix("gpt-5.6-") }
     print("live ChatGPT OAuth GPT-5.6 models: \(gpt56.map(\.id).joined(separator: ", "))")
@@ -2245,6 +2246,7 @@ func liveProviderList_openAIOAuthVisible_optInOnly() async throws {
     #expect([sol, terra, luna].allSatisfy { $0.supports_fast == true })
 
     let apiKey = try #require(providers.first(where: { $0.provider_id == "openai" }))
+    #expect(apiKey.models.contains { $0.id == "gpt-6-astra" } == false)
     let publicSol = try #require(apiKey.models.first { $0.id == "gpt-5.6-sol" })
     #expect(publicSol.supported_reasoning_efforts == ["none", "low", "medium", "high", "xhigh", "max"])
     #expect(publicSol.supported_reasoning_efforts?.contains("ultra") == false)

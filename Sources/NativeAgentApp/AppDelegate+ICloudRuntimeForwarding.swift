@@ -77,6 +77,43 @@ enum ICloudReplyPushNotificationPreparation: Equatable {
 }
 
 extension AppDelegate {
+    /// 2026-09-06: a runtime error can carry a Mac filesystem path (storage
+    /// errors name the file they failed on). Nothing leaving this Mac for the
+    /// phone may disclose one, so every absolute path in an exported detail is
+    /// reduced to its last component before it crosses the bridge.
+    static func redactedRemoteErrorDetail(_ value: String) -> String {
+        // 2026-09-06: match the SHAPE of an absolute path, not a list of roots.
+        // The old fixed root list let /data/..., /srv/... and /mnt/... through
+        // untouched. Any absolute path of two or more segments is reduced to
+        // its leaf; the lookbehind keeps the rule off relative paths ("a/b/c").
+        // 2026-09-06: a colon is NOT in that lookbehind. It was, and it let
+        // "path:/data/private/file.json" through whole — the leading slash was
+        // preceded by a colon, and every later slash by a letter. A URL scheme
+        // is still excluded without it: "https://host/x" cannot match at the
+        // first slash (a segment needs one non-slash character and the next
+        // character is "/"), nor at the second (preceded by "/"), nor at
+        // "/x" (preceded by a letter).
+        guard let regex = try? NSRegularExpression(
+            pattern: "(?<![A-Za-z0-9_.~%/-])(?:/[^\\s\"'<>)\\]},;/]+){2,}",
+            options: []
+        ) else { return value }
+        var text = value
+        let matches = regex.matches(
+            in: text,
+            options: [],
+            range: NSRange(location: 0, length: (text as NSString).length)
+        )
+        for match in matches.reversed() {
+            let path = (text as NSString).substring(with: match.range)
+            let leaf = (path as NSString).lastPathComponent
+            text = (text as NSString).replacingCharacters(
+                in: match.range,
+                with: leaf.isEmpty ? "[redacted path]" : ".../\(leaf)"
+            )
+        }
+        return text
+    }
+
     /// The only file-access IDs the signed iPhone chat route admits. This is
     /// intentionally shared with the mobile pill rather than treating its
     /// persisted label as authority.
@@ -305,22 +342,35 @@ extension AppDelegate {
                                 dataRoot: NativeAgentPaths.dataRoot
                             )
                         ))
-                    case .notice(_, let text):
+                    case .notice(let noticeKind, let text):
                         // Notify-don't-hang (2026-06-09): in-turn status (invoke
                         // start/heartbeat/timeout). kind "progress" routes to the
                         // iOS streaming-hint line (receiveICloudProgress) — shown
                         // live, never part of the durable reply.
+                        // 2026-09-06: a notice keeps its kind and its own KVS
+                        // key. Published as an anonymous "progress" into the
+                        // single latest-value progress key, a reconnect or
+                        // compaction notice was overwritten by the next tool
+                        // event before the phone could read it.
+                        // It is ALSO mirrored to the old progress key as kind
+                        // "progress" (the only kinds an older phone admits), or
+                        // a phone that predates the new key would stop seeing
+                        // notices at all. Both copies carry one message id, and
+                        // an updated phone drops the one it already dispatched.
                         _ = await iCloudBridge.shared.sendKVSChatProgress(
                             text: text,
                             sessionID: resolvedSessionID,
                             correlationID: msg.id,
                             metadata: [
-                                "kind": "progress",
+                                "kind": "notice",
+                                "noticeKind": noticeKind,
                                 "transport": "icloud",
                                 "source": "mac",
                                 "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
                                 "targetSourceKey": routeKey
-                            ]
+                            ],
+                            key: NativeAgentICloudBridgeConstants.KVSKey.chatNoticeLatest,
+                            mirrorKey: NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest
                         )
                     case .toolUse(let name, _):
                         // F7 P2: forward a lightweight tool_use progress event so
@@ -416,7 +466,9 @@ extension AppDelegate {
             }
             return (accumulated, deltaCoalescer.sequence, sawError, toolEventCounter)
         }
-        MacSyncEngine.shared.registerActiveChatTask(streamTask, for: resolvedSessionID)
+        // The run id is this turn's correlation id — the same one iOS holds
+        // for the placeholder it is waiting on, so a Stop can name it.
+        MacSyncEngine.shared.registerActiveChatTask(streamTask, for: resolvedSessionID, runID: msg.id)
         let outcome = await streamTask.value
         MacSyncEngine.shared.unregisterActiveChatTask(for: resolvedSessionID, expecting: streamTask)
         let wasCancelled = streamTask.isCancelled
@@ -472,7 +524,7 @@ extension AppDelegate {
                     correlationID: msg.id,
                     metadata: [
                         "kind": "error",
-                        "errorDetail": String(errMsg.prefix(400)),
+                        "errorDetail": String(Self.redactedRemoteErrorDetail(errMsg).prefix(400)),
                         "transport": "icloud",
                         "source": "mac",
                         "replyTo": remoteMetadata["clientSurface"] ?? "iphone",

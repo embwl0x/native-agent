@@ -202,22 +202,13 @@ extension CognitiveSubstrate {
 
     // MARK: - Telemetry
 
-    /// `<dataRoot>/logs/delivery_envelope_telemetry.jsonl`, derived from the
-    /// STORE'S data root rather than a process default. Hermetic by construction:
-    /// a substrate built without a store (every non-persistent test) has no
-    /// telemetry path at all and writes nothing, so no test can leak a row into
-    /// the live app's data root.
-    var deliveryEnvelopeTelemetryPath: URL? {
-        guard let root = storeDataRoot else { return nil }
-        return root
-            .appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("delivery_envelope_telemetry.jsonl")
-    }
-
-    /// Newest-N rotation, matching the other bounded local ledgers. Small on
-    /// purpose: this is a distribution sample for one staged decision, not a
-    /// permanent record of every reply the agent has ever made.
-    static let deliveryEnvelopeTelemetryMaxLines = 5_000
+    // Sweep item 21 (2026-09-01): `logs/delivery_envelope_telemetry.jsonl` is
+    // RETIRED — path, rotation bound and detached appender all removed. The
+    // envelope is telemetry-only by design (no flag reads it back into a turn)
+    // and nothing ever read the FILE either, so it was 471 rows of write-only
+    // disk. The envelope arithmetic, the pairing rules and the staged-ship
+    // contract are untouched; the paired row now lands in the in-memory
+    // `lastDeliveryEnvelopeTelemetryRow` slot (CognitiveSubstrate.swift).
 
     /// The committed-turn entry point. The live chat turn compiles its capsule
     /// on the FROZEN path, so the compile can't own the stash (the first cut
@@ -236,6 +227,13 @@ extension CognitiveSubstrate {
         let items = workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
         let signals = feltSignalsForCapsule(from: items, request: request, at: now)
         stashDeliveryEnvelope(signals: signals, request: request, at: now)
+        // Same certified boundary, one more durable consequence: the capsule
+        // cadence ledger. It rides here rather than in
+        // `applyCapsulePresentationCommit` because that commit is synchronous
+        // by contract (it must not suspend between snapshot and apply), and
+        // this is the very next call the runtime makes for the same accepted
+        // turn. No-op unless the commit actually moved the ledger.
+        await flushCapsulePresentationIfNeeded(at: now)
     }
 
     /// Stash the envelope for this turn. Overwrites any previous stash: the
@@ -257,13 +255,13 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// Pair the stashed envelope with the reply that actually happened and write
-    /// one bounded row. Consumes the stash either way — an envelope that missed
+    /// Pair the stashed envelope with the reply that actually happened and
+    /// record one row. Consumes the stash either way — an envelope that missed
     /// its completion is stale, and a stale envelope logged against a later reply
     /// would poison the very distribution this exists to measure.
     ///
-    /// Returns the row it wrote (nil when nothing was written) so tests can read
-    /// the pairing without parsing the file.
+    /// Returns the paired row (nil when nothing paired) and leaves it in
+    /// `lastDeliveryEnvelopeTelemetryRow`. Nothing is written to disk.
     @discardableResult
     func consumeDeliveryEnvelopeTelemetry(
         replyCharacters: Int,
@@ -296,27 +294,11 @@ extension CognitiveSubstrate {
                 replyCharacters >= pending.envelope.minimumCharacters
                     && replyCharacters <= pending.envelope.maximumCharacters),
             // NO reply text, no user text, no session id, no felt WORDS — a
-            // length telemetry file has no business carrying conversation
+            // length measurement has no business carrying conversation
             // content, and this one carries none.
         ])
-        writeDeliveryEnvelopeTelemetry(row)
+        lastDeliveryEnvelopeTelemetryRow = row
         return row
-    }
-
-    /// Fire-and-forget so a slow disk can never add latency to a turn, and
-    /// detached so the append does not hold the substrate actor while it takes
-    /// the file lock. Telemetry that can stall the conversation is worse than no
-    /// telemetry.
-    private func writeDeliveryEnvelopeTelemetry(_ row: JSONValue) {
-        guard let path = deliveryEnvelopeTelemetryPath else { return }
-        Task.detached(priority: .utility) {
-            do {
-                try await appendDeliveryEnvelopeTelemetryRow(row, to: path)
-            } catch {
-                NSLog("CognitiveSubstrate: delivery envelope telemetry write failed: %@",
-                      String(describing: error))
-            }
-        }
     }
 
     static func telemetryTimestamp(_ date: Date) -> String {
@@ -325,19 +307,4 @@ extension CognitiveSubstrate {
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         return formatter.string(from: date)
     }
-}
-
-/// Nonisolated so the detached writer can call it without re-entering the actor.
-/// Routes through the shared capped append (the same owner every other bounded
-/// JSONL ledger uses) rather than hand-rolling a rotation that would drift.
-func appendDeliveryEnvelopeTelemetryRow(_ row: JSONValue, to path: URL) async throws {
-    try FileManager.default.createDirectory(
-        at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try await appendJSONLCapped(
-        row,
-        to: path,
-        using: SwiftNativePersistenceCore(),
-        maxLines: CognitiveSubstrate.deliveryEnvelopeTelemetryMaxLines,
-        logLabel: "CognitiveSubstrate"
-    )
 }

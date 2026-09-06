@@ -56,7 +56,8 @@ extension NativeCognitionRuntime {
                 dataRoot: dataRoot,
                 cognitionRuntime: self
             ),
-            reason: reason
+            reason: reason,
+            demand: .spontaneous
         )
     }
 
@@ -70,8 +71,15 @@ extension NativeCognitionRuntime {
         await reflectionEventTask?.value
     }
 
+    /// `demand` decides what the call has to earn. `.spontaneous` (the loops and
+    /// the commit signal) must clear unresolved load; `.requested` — an explicit
+    /// call — only has to fit under the rolling cost ceiling.
     @discardableResult
-    func runReflectionIfDue(llm: any LLMClient, reason: String) async -> CognitiveBackgroundRunOutcome {
+    func runReflectionIfDue(
+        llm: any LLMClient,
+        reason: String,
+        demand: CognitiveReflectionDemand = .requested
+    ) async -> CognitiveBackgroundRunOutcome {
         await bootstrap()
         if let bootstrapFailure { return .failed(bootstrapFailure) }
         if let providerRoutingFailure { return .failed(providerRoutingFailure) }
@@ -79,8 +87,13 @@ extension NativeCognitionRuntime {
         case .skipped(let reason): return .skipped(reason)
         case .allowed: break
         }
-        guard let request = await substrate.planReflection(reason: reason) else {
-            return .skipped("reflection disabled, not due, or out of budget")
+        let request: CognitiveReflectionRequest
+        switch await substrate.planReflectionChecked(reason: reason, demand: demand) {
+        case .admitted(let planned):
+            request = planned
+        case .refused(let admission):
+            // Honest skip: which fence stopped it, and the load reading behind it.
+            return .skipped(admission.detail)
         }
         let reflectionOutcome = await executeReflection(request: request, llm: llm)
         publishRuntimeChange(reason: "reflection:finished")
@@ -240,16 +253,21 @@ extension NativeCognitionRuntime {
             publishRuntimeChange(reason: "reflection:provider_unavailable")
             return .skipped("provider routing unavailable: \(providerRoutingFailure)")
         }
-        guard let request = await substrate.planReflection(reason: reason) else {
+        let request: CognitiveReflectionRequest
+        switch await substrate.planReflectionChecked(reason: reason, demand: .requested) {
+        case .admitted(let planned):
+            request = planned
+        case .refused(let admission):
             await substrate.recordReceipt(
                 kind: "reflection.skipped",
                 payload: .object([
                     "reason": .string(reason),
-                    "status": .string("not_enabled_budgeted_or_available"),
+                    "status": .string(admission.reason),
+                    "detail": .string(admission.detail),
                 ])
             )
             publishRuntimeChange(reason: "reflection:skipped")
-            return .skipped("reflection disabled, not due, or out of budget")
+            return .skipped(admission.detail)
         }
         let outcome = await executeReflection(
             request: request,

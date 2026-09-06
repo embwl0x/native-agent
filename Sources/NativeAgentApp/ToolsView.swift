@@ -38,11 +38,14 @@ struct ToolsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if let message = ToolsRefreshPresentation.message(for: appModel.toolsRefreshState) {
-                    Label(message, systemImage: ToolsRefreshPresentation.systemImage(for: appModel.toolsRefreshState))
-                        .font(.caption)
+                    Text(message)
+                        .font(ShellType.label)
                         .foregroundStyle(
-                            appModel.toolsRefreshState == .refreshed ? .green : .orange
+                            appModel.toolsRefreshState == .refreshed
+                                ? NativeAgentShell.calm
+                                : NativeAgentShell.trouble
                         )
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
 
@@ -57,24 +60,28 @@ struct ToolsView: View {
                 }
 
                 if !appModel.toolOperationStatusReceipts.isEmpty {
-                    NativePanel(title: "Recent Tool Activity", systemImage: "checkmark.circle") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(appModel.toolOperationStatusReceipts) { receipt in
-                                CapabilityDetailRow(
-                                    title: receipt.outcome == .succeeded ? "Completed" : "Needs attention",
-                                    detail: receipt.message,
-                                    status: receipt.outcome.badgeStatus,
-                                    systemImage: receipt.outcome.systemImage
-                                )
-                                if receipt.id != appModel.toolOperationStatusReceipts.last?.id {
-                                    Divider()
-                                }
+                    ToolsSection(title: "Recent tool activity") {
+                        ForEach(appModel.toolOperationStatusReceipts) { receipt in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(receipt.outcome == .succeeded ? "Completed" : "Needs attention")
+                                    .font(ShellType.labelSemibold)
+                                    .foregroundStyle(
+                                        receipt.outcome == .succeeded
+                                            ? NativeAgentShell.calm
+                                            : NativeAgentShell.trouble
+                                    )
+                                Text(receipt.message)
+                                    .font(ShellType.label)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
                 }
             }
-            .padding()
+            .padding(.bottom, 32)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .toolbar {
             Button {
@@ -99,18 +106,25 @@ struct ToolsView: View {
     private func catalogContent(_ catalogState: ChatToolCatalogPresentation.CatalogState) -> some View {
         switch ToolsCatalogSurfacePresentation.state(for: catalogState) {
         case .loading(let presentation):
-            HStack {
+            HStack(spacing: 8) {
                 ProgressView()
+                    .controlSize(.small)
                 Text(presentation.detail)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             .padding(.vertical, 8)
         case let .empty(presentation), let .unavailable(presentation):
-            NativeEmptyState(
-                title: presentation.title,
-                detail: presentation.detail,
-                systemImage: presentation.systemImage
-            )
+            VStack(alignment: .leading, spacing: 4) {
+                Text(presentation.title)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Text(presentation.detail)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         case .catalog:
             switch catalogState {
             case let .available(catalog, bucketResult):
@@ -564,11 +578,11 @@ struct ChatToolDetailsButton: View {
         Button {
             isExpanded.toggle()
         } label: {
-            Label(isExpanded ? "Hide details" : "Show details",
-                  systemImage: isExpanded ? "chevron.up" : "chevron.down")
+            Text(isExpanded ? "Hide details" : "Show details")
         }
         .buttonStyle(.borderless)
-        .font(.caption)
+        .font(ShellType.label)
+        .foregroundStyle(NativeAgentShell.secondary)
         .accessibilityLabel("\(isExpanded ? "Hide" : "Show") details for \(toolName)")
         .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
         .help("Show or hide the full tool description and catalog metadata. This does not run the tool.")
@@ -589,13 +603,16 @@ private struct ChatToolCatalogSection: View {
     var body: some View {
         let filteredBuckets = searchState.filteredBuckets(bucketResult.buckets)
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Chat Tool Catalog")
-                    .font(.title2.weight(.semibold))
-                Spacer()
-                Text("\(bucketResult.visibleToolCount) usable of \(catalog.tools.count) tools • permission: \(catalog.permissionLevel.isEmpty ? "—" : catalog.permissionLevel)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Chat tool catalog")
+                    .font(ShellType.labelSemibold)
+                    .textCase(.uppercase)
+                    .kerning(0.6)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                Spacer(minLength: 8)
+                Text("\(bucketResult.visibleToolCount) usable of \(catalog.tools.count) tools · permission \(catalog.permissionLevel.isEmpty ? "unknown" : catalog.permissionLevel)")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
 
             if !bucketResult.buckets.isEmpty {
@@ -605,20 +622,21 @@ private struct ChatToolCatalogSection: View {
                         set: { searchState.setQuery($0) }
                     ))
                     .textFieldStyle(.roundedBorder)
+                    .font(ShellType.label)
                     .frame(maxWidth: 420)
                     .accessibilityLabel("Search chat tool catalog")
                     if searchState.isSearching {
-                        Button {
+                        Button("Clear search") {
                             searchState.setQuery("")
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
                         }
                         .buttonStyle(.borderless)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .help("Clear tool search")
                         .accessibilityLabel("Clear tool search")
                         Text("\(filteredBuckets.reduce(0) { $0 + $1.tools.count }) matching tools")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
                     Spacer(minLength: 0)
                 }
@@ -626,17 +644,16 @@ private struct ChatToolCatalogSection: View {
 
             if let staleDetail {
                 catalogWarning(
-                    "Showing the last loaded catalog. The latest refresh failed\(staleDetail.isEmpty ? "." : ": \(staleDetail)")",
-                    systemImage: "clock.arrow.circlepath"
+                    "Showing the last loaded catalog. The latest refresh failed\(staleDetail.isEmpty ? "." : ": \(staleDetail)")"
                 )
             }
 
             if let withheldNotice = bucketResult.withheldNotice {
-                catalogWarning(withheldNotice, systemImage: "exclamationmark.triangle")
+                catalogWarning(withheldNotice)
             }
 
             if let unclassifiedNotice = bucketResult.unclassifiedNotice {
-                catalogWarning(unclassifiedNotice, systemImage: "exclamationmark.triangle")
+                catalogWarning(unclassifiedNotice)
             }
 
             TimelineView(.periodic(from: .now, by: 30)) { timeline in
@@ -654,23 +671,34 @@ private struct ChatToolCatalogSection: View {
             }
 
             if bucketResult.buckets.isEmpty {
-                NativeEmptyState(
-                    title: "No Usable Chat Tool Rows",
-                    detail: catalog.tools.isEmpty
-                        ? "The last successfully loaded catalog contained no tools. Refresh to obtain a current catalog receipt."
-                        : "The live catalog returned \(catalog.tools.count) row\(catalog.tools.count == 1 ? "" : "s"), but none had a unique non-empty tool identity.",
-                    systemImage: "exclamationmark.triangle"
-                )
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("No usable chat tool rows")
+                        .font(ShellType.bodySemibold)
+                        .foregroundStyle(NativeAgentShell.text)
+                    Text(catalog.tools.isEmpty
+                        ? "The last catalog that loaded contained no tools. Refresh to get a current one."
+                        : "The live catalog returned \(catalog.tools.count) row\(catalog.tools.count == 1 ? "" : "s"), but none had a unique, non-empty tool identity.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else if filteredBuckets.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("No tools match this search", systemImage: "magnifyingglass")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("No tools match this search")
+                        .font(ShellType.bodySemibold)
+                        .foregroundStyle(NativeAgentShell.text)
                     Text("Try another name or description, or clear the search to browse the loaded catalog.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     Button("Clear search") { searchState.setQuery("") }
                         .buttonStyle(.borderless)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
                 .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 ForEach(filteredBuckets) { bucket in
                     bucketView(bucket)
@@ -679,60 +707,76 @@ private struct ChatToolCatalogSection: View {
         }
     }
 
-    private func catalogWarning(_ detail: String, systemImage: String) -> some View {
-        Label(detail, systemImage: systemImage)
-            .font(.caption)
-            .foregroundStyle(.orange)
-            .padding(8)
+    private func catalogWarning(_ detail: String) -> some View {
+        Text(detail)
+            .font(ShellType.label)
+            .foregroundStyle(NativeAgentShell.trouble)
+            .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func fullMacBanner(_ banner: ToolsFullMacBannerPresentation.State) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: banner.systemImage)
-                .foregroundStyle(NativeAgentTheme.statusColor(banner.status))
-                .font(.title3)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(banner.title)
-                    .font(.subheadline.weight(.semibold))
-                Text(banner.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button("Open Trust Center") { jumpToTrust() }
-                    .buttonStyle(.link)
-                    .font(.caption)
-            }
-            Spacer()
+        VStack(alignment: .leading, spacing: 2) {
+            Text(banner.title)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(bannerColor(banner.status))
+            Text(banner.detail)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Open the Trust page") { jumpToTrust() }
+                .buttonStyle(.link)
+                .font(ShellType.label)
         }
-        .padding(10)
-        .background(NativeAgentTheme.statusColor(banner.status).opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .fill(TodayPalette.cardFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+        )
+    }
+
+    private func bannerColor(_ status: String) -> Color {
+        switch status.lowercased() {
+        case "ok", "active", "ready": NativeAgentShell.calm
+        case "warn", "warning", "fail", "failed", "error": NativeAgentShell.trouble
+        default: NativeAgentShell.text
+        }
     }
 
     @ViewBuilder
     private func bucketView(_ bucket: ChatToolCatalogPresentation.Bucket) -> some View {
-        DisclosureGroup(isExpanded: bucketExpandedBinding(bucket.id)) {
-            VStack(alignment: .leading, spacing: 0) {
+        // A bare fold: the chevron, the words, the count. The plate the rows
+        // used to sit on and the rules between them are gone.
+        ToolsFold(isExpanded: bucketExpandedBinding(bucket.id)) {
+            HStack(spacing: 8) {
+                Text(bucket.title)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Text("\(bucket.tools.count)")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 12) {
                 ForEach(bucket.tools) { tool in
                     toolRow(tool)
-                    if tool.id != bucket.tools.last?.id {
-                        Divider()
-                    }
                 }
             }
-            .padding(.vertical, 6)
-            .padding(.horizontal, 10)
-            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
-            .padding(.top, 6)
-        } label: {
-            HStack {
-                Label(bucket.title, systemImage: bucket.icon)
-                    .font(.headline)
-                Spacer()
-                Text("\(bucket.tools.count)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(TodayPalette.cardFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+            )
         }
     }
 
@@ -748,12 +792,14 @@ private struct ChatToolCatalogSection: View {
     @ViewBuilder
     private func toolRow(_ tool: ChatCatalogTool) -> some View {
         let isExpanded = expanded.contains(tool.id)
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                // A tool name IS a code, so it takes `ShellType.code`.
                 Text(tool.name)
-                    .font(.system(.body, design: .monospaced))
+                    .font(ShellType.code)
+                    .foregroundStyle(NativeAgentShell.text)
                     .textSelection(.enabled)
-                Spacer()
+                Spacer(minLength: 8)
                 statusBadge(for: tool)
                 ChatToolDetailsButton(toolName: tool.name, isExpanded: Binding(
                     get: { expanded.contains(tool.id) },
@@ -763,44 +809,36 @@ private struct ChatToolCatalogSection: View {
                 ))
             }
             Text(tool.description)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
                 .lineLimit(isExpanded ? nil : 2)
+                .fixedSize(horizontal: false, vertical: isExpanded)
                 .textSelection(.enabled)
             if isExpanded {
                 if let params = tool.parametersPreview {
-                    Text("params: \(params)")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                    Text("Takes \(params)")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                         .textSelection(.enabled)
                 }
                 if let via = tool.dispatchableVia {
-                    Text("via: \(via)")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                    Text("Runs through \(via)")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                         .textSelection(.enabled)
                 }
             }
         }
-        .padding(.vertical, 6)
+        .frame(minHeight: 48, alignment: .top)
     }
 
     @ViewBuilder
     private func statusBadge(for tool: ChatCatalogTool) -> some View {
         let badge = ChatToolCatalogPresentation.toolStatusBadge(for: tool, in: catalog)
-        Label(badge.title, systemImage: badge.systemImage)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(statusColor(badge.tone))
+        Text(badge.title)
+            .font(ShellType.captionSemibold)
+            .foregroundStyle(ToolsStatusTone.color(badge.tone))
             .accessibilityLabel(badge.title)
-    }
-
-    private func statusColor(_ tone: ChatToolCatalogPresentation.ToolStatusBadgeTone) -> Color {
-        switch tone {
-        case .positive: .green
-        case .neutral: .secondary
-        case .warning: .orange
-        case .danger: .red
-        }
     }
 }
 
@@ -894,19 +932,11 @@ private struct AuthoredToolsSection: View {
     @State private var quarantineCandidate: ToolRecord?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Authored Tools (Self-Improvement)")
-                .font(.title2.weight(.semibold))
+        ToolsSection(title: "Tools the agent wrote") {
             ForEach(tools) { tool in
                 authoredRow(tool)
-                    .padding(.vertical, 6)
-                if tool.id != tools.last?.id {
-                    Divider()
-                }
             }
         }
-        .padding(10)
-        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
         .confirmationDialog(
             "Quarantine \(quarantineCandidate?.name ?? "tool")?",
             isPresented: Binding(
@@ -928,62 +958,68 @@ private struct AuthoredToolsSection: View {
 
     @ViewBuilder
     private func authoredRow(_ tool: ToolRecord) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
                 Text(tool.name)
-                    .font(.headline)
-                Spacer()
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: 8)
                 let badge = AuthoredToolPresentation.statusBadge(for: tool)
-                Label(badge.title, systemImage: badge.systemImage)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(statusColor(badge.tone))
+                Text(badge.title)
+                    .font(ShellType.captionSemibold)
+                    .foregroundStyle(ToolsStatusTone.color(badge.tone))
             }
             Text(tool.description)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.text)
+                .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             if !tool.triggers.isEmpty {
                 Text(tool.triggers.joined(separator: ", "))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .textSelection(.enabled)
             }
-            HStack {
+            HStack(spacing: 8) {
                 if tool.autoCreated == true {
-                    Label("Auto-created", systemImage: "wand.and.stars")
+                    Text("Written by the agent")
                 }
                 if tool.autoRun == true {
-                    Label("Auto-run", systemImage: "bolt.fill")
+                    Text("Runs on its own")
                 }
-                Label(tool.validationStatus ?? "untested", systemImage: validationIcon(tool.validationStatus))
-                Label("Used \(tool.useCount ?? 0)", systemImage: "hammer")
+                Text(tool.validationStatus ?? "untested")
+                Text("Used \(tool.useCount ?? 0) times")
             }
-            .font(.caption)
-            .foregroundStyle(.tertiary)
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.tertiary)
 
             if let permissions = tool.permissions, !permissions.isEmpty {
                 Text("Permissions: \(permissions.joined(separator: ", "))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
             if let errors = tool.validationErrors, !errors.isEmpty {
                 Text(errors.joined(separator: " "))
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
             if let path = tool.activePath ?? tool.proposalPath ?? tool.quarantinePath {
-                Text(path)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                Text(UserDisplayFormatters.tildifyPath(path))
+                    .font(ShellType.code)
+                    .foregroundStyle(NativeAgentShell.tertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
             }
 
-            HStack {
+            HStack(spacing: 8) {
                 let actionCatalog = AuthoredToolPresentation.actionCatalog(for: tool)
                 if let approval = actionCatalog.first(where: { $0.action == .approve }) {
-                    Button(approval.title, systemImage: "checkmark.seal") {
+                    Button(approval.title) {
                         Task { await appModel.promoteTool(tool, userRequested: true) }
                     }
                     .disabled(!approval.isEnabled)
@@ -991,39 +1027,103 @@ private struct AuthoredToolsSection: View {
                     .help(approval.help ?? "")
                     if let refusal = approval.refusal {
                         Text(refusal)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .font(ShellType.caption)
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
                 }
                 let autoRun = actionCatalog.first(where: { $0.action == .autoRun })!
-                Button(autoRun.title, systemImage: tool.autoRun == true ? "pause.circle" : "play.circle") {
+                Button(autoRun.title) {
                     Task { await appModel.setToolAutoRun(tool, autoRun: !(tool.autoRun ?? false)) }
                 }
                 .disabled(!autoRun.isEnabled)
                 let quarantine = actionCatalog.first(where: { $0.action == .quarantine })!
-                Button(quarantine.title, systemImage: "exclamationmark.triangle") {
+                Button(quarantine.title) {
                     quarantineCandidate = tool
                 }
                 .disabled(!quarantine.isEnabled)
             }
             .buttonStyle(.borderless)
+            .font(ShellType.label)
+            .padding(.top, 4)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
+}
 
-    private func statusColor(_ tone: ChatToolCatalogPresentation.ToolStatusBadgeTone) -> Color {
+// MARK: - Page kit (2026-09-03 Advanced refinement)
+
+/// One tone table for both tool lists. Four states, three room colours.
+private enum ToolsStatusTone {
+    static func color(_ tone: ChatToolCatalogPresentation.ToolStatusBadgeTone) -> Color {
         switch tone {
-        case .positive: .green
-        case .neutral: .secondary
-        case .warning: .orange
-        case .danger: .red
+        case .positive: NativeAgentShell.calm
+        case .neutral: NativeAgentShell.secondary
+        case .warning, .danger: NativeAgentShell.trouble
         }
     }
+}
 
-    private func validationIcon(_ status: String?) -> String {
-        switch status {
-        case "valid": "checkmark.seal"
-        case "failed": "exclamationmark.triangle"
-        default: "questionmark.circle"
+/// One section of the page: the eyebrow the Advanced list uses, and the rows
+/// under it on one card.
+private struct ToolsSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .padding(.horizontal, 2)
+            VStack(alignment: .leading, spacing: 12) { content }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .fill(TodayPalette.cardFill)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                )
+        }
+    }
+}
+
+/// A bare fold: a chevron, the words, one gesture, and Reduce Motion honoured.
+private struct ToolsFold<Label: View, Content: View>: View {
+    @Binding var isExpanded: Bool
+    @ViewBuilder var label: Label
+    @ViewBuilder var content: Content
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(ShellType.captionSemibold)
+                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    label
+                    Spacer(minLength: 8)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+
+            if isExpanded {
+                content
+                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+            }
         }
     }
 }

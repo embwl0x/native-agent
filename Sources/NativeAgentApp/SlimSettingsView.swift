@@ -4,6 +4,9 @@ import SwiftUI
 import Context
 import NativeAgentShared
 import NativeAgentCore
+// Personality depth item 9: the `studioWanderEnabled` key lives with the lane
+// law, so the switch and the lane can never disagree about its spelling.
+import BackgroundLoops
 
 /// One canonical owner for each live operational control. Views consume these
 /// labels rather than repeating storage-oriented wording, which keeps a
@@ -191,20 +194,33 @@ struct SoftwareUpdateRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label(state.title, systemImage: state.systemImage)
-                .foregroundStyle(NativeAgentTheme.statusColor(state.status))
-                .fontWeight(.semibold)
+            Text(state.title)
+                .font(ShellType.labelSemibold)
+                .foregroundStyle(SettingsInk.status(state.status))
             Text(state.detail)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
-            Button(action: onCheck) {
-                Label(actionTitle, systemImage: state.systemImage)
-            }
-            .disabled(!state.actionEnabled)
-            .accessibilityIdentifier("settings.softwareUpdate.check")
+            Button(actionTitle, action: onCheck)
+                .disabled(!state.actionEnabled)
+                .accessibilityIdentifier("settings.softwareUpdate.check")
         }
         .accessibilityIdentifier("settings.softwareUpdate.row")
+    }
+}
+
+/// The page's colour roles. `NativeAgentTheme` still answers in SwiftUI's own
+/// green/orange/red, which are not the shell's felt-state colours and do not
+/// carry their light-appearance contrast work — every status word on this page
+/// goes through here instead.
+private enum SettingsInk {
+    static func status(_ status: String?) -> Color {
+        switch status {
+        case "ok": NativeAgentShell.calm
+        case "warn", "fail": NativeAgentShell.trouble
+        default: NativeAgentShell.secondary
+        }
     }
 }
 
@@ -239,7 +255,7 @@ struct SlimSettingsView: View {
     @State private var updateController = UpdateController.shared
     @AppStorage("nativeagent.showTour") private var showTour = false
     @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
-    @AppStorage("nativeagent.darkMode") private var preferDark = false
+    @AppStorage("nativeagent.darkMode") private var preferDark = true
     // User-selected transcript threshold ceiling. The shared compactor clamps
     // this to 40% of the active model window so smaller-window models compact
     // before the configured ceiling becomes unsafe.
@@ -248,108 +264,79 @@ struct SlimSettingsView: View {
     // Cognition, …) behind an explicit preference. Off on fresh installs. Purely
     // a UI-visibility preference — NOT Trust Center's developerMode policy.
     @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
-    @AppStorage(NativeExperiencePreferences.masterKey) private var experienceEnabled = false
-    @AppStorage(NativeExperiencePreferences.journeyKey) private var journeyEnabled = true
-    @AppStorage(NativeExperiencePreferences.contextKey) private var experienceContextEnabled = true
-    @AppStorage(NativeExperiencePreferences.projectsKey) private var experienceProjectsEnabled = true
-    @AppStorage(NativeExperiencePreferences.automationsKey) private var experienceAutomationsEnabled = true
-    @AppStorage(NativeExperiencePreferences.capabilitiesKey) private var experienceCapabilitiesEnabled = true
-    @AppStorage(NativeExperiencePreferences.lineageKey) private var experienceLineageEnabled = true
-    @AppStorage(NativeExperiencePreferences.workbenchKey) private var experienceWorkbenchEnabled = true
-    @AppStorage(NativeExperiencePreferences.diagnosticsKey) private var experienceDiagnosticsEnabled = true
-    @AppStorage(NativeExperiencePreferences.kitsKey) private var experienceKitsEnabled = true
-    @AppStorage(NativeExperiencePreferences.remoteNodesKey) private var experienceRemoteNodesEnabled = true
-    @AppStorage(NativeExperiencePreferences.skillEvolutionKey) private var experienceSkillEvolutionEnabled = true
     // 2026-07-23 B2.6c: Subconscious + Embeddings are power-user internals a
     // stranger never touches; they collapse behind this persisted Advanced
     // disclosure. Attention flags let an error/partial state still surface a
     // warn badge on the collapsed header (CapabilitiesView collapsedCard idiom).
     @AppStorage("nativeagent.settingsShowAdvanced") private var showAdvancedSettings = false
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
     @State private var embeddingsAttention = false
     @State private var subconsciousAttention = false
-    @State private var confirmClassicPresentation = false
     @State private var dataLimitsFailure: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     NavigationLink(value: SlimSettingsPairDeviceLink.destination) {
-                        Label(
-                            SlimSettingsPairDeviceLink.title,
-                            systemImage: SlimSettingsPairDeviceLink.systemImage
-                        )
+                        Text(SlimSettingsPairDeviceLink.title)
+                            .font(ShellType.labelSemibold)
+                            .foregroundStyle(NativeAgentShell.text)
                     }
                     .accessibilityHint(SlimSettingsPairDeviceLink.accessibilityHint)
                 } header: {
-                    Text("Devices")
+                    SettingsEyebrow("Devices")
                 }
 
                 Section {
                     let telegramLink = SlimSettingsTelegramLink.presentation
                     NavigationLink(value: telegramLink.destination) {
-                        Label(
-                            telegramLink.title,
-                            systemImage: telegramLink.systemImage
-                        )
+                        Text(telegramLink.title)
+                            .font(ShellType.labelSemibold)
+                            .foregroundStyle(NativeAgentShell.text)
                     }
                     .accessibilityHint(telegramLink.accessibilityHint)
                     .accessibilityIdentifier("settings.telegram-link")
                 } header: {
-                    Text("Integrations")
+                    SettingsEyebrow("Integrations")
                 }
 
                 Section {
-                    Toggle("Prefer Dark Appearance", isOn: $preferDark)
-                    Toggle("Show Developer Surfaces", isOn: $showDeveloperSurfaces)
-                } header: {
-                    Text("Appearance")
-                } footer: {
-                    Text("Reveals internal tabs — Capabilities, Knowledge Graph, Dreams, Diagnostics (home of the Cognition and Inspector segments), Inbox Policy, and MCP — in the sidebar's Advanced group and the Cmd+K palette. Off by default; deep links to these still resolve.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-
-                Section {
-                    Toggle("Native Experience", isOn: $experienceEnabled)
-
-                    if experienceEnabled {
-                        Toggle("Learning journey", isOn: $journeyEnabled)
-                        Toggle("Context economics", isOn: $experienceContextEnabled)
-                        Toggle("Project spaces", isOn: $experienceProjectsEnabled)
-                        Toggle("Automation blueprints", isOn: $experienceAutomationsEnabled)
-                        Toggle("Capability readiness", isOn: $experienceCapabilitiesEnabled)
-                        Toggle("Conversation lineage", isOn: $experienceLineageEnabled)
-                        Toggle("Native workbench", isOn: $experienceWorkbenchEnabled)
-                        Toggle("Diagnostic observer", isOn: $experienceDiagnosticsEnabled)
-                        Toggle("Capability Kits", isOn: $experienceKitsEnabled)
-                        Toggle("Skill evolution", isOn: $experienceSkillEvolutionEnabled)
-                        Toggle("Trusted remote nodes", isOn: $experienceRemoteNodesEnabled)
-
-                        Button("Return to Classic NativeAgent", role: .destructive) {
-                            confirmClassicPresentation = true
-                        }
+                    SettingsSwitch("Prefer Dark Appearance", isOn: $preferDark)
+                    // User, 2026-09-04: the new shell shows every surface; the
+                    // switch only means something on the classic sidebar.
+                    if classicShell {
+                        SettingsSwitch("Show Developer Surfaces", isOn: $showDeveloperSurfaces)
                     }
+                    // ui-simplify 2026-09-02 (Lane A): the kill switch, made
+                    // reachable. ON restores the previous sidebar, session
+                    // list, chat chrome and composer exactly as they were.
+                    SettingsSwitch("Use the classic sidebar", isOn: $classicShell)
+                        .accessibilityIdentifier("settings.classic-shell-toggle")
+                        .accessibilityHint("Restores the previous sidebar, session list, and chat layout")
                 } header: {
-                    Text("NativeAgent Experience")
+                    SettingsEyebrow("Appearance")
                 } footer: {
-                    Text("Adds optional native views over existing NativeAgent owners. It does not change chat, models, memory, Fluid Context, the subconscious, the organism, trust, or background work. Return to Classic hides every addition without deleting data, tool loadouts, versions, receipts, or schedules you created.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                    SettingsFootnote("Developer surfaces reveal the internal pages — Capabilities, Knowledge Graph, Dreams, Diagnostics, Inbox Policy and MCP — under Advanced and in the command palette. Off by default; a deep link to one still resolves.")
                 }
 
                 Section {
                     HotkeyControlView()
                 } header: {
-                    Text("Global Shortcut")
+                    SettingsEyebrow("Global shortcut")
                 }
 
                 Section {
-                    HStack {
-                        Label("Auto-compact threshold", systemImage: "rectangle.compress.vertical")
+                    HStack(spacing: 8) {
+                        Text("Auto-compact threshold")
+                            .font(ShellType.labelSemibold)
+                            .foregroundStyle(NativeAgentShell.text)
                             .accessibilityHidden(true)
-                        Spacer()
+                        Spacer(minLength: 8)
                         Text(formatThresholdTokens(compactionThresholdTokens))
-                            .font(.system(.body, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                            .font(ShellType.label.monospaced())
+                            .foregroundStyle(NativeAgentShell.secondary)
                             .accessibilityHidden(true)
                         Stepper("Auto-compact threshold",
                                 value: $compactionThresholdTokens,
@@ -367,49 +354,15 @@ struct SlimSettingsView: View {
                             .accessibilityHint("Adjusts the maximum chat transcript size before automatic compaction")
                     }
                 } header: {
-                    Text("Chat")
+                    SettingsEyebrow("Chat")
                 } footer: {
-                    Text("Maximum transcript size before automatic compaction. Models with smaller context windows compact earlier at 40% of their window. Default ceiling is 200k.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-
-                // Swift-native Memory (CoreML embeddings) + Subconscious
-                // background loops — power-user internals, collapsed behind an
-                // Advanced disclosure (B2.6c). An error/partial state in either
-                // block still raises a warn badge on the collapsed header.
-                Section {
-                    Button {
-                        withAnimation(.snappy) { showAdvancedSettings.toggle() }
-                    } label: {
-                        HStack(spacing: 8) {
-                            Label("Advanced", systemImage: "slider.horizontal.3")
-                            Spacer()
-                            if !showAdvancedSettings, embeddingsAttention || subconsciousAttention {
-                                StatusBadge(text: "Needs attention", status: "warn")
-                            }
-                            Image(systemName: showAdvancedSettings ? "chevron.down" : "chevron.right")
-                                .foregroundStyle(.secondary)
-                                .font(.caption)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.naFeel)
-                } footer: {
-                    Text("Semantic memory embeddings and the Subconscious background loops. Most people never need to change these.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-
-                if showAdvancedSettings {
-                    EmbeddingsSettingsSection(attention: $embeddingsAttention)
-                    SubconsciousSettingsSection(attention: $subconsciousAttention)
+                    SettingsFootnote("The largest a transcript grows before it is compacted. A model with a smaller context window compacts earlier, at 40% of that window. The default ceiling is 200k.")
                 }
 
                 Section {
-                    Button {
+                    Button("Replay the onboarding tour") {
                         showTour = true
                         tourReplayCoordinator.requestReplay()
-                    } label: {
-                        Label("Replay Onboarding Tour", systemImage: "map")
                     }
                     Button {
                         let outcome = SlimSettingsDataLimitsReference.open(
@@ -426,10 +379,10 @@ struct SlimSettingsView: View {
                             dataLimitsFailure = failure
                         }
                     } label: {
-                        Label("Show data limits", systemImage: "ruler")
+                        Text("Show data limits")
                     }
                 } header: {
-                    Text("Help & Reference")
+                    SettingsEyebrow("Help and reference")
                 }
 
                 Section {
@@ -439,9 +392,14 @@ struct SlimSettingsView: View {
                     // identical and a bug report could not name the bytes.
                     // Copyable, because the point is pasting it into a report.
                     let identity = NativeAgentBuildIdentity.current
-                    LabeledContent("Version") {
+                    HStack(spacing: 8) {
+                        Text("Version")
+                            .font(ShellType.labelSemibold)
+                            .foregroundStyle(NativeAgentShell.text)
+                        Spacer(minLength: 8)
                         Text(Self.buildIdentityLine(identity))
-                            .font(.system(.caption, design: .monospaced))
+                            .font(ShellType.label.monospaced())
+                            .foregroundStyle(NativeAgentShell.secondary)
                             .textSelection(.enabled)
                     }
                     .contextMenu {
@@ -464,25 +422,109 @@ struct SlimSettingsView: View {
                         runtimeOK: appModel.health?.ok,
                         lastRefreshError: appModel.lastRefreshError
                     )
-                    LabeledContent("Runtime") {
-                        VStack(alignment: .trailing, spacing: 2) {
-                            Label(runtimeStatus.text, systemImage: runtimeStatus.systemImage)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 8) {
+                            Text("Runtime")
+                                .font(ShellType.labelSemibold)
+                                .foregroundStyle(NativeAgentShell.text)
+                            Spacer(minLength: 8)
+                            Text(runtimeStatus.text)
+                                .font(ShellType.label)
                                 .foregroundStyle(runtimeStatusColor(runtimeStatus.tone))
-                            if let detail = runtimeStatus.detail {
-                                Text(detail)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .multilineTextAlignment(.trailing)
-                                    .textSelection(.enabled)
-                            }
+                                .multilineTextAlignment(.trailing)
                         }
-                        .accessibilityLabel("Runtime status: \(runtimeStatus.text)")
+                        if let detail = runtimeStatus.detail {
+                            Text(detail)
+                                .font(ShellType.caption)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                        }
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Runtime status: \(runtimeStatus.text)")
                 } header: {
-                    Text("About")
+                    SettingsEyebrow("About")
+                }
+
+                // ui-simplify 2026-09-02 (Lane A): ONE Advanced door, at the
+                // bottom, and everything that used to compete for sidebar space
+                // is behind it — the four setup pages that were primary tabs
+                // (Skills & Tools, Providers, Trust, Mac Integration), the old
+                // Advanced group, and the two power-user blocks that were
+                // already collapsed here. Nothing was removed and no view was
+                // forked: each row pushes the SAME page ContentView renders,
+                // and the Developer Surfaces gate is unchanged.
+                // User, 2026-09-04: the Advanced door exists for the classic
+                // sidebar; the new shell's Settings page carries every card.
+                if classicShell {
+                Section {
+                    Button {
+                        withAnimation(
+                            NativeAgentMotion.respecting(
+                                ShellFoldMotion.open,
+                                reduceMotion: reduceMotion
+                            )
+                        ) { showAdvancedSettings.toggle() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("Advanced")
+                                .font(ShellType.labelSemibold)
+                                .foregroundStyle(NativeAgentShell.text)
+                            Spacer(minLength: 8)
+                            if !showAdvancedSettings, embeddingsAttention || subconsciousAttention {
+                                StatusBadge(text: "Needs attention", status: "warn")
+                            }
+                            Image(systemName: showAdvancedSettings ? "chevron.down" : "chevron.right")
+                                .foregroundStyle(NativeAgentShell.tertiary)
+                                .font(ShellType.captionSemibold)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.naFeel)
+                    .accessibilityIdentifier("settings.advanced.disclosure")
+                    .accessibilityValue(
+                        SidebarAdvancedDisclosurePresentation
+                            .accessibilityValue(isExpanded: showAdvancedSettings)
+                    )
+
+                    // User, 2026-09-04: the new shell's pages are on the rail;
+                    // only the classic sidebar still opens them from here.
+                    if showAdvancedSettings, classicShell {
+                        ForEach(
+                            SidebarItem.visibleAdvancedItems(
+                                developerSurfacesEnabled: showDeveloperSurfaces
+                            )
+                        ) { item in
+                            NavigationLink(
+                                value: SlimSettingsNavigationDestination.advanced(item)
+                            ) {
+                                Text(item.displayName)
+                                    .font(ShellType.labelSemibold)
+                                    .foregroundStyle(NativeAgentShell.text)
+                            }
+                            .accessibilityIdentifier("settings.advanced.page.\(item.rawValue)")
+                        }
+                    }
+                } footer: {
+                    SettingsFootnote(classicShell
+                        ? "Skills, providers, trust, Mac access, and the internals. Set once; most people never come back."
+                        : "Embeddings and the subconscious. Set once; most people never come back.")
+                }
+                }
+
+                // User, 2026-09-04: in the new shell these live on the Settings
+                // page as cards; the classic sidebar keeps them here.
+                if showAdvancedSettings, classicShell {
+                    EmbeddingsSettingsSection(attention: $embeddingsAttention)
+                    SubconsciousSettingsSection(attention: $subconsciousAttention)
                 }
             }
             .formStyle(.grouped)
+            // The page renders inside the shell's room as well as in the
+            // Settings window; without this the Form paints its own slab over
+            // the glass (`ShellPageFrame`, SetupView.swift).
+            .scrollContentBackground(.hidden)
             .navigationDestination(for: SlimSettingsNavigationDestination.self) { destination in
                 SlimSettingsDestinationView(destination: destination)
             }
@@ -495,19 +537,6 @@ struct SlimSettingsView: View {
             .task(id: showAdvancedSettings) {
                 guard !showAdvancedSettings else { return }
                 await seedEmbeddingsAttention()
-            }
-            .confirmationDialog(
-                "Return to the classic NativeAgent presentation?",
-                isPresented: $confirmClassicPresentation,
-                titleVisibility: .visible
-            ) {
-                Button("Return to Classic", role: .destructive) {
-                    NativeExperiencePreferences.returnToClassic()
-                    experienceEnabled = false
-                }
-                Button("Keep Native Experience", role: .cancel) {}
-            } message: {
-                Text("Only the optional presentation is removed. NativeAgent's capabilities and living runtime stay exactly as they are.")
             }
             .alert(
                 "Can’t open data limits",
@@ -537,10 +566,9 @@ struct SlimSettingsView: View {
 
     private func runtimeStatusColor(_ tone: SlimSettingsStatusLinePresentation.Tone) -> Color {
         switch tone {
-        case .neutral: .secondary
-        case .success: NativeAgentTheme.ok
-        case .warning: NativeAgentTheme.warn
-        case .failure: NativeAgentTheme.fail
+        case .neutral: NativeAgentShell.secondary
+        case .success: NativeAgentShell.calm
+        case .warning, .failure: NativeAgentShell.trouble
         }
     }
 
@@ -563,7 +591,54 @@ struct SlimSettingsDestinationView: View {
             MacPairingView()
         case .telegramSettings:
             TelegramView()
+        case .advancedPage(let item):
+            AdvancedSettingsPage(item: item)
         }
+    }
+}
+
+/// ui-simplify 2026-09-02 (Lane A): the pages that left the sidebar, rendered
+/// unchanged. This is deliberately a one-to-one map onto the SAME views
+/// ContentView's detail switch renders — moving a page behind the Advanced door
+/// must not fork it into a second implementation. Anything not in the Advanced
+/// set falls back to Settings' own root rather than inventing a page.
+struct AdvancedSettingsPage: View {
+    let item: SidebarItem
+    /// Skills & Tools owns a two-way segment. Behind the Advanced door it keeps
+    /// working; a `.constant` binding would freeze it on Skills.
+    @SceneStorage("advancedSkillsToolsSection") private var skillsSectionRaw = SkillsToolsSection.skills.rawValue
+
+    private var skillsSection: Binding<SkillsToolsSection> {
+        Binding(
+            get: { SkillsToolsSection(rawValue: skillsSectionRaw) ?? .skills },
+            set: { skillsSectionRaw = $0.rawValue }
+        )
+    }
+
+    var body: some View {
+        Group {
+            switch item.normalized {
+            case .skills: SkillsToolsView(selection: skillsSection)
+            case .providers: ProviderSettingsView()
+            case .trust: TrustCenterView()
+            case .macIntegration: MacIntegrationView()
+            case .personality: PersonalityView()
+            case .connectors: ConnectorsView()
+            case .capabilities: CapabilitiesView()
+            case .knowledge: KnowledgeGraphView()
+            case .dreams: DreamsView()
+            case .diagnostics: DiagnosticsView()
+            case .inboxPolicy: InboxSettingsView()
+            case .mcp: MCPHubView()
+            default:
+                NativeEmptyState(
+                    title: "That page moved",
+                    detail: "It is reachable from the command palette (Command-K).",
+                    systemImage: "questionmark.circle"
+                )
+            }
+        }
+        .navigationTitle(item.displayName)
     }
 }
 
@@ -592,6 +667,11 @@ private struct SubconsciousSettingsSection: View {
     @AppStorage("contextFlowMode") private var contextFlowMode = ContextFlowMode.shadow.rawValue
     @AppStorage("cognitiveSubstrateReflectionModel") private var subconsciousModel = "claude-opus-4-8"
     @AppStorage("cognitiveSubstrateReflectionProvider") private var subconsciousProvider = ""
+    // Personality depth item 9 — HER HOUR. Default false, deliberately, in
+    // every build: an install that never opened this page never spends an hour
+    // of hers, and a public-safe build before onboarding cannot install the lane
+    // at all (NativeAgentPublicSafety, checked again at the lane).
+    @AppStorage(StudioWanderLane.enabledDefaultsKey) private var studioWanderEnabled = false
     @State private var savingToggle = false
     @State private var savingContextFlow = false
     @State private var savingModel = false
@@ -603,38 +683,56 @@ private struct SubconsciousSettingsSection: View {
 
     var body: some View {
         Section {
-            Toggle(isOn: Binding(
+            SettingsSwitch("Subconscious", isOn: Binding(
                 get: { subconsciousEnabled },
                 set: { enabled in Task { await setSubconsciousEnabled(enabled) } }
-            )) {
-                Label("Subconscious", systemImage: "sparkles")
-            }
+            ))
             .disabled(savingToggle)
+
+            // HER HOUR (personality depth item 9; User, 2026-09-02: "give it to
+            // her"). A plain switch, no schedule to configure and no cadence to
+            // tune — those are hers, not settings. Off means the lane is NOT
+            // INSTALLED, not silently skipped: nothing is read and nothing is
+            // written while this is off. Disabled with the master because the
+            // hour is background cognition and cannot outlive it.
+            SettingsSwitch("\(appModel.agentDisplayName)'s hour", isOn: Binding(
+                get: { studioWanderEnabled },
+                set: { enabled in
+                    studioWanderEnabled = enabled
+                    Task { await NativeCognitionRuntime.reloadStudioWanderInstallation() }
+                }
+            ))
+            .disabled(savingToggle || !subconsciousEnabled)
+
+            SettingsFootnote("At most once a day, when nothing is happening, \(appModel.agentDisplayName) spends an hour on something of \(appModel.agentDisplayName)'s own choosing — or decides not to. Nothing is scheduled, nothing is required, and nothing is written unless \(appModel.agentDisplayName) writes it. Pick the model under Providers ▸ Studio Wandering.")
 
             Picker(OperationalSettingsControlPresentation.title(for: .fluidContext), selection: $contextFlowMode) {
                 ForEach([ContextFlowMode.active, .shadow, .off], id: \.self) { mode in
                     Text(contextFlowModeLabel(mode)).tag(mode.rawValue)
                 }
             }
+            .font(ShellType.label)
             .disabled(savingToggle || savingContextFlow)
             .onChange(of: contextFlowMode) { _, rawMode in
                 Task { await saveContextFlowMode(rawMode) }
             }
 
             if let contextFlowStatusText {
-                Text(contextFlowStatusText)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                SettingsFootnote(contextFlowStatusText)
             }
 
             if reflectionModelChoices.isEmpty {
-                LabeledContent("LLM") {
-                    Text("Connect a provider to choose a reflection model")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                HStack(spacing: 8) {
+                    Text("The mind for reflection")
+                        .font(ShellType.labelSemibold)
+                        .foregroundStyle(NativeAgentShell.text)
+                    Spacer(minLength: 8)
+                    Text("Connect a provider to choose one")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
                 }
             } else {
-                Picker("LLM", selection: Binding(
+                Picker("The mind for reflection", selection: Binding(
                     get: { pendingReflectionChoiceID ?? currentReflectionChoiceID },
                     set: { choiceID in
                         guard let choice = reflectionModelChoices.first(where: { $0.id == choiceID }) else {
@@ -649,15 +747,17 @@ private struct SubconsciousSettingsSection: View {
                             .tag(choice.id)
                     }
                 }
+                .font(ShellType.label)
                 .disabled(savingToggle || savingModel)
             }
 
-            HStack {
+            HStack(spacing: 8) {
                 let status = statusPresentation
-                Label(status.text, systemImage: status.systemImage)
-                    .font(.caption)
+                Text(status.text)
+                    .font(ShellType.label)
                     .foregroundStyle(statusColor(status.tone))
-                Spacer()
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
                 if savingToggle || savingContextFlow || savingModel {
                     ProgressView().controlSize(.small)
                 }
@@ -665,23 +765,23 @@ private struct SubconsciousSettingsSection: View {
 
             if let detail = statusPresentation.detail {
                 Text(detail)
-                    .font(.caption2)
+                    .font(ShellType.caption)
                     .foregroundStyle(statusColor(statusPresentation.tone))
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
 
             if let errorMessage {
                 Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
         } header: {
-            Text("Subconscious")
+            SettingsEyebrow("Subconscious")
         } footer: {
-            Text("When on, \(appModel.agentDisplayName) keeps bounded Swift-native cognitive background loops active and uses the selected model for budgeted reflection.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            SettingsFootnote("When on, \(appModel.agentDisplayName) keeps bounded background loops running and uses the selected mind for budgeted reflection.")
         }
         .task {
             if appModel.modelCatalog == nil {
@@ -741,9 +841,14 @@ private struct SubconsciousSettingsSection: View {
     }
 
     private var effectiveSubconsciousProvider: String {
+        // User, 2026-09-06: the routing snapshot is the authority for BOTH
+        // halves of this row. Preferring the stored preference key here while
+        // the model reader preferred the live route paired a stale provider
+        // with the live model, so the picker named a combination that never
+        // runs. Same order as `effectiveSubconsciousModel` now.
+        if let live = reflectionRouteStatus?.providerID, !live.isEmpty { return live }
         let stored = subconsciousProvider.trimmingCharacters(in: .whitespacesAndNewlines)
         if !stored.isEmpty { return stored }
-        if let live = reflectionRouteStatus?.providerID, !live.isEmpty { return live }
         return NativeCognitionRuntime.inferredReflectionProvider(for: effectiveSubconsciousModel)
     }
 
@@ -775,14 +880,12 @@ private struct SubconsciousSettingsSection: View {
 
     private func statusColor(_ tone: SlimSettingsSubconsciousStatusLine.Tone) -> Color {
         switch tone {
-        case .neutral:
-            .secondary
-        case .progress:
-            .secondary
+        case .neutral, .progress:
+            NativeAgentShell.secondary
         case .healthy:
-            .green
+            NativeAgentShell.calm
         case .warning, .unavailable:
-            .orange
+            NativeAgentShell.trouble
         }
     }
 
@@ -809,6 +912,13 @@ private struct SubconsciousSettingsSection: View {
             enabled,
             reflectionBudget: enabled ? max(1, reflectionBudget) : 0
         )
+        // Her hour cannot outlive the master, and installation is CACHED — so
+        // the master moving in either direction has to drop that cache or a
+        // lane that is no longer permitted keeps running on a stale
+        // `.installed` for the rest of the session. Turning the master off is
+        // the direction that matters; turning it on is invalidated for the same
+        // reason in reverse, so the switch below it takes effect immediately.
+        await NativeCognitionRuntime.reloadStudioWanderInstallation()
         await refreshReflectionRouteStatus()
         applySubconsciousRuntimeState(actual)
         let fullyActive = actual.enabled && actual.capsuleEnabled
@@ -1099,30 +1209,33 @@ struct EmbeddingsSettingsSection: View {
             if let s = status {
                 rows(for: s)
             } else if loading {
-                ProgressView("Checking memory backend…").controlSize(.small)
+                Text("Checking the memory backend.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
             } else {
-                Text("Status unavailable.")
-                    .foregroundStyle(.secondary).font(.caption)
+                Text("The memory backend did not report a status.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             if let err = errorMessage, actionControls.showsRetryMemoryStatus {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(err).foregroundStyle(.orange).font(.caption)
-                    Button {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(err)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Retry memory status") {
                         Task { await refreshStatus() }
-                    } label: {
-                        Label("Retry Memory Status", systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.naFeel)
-                    .font(.caption)
+                    .font(ShellType.label)
                     .disabled(loading)
                     .accessibilityIdentifier("settings.embeddings.retry-memory-status")
                 }
             }
         } header: {
-            Text("Memory")
+            SettingsEyebrow("Memory")
         } footer: {
-            Text("CoreML semantic embeddings run inside the Swift app for richer memory retrieval. No Python runtime or external install is required.")
-                .font(.caption2).foregroundStyle(.secondary)
+            SettingsFootnote("Semantic embeddings run inside the app for richer memory retrieval. No Python runtime or external install is required.")
         }
         .task {
             await refreshStatus()
@@ -1155,9 +1268,11 @@ struct EmbeddingsSettingsSection: View {
         let reindexState = s.reindexState?.state ?? "idle"
 
         // Row 1 — top-line status.
-        HStack {
-            Label("Advanced semantic embeddings", systemImage: "brain.head.profile")
-            Spacer()
+        HStack(spacing: 8) {
+            Text("Advanced semantic embeddings")
+                .font(ShellType.labelSemibold)
+                .foregroundStyle(NativeAgentShell.text)
+            Spacer(minLength: 8)
             statusBadge(for: s, installState: installState)
         }
 
@@ -1194,11 +1309,13 @@ struct EmbeddingsSettingsSection: View {
         let reindexState = s.reindexState?.state ?? "idle"
         switch installState {
         case "installing":
-            Label("Preparing…", systemImage: "arrow.down.circle")
-                .labelStyle(.titleAndIcon).foregroundStyle(.blue).font(.caption)
+            Text("Preparing…")
+                .font(ShellType.captionSemibold)
+                .foregroundStyle(NativeAgentShell.secondary)
         case "failed":
-            Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
-                .labelStyle(.titleAndIcon).foregroundStyle(.orange).font(.caption)
+            Text("Unavailable")
+                .font(ShellType.captionSemibold)
+                .foregroundStyle(NativeAgentShell.trouble)
         default:
             // gpt-5.5 review-4 STILL-NEEDS-FIX: badge branches on
             // `effectiveBackend` directly, not on `libraryAvailable`. The four
@@ -1213,19 +1330,25 @@ struct EmbeddingsSettingsSection: View {
                 // UI-6 (2026-08-01): "Fail-closed" is an internal term for the
                 // same thing the install-failure branch above already calls
                 // "Unavailable". One word, and it is the plain one.
-                Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
-                    .labelStyle(.titleAndIcon).foregroundStyle(.orange).font(.caption)
+                Text("Unavailable")
+                    .font(ShellType.captionSemibold)
+                    .foregroundStyle(NativeAgentShell.trouble)
             } else if reindexState == "running" {
-                Label("Indexing…", systemImage: "arrow.triangle.2.circlepath")
-                    .labelStyle(.titleAndIcon).foregroundStyle(.blue).font(.caption)
+                Text("Indexing…")
+                    .font(ShellType.captionSemibold)
+                    .foregroundStyle(NativeAgentShell.secondary)
             } else if s.effectiveBackend == "local" {
-                Label("Active", systemImage: "checkmark.circle.fill")
-                    .labelStyle(.titleAndIcon).foregroundStyle(.green).font(.caption)
+                Text("Active")
+                    .font(ShellType.captionSemibold)
+                    .foregroundStyle(NativeAgentShell.calm)
             } else if s.effectiveBackend == "hash" {
-                Label("Mock", systemImage: "circle.dashed")
-                    .labelStyle(.titleAndIcon).foregroundStyle(.secondary).font(.caption)
+                Text("Test vectors")
+                    .font(ShellType.captionSemibold)
+                    .foregroundStyle(NativeAgentShell.secondary)
             } else {
-                Text("Off").font(.caption).foregroundStyle(.secondary)
+                Text("Off")
+                    .font(ShellType.captionSemibold)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
         }
     }
@@ -1240,11 +1363,13 @@ struct EmbeddingsSettingsSection: View {
             // model identifiers moved down into the secondary line below,
             // which NativeClient fills from EmbeddingPlainCopy.technicalDetail.
             Text(EmbeddingPlainCopy.headline(.modelMissing))
-                .font(.caption).foregroundStyle(.secondary)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             if let detail = s.reindexState?.detail, !detail.isEmpty {
                 Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
                     .lineLimit(3)
             }
         }
@@ -1254,43 +1379,50 @@ struct EmbeddingsSettingsSection: View {
     private func installProgressView(state: EmbeddingsInstallState?) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             if let step = state?.currentStep, !step.isEmpty {
-                Text(step).font(.caption).foregroundStyle(.secondary)
+                Text(step)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             if let detail = state?.detail, !detail.isEmpty {
-                Text(detail).font(.caption2).foregroundStyle(.secondary)
+                Text(detail)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
                     .lineLimit(3)
                     .textSelection(.enabled)
             }
             let progress = max(0, min(100, state?.progress ?? 0))
             ProgressView(value: Double(progress), total: 100)
-            HStack {
-                Text("\(progress)%").font(.caption2).foregroundStyle(.secondary)
-                Spacer()
+            HStack(spacing: 8) {
+                Text("\(progress)%")
+                Spacer(minLength: 8)
                 Text("Safe to keep the app open while the model prepares.")
-                    .font(.caption2).foregroundStyle(.secondary)
             }
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.tertiary)
         }
     }
 
     @ViewBuilder
     private func failedInstallView(state: EmbeddingsInstallState?) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             if let err = state?.error {
-                Text("Install error: \(err)").font(.caption).foregroundStyle(.orange)
+                Text("Install error: \(err)")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let detail = state?.detail, !detail.isEmpty {
-                Text(detail).font(.caption2).foregroundStyle(.secondary)
-                    .lineLimit(3).textSelection(.enabled)
+                Text(detail)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
             }
             if actionControls.showsRetryStatus {
-                HStack {
-                    Button {
-                        Task { await refreshStatus() }
-                    } label: {
-                        Label("Retry status", systemImage: "arrow.clockwise")
-                    }
-                    .accessibilityIdentifier("settings.embeddings.retry-status")
+                Button("Retry status") {
+                    Task { await refreshStatus() }
                 }
+                .accessibilityIdentifier("settings.embeddings.retry-status")
             }
         }
     }
@@ -1298,12 +1430,14 @@ struct EmbeddingsSettingsSection: View {
     @ViewBuilder
     private func coreMLStatusRow(for s: EmbeddingsStatus) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Label("CoreML embeddings", systemImage: "cpu")
-                Spacer()
+            HStack(spacing: 8) {
+                Text("CoreML embeddings")
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: 8)
                 Text(s.modelName)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             // gpt-5.5 review-5 + review-6 STILL-NEEDS-FIX: branches keyed on
             // `effectiveBackend` (the badge layer's source of truth). The
@@ -1315,22 +1449,32 @@ struct EmbeddingsSettingsSection: View {
             // technical caption, and in the model name row above.
             if s.effectiveBackend == "unavailable" {
                 Text(EmbeddingPlainCopy.headline(.modelFailed))
-                    .font(.caption).foregroundStyle(.orange)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let detail = EmbeddingPlainCopy.technicalDetail(.modelFailed) {
-                    Text(detail).font(.caption2).foregroundStyle(.secondary)
+                    Text(detail)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
             } else if s.effectiveBackend == "hash" {
                 Text(EmbeddingPlainCopy.headline(.testVectors))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let detail = EmbeddingPlainCopy.technicalDetail(.testVectors) {
-                    Text(detail).font(.caption2).foregroundStyle(.secondary)
+                    Text(detail)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
             } else if s.effectiveBackend == "local" {
                 Text(EmbeddingPlainCopy.headline(.byMeaning))
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
             } else {
-                Text("Embedding backend status unknown (\(s.effectiveBackend)).")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Text("The embedding backend did not report a status.")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
             }
         }
     }
@@ -1340,9 +1484,11 @@ struct EmbeddingsSettingsSection: View {
         let presentation = EmbeddingsSettingsStatusPresentation(status: s)
         let currentMode = presentation.memoryMode
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("Memory mode", systemImage: "memorychip")
-                Spacer()
+            HStack(spacing: 8) {
+                Text("Memory mode")
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: 8)
                 if memoryModeSaving || releasingMemory {
                     ProgressView().controlSize(.small)
                 }
@@ -1356,22 +1502,21 @@ struct EmbeddingsSettingsSection: View {
                 Text("Low").tag("low_memory")
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .disabled(memoryModeSaving || releasingMemory)
 
             HStack(spacing: 8) {
                 Text(presentation.memoryModeDescription)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
                     .lineLimit(2)
-                Spacer()
+                Spacer(minLength: 8)
                 if actionControls.showsReleaseNow {
-                    Button {
+                    Button("Release now") {
                         Task { await releaseMemoryNow() }
-                    } label: {
-                        Label("Release now", systemImage: "xmark.circle")
                     }
                     .buttonStyle(.naFeel)
-                    .font(.caption)
+                    .font(ShellType.label)
                     .disabled(releasingMemory)
                     .accessibilityIdentifier("settings.embeddings.release-now")
                 }
@@ -1384,40 +1529,46 @@ struct EmbeddingsSettingsSection: View {
         let phase = state?.state ?? "idle"
         switch phase {
         case "running":
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(state?.currentStep ?? "Indexing existing memories")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                 ProgressView(value: Double(max(0, min(100, state?.progress ?? 0))), total: 100)
-                HStack {
+                HStack(spacing: 8) {
                     Text("\(max(0, min(100, state?.progress ?? 0)))%")
                     if let embedded = state?.embedded, let candidates = state?.candidates {
                         Text("Updated \(embedded)/\(candidates)")
                     }
-                    Spacer()
+                    Spacer(minLength: 8)
                 }
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.tertiary)
             }
         case "failed":
             VStack(alignment: .leading, spacing: 4) {
-                Text("Memory index update failed.")
-                    .font(.caption).foregroundStyle(.orange)
+                Text("The memory index update failed.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
                 if let detail = state?.detail, !detail.isEmpty {
-                    Text(detail).font(.caption2).foregroundStyle(.secondary)
+                    Text(detail)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                         .lineLimit(3)
                         .textSelection(.enabled)
                 }
             }
         case "complete":
             if active {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                Group {
                     if let embedded = state?.embedded, let skipped = state?.skipped {
                         Text("Existing memory index ready. Updated \(embedded), skipped \(skipped).")
                     } else {
                         Text("Existing memory index ready.")
                     }
                 }
-                .font(.caption).foregroundStyle(.secondary)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             }
         default:
             EmptyView()
@@ -1526,5 +1677,67 @@ struct EmbeddingsSettingsSection: View {
             return try await releaseMemory()
         }
         return try await appModel.releaseEmbeddingsMemory()
+    }
+}
+
+// MARK: - The kit
+//
+// Advanced page kit, 2026-09-03. This page is also the macOS Settings window
+// (Command-comma), so it keeps its Form — the shell frame hides the Form's
+// slab (`ShellPageFrame`, SetupView.swift). Everything ON it is the kit:
+// eyebrow section heads, `ShellType` throughout, colour from
+// `NativeAgentShell`, no glyph doing a word's job.
+
+/// A section head: 13 semibold, uppercase, tracked, secondary — the same one
+/// the Advanced list wears.
+private struct SettingsEyebrow: View {
+    let text: String
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.labelSemibold)
+            .textCase(.uppercase)
+            .kerning(0.6)
+            .foregroundStyle(NativeAgentShell.secondary)
+    }
+}
+
+/// The quiet line under a section: 11, tertiary, wraps rather than truncates.
+private struct SettingsFootnote: View {
+    let text: String
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.tertiary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// One switch row, said the way Setup says it: a 13 semibold title and the
+/// house switch, teal on-track and all (`SetupSwitchCard`, SetupView.swift).
+/// The body is the Toggle itself, so a caller's accessibility identifier and
+/// hint still land on the control.
+private struct SettingsSwitch: View {
+    let title: String
+    @Binding var isOn: Bool
+
+    init(_ title: String, isOn: Binding<Bool>) {
+        self.title = title
+        self._isOn = isOn
+    }
+
+    var body: some View {
+        Toggle(isOn: $isOn) {
+            Text(title)
+                .font(ShellType.labelSemibold)
+                .foregroundStyle(NativeAgentShell.text)
+        }
+        .toggleStyle(.switch)
+        .tint(NativeAgentBrand.accent)
     }
 }

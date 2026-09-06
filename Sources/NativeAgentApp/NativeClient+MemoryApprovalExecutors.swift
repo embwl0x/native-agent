@@ -319,19 +319,18 @@ extension NativeClient {
             // Surface-scoped resolution (gpt-5.5 review blocker): the
             // surface-less complete() defaults to "chat", whose active.json
             // provider entry can REMAP a pinned model to chat's provider —
-            // bypassing the pin. A pin on "memory" routes under the
-            // "memory" surface (no active.json entry → model-prefix
-            // inference honors the pin); unpinned falls back to the chat
-            // surface's own pick verbatim.
-            let model: String?
-            let surface: String
-            if let pinned = await routerForPins.pinnedModelStringForSurface("memory") {
-                model = pinned
-                surface = "memory"
-            } else {
-                model = await routerForPins.modelStringForSurface("chat")
-                surface = "chat"
-            }
+            // bypassing the pin. Routing under "memory" keeps the Memory row's
+            // own pin and its own provider.
+            // User, 2026-09-06: an UNPINNED Memory row used to fall back to the
+            // chat surface entirely, so assigning a provider to Memory without
+            // also pinning a model did nothing. The Memory row now takes its
+            // own surface whenever it says anything (a pin OR an assigned
+            // provider). A BLANK row still routes on "chat": on "memory" it
+            // would carry no active-provider entry and dispatch would infer the
+            // transport from the model prefix, sending Memory to ChatGPT OAuth
+            // while chat runs on the Codex CLI or the OpenAI API.
+            let surface = await routerForPins.surfaceHasOwnRouting("memory") ? "memory" : "chat"
+            let model = await routerForPins.modelStringForSurface(surface)
             let system = "You classify one memory snippet into exactly one of these kinds: "
                 + taxonomy.joined(separator: ", ")
                 + ". Reply with ONLY the kind word, lowercase, nothing else."

@@ -106,6 +106,35 @@ extension NativeCognitionRuntime {
         let generation = residualDeadline.invalidate()
         let opportunity = await organismKernel.residualRepairOpportunity()
         guard generation == residualDeadline.generation else { return }
+        // NORTHSTAR clause 4 (sweep item 39): the identity-Dream lane's own
+        // reading decides here. This adds no loop and no timer — it reads the
+        // opportunity this method already derived, on the events this method is
+        // already called for, and hands off to a detached task so a dream's
+        // provider call never blocks signal ingestion. See
+        // NativeCognitionRuntime+PressureDream.swift.
+        considerPressureDream(opportunity)
+        // Desk 903 phase 1: the encounter lane rides the SAME reading, on the
+        // same events, and never preempts the dream above it. No new timer, no
+        // new budget. See NativeCognitionRuntime+StudioEncounters.swift.
+        considerStudioEncounter(opportunity)
+        // Item 5 (2026-09-02): the forward register reads its sources on the
+        // SAME reading, on the same events. No new timer, no new budget, and no
+        // polling — the composition is rate-limited and hands off to a detached
+        // task exactly like the two lanes above it. See
+        // NativeCognitionRuntime+Expectations.swift.
+        considerHorizonExpectations(opportunity)
+        // Personality depth item 9 (2026-09-02) — HER HOUR. Same reading, same
+        // events, no timer of its own, and it never preempts the dream. When the
+        // Settings switch is off the lane is NOT INSTALLED: the call below
+        // returns having read nothing and written nothing. See
+        // BackgroundLoopsAssembly+Studio.swift.
+        considerStudioWander(opportunity)
+        // Personality depth item 12 (2026-09-02): the shoulder tap rides the
+        // SAME reading, on the same events, and owns no timer either. It never
+        // preempts anything — it does not compete for the pressure, it only asks
+        // whether one already-loud seed is worth a push. See
+        // NativeCognitionRuntime+Notify.swift.
+        considerShoulderTap(opportunity)
         // The same exact-deadline owner also wakes at pending prediction/model
         // expiry. That wake only re-derives pressure and may schedule the quiet
         // repair boundary; it does not perform cognition or call a provider.

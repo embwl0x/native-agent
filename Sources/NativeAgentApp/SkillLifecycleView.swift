@@ -300,26 +300,17 @@ struct SkillPointerSyncReceiptLine: View {
     let state: SkillPointerSyncReceiptPresentation.State
 
     var body: some View {
-        Label(SkillPointerSyncReceiptPresentation.line(for: state), systemImage: icon)
-            .font(.caption)
+        Text(SkillPointerSyncReceiptPresentation.line(for: state))
+            .font(ShellType.caption)
             .foregroundStyle(color)
+            .lineLimit(1)
             .help("Every skill gets a one-line pointer in memory so recall can surface it. Synced at launch and after skill changes.")
-    }
-
-    private var icon: String {
-        switch state {
-        case .current: return "checkmark.circle"
-        case .failed, .unavailable: return "exclamationmark.triangle"
-        case .loading: return "hourglass"
-        }
     }
 
     private var color: Color {
         switch state {
-        case .current: return .secondary
-        case .failed: return .red
-        case .unavailable: return .orange
-        case .loading: return .secondary
+        case .current, .loading: return NativeAgentShell.secondary
+        case .failed, .unavailable: return NativeAgentShell.trouble
         }
     }
 }
@@ -342,134 +333,122 @@ struct SkillLifecycleView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    GradientText(text: "Skills", colors: [NativeAgentBrand.accentDeep, NativeAgentBrand.accent, NativeAgentBrand.accentCool], font: NativeAgentFont.title)
-                    Text("\(appModel.skillManifests.count) playbooks · recall surfaces the right one when a conversation enters its territory; the full text loads only on demand.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button {
+        // 2026-09-03 Advanced refinement: the page's own gradient "Skills"
+        // title, the rule under the controls and the two banner strips were
+        // chrome sitting on the shell's sheet. What is left is one line about
+        // what skills are, the controls, and the rows.
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 8) {
+                Text("\(appModel.skillManifests.count) playbooks · recall surfaces the right one when a conversation enters its territory; the full text loads only on demand.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Button("Build in chat") {
                     _ = SkillBuildButtonPresentation.beginBuild(using: appModel)
-                } label: {
-                    Label("Build in Chat", systemImage: "wand.and.stars")
                 }
-                .buttonStyle(.borderedProminent)
                 .accessibilityIdentifier("skills.lifecycle.build")
 
-                Button {
+                Button(appModel.isLoadingSkillManifests ? "Refreshing…" : "Refresh") {
                     Task {
                         await appModel.loadSkillManifests()
                         await loadSyncReceipt()
                     }
-                } label: {
-                    Label(appModel.isLoadingSkillManifests ? "Refreshing…" : "Refresh", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.naFeel)
                 .disabled(appModel.isLoadingSkillManifests)
                 .accessibilityIdentifier("skills.lifecycle.refresh")
             }
-            .padding(.horizontal, NativeAgentSpacing.xl)
-            .padding(.top, NativeAgentSpacing.lg)
-            .padding(.bottom, NativeAgentSpacing.sm)
 
-            HStack(spacing: NativeAgentSpacing.sm) {
+            HStack(spacing: 8) {
                 TextField("Search skills", text: $searchText)
                     .textFieldStyle(.roundedBorder)
+                    .font(ShellType.label)
                     .frame(maxWidth: 320)
                     .accessibilityIdentifier("skills.lifecycle.search")
                 if searchResults.isFiltering, let resultCountText = searchResults.resultCountText {
                     Text(resultCountText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .accessibilityIdentifier("skills.lifecycle.search.resultCount")
-                    Button("Clear search", systemImage: "xmark.circle.fill") {
+                    Button("Clear search") {
                         searchText = ""
                     }
-                    .labelStyle(.iconOnly)
                     .buttonStyle(.plain)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .accessibilityLabel("Clear skill search")
                     .accessibilityIdentifier("skills.lifecycle.search.clear")
                 }
                 SkillPointerSyncReceiptLine(state: syncReceiptState)
-                Spacer()
+                Spacer(minLength: 8)
             }
-            .padding(.horizontal, NativeAgentSpacing.xl)
-            .padding(.bottom, NativeAgentSpacing.md)
-
-            Divider()
 
             if let feedback = appModel.skillLifecycleFeedback, feedback.kind == .failure {
-                HStack(spacing: NativeAgentSpacing.sm) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(NativeAgentTheme.warn)
+                HStack(spacing: 8) {
                     Text(feedback.message)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
                     Button("Dismiss") { appModel.dismissSkillManifestFeedback() }
                         .buttonStyle(.naFeel)
                 }
-                .padding(.horizontal, NativeAgentSpacing.xl)
-                .padding(.vertical, NativeAgentSpacing.sm)
-                .background(NativeAgentTheme.warn.opacity(0.08))
             }
 
             if let feedback = appModel.skillLifecycleFeedback, feedback.kind == .success {
-                HStack(spacing: NativeAgentSpacing.sm) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(NativeAgentTheme.ok)
-                    Text(feedback.message).font(.callout)
-                    Spacer()
-                }
-                .padding(.horizontal, NativeAgentSpacing.xl)
-                .padding(.vertical, NativeAgentSpacing.sm)
-                .background(NativeAgentTheme.ok.opacity(0.08))
-                .transition(.opacity)
-                .task(id: feedback.id) {
-                    try? await Task.sleep(for: .seconds(3))
-                    appModel.dismissSkillManifestSuccess(id: feedback.id)
-                }
+                Text(feedback.message)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.calm)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity)
+                    .task(id: feedback.id) {
+                        try? await Task.sleep(for: .seconds(3))
+                        appModel.dismissSkillManifestSuccess(id: feedback.id)
+                    }
             }
 
             if appModel.isLoadingSkillManifests {
                 ScrollView {
-                    VStack(spacing: NativeAgentSpacing.sm) {
+                    VStack(spacing: 8) {
                         ForEach(0..<4, id: \.self) { _ in
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.secondary.opacity(0.12))
+                            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                                .fill(NativeAgentShell.quietFill)
                                 .frame(height: 58)
                                 .appShimmer()
                         }
                     }
-                    .padding(NativeAgentSpacing.xl)
                 }
             } else if searchResults.displayed.isEmpty {
-                NativeEmptyState(
-                    title: searchResults.emptyTitle,
-                    detail: searchResults.emptyDetail,
-                    systemImage: searchResults.isFiltering ? "magnifyingglass" : "puzzlepiece.extension",
-                    actionTitle: searchResults.isFiltering ? nil : "Build a Skill",
-                    actionImage: searchResults.isFiltering ? nil : "wand.and.stars",
-                    action: searchResults.isFiltering ? nil : {
-                        _ = SkillBuildButtonPresentation.beginBuild(using: appModel)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(searchResults.emptyTitle)
+                        .font(ShellType.bodySemibold)
+                        .foregroundStyle(NativeAgentShell.text)
+                    Text(searchResults.emptyDetail)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !searchResults.isFiltering {
+                        Button("Build a skill") {
+                            _ = SkillBuildButtonPresentation.beginBuild(using: appModel)
+                        }
+                        .padding(.top, 4)
                     }
-                )
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             } else {
                 ScrollView {
-                    VStack(spacing: NativeAgentSpacing.sm) {
+                    VStack(spacing: 8) {
                         ForEach(searchResults.displayed) { info in
                             SkillRow(info: info,
                                      onRead: { readerTarget = info },
                                      onReview: { reviewTarget = info })
                         }
                     }
-                    .padding(NativeAgentSpacing.xl)
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .task {
             guard loadsOnAppear else { return }
             await appModel.loadSkillManifests()
@@ -532,37 +511,45 @@ private struct SkillRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(info.id)
-                    .font(.body.weight(.medium))
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(info.manifest.name.isEmpty ? info.id : info.manifest.name)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                 Text(info.manifest.description)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
             }
             Spacer(minLength: 8)
             Text(sourceLabel)
-                .font(.caption2.weight(.semibold))
-                .padding(.horizontal, 7).padding(.vertical, 2)
+                .font(ShellType.captionSemibold)
+                .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(
-                    (isDraft ? Color.orange : Color.primary).opacity(isDraft ? 0.16 : 0.08),
+                    isDraft ? NativeAgentShell.trouble.opacity(0.16) : NativeAgentShell.quietFill,
                     in: Capsule()
                 )
-                .foregroundStyle(isDraft ? Color.orange : Color.secondary)
+                .foregroundStyle(isDraft ? NativeAgentShell.trouble : NativeAgentShell.secondary)
             if isDraft {
-                Button("Review", systemImage: "checkmark.seal") { onReview() }
-                    .buttonStyle(.bordered)
+                Button("Review") { onReview() }
                     .controlSize(.small)
             }
             Image(systemName: "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .font(ShellType.captionSemibold)
+                .foregroundStyle(NativeAgentShell.tertiary)
         }
-        .padding(.vertical, 10).padding(.horizontal, 12)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.vertical, 12).padding(.horizontal, 16)
+        .frame(minHeight: 48)
+        .background(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .fill(TodayPalette.cardFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+        )
         .contentShape(Rectangle())
-        .naInteractive(radius: 8)
+        .naInteractive(radius: TodayMetrics.cardRadius)
         .onTapGesture { onRead() }
     }
 }
@@ -652,49 +639,53 @@ struct SkillBodySheet: View {
     @State private var state: SkillBodyPresentation.State = .loading
 
     var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-            HStack {
-                Text(info.id).font(.title3.weight(.semibold))
-                Spacer()
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text(info.manifest.name.isEmpty ? info.id : info.manifest.name)
+                    .font(ShellType.title)
+                    .foregroundStyle(NativeAgentShell.text)
+                Spacer(minLength: 8)
                 Button("Done") { onDismiss() }
                     .keyboardShortcut(.defaultAction)
             }
             switch state {
             case .loading:
                 ProgressView("Loading skill body…")
+                    .font(ShellType.label)
                     .accessibilityIdentifier("skills.lifecycle.body.loading")
             case .content(let body, let truncated):
                 ScrollView {
                     Text(body)
-                        .font(.system(.callout, design: .monospaced))
+                        .font(ShellType.code)
+                        .foregroundStyle(NativeAgentShell.text)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .accessibilityIdentifier("skills.lifecycle.body.content")
                 if truncated {
                     Text("Showing the first \(SkillBodyPresentation.maximumDisplayBytes.formatted()) bytes of this skill body.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             case .empty:
-                Label("Skill body is empty", systemImage: "doc")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Text("This skill has no body text yet.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .accessibilityIdentifier("skills.lifecycle.body.empty")
             case .unavailable(let detail):
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("Skill body unavailable", systemImage: "exclamationmark.triangle")
-                        .font(.callout.weight(.semibold))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Skill body unavailable")
+                        .font(ShellType.labelSemibold)
                     Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .foregroundStyle(.orange)
+                .foregroundStyle(NativeAgentShell.trouble)
                 .accessibilityIdentifier("skills.lifecycle.body.unavailable")
             }
-            Text(info.registry.path)
-                .font(NativeAgentFont.mono)
-                .foregroundStyle(.tertiary)
+            Text(UserDisplayFormatters.tildifyPath(info.registry.path))
+                .font(ShellType.code)
+                .foregroundStyle(NativeAgentShell.tertiary)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
@@ -759,28 +750,35 @@ struct SkillReviewSheet: View {
                 // Previously VStack measured every NativePanel (each with an
                 // .ultraThinMaterial background) on first present, which on
                 // a slow render compounds and looked like a freeze.
-                LazyVStack(alignment: .leading, spacing: NativeAgentSpacing.xl) {
+                LazyVStack(alignment: .leading, spacing: 24) {
                     // Description section
-                    reviewSection(title: "Description", systemImage: "text.alignleft") {
+                    reviewSection(title: "What it does") {
                         Text(info.manifest.description)
-                            .font(NativeAgentFont.body)
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.text)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     // Type section
-                    reviewSection(title: "Type", systemImage: "puzzlepiece") {
+                    reviewSection(title: "Type") {
                         Text(info.manifest.type)
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 8).padding(.vertical, 3)
-                            .background(Color.accentColor.opacity(0.12), in: Capsule())
+                            .font(ShellType.captionSemibold)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(NativeAgentShell.quietFill, in: Capsule())
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
 
                     // Author
                     if let author = info.manifest.author {
-                        reviewSection(title: "Author", systemImage: "person.circle") {
+                        reviewSection(title: "Author") {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(author.name).font(NativeAgentFont.body)
+                                Text(author.name)
+                                    .font(ShellType.label)
+                                    .foregroundStyle(NativeAgentShell.text)
                                 if let email = author.email {
-                                    Text(email).font(NativeAgentFont.mono).foregroundStyle(.secondary)
+                                    Text(email)
+                                        .font(ShellType.code)
+                                        .foregroundStyle(NativeAgentShell.secondary)
                                 }
                             }
                         }
@@ -788,11 +786,12 @@ struct SkillReviewSheet: View {
 
                     // Permissions
                     if let perms = info.manifest.permissions, !perms.isEmpty {
-                        reviewSection(title: "Permissions", systemImage: "lock.shield") {
-                            VStack(alignment: .leading, spacing: 6) {
+                        reviewSection(title: "Permissions") {
+                            VStack(alignment: .leading, spacing: 4) {
                                 ForEach(perms, id: \.self) { perm in
-                                    Label(perm, systemImage: "checkmark.shield")
-                                        .font(NativeAgentFont.mono)
+                                    Text(perm)
+                                        .font(ShellType.code)
+                                        .foregroundStyle(NativeAgentShell.text)
                                 }
                             }
                         }
@@ -800,22 +799,24 @@ struct SkillReviewSheet: View {
 
                     // Tools
                     if let tools = info.manifest.tools, !tools.isEmpty {
-                        reviewSection(title: "Tools (\(tools.count))", systemImage: "hammer") {
+                        reviewSection(title: "Tools (\(tools.count))") {
                             VStack(alignment: .leading, spacing: 8) {
                                 ForEach(Array(tools.prefix(toolPreviewLimit))) { tool in
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(tool.name)
-                                            .font(NativeAgentFont.mono)
+                                            .font(ShellType.code)
                                             .fontWeight(.semibold)
+                                            .foregroundStyle(NativeAgentShell.text)
                                         Text(tool.description)
-                                            .font(.callout)
-                                            .foregroundStyle(.secondary)
+                                            .font(ShellType.label)
+                                            .foregroundStyle(NativeAgentShell.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
                                     }
                                 }
                                 if tools.count > toolPreviewLimit {
                                     Text("\(tools.count - toolPreviewLimit) more tool definitions hidden in the review preview.")
-                                        .font(.caption)
-                                        .foregroundStyle(.tertiary)
+                                        .font(ShellType.caption)
+                                        .foregroundStyle(NativeAgentShell.tertiary)
                                 }
                             }
                         }
@@ -823,24 +824,29 @@ struct SkillReviewSheet: View {
 
                     // OAuth
                     if let oauth = info.manifest.oauth {
-                        reviewSection(title: "OAuth", systemImage: "key.fill") {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text("Provider:")
-                                        .foregroundStyle(.secondary)
+                        reviewSection(title: "Sign-in") {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 8) {
+                                    Text("Provider")
+                                        .font(ShellType.label)
+                                        .foregroundStyle(NativeAgentShell.secondary)
                                     Text(oauth.provider)
-                                        .font(NativeAgentFont.mono)
+                                        .font(ShellType.code)
+                                        .foregroundStyle(NativeAgentShell.text)
                                 }
-                                HStack(alignment: .top) {
-                                    Text("Scopes:")
-                                        .foregroundStyle(.secondary)
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text("Scopes")
+                                        .font(ShellType.label)
+                                        .foregroundStyle(NativeAgentShell.secondary)
                                     Text(oauth.scopes.joined(separator: ", "))
-                                        .font(NativeAgentFont.mono)
+                                        .font(ShellType.code)
+                                        .foregroundStyle(NativeAgentShell.text)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                                 if oauth.deviceFlow == true {
-                                    Label("Uses device flow — no browser login required", systemImage: "iphone.and.arrow.forward")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    Text("Uses device flow — no browser login required.")
+                                        .font(ShellType.caption)
+                                        .foregroundStyle(NativeAgentShell.secondary)
                                 }
                             }
                         }
@@ -848,21 +854,21 @@ struct SkillReviewSheet: View {
 
                     // README — deferred to second frame; see readmeReady above.
                     if let readme = info.readme, !readme.isEmpty {
-                        reviewSection(title: "README", systemImage: "doc.text") {
+                        reviewSection(title: "Read me") {
                             if readmeReady {
                                 BoundedSkillText(text: readme, limit: readmePreviewLimit)
                             } else {
                                 // Cheap placeholder so the section frame is
                                 // reserved without triggering text layout.
                                 Text("Loading preview…")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
+                                    .font(ShellType.caption)
+                                    .foregroundStyle(NativeAgentShell.tertiary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
                     }
                 }
-                .padding(NativeAgentSpacing.xl)
+                .padding(20)
             }
             // PATCH-2026-05-11: skill-review-freeze-fix — yield once after the
             // sheet's chrome lays out, then drop in the README. This lets the
@@ -887,20 +893,19 @@ struct SkillReviewSheet: View {
                             Task { _ = await installSkill() }
                         }
                     }
-                    .buttonStyle(.borderedProminent)
                     .disabled(!installControl.isEnabled)
                     .accessibilityIdentifier(SkillReviewInstallPresentation.installAccessibilityIdentifier)
                 }
             }
             .safeAreaInset(edge: .bottom) {
                 if let installRefusal {
-                    Label(installRefusal, systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    Text(installRefusal)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, NativeAgentSpacing.xl)
-                        .padding(.vertical, NativeAgentSpacing.sm)
-                        .background(NativeAgentTheme.warn.opacity(0.08))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 8)
                 }
             }
             .sheet(isPresented: $showOAuthFlow) {
@@ -951,13 +956,31 @@ struct SkillReviewSheet: View {
         }
     }
 
+    /// The review sheet's sections wore `NativePanel`'s thin-material slab, an
+    /// icon and a tinted border each. They are the Advanced list's shape now:
+    /// an eyebrow, then the words on one card.
     private func reviewSection<Content: View>(
         title: String,
-        systemImage: String,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
-        NativePanel(title: title, systemImage: systemImage) {
-            content()
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .padding(.horizontal, 2)
+            VStack(alignment: .leading, spacing: 12) { content() }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .fill(TodayPalette.cardFill)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                )
         }
     }
 }
@@ -990,7 +1013,8 @@ private struct BoundedSkillText: View {
                         .textSelection(.disabled)
                 }
             }
-            .font(NativeAgentFont.mono)
+            .font(ShellType.code)
+            .foregroundStyle(NativeAgentShell.text)
             .frame(maxWidth: .infinity, alignment: .leading)
             if isTruncated {
                 Button(expanded ? "Collapse preview" : "Show full preview") {
@@ -998,8 +1022,8 @@ private struct BoundedSkillText: View {
                 }
                 .buttonStyle(.naFeel)
                 Text("\(text.count - visibleText.count) characters hidden to keep the review sheet responsive.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
             }
         }
     }
@@ -1022,6 +1046,7 @@ struct OAuthFlowSheet: View {
     @State private var showSuccess = false
     @State private var successLogin = ""
     @State private var wasCancelled = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var oauthDataRoot: URL {
         appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -1029,17 +1054,18 @@ struct OAuthFlowSheet: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: NativeAgentSpacing.xl) {
+            VStack(spacing: 24) {
                 if showSuccess {
                     successView
                 } else if isLoading {
-                    ProgressView("Starting OAuth for \(provider)...")
-                        .padding()
+                    ProgressView("Starting sign-in for \(provider)…")
+                        .font(ShellType.label)
+                        .padding(16)
                 } else if let err = error {
                     errorView(err)
                 }
             }
-            .padding(NativeAgentSpacing.xl)
+            .padding(24)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Connect \(provider.capitalized)")
             .toolbar {
@@ -1062,37 +1088,38 @@ struct OAuthFlowSheet: View {
 
     @ViewBuilder
     private var successView: some View {
-        VStack(spacing: NativeAgentSpacing.lg) {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 52))
-                .foregroundStyle(NativeAgentTheme.ok)
-            Text("Connected" + (successLogin.isEmpty ? "!" : " as \(successLogin)!"))
-                .font(NativeAgentFont.title)
-            Text("Authorization complete. Finishing the \(skillName) installation…")
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(successLogin.isEmpty ? "Connected" : "Connected as \(successLogin)")
+                .font(ShellType.title)
+                .foregroundStyle(NativeAgentShell.calm)
+            Text("Authorization is complete. Finishing the \(skillName) installation…")
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
     private func errorView(_ err: String) -> some View {
-        VStack(spacing: NativeAgentSpacing.lg) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 36))
-                .foregroundStyle(NativeAgentTheme.fail)
+        VStack(alignment: .leading, spacing: 8) {
             Text("Authorization failed")
-                .font(NativeAgentFont.title)
+                .font(ShellType.title)
+                .foregroundStyle(NativeAgentShell.trouble)
             Text(err)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button("Try Again") {
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Try again") {
                 wasCancelled = false
                 isLoading = true
                 error = nil
                 flowTask?.cancel()
                 flowTask = Task { await startFlow() }
             }
-            .buttonStyle(.borderedProminent)
+            .padding(.top, 4)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @MainActor
@@ -1112,7 +1139,10 @@ struct OAuthFlowSheet: View {
         isLoading = false
         if result.ok {
             successLogin = ""
-            withAnimation {
+            // Motion pass: the bare default animation is now gated on the
+            // reader's Reduce Motion setting, like every other move in the
+            // shell.
+            withAnimation(NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)) {
                 showSuccess = true
             }
             try? await Task.sleep(nanoseconds: 2_000_000_000)

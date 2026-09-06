@@ -105,6 +105,13 @@ extension SwiftToolDispatcher {
         // pull-to-retrieve flow, 2026-06-29). The nine desk MUTATIONS stay lazy
         // (preload on tracking intent — the capture flow).
         "desk_read",
+        // Personality depth item 3 (2026-09-02) — `inner_state`. ALWAYS-ON for
+        // the same reason `agent_introspect` is: a tool she must `tool_load`
+        // before she can answer "how are you" is a tool she will not reach for
+        // mid-sentence, and the load dance is exactly what makes her compose an
+        // answer instead of reading one. Clause 6 is honored by REACH: one
+        // catalog row, zero prompt bytes until she pulls it.
+        "inner_state",
     ]
 
     /// Always-on tool names wired in SwiftToolDispatcher+Impls.swift.
@@ -120,6 +127,10 @@ extension SwiftToolDispatcher {
         // listAvailableTools() didn't include them → tool_catalog's nameSet
         // intersection dropped them from currently_loaded. Add here.
         "time_now", "claude_message", "invoke_claude",
+        // Personality depth item 3 (2026-09-02): the introspection pull. Also in
+        // alwaysOnCoreNames — listed here so listAvailableTools() reports it as
+        // currently_loaded rather than dropping it from tool_catalog.
+        "inner_state",
         "codex_message", "invoke_codex", "omp_message",
         "agent_swarm",
         "market_status", "market_watchlists", "tradingview_watchlist", "market_quote",
@@ -219,14 +230,58 @@ extension SwiftToolDispatcher {
         // are ledger-class writes into <dataRoot>/studio/; studio_consult_read
         // and studio_recall are pure local reads.
         "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+        // Canon (desk 903 phase 4). studio_canon is a pure local read;
+        // studio_canon_resolve is HER SEAT — the only path from a canon
+        // proposal to a canon row, and deliberately not reachable from any
+        // owner surface. Same lazy wiring as the four above.
+        "studio_canon", "studio_canon_resolve",
+        // The held standing-view tier (item 7, 2026-09-02). Catalog-visible and
+        // LAZY, like the studio lane and unlike `inner_state`: adopting a view
+        // is deliberate and rare — a handful of times, not per turn — so it has
+        // no business costing prompt bytes on every turn. Both are seated on her
+        // own live local turn and refuse every bridge, executor and replay.
+        "hold_view", "release_view",
+        // The moments lane (2026-09-02). Catalog-visible and LAZY — NOT in
+        // alwaysOnCoreNames: reviewing what she lived is a deliberate pull a
+        // few times a day, not per-turn business, and the per-turn nudge line
+        // in the volatile block already tells her when there is anything to
+        // pull. memory_moments_pending is a pure read; memory_moment_review is
+        // her memory WRITE (accept promotes a proposal into her own store).
+        "memory_moments_pending", "memory_moment_review",
+        // User, 2026-09-05: curation of her own store, a deliberate pass.
+        "list_memories", "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
+        // Agent, 2026-09-06: the whole of one message search only previewed.
+        // LAZY — reaching past a preview is a deliberate follow-up to a search,
+        // not per-turn business, and search_chat_history (always-on) names it.
+        "read_chat_message",
+    ]
+
+    /// The READ half of the Full-Mac file surface. Every entry only observes:
+    /// `file_excerpt` reads a byte range, `grep` shells a search, and the four
+    /// git tools run `status --short --branch` / `diff` / `log` / (status+log)
+    /// and parse stdout — no ref, object, worktree or index content is written.
+    /// The one shared mutable artifact is git's opportunistic index-stat
+    /// refresh, and git takes that lock OPTIONALLY (`repo_hold_locked_index`
+    /// with flags 0 in `cmd_status`/`cmd_diff`): on contention it skips the
+    /// refresh instead of failing, so two of these may run at once.
+    /// Split out from the write half so parallel dispatch can admit reads
+    /// without admitting `write_file` (see ParallelToolDispatch rule 2).
+    static let fullMacReadOnlyFileToolNames: [String] = [
+        "file_excerpt", "grep",
+        "git_status", "git_diff", "git_log", "repo_dirty_summary",
+    ]
+
+    /// The WRITE half of the Full-Mac file surface — mutates the filesystem.
+    static let fullMacWriteFileToolNames: [String] = [
+        "write_file",
     ]
 
     /// Swift-implemented builder/file tools exposed only when Trust Center's
     /// Full Mac mode is active and the matching MacControl category is enabled.
-    static let fullMacFileToolNames: [String] = [
-        "file_excerpt", "write_file", "grep",
-        "git_status", "git_diff", "git_log", "repo_dirty_summary",
-    ]
+    /// Composed from the two halves so gating, catalog membership and dispatch
+    /// routing keep covering exactly the same set they always did.
+    static let fullMacFileToolNames: [String] =
+        fullMacReadOnlyFileToolNames + fullMacWriteFileToolNames
 
     static let fullMacSystemToolNames: [String] = [
         "system_info", "remote_node_list",
@@ -277,6 +332,62 @@ extension SwiftToolDispatcher {
     /// `MacInjectionCapability`. Anything that would let it click or type
     /// belongs in `fullMacAccessibilityInjectionToolNames` instead.
     static let fullMacNudgeToolNames: [String] = ["mac_nudge"]
+
+    /// fable51 item 30 — THE CLIPBOARD ORGAN. Its own list, deliberately, and
+    /// for the same reason `mac_nudge` has one: it is neither neighbour.
+    ///
+    ///   • It is not an accessibility READ — it walks no AX tree and needs no
+    ///     Accessibility TCC grant to answer.
+    ///   • It is not INJECTION — it posts no CGEvent and performs no AX action,
+    ///     so it must not carry the injection list's approval capability.
+    ///
+    /// The separate list also keeps these two OUT of `legacyMacModelToolNames`
+    /// (which is the four-verb cutover boundary, computed from the app / read /
+    /// nudge / injection lists). Clipboard is a NEW organ for the four-verb
+    /// surface to reach for, not a legacy mac_* organ being retired — putting
+    /// it in either neighbour's list would have hidden it from Agent the moment
+    /// it was added.
+    ///
+    /// GATE, split by half: the read rides `accessibilityReadAllowed`, the
+    /// write rides `appControlAllowed`. Both still require an ACTIVE Full Mac
+    /// window and the accessibility category, enforced again inside MacControl.
+    static let macClipboardReadToolNames: [String] = ["clipboard_read"]
+    static let macClipboardWriteToolNames: [String] = ["clipboard_write"]
+    static let macClipboardToolNames: [String] =
+        macClipboardReadToolNames + macClipboardWriteToolNames
+
+    /// fable51 item 29 — THE MENU BAR ORGAN, split the same way and for the
+    /// same reasons as the clipboard above: `menu` is a bounded read-only walk
+    /// of `AXMenuBar` (no CGEvent, no AX action, it does not even open a menu),
+    /// while `menu_press` runs the app's own handler and clears the full
+    /// injection contract inside MacControl.
+    ///
+    /// Their own lists so neither lands in `legacyMacModelToolNames` — the menu
+    /// organ is a NEW surface for the four verbs to reach for, not a legacy
+    /// mac_* organ being retired behind the cutover.
+    static let macMenuReadToolNames: [String] = ["menu"]
+    static let macMenuPressToolNames: [String] = ["menu_press"]
+    static let macMenuToolNames: [String] = macMenuReadToolNames + macMenuPressToolNames
+
+    /// fable51 item 33 — THE READ ORGAN. Its own list for the same reason the
+    /// two organs above have theirs: it is neither neighbour.
+    ///
+    ///   • It is not one of the accessibility READS. That list's contract is
+    ///     the bounded glance under `look`'s budgets, and this one deliberately
+    ///     is not bounded that way — it returns a whole document and lets the
+    ///     turn's existing spill pager carry it.
+    ///   • It is not INJECTION. It moves a viewport and puts it back; it
+    ///     presses, types and activates nothing, so it must not carry the
+    ///     injection list's approval capability.
+    ///
+    /// The separate list also keeps it OUT of `legacyMacModelToolNames`: `read`
+    /// is a NEW organ for the four-verb surface to reach for, not a legacy
+    /// `mac_*` organ being retired.
+    ///
+    /// GATE: `accessibilityReadAllowed`, plus the file gate (`fileOpsAllowed`
+    /// and workspace file policy) for ANY filesystem route — a `path` the caller
+    /// names or one inferred from `AXDocument` (see `impl_mac_read_tool`).
+    static let macReadToolNames: [String] = ["read"]
 
     /// W7 (2026-08-14) — the ambient activity watcher's query tool.
     ///
@@ -351,6 +462,78 @@ extension SwiftToolDispatcher {
         alwaysOnCoreNames.union(activeTools.subtracting(legacyMacModelToolNames))
     }
 
+    /// The advertised tool contract for one turn, split into the part that can
+    /// never move and the part that only ever grows.
+    ///
+    /// FLOOR is `alwaysOnCoreNames ∩ available`, sorted by name — the same
+    /// bytes on turn 1 and turn 40 of a session. APPENDED is everything else
+    /// in LOAD ORDER, never re-sorted, so a `tool_load` adds rows at the END
+    /// instead of shifting every later row the way an alphabetical sort did.
+    /// That is what makes the contract append-only and the provider prefix
+    /// cache survivable across a session.
+    public struct ToolContractOrdering: Sendable, Equatable {
+        public let floor: [String]
+        public let appended: [String]
+
+        public init(floor: [String], appended: [String]) {
+            self.floor = floor
+            self.appended = appended
+        }
+
+        public var advertised: [String] { floor + appended }
+
+        /// SHA-256 over the ordered advertised contract. Two consecutive turns
+        /// with the same fingerprint carry the same catalog rows in the same
+        /// order, so a cache miss between them cannot be blamed on the tool
+        /// contract. Membership AND order both feed the digest — reordering
+        /// alone breaks a prefix just as thoroughly as adding a row.
+        public var fingerprintSHA256: String {
+            let text = floor.joined(separator: "\n")
+                + "\n\u{1F}\n"
+                + appended.joined(separator: "\n")
+            return SHA256.hash(data: Data(text.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+        }
+    }
+
+    /// Canonical advertised order for `names`.
+    ///
+    /// `loadOrder` is the session's append-only tool_load order (from
+    /// `ChatSessionActiveTools.loadOrder`). Names absent from it — MCP and
+    /// registry rows, which are present from the session's first turn — sort
+    /// BEFORE the session-loaded run in their incoming (catalog) order, so a
+    /// later `tool_load` can only ever append.
+    public static func canonicalToolOrder(
+        _ names: some Sequence<String>,
+        loadOrder: [String] = []
+    ) -> ToolContractOrdering {
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for name in names where !seen.contains(name) {
+            seen.insert(name)
+            ordered.append(name)
+        }
+        let floor = ordered.filter { alwaysOnCoreNames.contains($0) }.sorted()
+        var rank: [String: Int] = [:]
+        for (index, name) in loadOrder.enumerated() where rank[name] == nil {
+            rank[name] = index
+        }
+        let appended = ordered
+            .filter { !alwaysOnCoreNames.contains($0) }
+            .enumerated()
+            .sorted { lhs, rhs in
+                // Unranked rows (MCP membership, pinned from the first turn)
+                // sit AHEAD of the session load run, so a load only appends.
+                let lrank = rank[lhs.element] ?? -1
+                let rrank = rank[rhs.element] ?? -1
+                if lrank != rrank { return lrank < rrank }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+        return ToolContractOrdering(floor: floor, appended: appended)
+    }
+
     // Builder tools (agent-builder-tools, 2026-06-08). Gated on Full Mac
     // file_ops_allowed at dispatch time; surfaced in listAvailableTools()
     // under the same gate so catalog and dispatch agree. shell/bash/git/
@@ -379,7 +562,7 @@ extension SwiftToolDispatcher {
     // catalog and dispatch agree. Their own list keeps the tool catalog from
     // mislabeling them "implemented_swift_builder_tools".
     static let fullMacEvolutionToolNames: [String] = [
-        "evolution_propose", "evolution_status", "self_install",
+        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
     ]
 
     /// Names implemented by this dispatcher, including capability-gated
@@ -456,7 +639,7 @@ extension SwiftToolDispatcher {
         "list_skills", "read_skill", "save_skill", "recall_memory",
         "recall_search", "commit_memory", "search_kg", "search_chat_history",
         "session_search", "get_persona_doc", "persona_read", "persona_write",
-        "persona_append_section", "agent_introspect", "daemon_introspect",
+        "persona_append_section", "agent_introspect", "inner_state", "daemon_introspect",
         "list_tools", "context_lookup", "context_expand", "scratchpad_read",
         "recent_trace_summary", "time_now", "claude_message", "invoke_claude",
         "codex_message", "invoke_codex", "omp_message", "agent_swarm",
@@ -481,6 +664,11 @@ extension SwiftToolDispatcher {
         "desk_defer", "desk_breakdown", "desk_nag_control", "desk_open_pursuit",
         "desk_work_log",
         "studio_consult", "studio_consult_read", "studio_journal", "studio_recall",
+        "studio_canon", "studio_canon_resolve",
+        "hold_view", "release_view",
+        "memory_moments_pending", "memory_moment_review",
+        "list_memories", "rewrite_memory", "forget_memory", "rebuild_knowledge_graph",
+        "read_chat_message",
     ]
 
 }

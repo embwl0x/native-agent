@@ -1,11 +1,6 @@
 import Foundation
-import ApprovalInbox
-import MCPDispatcher
-import MemoryV2
 import NativeAgentCore
 import PersistenceCore
-import Research
-import SystemOps
 
 // MARK: - Create-side normalization (shared, pure) — mirror Runtime.create_workflow
 
@@ -30,9 +25,8 @@ public enum WorkflowCreate {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Mirror of the MODULE-LEVEL `slugify(value)` used by create_workflow
-    ///: differs from WorkflowRunState.slugify ONLY in
-    /// the empty-slug fallback — here an empty slug becomes `str(uuid.uuid4())`,
+    /// Mirror of the MODULE-LEVEL `slugify(value)` used by create_workflow:
+    /// an empty slug becomes `str(uuid.uuid4())`,
     /// exactly like Python `slug[:80] or str(uuid.uuid4())`. The regex
     /// `[^a-z0-9]+` → "-" then `.strip("-")` then `[:80]` is identical.
     public static func slugify(_ value: String, uuid: () -> String) -> String {
@@ -399,9 +393,6 @@ public enum WorkflowCreate {
 public typealias WorkflowRedaction = NativeAgentSecretRedactor
 
 public enum WorkflowOrchestrationError: Error, Equatable, LocalizedError {
-    case unknownRunState(String)
-    case workflowNotRunnable(id: String, reasons: [String])
-    case runControlIneligible(action: String, status: String, reason: String)
     /// Mirrors Python `int("abc")` / `int("1.2")` raising ValueError (and a
     /// truthy list/dict raising TypeError) inside create_workflow's per-step
     /// `int(timeoutSeconds or timeout_seconds or 0)`. The Python route would
@@ -412,12 +403,6 @@ public enum WorkflowOrchestrationError: Error, Equatable, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .unknownRunState(let runId):
-            return "unknown workflow run state: \(runId)"
-        case .workflowNotRunnable(let id, let reasons):
-            return "workflow '\(id)' is not runnable: \(reasons.joined(separator: "; "))"
-        case .runControlIneligible(let action, let status, let reason):
-            return "workflow \(action) is unavailable for run status '\(status)': \(reason)"
         case .invalidTimeout(let value):
             return "invalid workflow timeout: \(value)"
         case .tooManySteps(let count, let maximum):

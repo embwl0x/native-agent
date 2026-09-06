@@ -54,6 +54,10 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case genericPathCannotCreateAgent(handle: String)
     case notAPursuit(handle: String)
     case vetoRefusedTerminal(handle: String, status: DeskStatus)
+    /// 2026-09-06: closing an item that is ALREADY terminal silently replaced
+    /// its outcome — a `canceled` became `done`, and the recorded summary and
+    /// closedAt were overwritten by whichever writer arrived last.
+    case closeRefusedTerminal(handle: String, status: DeskStatus)
     case workSessionCapReached(scope: String, limit: Int, handle: String)
     case unknownReservation(reservationId: String, handle: String)
     case reservationAlreadyComplete(reservationId: String, handle: String)
@@ -108,6 +112,9 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: \(handle) is not a self-pursuit (origin=agent, kind=project)"
         case let .vetoRefusedTerminal(handle, status):
             return "desk: cannot veto \(handle) — it is already terminal (status \(status.rawValue))"
+        case let .closeRefusedTerminal(handle, status):
+            return "desk: cannot close \(handle) — it is already terminal (status \(status.rawValue)); "
+                + "reopen it first if the recorded outcome is wrong"
         case let .workSessionCapReached(scope, limit, handle):
             return "desk: work-session cap reached — \(scope) limit \(limit) for \(handle) already met today"
         case let .unknownReservation(reservationId, handle):
@@ -1487,11 +1494,19 @@ public struct SwiftNativeDeskStore: Sendable {
                     if !alreadyArchived.contains(node.handle) {
                         // takeLock: false — the caller already holds the ops
                         // flock, which serializes every archive write.
+                        //
+                        // 2026-09-06: durable: true. The archive record is the
+                        // ONLY trace an archived item leaves, and the removing
+                        // op two lines below is already durable — so a power
+                        // cut between them left the item gone from live state
+                        // with no record that it ever existed. "record before
+                        // op" only holds if the record is on the platter first.
                         try await appendJSONLCapped(
                             rec.toJSON(), to: archivePath, using: persistence,
                             maxLines: JSONLLineCaps.deskArchive,
                             logLabel: SwiftNativeDeskStore.logLabel,
-                            takeLock: false
+                            takeLock: false,
+                            durable: true
                         )
                     }
                     let archiveOp = DeskOp(ts: now, handle: node.handle, body: .archiveItem)
@@ -1856,6 +1871,14 @@ public struct SwiftNativeDeskStore: Sendable {
             try rejectTerminalParentWithOpenDescendant(op.handle, in: state)
 
         case .closeItem:
+            // A second close is not idempotent: it rewrites the outcome
+            // summary, the closedAt stamp, and (done ⇄ canceled) the verdict
+            // itself. Refuse it under the ops flock, where the read that
+            // decided cannot go stale — a caller's own pre-check can.
+            if let item = state.items.first(where: { $0.handle == op.handle }),
+               item.status.isTerminal {
+                throw DeskError.closeRefusedTerminal(handle: op.handle, status: item.status)
+            }
             try rejectTerminalParentWithOpenDescendant(op.handle, in: state)
 
         case .archiveItem:

@@ -128,7 +128,11 @@ final class ChatReceiptStateMachineEvalTests: XCTestCase {
         let user = ChatMessageRecord(id: UUID().uuidString, sessionId: sid, role: "user", content: "Hello")
         let reply = ChatMessageRecord(id: UUID().uuidString, sessionId: sid, role: "assistant", content: "Reply saved on Mac")
         engine.snapshotDir = directory
-        engine.chatTranscripts = [sid: [user]]
+        // 2026-09-06: chatTranscripts now holds iCloudSyncEngine.PublishedTranscript
+        // (rows + the Mac's transcriptGeneration in one published value). A
+        // pre-watermark Mac build publishes no generation, which is exactly the
+        // cached-but-stale state this test starts from.
+        engine.chatTranscripts = [sid: .init(records: [user], generation: nil)]
         let snapshot = [ChatTranscriptSnapshot(sessionId: sid, messages: [user, reply])]
         try JSONEncoder().encode(snapshot).write(to: directory.appendingPathComponent("chat_transcripts.json"))
 

@@ -243,6 +243,12 @@ public let memorySupersessionCosineFloor: Double = 0.55
 public let memoryDecayHalfLifeDays: [String: Double] = [
     "volatile": 60, "project": 60, "operational": 60,
     "decision": 180, "note": 180, "incident": 180,
+    // The moments lane (2026-09-02). A moment she keeps reaching for stays —
+    // `updatedAt` moves on recall — and one she never returns to fades out of
+    // ranking without ever being deleted. Same 60-day shape as the volatile
+    // lane, which is the honest half-life for something that was true of one
+    // afternoon.
+    "moment": 60,
 ]
 
 /// Bounded use-frequency nudge applied to the recall score. `recordRecallHits`
@@ -350,7 +356,11 @@ public enum MemoryRecallScoring {
         return out
     }
 
-    static func isSkillRecallHint(id: String, kind: String?) -> Bool {
+    /// The single definition of "this row is a skill pointer, not a memory".
+    /// Public because the ContextFlow lane must reserve the SAME rows the
+    /// legacy recall lane shares its budget with — two spellings of "is a
+    /// skill" would drift the moment either lane changed.
+    public static func isSkillRecallHint(id: String, kind: String?) -> Bool {
         id.hasPrefix("skill-pointer:")
             || kind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "skill"
     }
@@ -364,6 +374,18 @@ public enum MemoryRecallScoring {
             .filter { !$0.isEmpty }
     }
 
+    /// The unique query terms the lexical lane actually scores: lexical tokens
+    /// minus the shape-of-a-question stopwords. 2026-09-06: SELECTION and
+    /// RANKING must use this one rule, or a bounded prefilter fills its cap
+    /// with rows that only matched filler and the scorer never sees the rows
+    /// that carry the content terms.
+    public static func lexicalContentTerms(_ text: String?) -> [String] {
+        guard let text else { return [] }
+        return Array(
+            Set(lexicalTokens(text)).subtracting(RecallLexicalNormalization.stopWords)
+        )
+    }
+
     /// BM25 over the already-loaded candidate set. Recall already performs a
     /// full candidate sweep for cosine, so this avoids a schema migration while
     /// restoring the daemon-era lexical signal.
@@ -374,7 +396,20 @@ public enum MemoryRecallScoring {
         b: Double = 0.75
     ) -> [Double] {
         guard let query else { return Array(repeating: 0, count: documents.count) }
-        let queryTerms = Array(Set(lexicalTokens(query)))
+        // 2026-09-06: query STOPWORDS used to score as content terms. The
+        // boost is normalized by the best candidate's raw score, so a row that
+        // merely shared "what"/"does"/"me" with the question could take the
+        // whole +0.25 from the row that answered it ("What does User call me?"
+        // ranked the gender-address rule first and her titles third). The
+        // ROUTER has always filtered these before ranking; this lane now uses
+        // the same list. Documents keep every token — BM25's length
+        // normalization is supposed to see the real document length.
+        //
+        // 2026-09-06: a query made of nothing but stopwords ("who are you")
+        // gets ZERO lexical signal rather than falling back to the unfiltered
+        // terms — a fallback just puts the filler back in charge of the boost.
+        // The dense lane carries such a question.
+        let queryTerms = lexicalContentTerms(query)
         guard !queryTerms.isEmpty, !documents.isEmpty else {
             return Array(repeating: 0, count: documents.count)
         }
@@ -484,8 +519,19 @@ public enum MemoryStorageError: Error, LocalizedError {
     /// gate) — blocked at store/accept time per the rejection denylist.
     case tombstoned(String)
     case embeddingEpochMismatch(expected: String, actual: String?)
-    case embeddingActivationInvalid(String)
+    case embeddingActivationInvalid(EmbeddingActivationRefusal, String)
     case invalidTemporalEvidence(String)
+
+    /// 2026-09-06: why an activation was refused. The launch reconciler retries
+    /// a refusal by re-embedding the entire corpus, which is the right answer
+    /// only for `corpusDrift` — the rows moved under the candidate snapshot, so
+    /// a fresh snapshot can succeed. `unusableCandidate` says the vectors
+    /// themselves (or the retained rollback set) are wrong; retrying spends
+    /// three full corpus embeddings to reach the same refusal.
+    public enum EmbeddingActivationRefusal: String, Sendable {
+        case corpusDrift
+        case unusableCandidate
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -495,8 +541,8 @@ public enum MemoryStorageError: Error, LocalizedError {
         case .tombstoned(let id): return "MemoryStorage: content matches a tombstoned claim — \(id)"
         case .embeddingEpochMismatch(let expected, let actual):
             return "MemoryStorage: embedding epoch mismatch — expected \(expected), got \(actual ?? "unknown")"
-        case .embeddingActivationInvalid(let reason):
-            return "MemoryStorage: embedding epoch activation refused — \(reason)"
+        case .embeddingActivationInvalid(let refusal, let reason):
+            return "MemoryStorage: embedding epoch activation refused (\(refusal.rawValue)) — \(reason)"
         case .invalidTemporalEvidence(let reason):
             return "MemoryStorage: invalid temporal evidence — \(reason)"
         }
@@ -1319,25 +1365,7 @@ public actor MemoryStorage {
                 vector: memory.embedding,
                 epoch: memory.embeddingEpoch
             )
-            try db.execute(sql: """
-                INSERT INTO memories
-                  (id, content, persona_id, source, confidence,
-                   created_at, updated_at, embedding, status, metadata_json,
-                   use_count, last_used_at, lifecycle, embedding_epoch,
-                   valid_from, valid_to, observed_at, evidence_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, arguments: [
-                memory.id, memory.content, memory.personaId, memory.source, memory.confidence,
-                memory.createdAt, memory.updatedAt,
-                Self.encodeEmbedding(memory.embedding),
-                memory.status,
-                Self.encodeMetadata(memory.metadata),
-                memory.useCount, memory.lastUsedAt,
-                MemoryLifecycle.normalized(memory.lifecycle),
-                memory.embeddingEpoch,
-                memory.validFrom, memory.validTo, memory.observedAt,
-                Self.encodeMetadata(memory.evidence)
-            ])
+            try Self.executeMemoryInsert(memory, in: db)
             return try Self.pruneMemoriesToBound(
                 in: db,
                 limit: memoryLimit,
@@ -1349,6 +1377,106 @@ public actor MemoryStorage {
         await pokeProjectionHooks(memory)
         await handleBoundEvictions(evicted, reason: "insert")
         return memory
+    }
+
+    /// The row INSERT, shared by `insertMemory` and `importLegacyMemory` so the
+    /// two cannot drift apart. Runs inside the caller's write transaction.
+    private static func executeMemoryInsert(_ memory: StoredMemory, in db: Database) throws {
+        try db.execute(sql: """
+            INSERT INTO memories
+              (id, content, persona_id, source, confidence,
+               created_at, updated_at, embedding, status, metadata_json,
+               use_count, last_used_at, lifecycle, embedding_epoch,
+               valid_from, valid_to, observed_at, evidence_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, arguments: [
+            memory.id, memory.content, memory.personaId, memory.source, memory.confidence,
+            memory.createdAt, memory.updatedAt,
+            Self.encodeEmbedding(memory.embedding),
+            memory.status,
+            Self.encodeMetadata(memory.metadata),
+            memory.useCount, memory.lastUsedAt,
+            MemoryLifecycle.normalized(memory.lifecycle),
+            memory.embeddingEpoch,
+            memory.validFrom, memory.validTo, memory.observedAt,
+            Self.encodeMetadata(memory.evidence)
+        ])
+    }
+
+    /// What `importLegacyMemory` did with a legacy row.
+    public enum LegacyImportOutcome: Sendable {
+        case inserted
+        /// The canonical row existed but held no content, so it was refreshed
+        /// from the legacy source.
+        case refreshedEmpty
+        /// The canonical row exists and holds content — the live store wins.
+        case skippedExisting
+    }
+
+    /// Land one legacy memory: insert if absent, refresh only if the canonical
+    /// row is empty, otherwise leave the live row alone.
+    ///
+    /// 2026-09-06: MemoryV2Migrator used to decide this OUTSIDE the write —
+    /// check existence, embed, then upsert. Two problems, both fixed here by
+    /// making the decision part of the transaction. (a) The gap between the
+    /// check and the write is real: the app starts the memory coordinator
+    /// before migration runs, so a live writer can land a row that the upsert
+    /// then overwrites with legacy text. (b) A bare existence check has no
+    /// repair path — a blank or half-written canonical row was never refreshed,
+    /// and the one-way completion sentinel made that permanent.
+    public func importLegacyMemory(_ memory: StoredMemory) async throws -> LegacyImportOutcome {
+        let result = try await dbPool.write { db -> (LegacyImportOutcome, [StoredMemory]) in
+            let existing = try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM memories WHERE id = ?",
+                arguments: [memory.id]
+            ).map(Self.decodeMemory)
+            if let existing {
+                guard existing.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return (.skippedExisting, [])
+                }
+                try Self.requireWritableEpoch(
+                    in: db,
+                    vector: memory.embedding,
+                    epoch: memory.embeddingEpoch
+                )
+                try db.execute(sql: """
+                    UPDATE memories SET
+                      content = ?, source = ?, confidence = ?, updated_at = ?,
+                      embedding = ?, embedding_epoch = ?, status = ?, metadata_json = ?
+                    WHERE id = ?
+                """, arguments: [
+                    memory.content, memory.source, memory.confidence, memory.updatedAt,
+                    Self.encodeEmbedding(memory.embedding),
+                    memory.embeddingEpoch,
+                    memory.status,
+                    Self.encodeMetadata(memory.metadata),
+                    memory.id
+                ])
+                return (.refreshedEmpty, [])
+            }
+            try Self.validateTemporalEvidence(memory)
+            try Self.requireWritableEpoch(
+                in: db,
+                vector: memory.embedding,
+                epoch: memory.embeddingEpoch
+            )
+            try Self.executeMemoryInsert(memory, in: db)
+            let evicted = try Self.pruneMemoriesToBound(
+                in: db,
+                limit: memoryLimit,
+                preservingIDs: [memory.id]
+            )
+            return (.inserted, evicted)
+        }
+        guard result.0 != .skippedExisting else { return result.0 }
+        invalidateRecallCache()
+        pokeUserMDRegen(persona: memory.personaId)
+        await pokeProjectionHooks(memory)
+        if !result.1.isEmpty {
+            await handleBoundEvictions(result.1, reason: "insert")
+        }
+        return result.0
     }
 
     public func memory(id: String) async throws -> StoredMemory? {
@@ -1489,12 +1617,19 @@ public actor MemoryStorage {
     /// underlying rowid scan order — behaviour stays identical to the old
     /// per-call scan). Norms are precomputed with the EXISTING scalar l2norm so
     /// cached norms are bit-identical to the old per-turn recompute.
-    private func recallCandidates(queryEpoch: MemoryEmbeddingEpoch?) async throws -> [RecallCandidate] {
+    /// `epochMismatch` is the caller's cue that the dense lane cannot answer
+    /// at all: the query vector lives in a different space from the canonical
+    /// corpus. An empty candidate list alone was indistinguishable from an
+    /// empty store, so `recall` returned silence for the rest of a process
+    /// whose launch re-embedding had failed (2026-09-06).
+    private func recallCandidates(
+        queryEpoch: MemoryEmbeddingEpoch?
+    ) async throws -> (candidates: [RecallCandidate], epochMismatch: Bool) {
         let activeEpoch = try await dbPool.read { db in
             try Self.embeddingEpochState(in: db).activeEpoch
         }
         if let activeEpoch, queryEpoch?.rawValue != activeEpoch {
-            return []
+            return ([], true)
         }
         // Read data_version BEFORE fetching candidates: this guarantees the
         // recorded version is never NEWER than the candidate snapshot, so a
@@ -1507,7 +1642,7 @@ public actor MemoryStorage {
            cache.generation == recallGeneration,
            cache.dataVersion == liveDataVersion,
            cache.embeddingEpoch == activeEpoch {
-            return cache.candidates
+            return (cache.candidates, false)
         }
         // Rebuild: ONE query — the same candidate SET the old recall/
         // nearestActiveNeighbor scans used, minus the persona / excluding
@@ -1551,7 +1686,7 @@ public actor MemoryStorage {
             recallCache = nil
         }
         recallCacheRebuildCount += 1
-        return candidates
+        return (candidates, false)
     }
 
     // MARK: - Recall (hybrid dense + lexical sweep)
@@ -1563,12 +1698,47 @@ public actor MemoryStorage {
         topK: Int,
         persona: String? = nil
     ) async throws -> [(memory: StoredMemory, similarity: Double)] {
+        try await recallReportingKeywordFallback(
+            embedding: query,
+            embeddingEpoch: queryEpoch,
+            queryText: queryText,
+            topK: topK,
+            persona: persona
+        ).hits
+    }
+
+    /// The same recall, plus whether the dense lane was unusable and the answer
+    /// actually came from the keyword lane.
+    ///
+    /// 2026-09-06: the degrade-to-lexical decision is made here, below the layer
+    /// that owns provenance, so `MemoryV2.recall` had no way to know it happened
+    /// — keyword hits went out labelled `swift-native`, `search_kg` called them
+    /// meaning matches, and the dense-lane starvation diagnostic could fire on a
+    /// lane that never ran. The caller reads the flag and labels honestly.
+    public func recallReportingKeywordFallback(
+        embedding query: [Float],
+        embeddingEpoch queryEpoch: MemoryEmbeddingEpoch? = nil,
+        queryText: String? = nil,
+        topK: Int,
+        persona: String? = nil
+    ) async throws -> (hits: [(memory: StoredMemory, similarity: Double)], usedKeywordFallback: Bool) {
         // R5: pull the shared cached candidate set, then apply the persona
         // filter in-memory. A single-persona equality filter over the full
         // rowid-ordered scan yields the same rows in the same order the old
         // persona-clause SQL returned, so BM25 idx alignment + ranking stay
         // byte-identical.
-        let allCandidates = try await recallCandidates(queryEpoch: queryEpoch)
+        let scan = try await recallCandidates(queryEpoch: queryEpoch)
+        // 2026-09-06: the query vector is in a different space from the
+        // canonical corpus (a failed launch re-embedding leaves the provider on
+        // the new model and the store on the old epoch). The dense lane has
+        // nothing to say; the lexical lane still answers exact text, so degrade
+        // to it instead of returning silence until the next relaunch.
+        guard !scan.epochMismatch else {
+            return (try await recallByKeyword(
+                queryText: queryText, topK: topK, persona: persona
+            ), true)
+        }
+        let allCandidates = scan.candidates
         let candidates = persona == nil
             ? allCandidates
             : allCandidates.filter { $0.memory.personaId == persona }
@@ -1580,9 +1750,9 @@ public actor MemoryStorage {
         // lexical lane instead: a keyword ranking is worse than semantic, and
         // enormously better than nothing.
         guard queryNorm > 0 else {
-            return try await recallByKeyword(
+            return (try await recallByKeyword(
                 queryText: queryText, topK: topK, persona: persona
-            )
+            ), true)
         }
         let now = Date()
         let lexicalScores = MemoryRecallScoring.normalizedBM25Scores(
@@ -1618,7 +1788,7 @@ public actor MemoryStorage {
             ))
         }
         scored.sort { $0.1 > $1.1 }
-        return Self.uniqueRecallResults(scored, limit: topK)
+        return (Self.uniqueRecallResults(scored, limit: topK), false)
     }
 
     // MARK: - Keyword recall fallback (sweep R4, finding A5)
@@ -1644,7 +1814,12 @@ public actor MemoryStorage {
         persona: String? = nil
     ) async throws -> [(memory: StoredMemory, similarity: Double)] {
         guard topK > 0 else { return [] }
-        let tokens = Array(Set(MemoryRecallScoring.lexicalTokens(queryText ?? "")))
+        // 2026-09-06: the LIKE prefilter takes the same stopword-filtered terms
+        // the BM25 scorer below uses. It used to select on every token, so on a
+        // busy store the 400-row cap filled with rows that merely contained
+        // "what"/"does"/"me" and the rows carrying the content terms never
+        // reached the ranker. An all-stopword query gets no keyword signal.
+        let tokens = MemoryRecallScoring.lexicalContentTerms(queryText)
         guard !tokens.isEmpty else { return [] }
         let candidateCap = Self.keywordRecallCandidateCap
         let candidates = try await dbPool.read { db -> [StoredMemory] in
@@ -1729,7 +1904,7 @@ public actor MemoryStorage {
         // full rowid-ordered scan minus one id is the same order the old
         // `id != ?` SQL returned, so the strict-`>` first-seen-wins tie-break on
         // raw cosine is preserved.
-        let allCandidates = try await recallCandidates(queryEpoch: queryEpoch)
+        let allCandidates = try await recallCandidates(queryEpoch: queryEpoch).candidates
         let candidates = excludedId == nil
             ? allCandidates
             : allCandidates.filter { $0.memory.id != excludedId }
@@ -1831,7 +2006,69 @@ public actor MemoryStorage {
         return proposal
     }
 
-    public func acceptProposal(id: String) async throws -> StoredMemory {
+    /// User, 2026-09-06: the pending-proposal dedup as ONE transaction.
+    /// `SwiftNativeMemoryV2.propose` used to list pending proposals, merge the
+    /// new evidence in Swift, then call `updateProposalMetadata`, which
+    /// overwrites `metadata_json` unconditionally. Two observations of the same
+    /// fact landing together both read the pre-merge row and the second write
+    /// erased the first one's supporting sessions and recurrence — or, when
+    /// neither saw a pending row yet, both inserted and the review queue got
+    /// the duplicates the dedup exists to prevent. Doing the match, the merge
+    /// and the insert under one write lock closes both.
+    ///
+    /// `foldedKey` is the caller's normalisation (article folding + content
+    /// hash); `merge` receives the row found under the lock and returns the
+    /// metadata to store on it. With `insertIfAbsent` false, no match means no
+    /// write and a nil result — that lets the caller skip embedding work it
+    /// only needs on the insert path.
+    public func stagePendingProposal(
+        _ proposal: StoredProposal,
+        insertIfAbsent: Bool,
+        foldedKey: @Sendable (String) -> String,
+        merge: @Sendable (StoredProposal) -> JSONValue?
+    ) async throws -> StoredProposal? {
+        try await dbPool.write { db -> StoredProposal? in
+            let key = foldedKey(proposal.content)
+            // staged_at DESC matches `listProposals(status:)`, whose order this
+            // path's `.first(where:)` used to depend on.
+            let pending = try Row.fetchAll(
+                db,
+                sql: "SELECT * FROM proposals WHERE status = 'pending' ORDER BY staged_at DESC"
+            ).map(Self.decodeProposal)
+            if let existing = pending.first(where: { foldedKey($0.content) == key }) {
+                let merged = merge(existing)
+                try db.execute(sql: """
+                    UPDATE proposals SET metadata_json = ?
+                    WHERE id = ? AND status = 'pending'
+                """, arguments: [Self.encodeMetadata(merged), existing.id])
+                return try Row.fetchOne(
+                    db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [existing.id]
+                ).map(Self.decodeProposal)
+            }
+            guard insertIfAbsent else { return nil }
+            try Self.requireWritableEpoch(
+                in: db,
+                vector: proposal.embedding,
+                epoch: proposal.embeddingEpoch
+            )
+            try db.execute(sql: """
+                INSERT INTO proposals
+                  (id, content, persona_id, source, staged_at, status,
+                   resolved_at, rejection_reason, embedding, metadata_json, embedding_epoch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, arguments: [
+                proposal.id, proposal.content, proposal.personaId, proposal.source,
+                proposal.stagedAt, proposal.status,
+                proposal.resolvedAt, proposal.rejectionReason,
+                Self.encodeEmbedding(proposal.embedding),
+                Self.encodeMetadata(proposal.metadata),
+                proposal.embeddingEpoch
+            ])
+            return proposal
+        }
+    }
+
+    public func acceptProposal(id: String, review: ReviewedMomentAcceptance? = nil) async throws -> StoredMemory {
         // The semantic-gate rejection must COMMIT, so the write closure returns
         // an outcome instead of throwing mid-transaction (a throw inside
         // dbPool.write rolls back everything — including the rejection row).
@@ -1840,11 +2077,22 @@ public actor MemoryStorage {
             case tombstoned
         }
         let outcome = try await dbPool.write { db -> AcceptOutcome in
-            guard let proposal = try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id]).map(Self.decodeProposal) else {
+            guard var proposal = try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id]).map(Self.decodeProposal) else {
                 throw MemoryStorageError.notFound(id)
             }
             guard proposal.status == "pending" else {
                 throw MemoryStorageError.alreadyResolved(id)
+            }
+            if let review {
+                guard proposal.content == review.expectedContent, MemoryMoments.isMoment(proposal.metadata) else {
+                    throw MemoryV2Error.underlying("moment changed since review; review it again")
+                }
+                if let reason = MemoryCandidateQuality.rejectionReason(
+                    text: review.content, source: proposal.source, kind: MemoryMoments.kind
+                ) { throw MemoryV2Error.underlying("not durable memory: \(reason)") }
+                proposal.content = review.content
+                proposal.embedding = review.embedding
+                proposal.embeddingEpoch = review.embeddingEpoch
             }
             // Recheck the exact denylist inside the admission transaction.
             // A tombstone can arrive after the caller's earlier check, and
@@ -1854,6 +2102,7 @@ public actor MemoryStorage {
                 arguments: [Self.contentHash(proposal.content)]
             ) ?? 0 > 0
             if exactTombstone {
+                if review != nil { throw MemoryStorageError.tombstoned(id) }
                 try db.execute(sql: """
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                     WHERE id = ?
@@ -1871,6 +2120,7 @@ public actor MemoryStorage {
                    queryEpoch: proposal.embeddingEpoch,
                    threshold: memoryTombstoneMatchThreshold
                ) {
+                if review != nil { throw MemoryStorageError.tombstoned(id) }
                 try db.execute(sql: """
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                     WHERE id = ?
@@ -1920,7 +2170,15 @@ public actor MemoryStorage {
                 // whose extractor carried no kind get the semantics-neutral
                 // default ("general" → decayFactor 1.0, no supersession).
                 // Extractor-provided kinds pass through untouched.
-                metadata: MemoryKindStamp.stampingDefaultKind(proposal.metadata)
+                // Item 5 follow-up (2026-09-02): promotion is a NEW write, so
+                // the due-date extractor runs here too. Both write paths — the
+                // explicit `commit_memory` store above and this promoter
+                // acceptance — stamp through the same extractor, so a plan is
+                // dated the same way however it got remembered.
+                metadata: MemoryDueDateStamp.stamping(
+                    MemoryKindStamp.stampingDefaultKind(proposal.metadata),
+                    text: proposal.content
+                )
             )
             try Self.validateTemporalEvidence(mem)
             try db.execute(sql: """
@@ -2002,8 +2260,18 @@ public actor MemoryStorage {
     /// correction is demotion, not erasure (same canon as supersession).
     /// Conditional on the row being active and not already lifecycle-terminal;
     /// returns false when either endpoint is no longer eligible.
+    ///
+    /// `supersededBy` rides the SAME transaction for callers (the supersession
+    /// lint) whose provenance is a retirement record rather than a replacement
+    /// fact. Writing it separately could leave a demoted row with no pointer to
+    /// what demoted it, and nothing rereads a corrected row to repair that.
     @discardableResult
-    public func markCorrected(id: String, by newerId: String, reason: String? = nil) async throws -> Bool {
+    public func markCorrected(
+        id: String,
+        by newerId: String,
+        reason: String? = nil,
+        supersededBy: String? = nil
+    ) async throws -> Bool {
         // A deduplicated reassertion can resolve to the original record. It
         // must not retire that sole fact or create a self-referential lineage.
         guard id != newerId else { return false }
@@ -2039,6 +2307,7 @@ public actor MemoryStorage {
                 "reason": reason.map { JSONValue.string($0) } ?? .null,
             ]))
             meta["correction_history"] = .array(history)
+            if let supersededBy { meta["superseded_by"] = .string(supersededBy) }
             row.metadata = .object(meta)
             row.lifecycle = MemoryLifecycle.corrected
             row.updatedAt = now
@@ -2135,6 +2404,27 @@ public actor MemoryStorage {
             guard db.changesCount > 0 else { return nil }
             return try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id])
                 .map(Self.decodeProposal)
+        }
+    }
+
+    /// The moments-lane COUNT. A scalar SQL aggregate — no `SELECT *`, no row
+    /// decode, no Swift-side JSON walk — because the nudge line asks this on
+    /// the turn path and only ever needs the number.
+    ///
+    /// The `kind` disjunct mirrors `MemoryMoments.isMoment`: a row staged
+    /// before `lane` existed is identified by its kind, and the SQL must agree
+    /// with the Swift predicate or the nudge would count a different set than
+    /// the tool lists.
+    public func countMomentProposals(status: String?) async throws -> Int {
+        try await dbPool.read { db in
+            var sql = """
+                SELECT COUNT(*) FROM proposals
+                WHERE (json_extract(metadata_json, '$.lane') = 'moment'
+                       OR json_extract(metadata_json, '$.kind') = 'moment')
+            """
+            var args: [DatabaseValueConvertible] = []
+            if let status { sql += " AND status = ?"; args.append(status) }
+            return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
         }
     }
 
@@ -2375,16 +2665,16 @@ public actor MemoryStorage {
             for item in staged {
                 let key = Self.corpusKey(item.row.kind, item.row.id)
                 guard stagedByKey[key] == nil else {
-                    throw MemoryStorageError.embeddingActivationInvalid("duplicate staged row \(key)")
+                    throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "duplicate staged row \(key)")
                 }
                 guard let current = liveByKey[key], current.contentHash == item.row.contentHash else {
-                    throw MemoryStorageError.embeddingActivationInvalid("canonical content drifted for \(key)")
+                    throw MemoryStorageError.embeddingActivationInvalid(.corpusDrift, "canonical content drifted for \(key)")
                 }
                 guard !item.vector.isEmpty else {
-                    throw MemoryStorageError.embeddingActivationInvalid("empty vector for \(key)")
+                    throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "empty vector for \(key)")
                 }
                 if let dimensions, dimensions != item.vector.count {
-                    throw MemoryStorageError.embeddingActivationInvalid("mixed vector dimensions")
+                    throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "mixed vector dimensions")
                 }
                 dimensions = item.vector.count
                 stagedByKey[key] = item
@@ -2392,6 +2682,7 @@ public actor MemoryStorage {
             guard stagedByKey.count == liveByKey.count else {
                 let missing = Set(liveByKey.keys).subtracting(stagedByKey.keys).sorted().prefix(3)
                 throw MemoryStorageError.embeddingActivationInvalid(
+                    .corpusDrift,
                     "candidate covers \(stagedByKey.count)/\(liveByKey.count) rows; missing \(missing.joined(separator: ", "))"
                 )
             }
@@ -2455,7 +2746,7 @@ public actor MemoryStorage {
         let state = try await dbPool.write { db -> MemoryEmbeddingEpochState in
             let currentState = try Self.embeddingEpochState(in: db)
             guard currentState.rollbackAvailable else {
-                throw MemoryStorageError.embeddingActivationInvalid("no retained prior epoch")
+                throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "no retained prior epoch")
             }
             let live = try Self.embeddingCorpus(in: db)
             let previous = try Row.fetchAll(db, sql: """
@@ -2470,17 +2761,17 @@ public actor MemoryStorage {
                 )
             })
             guard liveKeys == previousKeys else {
-                throw MemoryStorageError.embeddingActivationInvalid("canonical row set changed after activation")
+                throw MemoryStorageError.embeddingActivationInvalid(.corpusDrift, "canonical row set changed after activation")
             }
             let liveByKey = Dictionary(uniqueKeysWithValues: live.map { (Self.corpusKey($0.kind, $0.id), $0) })
             for row in previous {
                 guard let kind = MemoryEmbeddingCorpusKind(rawValue: row["kind"] as String) else {
-                    throw MemoryStorageError.embeddingActivationInvalid("unknown retained row kind")
+                    throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "unknown retained row kind")
                 }
                 let id: String = row["row_id"]
                 let key = Self.corpusKey(kind, id)
                 guard liveByKey[key]?.contentHash == (row["content_hash"] as String) else {
-                    throw MemoryStorageError.embeddingActivationInvalid("canonical content changed for \(key)")
+                    throw MemoryStorageError.embeddingActivationInvalid(.corpusDrift, "canonical content changed for \(key)")
                 }
                 try Self.updateEmbedding(
                     in: db,
@@ -2550,7 +2841,7 @@ public actor MemoryStorage {
             sql: "SELECT embedding, embedding_epoch FROM \(table) WHERE \(key) = ?",
             arguments: [id]
         ) else {
-            throw MemoryStorageError.embeddingActivationInvalid("missing canonical row \(corpusKey(kind, id))")
+            throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "missing canonical row \(corpusKey(kind, id))")
         }
         return (row["embedding"], row["embedding_epoch"])
     }
@@ -2574,7 +2865,7 @@ public actor MemoryStorage {
             arguments: [embedding, epoch, id]
         )
         guard db.changesCount == 1 else {
-            throw MemoryStorageError.embeddingActivationInvalid("failed to update \(corpusKey(kind, id))")
+            throw MemoryStorageError.embeddingActivationInvalid(.unusableCandidate, "failed to update \(corpusKey(kind, id))")
         }
     }
 

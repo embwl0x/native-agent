@@ -2716,7 +2716,7 @@ private func _injectionReadyClient(
 // MARK: - W2 handler behaviour through the real dispatch path
 
 private func _actingClient(
-    sink: _RecordingEventSink,
+    sink: any MacEventSink,
     actRoot: _FakeAXActNode? = nil
 ) -> SwiftNativeMacControl {
     var pol = _permissiveMacPolicy()
@@ -3058,4 +3058,49 @@ private struct _TrustedReadOnlyAXSource: MacAXElementSource {
     // Idempotent, and a non-injection tool is untouched.
     #expect(MacInjectionResultRedaction.redacted(tool: "mac_ax_act", result: redacted) == redacted)
     #expect(MacInjectionResultRedaction.redacted(tool: "read_file", result: raw) == raw)
+}
+
+// MARK: - Sweep item 8: secure keyboard entry preflight
+
+/// Available, and reporting macOS secure input ON. `CGEvent.post` would return
+/// nothing to say the keys were dropped, which is exactly why the check has to
+/// happen BEFORE the loop rather than being inferred from the aftermath.
+private final class _SecureInputRecordingSink: MacEventSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _keys = 0
+    var isAvailable: Bool { true }
+    var secureKeyboardEntryActive: Bool { true }
+    var keyCount: Int { lock.lock(); defer { lock.unlock() }; return _keys }
+    func post(key: MacKeyEvent) { lock.lock(); _keys += 1; lock.unlock() }
+    func post(mouse: MacMouseEvent) {}
+    func post(scroll: MacScrollEvent) {}
+}
+
+@Test func keystrokeRefusesWhileSecureInputIsOnAndEmitsNothing() async throws {
+    let sink = _SecureInputRecordingSink()
+    let client = _actingClient(sink: sink)
+    let r = try await client.injectApproved(
+        action: "keystroke",
+        body: (["text": .string("sudo password"), "keys": .string("cmd+s")])
+    )
+    #expect(!r.ok)
+    #expect(r.error == MacActClosedLoop.secureInputReason)
+    #expect(sink.keyCount == 0, "keys posted under secure input vanish — post none")
+    guard case .object(let out) = r.output else { Issue.record("no output object"); return }
+    guard case .string(let note)? = out["note"] else { Issue.record("no note"); return }
+    #expect(note.contains("secure keyboard entry"), "\(note)")
+    let serialized = String(data: try r.output.serializedData(pretty: false), encoding: .utf8) ?? ""
+    #expect(!serialized.contains("sudo password"), "a refusal echoes the payload no more than a success does")
+}
+
+@Test func keystrokeStillTypesWhenSecureInputIsOff() async throws {
+    // The preflight is a measurement, not a mood: the default sink reports
+    // secure input off and the ordinary path is untouched.
+    let sink = _RecordingEventSink()
+    let r = try await _actingClient(sink: sink).injectApproved(
+        action: "keystroke",
+        body: (["text": .string("hi")])
+    )
+    #expect(r.ok, "\(r.error ?? "")")
+    #expect(sink.keys.count == 4)
 }

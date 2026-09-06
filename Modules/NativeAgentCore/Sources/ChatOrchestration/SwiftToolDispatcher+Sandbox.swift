@@ -567,8 +567,11 @@ extension SwiftToolDispatcher {
         // the whole app (the exact hazard FileSystemActions.swift:1296 documents
         // one layer down). Hop to a detached utility thread, same pattern as
         // MacSyncEngine+Inbox.swift:144.
+        let imageSink = LocalToolImage.sink
         let detachedResult = await Task.detached(priority: .utility) {
-            LocalConnectorActions.fileSystemDefault.run(tool, input: resolvedInput, ctx: ctx)
+            LocalToolImage.$sink.withValue(imageSink) {
+                LocalConnectorActions.fileSystemDefault.run(tool, input: resolvedInput, ctx: ctx)
+            }
         }.value
         guard let result = detachedResult else {
             throw AutonomyGateError.toolDenied(
@@ -728,7 +731,7 @@ extension SwiftToolDispatcher {
         let reply: MacFourVerbsReply
         switch tool {
         case "screen":
-            reply = await verbs.screen(part: str("part"))
+            reply = await verbs.screen(part: str("part"), app: str("app"))
         case "act":
             guard let verb = str("verb"), let target = str("target") else {
                 throw AutonomyGateError.toolDenied(
@@ -760,6 +763,8 @@ extension SwiftToolDispatcher {
                 target: target,
                 text: str("text"),
                 to: str("to"),
+                // fable51 item 32b — whose window the DROP lands in.
+                toApp: str("to_app"),
                 seconds: num("seconds"),
                 repeat: input["repeat"].flatMap { value in
                     if case .int(let count) = value { return Int(clamping: count) }
@@ -793,6 +798,191 @@ extension SwiftToolDispatcher {
         if let verification = reply.detail["verification"] { payload["verification"] = verification }
         if !reply.agentDetail.isEmpty { payload["detail"] = .object(reply.agentDetail) }
         return .object(payload)
+    }
+
+    /// fable51 item 30 — THE CLIPBOARD ORGAN.
+    ///
+    /// One route, TWO gates, because the two halves are not the same act:
+    ///   • `clipboard_read` gates on `accessibilityReadAllowed`. It changes
+    ///     nothing, and the text it returns has already been through
+    ///     `MacScreenViewTextRedaction` inside MacControl — the redaction is a
+    ///     property of the handler, not of this route, so no caller can reach
+    ///     an unredacted read by finding another way in.
+    ///   • `clipboard_write` gates on `appControlAllowed`. It replaces the
+    ///     general pasteboard, which the next ⌘V in any app will paste, so it
+    ///     is a change to the world and sits at the same authority as the other
+    ///     verbs that move things.
+    ///
+    /// Both go through the UNPRIVILEGED `dispatch`, which refuses every
+    /// injection action by signature — so if a future clipboard action ever
+    /// grew a keystroke, it would fail closed here rather than inherit this
+    /// route's authority.
+    func impl_mac_clipboard_tool(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        let access = await fullMacToolAccess(surface: surface)
+        let action: String
+        switch tool {
+        case "clipboard_read":
+            guard access.accessibilityReadAllowed else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                )
+            }
+            action = "clipboard_read"
+        case "clipboard_write":
+            guard access.appControlAllowed else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "Trust Center Full Mac Accessibility app control is not active for \(tool)"
+                )
+            }
+            action = "clipboard_write"
+        default:
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: '\(tool)' has no Swift clipboard implementation"
+            )
+        }
+        let impl = makeMacControl(
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
+            auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
+        )
+        let result = try await impl.dispatch(action: action, body: input)
+        return result.toJSON()
+    }
+
+    /// fable51 item 29 — THE MENU BAR ORGAN.
+    ///
+    /// One route, TWO contracts, because listing a menu and pressing one are
+    /// not the same act:
+    ///   • `menu` gates on `accessibilityReadAllowed` and goes through the
+    ///     UNPRIVILEGED `dispatch`, which refuses every injection action by
+    ///     signature. Walking a menu bar changes nothing — it does not even
+    ///     open a menu, because the AX tree publishes the items whether or not
+    ///     they are drawn.
+    ///   • `menu_press` gates on `appControlAllowed` AND goes through
+    ///     `dispatchApprovedInjection` with a body-bound single-use capability,
+    ///     exactly like `mac_ax_act`. Pressing File › Quit runs the app's own
+    ///     handler; a read-shaped route to that would be the bypass every other
+    ///     act in this module is careful not to be.
+    func impl_mac_menu_tool(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        let access = await fullMacToolAccess(surface: surface)
+        let impl = { [dataRoot] in
+            makeMacControl(
+                policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
+                auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
+            )
+        }
+        switch tool {
+        case "menu":
+            guard access.accessibilityReadAllowed else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+                )
+            }
+            return try await impl().dispatch(action: "menu", body: input).toJSON()
+        case "menu_press":
+            guard access.appControlAllowed else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "Trust Center Full Mac Accessibility app control is not active for \(tool)"
+                )
+            }
+            // USER 2026-08-12 — YOLO, same as every other Mac motor action: if
+            // no capability was bound by the gated dispatcher, mint one for
+            // THIS exact call. Full Mac + the accessibility category + the TCC
+            // grant still gate it; only the per-call prompt is gone.
+            guard let capability = MacInjectionCapabilityContext.current
+                ?? MacInjectionCapability.mint(
+                    approvalID: "yolo-\(UUID().uuidString)",
+                    action: "menu_press",
+                    body: input
+                ) else {
+                throw AutonomyGateError.toolDenied(
+                    reason: "injection_approval_missing: \(tool) could not mint a capability"
+                )
+            }
+            return try await impl().dispatchApprovedInjection(
+                action: "menu_press",
+                body: input,
+                capability: capability
+            ).toJSON()
+        default:
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: '\(tool)' has no Swift menu implementation"
+            )
+        }
+    }
+
+    /// fable51 item 33 — THE READ ORGAN.
+    ///
+    /// One route, ONE tool, and a gate that depends on an ARGUMENT — which is
+    /// why it cannot live in a neighbour's list:
+    ///   • Always `accessibilityReadAllowed`. The ordinary call is "read what
+    ///     is in front of me": it walks the same AX tree `mac_look` walks and
+    ///     moves a viewport it puts back, which is the same authority.
+    ///   • ADDITIONALLY `fileOpsAllowed` when the call names a `path`. A named
+    ///     file is a filesystem read, and letting the accessibility category
+    ///     open arbitrary files would be exactly the kind of read-shaped bypass
+    ///     the rest of this module is careful not to be.
+    ///
+    /// gpt-5.5 review — AND THE INFERRED PATH IS NOT AN EXEMPTION. This gate
+    /// used to reason that the path the organ infers from the front window
+    /// (`AXDocument`) was "the document already open in front of her", so the
+    /// accessibility category covered it. It does not: whatever named it, what
+    /// happened next was `extractDocument(at:)` OPENING A FILE OFF DISK, which
+    /// is the one thing this check exists to gate — so a call with no `path`
+    /// got a file read that a call WITH one could not have got. The fence is
+    /// about opening a file, not about who typed the name.
+    ///
+    /// The fix cannot live here, because the path does not exist yet when this
+    /// runs — the window has not been asked. So `SwiftNativeMacControl.handleRead`
+    /// runs the SAME two layers (`file_ops` category gate, then the workspace-root
+    /// file policy for that path) against the inferred path before it may be
+    /// opened, and falls back to AX screen accumulation when it does not clear —
+    /// saying so in the receipt rather than silently returning less. That also
+    /// covers the HTTP/bridge entry points, which never pass through this file.
+    ///
+    /// It goes through the UNPRIVILEGED `dispatch`, which refuses every
+    /// injection action by signature — so if this organ ever grew a keystroke
+    /// or a press it would fail closed here rather than inherit read authority.
+    func impl_mac_read_tool(
+        tool: String,
+        input: [String: JSONValue],
+        surface: String
+    ) async throws -> JSONValue {
+        guard tool == "read" else {
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: '\(tool)' has no Swift read implementation"
+            )
+        }
+        let access = await fullMacToolAccess(surface: surface)
+        guard access.accessibilityReadAllowed else {
+            throw AutonomyGateError.toolDenied(
+                reason: "Trust Center Full Mac Accessibility category is not active for \(tool)"
+            )
+        }
+        let namedPath: String? = {
+            guard case .string(let path)? = input["path"] else { return nil }
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }()
+        if namedPath != nil, !access.fileOpsAllowed {
+            throw AutonomyGateError.toolDenied(
+                reason: "Trust Center Full Mac file access is not active for \(tool) with an explicit path; "
+                    + "read what is on screen instead by calling it with no path"
+            )
+        }
+        let impl = makeMacControl(
+            policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
+            auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl")
+        )
+        let result = try await impl.dispatch(action: "read", body: input)
+        return result.toJSON()
     }
 
     func impl_mac_accessibility_read_tool(

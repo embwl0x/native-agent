@@ -171,9 +171,17 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     #expect(out == "hi\n")
     let captured = box.value
     #expect(captured?.executable == "/usr/bin/codex")
+    // 2026-09-06 (415949b3): the adapter used to invoke the INTERACTIVE CLI
+    // with a `--system` flag no codex surface has, so every turn either hung
+    // in the TUI or died on an unrecognised argument. It runs the
+    // non-interactive `codex exec` now, and the system text is folded into the
+    // prompt that goes over stdin instead of a flag.
+    #expect(captured?.arguments.prefix(4).elementsEqual(
+        ["exec", "--color", "never", "--skip-git-repo-check"]) == true)
     #expect(captured?.arguments.contains("-m") == true)
     #expect(captured?.arguments.contains("gpt-5.5") == true)
-    #expect(captured?.stdin == "hello")
+    #expect(captured?.arguments.contains("--system") == false)
+    #expect(captured?.stdin == "be terse\n\nhello")
 }
 
 @Test func codex_adapter_forwardsInjectedProcessEnvironment() async throws {
@@ -270,14 +278,22 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
     let invocation = try String(contentsOf: capture, encoding: .utf8)
         .split(separator: "\n", omittingEmptySubsequences: false)
         .map(String.init)
+    // 2026-09-06 (415949b3): `codex exec --color never --skip-git-repo-check`,
+    // and the system text folded into stdin rather than passed as a `--system`
+    // flag the CLI does not have. The PATH boundary this test exists for is
+    // unchanged.
     #expect(invocation == [
         "path=\(bin.path)",
         "argv0=\(fakeCodex.path)",
+        "arg=exec",
+        "arg=--color",
+        "arg=never",
+        "arg=--skip-git-repo-check",
         "arg=-m",
         "arg=gpt-5.6-sol",
-        "arg=--system",
-        "arg=boundary system",
         "stdin:",
+        "boundary system",
+        "",
         "boundary prompt",
         "",
     ])
@@ -310,7 +326,10 @@ private final class SuspendedAdapter: LLMAdapter, @unchecked Sendable {
             try await adapter.complete(prompt: "p", system: nil, model: "gpt-5.6-sol")
         }
     }
+    // 2026-09-06 (415949b3): the controls still lead the `-m`, behind the
+    // `codex exec` subcommand and its non-interactive flags.
     #expect(box.value?.arguments == [
+        "exec", "--color", "never", "--skip-git-repo-check",
         "-c", "model_reasoning_effort=\"ultra\"",
         "-c", "service_tier=\"priority\"",
         "-m", "gpt-5.6-sol",

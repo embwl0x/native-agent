@@ -213,23 +213,58 @@ struct DeskReportsOnlyWave8EvalTests {
         #expect(await handler.veto(pursuit.handle) == .alreadyVetoed)
     }
 
-    @Test("a mounted observatory panel requires and invokes its supplied veto action with the visible pursuit handle")
-    @MainActor func mountedPanelForwardsTheVetoButtonAction() async throws {
-        let root = try wave8DeskRoot("veto-mounted")
+    // Item 36: Veto lives on the Desk pursuits row now, not in the
+    // developer-gated observatory. The control still refuses to exist without
+    // its action, still disables only the clicked handle, and still routes into
+    // the SAME store mutation the observatory used.
+    @Test("the Desk pursuit veto control forwards the visible handle and routes through the same store action")
+    @MainActor func deskPursuitVetoControlRoutesThroughTheSameAction() async throws {
+        let root = try wave8DeskRoot("veto-desk-row")
         defer { try? FileManager.default.removeItem(at: root) }
         let store = SwiftNativeDeskStore(dataRoot: root)
         let pursuit = try await store.openPursuit(
-            project: "evaluation", title: "Mounted veto", pursuit: wave8Pursuit())
-        let snapshot = await WorkshopObservatorySnapshot.load(
-            store: store,
-            receiptsPath: root.appendingPathComponent("workshop/receipts.jsonl")
-        )
+            project: "evaluation", title: "Desk veto", pursuit: wave8Pursuit())
+
         var receivedHandle: String?
-        let panel = WorkshopObservatoryPanel(snapshot: snapshot) { handle in
+        let control = DeskPursuitVetoControl(pendingHandles: ["desk-other"]) { handle in
             receivedHandle = handle
         }
-
-        panel.triggerVeto(pursuit.handle)
+        #expect(!control.isDisabled(pursuit.handle))
+        #expect(control.isDisabled("desk-other"))
+        control.trigger(pursuit.handle)
         #expect(receivedHandle == pursuit.handle)
+
+        // The action the Desk row wires that closure to.
+        let outcome = await WorkshopObservatoryVetoHandler(dataRoot: root)
+            .veto(try #require(receivedHandle))
+        #expect(outcome == .completed)
+        #expect(DeskPursuitVetoNotice.receipt(for: outcome).isError == false)
+        let reloaded = try await SwiftNativeDeskStore(dataRoot: root).liveState()
+        let settled = try #require(reloaded.items.first { $0.handle == pursuit.handle })
+        #expect(settled.status == .canceled)
+        #expect(settled.notes.contains { $0.text == WorkshopObservatoryVetoHandler.rationale })
+    }
+
+    // The score/budget/reason the owner vetoes against come from the SAME pure
+    // fold the observatory used, so moving the control did not fork the numbers.
+    @Test("the Desk pursuit row shows the score and budget from the observatory's own fold")
+    func deskPursuitVetoRationaleMatchesTheObservatoryFold() async throws {
+        let root = try wave8DeskRoot("veto-desk-rationale")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SwiftNativeDeskStore(dataRoot: root)
+        let pursuit = try await store.openPursuit(
+            project: "evaluation", title: "Desk rationale", pursuit: wave8Pursuit())
+        let state = try await store.liveState()
+        let item = try #require(state.items.first { $0.handle == pursuit.handle })
+        let now = Date()
+
+        let row = try #require(DeskPursuitVetoRationale.row(for: item, now: now))
+        #expect(row == WorkshopPursuitRow.from(item: item, now: now))
+        #expect(DeskPursuitVetoRationale.budgetLabel(row.budget)
+            == "0/\(row.budget?.maxSessions ?? 0) sessions · 0/\(row.budget?.perDayCap ?? 0) today")
+        // A pursuit with no decodable score must say nothing, never a fake 0.
+        #expect(DeskPursuitVetoRationale.scoreLabel(nil) == nil)
+        #expect(DeskPursuitVetoRationale.reasonLabel("chose: it kept coming back") == "it kept coming back")
+        #expect(DeskPursuitVetoRationale.reasonLabel(nil) == nil)
     }
 }

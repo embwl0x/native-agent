@@ -160,7 +160,11 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     #expect(result.skipped.allSatisfy { $0.skippedReason == "outside the data directory" })
 }
 
-@Test func cleanupRefusesProtectedModelCache() throws {
+// Sweep item 21 (2026-09-01): the model cache used to be REFUSED here, on the
+// rationale "would just re-download". The CoreML cutover made that false — the
+// live embedder loads `Bundle.module/minilm.mlpackage` — so the cache is
+// residue and Clean Up may move it to the Trash like anything else.
+@Test func cleanupTrashesTheFormerlyProtectedModelCache() throws {
     let root = hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: root) }
     let rel = "extras/hf_cache/hub/models--x/blobs/deadbeef"
@@ -168,9 +172,12 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     var trashedURLs: [URL] = []
     let result = DataRootDiskHygiene.cleanup(
         dataRoot: root, relativePaths: [rel], trash: { trashedURLs.append($0) })
-    #expect(trashedURLs.isEmpty)
-    #expect(result.trashed.isEmpty)
-    #expect(result.skipped.first?.skippedReason?.contains("protected store") == true)
+    #expect(trashedURLs.count == 1)
+    #expect(result.skipped.isEmpty)
+    #expect(result.trashed.map(\.relativePath) == [rel])
+    #expect(result.freedBytes == 2000)
+    // …and there is no protected-store escape hatch left anywhere in the pass.
+    #expect(!result.outcomes.contains { $0.skippedReason?.contains("protected") == true })
 }
 
 @Test func cleanupSkipsMissingFilesDirectoriesAndSymlinks() throws {
@@ -215,22 +222,20 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("victim.bin").path))
 }
 
-// gpt-5.5 review: APFS is typically case-insensitive, so a case-varied spelling
-// of the protected prefix addresses the same store and must also be refused.
-@Test func cleanupRefusesProtectedModelCacheCaseInsensitively() throws {
+// APFS is typically case-insensitive, so a case-varied spelling addresses the
+// same store. The residue tier inherits that rule from the retired protected
+// tier — a re-downloaded `Extras/HF_Cache` must be reported, not missed.
+@Test func residueDetectionSurvivesACaseVariedSpelling() throws {
     let root = hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: root) }
-    try writeFile(root.appendingPathComponent("extras/hf_cache/hub/blob"), bytes: 2000)
-    var trashedURLs: [URL] = []
-    let result = DataRootDiskHygiene.cleanup(
+    try writeFile(root.appendingPathComponent("Extras/HF_Cache/hub/blob"), bytes: 2000)
+    let report = DataRootDiskHygiene.scan(
         dataRoot: root,
-        relativePaths: ["Extras/HF_Cache/hub/blob"],
-        trash: { trashedURLs.append($0) })
-    #expect(trashedURLs.isEmpty)
-    #expect(result.trashed.isEmpty)
-    // On a case-sensitive volume the varied spelling simply doesn't exist;
-    // either way nothing under the protected store may move.
-    #expect(result.skipped.count == 1)
+        singleFileThreshold: 10_000_000,
+        totalThreshold: 100_000_000,
+        directoryThreshold: 10_000_000)
+    #expect(report.largeDirectories.map { $0.relativePath.lowercased() } == ["extras/hf_cache"])
+    #expect(report.tripped)
 }
 
 @Test func cleanupReportsATrashFailureAsSkippedNotTrashed() throws {
@@ -289,7 +294,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
     #expect(recorder.reports.count == 1)
 }
 
-@Test func diskHygiene_cleanTreeCompletesWithoutNotice() async throws {
+@Test func diskHygiene_cleanTreeSkipsWithoutNotice() async throws {
     let root = hygieneTempDir()
     defer { try? FileManager.default.removeItem(at: root) }
     try writeFile(root.appendingPathComponent("logs/small.jsonl"), bytes: 50)
@@ -300,7 +305,14 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         fileNotice: { recorder.record($0); return true }
     )
     let outcome = await loop.tickOutcome()
-    if case .completed = outcome {} else { Issue.record("expected .completed, got \(outcome)") }
+    // FIX 4: a scan that found nothing filed nothing and changed nothing. It
+    // must NOT stamp `.completed` — that advanced the dormancy clock on a lane
+    // that had done no work.
+    guard case .skipped(let reason, _) = outcome else {
+        Issue.record("expected .skipped, got \(outcome)")
+        return
+    }
+    #expect(reason.contains("disk clean"))
     #expect(recorder.reports.isEmpty)
 }
 

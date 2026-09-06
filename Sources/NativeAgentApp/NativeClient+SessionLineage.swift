@@ -61,6 +61,11 @@ extension NativeClient {
             return try JSONDecoder.nativeAgent.decode(ChatSession.self, from: data)
         }
 
+        let newID = UUID().uuidString
+        guard let safeNewID = NativeAgentChatSessionID.normalizedPathComponent(newID) else {
+            throw SessionLineageError.targetCollision
+        }
+
         let transcript: (data: Data, count: Int, preview: String?) = try await persistence.withFileLock(sourcePath) {
             guard FileManager.default.fileExists(atPath: sourcePath.path) else {
                 if throughMessageId != nil { throw SessionLineageError.forkPointNotFound }
@@ -73,17 +78,41 @@ extension NativeClient {
             var preview: String?
             for raw in lines {
                 let line = Data(raw)
-                kept.append(line)
-                if let value = try? JSONValue.parse(line), case .object(let object) = value {
+                var emitted = line
+                var reachedForkPoint = false
+                if let value = try? JSONValue.parse(line), case .object(var object) = value {
                     if case .string(let content)? = object["content"], !content.isEmpty {
                         preview = String(content.replacingOccurrences(of: "\n", with: " ").prefix(160))
                     }
                     if let throughMessageId,
                        case .string(let id)? = object["id"],
                        id == throughMessageId {
-                        found = true
-                        break
+                        reachedForkPoint = true
                     }
+                    // 2026-09-06: the copy used to keep the SOURCE session's id
+                    // on every row, so the fork's transcript claimed to belong
+                    // to another session. Orphan recovery reads that as
+                    // corruption and refuses to rebuild the index row
+                    // (ChatSessionIndexReconciler), and every reader that
+                    // selects a session's rows by `sessionId` — the outcome
+                    // stores, the conversation anchor — matched none of them.
+                    // Lineage lives on the index row (parentSessionId /
+                    // rootSessionId / forkedAtMessageId), not here.
+                    // 2026-09-06: stamp rows that carry NO `sessionId` too. Only
+                    // rewriting the key where it already existed left a copied
+                    // row with no session at all — an orphan in the fork's own
+                    // transcript, invisible to every reader that selects by
+                    // sessionId, exactly the outcome this restamp exists to
+                    // prevent.
+                    object["sessionId"] = .string(safeNewID)
+                    if let restamped = try? JSONValue.object(object).serializedData(pretty: false) {
+                        emitted = restamped
+                    }
+                }
+                kept.append(emitted)
+                if reachedForkPoint {
+                    found = true
+                    break
                 }
             }
             guard found else { throw SessionLineageError.forkPointNotFound }
@@ -95,10 +124,6 @@ extension NativeClient {
             return (out, kept.count, preview)
         }
 
-        let newID = UUID().uuidString
-        guard let safeNewID = NativeAgentChatSessionID.normalizedPathComponent(newID) else {
-            throw SessionLineageError.targetCollision
-        }
         let targetPath = messagesRoot.appendingPathComponent("\(safeNewID).jsonl")
         guard !FileManager.default.fileExists(atPath: targetPath.path) else {
             throw SessionLineageError.targetCollision
@@ -113,11 +138,20 @@ extension NativeClient {
         var row: [String: JSONValue] = [
             "id": .string(safeNewID),
             "title": .string(normalizedForkTitle(title, sourceTitle: sourceSession.displayTitle)),
-            "source": .string("app"),
+            // 2026-09-06: a fork is the same conversation continued, so it
+            // inherits what the parent IS. Hardcoding "app" made a forked
+            // Telegram or iPhone thread read as a Mac chat, and made the
+            // mixed-source diagnostic disagree with the transcript it copied.
+            "source": .string(sourceSession.source ?? "app"),
             "createdAt": .string(now),
             "updatedAt": .string(now),
             "archived": .bool(false),
             "messageCount": .int(Int64(transcript.count)),
+            // 2026-09-06: a fork writes a transcript for a session that has
+            // never had one, so its transcript version starts at 1. Every
+            // later write to it bumps from here; the counter is what lets a
+            // remote reader order this session's published transcripts.
+            ChatSessionIndexFile.transcriptGenerationKey: .int(1),
             "parentSessionId": .string(sourceSession.id),
             "rootSessionId": .string(rootSessionID),
         ]
@@ -211,27 +245,6 @@ extension NativeClient {
         }
         let data = try JSONValue.object(updated).serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(ChatSession.self, from: data)
-    }
-
-    func compareChatSessions(left: String, right: String) async throws -> ExperienceSessionComparison {
-        let leftMessages = try await getChatMessages(sessionId: left)
-        let rightMessages = try await getChatMessages(sessionId: right)
-        var common = 0
-        for pair in zip(leftMessages, rightMessages) {
-            let sameID = pair.0.id == pair.1.id
-            let sameContent = pair.0.role == pair.1.role
-                && pair.0.content == pair.1.content
-                && pair.0.createdAt == pair.1.createdAt
-            guard sameID || sameContent else { break }
-            common += 1
-        }
-        return ExperienceSessionComparison(
-            leftSessionId: left,
-            rightSessionId: right,
-            commonMessageCount: common,
-            leftOnly: Array(leftMessages.dropFirst(common)),
-            rightOnly: Array(rightMessages.dropFirst(common))
-        )
     }
 
     private static func normalizedForkTitle(_ requested: String?, sourceTitle: String) -> String {

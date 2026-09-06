@@ -68,9 +68,13 @@ enum UserDisplayFormatters {
         fallback: String
     ) -> String {
         guard let date = parseISOTimestamp(iso) else { return fallback }
+        // Clock skew can put a fresh stamp a hair in the future; "in 0s" is
+        // nonsense to a person, so anything under a minute reads "now".
+        let now = Date()
+        if date > now || now.timeIntervalSince(date) < 60 { return "now" }
         let rel = RelativeDateTimeFormatter()
         rel.unitsStyle = unitsStyle
-        return rel.localizedString(for: date, relativeTo: Date())
+        return rel.localizedString(for: date, relativeTo: now)
     }
 
     /// Time-of-day only, localized ("6:02 PM"). On parse failure returns the

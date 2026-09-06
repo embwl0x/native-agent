@@ -147,6 +147,7 @@ struct PersonalityView: View {
     @State private var isReloadingDocuments = false
     @State private var isSavingName = false
     @State private var nameSaveFeedback: PersonalityNameSaveFeedback?
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     /// SOUL.md is the identity marker everywhere else in the system
     /// (PersonaRootResolver, onboarding guards) — same rule here. Presence
@@ -172,17 +173,13 @@ struct PersonalityView: View {
     var body: some View {
         Group {
             if isLoadingProfile {
-                NativeEmptyState(
-                    title: "Loading Personality",
-                    detail: "Reading the saved profile before showing controls.",
-                    systemImage: "person.wave.2",
-                    actionTitle: nil,
-                    actionImage: nil,
-                    action: nil
-                )
+                Text("Reading the saved profile.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 24) {
                         if personaInitialized {
                             identityPanel
                             docsPanel
@@ -194,11 +191,12 @@ struct PersonalityView: View {
                             // which must NOT masquerade as "no persona yet" —
                             // a live persona would see a false Create card
                             // (gpt-5.5 review LOW, 2026-07-03). Fail loud.
-                            NativePanel(title: "Persona Unavailable", systemImage: "exclamationmark.triangle") {
+                            PersonalityKitSection(label: "Persona unavailable") {
                                 Text(detail)
-                                    .font(.callout)
-                                    .foregroundStyle(.orange)
-                                Button("Retry", systemImage: "arrow.clockwise") {
+                                    .font(ShellType.label)
+                                    .foregroundStyle(NativeAgentShell.trouble)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Button("Retry") {
                                     Task { await loadProfile(forceRefresh: true) }
                                 }
                             }
@@ -206,8 +204,13 @@ struct PersonalityView: View {
                             starterPanel
                         }
                     }
-                    .frame(maxWidth: 920, alignment: .leading)
-                    .padding()
+                    .padding(.bottom, 32)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // The new shell's `ShellPageFrame` already insets the
+                    // column; the classic shell hands a page the bare pane,
+                    // so the page keeps its own margin there.
+                    .padding(.horizontal, classicShell ? 20 : 0)
+                    .padding(.top, classicShell ? 20 : 0)
                 }
             }
         }
@@ -220,10 +223,14 @@ struct PersonalityView: View {
     // MARK: starter — the only thing a new user sees
 
     private var starterPanel: some View {
-        NativePanel(title: "Create Your Agent", systemImage: "sparkles") {
-            Text("Give them a name. Add a few things about who they should be if you want — everything can grow and change later.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        PersonalityKitSection(
+            label: "Create the agent",
+            note: "Everything here can grow and change later."
+        ) {
+            Text("Name the agent. Add a few things about who the agent should be, if you want.")
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             TextField("Name", text: $starterAgentName)
                 .textFieldStyle(.roundedBorder)
@@ -232,27 +239,21 @@ struct PersonalityView: View {
                 .textFieldStyle(.roundedBorder)
 
             AdvancedTextEditor(
-                title: "A few things about them (optional)",
+                title: "A few things about the agent (optional)",
                 text: $starterNotes,
                 minHeight: 92
             )
 
-            HStack(spacing: 10) {
-                Button {
+            HStack(spacing: 8) {
+                Button(starterBusy ? "Creating\u{2026}" : "Create") {
                     Task { await createStarterPersona() }
-                } label: {
-                    if starterBusy {
-                        Label("Creating\u{2026}", systemImage: "hourglass")
-                    } else {
-                        Label("Create", systemImage: "checkmark.circle")
-                    }
                 }
                 .disabled(starterBusy || starterAgentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 if let starterError {
                     Text(starterError)
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.trouble)
                 }
             }
         }
@@ -286,15 +287,15 @@ struct PersonalityView: View {
     // MARK: identity — the one live profile field
 
     private var identityPanel: some View {
-        NativePanel(title: "Identity", systemImage: "person.wave.2") {
+        PersonalityKitSection(
+            label: "Name",
+            note: "The name shown across the app and in chat."
+        ) {
             TextField("Name", text: $draft.name)
                 .textFieldStyle(.roundedBorder)
-            Text("The name shown across the app and in chat.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
 
-            HStack {
-                Button("Save Name", systemImage: "checkmark.circle") {
+            HStack(spacing: 8) {
+                Button("Save name") {
                     Task { await saveName() }
                 }
                 // A name-only save cannot overwrite an unrelated stale profile
@@ -302,19 +303,21 @@ struct PersonalityView: View {
                 // prove this is an edit rather than an accidental initialization.
                 .disabled(appModel.personality == nil || isSavingName
                     || draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                Button("Reload", systemImage: "arrow.clockwise") {
+                Button("Reload") {
                     Task { await loadProfile(forceRefresh: true) }
                 }
-                Spacer()
+                Spacer(minLength: 8)
                 if let nameSaveFeedback {
-                    Label(nameSaveFeedback.text, systemImage: nameSaveFeedback.systemImage)
-                        .font(.caption)
+                    Text(nameSaveFeedback.text)
+                        .font(ShellType.caption)
                         .foregroundStyle(nameSaveFeedback.color)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 if let updatedAt = draft.updatedAt {
-                    Text("Updated: \(updatedAt)")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                    Text("Updated \(updatedAt)")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.tertiary)
                 }
             }
         }
@@ -342,17 +345,17 @@ struct PersonalityView: View {
     // MARK: documents — the persona itself
 
     private var docsPanel: some View {
-        NativePanel(title: "Persona Documents", systemImage: "doc.text") {
-            Text("These documents ARE the personality. Every chat turn compiles them into the system prompt in this order: SOUL \u{2192} VOICE \u{2192} USER \u{2192} GROWTH \u{2192} MEMORY \u{2192} AGENTS.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
+        PersonalityKitSection(
+            label: "Persona documents",
+            note: "These documents are the personality. Every chat turn compiles them into the system prompt in this order: SOUL, VOICE, USER, GROWTH, MEMORY, AGENTS."
+        ) {
             Picker("Document", selection: documentPickerSelection) {
                 ForEach(PersonalityDocumentDraftState.usableDocuments(in: appModel.personalityDocs)) { doc in
                     Text(doc.filename).tag(doc.id)
                 }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             AdvancedTextEditor(
                 title: selectedPersonalityDoc?.filename ?? "SOUL.md",
                 text: $personalityDocDraft,
@@ -364,8 +367,8 @@ struct PersonalityView: View {
             }
             .help(selectedPersonalityDocIsMemoryOwnedUser ? PersonalityDocHelpCopy.memoryOwnedDocument : "")
 
-            HStack {
-                Button("Save Document", systemImage: "checkmark.circle") {
+            HStack(spacing: 8) {
+                Button("Save document") {
                     let docId = documentDraftState.selectedDocumentID
                     let content = personalityDocDraft
                     Task {
@@ -380,7 +383,7 @@ struct PersonalityView: View {
                 }
                 .disabled(documentDraftState.selectedDocumentID.isEmpty || selectedPersonalityDocIsMemoryOwnedUser)
 
-                Button(isReloadingDocuments ? "Reloading…" : "Reload Documents", systemImage: "arrow.clockwise") {
+                Button(isReloadingDocuments ? "Reloading…" : "Reload documents") {
                     Task {
                         await reloadDocuments()
                     }
@@ -389,8 +392,8 @@ struct PersonalityView: View {
 
                 if let path = selectedPersonalityDoc?.path {
                     Text(path)
-                        .font(NativeAgentFont.mono)
-                        .foregroundStyle(.tertiary)
+                        .font(ShellType.label.monospaced())
+                        .foregroundStyle(NativeAgentShell.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
@@ -398,19 +401,21 @@ struct PersonalityView: View {
             }
 
             if documentDraftState.hasUnsavedDrafts {
-                Label("Unsaved edits are kept while you switch documents.", systemImage: "pencil.line")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Text("Unsaved edits are kept while you switch documents.")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
             if let banner = documentsReloadPresentation.banner {
-                Label(banner, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Text(banner)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let documentSaveError {
-                Label(documentSaveError, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Text(documentSaveError)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -569,17 +574,51 @@ private struct PersonalityNameSaveFeedback {
         .init(kind: .failed, text: "Could not save name: \(detail)")
     }
 
-    var systemImage: String {
-        switch kind {
-        case .saved: return "checkmark.circle.fill"
-        case .refused, .failed: return "exclamationmark.triangle.fill"
-        }
-    }
-
     var color: Color {
         switch kind {
-        case .saved: return .green
-        case .refused, .failed: return .orange
+        case .saved: return NativeAgentShell.calm
+        case .refused, .failed: return NativeAgentShell.trouble
+        }
+    }
+}
+
+/// An eyebrow, one card of controls, and the quiet line under it — the shape
+/// every group on an Advanced page takes.
+private struct PersonalityKitSection<Content: View>: View {
+    let label: String
+    var note: String?
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(label)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .padding(.horizontal, 2)
+
+            VStack(alignment: .leading, spacing: 12) {
+                content
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(NativeAgentShell.quietFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+            )
+
+            if let note {
+                Text(note)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 2)
+            }
         }
     }
 }

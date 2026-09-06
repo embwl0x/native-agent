@@ -30,60 +30,46 @@ enum CognitionSurfaceDispositionPresentation {
     enum StandingViewAction: String, CaseIterable, Hashable, Sendable {
         case approve
         case reject
+        /// The way OUT of a view she is already leaning on — active or held.
+        /// Not `reject`: rejecting is a verdict on a proposal, retiring is
+        /// ending something she has been living with, and the timeline records
+        /// them as the different facts they are.
+        case retire
 
         var title: String {
             switch self {
             case .approve: "Approve"
             case .reject: "Reject"
+            case .retire: "Retire"
             }
         }
 
         var approved: Bool { self == .approve }
+
+        var systemImage: String {
+            switch self {
+            case .approve: "checkmark"
+            case .reject: "xmark"
+            case .retire: "archivebox"
+            }
+        }
     }
 
     static let approvalsDestination: Destination = .activityCognitionProposals
     static let activityApprovalSection: ActivitySection = .cognitionProposals
     static let deskDebugDestination: Destination = .diagnosticsCognition
 
-    static func standingViewActions(isPending: Bool) -> [StandingViewAction] {
-        isPending ? StandingViewAction.allCases : []
+    /// Pending views get the review pair; a view she is already leaning on
+    /// (active or held) gets the one control that was missing until 2026-09-02.
+    static func standingViewActions(isPending: Bool, isLeaning: Bool = false) -> [StandingViewAction] {
+        if isPending { return [.approve, .reject] }
+        return isLeaning ? [.retire] : []
     }
 }
 import Observation
 import CognitiveSubstrate
 import Context
 import PersistenceCore
-
-/// The Observatory's Veto control may only claim a canceled pursuit after the
-/// Desk store commits both the terminal status and its rationale. This maps the
-/// handler's durable outcome into the mounted toast and refresh decision so a
-/// note-write failure remains an explicit adverse state.
-enum CognitionObservatoryWorkshopVetoPresentation {
-    enum Tone: Equatable {
-        case success
-        case info
-        case failure
-    }
-
-    struct Feedback: Equatable {
-        let tone: Tone
-        let text: String
-        let shouldRefresh: Bool
-    }
-
-    static func feedback(for outcome: WorkshopObservatoryVetoHandler.Outcome) -> Feedback {
-        switch outcome {
-        case .completed:
-            return Feedback(tone: .success, text: "Pursuit vetoed — closed as canceled.", shouldRefresh: true)
-        case .alreadyVetoed:
-            return Feedback(tone: .success, text: "Pursuit was already vetoed.", shouldRefresh: true)
-        case .inFlight:
-            return Feedback(tone: .info, text: "Veto already in progress.", shouldRefresh: false)
-        case let .failed(message):
-            return Feedback(tone: .failure, text: "Veto not recorded: \(message)", shouldRefresh: false)
-        }
-    }
-}
 
 struct CognitionObservatoryView: View {
     struct Dependencies {
@@ -109,7 +95,6 @@ struct CognitionObservatoryView: View {
 
     let runtime: NativeCognitionRuntime
     let dependencies: Dependencies
-    private let vetoHandler: WorkshopObservatoryVetoHandler
     @State private var detail: CognitiveObservatoryDetail?
     @State private var detailEvidenceStatus: CognitiveObservatoryDetailRead.EvidenceStatus?
     @State private var contextFlowHealth: ContextFlowObservatoryHealthState = .unavailable
@@ -127,7 +112,6 @@ struct CognitionObservatoryView: View {
     @State private var isRunningEvaluationSamplers = false
     @State private var evaluationSamplerOutcome: CognitiveEvaluationSamplerOutcome?
     @State var reflexReviewsInFlight: Set<String> = []
-    @State private var vetoingPursuitHandles: Set<String> = []
     @State private var lastRefresh: Date?
     @State private var pinNotice: String?
 
@@ -137,7 +121,6 @@ struct CognitionObservatoryView: View {
     ) {
         self.runtime = runtime
         self.dependencies = dependencies
-        self.vetoHandler = WorkshopObservatoryVetoHandler(dataRoot: dependencies.dataRoot)
     }
 
     private var isRefreshing: Bool { refreshCoordinator.isRefreshing }
@@ -194,7 +177,7 @@ struct CognitionObservatoryView: View {
                             .onChange(of: organismControlReadinessRevision) { _, _ in
                                 reportOrganismToggleStateIfReady()
                             }
-                        Stepper("Daily reflection budget: \(reflectionBudget)", value: reflectionBudgetBinding, in: 0...8)
+                        Stepper("Reflection budget (rolling 24h): \(reflectionBudget)", value: reflectionBudgetBinding, in: 0...8)
                             .disabled(!enabled || !reflectionEnabled)
                         // Same state as Settings ▸ Subconscious. That master
                         // switch sets ALL of these together; these granular
@@ -347,9 +330,12 @@ struct CognitionObservatoryView: View {
                             fallback: contextFlowFallback
                         )
                     }
-                    // L11 (Desk→Workshop): User's veto view onto Agent's Workshop.
-                    // Sourced from STORE QUERIES (liveState), never the capped
-                    // Desk projection — an open pursuit can never fall out of view.
+                    // L11 (Desk→Workshop): the workshop's counts, cadence and
+                    // session receipts. Sourced from STORE QUERIES (liveState),
+                    // never the capped Desk projection. The VETO control and the
+                    // per-pursuit list it sat on moved to DeskView's pursuits
+                    // row (item 36) — owner authority does not live behind the
+                    // developer gate.
                     collapsible(
                         .workshop,
                         title: "Desk",
@@ -358,12 +344,7 @@ struct CognitionObservatoryView: View {
                         count: workshop?.model?.openPursuitCount,
                         hint: workshop?.hint
                     ) {
-                        WorkshopObservatoryPanel(
-                            snapshot: workshop,
-                            pendingVetoHandles: vetoingPursuitHandles
-                        ) { handle in
-                            beginVetoPursuit(handle)
-                        }
+                        WorkshopObservatoryPanel(snapshot: workshop)
                     }
                     collapsible(.organism, title: "Organism Body", systemImage: "waveform.path.ecg", tint: .green,
                                 hint: Self.organismHint(detail.organism)) {
@@ -553,41 +534,6 @@ struct CognitionObservatoryView: View {
             organismControlReadinessRevision &+= 1
         }
         lastRefresh = Date()
-    }
-
-    /// Starts one mounted-button veto and holds that row disabled until its
-    /// durable result (and any needed refresh) has settled. The actor remains
-    /// the cross-surface guard; this local state prevents a second click from
-    /// racing a stale refresh into the visible Observatory snapshot.
-    private func beginVetoPursuit(_ handle: String) {
-        guard vetoingPursuitHandles.insert(handle).inserted else {
-            dependencies.systemToasts.push(info: "Veto already in progress.")
-            return
-        }
-        Task {
-            let shouldRefresh = await vetoPursuit(handle)
-            if shouldRefresh { await refresh() }
-            vetoingPursuitHandles.remove(handle)
-        }
-    }
-
-    /// Veto through the same resolved Desk root the panel refresh reads. The
-    /// store commits status plus rationale together and the handler guards
-    /// duplicate in-flight button events. Only a settled durable outcome may
-    /// refresh the visible pursuit list.
-    private func vetoPursuit(_ handle: String) async -> Bool {
-        let feedback = CognitionObservatoryWorkshopVetoPresentation.feedback(
-            for: await vetoHandler.veto(handle)
-        )
-        switch feedback.tone {
-        case .success:
-            dependencies.systemToasts.push(success: feedback.text)
-        case .info:
-            dependencies.systemToasts.push(info: feedback.text)
-        case .failure:
-            dependencies.systemToasts.push(error: feedback.text)
-        }
-        return feedback.shouldRefresh
     }
 
     private func contextFlowHint(_ state: ContextFlowObservatoryHealthState) -> String {

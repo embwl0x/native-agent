@@ -523,4 +523,56 @@ public struct SelfImprovementProposal: Sendable {
         self.applyOp = applyOp
         self.applyTarget = applyTarget
     }
+
+    /// A STABLE identity for this finding: the same finding produced by a
+    /// later pass digests to the same string (2026-09-06).
+    ///
+    /// The sweep stages its findings one at a time and rolls the weekly marker
+    /// back when a LATER one fails, so the next tick re-ran the whole pass and
+    /// re-staged everything that had already succeeded. Every staged row got a
+    /// fresh UUID, so nothing downstream could tell the retry's rows from the
+    /// first attempt's and the inbox filled with duplicate cards. Staging is
+    /// skip-if-present on this id instead.
+    public var findingId: String {
+        let material = [
+            kind == .runtime ? "runtime" : "code",
+            Self.withoutTimestamps(title),
+            Self.withoutTimestamps(proposedChange),
+            applyOp ?? "", applyTarget ?? "",
+        ].joined(separator: "\u{1D}")
+        return "swi-" + Self.digestHex(material).prefix(24)
+    }
+
+    /// The same finding, restated a week later, cites a different week. Dates
+    /// leak out of the evidence into the analyzer's own prose, so a digest that
+    /// hashed them raw gave one finding a fresh identity every pass and the
+    /// skip-if-present guards never fired (2026-09-06). Every `YYYY-MM-DD`,
+    /// with or without a time, collapses to a single placeholder before hashing.
+    static func withoutTimestamps(_ value: String) -> String {
+        guard let regex = timestampRegex else { return value }
+        let range = NSRange(value.startIndex..., in: value)
+        return regex.stringByReplacingMatches(
+            in: value, options: [], range: range, withTemplate: "<date>")
+    }
+
+    private static let timestampRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: "\\d{4}-\\d{2}-\\d{2}(?:[T ]\\d{2}:\\d{2}(?::\\d{2})?(?:\\.\\d+)?(?:Z|[+-]\\d{2}:?\\d{2})?)?"
+    )
+
+    private static func digestHex(_ value: String) -> String {
+        // FNV-1a 64, doubled over two salts: no CryptoKit dependency in this
+        // module, and collision risk over a handful of weekly findings is nil.
+        func fnv(_ bytes: [UInt8], seed: UInt64) -> UInt64 {
+            var hash = seed
+            for byte in bytes {
+                hash ^= UInt64(byte)
+                hash = hash &* 0x0000_0100_0000_01B3
+            }
+            return hash
+        }
+        let bytes = Array(value.utf8)
+        let low = fnv(bytes, seed: 0xcbf2_9ce4_8422_2325)
+        let high = fnv(bytes, seed: 0x9e37_79b9_7f4a_7c15)
+        return String(format: "%016lx%016lx", low, high)
+    }
 }

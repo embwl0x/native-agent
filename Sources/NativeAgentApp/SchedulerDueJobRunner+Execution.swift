@@ -133,7 +133,13 @@ extension SchedulerDueJobRunner {
                         errors.append("\(channel): \(result.error ?? result.delivery)")
                     }
                 case "push":
-                    try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+                    // Item 26: User chose "push" as this job's delivery channel,
+                    // so it is pinned — the router owns the exit and the class
+                    // stamp, not the channel the job explicitly asked for.
+                    // Payload unchanged.
+                    _ = try await AttentionRouter.shared.route(
+                        eventId: "scheduler:\(job.id):\(job.occurrenceKey)",
+                        importance: .ownerWaiting,
                         title: channelText.title,
                         body: channelText.message,
                         userInfo: [
@@ -141,7 +147,8 @@ extension SchedulerDueJobRunner {
                             "source": "scheduler",
                             "jobId": job.id,
                             "occurrenceKey": job.occurrenceKey,
-                        ]
+                        ],
+                        pinnedTo: .phone
                     )
                     delivered.append(channel)
                 case "telegram":
@@ -261,6 +268,23 @@ extension SchedulerDueJobRunner {
             )
         }
 
+        // 2026-09-06: a lost reservation is a retry-soon outcome, not a
+        // completed skip. Scheduled and pressure runs target different diary
+        // dates (the 03:30 job writes the day that just ended, a pressure run
+        // writes today), so a pressure run holding the lock at 03:30 would
+        // otherwise send the job straight to its next natural run and leave the
+        // previous day undreamt forever. Ask for a short retry; the per-day
+        // retry cap in update(job:) bounds it.
+        if (response["skipReason"] as? String) == "already_running" {
+            var retryObj = Self.object(output)
+            retryObj["retryAfterSeconds"] = .int(10 * 60)
+            return JobResult(
+                status: "skipped",
+                detail: "another dream run holds the reservation; retry scheduled",
+                output: .object(retryObj)
+            )
+        }
+
         if entries == 0 && errors.isEmpty {
             return JobResult(
                 status: "skipped",
@@ -335,12 +359,30 @@ extension SchedulerDueJobRunner {
     }
 
     private func executeREM(job: DueJob) async throws -> JobResult {
-        let response = try await NativeClient(baseURL: "").runRem()
+        // 2026-09-06: force:false. The scheduled Sunday pass must honour the
+        // weekly claim — a manual run earlier in the week already consolidated
+        // these dreams, and a forced re-run mints a duplicate proposal set.
+        let response = try await NativeClient(baseURL: "").runRem(force: false)
         let proposals = Self.anyInt(response["proposalsGenerated"])
         let archived = Self.anyInt(response["archivedEntries"])
         let tombstones = Self.anyInt(response["tombstoneSkips"])
         let evicted = Self.anyBool(response["growthMDEvicted"])
         let output = Self.jsonValue(from: response)
+
+        // 2026-09-06: a pass that lost the run reservation to a concurrent one
+        // is a retry-soon outcome, not a quiet week. It used to report zero
+        // proposals and "completed", so the weekly job went to its next natural
+        // run and that week's dreams were never consolidated. Same shape the
+        // dream job uses for its own reservation loss.
+        if (response["skipReason"] as? String) == "already_running" {
+            var retryObj = Self.object(output)
+            retryObj["retryAfterSeconds"] = .int(30 * 60)
+            return JobResult(
+                status: "skipped",
+                detail: "another REM pass holds the reservation; retry scheduled",
+                output: .object(retryObj)
+            )
+        }
 
         if proposals <= 0 {
             var outputObj = Self.object(output)

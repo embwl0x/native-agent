@@ -62,130 +62,138 @@ struct MacPairingView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                GradientText(
-                    text: "Pair iOS Device",
-                    colors: [.blue, .cyan, .teal],
-                    font: .title2.bold()
+            VStack(alignment: .leading, spacing: 24) {
+                Text("Copy the key below, then paste it into NativeAgent on your iPhone or iPad, under Pair with Mac. Until both hold the same key, messages from the phone are rejected.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                PairingNoticeCard(
+                    text: "The pairing key is a secret. Do not screenshot it, share it, or photograph it — anyone holding it can sign messages to this Mac.",
+                    systemImage: "lock.shield.fill"
                 )
 
-                // S.2: screenshot/sharing warning
-                HStack(spacing: 8) {
-                    Image(systemName: "lock.shield.fill").foregroundStyle(.orange)
-                    Text("This pairing key is a SECRET. Don't screenshot, share, or photograph it — anyone with this key can sign messages to your Mac.")
-                        .font(.caption).foregroundStyle(.orange)
-                }
-                .padding(10)
-                .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-
-                Text("Copy the key below, then paste it into NativeAgent on your iPhone or iPad (Pair with Mac -> Pairing key from Mac Settings) to enable secure iCloud sync. Without pairing, iOS messages are rejected.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-
                 if let pairingError {
-                    Label(pairingError, systemImage: "exclamationmark.shield.fill")
-                        .font(.callout)
-                        .foregroundStyle(.red)
-                        .padding(10)
-                        .background(.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                    PairingNoticeCard(text: pairingError, systemImage: "exclamationmark.shield.fill")
                 }
 
                 if !pairingPublicationWarning.isEmpty {
-                    Label(
-                        "Pairing delivery needs attention: \(pairingPublicationWarning)",
+                    PairingNoticeCard(
+                        text: "Pairing delivery needs attention: \(pairingPublicationWarning)",
                         systemImage: "exclamationmark.triangle.fill"
                     )
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .padding(10)
-                    .background(.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    PairingSectionLabel(text: "The pairing key")
+                    PairingCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack(spacing: 8) {
+                                // S.4: hide behind Reveal button; auto-hide after 30s
+                                if keyRevealed {
+                                    Text(secretBase64)
+                                        .font(PairingType.code)
+                                        .foregroundStyle(NativeAgentShell.text)
+                                        .textSelection(.enabled)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                } else {
+                                    Text(String(repeating: "•", count: 40))
+                                        .font(PairingType.code)
+                                        .foregroundStyle(NativeAgentShell.tertiary)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 8)
+                                Button(keyRevealed ? "Hide" : "Reveal") {
+                                    if keyRevealed {
+                                        // Hide immediately, cancel any pending timer
+                                        revealTimer?.cancel()
+                                        revealTimer = nil
+                                        keyRevealed = false
+                                    } else {
+                                        keyRevealed = true
+                                        revealTimer?.cancel()
+                                        revealTimer = Task { @MainActor in
+                                            try? await Task.sleep(for: .seconds(30))
+                                            if !Task.isCancelled { keyRevealed = false }
+                                            revealTimer = nil
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(secretBase64.isEmpty)
+                                Button(copied ? "Copied" : "Copy") {
+                                    let pb = NSPasteboard.general
+                                    pb.clearContents()
+                                    pb.setString(secretBase64, forType: .string)
+                                    copied = true
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(secretBase64.isEmpty)
+                            }
+                            .frame(height: 28)
+
+                            if secretBase64.isEmpty {
+                                Text("The key appears here once this Mac can read it.")
+                                    .font(ShellType.caption)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                            } else {
+                                Text("Revealing the key hides it again after thirty seconds.")
+                                    .font(ShellType.caption)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                            }
+                        }
+                    }
                 }
 
                 if let qr = qrImage {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Image(nsImage: qr)
-                            .resizable()
-                            .interpolation(.none)
-                            .frame(width: 240, height: 240)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .stroke(Color.gray.opacity(0.3), lineWidth: 1)
-                            )
-                        Text("The NativeAgent iPhone app does not scan a QR code yet — pair by pasting the key below.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Paste this key into NativeAgent on iOS:")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    HStack {
-                        // S.4: hide behind Reveal button; auto-hide after 30s
-                        if keyRevealed {
-                            Text(secretBase64)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        } else {
-                            Text(String(repeating: "•", count: 40))
-                                .font(.system(.caption, design: .monospaced))
-                                .lineLimit(1)
-                        }
-                        Button(keyRevealed ? "Hide" : "Reveal") {
-                            if keyRevealed {
-                                // Hide immediately, cancel any pending timer
-                                revealTimer?.cancel()
-                                revealTimer = nil
-                                keyRevealed = false
-                            } else {
-                                keyRevealed = true
-                                revealTimer?.cancel()
-                                revealTimer = Task { @MainActor in
-                                    try? await Task.sleep(for: .seconds(30))
-                                    if !Task.isCancelled { keyRevealed = false }
-                                    revealTimer = nil
-                                }
+                    VStack(alignment: .leading, spacing: 12) {
+                        PairingSectionLabel(text: "The same key, as a code")
+                        PairingCard {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Image(nsImage: qr)
+                                    .resizable()
+                                    .interpolation(.none)
+                                    .frame(width: 240, height: 240)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: NativeAgentRadius.card, style: .continuous)
+                                            .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+                                    )
+                                Text("The NativeAgent iPhone app does not scan a code yet. Pair by pasting the key above.")
+                                    .font(ShellType.caption)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
-                        .buttonStyle(.bordered)
-                        .disabled(secretBase64.isEmpty)
-                        Button(copied ? "Copied!" : "Copy") {
-                            let pb = NSPasteboard.general
-                            pb.clearContents()
-                            pb.setString(secretBase64, forType: .string)
-                            copied = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(secretBase64.isEmpty)
                     }
-                    .padding(.vertical, 6)
-                    .padding(.horizontal, 10)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
                 }
 
-                // S.3: confirmation dialog before regenerate
-                Button(role: .destructive) { showRegenConfirm = true } label: {
-                    Label("Regenerate Pairing Key", systemImage: "arrow.clockwise")
+                VStack(alignment: .leading, spacing: 12) {
+                    PairingSectionLabel(text: "Start over")
+                    // S.3: confirmation dialog before regenerate
+                    Button(role: .destructive) { showRegenConfirm = true } label: {
+                        Text("Regenerate the pairing key")
+                            .font(ShellType.labelMedium)
+                    }
+                    .buttonStyle(.bordered)
+                    .confirmationDialog(
+                        "Regenerate the pairing key?",
+                        isPresented: $showRegenConfirm,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Regenerate", role: .destructive) { regenerateSecret() }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("This invalidates the current pairing — you will need to paste the new key into every paired iPhone and iPad.")
+                    }
+                    Text("The old key stops working the moment a new one is made.")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
-                .help("Invalidates the existing pairing — you'll need to re-pair every iOS device.")
-                .confirmationDialog(
-                    "Regenerate Pairing Key?",
-                    isPresented: $showRegenConfirm,
-                    titleVisibility: .visible
-                ) {
-                    Button("Regenerate", role: .destructive) { regenerateSecret() }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text("This invalidates the current pairing — you will need to paste the new key into every paired iPhone and iPad.")
-                }
-
-                Spacer()
             }
-            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.bottom, 32)
         }
         .task {
             // mainactor_icloud: currentSecretBase64() does blocking disk I/O —
@@ -276,6 +284,70 @@ struct MacPairingView: View {
             let newSecretBase64 = persistedSecret.base64EncodedString()
             secretBase64 = newSecretBase64
             qrImage = renderQR(payload: pairingPayloadJSON(secret: newSecretBase64))
+        }
+    }
+}
+
+// MARK: - Page kit
+//
+// The page's own small vocabulary: the eyebrow that heads a run, the card the
+// controls sit in, and the one notice shape. Everything else on this page is
+// plain text on the sheet ShellPageFrame already draws.
+
+/// 13 monospaced, for a value that is a code. `ShellType` has no monospaced
+/// face, so this derives one from the token size rather than a literal.
+private enum PairingType {
+    static let code = Font.system(size: ShellType.labelSize, design: .monospaced)
+}
+
+private struct PairingSectionLabel: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.labelSemibold)
+            .textCase(.uppercase)
+            .kerning(0.6)
+            .foregroundStyle(NativeAgentShell.secondary)
+    }
+}
+
+private struct PairingCard<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(TodayPalette.cardFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+            )
+    }
+}
+
+/// Something the person has to know before they carry on: a card in the
+/// trouble colour, never a painted strip.
+private struct PairingNoticeCard: View {
+    let text: String
+    let systemImage: String
+
+    var body: some View {
+        PairingCard {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                Text(text)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
         }
     }
 }

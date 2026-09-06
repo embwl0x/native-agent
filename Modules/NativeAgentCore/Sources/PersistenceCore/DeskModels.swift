@@ -1229,6 +1229,63 @@ public struct DeskItem: Sendable, Equatable {
     }
 }
 
+// MARK: - OwnerAttentionPolicy — the ONE answer to "does she need User?"
+
+/// Every surface that answers "does she need me?" answers it from HERE.
+///
+/// Before this existed the Desk headline counted every blocked/flagged row
+/// ("Needs you · 10") while Living Status counted only rows whose `waitingOn`
+/// named the owner ("does not need you") — two predicates, same minute, both
+/// on screen. One of them had to be wrong, and the honest one is the narrow
+/// one: he is needed only when a DECISION OF HIS is what's missing.
+///
+/// The definition, stated once:
+///   - waiting on him  = an approval parked at a consent boundary, a Desk row
+///     whose `waitingOn` names him (`requiresOwnerInput`), or an external item
+///     explicitly routed to him (a needs-you GitHub item).
+///   - blocked         = everything else that can't move: CI, a provider, a
+///     sibling item, a verification run. Real, worth showing, NOT his to clear.
+///
+/// Both numbers stay visible — the label carries the distinction ("Waiting on
+/// you · N" vs "Blocked · M") instead of one number quietly meaning both.
+public enum OwnerAttentionPolicy {
+    /// The row-level predicate. Deliberately identical to
+    /// `DeskItem.requiresOwnerInput`: a nonterminal row that names the human
+    /// as the party it waits on.
+    public static func waitsOnOwner(_ item: DeskItem) -> Bool {
+        item.requiresOwnerInput
+    }
+
+    public static func ownerDecisionCount(in items: [DeskItem]) -> Int {
+        items.lazy.filter(waitsOnOwner).count
+    }
+
+    /// The headline number. `externalOwnerItems` is for surfaces that route
+    /// non-Desk work to the owner (GitHub items in the `needsUser` bucket);
+    /// surfaces without such a lane pass 0 and get the same arithmetic.
+    public static func waitingOnOwnerCount(
+        approvalsWaiting: Int,
+        ownerDecisionItems: Int,
+        externalOwnerItems: Int = 0
+    ) -> Int {
+        max(0, approvalsWaiting) + max(0, ownerDecisionItems) + max(0, externalOwnerItems)
+    }
+
+    /// The boolean the Living Status panel speaks aloud. Same inputs, same
+    /// rule — it can never disagree with the Desk's count again.
+    public static func needsOwner(
+        approvalsWaiting: Int,
+        ownerDecisionItems: Int,
+        externalOwnerItems: Int = 0
+    ) -> Bool {
+        waitingOnOwnerCount(
+            approvalsWaiting: approvalsWaiting,
+            ownerDecisionItems: ownerDecisionItems,
+            externalOwnerItems: externalOwnerItems
+        ) > 0
+    }
+}
+
 // MARK: - ArchiveRecord (append-only archived item record)
 
 public struct ArchiveRecord: Sendable, Equatable {

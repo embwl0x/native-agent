@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -15,6 +16,12 @@ struct TelegramUpdateClaim: Sendable, Equatable {
     let update: TelegramUpdate
     let phase: TelegramUpdateClaimPhase
     let queueAcknowledgementMessageId: Int?
+    /// 2026-09-06: for a queued `/retry`, the message text the retry resolved
+    /// to at queue time. `/retry` reads the last user message from the
+    /// coordinator's in-memory map; after a restart that map is empty, so a
+    /// queued retry replayed from this inbox answered "nothing to retry" and
+    /// settled its claim. Nil for every other update.
+    let resolvedRetryText: String?
     let claimedAt: String
     let updatedAt: String
 }
@@ -103,6 +110,7 @@ struct TelegramUpdateInbox: Sendable {
                 update: update,
                 phase: .pending,
                 queueAcknowledgementMessageId: nil,
+                resolvedRetryText: nil,
                 claimedAt: now,
                 updatedAt: now
             )
@@ -112,11 +120,17 @@ struct TelegramUpdateInbox: Sendable {
         }
     }
 
+    /// 2026-09-06: `resolvedRetryText` rides the phase write. A queued
+    /// `/retry` used to become `.queued` first and pin its text in a second
+    /// write, so a crash in between left exactly the claim recovery cannot
+    /// resolve — the bug the pin was added to fix. Nil keeps whatever the
+    /// claim already carries.
     @discardableResult
     func transition(
         updateId: Int,
         from allowed: Set<TelegramUpdateClaimPhase>,
-        to phase: TelegramUpdateClaimPhase
+        to phase: TelegramUpdateClaimPhase,
+        resolvedRetryText: String? = nil
     ) async throws -> TelegramUpdateClaim {
         let path = claimPath(updateId: updateId)
         return try await persistence.withFileLock(path) {
@@ -129,6 +143,7 @@ struct TelegramUpdateInbox: Sendable {
                 queueAcknowledgementMessageId: phase == .queued
                     ? current.queueAcknowledgementMessageId
                     : nil,
+                resolvedRetryText: resolvedRetryText ?? current.resolvedRetryText,
                 claimedAt: current.claimedAt,
                 updatedAt: _tgNowString()
             )
@@ -152,6 +167,7 @@ struct TelegramUpdateInbox: Sendable {
                 update: current.update,
                 phase: current.phase,
                 queueAcknowledgementMessageId: messageId,
+                resolvedRetryText: current.resolvedRetryText,
                 claimedAt: current.claimedAt,
                 updatedAt: _tgNowString()
             )
@@ -159,6 +175,18 @@ struct TelegramUpdateInbox: Sendable {
             try await upsertIndex(next)
             return next
         }
+    }
+
+    /// The pinned retry text for this update, or nil when the claim is gone,
+    /// unreadable, or was never a queued retry.
+    func resolvedRetryText(updateId: Int) async -> String? {
+        guard let claim = try? decodeClaim(
+            at: claimPath(updateId: updateId),
+            kind: .mutation
+        ) else { return nil }
+        let trimmed = claim.resolvedRetryText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trimmed?.isEmpty ?? true) ? nil : trimmed
     }
 
     /// Recovery reads the maintained index, then opens only pending,
@@ -242,6 +270,7 @@ struct TelegramUpdateInbox: Sendable {
             queueAcknowledgementMessageId: Self.optionalInt(
                 object["queueAcknowledgementMessageId"]
             ),
+            resolvedRetryText: Self.optionalString(object["resolvedRetryText"]),
             claimedAt: claimedAt,
             updatedAt: updatedAt
         )
@@ -258,12 +287,18 @@ struct TelegramUpdateInbox: Sendable {
             "updatedAt": .string(claim.updatedAt),
             "queueAcknowledgementMessageId": claim.queueAcknowledgementMessageId
                 .map { .int(Int64($0)) } ?? .null,
+            "resolvedRetryText": claim.resolvedRetryText.map { .string($0) } ?? .null,
             "update": updateValue,
         ])
         try await persistence.writeDataAtomicDurable(
             value.serializedData(pretty: true),
             to: path
         )
+    }
+
+    private static func optionalString(_ value: JSONValue?) -> String? {
+        guard case .string(let raw)? = value else { return nil }
+        return raw.isEmpty ? nil : raw
     }
 
     private static func optionalInt(_ value: JSONValue?) -> Int? {
@@ -363,6 +398,61 @@ extension TelegramPollLoop {
             obj[key] = value
         }
         try? await store.writeJSON(.object(obj), to: path)
+    }
+
+    /// A short, non-reversible fingerprint of the bot token. The token itself
+    /// never reaches state.json; this only has to tell one token from another.
+    static func botTokenFingerprint(_ token: String) -> String {
+        String(
+            SHA256.hash(data: Data(token.utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+                .prefix(16)
+        )
+    }
+
+    /// How long a cached identity is trusted. A rename is rare, so an hourly
+    /// getMe would be waste; a day is short enough that a stale @username
+    /// self-corrects without anyone clearing state.
+    static let botUsernameCacheSeconds: TimeInterval = 24 * 60 * 60
+
+    /// 2026-09-06: this bot's own @username, cached in telegram/state.json.
+    /// Only a slash command that NAMES a bot asks for it, so a failed getMe
+    /// costs one round trip per such command and never a per-tick one. Nil
+    /// means the identity is unknown; the caller then keeps the old permissive
+    /// behaviour rather than dropping the owner's own command.
+    ///
+    /// 2026-09-06: the cache is keyed to the token's fingerprint and expires.
+    /// Cached forever and untied to the token, a swapped token (or a rename)
+    /// left this loop answering as the PREVIOUS bot — every command addressed
+    /// to the new @username read as another bot's and was dropped.
+    func resolveBotUsername() async -> String? {
+        let store = SwiftNativePersistenceCore()
+        let path = telegramDir.appendingPathComponent("state.json")
+        let state = await store.readJSON(path, defaultValue: .object([:]))
+        let fingerprint = Self.botTokenFingerprint(token)
+        if case .object(let root) = state,
+           let cached = _tgJSONString(root["botUsername"]),
+           !cached.isEmpty,
+           _tgJSONString(root["botUsernameTokenFingerprint"]) == fingerprint,
+           let cachedAt = _tgParseDate(_tgJSONString(root["botUsernameAt"])),
+           Date().timeIntervalSince(cachedAt) < Self.botUsernameCacheSeconds {
+            return cached
+        }
+        do {
+            let username = try await Self.defaultFetchBotUsername(token)
+            let trimmed = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            await writeStatePatch([
+                "botUsername": .string(trimmed),
+                "botUsernameTokenFingerprint": .string(fingerprint),
+                "botUsernameAt": .string(_tgNowString()),
+            ])
+            return trimmed
+        } catch {
+            await recordError(context: "get_me", error: String(describing: error))
+            return nil
+        }
     }
 
     func syncCommandMenuIfNeeded() async {
@@ -540,7 +630,7 @@ extension TelegramPollLoop {
             return
         }
         do {
-            try await sendMessage(token, message.chatId, notice)
+            try await sendMessage(token, message.destination, notice)
             await recordReceipt(
                 kind: receiptKind,
                 update: update,

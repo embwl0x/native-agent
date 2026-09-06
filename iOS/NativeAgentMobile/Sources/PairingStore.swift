@@ -342,11 +342,60 @@ final class PairingStore: ObservableObject {
     /// deliberately ignored during a prior unpair; the comparison itself does
     /// not mutate pairing state.
     func publishedICloudPairingSecretForVerification() -> Data? {
-        guard let base64 = NSUbiquitousKeyValueStore.default.string(forKey: KVSPairingKey.hmacSecret),
-              let data = Data(base64Encoded: base64),
-              data.count == 32 else {
+        if let base64 = NSUbiquitousKeyValueStore.default.string(forKey: KVSPairingKey.hmacSecret),
+           let data = Data(base64Encoded: base64),
+           data.count == 32 {
+            return data
+        }
+        // 2026-09-06: KVS is not the only publication route. A Mac signed with
+        // the CloudKit-only entitlements has no ubiquity key-value store at all,
+        // so this used to return nil for every manual key on those builds — and
+        // since Re-pair records the cleared key's hash and CloudKit re-delivery
+        // of that same key is then refused, the phone had no way back.
+        //
+        // 2026-09-06: an expired peek is no material at all. The transport
+        // record this came from is the role-level singleton `pairing.mac`, so a
+        // retained value cannot be told apart from the current one — an old key
+        // that still matched here would install and leave the phone signing
+        // with authority the Mac has already rotated away from.
+        guard let peeked = cloudKitPublishedPairingSecret,
+              Date().timeIntervalSince(peeked.fetchedAt) < Self.peekedPairingSecretLifetime else {
+            cloudKitPublishedPairingSecret = nil
             return nil
         }
+        return peeked.data
+    }
+
+    /// The pairing secret read straight from the device transport for ONE
+    /// verification attempt, with the moment it was read. Never persisted,
+    /// never installed from here — `applyICloudSecret` remains the only manual
+    /// install path.
+    private struct PeekedPairingSecret {
+        var data: Data
+        var fetchedAt: Date
+    }
+
+    private var cloudKitPublishedPairingSecret: PeekedPairingSecret?
+
+    /// How long a peeked secret may back a comparison. Long enough for the
+    /// paste that follows the peek, short enough that it cannot outlive a Mac
+    /// rotation the phone never saw.
+    static let peekedPairingSecretLifetime: TimeInterval = 5 * 60
+
+    /// Ask the device transport for the Mac's published pairing material so the
+    /// verification that immediately follows has something to compare against.
+    ///
+    /// 2026-09-06: this ALWAYS replaces the held value — a failed or empty peek
+    /// clears it. Keeping the previous read meant a key the Mac no longer
+    /// publishes could still verify and install on the next paste.
+    @discardableResult
+    func refreshPublishedPairingSecretForVerification() async -> Data? {
+        guard let data = await iCloudBridge.shared.publishedPairingSecretFromTransport(),
+              data.count == 32 else {
+            cloudKitPublishedPairingSecret = nil
+            return nil
+        }
+        cloudKitPublishedPairingSecret = PeekedPairingSecret(data: data, fetchedAt: Date())
         return data
     }
 

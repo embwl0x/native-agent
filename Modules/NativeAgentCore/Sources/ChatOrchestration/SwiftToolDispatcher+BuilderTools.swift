@@ -465,6 +465,22 @@ extension SwiftToolDispatcher {
         return ranges
     }
 
+    /// The subtrees the builder sandbox profile denies `file-write*` on — the
+    /// live trust policy under the data root, and the repo-local `data/trust`
+    /// of the source checkout. One list, so the SBPL profile and the
+    /// in-process patch path fence the same directories.
+    static func builderWriteDeniedSubtrees(dataRoot: URL) -> [URL] {
+        var paths = [dataRoot.appendingPathComponent("trust", isDirectory: true)]
+        if let source = builderSourceRepoRoot(dataRoot: dataRoot) {
+            paths.append(
+                source
+                    .appendingPathComponent("data", isDirectory: true)
+                    .appendingPathComponent("trust", isDirectory: true)
+            )
+        }
+        return paths.map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+    }
+
     static func builderContextPatchFileURL(
         path: String,
         cwd: String,
@@ -477,6 +493,16 @@ extension SwiftToolDispatcher {
         guard builderAllowedRoots(dataRoot: dataRoot).contains(where: { root in
             resolved.path == root.path || resolved.path.hasPrefix(root.path + "/")
         }) else { return nil }
+        // 2026-09-06: a range-less @@ hunk takes the IN-PROCESS branch and
+        // writes with Foundation, never entering the sandboxed subprocess —
+        // so the SBPL profile's trust-directory denial did not apply and
+        // `data/trust/policy.json` was writable from apply_patch. Apply the
+        // same denial here.
+        if builderWriteDeniedSubtrees(dataRoot: dataRoot).contains(where: { denied in
+            resolved.path == denied.path || resolved.path.hasPrefix(denied.path + "/")
+        }) {
+            return nil
+        }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir),
               !isDir.boolValue else {
@@ -900,19 +926,9 @@ extension SwiftToolDispatcher {
             .joined(separator: "\n")
         let home = Self.sbplEscapeLiteral(
             URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path)
-        var trustPaths = [
-            dataRoot.appendingPathComponent("trust", isDirectory: true)
-        ]
-        if let source = builderSourceRepoRoot(dataRoot: dataRoot) {
-            trustPaths.append(
-                source
-                    .appendingPathComponent("data", isDirectory: true)
-                    .appendingPathComponent("trust", isDirectory: true)
-            )
-        }
         var seenTrustPaths = Set<String>()
-        let trustRules = trustPaths.compactMap { url -> String? in
-            let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let trustRules = builderWriteDeniedSubtrees(dataRoot: dataRoot).compactMap { url -> String? in
+            let path = url.path
             guard seenTrustPaths.insert(path).inserted else { return nil }
             return #"        (deny file-write* (subpath "\#(Self.sbplEscapeLiteral(path))"))"#
         }.joined(separator: "\n")
@@ -926,6 +942,7 @@ extension SwiftToolDispatcher {
         return """
         (version 1)
         (allow default)
+        \(Self.sbplAutomationDenials)
         (deny file-write*)
         (allow file-write*
         \(writableRoots)
@@ -970,11 +987,30 @@ extension SwiftToolDispatcher {
         return """
         (version 1)
         (allow default)
+        \(Self.sbplAutomationDenials)
         \(denyRules)
         (allow file-write* (subpath "\(Self.sbplEscapeLiteral(workspace))"))
         (deny file-write* (subpath "\(Self.sbplEscapeLiteral(trustPath))"))
         """
     }
+
+    /// 2026-09-06: both shell profiles are `(allow default)` narrowed only on
+    /// `file-write*`, which confined the process's OWN writes and nothing else.
+    /// Apple Events were wide open, so a sandboxed shell could tell Finder,
+    /// Terminal or System Events — none of them sandboxed — to write, move or
+    /// delete anything the user can reach, and the write never crossed this
+    /// profile at all. Denying the operation is the fence; denying the mach
+    /// services that carry it means a caller cannot route around the operation
+    /// name. Nothing a builder shell legitimately does (git, SwiftPM, compilers,
+    /// `open`) speaks Apple Events, so this costs no capability.
+    ///
+    /// Placed straight after `(allow default)`: SBPL is last-match-wins and no
+    /// later rule in either profile mentions these operations.
+    static let sbplAutomationDenials = """
+        (deny appleevent-send)
+        (deny mach-lookup (global-name "com.apple.coreservices.appleevents"))
+        (deny mach-lookup (global-name "com.apple.appleeventsd"))
+    """
 
     enum BuilderShellSandboxMode: String, Sendable {
         /// Strict / locked-down posture: workspace-confined AND the off-ramps

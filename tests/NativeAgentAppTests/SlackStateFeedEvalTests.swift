@@ -1,3 +1,6 @@
+// 2026-09-06: Connectors for ConnectorHealthDecay's canonical decayed
+// auth/health spellings (7df7a4cd), used by the connector-overlay tests below.
+import Connectors
 import Foundation
 import PersistenceCore
 import Testing
@@ -66,8 +69,19 @@ struct SlackStateFeedEvalTests {
 
         let client = NativeClient(baseURL: "", dataRootOverride: root)
         let unobserved = try #require(try await client.getConnectors().first { $0.id == "slack" })
-        #expect(unobserved.authState == "connected")
-        #expect(unobserved.healthStatus == "ok")
+        // 2026-09-06: the credential state this test holds constant is now
+        // "configured, unverified", not "connected/ok". 7df7a4cd added
+        // ConnectorHealthDecay to the list read
+        // (NativeClient+LocalAPI.swift readConnectorRecords): the overlay still
+        // derives connected/ok from the token file on disk, but a green whose
+        // only proof is credential PRESENCE decays unless
+        // connectors/actions/receipts.jsonl carries a real successful call.
+        // This fixture writes a token and no receipts, so every read below is
+        // `configured`/`unverified`. What the test pins is unchanged: the
+        // Socket Mode feed moves runtimeStatus and never touches the
+        // credential verdict.
+        #expect(unobserved.authState == ConnectorHealthDecay.configuredAuth)
+        #expect(unobserved.healthStatus == ConnectorHealthDecay.unverifiedHealth)
         #expect(unobserved.runtimeStatus == "unobserved")
 
         #expect(await SlackRuntimeStateStore.apply(
@@ -75,7 +89,8 @@ struct SlackStateFeedEvalTests {
             dataRoot: root
         ) == .stored)
         let live = try #require(try await client.getConnectors().first { $0.id == "slack" })
-        #expect(live.authState == "connected")
+        // 2026-09-06: unchanged credential verdict, new spelling (7df7a4cd decay).
+        #expect(live.authState == ConnectorHealthDecay.configuredAuth)
         #expect(live.runtimeStatus == "connected")
         #expect(live.runtimeUpdatedAt != nil)
 
@@ -86,7 +101,9 @@ struct SlackStateFeedEvalTests {
             now: staleAt
         ) == .stored)
         let stale = try #require(try await client.getConnectors().first { $0.id == "slack" })
-        #expect(stale.authState == "connected")
+        // 2026-09-06: a stale heartbeat still must not move the credential
+        // verdict off the decayed value (7df7a4cd).
+        #expect(stale.authState == ConnectorHealthDecay.configuredAuth)
         #expect(stale.runtimeStatus == "stale")
 
         try Data("[\"not an object\"]".utf8).write(
@@ -94,7 +111,9 @@ struct SlackStateFeedEvalTests {
             options: .atomic
         )
         let malformed = try #require(try await client.getConnectors().first { $0.id == "slack" })
-        #expect(malformed.authState == "connected")
+        // 2026-09-06: a malformed runtime file still must not move the
+        // credential verdict off the decayed value (7df7a4cd).
+        #expect(malformed.authState == ConnectorHealthDecay.configuredAuth)
         #expect(malformed.runtimeStatus == "unavailable")
     }
 
@@ -116,13 +135,20 @@ struct SlackStateFeedEvalTests {
         #expect(await SlackRuntimeStateStore.apply(["connected": .bool(true), "lastError": .null], dataRoot: root) == .stored)
         let client = NativeClient(baseURL: "", dataRootOverride: root)
         let recovering = try #require(try await client.getConnectors().first { $0.id == "slack" })
-        #expect(recovering.authState == "connected")
+        // 2026-09-06: "without changing authority" now means the row keeps the
+        // decayed credential verdict. 7df7a4cd's ConnectorHealthDecay downgrades
+        // a green proved only by the token file when
+        // connectors/actions/receipts.jsonl has no successful non-dry-run call,
+        // and this fixture writes none. Delivery-journal pressure still must
+        // not move it.
+        #expect(recovering.authState == ConnectorHealthDecay.configuredAuth)
         #expect(recovering.runtimeStatus == "recovery_required")
         #expect(recovering.runtimeDetail?.contains("1 replies have an unknown outcome") == true)
         #expect(recovering.runtimeDetail?.contains("PRIVATE MESSAGE BODY") == false)
         _ = try await journal.claim(message("2.000"))
         let paused = try #require(try await client.getConnectors().first { $0.id == "slack" })
-        #expect(paused.authState == "connected")
+        // 2026-09-06: same decayed verdict under a paused intake (7df7a4cd).
+        #expect(paused.authState == ConnectorHealthDecay.configuredAuth)
         #expect(paused.runtimeStatus == "intake_paused")
         #expect(paused.runtimeDetail?.contains("2 pending replies") == true)
         #expect(paused.runtimeDetail?.contains("nothing is automatically discarded or resent") == true)

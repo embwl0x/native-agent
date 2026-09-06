@@ -46,10 +46,11 @@ public struct OrganismDreamRepairEvidence: Codable, Sendable, Equatable, Identif
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !oneLine.isEmpty else { return fallback }
         let lower = oneLine.lowercased()
-        if lower.contains("bearer ")
-            || lower.contains("sk-")
-            || lower.contains("xoxb-")
-            || lower.contains("xapp-")
+        // Credential SHAPES come from the one shared filter; the key-name
+        // markers below are this lane's own, broader rule about evidence text.
+        // (The private copy this replaces matched `sk-` unanchored, so any
+        // `desk-…` evidence line was hidden as if it were a key.)
+        if JSONValueBounding.containsSecretLikeValue(oneLine)
             || lower.contains("authorization:")
             || lower.contains("api_key")
             || lower.contains("secret") {

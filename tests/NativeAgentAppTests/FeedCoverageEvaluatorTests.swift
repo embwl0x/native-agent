@@ -61,19 +61,30 @@ struct FeedCoverageEvaluatorTests {
         #expect(corrupt.stdout.contains("canonical id/status/dryRun/timestamp contract"))
     }
 
-    @Test func workJournalPairsTheSnapshotWithItsJSONLTail() throws {
+    /// Sweep item 21 (2026-09-01): `codex_daily.jsonl` is retired — the writer
+    /// stopped appending it because nothing in production read it, and this
+    /// evaluator was the only thing that ever opened the pair. `latest.json`
+    /// alone is now the feed, and stale residual daily rows must NOT drag it to
+    /// UNREADABLE: a retired half is history, not a broken contract.
+    @Test func workJournalReadsTheSnapshotAloneAndIgnoresRetiredDailyRows() throws {
         let data = try root("work-journal")
         defer { try? FileManager.default.removeItem(at: data.deletingLastPathComponent()) }
         let generated = ISO8601DateFormatter().string(from: Date())
         let id = "codex-work-\(UUID().uuidString.lowercased())"
         try write("{\"id\":\"\(id)\",\"status\":\"completed\",\"generatedAt\":\"\(generated)\"}", "work_journal/latest.json", under: data)
-        try write("{\"id\":\"codex-work-older\",\"status\":\"completed\",\"generatedAt\":\"2026-01-01T00:00:00Z\"}\n{\"id\":\"\(id)\",\"status\":\"completed\",\"generatedAt\":\"\(generated)\"}\n", "work_journal/codex_daily.jsonl", under: data)
 
         let healthy = try report(data)
-        #expect(healthy.stdout.contains("`feeds.work_journal` | **ACTIVE** | 2"))
-        #expect(healthy.stdout.contains("writer appends codex_daily.jsonl then writes matching latest.json"))
+        #expect(healthy.stdout.contains("`feeds.work_journal` | **ACTIVE** | 1"))
+        #expect(healthy.stdout.contains("latest.json is the whole production feed"))
 
-        try write("{\"id\":\"wrong\",\"status\":\"completed\",\"generatedAt\":\"\(generated)\"}\n", "work_journal/codex_daily.jsonl", under: data)
+        // A residual daily file that no longer matches the snapshot is exactly
+        // what the live root looks like after the writer stops. Still ACTIVE.
+        try write("{\"id\":\"codex-work-older\",\"status\":\"completed\",\"generatedAt\":\"2026-01-01T00:00:00Z\"}\n", "work_journal/codex_daily.jsonl", under: data)
+        let withResidue = try report(data)
+        #expect(withResidue.stdout.contains("`feeds.work_journal` | **ACTIVE** | 1"))
+
+        // The snapshot itself going bad is still a real UNREADABLE.
+        try write("{\"id\":\"wrong\",\"status\":\"completed\",\"generatedAt\":\"\(generated)\"}", "work_journal/latest.json", under: data)
         let mismatch = try report(data)
         #expect(mismatch.stdout.contains("`feeds.work_journal` | **UNREADABLE**"))
         #expect(mismatch.stdout.contains("ledger contract revision"))

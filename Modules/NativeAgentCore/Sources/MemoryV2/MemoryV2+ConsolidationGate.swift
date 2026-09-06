@@ -232,8 +232,52 @@ public enum MemoryConsolidationGate {
             .appendingPathComponent("memory.sqlite")
     }
 
+    /// The live store this gate swaps into.
+    static func liveStorePath(dataRoot: URL) -> URL {
+        dataRoot
+            .appendingPathComponent("memory", isDirectory: true)
+            .appendingPathComponent("memory.sqlite")
+    }
+
     static func manifestPath(dataRoot: URL, runId: String) -> URL {
         candidateRoot(dataRoot: dataRoot, runId: runId).appendingPathComponent("manifest.json")
+    }
+
+    /// User, 2026-09-06: the swap's applied marker, one row per run, written
+    /// INSIDE the swap transaction and living in the live store itself.
+    ///
+    /// The committed store need not match `manifest.candidateFingerprint`: the
+    /// usage veto keeps a row active where the candidate archived it, and the
+    /// row-cap prune can drop rows the candidate carried. So `applySwap`'s
+    /// crash-window branch cannot recognise a landed swap by fingerprint
+    /// equality alone, and any marker written AFTER the commit — the
+    /// `applied_fingerprint.txt` file this replaces — leaves a window where a
+    /// crash, or a canonical write landing before the next reconcile, makes a
+    /// swap that DID commit read as stale: candidate deleted, nothing applied,
+    /// the pending USER.md/Spotlight/KG/Fluid Context projections abandoned.
+    /// Being part of the transaction, this row is present exactly when the
+    /// swap committed, whatever the live fingerprint says afterwards.
+    static let appliedMarkerTable = "consolidation_applied"
+
+    /// True when the live store carries THIS run's applied marker. Any read
+    /// failure answers false: an unreadable store is not proof of a swap.
+    static func swapMarkerApplied(livePath: URL, runId: String) -> Bool {
+        var config = Configuration()
+        config.busyMode = .timeout(5)
+        config.readonly = true
+        guard let queue = try? DatabaseQueue(path: livePath.path, configuration: config) else {
+            return false
+        }
+        defer { try? queue.close() }
+        let found = try? queue.read { db -> Bool in
+            guard try db.tableExists(appliedMarkerTable) else { return false }
+            return try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM \(appliedMarkerTable) WHERE run_id = ?)",
+                arguments: [runId]
+            ) ?? false
+        }
+        return found ?? false
     }
 
     static func receiptsDir(dataRoot: URL) -> URL {
@@ -375,8 +419,15 @@ public enum MemoryConsolidationGate {
         let candidateStorage: MemoryStorage
         do {
             candidateStorage = try MemoryStorage(dataRoot: candidateRootURL)
-            plan = try await MemoryConsolidator(storage: candidateStorage, now: now)
-                .consolidateDestructively()
+            // 2026-09-06: the candidate root holds a COPY of memory.sqlite and
+            // nothing else — no trust/policy.json. Pass the REAL data root so
+            // "Keep consolidated memories without asking" and "Memory hygiene"
+            // are read from the policy the user actually edited.
+            plan = try await MemoryConsolidator(
+                storage: candidateStorage,
+                now: now,
+                policyRoot: dataRoot
+            ).consolidateDestructively()
         } catch {
             cleanupCandidate(dataRoot: dataRoot, runId: runId)
             throw error
@@ -555,7 +606,16 @@ public enum MemoryConsolidationGate {
             case ("pending", _):
                 outcomes.append(.pendingApproval(runId: runId))
             case (_, .some("approved")):
-                guard candidateExists else {
+                // User, 2026-09-06: a run whose swap committed is not
+                // unrecoverable just because its candidate is gone — a crash
+                // partway through `cleanupCandidate` leaves exactly that. The
+                // applied marker in the live store settles it, and `applySwap`
+                // takes the already-applied path and reconciles the pending
+                // projections.
+                guard candidateExists
+                    || swapMarkerApplied(
+                        livePath: liveStorePath(dataRoot: dataRoot), runId: runId
+                    ) else {
                     // Approved but the candidate is gone and no receipt —
                     // unrecoverable; write a terminal failure receipt so we
                     // never loop on it.
@@ -675,13 +735,19 @@ public enum MemoryConsolidationGate {
                 detail: "consolidation swap FAILED: staging manifest unreadable — nothing applied")
             return .failed(runId: runId, reason: "manifest unreadable: \(error)")
         }
-        let livePath = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("memory.sqlite")
+        let livePath = liveStorePath(dataRoot: dataRoot)
         let candidatePath = candidateDBPath(dataRoot: dataRoot, runId: runId)
         do {
+            // User, 2026-09-06: the applied marker is read BEFORE the candidate
+            // is touched. Once the swap has committed the candidate's state
+            // says nothing about this run — a half-finished cleanup or a
+            // drifted candidate file must not turn a landed swap into a
+            // terminal "failed" with its projections never reconciled.
+            let markerApplied = swapMarkerApplied(livePath: livePath, runId: runId)
             // Integrity: the candidate on disk must be the one that was scored.
-            let candidateFP = try fingerprint(ofDatabaseAt: candidatePath)
+            let candidateFP = markerApplied
+                ? manifest.candidateFingerprint
+                : try fingerprint(ofDatabaseAt: candidatePath)
             guard candidateFP == manifest.candidateFingerprint else {
                 writeReceipt(dataRoot: dataRoot, runId: runId, status: "failed",
                              approvalId: verified.id, backupPath: nil,
@@ -700,8 +766,16 @@ public enum MemoryConsolidationGate {
                 return .failed(runId: runId, reason: "candidate fingerprint drifted since staging")
             }
             let liveFP = try fingerprint(ofDatabaseAt: livePath)
-            // Crash-after-commit window: swap already landed.
-            if liveFP == manifest.candidateFingerprint {
+            // Crash-after-commit window: swap already landed. User, 2026-09-06:
+            // the committed store matches the candidate's fingerprint only when
+            // nothing changed it on the way in — the usage veto and the row-cap
+            // prune both do — and a canonical write landing before this retry
+            // moves it again. The marker the swap wrote INSIDE its transaction
+            // is the authority, whatever the live fingerprint now says; without
+            // it a swap that HAD committed fell through to `refuseStale` below,
+            // discarding the candidate and reporting nothing applied. The
+            // projection reconcile it re-runs is idempotent.
+            if markerApplied || liveFP == manifest.candidateFingerprint {
                 swapCommitted = true
                 let projections = try await reconcileDerivedProjections(
                     dataRoot: dataRoot,
@@ -738,7 +812,8 @@ public enum MemoryConsolidationGate {
             do {
                 let boundEvictions = try transactionalTableSwap(
                     livePath: livePath, candidatePath: candidatePath,
-                    expectedLiveFingerprint: manifest.liveFingerprint)
+                    expectedLiveFingerprint: manifest.liveFingerprint,
+                    appliedRunId: runId)
                 await MemoryStorage.recordBoundEvictions(
                     boundEvictions,
                     memoryPath: livePath,
@@ -748,6 +823,9 @@ public enum MemoryConsolidationGate {
                 return await refuseStale(dataRoot: dataRoot, runId: runId, approvalId: verified.id)
             }
             swapCommitted = true
+            // No stamp here: the applied marker went in with the transaction
+            // above, so a crash or a failed projection anywhere from this point
+            // still leaves the next reconcile a consistent answer.
             let projections = try await reconcileDerivedProjections(
                 dataRoot: dataRoot,
                 livePath: livePath,
@@ -830,7 +908,15 @@ public enum MemoryConsolidationGate {
         })
 
         let graph = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: livePath)
-        let graphReport = try await graph.rebuildMemoryDerivedGraphFromCanonicalStore()
+        // Settings ▸ "Knowledge graph": approving a consolidation is not
+        // consent to PRODUCE a graph. Off, the rebuild runs its removal half
+        // only and retires the indexer-owned nodes — the same answer the
+        // mutation hook and the startup backfill already give (User,
+        // 2026-09-06: this seam was the one place that rebuilt the whole graph
+        // from the store with the switch off). Read fresh on the reconcile.
+        let graphReport = try await graph.rebuildMemoryDerivedGraphFromCanonicalStore(
+            producing: MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
+        )
 
         await environment.publishInvalidation(DerivedSourceChange(
             namespace: "memory-v2",
@@ -893,7 +979,8 @@ public enum MemoryConsolidationGate {
         livePath: URL,
         candidatePath: URL,
         expectedLiveFingerprint: String,
-        memoryLimit: Int = memoryStoredRowCap
+        memoryLimit: Int = memoryStoredRowCap,
+        appliedRunId: String? = nil
     ) throws -> [StoredMemory] {
         var config = Configuration()
         config.busyMode = .timeout(5)
@@ -910,9 +997,23 @@ public enum MemoryConsolidationGate {
                     guard liveFP == expectedLiveFingerprint else {
                         throw SwapStaleError()
                     }
+                    // User, 2026-09-06: USAGE VETOES EVICTION AT SWAP TIME.
+                    // The candidate archives rows that were unused when it was
+                    // staged (archiveIfStillUnused re-checks use_count == 0, but
+                    // only inside the candidate db). The fingerprint deliberately
+                    // excludes use_count, so recall bumps between stage and
+                    // approve leave the candidate green — and this INSERT used to
+                    // copy `c.status` verbatim, archiving a row the user reached
+                    // for in the meantime while simultaneously carrying its grown
+                    // use count over. `c.use_count` IS the staged snapshot, so
+                    // `lu.use_count > c.use_count` means "used since staging";
+                    // when that row is still live-active, keep it active. Any
+                    // hygiene metadata the candidate wrote comes along, but the
+                    // status is authoritative and the next weekly pass re-decides
+                    // with the usage now visible.
                     try db.execute(sql: """
                         CREATE TEMP TABLE _live_usage AS
-                          SELECT id, use_count, last_used_at FROM memories;
+                          SELECT id, use_count, last_used_at, status FROM memories;
                         DELETE FROM memories;
                         INSERT INTO memories
                           (id, content, persona_id, source, confidence,
@@ -920,7 +1021,12 @@ public enum MemoryConsolidationGate {
                            use_count, last_used_at, lifecycle, embedding_epoch,
                            valid_from, valid_to, observed_at, evidence_json)
                         SELECT c.id, c.content, c.persona_id, c.source, c.confidence,
-                               c.created_at, c.updated_at, c.embedding, c.status, c.metadata_json,
+                               c.created_at, c.updated_at, c.embedding,
+                               CASE WHEN c.status = 'archived'
+                                     AND lu.status = 'active'
+                                     AND COALESCE(lu.use_count, 0) > COALESCE(c.use_count, 0)
+                                    THEN lu.status ELSE c.status END,
+                               c.metadata_json,
                                MAX(c.use_count, COALESCE(lu.use_count, 0)),
                                COALESCE(MAX(c.last_used_at, lu.last_used_at),
                                         c.last_used_at, lu.last_used_at),
@@ -946,6 +1052,23 @@ public enum MemoryConsolidationGate {
                         in: db,
                         limit: memoryLimit
                     )
+                    // User, 2026-09-06: the applied marker commits WITH the
+                    // swap. See `appliedMarkerTable` — a marker written after
+                    // the transaction returns leaves a window in which a
+                    // committed swap reads as stale.
+                    if let appliedRunId {
+                        try db.execute(sql: """
+                            CREATE TABLE IF NOT EXISTS \(appliedMarkerTable) (
+                              run_id TEXT PRIMARY KEY,
+                              applied_at TEXT NOT NULL
+                            )
+                        """)
+                        try db.execute(
+                            sql: "INSERT OR REPLACE INTO \(appliedMarkerTable) "
+                                + "(run_id, applied_at) VALUES (?, ?)",
+                            arguments: [appliedRunId, iso8601(Date())]
+                        )
+                    }
                     return .commit
                 }
             } catch {
@@ -1286,6 +1409,28 @@ public enum MemoryConsolidationGate {
                 return
             }
             object = existing
+            // 2026-09-06: reconciliation REPLAYS every applied terminal receipt
+            // on every pass, and this projection used to overwrite the record
+            // unconditionally — so a months-old run re-stamped a NEWER hygiene
+            // status (a deferred run, or a later consolidation) back to
+            // "completed", with the old run's createdAt and nextScheduled. A
+            // replayed receipt may only refresh a record that is not newer than
+            // it is; the same run re-stamping itself carries an equal stamp and
+            // still lands, so crash-window and upgrade recovery are unaffected.
+            //
+            // 2026-09-06: "equal stamp still lands" was too loose. These stamps
+            // are second-resolution ISO strings, so two DIFFERENT runs can carry
+            // the same one — and each replay then overwrote the other's record,
+            // ping-ponging the run id and reason on every pass. An equal stamp
+            // is accepted only from the run that wrote the record; anyone else's
+            // loses to what is already there.
+            if let existingAt = (existing["createdAt"] as? String).flatMap(Self.parseISO8601) {
+                if existingAt > appliedAt { return }
+                if existingAt == appliedAt,
+                   (existing["consolidationRunId"] as? String) != runId {
+                    return
+                }
+            }
         }
         object["id"] = (object["id"] as? String) ?? "consolidation-\(runId)"
         object["status"] = "completed"

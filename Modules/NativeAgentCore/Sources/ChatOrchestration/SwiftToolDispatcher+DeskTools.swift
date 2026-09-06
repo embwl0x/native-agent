@@ -524,7 +524,18 @@ extension SwiftToolDispatcher {
                 ])
             }
         } else {
-            _ = try await store.closeItem(handle, outcomeSummary: outcome, canceled: canceled)
+            do {
+                _ = try await store.closeItem(handle, outcomeSummary: outcome, canceled: canceled)
+            } catch let e as DeskError {
+                // 2026-09-06: closing an already-terminal item is refused by the
+                // store now (it used to overwrite the recorded outcome). Report
+                // it the way every other Desk refusal reports, not as a thrown
+                // tool error.
+                return .object([
+                    "status": .string("refused"),
+                    "reason": .string(e.errorDescription ?? "\(e)"),
+                ])
+            }
         }
         return await deskConfirm(store, handle: handle, prefix: canceled ? "canceled" : "closed")
     }

@@ -26,9 +26,16 @@ struct ChatCalmSurfaceArchitectureTests {
         let running = try AppSourceScraping.appSource("ChatRuntimeStatusChrome.swift")
         let runningOwner = try AppSourceScraping.appSource("AppModel+HealthEmbeddings.swift")
         let living = try AppSourceScraping.appSource("LivingStatusPanel.swift")
+        let today = try AppSourceScraping.appSource("TodayView.swift")
 
-        #expect(content.contains("case .activity: ActivityView()"))
+        // 2026-09-06: 552d6dbb ("Today and Setup behind the rail") split the
+        // one .activity destination by shell — the classic sidebar still gets
+        // ActivityView, the rail gets TodayView (ContentView.swift:290).
+        // Ownership is still global and singular; only the view behind the
+        // single route changed, so pin both owners.
+        #expect(content.contains("case .activity: if classicShell { ActivityView() } else { TodayView() }"))
         #expect(activity.contains("struct ActivityView: View"))
+        #expect(today.contains("struct TodayView: View"))
         #expect(activity.contains("Text(\"Needs your eyes\")"))
         #expect(running.contains("struct WhatsRunningPanel: View"))
         #expect(runningOwner.contains("func loadWhatsRunning()"))

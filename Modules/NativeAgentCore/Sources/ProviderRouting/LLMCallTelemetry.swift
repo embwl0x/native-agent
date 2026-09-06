@@ -2,6 +2,209 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
+/// One `cache_control` marker observed on an outgoing request body.
+///
+/// POSITIONS AND TTLs ONLY — never prompt bytes. Derived by WALKING THE
+/// FINISHED BODY rather than by instrumenting the code that places markers,
+/// so the row records what actually went on the wire, not what the placement
+/// logic believed it did.
+///
+/// Anthropic renders `tools` → `system` → `messages`, and requires entries
+/// with the LONGER TTL to appear before shorter ones. Reading a row's markers
+/// in order is therefore enough to spot both failure modes behind a cache
+/// regression: a breakpoint that never shipped, and a 5m marker sitting ahead
+/// of a 1h one.
+public struct LLMCacheMarker: Sendable, Equatable {
+    /// `"tools[2]"`, `"system[1]"`, `"messages[7]"` — section plus index.
+    public let position: String
+    /// `"1h"` for an extended-TTL marker, `"5m"` for the default (which is
+    /// the ABSENT `ttl` key on the wire, spelled out here so a row is
+    /// readable without knowing that convention).
+    public let ttl: String
+
+    public init(position: String, ttl: String) {
+        self.position = position
+        self.ttl = ttl
+    }
+
+    var json: JSONValue {
+        .object(["position": .string(position), "ttl": .string(ttl)])
+    }
+}
+
+// MARK: - Conversation-prefix shape receipts (v2Prefix, 2026-09-01)
+//
+// ADDITIVE. The prefix shape is decided at the chat lane, several frames above
+// any provider adapter, so it reaches the `llm.call` row the same way `surface`
+// and `sessionId` do: a task-local bound for the turn, read at record time.
+// Unbound → the row is byte-identical to before, which is what keeps every
+// non-chat caller (dream, REM, executions) unchanged.
+//
+// SIZES AND DIGESTS ONLY. `prefixFingerprintSHA256` is a hash over the bytes
+// that must be stable turn-to-turn for a provider cache to hit; it is the
+// instrument that makes "did the prefix actually stay put" observable without
+// putting one byte of prompt into a trace row.
+public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
+    public let shapeVersion: String
+    public let prefixFingerprintSHA256: String
+    public let historyMessageCount: Int
+    public let historyMessageChars: Int
+    public let volatileBlockChars: Int
+    public let volatileDelivery: String
+    public let windowCursorAdvanceCount: Int
+    public let windowSlid: Bool
+    /// PERMANENT DIAGNOSTIC. How many messages went on the wire, and a short
+    /// digest of each of the first few — role plus serialized content, first 12
+    /// hex of SHA-256.
+    ///
+    /// Head drift is the failure mode that keeps costing full-price input while
+    /// every other receipt looks healthy: the cursor reports stable, the sizes
+    /// look right, and the provider still re-reads the entire history because
+    /// `messages[0]` is not the bytes it cached. SIZES CANNOT SHOW THAT — two
+    /// different first messages have the same length. Digests can: two
+    /// consecutive turns' rows simply differ where they should match.
+    public let messageCount: Int
+    public let messageDigests: [String]
+    /// THE CACHE INVARIANT, made checkable. One digest per message of the
+    /// cacheable prefix (everything before the current user message). Turn
+    /// N+1 reused turn N's prefix iff turn N's list is a PREFIX of turn N+1's.
+    /// `prefixFingerprintSHA256` hashes the whole prefix and therefore moves
+    /// every turn by construction (each turn appends the last exchange), so
+    /// it can never be compared between consecutive turns — this can.
+    public let prefixMessageDigests: [String]
+    /// The first few prefix messages, role plus the first 96 characters,
+    /// so a digest that moved can be READ, not just counted. Bounded and
+    /// payload-light by construction; the head of the prefix is persona and
+    /// recollection, never a secret.
+    public let headPreviews: [String]
+    /// Mid-conversation tool-change receipts (Anthropic structured lanes).
+    /// nil on every lane that does not run the tool-change plan, so those rows
+    /// decode exactly as before.
+    public let toolChanges: ToolChangeReceipts?
+
+    /// Sizes and one digest. `arrayFingerprintSHA256` hashes the `tools` ARRAY
+    /// alone — the thing that must not move turn to turn — never the offered
+    /// set, which is supposed to move.
+    public struct ToolChangeReceipts: Sendable, Equatable {
+        public let arrayFingerprintSHA256: String
+        public let offeredCount: Int
+        public let additionCount: Int
+        public let removalCount: Int
+        public let droppedUnknownCount: Int
+        /// The session declaration's re-pin counter. The array is pinned per
+        /// session, so this is the ONLY legitimate reason the array
+        /// fingerprint moved between two turns of one session.
+        public let declarationGeneration: Int
+
+        public init(
+            arrayFingerprintSHA256: String,
+            offeredCount: Int,
+            additionCount: Int,
+            removalCount: Int,
+            droppedUnknownCount: Int,
+            declarationGeneration: Int = 0
+        ) {
+            self.arrayFingerprintSHA256 = arrayFingerprintSHA256
+            self.offeredCount = offeredCount
+            self.additionCount = additionCount
+            self.removalCount = removalCount
+            self.droppedUnknownCount = droppedUnknownCount
+            self.declarationGeneration = declarationGeneration
+        }
+
+        public var payload: [String: JSONValue] {
+            [
+                "tools.arrayFingerprintSHA256": .string(arrayFingerprintSHA256),
+                "tools.offeredCount": .int(Int64(offeredCount)),
+                "tools.additionCount": .int(Int64(additionCount)),
+                "tools.removalCount": .int(Int64(removalCount)),
+                "tools.droppedUnknownCount": .int(Int64(droppedUnknownCount)),
+                "tools.declarationGeneration": .int(Int64(declarationGeneration)),
+            ]
+        }
+    }
+
+    public init(
+        shapeVersion: String,
+        prefixFingerprintSHA256: String,
+        historyMessageCount: Int,
+        historyMessageChars: Int,
+        volatileBlockChars: Int,
+        volatileDelivery: String,
+        windowCursorAdvanceCount: Int,
+        windowSlid: Bool,
+        messageCount: Int = 0,
+        messageDigests: [String] = [],
+        toolChanges: ToolChangeReceipts? = nil,
+        prefixMessageDigests: [String] = [],
+        headPreviews: [String] = []
+    ) {
+        self.shapeVersion = shapeVersion
+        self.prefixFingerprintSHA256 = prefixFingerprintSHA256
+        self.historyMessageCount = historyMessageCount
+        self.historyMessageChars = historyMessageChars
+        self.volatileBlockChars = volatileBlockChars
+        self.volatileDelivery = volatileDelivery
+        self.windowCursorAdvanceCount = windowCursorAdvanceCount
+        self.windowSlid = windowSlid
+        self.messageCount = messageCount
+        self.messageDigests = messageDigests
+        self.toolChanges = toolChanges
+        self.prefixMessageDigests = prefixMessageDigests
+        self.headPreviews = headPreviews
+    }
+
+    public var payload: [String: JSONValue] {
+        var out: [String: JSONValue] = [
+            "shapeVersion": .string(shapeVersion),
+            "prefixFingerprintSHA256": .string(prefixFingerprintSHA256),
+            "historyMessageCount": .int(Int64(historyMessageCount)),
+            "historyMessageChars": .int(Int64(historyMessageChars)),
+            "volatileBlockChars": .int(Int64(volatileBlockChars)),
+            "volatileDelivery": .string(volatileDelivery),
+            "windowCursorAdvanceCount": .int(Int64(windowCursorAdvanceCount)),
+            "windowSlid": .bool(windowSlid),
+            "messageCount": .int(Int64(messageCount)),
+            "messageDigests": .array(messageDigests.map { .string($0) }),
+            "prefixMessageDigests": .array(prefixMessageDigests.map { .string($0) }),
+            "headPreviews": .array(headPreviews.map { .string($0) }),
+        ]
+        if let toolChanges {
+            for (key, value) in toolChanges.payload { out[key] = value }
+        }
+        return out
+    }
+}
+
+/// Write-once-per-turn mailbox for the receipts above.
+///
+/// A bare task-local value would have to be BOUND at the point the snapshot is
+/// known — which is after the context build, inside the tool loop's own frame
+/// — forcing the whole loop into a closure. The sink is bound EMPTY at the turn
+/// boundary instead and filled in place, so the binding site and the knowing
+/// site can be different frames.
+public final class ConversationPrefixTelemetrySink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: ConversationPrefixTelemetrySnapshot?
+
+    public init() {}
+
+    public func set(_ snapshot: ConversationPrefixTelemetrySnapshot) {
+        lock.lock(); value = snapshot; lock.unlock()
+    }
+
+    public var current: ConversationPrefixTelemetrySnapshot? {
+        lock.lock(); defer { lock.unlock() }; return value
+    }
+}
+
+public enum ConversationPrefixTelemetry {
+    /// Bound once per turn by the chat lane, alongside the shape task-local.
+    @TaskLocal public static var sink: ConversationPrefixTelemetrySink?
+
+    public static var current: ConversationPrefixTelemetrySnapshot? { sink?.current }
+}
+
 // MARK: - LLMUsage
 //
 // U1 step 1 (2026-06-10) — provider token-usage capture. Both providers
@@ -54,18 +257,39 @@ public struct LLMUsage: Sendable, Equatable {
         guard hasAnyInput else { return nil }
 
         if providerID.contains("anthropic") || cacheCreationInputTokens != nil {
-            return max(0, inputTokens ?? 0)
-                + max(0, cacheReadInputTokens ?? 0)
-                + max(0, cacheCreationInputTokens ?? 0)
+            // User, 2026-09-06: `intValue` clamps a malformed wire number to
+            // Int.max, so plain `+` across three counters TRAPS on overflow —
+            // the same provider input that used to crash the parse would crash
+            // the sum instead. Saturate: a nonsense total is worth Int.max.
+            // Every term is >= 0 here, so an overflow can only run positive.
+            func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+                let (sum, overflowed) = lhs.addingReportingOverflow(rhs)
+                return overflowed ? Int.max : sum
+            }
+            var total = max(0, inputTokens ?? 0)
+            total = saturatingAdd(total, max(0, cacheReadInputTokens ?? 0))
+            total = saturatingAdd(total, max(0, cacheCreationInputTokens ?? 0))
+            return total
         }
         return max(0, inputTokens ?? 0)
     }
 
     /// NSNumber-tolerant int read (JSONSerialization yields Int or Double
     /// depending on the wire literal).
+    ///
+    /// User, 2026-09-06: `Int(d)` TRAPS — not throws — on NaN, ±infinity and
+    /// any magnitude outside `Int`'s range, and a usage field is provider
+    /// input: `1e400` or `NaN` on the wire took the whole app down from a
+    /// telemetry read. A malformed token count is worth nil or a clamp, never
+    /// a crash.
     static func intValue(_ raw: Any?) -> Int? {
         if let i = raw as? Int { return i }
-        if let d = raw as? Double { return Int(d) }
+        if let d = raw as? Double {
+            guard d.isFinite else { return nil }
+            if d >= Double(Int.max) { return Int.max }
+            if d <= Double(Int.min) { return Int.min }
+            return Int(d)
+        }
         return nil
     }
 
@@ -256,7 +480,15 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         /// caller's requested id (e.g. the OAuth-direct adapters' Claude→GPT
         /// table or an `openai/` namespace strip). Additive and optional:
         /// rows without it decode exactly as before.
-        substitutedFrom: String? = nil
+        substitutedFrom: String? = nil,
+        /// Every `cache_control` marker ACTUALLY present on the outgoing
+        /// request body, in render order (tools → system → messages).
+        /// Positions and TTLs only — no prompt bytes. This is what makes a
+        /// cache-read regression provable per turn instead of inferred from
+        /// token counts: a missing or mis-TTL'd breakpoint shows up here
+        /// directly. Absent for callers that do not pass it, so those rows
+        /// decode exactly as before.
+        cacheMarkers: [LLMCacheMarker]? = nil
     ) async {
         let surface = LLMCallContext.surface ?? "unknown"
         // Turn Inspector W1: tag with the per-turn trace id so the Inspector
@@ -275,8 +507,17 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             "turnId": .string(turnId),
         ]
         if let ttftMs { payload["ttftMs"] = .int(Int64(ttftMs)) }
+        // Additive, chat-only: absent for every caller that does not bind the
+        // per-turn prefix receipts, so those rows decode exactly as before.
+        if let prefix = ConversationPrefixTelemetry.current {
+            for (key, value) in prefix.payload { payload[key] = value }
+        }
         if let substitutedFrom, !substitutedFrom.isEmpty, substitutedFrom != model {
             payload["substitutedFrom"] = .string(substitutedFrom)
+        }
+        if let cacheMarkers {
+            payload["cacheMarkerCount"] = .int(Int64(cacheMarkers.count))
+            payload["cacheMarkers"] = .array(cacheMarkers.map(\.json))
         }
         if let usage {
             if let v = usage.inputTokens { payload["inputTokens"] = .int(Int64(v)) }

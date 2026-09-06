@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ChatOrchestration
 
 /// Central scheduler for the few visible reads that genuinely sample live
 /// heterogeneous state and do not have one complete push owner (currently the
@@ -38,6 +39,9 @@ final class PollScheduler: ObservableObject {
     private let pausedRecheckInterval: TimeInterval = 5
     private let maxSleepInterval: TimeInterval = 120
     private let minSleepInterval: TimeInterval = 0.5
+    /// Ceiling on one handler. These are visible-UI reads; thirty seconds is
+    /// already far past any of them finishing honestly.
+    private let handlerDeadline: TimeInterval = 30
     private let now: @MainActor () -> Date
     private let sleep: @Sendable (TimeInterval) async throws -> Void
     private let isStreaming: @MainActor (AppModel?) -> Bool
@@ -121,20 +125,63 @@ final class PollScheduler: ObservableObject {
         return min(max(best, minSleepInterval), maxSleepInterval)
     }
 
+    /// 2026-09-06: a handler that never returns used to stall the whole
+    /// scheduler — the pass never reached its sleep, every other job stopped
+    /// firing, and the next `restart()` then waited on that same handler
+    /// forever. Each fire runs under a hard ceiling; a handler that blows it is
+    /// abandoned (cancelled, then ignored) and logged, and the pass moves on.
+    private func fire(_ id: String, _ handler: @escaping @MainActor () async -> Void) async {
+        let work = Task { @MainActor in await handler() }
+        // The race runs in its own unstructured task on purpose: `withDeadline`
+        // resolves to nil the moment ITS task is cancelled, and a restart
+        // cancels this loop — which would hand the generation back while the
+        // handler was still running, the very overlap `restart()` waits to
+        // avoid. An unstructured task does not inherit that cancellation, so
+        // the wait below ends on the handler or on the ceiling, nothing else.
+        let bounded = Task {
+            await IntraTurnContextCompaction.withDeadline(seconds: handlerDeadline) {
+                await work.value
+                return true
+            }
+        }
+        guard await bounded.value == nil else { return }
+        work.cancel()
+        NSLog(
+            "[poll-scheduler] job %@ exceeded its %.0fs ceiling — abandoned, scheduler continuing",
+            id, handlerDeadline
+        )
+    }
+
     private func restart() {
-        task?.cancel()
+        // 2026-09-06: cancellation is a request, and the old generation only
+        // checked it at the top of its `while`. A restart mid-handler (any
+        // register/unregister, and every view appear/disappear does one) left
+        // the cancelled loop running the REST of its snapshot while the new
+        // loop fired the same handlers — two overlapping reads of the same
+        // state. The new generation now waits for the old one to actually exit,
+        // and the old one checks cancellation between handlers so that wait is
+        // bounded by ONE handler, not a whole pass.
+        let previous = task
+        previous?.cancel()
         guard !jobs.isEmpty else {
-            task = nil
+            // 2026-09-06: this used to drop the reference. Unregistering the
+            // last job while its handler was still running left the NEXT
+            // registration with nothing to await, so the new generation started
+            // on top of the old handler — exactly the overlap the wait below
+            // exists to prevent. The cancelled task is kept so whoever
+            // registers next joins it first.
             return
         }
         task = Task { [weak self] in
+            await previous?.value
             while !Task.isCancelled {
                 guard let me = self else { return }
                 let now = me.now()
                 let snapshot = Array(me.jobs.values)
                 for job in snapshot where me.shouldFire(job, now: now) {
+                    if Task.isCancelled { return }
                     me.lastTick[job.id] = now
-                    if let h = me.handlers[job.id] { await h() }
+                    if let h = me.handlers[job.id] { await me.fire(job.id, h) }
                 }
                 let delay = me.nextSleepInterval(now: me.now())
                 try? await me.sleep(delay)

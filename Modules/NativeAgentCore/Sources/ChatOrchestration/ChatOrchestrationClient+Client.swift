@@ -203,7 +203,16 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
             requestedModel: model,
             requestedReasoningEffort: reasoningEffort
         )
-        return try await LLMCallContext.$admittedModel.withValue(admission.modelId) {
+        // v2Prefix: the adapters read ONLY the task-local override (never
+        // `.effective`), so EVERY outer turn entry has to resolve it once and
+        // bind it. This is the non-streaming entry — the streaming facade wraps
+        // its own; an entry that forgot would silently ship v1 wire layout for a
+        // v2-shaped body.
+        let prefixShape = ConversationPrefixShape.effective
+        let prefixTelemetrySink = ConversationPrefixTelemetrySink()
+        return try await ConversationPrefixTelemetry.$sink.withValue(prefixTelemetrySink) {
+        try await ConversationPrefixShape.$override.withValue(prefixShape) {
+        try await LLMCallContext.$admittedModel.withValue(admission.modelId) {
         try await LLMCallContext.$providerId.withValue(admission.providerId) {
         try await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
         try await LLMCallContext.$serviceTier.withValue(admission.serviceTier) {
@@ -249,6 +258,8 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
             let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
             response.requestedModel = requested.isEmpty ? nil : requested
             return response
+        }
+        }
         }
         }
         }

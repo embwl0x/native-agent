@@ -7,11 +7,16 @@ import PersistenceCore
 
 // MARK: - Helpers
 
+// 2026-09-06: persona now lives UNDER the data root, which is the layout
+// `PersistenceCore.defaultPersonaRoot(dataRoot:)` resolves. 4c631d6d made pin
+// emission reconcile approved rows against the live document, and it finds
+// that document through that resolver — a sibling `base/persona` was never the
+// production shape and now reads as an absent document.
 private func tempREMRoot() -> (data: URL, persona: URL) {
     let base = FileManager.default.temporaryDirectory
         .appendingPathComponent("rem-cycle-\(UUID().uuidString)", isDirectory: true)
     let data = base.appendingPathComponent("data", isDirectory: true)
-    let persona = base.appendingPathComponent("persona", isDirectory: true)
+    let persona = data.appendingPathComponent("persona", isDirectory: true)
     try? FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
     try? FileManager.default.createDirectory(at: persona, withIntermediateDirectories: true)
     return (data, persona)
@@ -571,11 +576,18 @@ func REMConsolidator_promoted_proposal_surfaces_in_rem_pins() async throws {
     try writeDreamEntryWithMtime(
         dataRoot: dataRoot, date: "2026-05-29", content: "x", daysAgo: 1
     )
-    for name in ["SOUL.md", "VOICE.md", "GROWTH.md"] {
+    for name in ["SOUL.md", "VOICE.md"] {
         try "seed\n".data(using: .utf8)!.write(
             to: personaRoot.appendingPathComponent(name)
         )
     }
+    // 2026-09-06: 4c631d6d made a pin live only while its lesson is still an
+    // entry paragraph in the document it was approved into, so GROWTH.md has
+    // to actually carry the approved text — an approved row alone no longer
+    // pins. Seeding it here is the state the approval executor leaves behind.
+    try "seed\n\napproved-fact-1\n".data(using: .utf8)!.write(
+        to: personaRoot.appendingPathComponent("GROWTH.md")
+    )
     // Pre-seed an APPROVED proposal in the jsonl so the next REM run
     // rebuilds rem_pins.json with one entry.
     let approved: [String: Any] = [
@@ -775,6 +787,14 @@ func REMFeedHarness_successPairsMarkerProposalPromotionAndCompletedReceipt() asy
     #expect(pending.targetDoc == "GROWTH.md")
     #expect(pending.proposalText == "Keep the steady lesson available next week.")
 
+    // 2026-09-06: 4c631d6d made a pin live only while its lesson is still an
+    // entry paragraph in the document it was approved into. The approval
+    // executor writes GROWTH.md; `applyApproval` only flips the row and
+    // re-derives the index, so the document write stands in for that step
+    // here. Without it the approved row is a historical fact with no pin.
+    _ = try await REMGrowthWriter.appendApprovedLesson(
+        personaRoot: personaRoot, proposalText: pending.proposalText
+    )
     let approved = try await store.applyApproval(proposalId: pending.id)
     #expect(approved.status == "approved")
     #expect(store.loadAll().map(\.status) == ["approved"])

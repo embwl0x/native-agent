@@ -131,13 +131,26 @@ struct MainWindowContent: View {
     // The Mac app process is the runtime now; the only restart control is
     // "Restart App".
     @State private var restartPresentation: MainWindowRestartToolbarPresentation = .ready
+    @AppStorage(NativeAgentShellPreference.classicShellKey) private var classicShell = false
 
     var body: some View {
         ContentView()
+            .background {
+                if !classicShell { ShellWindowChrome() }
+            }
+            // Agent, 2026-09-02, glyph diet: in the new shell the window title
+            // bar showed a bare circular-arrows glyph and the » that AppKit
+            // adds when the item behind it will not fit — two marks, no words,
+            // for an action nobody is looking for in a title bar. Restart App
+            // is not lost: it is a worded item in the menu bar's NativeAgent
+            // menu (NativeAgentApp.swift), which is reachable even when this
+            // window is closed. The classic shell keeps the button here.
             .toolbar {
-                ToolbarItemGroup(placement: .primaryAction) {
-                    MainWindowRestartToolbarButton(presentation: restartPresentation) {
-                        restartPresentation.requestConfirmation()
+                if classicShell {
+                    ToolbarItemGroup(placement: .primaryAction) {
+                        MainWindowRestartToolbarButton(presentation: restartPresentation) {
+                            restartPresentation.requestConfirmation()
+                        }
                     }
                 }
             }

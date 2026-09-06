@@ -172,7 +172,12 @@ public struct WorkshopSession: WorkshopSessionRunning {
         let executor = turnExecutor ?? Self.productionTurnExecutor(dataRoot: dataRoot)
 
         let outcome = await runWithDeadline(request: request, tools: profile, executor: executor)
-        let artifacts = await collector.written()
+        // User, 2026-09-06: seal the membrane before reading the artifact set.
+        // The deadline cancels the turn but cannot stop an executor that
+        // ignores cancellation, and its later `workshop_artifact_write` calls
+        // used to keep landing — making this receipt's `artifactPaths` stale
+        // the moment it was saved.
+        let artifacts = await collector.close()
         let progress = await progressCollector.latest()
 
         let receipt: WorkshopSessionReceipt
@@ -195,6 +200,17 @@ public struct WorkshopSession: WorkshopSessionRunning {
                 handle: request.handle, reservationId: request.reservationId,
                 status: .blocked, summary: "session exceeded the \(Int(deadlineSeconds))s deadline; left in-flight for the user",
                 model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
+        case .incomplete(let reason, let output):
+            // Same finite needs-User shape as the deadline: artifacts already
+            // written are kept, the partial text is reported as partial, and
+            // the disposition never claims the goal was satisfied.
+            receipt = WorkshopSessionReceipt(
+                handle: request.handle, reservationId: request.reservationId,
+                status: .blocked,
+                summary: Self.trimSummary("session did not finish: \(reason)"
+                    + (output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "" : " Partial output: \(output)")),
+                model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
         case .failed(let reason):
             receipt = WorkshopSessionReceipt(
                 handle: request.handle, reservationId: request.reservationId,
@@ -214,7 +230,16 @@ public struct WorkshopSession: WorkshopSessionRunning {
             status: .refused, summary: why, model: nil, artifactPaths: [], generatedAt: now(), disposition: .blocked)
     }
 
-    private enum TurnOutcome { case done(model: String, output: String); case timedOut; case failed(String) }
+    private enum TurnOutcome: Sendable {
+        case done(model: String, output: String)
+        case timedOut
+        // User, 2026-09-06: the turn ENDED but never produced a completed final
+        // reply (budget exhaustion, iteration cap). Its retained text is a
+        // fallback, and its attempted effects are unverified — a distinct
+        // outcome so it can never be read as a finished session.
+        case incomplete(reason: String, output: String)
+        case failed(String)
+    }
 
     /// Race the turn against the deadline. Whichever finishes first wins; the
     /// loser is cancelled. This is the finite bound M6 requires.
@@ -223,24 +248,24 @@ public struct WorkshopSession: WorkshopSessionRunning {
         tools: any ToolDispatchClient,
         executor: @escaping @Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String)
     ) async -> TurnOutcome {
-        let deadlineNanos = UInt64(max(0.001, deadlineSeconds) * 1_000_000_000)
-        return await withTaskGroup(of: TurnOutcome.self) { group in
-            group.addTask {
-                do {
-                    let (model, output) = try await executor(request, tools)
-                    return .done(model: model, output: output)
-                } catch {
-                    return .failed(String(describing: error))
-                }
+        // User, 2026-09-06: this was a task group, and leaving a group waits for
+        // its cancelled children — a turn that ignored its cancellation held the
+        // Workshop pump past the very ceiling this exists to enforce. Same
+        // resume-once shape the provider wall and the tool-dispatch deadline
+        // use; the loser is still cancelled.
+        let outcome = await IntraTurnContextCompaction.withDeadline(
+            seconds: max(0.001, deadlineSeconds)
+        ) { () -> TurnOutcome in
+            do {
+                let (model, output) = try await executor(request, tools)
+                return .done(model: model, output: output)
+            } catch let incomplete as EphemeralToolTurnIncomplete {
+                return .incomplete(reason: incomplete.reason, output: incomplete.output)
+            } catch {
+                return .failed(String(describing: error))
             }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: deadlineNanos)
-                return .timedOut
-            }
-            let first = await group.next() ?? .timedOut
-            group.cancelAll()
-            return first
         }
+        return outcome ?? .timedOut
     }
 
     /// The production turn: one ephemeral, read-only tool turn on the
@@ -261,6 +286,7 @@ public struct WorkshopSession: WorkshopSessionRunning {
                 autonomyResolver: WorkshopAutonomyResolver(
                     base: SwiftNativeTrustCenter(dataRoot: dataRoot)
                 ),
+                requireCompleted: true,
                 surface: WorkshopSurfaceVocabulary.canonical
             )
             return (response.model, response.output)

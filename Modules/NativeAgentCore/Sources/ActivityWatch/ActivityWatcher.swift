@@ -4,6 +4,7 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 import MacControl
+import PersistenceCore
 
 /// Platform notifications translated before they enter the capture thread.
 /// Keeping this boundary injectable lets the real watcher own the same
@@ -97,6 +98,12 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// silently overstates every inactive session.
     public static let defaultIdleThreshold: TimeInterval = 300
 
+    /// How much newer than the agent's OWN last motor event the system's last
+    /// input has to be before the idle-resume watch reads it as a person coming
+    /// back. Same span the motor epoch's yes/no fence uses, applied as a
+    /// separation so it survives a tick that is far longer than the window.
+    static let agentMotorSeparation: TimeInterval = NativeAgentMotorEpoch.defaultWindow
+
     /// Kept as a static for source compatibility; the authority is
     /// `ActivityPolicy.alwaysExcludedBundleIDs`, which cannot be overridden.
     public static var nativeAgentBundleIDs: Set<String> {
@@ -150,9 +157,17 @@ public final class ActivityWatcher: @unchecked Sendable {
     private let accessibilityObservationEnabled: Bool
     private let motorEpochIsAgentDriven: @Sendable () -> Bool
     private let idleSecondsSinceLastInput: @Sendable () -> Double
+    /// Age of the agent's own last synthesized motor event. Compared against
+    /// `idleSecondsSinceLastInput` so a tick far longer than the motor epoch's
+    /// window can still tell our input apart from the human's.
+    private let secondsSinceLastAgentMotorInput: @Sendable () -> Double
     /// `nil` retains the real frontmost-app lock reconciliation. A supplied
     /// value is a platform seam for deterministic observer/tick verification.
     private let lockProbe: (@Sendable () -> Bool?)?
+    /// Where to publish the human-presence stamp, or `nil` to publish nothing.
+    /// `nil` is the default so every existing caller — every test, every
+    /// simulation — writes no file at all outside the app.
+    private let presenceStampURL: URL?
 
     // Cross-thread scalars. Guarded by `lock`.
     private let lock = NSLock()
@@ -189,6 +204,23 @@ public final class ActivityWatcher: @unchecked Sendable {
     private var observerContext: ActivityObserverContext?
     private var observedPID: pid_t?
     private var tickTimer: CFRunLoopTimer?
+    /// The span was closed by the IDLE deadline and the tick timer was kept
+    /// running so ordinary interaction can reopen it. Cleared the moment a span
+    /// opens again, or when the timer stops for any other reason.
+    private var idleResumeWatch = false
+    /// MONOTONIC time of the last presence-stamp write. 2026-09-06: this was a
+    /// wall value, so a backward clock step (an NTP correction, a manual set)
+    /// parked the throttle in the future and the stamp stopped refreshing
+    /// until wall time caught up. `-.infinity` so the first live tick publishes.
+    private var lastPresenceStampWrite: Double = -.infinity
+    /// Last present/away conclusion actually published, or nil before the first
+    /// one. Only a CHANGE touches the transition file the scheduler watches.
+    private var lastPublishedPresence: Bool?
+    /// The tick is alive purely to keep the presence stamp fresh: no span, no
+    /// observer, no title. Set when the frontmost app is privacy-excluded, this
+    /// process, or unidentifiable — states where the person is still at the Mac
+    /// but nothing may be recorded about what they are doing.
+    private var presenceOnlyWatch = false
     private var screensAsleep = false
     private var sessionInactive = false
     /// Set by `com.apple.screenIsLocked` / cleared by `com.apple.screenIsUnlocked`.
@@ -222,10 +254,14 @@ public final class ActivityWatcher: @unchecked Sendable {
                 .combinedSessionState, eventType: CGEventType(rawValue: ~0) ?? .null
             )
         },
+        secondsSinceLastAgentMotorInput: @escaping @Sendable () -> Double = {
+            NativeAgentMotorEpoch.secondsSinceLastAgentMotorEvent()
+        },
         lockProbe: (@Sendable () -> Bool?)? = nil,
         policySource: (any ActivityPolicySource)? = nil,
         lifecycleChanged: (@Sendable (LifecycleState) -> Void)? = nil,
-        policyChanged: (@Sendable (ActivityPolicy) -> Void)? = nil
+        policyChanged: (@Sendable (ActivityPolicy) -> Void)? = nil,
+        presenceStampURL: URL? = nil
     ) {
         self.store = store
         self.retentionRunner = retentionRunner ?? ActivityRetentionRunner(databaseURL: store.databaseURL)
@@ -241,9 +277,11 @@ public final class ActivityWatcher: @unchecked Sendable {
         self.accessibilityObservationEnabled = accessibilityObservationEnabled
         self.motorEpochIsAgentDriven = motorEpochIsAgentDriven
         self.idleSecondsSinceLastInput = idleSecondsSinceLastInput
+        self.secondsSinceLastAgentMotorInput = secondsSinceLastAgentMotorInput
         self.lockProbe = lockProbe
         self.lifecycleChanged = lifecycleChanged
         self.policyChanged = policyChanged
+        self.presenceStampURL = presenceStampURL
         // The caller passed us the policy it just loaded off disk; priming here
         // stops the first poll from re-applying that identical policy.
         (policySource as? ActivityPolicyFileSource)?.prime()
@@ -984,23 +1022,23 @@ public final class ActivityWatcher: @unchecked Sendable {
             guard !screensAsleep else { return }
             screensAsleep = true
             feed(.sleep(at: safeNow()))
-            detachObserver()
-            stopTickTimer()
+            standDownAway()
             publishLocked(true)
         case .wake:
             guard screensAsleep else { return }
             screensAsleep = false
             feed(.wake(at: safeNow()))
+            standUpPresent()
             seedFromFrontmostApplication()
         case .sessionResignedActive:
             sessionInactive = true
             feed(.lock(at: safeNow()))
-            detachObserver()
-            stopTickTimer()
+            standDownAway()
             publishLocked(true)
         case .sessionBecameActive:
             sessionInactive = false
             feed(.unlock(at: safeNow()))
+            standUpPresent()
             seedFromFrontmostApplication()
         }
     }
@@ -1023,8 +1061,7 @@ public final class ActivityWatcher: @unchecked Sendable {
                 guard let self else { return }
                 self.screenLockedByNotification = true
                 self.feed(.lock(at: self.safeNow()))
-                self.detachObserver()
-                self.stopTickTimer()
+                self.standDownAway()
                 self.publishLocked(true)
             }
         })
@@ -1035,6 +1072,10 @@ public final class ActivityWatcher: @unchecked Sendable {
                 guard let self else { return }
                 self.screenLockedByNotification = false
                 self.feed(.unlock(at: self.safeNow()))
+                // Publish FIRST, then re-seed: if the re-read concludes we are
+                // still locked it calls `standDownAway`, which overwrites this
+                // with away — the right precedence.
+                self.standUpPresent()
                 // Re-read; never assume unlocked just because a note said so.
                 self.seedFromFrontmostApplication()
             }
@@ -1106,8 +1147,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         guard !isPaused else { return }
         if reconcileLocked() {
             feed(.lock(at: safeNow()))
-            detachObserver()
-            stopTickTimer()
+            standDownAway()
             return
         }
         let front = NSWorkspace.shared.frontmostApplication
@@ -1148,7 +1188,16 @@ public final class ActivityWatcher: @unchecked Sendable {
                 at: safeNow()
             ))
             detachObserver()
-            stopTickTimer()
+            // 2026-09-06: this stopped the tick outright, which also stopped the
+            // human-presence stamp — so an agent-driven activation left the
+            // stamp to go stale within five minutes while the person was
+            // sitting right there, the trigger scheduler fell back to chat
+            // quiet, and an idle check-in arrived at their elbow. The
+            // presence-only watch is the same answer the excluded-app path
+            // already uses: the tick survives writing nothing but the stamp,
+            // and the stamp's own provenance fence still refuses to publish
+            // while the last input was the agent's.
+            enterPresenceOnlyWatch()
             // Observe without opening a span. The first later AX event outside
             // the bounded motor epoch is evidence the human took over this app;
             // it will seed a fresh human span below. This avoids permanently
@@ -1166,8 +1215,7 @@ public final class ActivityWatcher: @unchecked Sendable {
             : Self.isLockSignal(bundleId: bundleId, localizedName: appName) || reconcileLocked()
         if locked {
             feed(.lock(at: safeNow()))
-            detachObserver()
-            stopTickTimer()
+            standDownAway()
             return
         }
 
@@ -1180,7 +1228,7 @@ public final class ActivityWatcher: @unchecked Sendable {
                 bundleId: ActivityPolicy.selfProcessBundleID, appName: "unknown", at: safeNow()
             ))
             detachObserver()
-            stopTickTimer()
+            enterPresenceOnlyWatch()
             return
         }
 
@@ -1191,7 +1239,7 @@ public final class ActivityWatcher: @unchecked Sendable {
                 bundleId: ActivityPolicy.selfProcessBundleID, appName: "self", at: safeNow()
             ))
             detachObserver()
-            stopTickTimer()
+            enterPresenceOnlyWatch()
             return
         }
 
@@ -1201,7 +1249,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         guard engine.shouldCapture(bundleID: bundleId) else {
             feed(.activate(bundleId: bundleId, appName: appName ?? bundleId, at: safeNow()))
             detachObserver()
-            stopTickTimer()
+            enterPresenceOnlyWatch()
             return
         }
 
@@ -1216,6 +1264,10 @@ public final class ActivityWatcher: @unchecked Sendable {
         // become a capture blind spot (W1 condition on cutting the LRU).
         feed(.activate(bundleId: bundleId, appName: appName ?? bundleId, at: clock.wallNow()))
 
+        // A span is open again: the timer is a heartbeat once more, not the
+        // idle-resume or presence-only watch.
+        idleResumeWatch = false
+        presenceOnlyWatch = false
         startTickTimer()
         attachObserver(pid: pid)
 
@@ -1363,6 +1415,8 @@ public final class ActivityWatcher: @unchecked Sendable {
     }
 
     private func stopTickTimer() {
+        idleResumeWatch = false
+        presenceOnlyWatch = false
         guard let timer = tickTimer else { return }
         CFRunLoopTimerInvalidate(timer)
         tickTimer = nil
@@ -1386,12 +1440,45 @@ public final class ActivityWatcher: @unchecked Sendable {
         // (3) reconcile lock state — a missed notification self-heals in <= 60 s.
         if reconcileLocked() {
             feed(.lock(at: safeNow()))
-            detachObserver()
-            stopTickTimer()
+            standDownAway()
             return
         }
+        // (2.5) publish the human-presence stamp. Deliberately BEFORE the
+        // open-span branch: while the person is away the span is closed, and
+        // that is exactly the state the trigger scheduler most needs described.
+        writePresenceStampIfDue()
+
         guard let span = engine.openSpan else {
-            stopTickTimer()
+            // 2026-09-06: the idle close used to take the AX observer AND this
+            // timer with it, so nothing was left that could notice the human
+            // coming back. Typing in the SAME app produced no activation
+            // notification and no AX callback (the observer was gone), so the
+            // watcher stayed dark until the next app switch. The timer is kept
+            // as the low-rate resume observer instead: fresh input reopens the
+            // span through the ordinary activation path, which re-attaches the
+            // observer and re-applies every policy and lock gate.
+            guard idleResumeWatch || presenceOnlyWatch else {
+                stopTickTimer()
+                return
+            }
+            // Presence-only: the stamp above is the whole job. Nothing here may
+            // seed a span — the frontmost app is one this watcher is not
+            // allowed to record, and re-seeding would only re-derive that.
+            guard !presenceOnlyWatch else { return }
+            // Motor-driven synthetic input is not the human coming back.
+            // 2026-09-06: the AX callback's fence (a 3 s epoch window) cannot
+            // carry this decision — this timer fires once a MINUTE, so an agent
+            // click 30 s ago has reset the system idle clock and is already out
+            // of the window, and the watch reopened the span on the agent's own
+            // input. The two AGES are compared instead: the system's last input
+            // has to be newer than the agent's last motor event by a margin
+            // before anyone but the human could have produced it.
+            let systemIdle = idleSecondsSinceLastInput()
+            let motorAge = secondsSinceLastAgentMotorInput()
+            guard systemIdle.isFinite, systemIdle <= idleThreshold,
+                  systemIdle + Self.agentMotorSeparation < motorAge else { return }
+            idleResumeWatch = false
+            seedFromFrontmostApplication()
             return
         }
 
@@ -1407,13 +1494,175 @@ public final class ActivityWatcher: @unchecked Sendable {
         ) {
             feed(.idle(at: closeAt))
             detachObserver()
-            stopTickTimer()
+            // The timer stays: it is now the only thing that can see the human
+            // return to an app that was never switched away from.
+            idleResumeWatch = true
             return
         }
 
         // (1) advance last_seen_at. Heartbeat only — it must NOT bump
         // event_count, or the events/hour number is fiction.
         feed(.heartbeat(at: now))
+    }
+
+    /// Publish the last input attributable to a PERSON, at most once a minute.
+    ///
+    /// 2026-09-06: the trigger scheduler's `idle` kind measured how long the
+    /// CHAT had been quiet, which says nothing about whether anyone is at the
+    /// Mac. It now reads this stamp too, and only fires when both are quiet.
+    /// The watcher is the writer because it already holds the one signal that
+    /// can tell a person apart from the agent's own synthesized input.
+    ///
+    /// Writes NOTHING when that separation cannot be made, rather than writing
+    /// a guess: an unrefreshed stamp goes stale within
+    /// `HumanPresenceStamp.freshness` and the reader falls back to the signal
+    /// it had before. "We cannot tell" must not read as "nobody is here" —
+    /// that is the direction that fires a check-in at the user's elbow.
+    private func writePresenceStampIfDue() {
+        guard presenceStampURL != nil else { return }
+        // 2026-09-06: the throttle is MONOTONIC. Compared against wall time, a
+        // backward clock step (NTP correction, a hand-set clock) left the last
+        // write sitting in the future and the stamp simply stopped refreshing
+        // until wall time caught up — silently, and in the direction that lets
+        // the reader fall back to chat quiet and fire beside the person.
+        let mono = clock.monotonicNow()
+        guard mono - lastPresenceStampWrite >= HumanPresenceStamp.writeInterval else { return }
+        // The same fence the idle-resume watch applies: the system's last input
+        // has to be newer than the agent's own last motor event by a margin
+        // before anyone but the human could have produced it. A once-a-minute
+        // tick cannot use the 3 s epoch window directly — the two AGES are
+        // compared instead.
+        let now = clock.wallNow()
+        let systemIdle = idleSecondsSinceLastInput()
+        let motorAge = secondsSinceLastAgentMotorInput()
+        guard systemIdle.isFinite, systemIdle >= 0, now.isFinite,
+              systemIdle + Self.agentMotorSeparation < motorAge else { return }
+        publish(
+            lastInputAt: now - systemIdle,
+            at: now,
+            away: false,
+            present: systemIdle <= idleThreshold,
+            mono: mono
+        )
+    }
+
+    /// The one write of both presence files.
+    ///
+    /// The stamp moves every minute; the transition file is touched ONLY when
+    /// the present/away conclusion actually flips. That split is the whole
+    /// point (2026-09-06): the trigger scheduler's event loop watches the
+    /// transition file, so a person coming back after an idle check-in fired
+    /// re-wakes the loop and it recomputes its next crossing there and then,
+    /// instead of waiting up to six hours for the integrity tick. Watching the
+    /// per-minute stamp instead would wake that loop sixty times an hour.
+    private func publish(
+        lastInputAt: Double,
+        at now: Double,
+        away: Bool,
+        present: Bool,
+        mono: Double
+    ) {
+        guard let presenceStampURL else { return }
+        let stamp = HumanPresenceStamp(
+            lastInputAt: Date(timeIntervalSince1970: min(lastInputAt, now)),
+            writtenAt: Date(timeIntervalSince1970: now),
+            away: away
+        )
+        guard stamp.write(to: presenceStampURL) else { return }
+        lastPresenceStampWrite = mono
+        guard lastPublishedPresence != present else { return }
+        // 2026-09-06: `lastPublishedPresence` used to advance BEFORE this write
+        // and the write's result was discarded, so ONE failed transition write
+        // lost the crossing permanently — every later tick saw "nothing
+        // changed", the trigger scheduler's event loop was never woken, and it
+        // waited up to six hours for the integrity tick. The marker now moves
+        // only on a write that actually landed, so the next tick retries.
+        guard HumanPresenceStamp.writeTransition(
+            present: present,
+            at: Date(timeIntervalSince1970: now),
+            to: HumanPresenceStamp.transitionURL(besideStampAt: presenceStampURL)
+        ) else {
+            FileHandle.standardError.write(Data((
+                "ActivityWatcher: presence transition write failed (present=\(present)); "
+                    + "holding the crossing so the next tick retries\n"
+            ).utf8))
+            return
+        }
+        lastPublishedPresence = present
+    }
+
+    /// The teardown every LOCK and SLEEP edge shares.
+    ///
+    /// 2026-09-06: locked counts as AWAY from the lock instant, and this writes
+    /// the one final stamp that says so before the watcher goes quiet. Nothing
+    /// is written while the screen stays locked — an away-marked stamp is the
+    /// writer's deliberate last word rather than a frozen tick, so the reader
+    /// keeps believing it past the ordinary freshness window. Unthrottled: this
+    /// is a crossing, and crossings are rare.
+    private func standDownAway() {
+        if presenceStampURL != nil {
+            let now = clock.wallNow()
+            let systemIdle = idleSecondsSinceLastInput()
+            if now.isFinite {
+                let lastInput = systemIdle.isFinite && systemIdle >= 0 ? now - systemIdle : now
+                publish(
+                    lastInputAt: lastInput,
+                    at: now,
+                    away: true,
+                    present: false,
+                    mono: clock.monotonicNow()
+                )
+            }
+        }
+        detachObserver()
+        stopTickTimer()
+    }
+
+    /// The counterpart to `standDownAway` at every UNLOCK and WAKE edge.
+    ///
+    /// 2026-09-06: the lock/sleep edge writes an AWAY stamp that the reader
+    /// deliberately keeps believing past the ordinary freshness window — it is
+    /// the writer's last word, not a frozen tick from a writer that died.
+    /// Coming BACK published nothing at all: presence was republished only by
+    /// `onTick`, so the away stamp stayed authoritative for up to a minute, and
+    /// indefinitely whenever the frontmost app on return was one this watcher
+    /// may not record and the tick never restarted. Unthrottled, like the lock
+    /// edge it mirrors: a crossing is rare and it is the whole signal.
+    private func standUpPresent() {
+        guard presenceStampURL != nil else { return }
+        let now = clock.wallNow()
+        guard now.isFinite else { return }
+        let systemIdle = idleSecondsSinceLastInput()
+        let motorAge = secondsSinceLastAgentMotorInput()
+        // Same provenance fence the tick applies: an unlock or wake whose only
+        // input was the agent's own synthetic motor event is not evidence that
+        // the person is back.
+        guard systemIdle.isFinite, systemIdle >= 0,
+              systemIdle + Self.agentMotorSeparation < motorAge else { return }
+        publish(
+            lastInputAt: now - systemIdle,
+            at: now,
+            away: false,
+            present: systemIdle <= idleThreshold,
+            mono: clock.monotonicNow()
+        )
+    }
+
+    /// Keep the tick alive purely to refresh the presence stamp.
+    ///
+    /// 2026-09-06: a privacy-excluded frontmost app (also this process, also an
+    /// unidentifiable one) closed the span, dropped the observer AND stopped
+    /// the tick — so the stamp went stale within five minutes while the person
+    /// was sitting there typing, the trigger scheduler fell back to chat quiet,
+    /// and an idle check-in arrived at their elbow. The tick survives instead,
+    /// writing nothing but the stamp: no span, no heartbeat, no title, no app
+    /// identity. The stamp says "human input at time T" and nothing else, so
+    /// refreshing it in an excluded app discloses nothing the exclusion
+    /// withholds.
+    private func enterPresenceOnlyWatch() {
+        idleResumeWatch = false
+        presenceOnlyWatch = true
+        startTickTimer()
     }
 
     /// The timer's temporal decision, factored only so the exact same boundary

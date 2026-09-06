@@ -94,7 +94,10 @@ public struct AutonomyPromotionLoop: LoopRunner {
         // could let THIS loop propose flipping `self_install` to `auto` —
         // a "nothing self-grants" violation (the install trigger going
         // approval-free). Never auto-promote a self-modification surface.
-        "evolution_propose", "evolution_status", "self_install",
+        // evolution_withdraw joins them (2026-09-02): it is still a
+        // self-modification surface (an evolution-store write), and nothing on
+        // that surface ever self-grants its way to `auto`.
+        "evolution_propose", "evolution_status", "evolution_withdraw", "self_install",
     ]
     static let minApprovals = 5
     static let minSpanDays = 14
@@ -142,9 +145,11 @@ public struct AutonomyPromotionLoop: LoopRunner {
         // Fail-safe: autonomy off ⇒ neither reconcile nor propose. A security
         // loosening must never apply while the master switch is off.
         guard await isEnabled() else { return .skipped(reason: "autonomy disabled") }
+        let applied: Int
+        let staged: Int
         do {
-            try await reconcile()
-            try await propose()
+            applied = try await reconcile()
+            staged = try await propose()
         } catch {
             // A staging/annotate WRITE did not land — do not report success.
             // .failed trips the manager's failure-receipt net so the dropped
@@ -153,7 +158,15 @@ public struct AutonomyPromotionLoop: LoopRunner {
                 "AutonomyPromotionLoop: staging failed: \(error)\n".utf8))
             return .failed(error: "autonomy promotion staging: \(SwiftNativeLoopScheduler.describeLoopError(error))")
         }
-        return .completed(result: "autonomy promotion reconcile/propose completed")
+        // The overwhelmingly common tick applies nothing and stages nothing:
+        // there is no approved card waiting and no tool has crossed the trust
+        // thresholds. That is not success, and stamping it `.completed` made
+        // this lane look busy to the dormancy rule forever.
+        guard applied > 0 || staged > 0 else {
+            return .skipped(reason: "no approved promotions to apply and no new candidates")
+        }
+        return .completed(
+            result: "autonomy promotion applied \(applied), staged \(staged)")
     }
 
     // MARK: - Reconcile (apply human-approved promotions)
@@ -162,8 +175,14 @@ public struct AutonomyPromotionLoop: LoopRunner {
     /// Runs every tick (cheap, must be responsive). Each card is re-read and
     /// re-verified from the inbox before any policy mutation, and stamped
     /// afterward so it is never re-applied.
-    func reconcile() async throws {
+    ///
+    /// Returns how many promotion cards this pass actually stamped (applied,
+    /// skipped-as-ineligible, or failed) — every one of those is a durable
+    /// mutation. A pass that found no approved card returns 0.
+    @discardableResult
+    func reconcile() async throws -> Int {
         let approved = await port.approvedPromotions()
+        var stamped = 0
         for promotion in approved {
             // RE-READ from the inbox — the caller's record is trusted for its
             // ID ONLY. A forged in-process ApprovedPromotion must not mutate
@@ -202,6 +221,7 @@ public struct AutonomyPromotionLoop: LoopRunner {
                     ]),
                     detail: "autonomy promotion skipped: \(tool) is not an eligible promotion "
                         + "target (current tier: \(tier ?? "absent/default-auto")) — nothing changed")
+                stamped += 1
                 continue
             }
             let ok = await applyPromotion(tool)
@@ -216,7 +236,9 @@ public struct AutonomyPromotionLoop: LoopRunner {
                 detail: ok
                     ? "autonomy promotion applied: \(tool) \(tier)→auto"
                     : "autonomy promotion FAILED to write policy for \(tool) (left at \(tier))")
+            stamped += 1
         }
+        return stamped
     }
 
     // MARK: - Propose (stage promotion cards)
@@ -224,8 +246,12 @@ public struct AutonomyPromotionLoop: LoopRunner {
     /// Scan resolved tool-call approval history and stage a promotion card for
     /// every tool that crosses the trust thresholds. Gated by a daily cooldown
     /// marker so an hourly tick does not re-scan the same data.
-    func propose() async throws {
-        guard await shouldScan() else { return }
+    ///
+    /// Returns how many promotion cards were staged; 0 when the daily cooldown
+    /// holds or no tool crossed the thresholds.
+    @discardableResult
+    func propose() async throws -> Int {
+        guard await shouldScan() else { return 0 }
         let decisions = await port.resolvedToolDecisions()
         let pending = await port.pendingPromotionTools()
         let recentlyDecided = await port.recentlyDecidedPromotionTools()
@@ -234,12 +260,15 @@ public struct AutonomyPromotionLoop: LoopRunner {
         var byTool: [String: [ToolDecisionSnapshot]] = [:]
         for d in decisions { byTool[d.tool, default: []].append(d) }
 
+        var staged = 0
         for (tool, rows) in byTool {
             if let candidate = await evaluate(
                 tool: tool, rows: rows, pending: pending, recentlyDecided: recentlyDecided) {
                 try await port.stagePromotion(candidate)
+                staged += 1
             }
         }
+        return staged
     }
 
     /// Pure-ish candidate gate (the `currentTier` read is the only IO). Returns

@@ -974,25 +974,94 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
 
     @discardableResult
     public func observe(_ observation: GitHubCommandObservation) async throws -> GitHubCommandItem {
-        try Self.validate(observation)
-        return try await append(.observed(observation), itemId: observation.itemId)
+        // One code path, one no-change filter. `.observed` carries no
+        // op-against-state precondition (see `validate(_:state:)`), so the
+        // batch transaction is exactly this operation plus the filter.
+        guard let item = try await observe([observation]).first else {
+            throw GitHubCommandStoreError.unknownItem(observation.itemId)
+        }
+        return item
     }
 
     /// Record one refresh worth of observations as one canonical transaction:
     /// one feed read/replay, one append write, one state projection write, and
     /// one live invalidation. Sequential replay still preserves observation
     /// ordering and freshest-review-thread semantics within the batch.
+    ///
+    /// Observations that would not move the reduced state are DROPPED before
+    /// anything is written (see `observationIsInformationFree`); a refresh in
+    /// which nothing changed upstream writes nothing, wakes nobody, and
+    /// returns the state it read.
     @discardableResult
     public func observe(_ observations: [GitHubCommandObservation]) async throws -> [GitHubCommandItem] {
         guard !observations.isEmpty else { return [] }
         try observations.forEach(Self.validate)
-        let committed = try await persistence.withFileLock(opsPath) {
+        let committed: (
+            items: [GitHubCommandItem],
+            state: GitHubCommandState?,
+            stamp: GitHubCommandLiveStateMemo.FeedStamp?
+        ) = try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedLocked()
-            let newOps = observations.map {
-                GitHubCommandOp(
+            let prior = try replay(base: feed.base, feed.ops)
+            let dispatched = Set(prior.dispatchedEventKeys)
+            // Sequential dry run: an item observed twice in one batch sees the
+            // first observation's result, exactly as replay would.
+            var projected: [String: GitHubCommandItem] = [:]
+            var newOps: [GitHubCommandOp] = []
+            for observation in observations {
+                let at = DeskClock.nowISO()
+                let existing = projected[observation.itemId] ?? prior.item(observation.itemId)
+                let candidate = Self.reduceObservation(
+                    observation, into: existing, at: at, dispatched: dispatched
+                )
+                if let existing, Self.observationIsInformationFree(candidate, against: existing) {
+                    continue
+                }
+                projected[observation.itemId] = candidate
+                newOps.append(GitHubCommandOp(
                     id: UUID().uuidString.lowercased(),
-                    at: DeskClock.nowISO(),
-                    body: .observed($0)
+                    at: at,
+                    body: .observed(observation)
+                ))
+            }
+            // Terminal retirement is this reducer's SECOND clock-driven
+            // transition (the first — codex_working aging — lives inside
+            // `route`, so the dry run above already sees it). It runs at the
+            // end of `replay` against the feed's OWN newest stamp, which is
+            // what makes a feed always fold to the same state. The price of
+            // that determinism is that a feed which stops growing stops
+            // retiring: with every quiet observation dropped, a resolved item
+            // in a quiet repo would sit in the reduced state forever. So when
+            // a retirement has come due by the clock, admit ONE real
+            // observation and let the feed's own time carry the pass.
+            //
+            // The advancer must NOT be an observation of a due item: the
+            // reducer stamps `updatedAt = op.at` before the retirement pass
+            // runs, so an item that reports itself resets its own retention
+            // window — which is precisely why continuously re-observed
+            // terminal items never retired at all before this filter existed.
+            // If every observation in the batch is of a due item there is no
+            // honest advancer; those items simply wait for the next real
+            // change, exactly as they did before.
+            if newOps.isEmpty {
+                let at = DeskClock.nowISO()
+                let due = Self.retirementDueItemIds(
+                    prior, at: at, retentionSeconds: terminalItemRetentionSeconds
+                )
+                if !due.isEmpty,
+                   let advancer = observations.first(where: { !due.contains($0.itemId) }) {
+                    newOps.append(GitHubCommandOp(
+                        id: UUID().uuidString.lowercased(),
+                        at: at,
+                        body: .observed(advancer)
+                    ))
+                }
+            }
+            guard !newOps.isEmpty else {
+                return (
+                    items: observations.compactMap { prior.item($0.itemId) },
+                    state: nil as GitHubCommandState?,
+                    stamp: nil as GitHubCommandLiveStateMemo.FeedStamp?
                 )
             }
             let state = try replay(base: feed.base, feed.ops + newOps)
@@ -1013,11 +1082,16 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 stamp: Self.feedStamp(opsPath: opsPath, basePath: basePath)
             )
         }
+        // Nothing was written, so the feed the readers already hold is still
+        // the truth: no memo prime, and above all no change-bus wake — the
+        // tracking loop watches this very op log, and waking it for a
+        // no-change poll is what made the refresh feed itself.
+        guard let state = committed.state else { return committed.items }
         // The writer already owns the exact reduced state for the final feed
         // stamp. Publish it before waking readers so the physiology/runtime
         // reaction does not immediately decode and replay the same ~1 MB feed.
         await liveStateMemo.prime(
-            key: Self.memoKey(opsPath), stamp: committed.stamp, state: committed.state
+            key: Self.memoKey(opsPath), stamp: committed.stamp, state: state
         )
         changeBus.emit(StoreChange(store: .githubCommand, path: opsPath))
         return committed.items
@@ -1519,61 +1593,9 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
                 }
 
             case .observed(let observation):
-                let id = observation.itemId
-                var item = byId[id] ?? GitHubCommandItem(
-                    itemId: id, repository: observation.repository, number: observation.number,
-                    kind: observation.kind, title: observation.title, state: .detected,
-                    observation: nil, dispatchIntent: nil, dispatchReceipt: nil, workLog: [],
-                    blocker: nil, finalReceipt: nil, lastCallbackStatus: nil,
-                    lastSettledEventKey: nil,
-                    notificationClaims: [], notificationReceipts: [], verificationReadFailures: nil, createdAt: op.at, updatedAt: op.at
+                byId[observation.itemId] = Self.reduceObservation(
+                    observation, into: byId[observation.itemId], at: op.at, dispatched: dispatched
                 )
-                let priorObservation = item.observation
-                var preserved = observation.preservingFreshestReviewThreads(from: priorObservation)
-                // If preservation refused an evidence regression, the incoming
-                // observation's actionability claims are stale too. When those
-                // claims are purely thread-derived and the fresh evidence shows
-                // no actionable thread, the poll is known-stale: keep the
-                // preserved evidence, neutralize the stale claims, and leave
-                // the item's state exactly where fresher truth put it.
-                var staleNeutralized = false
-                // The empty set is a subset of everything, so a QUIET
-                // observation (no signals at all) used to satisfy this guard
-                // and skip routing entirely — leaving items parked forever on
-                // whatever state they were last in. Live cost: two of User's
-                // PRs sat in attention(verification_read_failed) with fresh,
-                // clean, zero-signal observations arriving every sweep; one of
-                // them had already CLOSED upstream and still never resolved.
-                // Neutralization only makes sense for an observation that
-                // actually CLAIMS actionability from stale thread evidence;
-                // a quiet reading is real news and must route (2026-08-18).
-                if preserved != observation,
-                   !observation.signals.isEmpty,
-                   observation.signals.isSubset(of: [.reviewComment, .changesRequested]),
-                   preserved.reviewThreads?.contains(where: \.isActionable) == false {
-                    staleNeutralized = true
-                    preserved = GitHubCommandObservation(
-                        repository: preserved.repository, number: preserved.number,
-                        kind: preserved.kind, title: preserved.title,
-                        isOpen: preserved.isOpen, isMerged: preserved.isMerged,
-                        observedVersion: preserved.observedVersion,
-                        actionableEventVersion: nil, signals: [],
-                        headSHA: preserved.headSHA, humanDecision: preserved.humanDecision,
-                        waitingKind: preserved.waitingKind, isStale: preserved.isStale,
-                        finalReceipt: preserved.finalReceipt, reviewThreads: preserved.reviewThreads
-                    )
-                }
-                item.repository = preserved.repository
-                item.kind = preserved.kind
-                item.title = preserved.title
-                item.observation = preserved
-                // Any successful observation ends a consecutive-read-failure run.
-                item.verificationReadFailures = nil
-                item.updatedAt = op.at
-                if !staleNeutralized {
-                    Self.route(&item, observation: preserved, priorObservation: priorObservation, dispatched: dispatched)
-                }
-                byId[id] = item
 
             case .dispatchPrepared(let intent):
                 guard var item = byId[intent.itemId] else { continue }
@@ -1768,6 +1790,123 @@ public struct GitHubCommandStore: Sendable, MotorActionReadModelProviding {
         if item.workLog.count > maxWorkLogEntries {
             item.workLog.removeFirst(item.workLog.count - maxWorkLogEntries)
         }
+    }
+
+    /// The whole `.observed` reduction as one pure function of (prior item,
+    /// observation, stamp, dispatch ledger). Lifted out of `replay` so that
+    /// `observe()` can DRY-RUN the exact reduction the feed would perform and
+    /// refuse to append an operation that changes nothing.
+    private static func reduceObservation(
+        _ observation: GitHubCommandObservation,
+        into existing: GitHubCommandItem?,
+        at now: String,
+        dispatched: Set<String>
+    ) -> GitHubCommandItem {
+        let id = observation.itemId
+        var item = existing ?? GitHubCommandItem(
+            itemId: id, repository: observation.repository, number: observation.number,
+            kind: observation.kind, title: observation.title, state: .detected,
+            observation: nil, dispatchIntent: nil, dispatchReceipt: nil, workLog: [],
+            blocker: nil, finalReceipt: nil, lastCallbackStatus: nil,
+            lastSettledEventKey: nil,
+            notificationClaims: [], notificationReceipts: [], verificationReadFailures: nil, createdAt: now, updatedAt: now
+        )
+        let priorObservation = item.observation
+        var preserved = observation.preservingFreshestReviewThreads(from: priorObservation)
+        // If preservation refused an evidence regression, the incoming
+        // observation's actionability claims are stale too. When those
+        // claims are purely thread-derived and the fresh evidence shows
+        // no actionable thread, the poll is known-stale: keep the
+        // preserved evidence, neutralize the stale claims, and leave
+        // the item's state exactly where fresher truth put it.
+        var staleNeutralized = false
+        // The empty set is a subset of everything, so a QUIET
+        // observation (no signals at all) used to satisfy this guard
+        // and skip routing entirely — leaving items parked forever on
+        // whatever state they were last in. Live cost: two of User's
+        // PRs sat in attention(verification_read_failed) with fresh,
+        // clean, zero-signal observations arriving every sweep; one of
+        // them had already CLOSED upstream and still never resolved.
+        // Neutralization only makes sense for an observation that
+        // actually CLAIMS actionability from stale thread evidence;
+        // a quiet reading is real news and must route (2026-08-18).
+        if preserved != observation,
+           !observation.signals.isEmpty,
+           observation.signals.isSubset(of: [.reviewComment, .changesRequested]),
+           preserved.reviewThreads?.contains(where: \.isActionable) == false {
+            staleNeutralized = true
+            preserved = GitHubCommandObservation(
+                repository: preserved.repository, number: preserved.number,
+                kind: preserved.kind, title: preserved.title,
+                isOpen: preserved.isOpen, isMerged: preserved.isMerged,
+                observedVersion: preserved.observedVersion,
+                actionableEventVersion: nil, signals: [],
+                headSHA: preserved.headSHA, humanDecision: preserved.humanDecision,
+                waitingKind: preserved.waitingKind, isStale: preserved.isStale,
+                finalReceipt: preserved.finalReceipt, reviewThreads: preserved.reviewThreads
+            )
+        }
+        item.repository = preserved.repository
+        item.kind = preserved.kind
+        item.title = preserved.title
+        item.observation = preserved
+        // Any successful observation ends a consecutive-read-failure run.
+        item.verificationReadFailures = nil
+        item.updatedAt = now
+        if !staleNeutralized {
+            Self.route(&item, observation: preserved, priorObservation: priorObservation, dispatched: dispatched)
+        }
+        return item
+    }
+
+    /// True when appending this observation would leave the reduced item
+    /// byte-identical to the one already in the state.
+    ///
+    /// Measured on the live feed (2026-09-01): 1,734 of 1,899 operations —
+    /// 91.3% — were re-readings of a pull request that had not moved. Each one
+    /// cost an ops append, a full state rewrite, a tracking-snapshot rewrite,
+    /// and a change-bus wake that sent the tracking loop straight back around
+    /// to read it all again. None of them carried information.
+    ///
+    /// The test IS the reduction, so no hazard has to be enumerated by hand:
+    /// anything that would actually move an item still writes its operation.
+    /// That deliberately covers the one transition an observation drives from
+    /// the CLOCK rather than from GitHub — `codex_working` aging into
+    /// `attention(.callback_overdue)` inside `route` — which fires on this dry
+    /// run exactly as it would on replay and therefore keeps its operation.
+    ///
+    /// `updatedAt` is the only field normalized away: on an unchanged item it
+    /// is pure write bookkeeping ("a poll happened"), not observed truth, and
+    /// nothing reads it as a freshness signal — the notification/staleness
+    /// path prefers `observation.actionableEventVersion`/`observedVersion`
+    /// and falls back to `updatedAt` only for an item that has never been
+    /// observed at all. Feed-level `state.updatedAt` and terminal retirement
+    /// now advance on real change, which is what they always meant.
+    private static func observationIsInformationFree(
+        _ candidate: GitHubCommandItem,
+        against existing: GitHubCommandItem
+    ) -> Bool {
+        var normalized = candidate
+        normalized.updatedAt = existing.updatedAt
+        return normalized == existing
+    }
+
+    /// Terminal items whose retention window has already closed at `now`.
+    /// Mirrors the retirement pass at the end of `replay`, which measures the
+    /// same distance against the feed's newest stamp — and since the operation
+    /// this predicate admits carries `now` as its stamp, the two agree.
+    private static func retirementDueItemIds(
+        _ state: GitHubCommandState,
+        at now: String,
+        retentionSeconds: TimeInterval
+    ) -> Set<String> {
+        guard let now = DeskClock.parseISO(now) else { return [] }
+        return Set(state.items.compactMap { item -> String? in
+            guard item.state.isTerminal,
+                  let stamp = DeskClock.parseISO(item.updatedAt),
+                  now.timeIntervalSince(stamp) > retentionSeconds else { return nil }
+            return item.itemId
+        })
     }
 
     private static func route(

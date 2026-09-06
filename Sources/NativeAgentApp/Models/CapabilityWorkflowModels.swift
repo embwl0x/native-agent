@@ -2,7 +2,6 @@ import Foundation
 import Observation
 import NativeAgentShared
 import PersistenceCore
-import WorkflowOrchestration
 
 struct PrivacyCategory: Identifiable, Codable, Hashable {
     var id: String
@@ -120,39 +119,10 @@ struct WorkflowRecord: Identifiable, Codable, Hashable {
     var steps: [WorkflowStep]
     var createdAt: String?
     var updatedAt: String?
-
-    var executionAvailability: WorkflowExecutionAvailability {
-        WorkflowExecutionPreflight.evaluate(
-            status: status,
-            stepKinds: steps.map(\.kind)
-        )
-    }
 }
 
-struct WorkflowRun: Identifiable, Codable, Hashable {
-    var id: String
-    var workflowId: String
-    var workflowName: String?
-    var objective: String?
-    var status: String
-    var mode: String?
-    var engineVersion: String?
-    var steps: [WorkflowStep]
-    var createdAt: String?
-    var completedAt: String?
-    var currentStepIndex: Int?
-    var approvalId: String?
-
-    /// Uses the same Core projection enforced by the workflow state owner.
-    /// The caller supplies the current approval decision from the already
-    /// mounted ApprovalInbox read, so a waiting run never advertises Resume
-    /// merely because its stale status string happens to say waiting.
-    func controlAvailability(approvalDecision: String? = nil) -> WorkflowRunControlAvailability {
-        WorkflowRunControlPreflight.evaluate(
-            status: status,
-            approvalDecision: approvalDecision
-        )
-    }
-}
+// 2026-09-01: `WorkflowRun` and its run-control projection were retired with
+// the workflow run engine (User authorized). The registry record above is what
+// the Capabilities panel still reads.
 
 // ApprovalRequest moved to NativeAgentShared.

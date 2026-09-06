@@ -823,11 +823,16 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         }
         let adapter = makeOAuthAdapter(telemetryRoot: makeTmpDataRoot())
         let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        _ = try await LLMCallContext.$systemSegments.withValue(segments) {
-            try await adapter.completeMessages(
-                messages: [.user("hi")], system: Self.segCombined,
-                model: "claude-opus-4-8", tools: makeTools()
-            )
+        // LEGACY ARM PIN: production now defaults to v2Prefix, so this test
+        // binds v1Legacy explicitly. Its assertions ARE the byte-identity
+        // guard for the rollback arm.
+        _ = try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+            try await LLMCallContext.$systemSegments.withValue(segments) {
+                try await adapter.completeMessages(
+                    messages: [.user("hi")], system: Self.segCombined,
+                    model: "claude-opus-4-8", tools: makeTools()
+                )
+            }
         }
         let body = try JSONSerialization.jsonObject(
             with: U1StubURLProtocol.lastBody ?? Data()
@@ -1022,11 +1027,14 @@ private func openAIResponsesSSE(usage: [String: Any]?) -> Data {
         }
         let adapter = makeOAuthAdapter(telemetryRoot: makeTmpDataRoot())
         let segments = SystemPromptSegments(stable: Self.segStable, dynamic: Self.segDynamic)
-        _ = try await LLMCallContext.$systemSegments.withValue(segments) {
-            try await adapter.completeMessages(
-                messages: [.user("hi")], system: Self.segCombined,
-                model: "claude-opus-4-8", tools: nil
-            )
+        // LEGACY ARM PIN — see the note on the tools variant above.
+        _ = try await ConversationPrefixShape.$override.withValue(.v1Legacy) {
+            try await LLMCallContext.$systemSegments.withValue(segments) {
+                try await adapter.completeMessages(
+                    messages: [.user("hi")], system: Self.segCombined,
+                    model: "claude-opus-4-8", tools: nil
+                )
+            }
         }
         let body = try JSONSerialization.jsonObject(
             with: U1StubURLProtocol.lastBody ?? Data()

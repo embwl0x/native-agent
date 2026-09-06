@@ -92,6 +92,13 @@ public struct EvolutionProposal: Sendable, Codable, Equatable {
     public var createdAt: String
     public var updatedAt: String
     public var receipts: [EvolutionReceipt]
+    /// Stable content identity of the finding that produced this row, when the
+    /// filer had one (2026-09-06). The weekly sweep's skip-if-present guard
+    /// keys on it: comparing the title plus the evidence TEXT could not work,
+    /// because the evidence carries the week's timestamps and every pass
+    /// therefore looked like a new finding. nil on rows filed before this and
+    /// on rows from filers that carry no digest.
+    public var findingId: String?
 
     /// Structurally pinned high tier — see file header. Not settable.
     public private(set) var risk: String = Self.pinnedRisk
@@ -114,7 +121,8 @@ public struct EvolutionProposal: Sendable, Codable, Equatable {
         denyReason: String? = nil,
         createdAt: String,
         updatedAt: String,
-        receipts: [EvolutionReceipt] = []
+        receipts: [EvolutionReceipt] = [],
+        findingId: String? = nil
     ) {
         self.id = id
         self.source = source
@@ -130,6 +138,7 @@ public struct EvolutionProposal: Sendable, Codable, Equatable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.receipts = receipts
+        self.findingId = findingId
         self.risk = Self.pinnedRisk
         self.autoApprove = false
     }
@@ -150,6 +159,7 @@ public struct EvolutionProposal: Sendable, Codable, Equatable {
         self.createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
         self.updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt) ?? ""
         self.receipts = try c.decodeIfPresent([EvolutionReceipt].self, forKey: .receipts) ?? []
+        self.findingId = try c.decodeIfPresent(String.self, forKey: .findingId)
         // HARD PIN: ignore whatever is on disk. A tampered "risk": "low" or
         // "autoApprove": true must never survive a round-trip.
         self.risk = Self.pinnedRisk
@@ -189,7 +199,8 @@ public actor EvolutionProposalStore {
         title: String,
         evidence: String,
         diffText: String? = nil,
-        expectedHead: String? = nil
+        expectedHead: String? = nil,
+        findingId: String? = nil
     ) async throws -> EvolutionProposal {
         let stamp = EvolutionSupport.isoTimestamp(now())
         let trimmedDiff = diffText?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -205,7 +216,8 @@ public actor EvolutionProposalStore {
             status: hasDiff ? .proposed : .needsDiff,
             createdAt: stamp,
             updatedAt: stamp,
-            receipts: [EvolutionReceipt(at: stamp, kind: "proposed", detail: "filed via \(source.rawValue)")]
+            receipts: [EvolutionReceipt(at: stamp, kind: "proposed", detail: "filed via \(source.rawValue)")],
+            findingId: findingId
         )
         try await mutateAll { proposals -> Bool in
             proposals.append(proposal)

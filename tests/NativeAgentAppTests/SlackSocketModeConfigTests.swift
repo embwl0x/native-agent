@@ -2,6 +2,17 @@ import Foundation
 import Testing
 @testable import NativeAgentApp
 
+@Test func slackErrorsStripSocketURLCredentialsAndPreserveEndpoint() {
+    let raw = "failed wss://wss-primary.slack.com/link/?ticket=fixture-secret&app_id=fixture-app "
+        + "NSError URL=https://example.test/path?token=second-secret#fragment"
+    let redacted = SlackSocketModeLoop.redact(raw)
+    #expect(redacted.contains("wss-primary.slack.com/link/"))
+    #expect(!redacted.contains("fixture-secret"))
+    #expect(!redacted.contains("fixture-app"))
+    #expect(!redacted.contains("second-secret"))
+    #expect(!redacted.contains("fragment"))
+}
+
 private func makeSlackConfigRoot(_ values: [String: Any]) throws -> URL {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("SlackSocketModeConfigTests-\(UUID().uuidString)", isDirectory: true)

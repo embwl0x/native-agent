@@ -193,7 +193,24 @@ if [ -n "$CHANGED_SHA" ]; then
     [ "$changed_exit_code" = 0 ] && changed_exit_code=1
   done < "$OUT/changed-unmapped.tsv"
 
+  # Gate velocity (2026-09-01): the wall clock here went on REDUNDANT BUILDS,
+  # not on the number of test runs. Every selection got its own `swift test`,
+  # and each one re-parsed the manifests and re-ran the incremental build check
+  # for a package an earlier selection had already built — 65 times on
+  # 4632df4b. The first selection of a package now owns its build and every
+  # later selection of that package reuses it with --skip-build.
+  #
+  # Deliberately NOT batched into one alternation filter per package: SwiftPM's
+  # `--filter` selects Swift Testing cases by their source FILE as well as by
+  # test id, so the filters cannot be verified against `swift test list` output,
+  # and a single combined run can only prove a non-zero executed-test count for
+  # the batch as a whole. One process per selection keeps changed_test_step's
+  # per-selection proof — a stale ledger filter that now selects zero tests
+  # fails its own step and names its own surface — which is the whole point of
+  # the gate. A package's build is paid once either way.
   index=0
+  built_packages=""
+  root_tests_built=0
   while IFS=$'\t' read -r package_label package_path filter; do
     [ -z "$filter" ] && continue
     index=$((index+1)); name=$(printf 'changed-%03d' "$index")
@@ -206,17 +223,42 @@ if [ -n "$CHANGED_SHA" ]; then
         "$ROOT/script/test_ios.sh" --require --only-testing "$filter" || true
     else
       printf '  SELECTED: %s --filter %s\n' "$package_label" "$filter"
-      changed_test_step "$name" "$package_label" "$filter" \
-        swift test --force-resolved-versions --skip-update --package-path "$ROOT/$package_path" --filter "$filter" || true
+      # --skip-build only after a run of THIS package has completed
+      # successfully, so a failed build never hands a later selection a stale
+      # or missing binary to succeed against.
+      changed_build_flag=()
+      case " $built_packages " in
+        *" $package_label "*) changed_build_flag=(--skip-build);;
+      esac
+      if changed_test_step "$name" "$package_label" "$filter" \
+          swift test --force-resolved-versions --skip-update \
+          --package-path "$ROOT/$package_path" \
+          ${changed_build_flag[@]+"${changed_build_flag[@]}"} --filter "$filter"; then
+        case " $built_packages " in
+          *" $package_label "*) ;;
+          *) built_packages="$built_packages $package_label";;
+        esac
+        [ "$package_label" = "root" ] && root_tests_built=1
+      fi
     fi
   done < "$OUT/changed-selections.tsv"
   if [ "$docs_only" = 1 ]; then
     changed_docs_merge_step || true
   fi
-  changed_test_step ledger-keeper root EvalCoverageLedger \
-    swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "EvalCoverageLedger" || true
+  # The two always-on root keepers reuse the root package's build for the same
+  # reason; nothing between them touches source.
+  keeper_build_flag=()
+  [ "$root_tests_built" = 1 ] && keeper_build_flag=(--skip-build)
+  if changed_test_step ledger-keeper root EvalCoverageLedger \
+      swift test --force-resolved-versions --skip-update --package-path "$ROOT" \
+      ${keeper_build_flag[@]+"${keeper_build_flag[@]}"} --filter "EvalCoverageLedger"; then
+    root_tests_built=1
+  fi
+  contract_build_flag=()
+  [ "$root_tests_built" = 1 ] && contract_build_flag=(--skip-build)
   changed_test_step total-surface-contract root TotalSurfaceContract \
-    swift test --force-resolved-versions --skip-update --package-path "$ROOT" --filter "TotalSurfaceContract" || true
+    swift test --force-resolved-versions --skip-update --package-path "$ROOT" \
+    ${contract_build_flag[@]+"${contract_build_flag[@]}"} --filter "TotalSurfaceContract" || true
 
   echo
   if [ "$fails" = 0 ] && [ "$docs_only" = 1 ]; then

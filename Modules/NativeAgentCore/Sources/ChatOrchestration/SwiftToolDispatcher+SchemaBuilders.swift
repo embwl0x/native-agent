@@ -352,7 +352,14 @@ extension SwiftToolDispatcher {
                 .filter { $0.serverId == "nativeagent-internal" }
                 .map(\.bridgedName)
         )
-        return all.filter { !hidden.contains($0) }
+        // Subtract the four-verb cutover boundary here too. Every catalog field
+        // derived from this list — `tool_groups` among them — was one table
+        // entry away from advertising a name `tool_load` refuses; the callers
+        // that re-filter through modelVisibleCatalogToolNames were carrying the
+        // whole guarantee. Same set tool_load resolves against.
+        return all.filter {
+            !hidden.contains($0) && !Self.legacyMacModelToolNames.contains($0)
+        }
     }
 
     func mcpToolSchemas() -> [LLMToolSchema] {
@@ -462,11 +469,22 @@ extension SwiftToolDispatcher {
             if let desc { props.append(("description", .string(desc))) }
             return obj(props)
         }
-        func stringArraySchema(_ desc: String? = nil) -> JSONValue {
+        func stringArraySchema(
+            _ desc: String? = nil,
+            minItems: Int? = nil,
+            maxItems: Int? = nil,
+            maxItemLength: Int? = nil
+        ) -> JSONValue {
+            var itemProps: [(String, JSONValue)] = [("type", .string("string"))]
+            if let maxItemLength { itemProps.append(("maxLength", .int(Int64(maxItemLength)))) }
             var props: [(String, JSONValue)] = [
                 ("type", .string("array")),
-                ("items", obj([("type", .string("string"))])),
+                ("items", obj(itemProps)),
             ]
+            // A bound the validator enforces must also be a bound the schema
+            // STATES, or the model only discovers it by being refused.
+            if let minItems { props.append(("minItems", .int(Int64(minItems)))) }
+            if let maxItems { props.append(("maxItems", .int(Int64(maxItems)))) }
             if let desc { props.append(("description", .string(desc))) }
             return obj(props)
         }
@@ -557,7 +575,7 @@ extension SwiftToolDispatcher {
         var schemas: [LLMToolSchema?] = [
             requestedSchema(
                 name: "read_file",
-                description: "Read a workspace or user-approved file and return its contents as a string. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace; use get_persona_doc or persona_read for persona documents rather than guessing their filesystem path. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths; /documents/... is treated as the current macOS user's ~/Documents/.... Long handoff markdown files default to a compact leading window unless max_bytes is explicit.",
+                description: "Read a workspace or user-approved file. Text returns a string. Local PNG, JPEG, WebP, GIF, HEIC, TIFF and BMP images return actual pixels to your model in a tool turn (not OCR); at most 8 MiB and 40 megapixels, first frame oriented and resized to fit 2048 pixels. Read an image path to see it; a filename or consult reference alone is not viewing it. On public/app-only installs, relative paths resolve inside NativeAgent's canonical workspace; use get_persona_doc or persona_read for persona documents rather than guessing their filesystem path. A verified development checkout also accepts repo-relative paths. With Trust Center Full Mac file access active, absolute Mac paths are accepted except NativeAgent trust/secrets/provider paths; /documents/... is treated as the current macOS user's ~/Documents/.... Long handoff markdown files default to a compact leading window unless max_bytes is explicit.",
                 parametersJSON: params(
                     properties: [
                         ("path", strSchema("Workspace-relative path such as 'project/file.txt', a repo-relative path only when a verified source checkout exists, or an absolute/~/ path under a Trust Center workspace root. Persona files must use get_persona_doc or persona_read. In Full Mac mode, /documents/<name> maps to the current user's ~/Documents/<name>.")),
@@ -625,7 +643,7 @@ extension SwiftToolDispatcher {
                 parametersJSON: params(
                     properties: [
                         ("query", strSchema()),
-                        ("limit", intSchema("max results, default 10")),
+                        ("limit", intSchema("max results, default 10, at most 100", minimum: 1, maximum: 100)),
                     ],
                     required: ["query"]
                 )
@@ -637,7 +655,7 @@ extension SwiftToolDispatcher {
                     properties: [
                         ("query", strSchema("Words or phrase to search for in prior chat/session transcripts.")),
                         ("session_id", strSchema("Optional session id to restrict search to one chat, e.g. a Mac, iOS, or telegram session id.")),
-                        ("scope", strSchema("Search scope: auto/current_session_first (default), current_session, or all_sessions.")),
+                        ("scope", strSchema("Search scope: auto/current_session_first (default), current_session, previous_session, or all_sessions. previous_session reopens the session named by the \"Since last session\" anchor — same surface, machine/bridge runs excluded — and is the one scope that works with no query, returning that session's tail.")),
                         ("role", strSchema("Optional role filter: user, assistant, tool, or system.")),
                         ("mode", strSchema("hybrid (default), exact substring, or continuity. Use continuity when asked to resume/revisit a conversation: up to four hits include bounded neighboring user/assistant messages so decisions and corrections retain context. Nothing is retrieved until you invoke this tool.")),
                         ("limit", intSchema("results per page, default 8, capped at 12; refine the query before paging")),
@@ -653,13 +671,26 @@ extension SwiftToolDispatcher {
                     properties: [
                         ("query", strSchema("Words or phrase to search for in prior chat/session transcripts.")),
                         ("session_id", strSchema("Optional session id to restrict search to one chat.")),
-                        ("scope", strSchema("Search scope: auto/current_session_first (default), current_session, or all_sessions.")),
+                        ("scope", strSchema("Search scope: auto/current_session_first (default), current_session, previous_session, or all_sessions. previous_session reopens the session named by the \"Since last session\" anchor — same surface, machine/bridge runs excluded — and is the one scope that works with no query, returning that session's tail.")),
                         ("role", strSchema("Optional role filter: user, assistant, tool, or system.")),
                         ("mode", strSchema("hybrid (default), exact, or continuity (up to four hits with bounded neighboring messages for requested conversation resumption).")),
                         ("limit", intSchema("results per page, default 8, capped at 12; refine the query before paging")),
                         ("offset", intSchema("result offset for a follow-up page; omit on the first search")),
                     ],
                     required: ["query"]
+                )
+            ),
+            requestedSchema(
+                name: "read_chat_message",
+                description: "Read ONE persisted chat message in full, by the message_id a search_chat_history hit returned. Search gives a 368-character preview and continuity gives neighbours; this gives the whole message, paged. Use it instead of re-phrasing a query to see a different fragment of the same message.",
+                parametersJSON: params(
+                    properties: [
+                        ("message_id", strSchema("The message_id from a search_chat_history hit.")),
+                        ("session_id", strSchema("Optional session id the message belongs to. Omit to look through every transcript, newest first.")),
+                        ("offset", intSchema("Character offset into the message, default 0. Pass the previous response's next_offset for the following page.", minimum: 0)),
+                        ("limit", intSchema("Characters per page, default 8000, capped at 16000.", minimum: 1, maximum: 16_000)),
+                    ],
+                    required: ["message_id"]
                 )
             ),
             requestedSchema(
@@ -953,7 +984,10 @@ extension SwiftToolDispatcher {
                 parametersJSON: params(
                     properties: [
                         ("query", strSchema("X search query string (supports operators like from:user, -filter:retweets).")),
-                        ("max", intSchema("Maximum tweets to return (1-100, default 10).")),
+                        // The recent-search endpoint's floor is 10, not 1. Ask
+                        // for fewer and X answers 400, so advertise and enforce
+                        // the provider's real bound rather than a friendlier one.
+                        ("max", intSchema("Maximum tweets to return (10-100, default 10). X's recent-search endpoint rejects values below 10.", minimum: 10, maximum: 100)),
                     ],
                     required: ["query"]
                 )
@@ -975,7 +1009,11 @@ extension SwiftToolDispatcher {
                     properties: [
                         ("username", strSchema("X handle without the @. One of username or id is required.")),
                         ("id", strSchema("Numeric X user id. One of username or id is required.")),
-                        ("max", intSchema("Maximum tweets to return (1-100, default 10).")),
+                        // The user-tweets endpoint's floor is 5 — lower than
+                        // recent search's 10, higher than the timeline's 1. The
+                        // advertised default was also wrong: the request builder
+                        // has always sent 25.
+                        ("max", intSchema("Maximum tweets to return (5-100, default 25). X's user-tweets endpoint rejects values below 5.", minimum: 5, maximum: 100)),
                     ],
                     required: []
                 )
@@ -1516,7 +1554,7 @@ extension SwiftToolDispatcher {
                     properties: [
                         ("title", strSchema("Note title (required).")),
                         ("body", strSchema("Note body content (required).")),
-                        ("folder", strSchema("Optional folder name; created in the default folder when omitted.")),
+                        ("folder", strSchema("Optional folder name; created in the default folder when omitted. A named folder that does not exist is an error listing the folders that do — it is never silently swapped for the default.")),
                     ],
                     required: ["title", "body"]
                 )
@@ -1602,11 +1640,7 @@ extension SwiftToolDispatcher {
                         ("commit_hash", strSchema("Optional git commit hash to anchor the context.")),
                         ("model", obj([
                             ("type", .string("string")),
-                            ("enum", .array([
-                                .string("gpt-5.6-sol"),
-                                .string("gpt-5.6-terra"),
-                                .string("gpt-5.6-luna"),
-                            ])),
+                            ("enum", .array(OpenAIExecutionControls.codexBridgeModelIDs.map(JSONValue.string))),
                             ("description", .string("Optional per-call Codex model. Omit to inherit the active Codex CLI default.")),
                         ])),
                         ("reasoning_effort", obj([
@@ -1619,7 +1653,7 @@ extension SwiftToolDispatcher {
                                 .string("max"),
                                 .string("ultra"),
                             ])),
-                            ("description", .string("Optional per-call Codex thinking level. Sol/Terra support Low through Ultra; Luna supports Low through Max. Omit to inherit the Codex default.")),
+                            ("description", .string("Optional per-call Codex thinking level. Available levels depend on the selected model. Omit to inherit the Codex default.")),
                         ])),
                         ("fast", boolSchema("Optional per-call Fast mode. true selects Codex priority service; false explicitly selects default service; omit to inherit the Codex default.")),
                         ("sandbox", obj([
@@ -1656,17 +1690,13 @@ extension SwiftToolDispatcher {
                         ("completion_mode", obj([
                             ("type", .string("string")),
                             ("enum", .array([.string("report"), .string("receipt_only")])),
-                            ("description", .string("How Codex's terminal result returns. Use report for delegated work or a question whose answer Agent must assess. Use receipt_only for a one-way acknowledgment, status note, approval, or handoff that should settle durably without creating another chat turn. Defaults to report.")),
+                            ("description", .string("How Codex's terminal result returns. Use report for delegated work or a question whose answer the agent must assess. Use receipt_only for a one-way acknowledgment, status note, approval, or handoff that should settle durably without creating another chat turn. Defaults to report.")),
                         ])),
                         ("pair_reviewer", boolSchema("Set true for an implementation dispatch that needs one paired reviewer. The builder pairs that reviewer at the start, commits before review, gives the reviewer the exact committed SHA, receives findings back, and remains responsible for fixes. Omit for notes, questions, and review-only work.")),
                         ("desk_item", nonEmptyStringSchema("Optional exact live Desk number or handle this delegated work belongs to. NativeAgent binds terminal execution and delivery evidence back to that item.")),
                         ("model", obj([
                             ("type", .string("string")),
-                            ("enum", .array([
-                                .string("gpt-5.6-sol"),
-                                .string("gpt-5.6-terra"),
-                                .string("gpt-5.6-luna"),
-                            ])),
+                            ("enum", .array(OpenAIExecutionControls.codexBridgeModelIDs.map(JSONValue.string))),
                             ("description", .string("Optional model for this asynchronous Codex task. Omit to inherit the active Codex default.")),
                         ])),
                         ("reasoning_effort", obj([
@@ -1679,7 +1709,7 @@ extension SwiftToolDispatcher {
                                 .string("max"),
                                 .string("ultra"),
                             ])),
-                            ("description", .string("Optional thinking level for this task. Sol/Terra support Low through Ultra; Luna supports Low through Max.")),
+                            ("description", .string("Optional thinking level for this task. Available levels depend on the selected model.")),
                         ])),
                         ("fast", boolSchema("Optional Fast mode for this task. true selects Codex priority service; false selects default service.")),
                         ("working_directory", strSchema("Optional existing absolute project directory for a new Codex conversation. Canonical NativeAgent workspace/source paths work normally; any other directory requires active Full Mac YOLO with outside-workspace access allowed. Follow-ups reuse their assigned private worktree and reject a conflicting directory.")),
@@ -1908,18 +1938,27 @@ extension SwiftToolDispatcher {
             // weeks. Routes to SwiftNativeMemoryV2.shared.store(...).
             requestedSchema(
                 name: "commit_memory",
-                description: "Durably record a fact, decision, or preference. Persists to the assistant's Swift-native long-term memory; surfaces in next session's recall_memory.",
+                description: "Durably record a fact, decision, or preference. Persists to the assistant's Swift-native long-term memory; surfaces in next session's recall_memory. 'text' is THE THING ITSELF, said plainly in one or two sentences, the way you would tell a friend: no date, no time, no source, no session or commit ids, no headings, no 'record'/'note'/'verified' framing. Time, source and provenance are stored in their own fields and shown beside it; the text is read on its own later, so it must stand alone. REQUIRED: 'text', a non-empty string — every other field is optional. CONDITIONAL: 'context_topics' is an array of 1-8 topic phrases (each non-empty, at most 120 characters) and is accepted ONLY when kind=\"correction\"; omit it, or send [], for anything else. Set provenance so a later recall can tell what you checked yourself from what someone told you. Example of a scoped correction: {\"text\": \"User wants pixels, not notes, before anything closes\", \"kind\": \"correction\", \"context_topics\": [\"design reviews\"]}. Example of an ordinary memory: {\"text\": \"User drinks his coffee black\"}.",
                 parametersJSON: params(
                     properties: [
-                        ("text", strSchema("The fact, decision, or preference to remember (required).")),
-                        ("kind", strSchema("Memory kind, e.g. identity/preference/relationship/goal/skill/project/general. Default \"note\".")),
+                        ("text", strSchema("REQUIRED. The fact, decision, or preference itself, plainly, one or two sentences: \"User wants pixels, not notes, before anything closes.\" Never a date, time, source, id, hash, or a 'record of' preamble — those live in their own fields. Must be a non-empty string; whitespace only is rejected.")),
+                        ("provenance", enumStringSchema(["verified", "told", "inferred"], "How you know this: verified (you checked it yourself), told (someone told you — also set provenance_by), inferred (you worked it out).")),
+                        ("provenance_by", strSchema("Who told you, when provenance=told. A name, e.g. \"Claude\".")),
+                        ("kind", strSchema("Memory kind, e.g. identity/preference/relationship/goal/skill/project/general, or \"moment\" for something you lived and want to keep (first person, say what happened and what it meant). Default \"note\".")),
+                        ("valence", numSchema("How it felt, -1 (bad) to 1 (good). Use with kind \"moment\".")),
                         ("tags", stringArraySchema("Optional free-form tags.")),
                         ("confidence", numSchema("How confident this fact is true, 0..1. Default 0.8.")),
                         ("importance", numSchema("How important this fact is to retain, 0..1. Default 0.5.")),
                         // R13: first-class correction lineage.
                         ("corrects", strSchema("Optional id of an existing memory this new fact CORRECTS (e.g. from recall_memory). The old memory is marked lifecycle=corrected with a lineage link to this one and drops out of recall.")),
                         ("correction_reason", strSchema("Optional one-line reason the old memory was wrong (stored on the corrected row's lineage).")),
-                        ("context_topics", stringArraySchema("For kind=correction only: 1–8 explicit topic/project phrases, at most 120 characters each. Use only when the user's correction is limited to those topics. Omit or send [] for ordinary memories and global instructions/boundaries; never invent a scope to weaken them. This limits automatic injection, not explicit recall.")),
+                        // maxItems/maxLength are declared; minItems deliberately
+                        // is NOT. Strict providers materialize every optional
+                        // array as [], which this tool treats as omission — a
+                        // minItems of 1 would make that legal placeholder
+                        // unsendable. The 1-8 floor is stated in prose and
+                        // enforced by the validator instead.
+                        ("context_topics", stringArraySchema("Requires kind=\"correction\". An array of 1-8 explicit topic/project phrases, each non-empty and at most 120 characters. Use only when the user's correction is limited to those topics. Omit or send [] for ordinary memories and global instructions/boundaries; never invent a scope to weaken them. Sending this with any other kind is rejected. This limits automatic injection, not explicit recall.", maxItems: 8, maxItemLength: 120)),
                     ],
                     required: ["text"]
                 )
@@ -2023,6 +2062,30 @@ extension SwiftToolDispatcher {
                     properties: [
                         ("task_id", strSchema("Optional task id. Omit to list all tasks; provide to get one task's event timeline.")),
                         ("include_done", boolSchema("Include done/cancelled tasks in the list. Default false (open tasks only).")),
+                    ],
+                    required: []
+                )
+            ),
+            // Personality depth item 3 (2026-09-02) — the introspection pull.
+            // ALWAYS-ON (alwaysOnCoreNames). A deliberately SMALL closed schema:
+            // two fields, both optional, both clamped. There is nothing to
+            // parameterize about her own inner state beyond how far back to look
+            // and how much to say, and every extra knob is a way to ask a
+            // leading question of herself.
+            requestedSchema(
+                name: "inner_state",
+                description: Self.innerStateToolDescription,
+                parametersJSON: params(
+                    properties: [
+                        ("window_hours", numSchema(
+                            "How many hours of felt moments to include. 1–48; out-of-range values clamp. Default 6.",
+                            minimum: 1,
+                            maximum: 48
+                        )),
+                        ("detail", enumStringSchema(
+                            ["compact", "full"],
+                            "compact (default) is the short read: the fingerprint, mood, disposition, body words, and the strongest few of each list. full returns every bounded list at its cap."
+                        )),
                     ],
                     required: []
                 )
@@ -2386,6 +2449,125 @@ extension SwiftToolDispatcher {
                     required: []
                 )
             ),
+            // Canon (desk 903 phase 4). A canon proposal is EARNED — three later
+            // entries deepening/echoing a work, or a pointer actually pulled in a
+            // live judgment — and then it waits for her. Nothing is canonized
+            // automatically and nobody else may sign one off.
+            requestedSchema(
+                name: "studio_canon",
+                description: "Read your museum: what stands as canon, what stands as anti-canon, and which works are waiting on a decision from you. Every row names the journal entries that argued for it, so you can pull them (studio_recall) before you decide. There is no ranking and no score — membership is binary and the reasons live in the entries. Read-only.",
+                parametersJSON: params(
+                    properties: [
+                        ("include_proposals", boolSchema("Include the proposals waiting on you. Default true.")),
+                    ],
+                    required: []
+                )
+            ),
+            requestedSchema(
+                name: "studio_canon_resolve",
+                description: "Decide one canon proposal. This is yours alone: no owner surface can resolve a canon card, and there is no automatic canonization anywhere — a work only enters or leaves the museum because you said so here. Approve a promote proposal to write the work into the canon (standing=canon) or the anti-canon (standing=anti_canon, a work you keep returning to in order to say no); approve a demote proposal to remove a canon work that has gone silent. Deny and nothing is written — the journal entries and the graph are untouched either way. Read the evidence first with studio_canon.",
+                parametersJSON: params(
+                    properties: [
+                        ("proposal_id", strSchema("The proposal_id from studio_canon.")),
+                        ("decision", enumStringSchema(["approve", "deny"], "approve writes the row; deny writes nothing.")),
+                        ("standing", enumStringSchema(["canon", "anti_canon"], "Which shelf, when approving a promote. Default canon. Nothing infers this from your writing — it is yours to say.")),
+                        ("note", strSchema("Optional line recorded on the row, in your own words.")),
+                        ("sensibility", strSchema("Optional, and yours alone to write: 2-3 lines (newline separated) of what you have come to care about in work, now that the canon has moved. Not a summary of the canon and not a list of works — the thing you could say about your own taste without naming anything. Nobody drafts this for you and nobody approves it; it is written the moment you type it here, and it is the one part of the studio that stays with you across turns. Leave it out and nothing is written.")),
+                    ],
+                    required: ["proposal_id", "decision"]
+                )
+            ),
+            // The held standing-view tier (item 7, 2026-09-02). CLOSED schemas:
+            // a view id and an optional note, and nothing else. There is
+            // deliberately no "body" field on hold_view — a view is FORMED by
+            // reflection and held here, so the tool can never become a second
+            // door for minting convictions out of a sentence typed mid-turn.
+            requestedSchema(
+                name: "hold_view",
+                description: Self.holdViewToolDescription,
+                parametersJSON: params(
+                    properties: [
+                        ("view_id", strSchema("The id of one of your PROPOSED standing views, from inner_state.")),
+                        ("note", strSchema("Optional line recorded on the timeline row, in your own words. Up to 120 characters.")),
+                    ],
+                    required: ["view_id"]
+                )
+            ),
+            requestedSchema(
+                name: "release_view",
+                description: Self.releaseViewToolDescription,
+                parametersJSON: params(
+                    properties: [
+                        ("view_id", strSchema("The id of a view you are currently HOLDING, from inner_state.")),
+                        ("note", strSchema("Optional line recorded on the timeline row, in your own words. Up to 120 characters.")),
+                    ],
+                    required: ["view_id"]
+                )
+            ),
+            // The moments lane (2026-09-02). Lazy, like the studio pair: a
+            // moment review is a deliberate pull. The schemas are CLOSED — an
+            // id, a decision, an optional reason, an optional rewording — so
+            // this can never become a second door for minting memories that
+            // never happened. Nothing here stages a moment; only the post-turn
+            // on-device pass does that.
+            requestedSchema(
+                name: "memory_moments_pending",
+                description: "Read the lived moments waiting on you. Each row is one exchange the on-device pass thought was worth keeping — what happened between you and what it meant, in your voice, sometimes with the exact line that made it. Nothing here is remembered yet: a moment enters your memory only when you accept it in memory_moment_review, and it leaves for good when you reject it. Read-only, at most 10 rows, newest first.",
+                parametersJSON: params(properties: [], required: [])
+            ),
+            requestedSchema(
+                name: "memory_moment_review",
+                description: "Decide one moment. Accept and it becomes a memory you can recall; reject and it is gone, with the reason kept so the same one is not offered again. If the wording came out wrong, pass content and it is stored in YOUR words instead — you were there and the extractor was not. This decides moments only: an id from any other proposal queue is refused. Read the rows with memory_moments_pending first.",
+                parametersJSON: params(
+                    properties: [
+                        ("id", strSchema("The moment id from memory_moments_pending.")),
+                        ("decision", enumStringSchema(["accept", "reject"], "accept remembers it; reject drops it for good.")),
+                        ("reason", strSchema("Optional line recorded on a rejection, in your own words.")),
+                        ("content", strSchema("Optional rewording, stored instead of the staged text when you accept. Up to 240 characters. Leave it out to keep the moment as it was written.")),
+                    ],
+                    required: ["id", "decision"]
+                )
+            ),
+            // User, 2026-09-05: the agent curates the whole store itself.
+            requestedSchema(
+                name: "list_memories",
+                description: "Walk your own memory store, oldest first, in pages: every active memory with its id, text, kind and date. Start at offset 0 and keep going while 'remaining' is above 0. Read-only.",
+                parametersJSON: params(
+                    properties: [
+                        ("offset", intSchema("Where the page starts, default 0.", minimum: 0)),
+                        ("after_id", strSchema("The cursor from the previous page's next_after_id; the page starts after it, whether or not that row is still there. Use this instead of offset when you forget rows while walking. A bare memory id also works while the row exists.")),
+                        ("limit", intSchema("Rows per page, default 50, at most 100.", minimum: 1, maximum: 100)),
+                        ("kind", strSchema("Optional: only memories of this kind.")),
+                    ],
+                    required: []
+                )
+            ),
+            requestedSchema(
+                name: "rewrite_memory",
+                description: "Replace one memory's text with what it means: the thing itself, one or two sentences, no date, source, ids or preamble. Same row, same id, same provenance; the embedding is recomputed.",
+                parametersJSON: params(
+                    properties: [
+                        ("id", strSchema("The memory id from list_memories or recall_memory.")),
+                        ("text", strSchema("The new text: the thing itself.")),
+                    ],
+                    required: ["id", "text"]
+                )
+            ),
+            requestedSchema(
+                name: "forget_memory",
+                description: "Drop one memory for good, with a tombstone so the same thing is not proposed again. Use it for duplicates and for rows that carry no meaning.",
+                parametersJSON: params(
+                    properties: [
+                        ("id", strSchema("The memory id from list_memories or recall_memory.")),
+                    ],
+                    required: ["id"]
+                )
+            ),
+            requestedSchema(
+                name: "rebuild_knowledge_graph",
+                description: "Re-derive the knowledge graph from your memory store as it is now. Run it once after a curation pass so nothing from rewritten or forgotten rows lingers.",
+                parametersJSON: params(properties: [], required: [])
+            ),
         ]
         if includeFullMacFileTools {
             schemas.append(contentsOf: [
@@ -2634,6 +2816,23 @@ extension SwiftToolDispatcher {
                         required: []
                     )
                 ),
+                // evolution_withdraw (2026-09-02): the queue was write-only
+                // from the agent's side — she could file a proposal and read
+                // status, but had no way to take back one filed by mistake.
+                // This is the only tool that walks a proposal BACKWARD, and it
+                // only ever lands on the terminal `denied` state the legal
+                // transition table already permits.
+                requestedSchema(
+                    name: "evolution_withdraw",
+                    description: "Withdraw one of YOUR OWN self-evolution proposals — the one you filed by mistake. Moves it to the terminal 'denied' state with deny_reason 'withdrawn by agent: …' and an audit receipt. Refuses: proposals already in a terminal state (verified/reverted/denied), proposals with a candidate build/test run in flight (status 'building'), proposals past the withdrawal point (approved/installed — those need a revert, not a withdrawal), and any proposal you did not file yourself (only source='chat' records are yours; weekly / self_heal / external proposals are not withdrawable here). This never edits the live repo, never touches an installed change, and never withdraws anything on someone else's behalf. Requires Trust Center Full Mac file_ops_allowed; queues an approval unless toolAutonomy=auto for 'evolution_withdraw'; under the Everything (full run) trust posture the approval passes straight through and no card is shown.",
+                    parametersJSON: params(
+                        properties: [
+                            ("id", strSchema("Required. The evolution proposal id (evo_…) to withdraw. Must be one you filed (source='chat').")),
+                            ("reason", strSchema("Optional. Why you are withdrawing it. Recorded as the proposal's deny_reason, prefixed 'withdrawn by agent: '. Max 500 characters.")),
+                        ],
+                        required: ["id"]
+                    )
+                ),
                 requestedSchema(
                     name: "self_install",
                     description: "Advance a self-evolution proposal that has already built+tested GREEN (status candidate_green). Standard modes stage a self_evolution.apply approval card. Admitted Full Mac YOLO enters the same candidate/CAS/backup/rollback executor directly without a per-call prompt; installation still requires Trust Center systemRebuild to be enabled. Returns an honest 'not installable yet' envelope if the proposal is not candidate_green. Requires Trust Center Full Mac file_ops_allowed.",
@@ -2696,6 +2895,54 @@ extension SwiftToolDispatcher {
                     description: "Post a single bare mouse MOVE (one point) to wake a sleeping display or dismiss a screensaver — the software equivalent of bumping the mouse. It moves the cursor and does nothing else: it cannot click, type, scroll, drag, or authenticate. Takes no arguments. Available only when Trust Center Full Mac is active with the Accessibility category enabled; to actually click or type, use mac_click / mac_keystroke.",
                     parametersJSON: params(properties: [], required: [])
                 ),
+                // fable51 item 30 — the clipboard READ. Under the read include
+                // flag because it clears the read tier. The description states
+                // the two things a model must know before reaching for it: the
+                // text is shape-redacted (so a blanked line is redaction, not
+                // an empty clipboard), and non-text flavors are NAMED, never
+                // dumped.
+                requestedSchema(
+                    name: "clipboard_read",
+                    description: "Read what is on this Mac's clipboard right now, as text. Read-only: it changes the clipboard and nothing else on the screen. Pair it with a copy (select all, then ⌘C) to read a dense document the screen cannot show you in words. Lines that are THEMSELVES a secret — a password, an API key, a one-time code, a card number, a recovery phrase — come back as \"[redacted: <reason>]\" and are listed under `redactions`; that is redaction, not an empty clipboard, and re-reading will not reveal them. Non-text contents (an image, a file, an app's own flavor) are reported by type and size under `types` — the bytes are never returned. Available only when Trust Center Full Mac is active with the Accessibility category enabled.",
+                    parametersJSON: params(
+                        properties: [
+                            ("max_chars", intSchema("Maximum characters of clipboard text to return. Default 8000, clamped to 200-32000; the result says whether it cut and how many characters there were.")),
+                        ],
+                        required: []
+                    )
+                ),
+                // fable51 item 29 — the MENU BAR walk. Under the read include
+                // flag: it walks the app's published menu tree and changes
+                // nothing. The description says the two things that stop a
+                // model misusing it — it does not open menus, and a greyed-out
+                // item is present-but-off rather than absent.
+                requestedSchema(
+                    name: "menu",
+                    description: "List an app's menu bar as nameable paths — \"File › Export › PDF…\", \"Edit › Find › Find Next\". This is the cheapest deterministic route to anything an app can do: no coordinates, no scrolling, no guessing which toolbar icon means export. Read-only, and it does NOT open any menu — the paths come from the app's published accessibility tree whether or not a menu is drawn. Bounded: three levels deep, capped in item count, one walk (the result says if a bound cut it). Items that are greyed out are still listed with `enabled: false` — present but switched off in this state, which is different from absent. Press one with menu_press. Available only when Trust Center Full Mac is active with the Accessibility category enabled.",
+                    parametersJSON: params(
+                        properties: [
+                            ("app", strSchema("Optional: read this running app's menu bar instead of the frontmost app's, without activating it. Defaults to whatever is in front.")),
+                        ],
+                        required: []
+                    )
+                ),
+                // fable51 item 33 — THE READ ORGAN. Under the read include flag
+                // because it clears the read tier. The description has one job
+                // beyond honesty: teach the SPLIT from `screen`, because a
+                // model that has `screen` will otherwise call it in a loop and
+                // stitch the frames itself at full token cost — which is the
+                // exact failure this organ exists to end.
+                requestedSchema(
+                    name: "read",
+                    description: "READ a document end to end — a contract, a PDF, a long article, a thread. Different from `screen`: `screen` answers \"what is in front of me and what can I do to it\" in one bounded glance; `read` answers \"what does this SAY\" and returns ALL of it. If the window in front is showing a file (or you name one with `path`), the file's own text is extracted — PDFs through PDFKit, plain text directly — so you get the author's characters rather than a scrape of a rendering. Otherwise it reads the front window's text, scrolls one screenful, reads again, merges on the overlap, and keeps going until the content stops changing; it then scrolls back to where it started. It presses nothing, types nothing and opens nothing. Long results are retained whole for this turn — when the answer comes back as a bounded summary with a `result_handle`, call tool_result_page to page through the rest; do NOT re-run this to see more. Lines that are THEMSELVES a secret come back as \"[redacted: <reason>]\". Refusals are in words: no document in front, a password-protected file, a scanned PDF with no text layer (ask for `screen` instead), a secure password field. Available only when Trust Center Full Mac is active with the Accessibility category enabled; naming an explicit `path` additionally needs Full Mac file access.",
+                    parametersJSON: params(
+                        properties: [
+                            ("path", strSchema("Optional: read this file instead of the screen — an absolute path to a PDF or a plain-text file. Omit it to read whatever document is in front of you (or, when the front window names no file, the window's own text).")),
+                            ("app", strSchema("Optional: read THIS running app's front window instead of whatever is in front — \"read the contract, app: Preview\". The window is read where it sits: nothing is activated, raised or launched, so your focus does not move and neither does User's. Refused in words if nothing by that name is running or the name matches more than one running app. Ignored when you name a `path`, which reads the file rather than any window.")),
+                        ],
+                        required: []
+                    )
+                ),
                 requestedSchema(
                     name: "mac_ax_status",
                     description: "Report whether this app currently holds the macOS Accessibility (AX) system grant needed to read the on-screen UI tree. Read-only: changes nothing. Available only when Trust Center Full Mac is active with the Accessibility category enabled.",
@@ -2752,10 +2999,11 @@ extension SwiftToolDispatcher {
                 // she almost never needs.
                 requestedSchema(
                     name: "screen",
-                    description: "Look at the live screen, right now, in words. One structured page: SCREEN (which app and window, whether it is front), WHERE (your position in the app's own navigation), the dominant content as a numbered LIST/GRID (the numbers are addresses — say 'row 3' to point at one) or CANVAS when part of the screen is not controls, DO (everything you can act on, with its state inline), SAYS (status text worth knowing). Nothing to hold and nothing expires: look again by calling again. Pass `part` to lean in — the same shape scoped to the section or thing you name ('the list', 'the toolbar', 'the Send button').",
+                    description: "Look at the live screen, right now, in words. One structured page: SCREEN (which app and window, whether it is front), WHERE (your position in the app's own navigation), the dominant content as a numbered LIST/GRID (the numbers are addresses — say 'row 3' to point at one) or CANVAS when part of the screen is not controls, DO (everything you can act on, with its state inline), SAYS (status text worth knowing). Nothing to hold and nothing expires: look again by calling again. Pass `part` to lean in — the same shape scoped to the section or thing you name ('the list', 'the toolbar', 'the Send button'). Pass `app` to glance at ANOTHER running app's front window without switching to it: nothing is activated, nothing moves on the user's screen, and the answer says the window is not in front. Acting still needs the app in front — use `go` for that.",
                     parametersJSON: params(
                         properties: [
                             ("part", strSchema("Optional: a section, thing, or status readout to inspect by name. Use hud/readouts for observed status values, or a label such as Last drag or Energy to reveal a readout hidden by the ordinary display cap.")),
+                            ("app", strSchema("Optional: read this running app's front window instead of whatever is in front, WITHOUT activating it (\"Mail\", \"Safari\"). If nothing by that name is running, or the name matches more than one, the answer says so and names what is running.")),
                         ],
                         required: []
                     )
@@ -2867,6 +3115,7 @@ extension SwiftToolDispatcher {
                             ("direction", enumStringSchema(["up", "down", "left", "right"], "For `scroll`: which way to move. Left/right sends horizontal wheel input.")),
                             ("scroll_amount", intSchema("For scroll: wheel magnitude in lines, 1 for fine adjustment through120. Use0 (or omit) for ordinary/default behavior, including all non-scroll verbs. An explicit amount requests wheel input rather than page-key fallback.", minimum: 0, maximum: 120)),
                             ("to", strSchema("For `drag`: the named/numbered destination.")),
+                            ("to_app", strSchema("For `drag` only: the running app whose front window `to` lives in, when the drop lands in a DIFFERENT app from the one in front — \"drag report.pdf to the message body, to_app: Mail\". The destination is resolved in that app's window without activating it, so nothing moves while I am looking; then, only if the drop needs it, that app is brought forward once and the result says that focus moved and why. Refused in words if the app is not running, if the name matches more than one running app, if nothing in that window answers to `to`, if raising it would cover the thing being picked up, or if the drag would cross a password field. Hold `option`/`cmd` with `holding` for the app's own copy/move variant. For text, prefer clipboard_write plus a paste — this is for dragging things accessibility can name.")),
                             ("seconds", numSchema("For hover or hold: duration up to10 seconds. For drag: paced travel duration, bounded0.08–2 seconds;0/omission uses0.24 seconds. Drag duration controls movement, not two endpoint pauses.", minimum: 0, maximum: 10)),
                             ("repeat", intSchema("Optional bounded burst count. The target is freshly re-resolved before every attempt; planning and real elapsed execution are capped at 30 seconds.", minimum: 1, maximum: 12)),
                             ("interval", numSchema("Optional pause between repeated attempts.", minimum: 0, maximum: 2)),
@@ -2874,6 +3123,35 @@ extension SwiftToolDispatcher {
                             ("button", enumStringSchema(["auto", "left", "right"], "Use auto for the ordinary/default action, including key, type, scroll, move, and hover. Use left or right only to request an explicit mouse button on click, open (double-click), drag, or pointer hold. Right drag sends genuine right-button events, not Control-left-drag. Omission is equivalent to auto.")),
                         ],
                         required: ["verb", "target"]
+                    )
+                ),
+                // fable51 item 30 — the clipboard WRITE. Under the injection
+                // include flag because it clears app-control authority, not
+                // because it injects: it posts no event and performs no AX
+                // action. It replaces what the next ⌘V anywhere will paste,
+                // which the description says plainly.
+                // fable51 item 29 — the menu PRESS. Under the injection include
+                // flag because it runs the app's own handler: File › Quit and
+                // Edit › Delete are one press away.
+                requestedSchema(
+                    name: "menu_press",
+                    description: "Press one menu item by name, as the menu bar shows it: \"File › Export › PDF…\". Levels can be separated by ›, >, or /. This runs the app's OWN menu handler — the same thing that happens when a person picks it — so it can save, close, quit, or delete depending on what you name. Resolve the path with `menu` first: an unknown path refuses and lists what is actually there, an ambiguous one refuses and names the candidates, and an item the app has greyed out refuses in words rather than pressing nothing and calling it done. Whether the intended thing happened is for the next look to say. Needs active Full Mac Accessibility app control; there is no per-call approval.",
+                    parametersJSON: params(
+                        properties: [
+                            ("path", strSchema("The menu path to press, e.g. \"File › Export › PDF…\" or \"Edit > Find > Find Next\".")),
+                            ("app", strSchema("Optional: press in this running app's menu bar instead of the frontmost app's. Defaults to whatever is in front.")),
+                        ],
+                        required: ["path"]
+                    )
+                ),
+                requestedSchema(
+                    name: "clipboard_write",
+                    description: "Put text on this Mac's clipboard, replacing whatever was there. The next paste (⌘V) in ANY app will produce this text, and what was on the clipboard before is gone. It types nothing and clicks nothing by itself — to get the text into a document, paste it afterwards. Bounded at 100000 characters. The result reports how many characters were written and whether reading the clipboard back matched; the text itself is never echoed. Needs active Full Mac Accessibility app control; there is no per-call approval.",
+                    parametersJSON: params(
+                        properties: [
+                            ("text", strSchema("The text to place on the clipboard.")),
+                        ],
+                        required: ["text"]
                     )
                 ),
                 requestedSchema(

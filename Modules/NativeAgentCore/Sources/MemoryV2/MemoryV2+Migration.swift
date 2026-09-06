@@ -16,6 +16,9 @@ import PersistenceCore
 // result of owner deletion. Before completion, retries remain safe because
 // every insert is existence-gated. Original JSON files are preserved for the
 // legacy backup window but are never re-imported after completion.
+// 2026-09-06: "existence-gated" now means insert-if-absent /
+// refresh-only-if-the-canonical-row-is-empty, decided inside the storage write
+// (`importLegacyMemory`) rather than by a check before the embed.
 
 // MARK: - MemoryStorage seam
 //
@@ -31,6 +34,33 @@ public protocol MemoryV2Storage: Sendable {
     func deleteProposal(id: String) async throws -> Bool
     func tombstoneExists(_ key: String) async throws -> Bool
     func insertTombstone(_ key: String) async throws
+    /// 2026-09-06: insert-if-absent / refresh-only-if-empty, with the decision
+    /// made inside the storage write. Replaces the migrator's check-then-upsert
+    /// pairs, which raced a live writer and had no way to repair a blank
+    /// canonical row behind the one-way completion sentinel.
+    func importLegacyMemory(_ record: MemoryRecord, embedding: [Float]) async throws -> MemoryLegacyImportOutcome
+}
+
+public enum MemoryLegacyImportOutcome: Sendable {
+    case inserted
+    case refreshedEmpty
+    case skippedExisting
+
+    /// True when the canonical store now holds this legacy row because of us.
+    public var landed: Bool { self != .skippedExisting }
+}
+
+public extension MemoryV2Storage {
+    /// Non-atomic fallback for storages with no transactional gate of their own
+    /// (the in-memory test stub). Same DECISION, without the atomicity.
+    func importLegacyMemory(
+        _ record: MemoryRecord,
+        embedding: [Float]
+    ) async throws -> MemoryLegacyImportOutcome {
+        if try await memoryExists(id: record.id) { return .skippedExisting }
+        try await insertMemory(record, embedding: embedding)
+        return .inserted
+    }
 }
 
 // MARK: - RealMemoryStorage — MemoryV2Storage backed by the GRDB MemoryStorage actor
@@ -95,6 +125,31 @@ public actor RealMemoryStorage: MemoryV2Storage {
             )
         )
         return false
+    }
+
+    /// Atomic legacy-import gate — the decision happens inside the SQLite write
+    /// transaction, so a live writer cannot slip between it and the write.
+    public func importLegacyMemory(
+        _ record: MemoryRecord,
+        embedding: [Float]
+    ) async throws -> MemoryLegacyImportOutcome {
+        let stored = StoredMemory(
+            id: record.id,
+            content: record.text,
+            personaId: Self.personaID(from: record),
+            source: record.sourceRunId,
+            confidence: record.confidence ?? 1.0,
+            createdAt: record.createdAt,
+            updatedAt: record.updatedAt ?? record.createdAt,
+            embedding: embedding.isEmpty ? nil : embedding,
+            status: record.status ?? "active",
+            metadata: record.extras
+        )
+        switch try await storage.importLegacyMemory(stored) {
+        case .inserted: return .inserted
+        case .refreshedEmpty: return .refreshedEmpty
+        case .skippedExisting: return .skippedExisting
+        }
     }
 
     public func deleteProposal(id: String) async throws -> Bool {
@@ -171,7 +226,7 @@ public actor MemoryV2Migrator {
     ) {
         self.dataRoot = dataRoot
         self.providedStorage = storage
-        self.embedder = embedder ?? Self.defaultEmbeddingProvider()
+        self.embedder = embedder ?? Self.defaultEmbeddingProvider(dataRoot: dataRoot)
     }
 
     /// Pick the embedding provider for the legacy → SQLite migration pass.
@@ -188,8 +243,8 @@ public actor MemoryV2Migrator {
     /// `.migrated_to_sqlite_v2_approved_only` sentinel when any required embed
     /// / insert failed — so a fail-closed migration retries on the next launch
     /// instead of locking in a partial state. See `MigrationReport.requiredFailures`.
-    private nonisolated static func defaultEmbeddingProvider() -> any EmbeddingProvider {
-        if let coreML = try? CoreMLEmbeddingProvider.bundled() {
+    private nonisolated static func defaultEmbeddingProvider(dataRoot: URL) -> any EmbeddingProvider {
+        if let coreML = try? CoreMLEmbeddingProvider.bundled(extrasRoot: dataRoot) {
             return coreML
         }
         if ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1" {
@@ -293,10 +348,17 @@ public actor MemoryV2Migrator {
                 continue
             }
             do {
-                if try await storage.memoryExists(id: record.id) { continue }
+                // 2026-09-06: gated by `importLegacyMemory` like the other two
+                // branches. The check-then-insert pair raced the live
+                // coordinator — a row that landed between the existence check
+                // and the insert threw UNIQUE, which counted as a required
+                // failure and blocked the sentinel on every launch from then on
+                // — and it left a blank canonical row blank forever behind the
+                // one-way completion sentinel.
                 let vector = (try await embedder.embed([record.text])).first ?? []
-                try await storage.insertMemory(record, embedding: vector)
-                report.memoriesImported += 1
+                if try await storage.importLegacyMemory(record, embedding: vector).landed {
+                    report.memoriesImported += 1
+                }
             } catch {
                 report.errors.append("memory \(record.id): \(error)")
                 report.requiredFailures += 1
@@ -326,6 +388,23 @@ public actor MemoryV2Migrator {
 
     // MARK: legacy notes.jsonl
 
+    /// True only for "no such file or directory" — the one error that means a
+    /// legacy directory is absent rather than unreadable. 2026-09-06.
+    static func isNoSuchFileError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           nsError.code == NSFileReadNoSuchFileError || nsError.code == NSFileNoSuchFileError {
+            return true
+        }
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(ENOENT) {
+            return true
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isNoSuchFileError(underlying)
+        }
+        return false
+    }
+
     /// Import already-committed legacy note memories. `notes.jsonl` is the
     /// durable output of `commit_memory`; pending/rejected proposal files live
     /// elsewhere and are handled by `migrateProposals`.
@@ -341,7 +420,11 @@ public actor MemoryV2Migrator {
         } catch {
             // A missing legacy directory is a clean fresh install. An existing
             // directory that cannot be enumerated is not equivalent to empty.
-            if fm.fileExists(atPath: memoryDir.path) {
+            // 2026-09-06: decided by the listing's own error — only "no such
+            // file or directory" is absence. `fileExists` answered false for a
+            // directory we merely could not stat, reporting a real failure as a
+            // fresh install.
+            if !Self.isNoSuchFileError(error) {
                 report.errors.append("memory legacy directory exists but is unreadable: \(error)")
                 report.requiredFailures += 1
             }
@@ -383,9 +466,21 @@ public actor MemoryV2Migrator {
                         report.requiredFailures += 1
                         continue
                     }
+                    // 2026-09-06: the migration retries whenever it left a
+                    // required failure behind, and `upsertMemory` UPDATES an
+                    // existing row — so a retry overwrote the canonical memory a
+                    // prior attempt had already imported (and anything that
+                    // edited it since) with the legacy text. Gated, but by
+                    // `importLegacyMemory`, not by a bare existence check: the
+                    // decision belongs inside the storage write (the coordinator
+                    // is already running, so check-then-write races it), and a
+                    // blank canonical row still needs a repair path or the
+                    // one-way completion sentinel makes it permanent.
                     let vector = (try await embedder.embed([legacy.text])).first ?? []
-                    let inserted = try await storage.upsertMemory(legacy.memoryRecord(), embedding: vector)
-                    if inserted {
+                    if try await storage.importLegacyMemory(
+                        legacy.memoryRecord(),
+                        embedding: vector
+                    ).landed {
                         report.memoriesImported += 1
                     }
                 } catch {
@@ -487,7 +582,27 @@ public actor MemoryV2Migrator {
 
     private func migrateProposals(storage: any MemoryV2Storage, into report: inout MigrationReport) async {
         let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(at: proposalsDir, includingPropertiesForKeys: nil) else {
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(at: proposalsDir, includingPropertiesForKeys: nil)
+        } catch {
+            // 2026-09-06: same rule migrateLegacyNotes already applies. A
+            // missing proposals directory is a clean fresh install; an existing
+            // directory that cannot be enumerated is NOT equivalent to empty,
+            // and swallowing it let the completion sentinel land with every
+            // approved proposal still unimported — permanently, since
+            // completion is one-way.
+            //
+            // 2026-09-06: absence is decided by the LISTING'S OWN error, not by
+            // a follow-up `fileExists`. fileExists answers false for a
+            // directory we merely lack permission to stat, and it is a second,
+            // later look at a path that may have changed in between — either
+            // way a real failure was reported as a clean fresh install. Only
+            // "no such file or directory" means absent.
+            if !Self.isNoSuchFileError(error) {
+                report.errors.append("memory proposals directory exists but is unreadable: \(error)")
+                report.requiredFailures += 1
+            }
             return
         }
         for url in entries where url.pathExtension == "json" {
@@ -512,9 +627,18 @@ public actor MemoryV2Migrator {
                         continue
                     }
                     do {
+                        // 2026-09-06: gated for the same reason as the
+                        // legacy-notes branch — a retried migration must not
+                        // overwrite a canonical memory an earlier attempt
+                        // already imported — and gated the same way, by
+                        // `importLegacyMemory`. A bare existence check both
+                        // raced the live coordinator and left a blank canonical
+                        // row blank forever behind the completion sentinel.
                         let vector = (try await embedder.embed([legacy.content])).first ?? []
-                        let inserted = try await storage.upsertMemory(legacy.memoryRecord(), embedding: vector)
-                        if inserted {
+                        if try await storage.importLegacyMemory(
+                            legacy.memoryRecord(),
+                            embedding: vector
+                        ).landed {
                             report.memoriesImported += 1
                         }
                     } catch {

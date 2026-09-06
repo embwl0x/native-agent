@@ -132,16 +132,12 @@ let extraDeps: [String: [String]] = [
     // MemoryV2 depends on PersistenceCore/KnowledgeGraph/ApprovalInbox and
     // never imports WorkshopExecution. See WorkshopExecution+ExecutionMemory.swift.
     "WorkshopExecution": ["PersistenceCore", "ProviderRouting", "ApprovalInbox", "MemoryV2", "TrustCenter"],
-    "WorkflowOrchestration": [
-        "PersistenceCore",
-        "ApprovalInbox",
-        "TrustCenter",
-        "MCPDispatcher",
-        "MemoryV2",
-        "Research",
-        "SystemOps",
-        "ToolExecution",
-    ],
+    // 2026-09-01: the workflow RUN engine was retired (User authorized). What is
+    // left is the workflow registry (list + create), which reads and writes one
+    // JSON file. Every execution-side dependency — ApprovalInbox, TrustCenter,
+    // MCPDispatcher, MemoryV2, Research, SystemOps, ToolExecution — went with
+    // the engine that used them.
+    "WorkflowOrchestration": ["PersistenceCore"],
     "KnowledgeGraph": ["PersistenceCore"],
     "Skills": ["PersistenceCore"],
     "NotificationInbox": ["PersistenceCore"],

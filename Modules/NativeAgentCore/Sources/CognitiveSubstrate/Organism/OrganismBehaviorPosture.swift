@@ -248,7 +248,15 @@ public struct OrganismBehaviorPosture: Codable, Sendable, Equatable {
         if bodySchema.providerPathRequiresCaution || bodySchema.toolPathRequiresCaution || predictionSummary.strategyCaution >= 0.18 {
             return .verifyBeforeRetry
         }
-        if predictionSummary.bodyConfidence.toolPath >= 0.58 {
+        // Item 47 (review fix 4): `preferKnownPath` says "lean on the path you
+        // know works". A tool read that is merely CONFIGURED, or whose live
+        // capability receipt has decayed past its horizon, is exactly the case
+        // where she does NOT know that — the uncertainty and freshness the typed
+        // layer carries, which the collapsed Bool threw away. Withholding the
+        // optimistic strategy is the honest consequence; raising caution would
+        // not be.
+        if predictionSummary.bodyConfidence.toolPath >= 0.58,
+           !bodySchema.toolPathIsUnprovenOrStale {
             return .preferKnownPath
         }
         return .normal

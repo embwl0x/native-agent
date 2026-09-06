@@ -463,7 +463,14 @@ public actor WorkshopExecutorLoop {
     /// One drain pass: claim + run queued Workshop executions, oldest first, one at a
     /// time. Per-Workshop execution failures are contained (logged + that Workshop execution goes
     /// `failed`); the pass moves on. Safe to call from a LoopRunner tick.
-    public func drainOnce() async {
+    ///
+    /// Returns how many queued executions this pass actually claimed and ran.
+    /// The loop owner reports 0 as `.skipped`, not `.completed` — a drain that
+    /// found nothing to drain is not successful work, and stamping it as such
+    /// is what made an idle `mission_executor` indistinguishable from a
+    /// working one to the dormancy rule.
+    @discardableResult
+    public func drainOnce() async -> Int {
         // Crash/restart orphan recovery — completes BEFORE this drain claims
         // anything (the shared barrier; see reconcileTask).
         await ensureOrphansReconciled()
@@ -474,7 +481,7 @@ public actor WorkshopExecutorLoop {
         await reconcileTerminalDeskSettlements()
         // Disabling autonomous execution blocks new claims, not durable
         // zero-effect repair of work that was already admitted.
-        guard await isEnabled() else { return }
+        guard await isEnabled() else { return 0 }
         // Fail approvals nobody is coming to answer (no-op unless the
         // approval-wait deadline is configured). Runs each drain tick so the
         // timeout granularity is the drain interval — fine for a multi-hour
@@ -483,17 +490,20 @@ public actor WorkshopExecutorLoop {
         let queued = await scanQueue()
             .filter { $0.status == "queued" }
             .sorted { $0.createdAt < $1.createdAt }   // submit order
+        var ran = 0
         for record in queued {
-            if Task.isCancelled { return }
+            if Task.isCancelled { return ran }
             do {
                 guard let claimed = try await claim(record.id) else { continue }
                 await runClaimedWorkshopExecution(claimed)
+                ran += 1
             } catch is CancellationError {
-                return
+                return ran
             } catch {
                 Self.logger.error("drain claim failed for \(record.id, privacy: .public): \(String(describing: error), privacy: .public)")
             }
         }
+        return ran
     }
 
     private func reconcileTerminalDeskSettlements() async {

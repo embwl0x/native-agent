@@ -271,42 +271,38 @@ struct InboxSettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 24) {
                 // ── Master toggle ──────────────────────────────────────────
-                NativePanel(title: "Proactive Inbox", systemImage: "tray.and.arrow.down") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Toggle("Enable Proactive Inbox", isOn: $masterEnabled)
-                            .disabled(masterToggleDisabled)
-                            .onChange(of: masterEnabled) { _, val in
-                                if suppressMasterSave {
-                                    suppressMasterSave = false
-                                    return
-                                }
-                                Task { await saveMaster(enabled: val) }
+                InboxSection(title: "Proactive inbox") {
+                    Toggle("Let the agent raise things unasked", isOn: $masterEnabled)
+                        .disabled(masterToggleDisabled)
+                        .onChange(of: masterEnabled) { _, val in
+                            if suppressMasterSave {
+                                suppressMasterSave = false
+                                return
                             }
-
-                        Text("When enabled, \(agentDisplayName) can surface observations, file changes, completed Desk tasks, and check-ins without being asked.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        HStack {
-                            Button("View Inbox History") {
-                                Task { await openInboxHistory() }
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .disabled(inboxHistoryRoute.isLoading)
-
-                            // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/inbox/self_test
+                            Task { await saveMaster(enabled: val) }
                         }
 
-                        if !statusSlot.entries.isEmpty {
-                            VStack(alignment: .leading, spacing: 4) {
-                                ForEach(statusSlot.entries, id: \.source) { entry in
-                                    Text(entry.status.text)
-                                        .font(.caption)
-                                        .foregroundStyle(statusColor(entry.status.tone))
-                                }
+                    Text("When this is on, \(agentDisplayName) can surface observations, file changes, finished Desk tasks and check-ins without being asked.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Button("View inbox history") {
+                        Task { await openInboxHistory() }
+                    }
+                    .disabled(inboxHistoryRoute.isLoading)
+
+                    // SUBSYSTEM #17 (2026-05-31): retired diagnostic UI + /v1/inbox/self_test
+
+                    if !statusSlot.entries.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(statusSlot.entries, id: \.source) { entry in
+                                Text(entry.status.text)
+                                    .font(ShellType.label)
+                                    .foregroundStyle(statusColor(entry.status.tone))
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                     }
@@ -315,65 +311,67 @@ struct InboxSettingsView: View {
                 // ── Triggers ───────────────────────────────────────────────
                 switch triggersPanelGate {
                 case .enabled:
-                    NativePanel(title: "Triggers", systemImage: "bolt") {
-                        VStack(alignment: .leading, spacing: 14) {
-                            ForEach(triggers) { trigger in
-                                TriggerRowView(
-                                    trigger: trigger,
-                                    watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
-                                    onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) },
-                                    onFireNow: { Task { await fireTriggerNow(trigger) } }
-                                )
-                                if trigger != triggers.last { Divider() }
-                            }
+                    InboxSection(title: "Triggers") {
+                        ForEach(triggers) { trigger in
+                            TriggerRowView(
+                                trigger: trigger,
+                                watchedPaths: trigger.name == "file_watch" ? $watchedPaths : .constant(""),
+                                onToggle: { enabled in await setTriggerEnabled(trigger.name, enabled: enabled) },
+                                onFireNow: { Task { await fireTriggerNow(trigger) } }
+                            )
                         }
                     }
 
                     // File watcher path editor
                     if triggers.first(where: { $0.name == "file_watch" })?.enabled == true {
-                        NativePanel(title: "Watched Paths", systemImage: "folder.badge.gearshape") {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Enter one path per line (e.g. ~/Projects/NativeAgent/Modules/NativeAgentCore/Sources/)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                TextEditor(text: $watchedPaths)
-                                    .font(.caption.monospaced())
-                                    .frame(minHeight: 80)
-                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 1))
-                                Button("Save Paths") {
-                                    Task { await saveWatchedPaths() }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
+                        InboxSection(title: "Watched folders") {
+                            Text("One path per line.")
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                            TextEditor(text: $watchedPaths)
+                                .font(ShellType.code)
+                                .scrollContentBackground(.hidden)
+                                .frame(minHeight: 80)
+                                .padding(8)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(NativeAgentShell.quietFill)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
+                                )
+                            Button("Save paths") {
+                                Task { await saveWatchedPaths() }
                             }
                         }
                     }
                 case .disabled:
                     EmptyView()
                 case .loading:
-                    NativePanel(title: "Triggers", systemImage: "bolt") {
-                        Label("Checking whether proactive inbox is enabled…", systemImage: "hourglass")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    InboxSection(title: "Triggers") {
+                        Text("Checking whether the proactive inbox is on…")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.secondary)
                     }
                 case .unavailable(let detail):
-                    NativePanel(title: "Triggers unavailable", systemImage: "exclamationmark.triangle") {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("The proactive inbox setting could not be read. Trigger settings are unavailable, not disabled.")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                            Text(detail)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(3)
-                        }
+                    InboxSection(title: "Triggers unavailable") {
+                        Text("The proactive inbox setting could not be read, so the trigger settings are unavailable rather than off.")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.trouble)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(detail)
+                            .font(ShellType.caption)
+                            .foregroundStyle(NativeAgentShell.secondary)
+                            .lineLimit(3)
                     }
                 }
             }
-            .padding()
+            .padding(.bottom, 32)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         // ui-taste-sweep 2026-06-07: was falling back to the bundle name.
-        .navigationTitle("Inbox Policy")
+        .navigationTitle("Notifications")
         .task { await load() }
         .sheet(isPresented: Binding(
             get: { inboxHistoryRoute.isPresented },
@@ -530,9 +528,9 @@ struct InboxSettingsView: View {
 
     private func statusColor(_ tone: InboxPolicyStatus.Tone) -> Color {
         switch tone {
-        case .success: return .green
-        case .warning: return .orange
-        case .failure: return .red
+        case .success: return NativeAgentShell.calm
+        case .warning: return NativeAgentShell.trouble
+        case .failure: return NativeAgentShell.trouble
         }
     }
 }
@@ -554,34 +552,35 @@ struct InboxHistoryView: View {
             VStack(alignment: .leading, spacing: 0) {
                 if let errorText = route.errorText {
                     Text(errorText)
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(NativeAgentTheme.fail)
-                        .padding(.horizontal)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .padding(.horizontal, 20)
                         .padding(.vertical, 8)
                 }
 
                 switch InboxHistoryPresentation.content(items: appModel.inboxItems) {
                 case .empty where route.isLoading:
-                    ProgressView("Loading Inbox History…")
+                    ProgressView("Loading inbox history…")
+                        .font(ShellType.label)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .empty:
-                    NativeEmptyState(
-                        title: "No inbox history",
-                        detail: "Inbox cards will appear here after the agent records an observation.",
-                        systemImage: "tray",
-                        actionTitle: nil,
-                        actionImage: nil,
-                        action: nil
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Text("No inbox history yet. Cards appear here after the agent records an observation, a file change or a finished Desk task.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(20)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 case .rows(let items):
                     List(items) { item in
                         InboxHistoryRow(item: item)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
                     }
                     .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
                 }
             }
-            .navigationTitle("Inbox History")
+            .navigationTitle("Inbox history")
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button {
@@ -590,7 +589,7 @@ struct InboxHistoryView: View {
                         Image(systemName: "arrow.clockwise")
                     }
                     .disabled(route.isLoading)
-                    .accessibilityLabel("Refresh Inbox History")
+                    .accessibilityLabel("Refresh inbox history")
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Close", action: onClose)
@@ -604,28 +603,35 @@ private struct InboxHistoryRow: View {
     let item: InboxItemRecord
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: item.sourceIcon)
-                .foregroundStyle(item.severityColor)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.tertiary)
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(item.title.isEmpty ? "Untitled inbox item" : item.title)
-                    .font(NativeAgentFont.label.weight(.semibold))
+                    .font(ShellType.labelSemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                 if !item.summary.isEmpty {
                     Text(item.summary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                         .lineLimit(2)
                 }
-                Text(item.created_at.isEmpty ? "Time unavailable" : item.created_at)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
+                Text(item.created_at.isEmpty
+                     ? "Time unavailable"
+                     : UserDisplayFormatters.humanizeISOTimestamp(item.created_at))
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
             }
             Spacer(minLength: 8)
+            // The teal is the room's one "waiting on you" colour, and an
+            // unread inbox card is exactly that; a read one goes quiet.
             Text(InboxHistoryPresentation.statusLabel(for: item))
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(item.isUnread ? item.severityColor : .secondary)
+                .font(ShellType.captionMedium)
+                .foregroundStyle(item.isUnread ? NativeAgentShell.needsYou : NativeAgentShell.secondary)
         }
+        .frame(minHeight: 48)
         .accessibilityElement(children: .combine)
     }
 }
@@ -704,34 +710,34 @@ struct TriggerRowView: View {
 
     // PATCH-2026-05-07: polish-InboxSettingsView PulsingDot for enabled triggers
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
+        HStack(alignment: .center, spacing: 8) {
             ZStack(alignment: .bottomTrailing) {
                 Image(systemName: trigger.systemImage)
-                    .font(.body)
-                    .foregroundStyle(.blue)
+                    .font(ShellType.body)
+                    .foregroundStyle(NativeAgentShell.tertiary)
                     .frame(width: 22)
                 if toggleState.visualEnabled {
-                    PulsingDot(color: .green, size: 6)
+                    PulsingDot(color: NativeAgentShell.calm, size: 6)
                         .offset(x: 4, y: 4)
                 }
             }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(trigger.displayName)
-                    .font(NativeAgentFont.body.weight(.medium))
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                 if let desc = trigger.description {
                     Text(desc)
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
             Button("Test") { onFireNow() }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-                .font(.caption)
+                .controlSize(.small)
                 .disabled(!trigger.supportsRealManualFire)
                 .help(trigger.supportsRealManualFire
                     ? "Create one real trigger item now"
@@ -743,6 +749,7 @@ struct TriggerRowView: View {
             ))
                 .labelsHidden()
         }
+        .frame(minHeight: 48)
         .onChange(of: trigger.enabled) { _, val in
             toggleState.synchronizeServer(enabled: val)
         }
@@ -753,6 +760,38 @@ struct TriggerRowView: View {
         Task {
             let accepted = await onToggle(request.requestedEnabled)
             toggleState.completed(request, accepted: accepted)
+        }
+    }
+}
+
+// MARK: - Page kit (2026-09-03 Advanced refinement)
+
+/// One section of the page: the eyebrow the Advanced list uses, and the rows
+/// under it on one card. Replaces the stack of `NativePanel` material slabs
+/// this page carried; on the shell's one sheet those read as plates.
+private struct InboxSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .padding(.horizontal, 2)
+            VStack(alignment: .leading, spacing: 12) { content }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .fill(TodayPalette.cardFill)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                        .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+                )
         }
     }
 }

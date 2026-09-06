@@ -10,7 +10,9 @@ private struct XAIOIDCDiscovery: Sendable {
 
 extension NativeOAuthFlow {
     @MainActor
-    static func startXAIOAuthFlow() async -> OAuthFlowResult {
+    static func startXAIOAuthFlow(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) async -> OAuthFlowResult {
         let server: NativeOAuthLoopbackCallbackServer
         do {
             server = try NativeOAuthLoopbackCallbackServer(
@@ -102,7 +104,8 @@ extension NativeOAuthFlow {
                 tokens,
                 discovery: discovery,
                 redirectURI: redirectURI,
-                scope: scope
+                scope: scope,
+                dataRoot: dataRoot
             )
         } catch {
             return OAuthFlowResult(ok: false,
@@ -186,7 +189,8 @@ extension NativeOAuthFlow {
         _ tokens: [String: Any],
         discovery: XAIOIDCDiscovery,
         redirectURI: String,
-        scope: String
+        scope: String,
+        dataRoot: URL
     ) throws {
         guard let access = tokens["access_token"] as? String,
               !access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -194,7 +198,7 @@ extension NativeOAuthFlow {
                 NSLocalizedDescriptionKey: "xAI token response did not include access_token.",
             ])
         }
-        let path = OAuthCredentialDestinations.xAIProvider()
+        let path = OAuthCredentialDestinations.xAIProvider(dataRoot: dataRoot)
         var existing = (try? loadJSONObject(path)) ?? [:]
         existing["provider_id"] = "xai_oauth_direct"
         existing["auth_mode"] = "oauth_pkce"

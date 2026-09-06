@@ -28,7 +28,11 @@ let package = Package(
     targets: [
         .target(
             name: "NativeAgentChromeRelayCore",
-            path: "Sources/NativeAgentChromeRelayCore"
+            path: "Sources/NativeAgentChromeRelayCore",
+            // 2026-09-06: ChromeHostIdentity decides "is this a browser" from
+            // the parent's code signature (SecStaticCodeCheckValidity), not
+            // from an Info.plist anyone can write.
+            linkerSettings: [.linkedFramework("Security")]
         ),
         .executableTarget(
             name: "NativeAgentChromeRelay",

@@ -298,3 +298,129 @@ private func observation(
         .appendingPathComponent("nonexistent-\(UUID().uuidString).jsonl")
     #expect(DoctorLoopHealth.recentFailureDates(receiptsFile: missing).isEmpty)
 }
+
+// FIX-4 (2026-09-01): the loop verdicts above had no route into
+// `doctorReport.checks`, so `AppModel.systemHealthSummary` — the toolbar pill —
+// could not see them. On the day this was written the receipts file held 215
+// telegram_poll and 212 slack failures and the pill was green. These pin the
+// single `background_loops` row that carries the fleet into that report.
+
+private func loopObservation(
+    loopId: String,
+    now: Date,
+    lastError: String? = nil,
+    running: Bool = true,
+    lastSuccessfulWorkAt: Date? = nil,
+    firstSeenAt: Date? = nil,
+    interval: TimeInterval = 300
+) -> LoopHealthObservation {
+    LoopHealthObservation(
+        loopId: loopId,
+        lastRun: now.addingTimeInterval(-interval / 2),
+        nextRun: now.addingTimeInterval(interval / 2),
+        lastError: lastError,
+        running: running,
+        lastSuccessfulWorkAt: lastSuccessfulWorkAt,
+        firstSeenAt: firstSeenAt
+    )
+}
+
+@Test func background_loops_row_reports_a_failing_fleet_as_fail_and_names_the_worst() {
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let failing = loopObservation(
+        loopId: "telegram_poll",
+        now: now,
+        lastError: "getUpdates timed out",
+        lastSuccessfulWorkAt: now.addingTimeInterval(-600)
+    )
+    let dormant = loopObservation(
+        loopId: "weekly_self_improvement",
+        now: now,
+        lastSuccessfulWorkAt: now.addingTimeInterval(-30 * 86_400),
+        firstSeenAt: now.addingTimeInterval(-60 * 86_400)
+    )
+    let healthy = loopObservation(
+        loopId: "memory_hygiene",
+        now: now,
+        lastSuccessfulWorkAt: now.addingTimeInterval(-120)
+    )
+    let receipts = [
+        "telegram_poll": (0..<DoctorLoopHealth.persistentFailureThreshold)
+            .map { now.addingTimeInterval(-60 * Double($0 + 1)) },
+    ]
+
+    let row = DoctorLoopHealth.doctorCheck(
+        observations: [healthy, dormant, failing],
+        recentFailureDates: receipts,
+        now: now
+    )
+    // `live.` marks an app-added live row: excluded from the Support
+    // Snapshot's offline rollup and from onboarding's scaffold gate, included
+    // in `doctorReport.checks` — which is all the pill reads.
+    #expect(row.id == "live.background_loops")
+    #expect(NativeClient.supportSnapshotOfflineRollup([row]) == "ok")
+    #expect(row.status == "fail")
+    #expect(row.detail.contains("3 background loop(s)"))
+    #expect(row.detail.contains("1 failing"))
+    #expect(row.detail.contains("1 dormant"))
+    #expect(row.detail.contains("1 healthy"))
+    #expect(row.detail.contains("Worst: telegram_poll"))
+    #expect(row.detail.contains("Failing persistently"))
+
+    // The row is the whole point: a failing fleet must lower the pill, which
+    // reads `doctorReport.checks` and nothing else.
+    let report = DoctorReport(status: "ok", repaired: false, checks: [row])
+    #expect(NativeClient.doctorRollup(report.checks.map(\.status)) == "fail")
+}
+
+@Test func background_loops_row_separates_dormant_from_healthy() {
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let dormant = loopObservation(
+        loopId: "procedural_lane",
+        now: now,
+        lastSuccessfulWorkAt: nil,
+        firstSeenAt: now.addingTimeInterval(-30 * 86_400)
+    )
+    let healthy = loopObservation(
+        loopId: "memory_hygiene",
+        now: now,
+        lastSuccessfulWorkAt: now.addingTimeInterval(-120)
+    )
+    let row = DoctorLoopHealth.doctorCheck(
+        observations: [dormant, healthy],
+        recentFailureDates: [:],
+        now: now
+    )
+    #expect(row.status == "warn")
+    #expect(row.detail.contains("0 failing"))
+    #expect(row.detail.contains("1 dormant"))
+    #expect(row.detail.contains("1 healthy"))
+    #expect(row.detail.contains("Worst: procedural_lane"))
+    #expect(row.repair != nil)
+}
+
+@Test func background_loops_row_is_green_only_when_every_loop_is() {
+    let now = Date(timeIntervalSince1970: 1_784_200_000)
+    let row = DoctorLoopHealth.doctorCheck(
+        observations: [
+            loopObservation(loopId: "a", now: now, lastSuccessfulWorkAt: now.addingTimeInterval(-60)),
+            loopObservation(loopId: "b", now: now, lastSuccessfulWorkAt: now.addingTimeInterval(-60)),
+        ],
+        recentFailureDates: [:],
+        now: now
+    )
+    #expect(row.status == "ok")
+    #expect(row.detail.contains("2 healthy"))
+    #expect(row.repair == nil)
+}
+
+@Test func background_loops_row_treats_an_empty_fleet_as_missing_signal() {
+    let row = DoctorLoopHealth.doctorCheck(
+        observations: [],
+        recentFailureDates: [:],
+        now: Date(timeIntervalSince1970: 1_784_200_000)
+    )
+    // Absence is no signal, never health.
+    #expect(row.status == "warn")
+    #expect(row.detail.contains("No background loops are registered"))
+}

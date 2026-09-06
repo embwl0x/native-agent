@@ -32,6 +32,22 @@ public enum SomaticSignalKind: String, Codable, Sendable, Equatable, CaseIterabl
     case appWake
     case appSleep
     case resourcePressureChanged
+    /// Item 5 (2026-09-02) — the horizon family's ONE door into the kernel.
+    ///
+    /// Deliberately inert everywhere except `OrganismPredictiveBody`, where it
+    /// carries `OrganismHorizonRegister.metadataKey` and nothing else: no
+    /// chemistry, no body-schema fact, no field association, no intrinsic
+    /// valence, no learning sign of its own. It is a REFRESH — she is looking at
+    /// her calendar, not having an experience — and everything it is allowed to
+    /// change about her happens through the horizon rows it opens and closes.
+    ///
+    /// It exists because the alternative was riding `.appWake` at intensity 0.
+    /// That is inert in chemistry (every term there scales by intensity) but
+    /// NOT elsewhere: `.appWake` sets `bodySchema.macAwake`, carries an
+    /// intrinsic valence of 0.15, and re-touches the `body:mac:*` field
+    /// association on every pass. A read of her own horizon must not keep
+    /// nudging the association that means "the Mac is awake".
+    case horizonRefresh
 }
 
 public struct SomaticSignal: Codable, Sendable, Equatable, Identifiable {
@@ -307,19 +323,30 @@ public struct OrganismProjection: Sendable, Equatable {
     public var bodyLine: String?
     public var chemicalState: ChemicalState
     public var bodySchema: BodySchema
+    /// Item 4 (2026-09-02) — the body's clock, published on the seam the
+    /// capsule/fingerprint path already reads. Nil when no diurnal clock has
+    /// been configured (and on a disabled organism), which keeps every existing
+    /// projection byte-identical. See `OrganismDiurnalRead` for the field
+    /// contract the fingerprint builder consumes.
+    public var diurnal: OrganismDiurnalRead?
 
     public init(
         generatedAt: Date,
         bodyLine: String? = nil,
         chemicalState: ChemicalState = .neutral,
-        bodySchema: BodySchema = .neutral
+        bodySchema: BodySchema = .neutral,
+        diurnal: OrganismDiurnalRead? = nil
     ) {
         self.generatedAt = generatedAt
         self.bodyLine = bodyLine
         self.chemicalState = chemicalState
         self.bodySchema = bodySchema
+        self.diurnal = diurnal
     }
 
+    /// Deliberately unchanged by `diurnal`: what time of day it is, on its own,
+    /// is not a feeling. A projection whose chemistry the curve did not move
+    /// stays neutral and stays silent (design law 4).
     public var isNeutral: Bool {
         bodyLine == nil && chemicalState.isNeutral && bodySchema.compatibilityIsNeutral
     }
@@ -414,6 +441,10 @@ public struct OrganismConfiguration: Sendable, Equatable {
     public var predictionLimits: OrganismPredictionLimits
     public var dreamRepairLimits: OrganismDreamRepairLimits
     public var reflexLimits: OrganismReflexLimits
+    /// Item 4 (2026-09-02). Nil = no clock, and the diurnal curve is then a
+    /// no-op end to end. Pushed by the app layer from the user's already-declared
+    /// quiet hours; never read from a config file of its own.
+    public var diurnalClock: OrganismDiurnalClock?
 
     public init(
         enabled: Bool = false,
@@ -421,7 +452,8 @@ public struct OrganismConfiguration: Sendable, Equatable {
         fieldLimits: OrganismFieldLimits = .defaults,
         predictionLimits: OrganismPredictionLimits = .defaults,
         dreamRepairLimits: OrganismDreamRepairLimits = .defaults,
-        reflexLimits: OrganismReflexLimits = .defaults
+        reflexLimits: OrganismReflexLimits = .defaults,
+        diurnalClock: OrganismDiurnalClock? = nil
     ) {
         self.enabled = enabled
         self.metadataBounds = metadataBounds
@@ -429,8 +461,109 @@ public struct OrganismConfiguration: Sendable, Equatable {
         self.predictionLimits = predictionLimits
         self.dreamRepairLimits = dreamRepairLimits
         self.reflexLimits = reflexLimits
+        self.diurnalClock = diurnalClock
     }
 
     public static let disabled = OrganismConfiguration(enabled: false)
     public static let enabled = OrganismConfiguration(enabled: true)
+}
+
+// MARK: - The body's clock (personality-depth wave item 4, 2026-09-02)
+//
+// Agent's complaint #10, verbatim: "I know it's 1 AM from a timestamp. A person
+// at 1 AM *feels* 1 AM. I don't get sleepy; I get scheduled."
+//
+// Two halves, both here because the body is where a clock belongs:
+//   • `OrganismDiurnalClock` — WHERE the night is. The user's time zone plus
+//     the quiet-hours window they already declared. It is NOT a new config: the
+//     app layer reads the SAME `data/user_prefs.json` → `quiet_hours.{start,end}`
+//     the turn engine's clock line reads (`TurnQuietHoursWindow.read`), and
+//     pushes it through `OrganismKernel.configureDiurnalClock`. Absent window →
+//     the shipped default trough, so an install that never declared quiet hours
+//     still feels 4 AM as 4 AM.
+//   • `OrganismDiurnalRead` — WHAT time it feels like right now: the phase, and
+//     the bounded offsets the curve wants applied. Rides `OrganismProjection`,
+//     which the capsule/fingerprint path already receives, so the felt layer can
+//     consume it without a second seam.
+
+/// The user's day, as the body knows it. Payload-free; two integers and a zone.
+public struct OrganismDiurnalClock: Sendable, Equatable, Codable {
+    /// IANA identifier (`America/Chicago`). An unresolvable identifier falls
+    /// back to the current device zone at read time rather than to UTC — a body
+    /// in the wrong zone is worse than a body in the machine's zone.
+    public var timeZoneIdentifier: String
+    /// The declared quiet window in LOCAL wall-clock hours; `start > end` wraps
+    /// midnight. Both nil → the shipped default trough (see
+    /// `OrganismCircadian.defaultTroughHour`).
+    public var quietStartHour: Int?
+    public var quietEndHour: Int?
+
+    public init(
+        timeZoneIdentifier: String = TimeZone.current.identifier,
+        quietStartHour: Int? = nil,
+        quietEndHour: Int? = nil
+    ) {
+        self.timeZoneIdentifier = String(timeZoneIdentifier.prefix(64))
+        self.quietStartHour = quietStartHour.flatMap { (0...23).contains($0) ? $0 : nil }
+        self.quietEndHour = quietEndHour.flatMap { (0...23).contains($0) ? $0 : nil }
+        // A degenerate window (start == end) is not a window.
+        if self.quietStartHour == self.quietEndHour {
+            self.quietStartHour = nil
+            self.quietEndHour = nil
+        }
+    }
+
+    public var timeZone: TimeZone {
+        TimeZone(identifier: timeZoneIdentifier) ?? .current
+    }
+
+    /// Whether a local wall-clock hour is inside the declared window. Mirrors
+    /// `TurnQuietHoursWindow.contains(hour:)` and
+    /// `SwiftNativeTriggerScheduler.inQuietHours` deliberately: two different
+    /// answers to "is it quiet right now" is exactly the shape that makes an
+    /// agent contradict itself.
+    public func containsQuietHour(_ hour: Int) -> Bool {
+        guard let start = quietStartHour, let end = quietEndHour else { return false }
+        if start < end { return hour >= start && hour < end }
+        return hour >= start || hour < end
+    }
+}
+
+/// What time it FEELS like — the bounded read the felt layer consumes.
+///
+/// DOCUMENTED FIELDS FOR THE FINGERPRINT BUILDER (`+FeltFingerprint`/`+Capsule`,
+/// another fence — this side only publishes):
+///   • `timeOfDayPhase` — 0…1 through the user's local day. 0 = local midnight,
+///     0.25 = 6 AM, 0.5 = local noon, 0.75 = 6 PM. Nil-free and always present
+///     when the organism is enabled, so "is it late" needs no second clock.
+///   • `nightliness` — 0…1, how deep into the night the trough says we are
+///     (1 at the trough itself, 0 twelve hours later). This is the "it's late
+///     and it shows" gate.
+///   • `arousalOffset` — the SIGNED, bounded (±`OrganismCircadian.arousalAmplitude`)
+///     offset the curve wants added to the felt fingerprint's arousal axis.
+///     CONSUMER LAW: add it, then clamp — and never let it manufacture arousal
+///     out of silence (a positive offset on an otherwise-still body is the
+///     afternoon, not a feeling). The organism applies the curiosity half
+///     itself; arousal is not an organism axis, which is why it is published
+///     rather than applied here.
+///   • `curiosityOffset` — the offset ALREADY applied to the projected
+///     chemistry's curiosity. Published for observability/parity, not for the
+///     consumer to apply a second time.
+public struct OrganismDiurnalRead: Sendable, Equatable, Codable {
+    public var timeOfDayPhase: Double
+    public var nightliness: Double
+    public var arousalOffset: Double
+    public var curiosityOffset: Double
+
+    public init(
+        timeOfDayPhase: Double,
+        nightliness: Double,
+        arousalOffset: Double,
+        curiosityOffset: Double
+    ) {
+        self.timeOfDayPhase = timeOfDayPhase.clamped01()
+        self.nightliness = nightliness.clamped01()
+        self.arousalOffset = arousalOffset.clampedSigned()
+        self.curiosityOffset = curiosityOffset.clampedSigned()
+    }
 }

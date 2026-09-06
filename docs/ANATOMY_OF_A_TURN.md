@@ -178,6 +178,29 @@ The normal packet is deliberately small. When the selected generation offers
 an expandable pointer, `context_expand` may retrieve that exact pointer only
 for the current turn and generation. It is not a global search bypass.
 
+Memory rows also answer to a semantic floor: a `.memory` atom below
+`memorySemanticFloor` cosine is refused admission unless it matches lexically,
+shares an identifier, covers the message, or is already active, and a message
+of four content tokens or fewer gets a narrower memory lane
+(`shortMessageMemoryRowCap`). Small talk stops carrying a full quota of
+low-relevance recall; a cold embedder disables the floor rather than emptying
+the lane.
+
+A recalled memory arrives in the packet with time and provenance on it. Each
+memory atom leads with a coarse relative-age tag derived from the record's own
+recorded time — `(just now)`, `(this morning)`, `(yesterday)`, `(3 days ago)`,
+`(in March)`, `(in December 2025)` — and closes with where it came from, when
+the record says: `[verified]`, `[told by Claude]`, `[inferred]`. Both are
+applied where the packet is rendered, not where the atom is compiled, so
+neither re-compiles an atom or invalidates a cached generation. The age is
+computed from the turn's own frozen evaluation time in the user's local time
+zone — one clock for the whole packet, never a wall-clock read per atom — so
+two memories rendered either side of local midnight agree on what "yesterday"
+means, and the buckets are day-stable: a memory older than yesterday reads
+identically on every turn of that local day. Non-memory atoms — persona documents, instructions, corrections —
+render exactly as before, and a memory with no recorded provenance renders no
+provenance tag.
+
 ### Conversation continuity
 
 The history reader keeps recent anchors and the useful tail of the session,
@@ -185,6 +208,24 @@ then samples older middle turns only when needed. Tool results are projected
 into bounded summaries for later turns instead of replaying unlimited raw
 payloads. The selected model's verified context window determines the current
 history and memory budgets.
+
+Continuity also crosses sessions. As a session ages, its older turns are
+distilled into one recollection row that the prefix leads with
+(`[session recollection] …`), but that row lives only in the session that aged
+— so a surface that mints a fresh session per chat used to open knowing
+nothing about the conversation actually in progress. When a session has no
+recollection of its own, and the published conversation anchor names a
+different session that does, the anchor's recollection is seeded at the head of
+that turn's replayed prefix as
+`[session recollection, carried from your main conversation] …`. It is strictly
+read-only: synthesised per turn from the anchor's transcript, never written
+into this session's own transcript, never seen by the aging lane, and replaced
+by this session's own recollection the moment one exists. It is bounded by the
+same per-row cap the pinned recollection gets, and it rides ahead of the
+history window boundary in the cached prefix, so it changes only when the
+anchor's recollection row changes. A missing, unreadable, or not-yet-aged
+anchor simply carries nothing; the turn proceeds either way. The behaviour is
+on by default and can be turned off with `chatCarryAnchorRecollection`.
 
 ### Cognition and organism state
 

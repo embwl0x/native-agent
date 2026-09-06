@@ -33,7 +33,14 @@ struct MacChatAccessibilityAcceptanceTests {
 
         #expect(search.contains(".accessibilityLabel(\"Search status: \\(controller.statusText)\")"))
         #expect(search.contains(".accessibilityAddTraits(.updatesFrequently)"))
-        #expect(card.contains(".accessibilityLabel(model.spokenMeta)"))
+        // 2026-09-06: 99d3783a ("Turn card: the trailing readout advances on
+        // its own clock") lifted the timing readout out of the card body into
+        // MacChatTurnCardMetaText so only that string is on the one-second
+        // schedule. The spoken label is now assembled in one place —
+        // label(visible:spoken:) — and the model's `spokenMeta` feeds the
+        // no-clock fallback, so pin both halves rather than the old literal.
+        #expect(card.contains(".accessibilityLabel(spoken)"))
+        #expect(card.contains("fallbackSpoken: model.spokenMeta"))
         #expect(card.contains(".accessibilityAddTraits(.updatesFrequently)"))
 
         let icon = try #require(search.range(of: "Image(systemName: \"magnifyingglass\")"))
@@ -58,11 +65,30 @@ struct MacChatAccessibilityAcceptanceTests {
         #expect(!source.contains("if !isUser { toggleReadAloud() }"),
                 "A user message must not expose an assistant-only action that does nothing.")
 
-        let hoverCall = try #require(source.range(of: "BubbleHoverBar("))
-        let overlayEnd = try #require(source.range(of: "if !isUser, isLastAssistant", range: hoverCall.upperBound..<source.endIndex))
-        let hoverOverlay = source[hoverCall.lowerBound..<overlayEnd.lowerBound]
-        #expect(hoverOverlay.contains(".accessibilityHidden(true)"),
-                "Opacity-zero pointer controls must not remain phantom VoiceOver focus stops.")
+        // 2026-09-06: a3949b30 ("Chat room: the action bar under the message")
+        // gave the bar a second home. It is built once in `private var
+        // hoverBar` and placed twice — the classic shell's floating overlay,
+        // and the new shell's reserved strip UNDER the message — and the
+        // construction now sits BELOW both placements, so slicing forward from
+        // `BubbleHoverBar(` no longer reaches either one. Check every placement
+        // instead: each is a pointer-only duplicate of the accessibility
+        // actions above, so each must be gated on hover AND kept out of the AX
+        // tree.
+        #expect(source.contains("private var hoverBar: some View"),
+                "Both placements must share one construction.")
+        var placements = 0
+        var cursor = source.startIndex
+        while let placed = source.range(of: "hoverBar\n", range: cursor..<source.endIndex) {
+            cursor = placed.upperBound
+            placements += 1
+            let modifiers = source[placed.upperBound...].prefix(1_000)
+            #expect(modifiers.contains(".opacity(isHovered ? 1 : 0)"),
+                    "The action bar stays pointer-only; it must not appear unhovered.")
+            #expect(modifiers.contains(".accessibilityHidden(true)"),
+                    "Opacity-zero pointer controls must not remain phantom VoiceOver focus stops.")
+        }
+        #expect(placements == 2,
+                "Classic floating overlay and new-shell strip; a third placement needs its own check.")
     }
 
     @Test func composerAndSearchKeepAStableKeyboardFocusOrder() throws {

@@ -6,6 +6,25 @@ import PersistenceCore
 
 private enum LifecycleReceiptError: Error { case injectedWriteFailure }
 
+@Test func swarmDeadlineRetainsLateEvidenceWithoutClaimingCompletion() async throws {
+    let executor = SwiftNativeAgentSwarmExecutor(llm: LifecycleTraceLLM(),
+        runsPath: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+    do {
+        _ = try await executor.withTimeout(seconds: 1, reportID: "deadline-fixture") {
+            // A worker that settles after cancellation, rather than throwing.
+            do { try await Task.sleep(for: .seconds(60)) } catch { }
+            return "late retained evidence"
+        }
+        Issue.record("Late output must not count as successful completion")
+    } catch let incomplete as AgentSwarmWorkerIncomplete {
+        #expect(incomplete.output == "late retained evidence")
+        #expect(incomplete.reason.contains("settlement awaited"))
+        #expect(incomplete.reason.contains("not verified completion"))
+    }
+    let onTime = try await executor.withTimeout(seconds: 60, reportID: "on-time-fixture") { "on time" }
+    #expect(onTime == "on time")
+}
+
 private struct LifecycleIncompleteWorker: AgentSwarmWorkerRunning {
     func runWorker(prompt: String, model: String, reasoningEffort: String, access: String,
                    originSurface: String, originSessionId: String?) async throws -> String {

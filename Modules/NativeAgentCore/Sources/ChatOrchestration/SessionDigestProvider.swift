@@ -3,42 +3,245 @@ import NativeAgentCore
 import PersistenceCore
 import MemoryV2
 
-// MARK: - SessionDigestProvider (U3 wave 2, item 8 — 2026-06-10)
+// MARK: - The /new carry-over ANCHOR (clause 6: reach, not weight)
 //
-// Assembles a "since last session" digest from cheap local sources:
-//   - chat session metadata  (data/chat/sessions.json — prior-session headline)
-//   - traces                 (data/traces/events.jsonl — event counts by kind)
-//   - Workshop executions    (data/workshop/executions — updated directed work)
-//   - dream diary            (data/dream_diary/*.md — new entries by mtime)
-//   - agent inbox standups   (<repo>/docs/agent_inbox/from_*.md — by mtime)
-//   - claude worklog        (~/.claude/state/claude-worklog.jsonl)
+// TWO LINES, one of which is a pointer. That is the whole payload.
 //
-// MECHANICAL assembly only — counts + headline lines, NO LLM call. Every
-// source is fail-open: a missing, unreadable, or corrupt source simply drops
-// out of the digest; nothing here ever throws into the turn path.
+// This file used to assemble a ~500-token "since last session" briefing out
+// of five background sources (claude worklog, workshop executions, agent
+// standups, dream diary, trace counts) plus a verbatim quote of her own last
+// reply. Two things were wrong with it, and both are fixed here:
 //
-// CACHING CONTRACT (U1): the digest is injected at the END of the STABLE
-// system-prompt segment (after persona + REM pins, before dynamic
-// recall/history). It therefore MUST be PER-SESSION-CONSTANT — computed once
-// on the session's first context build and byte-identical on every later
-// turn, or it would churn the provider prompt-cache prefix every turn.
-// Two layers make that durable and race-free (gpt-5.5 review, 2026-06-10):
-//   1. DISK: the first build persists the rendered bytes to
-//      <dataRoot>/chat/session_state/<sessionId>/digest.txt and every later
-//      build prefers the on-disk copy — so in-memory eviction (or an app
-//      restart mid-session) costs a disk read, never a rebuild from
-//      sources that have moved on.
-//   2. SINGLE-FLIGHT: `SessionDigestCache` (an actor) coalesces concurrent
-//      first turns for the same key onto ONE in-flight build, so two racing
-//      first turns can never observe two different byte sequences.
-// Both layers stay fail-open: a disk write failure degrades to the
-// in-memory cache (still single-flighted, still per-session-stable for the
-// process lifetime).
+//   CLUTTER (clause 6). Two-thirds of those tokens were background telemetry
+//   pushed IN FRONT of her on the first turn of every session whether or not
+//   the turn needed any of it. The litmus is "reachable vs in-front-of":
+//   trace counts and standup headlines are reachable through their own tools;
+//   they were never worth the prompt mass. Deleted, bodies and all.
+//
+//   DISHONESTY (clause 2). `latestPriorSession` was surface-blind, so a
+//   Telegram /new could be told its "previous session" was a codex bridge
+//   probe, with the probe's machine output quoted back as her own last words.
+//   277 of the 532 frozen digest.txt files on disk are exactly that. The
+//   resolver below is surface-scoped and bridge-excluding (PriorChatSession),
+//   and the quoted `Last reply:` line — with the greeting-stripping
+//   workaround it needed — is gone: a pointer does not have to put words in
+//   her mouth.
+//
+// What survives is what the carry-over actually needs: she starts a new
+// session knowing a previous one exists, on THIS surface, with a name, a
+// size, an age, and the exact call that pulls it back.
+//
+// BYTE-STABILITY (unchanged, and now trivially true): the anchor is injected
+// at the HEAD of the DYNAMIC segment on the session's FIRST turn only, and
+// its bytes are frozen on first build — persisted to
+// <dataRoot>/chat/session_state/<sessionId>/digest.txt, single-flighted
+// through `SessionDigestCache` so racing first turns cannot observe two
+// byte sequences. Freezing is now unambiguously CORRECT: the two lines
+// describe a session that has already ENDED, so nothing in them can go stale
+// mid-session. Both layers stay fail-open — any filesystem error degrades to
+// the in-memory value, never into the turn path.
+
+// MARK: - PriorChatSession
+
+/// "The session before this one", resolved ONCE and shared by both halves of
+/// the carry-over: the anchor that names it, and `session_search(scope:
+/// "previous_session")` that opens it. One definition means the tool can
+/// never land on a different session than the anchor described — which is
+/// also why the anchor never has to carry a UUID.
+///
+/// Three qualifications, in the order they were learned:
+///   1. ENDED — anchor on the current session's `createdAt` and admit only
+///      rows whose last activity strictly predates it. Without this an
+///      interleaved second window (or a resumed old session) reads as "your
+///      previous session" while it is still running.
+///   2. SURFACE — a candidate must share the current row's `source` AND
+///      `sourceKey`. Telegram's /new must not resurface a Mac window, and one
+///      iOS device must not resurface another's.
+///   3. HUMAN — bridge and probe runs are excluded, on BOTH sides: never
+///      offered as the prior session, and never handed one. The bridge titles
+///      a session with its own first message, so `[from: …, via bridge]` is
+///      the marking; probe/bridge runs also mint slug ids where every real
+///      surface session carries a UUID — except legacy `telegram:<chatId>`
+///      threads, which are human and are carved back in by row source.
+///   4. LIVE — archived rows are out, on both sides: a thread User has put
+///      away is not "your previous session", and an archived current row has
+///      no carry-over coming to it.
+///
+/// Strict on every axis by design: a row we cannot positively qualify drops
+/// out and the anchor simply says nothing. Silence is the honest failure.
+enum PriorChatSession {
+    struct Resolved: Sendable {
+        let id: String
+        let title: String?
+        let source: String?
+        let updatedAt: Date
+        let messageCount: Int?
+    }
+
+    /// A malformed or absurdly large index is not worth reading on a turn.
+    private static let maxIndexBytes = 5 * 1024 * 1024
+
+    static func latest(excluding currentSessionId: String, dataRoot: URL) -> Resolved? {
+        let path = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
+              let size = (attrs[.size] as? NSNumber)?.intValue, size <= maxIndexBytes,
+              let data = try? Data(contentsOf: path),
+              let parsed = try? JSONValue.parse(data),
+              case .array(let rows) = parsed else { return nil }
+
+        // No persisted row for the current session → we cannot know which
+        // surface is asking, so we do not answer. In production the turn's
+        // user message is persisted (and the row stamped with source +
+        // sourceKey) before context assembly, so this is the fail-closed edge,
+        // not the normal path.
+        var anchor: Date? = nil
+        var source: String? = nil
+        var sourceKey: String? = nil
+        for row in rows {
+            guard case .object(let obj) = row, string(obj["id"]) == currentSessionId else { continue }
+            // Symmetric with the candidate rule: a machine's conversation has
+            // no human carry-over to be handed either. A bridge or probe run
+            // that opens a fresh session must not be told what User was last
+            // talking to her about on the Mac.
+            guard !isMachineOrigin(
+                id: currentSessionId,
+                title: string(obj["title"]),
+                source: string(obj["source"])
+            ) else {
+                return nil
+            }
+            // An archived current row is a thread User has already put away;
+            // it has no live carry-over to be handed.
+            guard bool(obj["archived"]) != true else { return nil }
+            anchor = parseTimestamp(string(obj["createdAt"]) ?? string(obj["updatedAt"]) ?? "")
+            source = string(obj["source"])
+            sourceKey = string(obj["sourceKey"])
+            break
+        }
+        guard let anchor else { return nil }
+
+        var best: Resolved? = nil
+        for row in rows {
+            guard case .object(let obj) = row else { continue }
+            guard let id = string(obj["id"]), id != currentSessionId else { continue }
+            guard string(obj["source"]) == source, string(obj["sourceKey"]) == sourceKey else { continue }
+            guard !isMachineOrigin(
+                id: id, title: string(obj["title"]), source: string(obj["source"])
+            ) else { continue }
+            // Archived: retired by hand, not "your previous session".
+            guard bool(obj["archived"]) != true else { continue }
+            guard let updated = parseTimestamp(
+                string(obj["updatedAt"]) ?? string(obj["createdAt"]) ?? ""
+            ) else { continue }
+            guard updated < anchor else { continue } // interleaved/later: skip
+            if let best, best.updatedAt >= updated { continue }
+            best = Resolved(
+                id: id,
+                title: string(obj["title"]),
+                source: string(obj["source"]),
+                updatedAt: updated,
+                messageCount: int(obj["messageCount"])
+            )
+        }
+        return best
+    }
+
+    /// Bridge/probe rows, which are conversations WITH A MACHINE that happen
+    /// to run on chat's surface and permissions. Two markings:
+    ///
+    ///   TITLE — the bridge titles a session with its own first message, so
+    ///   `"[from: "` + `"via bridge]"` is the tell (the same two-part shape
+    ///   the tool preloader uses).
+    ///
+    ///   ID — bridge and probe runs choose their OWN session id. There is no
+    ///   minting prefix to key on: `ClaudeBridge.bridgeMessageSessionID`
+    ///   simply forwards whatever the caller put on the wire, so the live
+    ///   index carries free-form slugs ("generalist-outcome-proof-20260830",
+    ///   "murmur-house-art-review-20260828", "codex-architecture-loop-agent",
+    ///   "telegram-drive-1780552030", "telegram:codex-probe"). Every real
+    ///   Mac/iOS/Telegram session id, by contrast, is a UUID.
+    ///
+    /// The UUID test used to stand alone, and it was over-broad: Telegram's
+    /// own store still mints `telegram:<chatId>` for legacy human threads
+    /// (`TelegramSessionStore.legacySessionId`), and those were being read as
+    /// probes — dropped from the /new pointer AND from `previous_session`.
+    /// So one carve-out, and only one: a `telegram:<chatId>` id whose ROW
+    /// says `source: "telegram"` is human. The row's source is what separates
+    /// it from `telegram:codex-probe`, which the live index carries with
+    /// `source: "app"`. A telegram-shaped id we cannot corroborate against a
+    /// telegram row stays machine — fail closed, as everywhere else here.
+    static func isMachineOrigin(id: String, title: String?, source: String? = nil) -> Bool {
+        let normalized = (title ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalized.hasPrefix("[from: "), normalized.contains("via bridge]") { return true }
+        if UUID(uuidString: id) != nil { return false }
+        return !isLegacyTelegramHumanId(id, source: source)
+    }
+
+    /// `telegram:<chatId>` (chatId is an Int, negative for groups) on a row
+    /// whose source really is telegram — the ONE non-UUID id shape a human
+    /// session legitimately carries.
+    static func isLegacyTelegramHumanId(_ id: String, source: String?) -> Bool {
+        guard (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "telegram" else { return false }
+        guard id.hasPrefix("telegram:") else { return false }
+        var chatId = Substring(id.dropFirst("telegram:".count))
+        if chatId.first == "-" { chatId = chatId.dropFirst() }
+        return !chatId.isEmpty && chatId.allSatisfy(\.isNumber)
+    }
+
+    // MARK: value + time helpers
+
+    static func string(_ value: JSONValue?) -> String? {
+        if case .string(let s)? = value { return s }
+        return nil
+    }
+
+    static func bool(_ value: JSONValue?) -> Bool? {
+        if case .bool(let b)? = value { return b }
+        return nil
+    }
+
+    static func int(_ value: JSONValue?) -> Int? {
+        switch value {
+        case .int(let i): return Int(i)
+        case .double(let d): return Int(d)
+        default: return nil
+        }
+    }
+
+    /// Parse the ISO8601 variants the codebase writes: "...Z", "...+00:00",
+    /// and Python's 6-digit fractional seconds (normalized down to 3 —
+    /// ISO8601DateFormatter only accepts millisecond fractions).
+    static func parseTimestamp(_ raw: String) -> Date? {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return nil }
+        if let d = MemoryRecallScoring.parseTimestamp(s) { return d }
+        return MemoryRecallScoring.parseTimestamp(normalizeFraction(s))
+    }
+
+    /// "2026-05-05T23:38:45.362745+00:00" → "2026-05-05T23:38:45.362+00:00"
+    private static func normalizeFraction(_ s: String) -> String {
+        guard let dot = s.firstIndex(of: ".") else { return s }
+        var idx = s.index(after: dot)
+        var digits = 0
+        while idx < s.endIndex, s[idx].isNumber {
+            digits += 1
+            idx = s.index(after: idx)
+        }
+        guard digits > 3 else { return s }
+        let keepEnd = s.index(dot, offsetBy: 4) // "." + 3 digits
+        return String(s[..<keepEnd]) + String(s[idx...])
+    }
+}
 
 // MARK: - SessionDigestCache
 
 /// Process-global per-session digest cache + build single-flight. The VALUE
-/// is the rendered digest ("" = computed-and-empty, also cached so a fresh
+/// is the rendered anchor ("" = computed-and-empty, also cached so a fresh
 /// session never recomputes). Bounded: oldest-inserted keys are evicted past
 /// `capacity` — sessions are long-lived relative to process lifetime, so
 /// simple insertion-order eviction is enough (state-lifecycle rule: every
@@ -90,62 +293,40 @@ actor SessionDigestCache {
 // MARK: - SessionDigestProvider
 
 public struct SessionDigestProvider: Sendable {
-    /// Root of the daemon-format data dir (data/chat, data/traces, ...).
+    /// Root of the daemon-format data dir (chat/sessions.json is the only
+    /// source now — the five background feeds this used to read are gone).
     public let dataRoot: URL
-    /// Directory holding agent standup files (from_*.md). Defaults to
-    /// `<dataRoot parent>/docs/agent_inbox` — the repo-layout convention.
-    public let agentInboxDir: URL
-    /// Claude worklog JSONL feed. Defaults to
-    /// `~/.claude/state/claude-worklog.jsonl`.
-    public let worklogPath: URL
 
-    /// ~500-token hard cap, enforced as characters at the conservative
-    /// 4-chars-per-token heuristic. Truncation is sentence-safe via
-    /// `MemoryTextClip.sentenceClip` (U3 wave-1 helper).
-    static let digestCharCap = 2000
-    /// First line of every rendered digest (tests + adapters key off it).
+    /// Safety net, not a working limit: the rendered anchor is ~180 chars in
+    /// practice and cannot exceed ~200 with every field at its clip. The cap
+    /// exists because the title comes off disk.
+    static let digestCharCap = 220
+    /// Titles are user/first-message derived; keep them short enough that the
+    /// pointer sentence always survives.
+    static let titleCharCap = 32
+    /// First line of every rendered anchor (tests + adapters key off it).
     public static let headerLine = "# Since last session"
+    /// The reach half of clause 6: the exact call that expands two lines back
+    /// into the conversation they point at.
+    public static let pointerSentence =
+        "session_search(scope: \"previous_session\", mode: \"continuity\") pulls it back."
 
-    // Bounded tail reads keep the build well under the <100ms budget even
-    // when the underlying logs are large.
-    private static let tracesTailBytes = 256 * 1024
-    private static let worklogTailBytes = 128 * 1024
-    private static let standupHeadBytes = 4096
-    private static let maxSourceFileBytes = 5 * 1024 * 1024
-
-    public init(
-        dataRoot: URL,
-        agentInboxDir: URL? = nil,
-        worklogPath: URL? = nil
-    ) {
+    public init(dataRoot: URL) {
         self.dataRoot = dataRoot
-        self.agentInboxDir = agentInboxDir
-            ?? dataRoot
-                .deletingLastPathComponent()
-                .appendingPathComponent("docs", isDirectory: true)
-                .appendingPathComponent("agent_inbox", isDirectory: true)
-        self.worklogPath = worklogPath
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".claude", isDirectory: true)
-                .appendingPathComponent("state", isDirectory: true)
-                .appendingPathComponent("claude-worklog.jsonl")
     }
 
-    /// The per-session digest, or nil when there is nothing to say (no prior
-    /// session on disk, empty/blank sessionId, or every source failed).
+    /// The per-session anchor, or nil when there is nothing to point at (no
+    /// qualifying prior session on this surface, blank sessionId, unreadable
+    /// index).
     ///
-    /// BYTE-STABILITY: the first call for a (sources, sessionId) pair builds
-    /// the digest ONCE (single-flighted across concurrent first turns),
-    /// persists the bytes to chat/session_state/<sessionId>/digest.txt, and
-    /// caches them; every subsequent call returns those bytes verbatim —
-    /// even if sessions.json / traces / worklog have changed since, even
-    /// after in-memory eviction (disk copy wins over rebuild forever).
+    /// BYTE-STABILITY: the first call for a (dataRoot, sessionId) pair builds
+    /// ONCE (single-flighted across concurrent first turns), persists the
+    /// bytes, and caches them; every later call returns those bytes verbatim.
     /// Never throws; all source errors degrade to absence.
     public func digest(forSessionId sessionId: String) async -> String? {
         let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let key = [dataRoot.path, agentInboxDir.path, worklogPath.path, trimmed]
-            .joined(separator: "\u{1F}")
+        let key = [dataRoot.path, trimmed].joined(separator: "\u{1F}")
         let provider = self
         let value = await SessionDigestCache.shared.value(forKey: key) {
             provider.loadOrBuildAndPersist(sessionId: trimmed)
@@ -155,14 +336,12 @@ public struct SessionDigestProvider: Sendable {
 
     // MARK: durable per-session bytes (disk layer)
 
-    /// Disk-first resolution: a previously persisted digest ALWAYS wins over
-    /// a rebuild (rebuild inputs drift; persisted bytes don't). Runs inside
-    /// the cache's single-flight, so one session never builds twice
-    /// concurrently in-process; cross-PROCESS races (app + chat-drive over
-    /// the same dataRoot) converge through the exclusive-publish below —
-    /// the FIRST writer's bytes become canonical and losers adopt them
-    /// (gpt-5.5 delta re-review, 2026-06-10: a plain .atomic write was
-    /// last-writer-wins, so two processes could keep different bytes).
+    /// Disk-first resolution: a previously persisted anchor ALWAYS wins over
+    /// a rebuild. Runs inside the cache's single-flight, so one session never
+    /// builds twice concurrently in-process; cross-PROCESS races (app +
+    /// chat-drive over the same dataRoot) converge through the
+    /// exclusive-publish below — the FIRST writer's bytes become canonical
+    /// and losers adopt them.
     func loadOrBuildAndPersist(sessionId: String) -> String {
         if let persisted = readPersistedDigest(sessionId: sessionId) { return persisted }
         let built = buildDigest(currentSessionId: sessionId) ?? ""
@@ -174,6 +353,11 @@ public struct SessionDigestProvider: Sendable {
     /// the backup manifest). nil when the session id is not filesystem-safe
     /// (same `NativeAgentChatSessionID` gate the messages store uses) —
     /// such ids degrade to the in-memory cache only.
+    ///
+    /// The ~532 digest.txt files already on disk hold the OLD five-source
+    /// payload. They are not migrated or deleted: each belongs to one session,
+    /// is only ever read back for that session, and every new session writes
+    /// the new two-line shape. Retention prunes them with their sessions.
     func persistedDigestPath(sessionId: String) -> URL? {
         guard let safe = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             return nil
@@ -198,8 +382,7 @@ public struct SessionDigestProvider: Sendable {
     /// the destination already exists. Returns the bytes that ended up
     /// canonical for the session: ours when the link wins, the on-disk
     /// winner's when it loses. Fail-open: any filesystem error degrades to
-    /// our in-memory bytes (still single-flighted, still stable for the
-    /// process lifetime) — never throws into the turn path.
+    /// our in-memory bytes — never throws into the turn path.
     private func persistDigestExclusively(_ digest: String, sessionId: String) -> String {
         guard let path = persistedDigestPath(sessionId: sessionId) else { return digest }
         let tmp = path.deletingLastPathComponent()
@@ -212,9 +395,6 @@ public struct SessionDigestProvider: Sendable {
             try FileManager.default.linkItem(at: tmp, to: path)
             return digest
         } catch {
-            // Lost the publish race (destination exists) or the write
-            // failed outright: adopt the winner if one is readable, else
-            // keep ours in-memory (fail-open by contract).
             return readPersistedDigest(sessionId: sessionId) ?? digest
         }
     }
@@ -222,309 +402,55 @@ public struct SessionDigestProvider: Sendable {
     // MARK: build
 
     /// One uncached assembly pass. Internal so tests can exercise the builder
-    /// directly; production goes through `digest(forSessionId:)`. `cap` is a
-    /// test seam for the final sentence-safe truncation — per-line clips keep
-    /// the natural digest size well under the production cap, so the hard cap
-    /// is a safety net that fixtures can only reach with a lowered value.
+    /// directly; production goes through `digest(forSessionId:)`.
+    ///
+    /// `now` is frozen into the rendered age on purpose — see the file header:
+    /// the sentence describes a session that has ended, so an age that never
+    /// moves is both honest and what makes the bytes cache-safe.
     func buildDigest(
         currentSessionId: String,
+        now: Date = Date(),
         cap: Int = SessionDigestProvider.digestCharCap
     ) -> String? {
-        guard let prior = latestPriorSession(excluding: currentSessionId) else {
-            return nil
-        }
-        let anchor = prior.updatedAt
+        guard let prior = PriorChatSession.latest(
+            excluding: currentSessionId, dataRoot: dataRoot
+        ) else { return nil }
 
-        var lines: [String] = [Self.headerLine]
-        var headline = "Previous session"
+        var detail: [String] = []
         if let title = prior.title, !title.isEmpty {
-            headline += " \"\(clip(title, 80))\""
+            detail.append("\"\(clip(title, Self.titleCharCap))\"")
         }
         if let count = prior.messageCount, count > 0 {
-            headline += " (\(count) message\(count == 1 ? "" : "s"))"
+            detail.append("\(count) message\(count == 1 ? "" : "s")")
         }
-        headline += " ended \(Self.formatUTC(anchor))."
-        lines.append(headline)
-        if let preview = prior.lastMessagePreview, !preview.isEmpty {
-            lines.append("Last reply: \(clip(Self.deGreetedPreview(preview), 220))")
-        }
-
-        var activity: [String] = []
-        activity.append(contentsOf: worklogLines(after: anchor))
-        if let m = workshopExecutionsLine(after: anchor) { activity.append(m) }
-        activity.append(contentsOf: standupLines(after: anchor))
-        if let d = dreamsLine(after: anchor) { activity.append(d) }
-        if let t = tracesLine(after: anchor) { activity.append(t) }
-
-        if activity.isEmpty {
-            lines.append("No recorded background activity since.")
-        } else {
-            lines.append("Activity since then:")
-            lines.append(contentsOf: activity.map { "- " + $0 })
-        }
-
-        let joined = lines.joined(separator: "\n")
-        return MemoryTextClip.sentenceClip(joined, cap: cap)
+        var line = "Your last \(Self.surfaceLabel(prior.source)) session"
+        if !detail.isEmpty { line += " (\(detail.joined(separator: ", ")))" }
+        line += " ended \(Self.relativeAge(prior.updatedAt, from: now))."
+        line += " " + Self.pointerSentence
+        return MemoryTextClip.sentenceClip("\(Self.headerLine)\n\(line)", cap: cap)
     }
 
-    // MARK: sources — chat sessions
-
-    struct PriorSession {
-        let id: String
-        let title: String?
-        let updatedAt: Date
-        let messageCount: Int?
-        let lastMessagePreview: String?
+    /// CLOSED vocabulary. `source` is a disk string whose writer has an
+    /// open-ended `default:` branch, and this lands in her system prompt —
+    /// an unrecognized value renders as the neutral word, never as its own
+    /// raw text (same posture as the transcript provenance badges).
+    static func surfaceLabel(_ source: String?) -> String {
+        switch (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "telegram": return "Telegram"
+        case "ios": return "iOS"
+        case "app", "mac", "chat", "default": return "Mac"
+        default: return "chat"
+        }
     }
 
-    /// Most-recently-updated session in sessions.json that genuinely ENDED
-    /// before the current session began. nil → fresh install / first-ever
-    /// session → no digest.
-    ///
-    /// ANCHOR (gpt-5.5 review fix, 2026-06-10): `id != current` alone is not
-    /// enough — with interleaved sessions (a second window active in
-    /// parallel) or a resumed old session, the most-recently-updated OTHER
-    /// session can be one still running NOW, and its title/preview would be
-    /// injected as the "previous session ended" headline. So: anchor on the
-    /// CURRENT session's creation time (`createdAt` in sessions.json — the
-    /// field the index writer stamps on first message) and qualify only
-    /// sessions whose LAST activity (`updatedAt`) strictly predates it. A
-    /// brand-new session with no row yet anchors at digest-build time.
-    func latestPriorSession(excluding currentSessionId: String) -> PriorSession? {
-        let path = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
-        guard let parsed = readJSON(at: path), case .array(let arr) = parsed else {
-            return nil
-        }
-        var anchor = Date() // no persisted row → session starts "now"
-        for entry in arr {
-            guard case .object(let obj) = entry,
-                  string(obj["id"]) == currentSessionId else { continue }
-            let stamp = string(obj["createdAt"]) ?? string(obj["updatedAt"]) ?? ""
-            if let created = Self.parseTimestamp(stamp) { anchor = created }
-            break
-        }
-        var best: PriorSession? = nil
-        for entry in arr {
-            guard case .object(let obj) = entry else { continue }
-            guard let id = string(obj["id"]), id != currentSessionId else { continue }
-            let stamp = string(obj["updatedAt"]) ?? string(obj["createdAt"]) ?? ""
-            guard let updated = Self.parseTimestamp(stamp) else { continue }
-            guard updated < anchor else { continue } // interleaved/later: skip
-            if let current = best, current.updatedAt >= updated { continue }
-            best = PriorSession(
-                id: id,
-                title: string(obj["title"]),
-                updatedAt: updated,
-                messageCount: int(obj["messageCount"]),
-                lastMessagePreview: string(obj["lastMessagePreview"])
-            )
-        }
-        return best
-    }
-
-    // MARK: sources — claude worklog
-
-    /// Up to 3 most-recent worklog entries newer than the anchor, newest
-    /// first, plus a count line when more exist.
-    private func worklogLines(after anchor: Date) -> [String] {
-        let rows = tailJSONLObjects(at: worklogPath, maxBytes: Self.worklogTailBytes)
-        var entries: [(Date, String)] = []
-        for obj in rows {
-            guard let ts = string(obj["ts"]), let date = Self.parseTimestamp(ts),
-                  date > anchor else { continue }
-            let kind = string(obj["kind"]) ?? "work"
-            let project = string(obj["project"]) ?? ""
-            let summary = string(obj["summary"]) ?? ""
-            guard !summary.isEmpty else { continue }
-            let scope = project.isEmpty ? kind : "\(kind), \(project)"
-            // Whole-line clip: kind/project come off disk too — never trust
-            // them to be short.
-            entries.append((date, clip("Claude worklog (\(scope)): \(clip(summary, 200))", 240)))
-        }
-        guard !entries.isEmpty else { return [] }
-        entries.sort { $0.0 > $1.0 }
-        var lines = entries.prefix(3).map { $0.1 }
-        if entries.count > 3 {
-            lines.append("Claude worklog: +\(entries.count - 3) more entries since.")
-        }
-        return lines
-    }
-
-    // MARK: sources — Workshop executions
-
-    private func workshopExecutionsLine(after anchor: Date) -> String? {
-        let path = dataRoot
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent("legacy_executions.json")
-        guard let parsed = readJSON(at: path), case .array(let arr) = parsed else {
-            return nil
-        }
-        var touched: [(Date, String)] = []
-        for entry in arr {
-            guard case .object(let obj) = entry else { continue }
-            let stamp = string(obj["completedAt"]) ?? string(obj["updatedAt"]) ?? ""
-            guard let date = Self.parseTimestamp(stamp), date > anchor else { continue }
-            let title = string(obj["title"]) ?? "untitled"
-            let status = string(obj["status"]) ?? string(obj["phase"]) ?? "updated"
-            touched.append((date, "\"\(clip(title, 80))\" (\(status))"))
-        }
-        guard !touched.isEmpty else { return nil }
-        touched.sort { $0.0 > $1.0 }
-        let shown = touched.prefix(3).map { $0.1 }.joined(separator: ", ")
-        let suffix = touched.count > 3 ? " +\(touched.count - 3) more" : ""
-        return clip("Workshop: \(touched.count) task(s) updated — \(shown)\(suffix)", 260)
-    }
-
-    // MARK: sources — agent inbox standups
-
-    /// Headline per standup file (from_*.md) modified since the anchor:
-    /// first `## ` header + first `**Worked on:**` line (newest-on-top
-    /// convention — see docs/agent_inbox/REPORTING.md).
-    private func standupLines(after anchor: Date) -> [String] {
-        let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: agentInboxDir.path) else {
-            return []
-        }
-        var lines: [(Date, String)] = []
-        for name in names.sorted() {
-            guard name.hasPrefix("from_"), name.hasSuffix(".md") else { continue }
-            let path = agentInboxDir.appendingPathComponent(name)
-            guard let mtime = fileMTime(path), mtime > anchor else { continue }
-            guard let head = readHead(at: path, maxBytes: Self.standupHeadBytes) else { continue }
-            var header: String? = nil
-            var workedOn: String? = nil
-            for rawLine in head.split(separator: "\n", omittingEmptySubsequences: true) {
-                let line = rawLine.trimmingCharacters(in: .whitespaces)
-                if header == nil, line.hasPrefix("## ") {
-                    header = String(line.dropFirst(3))
-                } else if header != nil, workedOn == nil, line.hasPrefix("**Worked on:**") {
-                    workedOn = line
-                        .replacingOccurrences(of: "**Worked on:**", with: "")
-                        .trimmingCharacters(in: .whitespaces)
-                }
-                if header != nil, workedOn != nil { break }
-            }
-            let agent = String(name.dropFirst("from_".count).dropLast(".md".count))
-            var body = "Standup from \(agent)"
-            if let header { body += " (\(clip(header, 60)))" }
-            if let workedOn, !workedOn.isEmpty { body += ": \(clip(workedOn, 180))" }
-            lines.append((mtime, clip(body, 260)))
-        }
-        lines.sort { $0.0 > $1.0 }
-        return Array(lines.prefix(2).map { $0.1 })
-    }
-
-    // MARK: sources — dream diary
-
-    private func dreamsLine(after anchor: Date) -> String? {
-        let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return nil }
-        var fresh: [(Date, String)] = []
-        for name in names {
-            guard name.hasSuffix(".md") else { continue }
-            let path = dir.appendingPathComponent(name)
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: path.path, isDirectory: &isDir), !isDir.boolValue else {
-                continue
-            }
-            guard let mtime = fileMTime(path), mtime > anchor else { continue }
-            fresh.append((mtime, name))
-        }
-        guard !fresh.isEmpty else { return nil }
-        fresh.sort { $0.0 > $1.0 }
-        let latest = fresh[0].1
-        let plural = fresh.count == 1 ? "entry" : "entries"
-        return "Dream diary: \(fresh.count) new \(plural) (latest: \(clip(latest, 60)))"
-    }
-
-    // MARK: sources — traces
-
-    private func tracesLine(after anchor: Date) -> String? {
-        let path = dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-        let rows = tailJSONLObjects(at: path, maxBytes: Self.tracesTailBytes)
-        var total = 0
-        var byKind: [String: Int] = [:]
-        for obj in rows {
-            guard let created = string(obj["createdAt"]),
-                  let date = Self.parseTimestamp(created),
-                  date > anchor else { continue }
-            total += 1
-            let kind = string(obj["kind"]) ?? "event"
-            byKind[kind, default: 0] += 1
-        }
-        guard total > 0 else { return nil }
-        // Deterministic ordering: count desc, then kind name.
-        let top = byKind.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
-            .prefix(3)
-            .map { "\($0.key) ×\($0.value)" }
-            .joined(separator: ", ")
-        return "Traces: \(total) events (\(top))"
-    }
-
-    // MARK: - file helpers (all fail-open)
-
-    private func readJSON(at path: URL) -> JSONValue? {
-        guard let size = fileSize(path), size <= Self.maxSourceFileBytes else { return nil }
-        guard let data = try? Data(contentsOf: path) else { return nil }
-        return try? JSONValue.parse(data)
-    }
-
-    private func readHead(at path: URL, maxBytes: Int) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return nil }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: maxBytes) else { return nil }
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    /// Last `maxBytes` of a JSONL file, decoded into top-level objects. The
-    /// first (possibly partial) line is dropped when the read was truncated.
-    private func tailJSONLObjects(at path: URL, maxBytes: Int) -> [[String: JSONValue]] {
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return [] }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd(), size > 0 else { return [] }
-        let offset = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
-        guard (try? handle.seek(toOffset: offset)) != nil,
-              let data = try? handle.readToEnd() else { return [] }
-        var lines = String(decoding: data, as: UTF8.self)
-            .split(separator: "\n", omittingEmptySubsequences: true)
-        if offset > 0, !lines.isEmpty { lines.removeFirst() }
-        var out: [[String: JSONValue]] = []
-        out.reserveCapacity(lines.count)
-        for line in lines {
-            guard let lineData = line.data(using: .utf8),
-                  let parsed = try? JSONValue.parse(lineData),
-                  case .object(let obj) = parsed else { continue }
-            out.append(obj)
-        }
-        return out
-    }
-
-    private func fileMTime(_ path: URL) -> Date? {
-        (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
-    }
-
-    private func fileSize(_ path: URL) -> Int? {
-        ((try? FileManager.default.attributesOfItem(atPath: path.path))?[.size] as? NSNumber)?.intValue
-    }
-
-    // MARK: - value helpers
-
-    private func string(_ value: JSONValue?) -> String? {
-        if case .string(let s)? = value { return s }
-        return nil
-    }
-
-    private func int(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let i): return Int(i)
-        case .double(let d): return Int(d)
-        default: return nil
-        }
+    /// Compact, prompt-sized age: "just now", "42m ago", "6h ago", "3d ago".
+    static func relativeAge(_ date: Date, from reference: Date) -> String {
+        let minutes = Int(max(0, reference.timeIntervalSince(date)) / 60)
+        if minutes < 1 { return "just now" }
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours)h ago" }
+        return "\(hours / 24)d ago"
     }
 
     private func clip(_ text: String, _ cap: Int) -> String {
@@ -532,89 +458,5 @@ public struct SessionDigestProvider: Sendable {
             .replacingOccurrences(of: "\r", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
         return MemoryTextClip.sentenceClip(normalized, cap: cap)
-    }
-
-    /// The "Last reply" line is a BRIEFING about what the conversation was
-    /// about — not a voice sample. Quoting her greeting verbatim at every
-    /// session start re-seeded her own pet-name rut cross-session (the
-    /// "handsome" loop, 2026-08-01 — the capsule Sound echo was the other
-    /// carrier). When the preview OPENS with a short salutation clause
-    /// followed by real content, drop the salutation and brief the content.
-    /// Deliberately generic — a clause-length heuristic, never a word list:
-    /// it sheds "Morning, handsome. 💜", "Night, User.", and whatever she
-    /// coins next, while a short reply with no substance behind it stays
-    /// whole. SENTENCE punctuation only: an em-dash boundary would chop
-    /// substantive short leads ("Saved — memory 35810648…", "Verdict —
-    /// failed…"), live shapes in her data (gpt-5.5 review, 2026-08-02) —
-    /// dash-glued greetings that survive here are damped downstream by the
-    /// capsule echo's worn-word rule.
-    static let greetingClauseMaxCharacters = 45
-    static let greetingRemainderMinCharacters = 40
-
-    static func deGreetedPreview(_ preview: String) -> String {
-        let trimmed = preview.trimmingCharacters(in: .whitespacesAndNewlines)
-        var boundary: String.Index? = nil
-        for (offset, ch) in trimmed.enumerated() {
-            if ".!?".contains(ch) {
-                boundary = trimmed.index(trimmed.startIndex, offsetBy: offset)
-                break
-            }
-            if offset > greetingClauseMaxCharacters { break }
-        }
-        guard let boundary else { return trimmed }
-        let clause = trimmed[..<boundary]
-        guard clause.count <= greetingClauseMaxCharacters else { return trimmed }
-        var rest = String(trimmed[trimmed.index(after: boundary)...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        // Shed a stranded leading emoji/symbol run left behind by the clause
-        // ("💜 Early one —" → "Early one —").
-        while let first = rest.first, !first.isLetter, !first.isNumber {
-            rest.removeFirst()
-        }
-        rest = rest.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard rest.count >= greetingRemainderMinCharacters else { return trimmed }
-        return rest
-    }
-
-    // MARK: - time helpers
-
-    /// Parse the ISO8601 variants the codebase writes: "...Z", "...+00:00",
-    /// and Python's 6-digit fractional seconds (normalized down to 3 —
-    /// ISO8601DateFormatter only accepts millisecond fractions).
-    static func parseTimestamp(_ raw: String) -> Date? {
-        let s = raw.trimmingCharacters(in: .whitespaces)
-        guard !s.isEmpty else { return nil }
-        if let d = MemoryRecallScoring.parseTimestamp(s) { return d }
-        return MemoryRecallScoring.parseTimestamp(normalizeFraction(s))
-    }
-
-    /// "2026-05-05T23:38:45.362745+00:00" → "2026-05-05T23:38:45.362+00:00"
-    private static func normalizeFraction(_ s: String) -> String {
-        guard let dot = s.firstIndex(of: ".") else { return s }
-        var idx = s.index(after: dot)
-        var digits = 0
-        while idx < s.endIndex, s[idx].isNumber {
-            digits += 1
-            idx = s.index(after: idx)
-        }
-        guard digits > 3 else { return s }
-        let keepEnd = s.index(dot, offsetBy: 4) // "." + 3 digits
-        return String(s[..<keepEnd]) + String(s[idx...])
-    }
-
-    // DateFormatter is Sendable on this SDK (documented thread-safe since
-    // macOS 10.9); configured once and never mutated (same convention as
-    // MemoryRecallScoring's cached ISO formatters) — an explicit
-    // nonisolated(unsafe) here is redundant and trips a build warning.
-    private static let utcFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(identifier: "UTC")
-        f.dateFormat = "yyyy-MM-dd HH:mm 'UTC'"
-        return f
-    }()
-
-    static func formatUTC(_ date: Date) -> String {
-        utcFormatter.string(from: date)
     }
 }

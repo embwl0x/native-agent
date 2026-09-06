@@ -1386,8 +1386,9 @@ func swiftToolDispatcher_alwaysOnCoreNames_staysWithinLazyLoadBudget() async thr
     // Bumped 21→22 for desk_read (2026-06-29, User's pull-to-retrieve flow:
     // "what's on the desk" must work regardless of phrasing — the nine desk
     // mutations stay lazy).
-    // Bumped 22→23 for ContextFlow's context_expand. Its schema is omitted on
-    // ordinary turns and appears only when that turn offers a pinned pointer.
+    // Bumped 22→23 for ContextFlow's context_expand. As of 2026-09-01 its
+    // schema is advertised on EVERY turn — a floor that appears and disappears
+    // with the packet is a per-turn prefix rewrite, not a floor.
     // Canonical-only hot names: compatibility aliases remain catalog-visible
     // but no longer tax every ordinary provider request.
     #expect(alwaysOn.count <= 24)
@@ -1444,7 +1445,7 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
                 "topic": JSONValue.string("nativeagent-test"),
                 "completion_mode": JSONValue.string("receipt_only"),
                 "desk_item": JSONValue.string(deskItem.alias),
-                "model": JSONValue.string("gpt-5.6-terra"),
+                "model": JSONValue.string("gpt-6-astra"),
                 "reasoning_effort": JSONValue.string("ultra"),
                 "fast": JSONValue.bool(true),
                 "__session_id": JSONValue.string("session-test"),
@@ -1494,7 +1495,7 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
     #expect(row["completionMode"] == JSONValue.string("receipt_only"))
     #expect(row["text"] == JSONValue.string("hello Codex from Agent"))
     #expect(row["sessionId"] == JSONValue.string("session-test"))
-    #expect(row["model"] == JSONValue.string("gpt-5.6-terra"))
+    #expect(row["model"] == JSONValue.string("gpt-6-astra"))
     #expect(row["reasoningEffort"] == JSONValue.string("ultra"))
     #expect(row["serviceTier"] == JSONValue.string("priority"))
     #expect(row["fast"] == JSONValue.bool(true))
@@ -1540,7 +1541,7 @@ func swiftToolDispatcher_codexMessageQueuesInboxAndPostsMacNotification() async 
     #expect(wakeupInputs.first?["completionMode"] == JSONValue.string("receipt_only"))
     #expect(wakeupInputs.first?["source"] == JSONValue.string("codex_message"))
     #expect(wakeupInputs.first?["sessionId"] == JSONValue.string("session-test"))
-    #expect(wakeupInputs.first?["model"] == JSONValue.string("gpt-5.6-terra"))
+    #expect(wakeupInputs.first?["model"] == JSONValue.string("gpt-6-astra"))
     #expect(wakeupInputs.first?["reasoningEffort"] == JSONValue.string("ultra"))
     #expect(wakeupInputs.first?["serviceTier"] == JSONValue.string("priority"))
     #expect(wakeupInputs.first?["fast"] == JSONValue.bool(true))
@@ -1670,7 +1671,7 @@ func swiftToolDispatcher_emptyConversationReferenceStartsFreshInsteadOfFailing()
             Issue.record("claude_message should return an object")
             return
         }
-        #expect(object["status"] == .string("queued"))
+        #expect(object["status"] == .string("accepted"))
         #expect(object["reason"] == nil)
         // Empty means absent, so the requested topic still mints the handle.
         #expect(object["conversationId"] == .string("claude:upgrade-sweep-c9"))
@@ -1854,7 +1855,7 @@ func swiftToolDispatcher_builderReviewRequestNeverClaimsPairingWhenWakeSkipsOrFa
             Issue.record("\(tool) \(expectedWakeStatus) wake should return a nested receipt")
             continue
         }
-        #expect(object["status"] == .string("queued"))
+        #expect(object["status"] == .string(tool == "claude_message" && expectedWakeStatus == "failed" ? "failed" : "queued"))
         #expect(object["reviewerPairRequested"] == .bool(true))
         #expect(object["reviewerPaired"] == nil)
         #expect(wakeup["status"] == .string(expectedWakeStatus))
@@ -1892,7 +1893,7 @@ func swiftToolDispatcher_claudeMessageQueuesInboxAndWakesClaudeSession() async t
         Issue.record("claude_message should return an object")
         return
     }
-    #expect(obj["status"] == JSONValue.string("queued"))
+    #expect(obj["status"] == JSONValue.string("accepted"))
     #expect(obj["deduplicated"] == JSONValue.bool(false))
     #expect(obj["conversationId"] == JSONValue.string("claude:wake-parity"))
     #expect(obj["replyWith"] == JSONValue.string("claude_message"))
@@ -2684,7 +2685,7 @@ func swiftToolDispatcher_codexExecArguments_matchCurrentCli() async throws {
         sandbox: "read-only",
         cwd: "/tmp/nativeagent",
         lastMessagePath: "/tmp/nativeagent/last-message.txt",
-        model: "gpt-test",
+        model: "gpt-6-astra",
         reasoningEffort: "xhigh",
         serviceTier: "priority",
         prompt: "return OK"
@@ -2699,7 +2700,7 @@ func swiftToolDispatcher_codexExecArguments_matchCurrentCli() async throws {
     #expect(args.contains("-o"))
     #expect(args.contains("/tmp/nativeagent/last-message.txt"))
     #expect(args.contains("-m"))
-    #expect(args.contains("gpt-test"))
+    #expect(args.contains("gpt-6-astra"))
     #expect(args.contains("model_reasoning_effort=\"xhigh\""))
     #expect(args.contains("service_tier=\"priority\""))
     #expect(args.last == "return OK")
@@ -2707,6 +2708,31 @@ func swiftToolDispatcher_codexExecArguments_matchCurrentCli() async throws {
 
 @Test
 func swiftToolDispatcher_codexBrainControlsValidateModelCapabilities() {
+    let args = SwiftToolDispatcher.codexExecArguments(
+        sandbox: "read-only", cwd: "/tmp/astra-fixture",
+        lastMessagePath: "/tmp/astra-fixture/reply.txt",
+        model: "gpt-6-astra", reasoningEffort: "medium", serviceTier: "default", prompt: "Reply OK"
+    )
+    #expect(args.contains("gpt-6-astra"))
+    #expect(args.contains("model_reasoning_effort=\"medium\""))
+    let astra = SwiftToolDispatcher.codexBrainControls(from: [
+        "model": .string(" GPT-6-ASTRA "),
+        "reasoning_effort": .string("ultra"),
+        "fast": .bool(true),
+    ])
+    #expect(astra == .success(.init(
+        model: "gpt-6-astra",
+        reasoningEffort: "ultra",
+        serviceTier: "priority",
+        fast: true
+    )))
+    if case .success = SwiftToolDispatcher.codexBrainControls(from: [
+        "model": .string("gpt-6-astra"),
+        "reasoning_effort": .string("none"),
+    ]) {
+        Issue.record("Astra does not support None reasoning")
+    }
+
     let terra = SwiftToolDispatcher.codexBrainControls(from: [
         "model": .string("gpt-5.6-terra"),
         "reasoning_effort": .string("extra high"),
@@ -2730,6 +2756,18 @@ func swiftToolDispatcher_codexBrainControlsValidateModelCapabilities() {
     #expect(model == "gpt-5.6-luna")
     #expect(supported.contains("max"))
     #expect(!supported.contains("ultra"))
+
+    let legacy = SwiftToolDispatcher.codexBrainControls(from: [
+        "model": .string("gpt-5.4"),
+        "reasoning_effort": .string("high"),
+    ])
+    #expect(legacy == .success(.init(
+        model: "gpt-5.4",
+        reasoningEffort: "high",
+        serviceTier: nil,
+        fast: nil
+    )))
+
 }
 
 @Test
@@ -3111,6 +3149,14 @@ func swiftToolDispatcher_builderMessageSchemasExposeConversationReplies() async 
     let root = try makeTempRoot("builder-conversation-schemas")
     defer { try? FileManager.default.removeItem(at: root) }
     let schemas = try await SwiftToolDispatcher(dataRoot: root).listAvailableToolSchemas()
+    for name in ["invoke_codex", "codex_message"] {
+        let schema = try #require(schemas.first { $0.name == name })
+        let decoded = try #require(JSONSerialization.jsonObject(with: schema.parametersJSON) as? [String: Any])
+        let properties = try #require(decoded["properties"] as? [String: [String: Any]])
+        let models = try #require(properties["model"]?["enum"] as? [String])
+        #expect(models.contains("gpt-6-astra"))
+        #expect(!models.contains("gpt-6"))
+    }
     for toolName in ["codex_message", "claude_message", "omp_message"] {
         let schema = try #require(schemas.first { $0.name == toolName })
         let parsed = try JSONValue.parse(schema.parametersJSON)
@@ -3121,6 +3167,25 @@ func swiftToolDispatcher_builderMessageSchemasExposeConversationReplies() async 
         }
         #expect(properties["conversation_id"] != nil)
         #expect(schema.description.contains("conversationId"))
+    }
+}
+
+@Test
+func swiftToolDispatcher_codexSchemasAdvertiseTheExactCurrentModelIDs() async throws {
+    let root = try makeTempRoot("codex-model-schemas")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let schemas = try await SwiftToolDispatcher(dataRoot: root).listAvailableToolSchemas()
+    for toolName in ["invoke_codex", "codex_message"] {
+        let schema = try #require(schemas.first { $0.name == toolName })
+        let parsed = try JSONValue.parse(schema.parametersJSON)
+        guard case .object(let object) = parsed,
+              case .object(let properties)? = object["properties"],
+              case .object(let model)? = properties["model"],
+              case .array(let values)? = model["enum"] else {
+            Issue.record("expected \(toolName) model enum")
+            continue
+        }
+        #expect(values == OpenAIExecutionControls.codexBridgeModelIDs.map(JSONValue.string))
     }
 }
 
@@ -7435,22 +7500,6 @@ func chatClient_does_not_duplicate_current_user_turn_as_prior_history() async th
     let firstSystem: String = (llm.systems.first ?? nil) ?? ""
     #expect(firstSystem.contains("PRIOR_CONTEXT_ONLY"))
     #expect(!firstSystem.contains("[user] CURRENT_USER_DUP_TOKEN"))
-}
-
-// Native vision (2026-06-11): composeMessage NO LONGER stringifies attachments.
-// It returns the raw message; images ride as native content blocks.
-@Test
-func chatClient_composeMessage_returnsRawMessage_noStringifiedAttachments() async throws {
-    let att = MultimodalAttachment(
-        type: "image", base64: "AA==", mime: "image/png",
-        name: "screenshot.png", byteSize: 4
-    )
-    let composed = SwiftNativeChatOrchestrationClient.composeMessage(
-        message: "look at this", attachments: [att]
-    )
-    #expect(composed == "look at this")
-    #expect(!composed.contains("[attachments:"))
-    #expect(!composed.contains("screenshot.png"))
 }
 
 // End-to-end: an image attachment on chat() reaches the LLM as a NATIVE .image

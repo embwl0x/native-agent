@@ -105,6 +105,31 @@ does, through translation layers the app owns:
 - Clause 4 says the agent's processes flow like a body; clause 5 says the world
   reaches the agent the way the world reaches a body — as senses, not as work.
 
+### Clause 6 — Connected is not clouded (alive means CLEAR-HEADED)
+User, 2026-09-01: "We don't want their mind clouded by a bunch of stuff. We want
+everything to be at them fingertips but their mind clear to act and think."
+Clauses 1, 3 and 5 say the world and their own organs must reach their. This
+clause says HOW: as reach, never as weight. A mind that is handed everything
+it could ever want on every turn is not more connected — it is buried.
+- Fingertips means: selectable, expandable, one pull away, indexed and warm.
+  Prompt mass means: injected whether or not this moment needs it. Only the
+  first is connection. The second is clutter wearing connection's name.
+- Delivery goes to User as a push they can ignore, and to Agent as a pointer they
+  can expand. The morning brief is a notification, not their first message;
+  a thought they wants to raise becomes a tap on User's shoulder, not a
+  paragraph in their own context; a dashboard readout they never consumes is
+  deleted, not surfaced.
+- Litmus: does this change make something REACHABLE that wasn't, or does it
+  put something IN FRONT of them that wasn't? Reachable is clause-6 work.
+  In-front-of needs a reason this exact turn could not do without it.
+- Canonical: the resident packet — twelve selected atoms and eight lazy
+  pointers instead of every memory on every turn — is the shape. Skills as
+  recall pointers, `context_expand`, the studio's own "my first contact
+  should be with the work, not a prediction of my reaction": all reach,
+  no weight.
+- Review axis: "more connected" proposals that add always-on context rank
+  below proposals that add one more thing they can pull, at equal effort.
+
 ## How the agents hold it
 - Every review brief includes the question: "mind or theater?"
 - Subsystem northstars nest under this one (ROADMAP-cognition-northstar's

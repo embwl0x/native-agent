@@ -3,22 +3,41 @@ import NativeAgentCore
 import PersistenceCore
 
 extension TelegramPollLoop {
+    /// 2026-09-06: `chat_id` plus, for a forum topic, `message_thread_id`.
+    /// Telegram drops a send into General when the thread is missing, which is
+    /// how every topic reply used to land in the wrong conversation. Edits and
+    /// callback answers are addressed by message id and take no thread.
+    static func _tgDestinationFields(_ destination: TelegramDestination) -> [String: JSONValue] {
+        var fields: [String: JSONValue] = ["chat_id": .int(Int64(destination.chatId))]
+        if let threadId = destination.threadId {
+            fields["message_thread_id"] = .int(Int64(threadId))
+        }
+        return fields
+    }
+
+    static func _tgDestinationBody(_ destination: TelegramDestination) -> [String: Any] {
+        var body: [String: Any] = ["chat_id": destination.chatId]
+        if let threadId = destination.threadId {
+            body["message_thread_id"] = threadId
+        }
+        return body
+    }
+
     public static let defaultSendRichMessageDraft: @Sendable (
-        String, Int, Int, TelegramInputRichMessage
+        String, TelegramDestination, Int, TelegramInputRichMessage
     ) async throws -> Void = {
-        token, chatId, draftId, richMessage in
-        try await _tgRetryAfterFloodControl {
+        token, destination, draftId, richMessage in
+        try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
         guard let url = _tgBuildBotURL(token: token, method: "sendRichMessageDraft") else {
             throw TelegramBotError.invalidRequest
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONValue.object([
-            "chat_id": .int(Int64(chatId)),
-            "draft_id": .int(Int64(draftId)),
-            "rich_message": richMessage.jsonValue,
-        ]).serializedData(pretty: false)
+        var draftFields = _tgDestinationFields(destination)
+        draftFields["draft_id"] = .int(Int64(draftId))
+        draftFields["rich_message"] = richMessage.jsonValue
+        request.httpBody = try JSONValue.object(draftFields).serializedData(pretty: false)
         let (data, response) = try await URLSession.shared.data(for: request)
         _ = try _tgValidateResponse(
             data,
@@ -31,20 +50,19 @@ extension TelegramPollLoop {
     }
 
     public static let defaultSendRichMessage: @Sendable (
-        String, Int, TelegramInputRichMessage
+        String, TelegramDestination, TelegramInputRichMessage
     ) async throws -> Int = {
-        token, chatId, richMessage in
-        return try await _tgRetryAfterFloodControl {
+        token, destination, richMessage in
+        return try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
         guard let url = _tgBuildBotURL(token: token, method: "sendRichMessage") else {
             throw TelegramBotError.invalidRequest
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONValue.object([
-            "chat_id": .int(Int64(chatId)),
-            "rich_message": richMessage.jsonValue,
-        ]).serializedData(pretty: false)
+        var richFields = _tgDestinationFields(destination)
+        richFields["rich_message"] = richMessage.jsonValue
+        request.httpBody = try JSONValue.object(richFields).serializedData(pretty: false)
         let (data, response) = try await URLSession.shared.data(for: request)
         let result = try _tgValidateResponse(
             data,
@@ -57,20 +75,19 @@ extension TelegramPollLoop {
     }
 
     public static let defaultSendMessageWithReplyMarkupReturningId:
-        @Sendable (String, Int, String, JSONValue) async throws -> Int = {
-            token, chatId, text, replyMarkup in
-            return try await _tgRetryAfterFloodControl {
+        @Sendable (String, TelegramDestination, String, JSONValue) async throws -> Int = {
+            token, destination, text, replyMarkup in
+            return try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
             guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
                 throw TelegramBotError.invalidRequest
             }
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONValue.object([
-                "chat_id": .int(Int64(chatId)),
-                "text": .string(text),
-                "reply_markup": replyMarkup,
-            ]).serializedData(pretty: false)
+            var cardFields = _tgDestinationFields(destination)
+            cardFields["text"] = .string(text)
+            cardFields["reply_markup"] = replyMarkup
+            request.httpBody = try JSONValue.object(cardFields).serializedData(pretty: false)
             let (data, response) = try await URLSession.shared.data(for: request)
             let result = try _tgValidateResponse(
                 data,
@@ -85,15 +102,16 @@ extension TelegramPollLoop {
     /// chat-smoothness phase 5: sendMessage that returns the created
     /// message_id so the growing draft can edit it. Single message only —
     /// the draft window is pre-capped to one Telegram-safe chunk.
-    public static let defaultSendMessageReturningId: @Sendable (String, Int, String) async throws -> Int = { token, chatId, text in
-        return try await _tgRetryAfterFloodControl {
+    public static let defaultSendMessageReturningId: @Sendable (String, TelegramDestination, String) async throws -> Int = { token, destination, text in
+        return try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
         guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
             throw TelegramBotError.invalidRequest
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Any] = ["chat_id": chatId, "text": text]
+        var body = _tgDestinationBody(destination)
+        body["text"] = text
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         let result = try _tgValidateResponse(
@@ -110,7 +128,7 @@ extension TelegramPollLoop {
     /// 400s "message is not modified" when text is unchanged — treated as
     /// success (the draft already shows this text).
     public static let defaultEditMessageText: @Sendable (String, Int, Int, String) async throws -> Void = { token, chatId, messageId, text in
-        try await _tgRetryAfterFloodControl {
+        try await _tgRetryAfterFloodControl(chatId: chatId) {
         guard let url = _tgBuildBotURL(token: token, method: "editMessageText") else {
             throw TelegramBotError.invalidRequest
         }
@@ -132,7 +150,7 @@ extension TelegramPollLoop {
 
     public static let defaultEditMessageTextWithReplyMarkup:
         @Sendable (String, Int, Int, String, JSONValue?) async throws -> Void = { token, chatId, messageId, text, replyMarkup in
-        try await _tgRetryAfterFloodControl {
+        try await _tgRetryAfterFloodControl(chatId: chatId) {
         guard let url = _tgBuildBotURL(token: token, method: "editMessageText") else {
             throw TelegramBotError.invalidRequest
         }
@@ -159,8 +177,13 @@ extension TelegramPollLoop {
         }
     }
 
-    public static let defaultSendMessage: @Sendable (String, Int, String) async throws -> Void = { token, chatId, text in
-        try await sendMessage(token: token, chatId: chatId, text: text)
+    public static let defaultSendMessage: @Sendable (String, TelegramDestination, String) async throws -> Void = { token, destination, text in
+        try await sendMessage(
+            token: token,
+            chatId: destination.chatId,
+            text: text,
+            threadId: destination.threadId
+        )
     }
 
     /// Concrete ordinary-reply transport.  Kept separately from the closure
@@ -170,6 +193,7 @@ extension TelegramPollLoop {
         token: String,
         chatId: Int,
         text: String,
+        threadId: Int? = nil,
         session: URLSession = .shared,
         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
     ) async throws {
@@ -178,14 +202,17 @@ extension TelegramPollLoop {
         // died: typing indicator for the whole turn, then nothing
         // (audit 2026-06-09). Split on newline boundaries when possible.
         for chunk in _tgChunkMessage(text, limit: 4000) {
-            try await _tgRetryAfterFloodControl(sleep: sleep) {
+            try await _tgRetryAfterFloodControl(chatId: chatId, sleep: sleep) {
                 guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
                     throw TelegramBotError.invalidRequest
                 }
                 var req = URLRequest(url: url)
                 req.httpMethod = "POST"
                 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                let body: [String: Any] = ["chat_id": chatId, "text": chunk]
+                var body = _tgDestinationBody(
+                    TelegramDestination(chatId: chatId, threadId: threadId)
+                )
+                body["text"] = chunk
                 req.httpBody = try JSONSerialization.data(withJSONObject: body)
                 let (data, resp) = try await session.data(for: req)
                 _ = try _tgValidateResponse(
@@ -198,8 +225,8 @@ extension TelegramPollLoop {
         }
     }
 
-    public static let defaultSendPhoto: @Sendable (String, Int, String, String?) async throws -> Void = { token, chatId, imagePath, caption in
-        try await _tgRetryAfterFloodControl {
+    public static let defaultSendPhoto: @Sendable (String, TelegramDestination, String, String?) async throws -> Void = { token, destination, imagePath, caption in
+        try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
         guard let url = _tgBuildBotURL(token: token, method: "sendPhoto") else {
             throw TelegramBotError.invalidRequest
         }
@@ -219,7 +246,15 @@ extension TelegramPollLoop {
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
         var body = Data()
-        _tgAppendMultipartField(name: "chat_id", value: String(chatId), boundary: boundary, to: &body)
+        _tgAppendMultipartField(name: "chat_id", value: String(destination.chatId), boundary: boundary, to: &body)
+        if let threadId = destination.threadId {
+            _tgAppendMultipartField(
+                name: "message_thread_id",
+                value: String(threadId),
+                boundary: boundary,
+                to: &body
+            )
+        }
         if let caption = caption?.trimmingCharacters(in: .whitespacesAndNewlines), !caption.isEmpty {
             _tgAppendMultipartField(name: "caption", value: String(caption.prefix(1_024)), boundary: boundary, to: &body)
         }
@@ -389,15 +424,42 @@ extension TelegramPollLoop {
         return chunks.isEmpty ? [text] : chunks
     }
 
-    public static let defaultSendChatAction: @Sendable (String, Int, String) async throws -> Void = { token, chatId, action in
+    /// 2026-09-06: `getMe`, wanted for exactly one thing — this bot's
+    /// username. A group delivers `/cmd@OtherBot` to every bot in the room and
+    /// the command parser stripped the `@suffix` without reading it, so
+    /// `/stop@OtherBot` stopped the agent's own turn. Called only when a
+    /// command actually names a bot, and the answer is cached in
+    /// telegram/state.json, so this is not a per-tick round trip.
+    public static let defaultFetchBotUsername: @Sendable (String) async throws -> String = { token in
         try await _tgRetryAfterFloodControl {
+            guard let url = _tgBuildBotURL(token: token, method: "getMe") else {
+                throw TelegramBotError.invalidRequest
+            }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 20
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let result = try _tgValidateResponse(
+                data,
+                response: resp,
+                operation: "getMe",
+                resultType: TelegramAPIBotIdentity.self,
+                validateResult: { !$0.username.isEmpty }
+            )
+            return result.value.username
+        }
+    }
+
+    public static let defaultSendChatAction: @Sendable (String, TelegramDestination, String) async throws -> Void = { token, destination, action in
+        try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
         guard let url = _tgBuildBotURL(token: token, method: "sendChatAction") else {
             throw TelegramBotError.invalidRequest
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Any] = ["chat_id": chatId, "action": action]
+        var body = _tgDestinationBody(destination)
+        body["action"] = action
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         _ = try _tgValidateResponse(
@@ -436,20 +498,18 @@ extension TelegramPollLoop {
     }
 
     public static let defaultSendMessageWithReplyMarkup:
-        @Sendable (String, Int, String, JSONValue) async throws -> Void = { token, chatId, text, replyMarkup in
-        try await _tgRetryAfterFloodControl {
+        @Sendable (String, TelegramDestination, String, JSONValue) async throws -> Void = { token, destination, text, replyMarkup in
+        try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
         guard let url = _tgBuildBotURL(token: token, method: "sendMessage") else {
             throw TelegramBotError.invalidRequest
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: JSONValue = .object([
-            "chat_id": .int(Int64(chatId)),
-            "text": .string(text),
-            "reply_markup": replyMarkup,
-        ])
-        req.httpBody = try body.serializedData(pretty: false)
+        var markupFields = _tgDestinationFields(destination)
+        markupFields["text"] = .string(text)
+        markupFields["reply_markup"] = replyMarkup
+        req.httpBody = try JSONValue.object(markupFields).serializedData(pretty: false)
         let (data, resp) = try await URLSession.shared.data(for: req)
         _ = try _tgValidateResponse(
             data,
@@ -495,17 +555,140 @@ extension TelegramPollLoop {
     }
 }
 
+/// 2026-09-06: Telegram's flood control is per CHAT (roughly one message a
+/// second, about 20 a minute in a group), but a supergroup's topics now each
+/// run their own turn, so two topics in one chat could put two sends on the
+/// wire at the same instant and a 429 was answered only by the single request
+/// that earned it. This lane is the one wire queue for a chat: sends to the
+/// same chatId are serialised, and the retry window any of them is handed
+/// becomes a chat-level cooldown the next send waits out instead of earning a
+/// second 429. Turns stay concurrent — only the sends line up.
+actor TelegramChatSendLane {
+    static let shared = TelegramChatSendLane()
+
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private var busy: Set<Int> = []
+    private var waiting: [Int: [Waiter]] = [:]
+    private var cooldownUntil: [Int: Date] = [:]
+
+    func run<T: Sendable>(
+        chatId: Int,
+        sleep: @escaping @Sendable (UInt64) async throws -> Void,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await acquire(chatId)
+        defer { release(chatId) }
+        // 2026-09-06: `release` hands the lane straight to the next waiter, so a
+        // waiter cancelled in that instant is past `acquire`'s cancellation
+        // check and its `abandon` is a no-op. Re-check here, and let a cancelled
+        // cooldown wait THROW: `try?` swallowed the cancellation, skipped the
+        // rest of the flood cooldown, and sent into a chat Telegram had told to
+        // be quiet — for a turn the user had already stopped.
+        try Task.checkCancellation()
+        if let wait = cooldownNanoseconds(chatId) {
+            try await sleep(wait)
+        }
+        do {
+            return try await operation()
+        } catch let error as TelegramAPIFailure {
+            if error.httpStatus == 429 || error.errorCode == 429,
+               let seconds = error.parameters?.retryAfter, seconds > 0 {
+                noteRetryAfter(chatId, seconds: seconds)
+            }
+            throw error
+        }
+    }
+
+    /// 2026-09-06: the wait for the lane is CANCELLABLE. It used to be a
+    /// non-throwing continuation, so a stopped turn queued behind a chat in a
+    /// 30s flood cooldown ignored its cancellation and sent anyway, long after
+    /// the user asked it to stop. A cancelled waiter leaves the queue and
+    /// throws; a waiter that already owns the lane keeps it and releases it in
+    /// the normal way.
+    private func acquire(_ chatId: Int) async throws {
+        guard busy.contains(chatId) else {
+            busy.insert(chatId)
+            return
+        }
+        let waiterId = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                waiting[chatId, default: []].append(Waiter(id: waiterId, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.abandon(chatId, waiterId: waiterId) }
+        }
+    }
+
+    /// Drop a cancelled waiter. A no-op when `release` already handed it the
+    /// lane — that task owns the lane and releases it itself.
+    private func abandon(_ chatId: Int, waiterId: UUID) {
+        guard var queue = waiting[chatId],
+              let index = queue.firstIndex(where: { $0.id == waiterId }) else { return }
+        let waiter = queue.remove(at: index)
+        waiting[chatId] = queue.isEmpty ? nil : queue
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func release(_ chatId: Int) {
+        guard var queue = waiting[chatId], !queue.isEmpty else {
+            waiting[chatId] = nil
+            busy.remove(chatId)
+            return
+        }
+        let next = queue.removeFirst()
+        waiting[chatId] = queue.isEmpty ? nil : queue
+        // The lane stays held: ownership passes straight to the next waiter.
+        next.continuation.resume()
+    }
+
+    private func cooldownNanoseconds(_ chatId: Int) -> UInt64? {
+        guard let until = cooldownUntil[chatId] else { return nil }
+        let remaining = until.timeIntervalSinceNow
+        guard remaining > 0 else {
+            cooldownUntil[chatId] = nil
+            return nil
+        }
+        return UInt64(remaining * 1_000_000_000)
+    }
+
+    private func noteRetryAfter(_ chatId: Int, seconds: Int) {
+        let until = Date().addingTimeInterval(TimeInterval(seconds))
+        guard cooldownUntil[chatId].map({ $0 < until }) ?? true else { return }
+        cooldownUntil[chatId] = until
+    }
+}
+
 /// A Bot API 429 is a definite non-delivery, unlike a transport interruption
 /// after bytes left this process. Retry exactly once, only for that typed
 /// rejection, and honor the server's advertised retry window before rebuilding
 /// the request. This keeps a successful retry from being duplicated while
 /// refusing to invent a replay after an ambiguous transport outcome.
+///
+/// 2026-09-06: `chatId` puts the attempt in that chat's send lane above. The
+/// retry sleep stays OUTSIDE the lane so a waiting topic is not held behind a
+/// sleeping request — it hits the published cooldown instead. Methods with no
+/// chat of their own (getMe, setMyCommands, answerCallbackQuery, getUpdates)
+/// pass nil and go straight to the wire.
 func _tgRetryAfterFloodControl<T: Sendable>(
+    chatId: Int? = nil,
     sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
     operation: @escaping @Sendable () async throws -> T
 ) async throws -> T {
+    @Sendable func attempt() async throws -> T {
+        guard let chatId else { return try await operation() }
+        return try await TelegramChatSendLane.shared.run(
+            chatId: chatId,
+            sleep: sleep,
+            operation: operation
+        )
+    }
     do {
-        return try await operation()
+        return try await attempt()
     } catch let error as TelegramAPIFailure {
         // `retry_after` is meaningful only for the actual flood-control
         // response.  Do not replay a different rejection merely because a
@@ -513,7 +696,7 @@ func _tgRetryAfterFloodControl<T: Sendable>(
         guard (error.httpStatus == 429 || error.errorCode == 429),
               let seconds = error.parameters?.retryAfter, seconds > 0 else { throw error }
         try await sleep(UInt64(seconds) * 1_000_000_000)
-        return try await operation()
+        return try await attempt()
     }
 }
 

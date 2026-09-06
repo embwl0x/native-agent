@@ -69,67 +69,10 @@ enum WorkflowBuilderError: LocalizedError, Equatable {
     }
 }
 
-enum WorkflowLifecycleAction: Equatable {
-    case resume
-    case cancel
-    case rollback
-
-    var title: String {
-        switch self {
-        case .resume: "Resume"
-        case .cancel: "Cancel"
-        case .rollback: "Rollback"
-        }
-    }
-}
-
-enum WorkflowLifecycleActionOutcome: Equatable {
-    case persisted(status: String)
-    case unavailable(detail: String)
-    case unconfirmed(detail: String)
-    case failed(detail: String)
-}
-
-enum WorkflowLifecycleButtonPresentation {
-    struct Notice: Equatable {
-        let detail: String
-        let status: String
-    }
-
-    static func eligibility(
-        action: WorkflowLifecycleAction,
-        run: WorkflowRun,
-        approvalDecision: String?,
-        isPerforming: Bool
-    ) -> WorkflowRunControlEligibility {
-        if isPerforming {
-            return WorkflowRunControlEligibility(
-                isEligible: false,
-                detail: "Workflow lifecycle action is in progress."
-            )
-        }
-        let controls = run.controlAvailability(approvalDecision: approvalDecision)
-        switch action {
-        case .resume: return controls.resume
-        case .cancel: return controls.cancel
-        case .rollback: return controls.rollback
-        }
-    }
-
-    static func notice(
-        for action: WorkflowLifecycleAction,
-        outcome: WorkflowLifecycleActionOutcome
-    ) -> Notice {
-        switch outcome {
-        case .persisted(let status):
-            return Notice(detail: "\(action.title) persisted as \(status).", status: "ok")
-        case .unavailable(let detail), .unconfirmed(let detail):
-            return Notice(detail: detail, status: "warn")
-        case .failed(let detail):
-            return Notice(detail: detail, status: "failed")
-        }
-    }
-}
+// 2026-09-01: `WorkflowLifecycleAction`, `WorkflowLifecycleActionOutcome`, and
+// `WorkflowLifecycleButtonPresentation` were retired with the workflow run
+// engine (User authorized). They existed only to drive Resume / Cancel /
+// Rollback on a run.
 
 @MainActor
 extension AppModel {
@@ -206,21 +149,6 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func runWorkflow(_ workflow: WorkflowRecord, objective: String) async {
-        do {
-            let run = try await client.runWorkflow(id: workflow.id, objective: objective, execute: true)
-            disabledFeature = nil
-            await refreshWorkflowControlOutcome(run, action: "Workflow execution")
-        } catch let err as NSError where AppModel.isNotImplemented(err) {
-            disabledFeature = AppModel.disabledBadge(for: "Workflow run", error: err)
-            statusText = disabledFeature ?? "Workflow run disabled"
-        } catch {
-            await refreshAll()
-            statusText = "Workflow run failed: \(error.localizedDescription)"
-        }
-    }
-
     /// Creates the smallest reviewable workflow through the canonical registry
     /// writer. A create response alone is not presented as success: the
     /// returned id must appear in a fresh registry read from the same root.
@@ -265,94 +193,6 @@ extension AppModel {
             msg += " (see: \(followup))"
         }
         return msg
-    }
-
-    @MainActor
-    @discardableResult
-    func resumeWorkflowRun(_ run: WorkflowRun) async -> WorkflowLifecycleActionOutcome {
-        let approvalDecision = run.approvalId.flatMap { approvalID in
-            approvals.first(where: { $0.id == approvalID })?.decision
-        }
-        let eligibility = run.controlAvailability(approvalDecision: approvalDecision).resume
-        guard eligibility.isEligible else {
-            let detail = "Workflow resume unavailable: \(eligibility.detail)"
-            statusText = detail
-            return .unavailable(detail: detail)
-        }
-        do {
-            let updated = try await client.resumeWorkflowRun(id: run.id)
-            return await refreshWorkflowControlOutcome(updated, action: "Workflow resume")
-        } catch {
-            await refreshAll()
-            let detail = "Workflow resume failed: \(error.localizedDescription)"
-            statusText = detail
-            return .failed(detail: detail)
-        }
-    }
-
-    @MainActor
-    @discardableResult
-    func cancelWorkflowRun(_ run: WorkflowRun) async -> WorkflowLifecycleActionOutcome {
-        let eligibility = run.controlAvailability().cancel
-        guard eligibility.isEligible else {
-            let detail = "Workflow cancel unavailable: \(eligibility.detail)"
-            statusText = detail
-            return .unavailable(detail: detail)
-        }
-        do {
-            let updated = try await client.cancelWorkflowRun(id: run.id)
-            return await refreshWorkflowControlOutcome(updated, action: "Workflow cancel")
-        } catch {
-            await refreshAll()
-            let detail = "Workflow cancel failed: \(error.localizedDescription)"
-            statusText = detail
-            return .failed(detail: detail)
-        }
-    }
-
-    @MainActor
-    @discardableResult
-    func rollbackWorkflowRun(_ run: WorkflowRun) async -> WorkflowLifecycleActionOutcome {
-        let eligibility = run.controlAvailability().rollback
-        guard eligibility.isEligible else {
-            let detail = "Workflow rollback unavailable: \(eligibility.detail)"
-            statusText = detail
-            return .unavailable(detail: detail)
-        }
-        do {
-            let updated = try await client.rollbackWorkflowRun(id: run.id)
-            return await refreshWorkflowControlOutcome(updated, action: "Workflow rollback")
-        } catch {
-            await refreshAll()
-            let detail = "Workflow rollback failed: \(error.localizedDescription)"
-            statusText = detail
-            return .failed(detail: detail)
-        }
-    }
-
-    /// A client response is not enough to claim a run-control action completed:
-    /// the visible list is deliberately rebuilt from its durable JSONL history.
-    /// Confirm the exact returned run after that rebuild and leave an adverse
-    /// message if a write/ledger conflict made the result unobservable.
-    @MainActor
-    @discardableResult
-    private func refreshWorkflowControlOutcome(
-        _ expected: WorkflowRun,
-        action: String
-    ) async -> WorkflowLifecycleActionOutcome {
-        await refreshAll()
-        guard let reloaded = workflowRuns.first(where: { $0.id == expected.id }) else {
-            let detail = "\(action) outcome is not visible after reload; durable status could not be confirmed."
-            statusText = detail
-            return .unconfirmed(detail: detail)
-        }
-        guard reloaded.status == expected.status else {
-            let detail = "\(action) conflicted with persisted state: returned \(expected.status), reloaded \(reloaded.status)."
-            statusText = detail
-            return .unconfirmed(detail: detail)
-        }
-        statusText = "\(action) persisted as \(reloaded.status)."
-        return .persisted(status: reloaded.status)
     }
 
     @MainActor

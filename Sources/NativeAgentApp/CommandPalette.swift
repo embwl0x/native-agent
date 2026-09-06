@@ -114,7 +114,7 @@ enum CommandPalettePresentation {
             )
         }
         return tabs + chats + CommandPaletteRecentAction.visible(
-            showDeveloperSurfaces: showDeveloperSurfaces
+            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
         ).map { action in
             let presentation = action.presentation
             return PaletteItem(
@@ -353,7 +353,7 @@ struct CommandPaletteView: View {
     private func itemPool() -> [PaletteItem] {
         CommandPalettePresentation.itemPool(
             sessions: appModel.chatSessions,
-            showDeveloperSurfaces: showDeveloperSurfaces
+            showDeveloperSurfaces: NativeAgentShellPreference.developerSurfacesShown(showDeveloperSurfaces)
         )
     }
 

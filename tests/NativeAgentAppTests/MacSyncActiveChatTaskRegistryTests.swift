@@ -10,9 +10,16 @@ import Testing
 //   - an entry added and never removed leaks a Task per turn forever, and every
 //     later cancel for that session cancels a DEAD task while the live one runs;
 //   - a stale unregister (an older turn finishing after a newer one replaced it)
-//     removing the CURRENT entry makes cancel silently return false — the phone
+//     removing the CURRENT entry makes cancel report `.noActiveTask` — the phone
 //     shows "cancelled", the Mac keeps talking.
 // Neither leaves a row anywhere; the only symptom is a cancel that does nothing.
+//
+// 2026-09-06: `cancelActiveChatTask` returns `MacSyncChatCancelOutcome` instead
+// of Bool (394e20ac) so a Stop that names a run can say WHICH of the three
+// no-cancel states it hit — `.runMismatch` (a later turn holds the session),
+// `.stopRecorded` (the Stop overtook its own turn's handoff) or `.noActiveTask`.
+// These tests all call the unscoped form (no `runIDs`), whose two outcomes are
+// exactly the old true/false: `.cancelled` and `.noActiveTask`.
 //
 // `MacSyncEngine.init` is private (singleton-enforced), so these drive
 // `.shared` — the same production object the inbox router uses. To stay
@@ -108,7 +115,8 @@ struct MacSyncActiveChatTaskRegistryTests {
         await expectCancelled(first, "the superseded task")
 
         #expect(mine(engine, ns).count == 1, "a superseded task must not leave a second entry")
-        #expect(engine.cancelActiveChatTask(for: ns + "b"), "the LIVE task must be the one cancel reaches")
+        #expect(engine.cancelActiveChatTask(for: ns + "b") == .cancelled,
+                "the LIVE task must be the one cancel reaches")
         await expectCancelled(second, "the live task after an explicit cancel")
 
         engine.unregisterActiveChatTask(for: ns + "b", expecting: second)
@@ -131,7 +139,7 @@ struct MacSyncActiveChatTaskRegistryTests {
         // map entry, the next cancelChat from the phone would silently no-op.
         engine.unregisterActiveChatTask(for: ns + "c", expecting: stale)
         #expect(mine(engine, ns).count == 1, "a finished older turn evicted the live turn's registration")
-        #expect(engine.cancelActiveChatTask(for: ns + "c"),
+        #expect(engine.cancelActiveChatTask(for: ns + "c") == .cancelled,
                 "cancelChat found nothing to cancel — the phone would report success over a running turn")
         await expectCancelled(live, "the live task")
 
@@ -141,17 +149,20 @@ struct MacSyncActiveChatTaskRegistryTests {
     }
 
     @Test("cancel reports honestly when there is nothing to cancel")
-    func cancelUnknownSessionReturnsFalse() async {
+    func cancelUnknownSessionReturnsNoActiveTask() async {
         let engine = MacSyncEngine.shared
         let ns = namespace()
-        #expect(engine.cancelActiveChatTask(for: ns + "never-registered") == false)
-        #expect(engine.cancelActiveChatTask(for: "") == false)
-        #expect(engine.cancelActiveChatTask(for: "   ") == false)
+        // An UNSCOPED Stop (no run named) over an empty registry has nothing to
+        // hold against a run id, so it reports `.noActiveTask` rather than
+        // recording a stop request.
+        #expect(engine.cancelActiveChatTask(for: ns + "never-registered") == .noActiveTask)
+        #expect(engine.cancelActiveChatTask(for: "") == .noActiveTask)
+        #expect(engine.cancelActiveChatTask(for: "   ") == .noActiveTask)
 
         let task = makeTask()
         engine.registerActiveChatTask(task, for: ns + "d")
         // Whitespace around the id must not create a second, uncancellable lane.
-        #expect(engine.cancelActiveChatTask(for: "  \(ns)d  "))
+        #expect(engine.cancelActiveChatTask(for: "  \(ns)d  ") == .cancelled)
         await expectCancelled(task, "the task addressed by a padded session id")
         engine.unregisterActiveChatTask(for: " \(ns)d ", expecting: task)
         #expect(mine(engine, ns).isEmpty, "a padded id took a different code path and orphaned the entry")
@@ -183,7 +194,7 @@ struct MacSyncActiveChatTaskRegistryTests {
         #expect(mine(engine, ns).count == 25)
 
         for (id, task) in tasks {
-            #expect(engine.cancelActiveChatTask(for: id))
+            #expect(engine.cancelActiveChatTask(for: id) == .cancelled)
             await expectCancelled(task, "session \(id)")
             engine.unregisterActiveChatTask(for: id, expecting: task)
         }

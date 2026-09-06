@@ -7,7 +7,11 @@ enum InboxPushNotifier {
         title: String,
         summary: String,
         source: String,
-        severity: String
+        severity: String,
+        /// Optional explicit class. Defaults to the severity mapping so every
+        /// existing call site keeps its exact current gate — see
+        /// `AttentionImportance.fromInboxSeverity`.
+        importance: AttentionImportance? = nil
     ) async {
         guard shouldNotify(severity: severity) else { return }
         guard usesLiveAppDataRoot(dataRoot) else { return }
@@ -15,9 +19,15 @@ enum InboxPushNotifier {
         guard ProcessInfo.processInfo.environment["NATIVE_AGENT_DISABLE_INBOX_PUSH"] != "1" else { return }
 
         do {
-            try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+            // Item 26: the routing decision belongs to ONE place. The payload
+            // below is unchanged; the router decides whether it reaches User's
+            // phone, his Telegram, or nowhere.
+            try await AttentionRouter.shared.route(
+                eventId: "inbox:\(itemId)",
+                importance: importance ?? AttentionImportance.fromInboxSeverity(severity),
                 title: NativeAppSecretRedactor.redactText(String(title.prefix(160))),
                 body: NativeAppSecretRedactor.redactText(String(summary.prefix(500))),
+                reason: "\(severity)|\(summary.prefix(500))",
                 userInfo: [
                     "screen": "inbox",
                     "source": source,

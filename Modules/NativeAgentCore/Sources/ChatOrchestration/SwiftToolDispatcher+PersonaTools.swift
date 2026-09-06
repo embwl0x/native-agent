@@ -170,9 +170,10 @@ extension SwiftToolDispatcher {
 
         let availableTools = Set(await modelVisibleToolNames())
         let mcpTools = modelVisibleMCPToolNames().sorted()
-        let sessionTools: Set<String> = sessionId.isEmpty
-            ? []
-            : await activeToolsStore.load(sessionId: sessionId).activeTools
+        let sessionState: ChatSessionActiveTools? = sessionId.isEmpty
+            ? nil
+            : await activeToolsStore.load(sessionId: sessionId)
+        let sessionTools: Set<String> = sessionState?.activeTools ?? []
         let modelVisibleAvailableTools = Self.modelVisibleCatalogToolNames(availableTools)
         let activeTools = Self.alwaysOnCoreNames
             .union(sessionTools)
@@ -204,6 +205,32 @@ extension SwiftToolDispatcher {
         response["active_tools"] = .array(activeTools.map { .string($0) })
         response["active_tool_count"] = .int(Int64(activeTools.count))
         response["available_tool_count"] = .int(Int64(modelVisibleAvailableTools.count))
+        // `active_tool_count` and tool_load's `session_active_count` were read
+        // as the same number and are not: this one is the whole advertised set
+        // for the turn (always-on core ∪ session-pinned ∪ turn-scoped ∪ MCP),
+        // tool_load's is only the persisted pinned row. Publish the pinned set
+        // here too, under a name that says so, and label all three — the two
+        // tools can now be reconciled instead of contradicting each other.
+        let sessionPinnedTools = sessionTools.sorted()
+        response["session_pinned_tools"] = .array(sessionPinnedTools.map { .string($0) })
+        response["session_pinned_tool_count"] = .int(Int64(sessionPinnedTools.count))
+        if let sessionState {
+            // Where the pinned set was read from and when it was last written.
+            // Same renderer as tool_load's receipt, so the two tools cannot
+            // tell different stories about the same number.
+            response["pinned_set_provenance"] = sessionState.pinnedSetProvenance
+        }
+        response["tool_count_semantics"] = .object([
+            "active_tool_count": .string("Tools advertised to the model this turn: always-on core + session-pinned + turn-scoped + MCP, intersected with the model-visible catalog. Larger than session_active_count by design."),
+            // Corrected 2026-09-03: this was documented as "pinned via
+            // tool_load", which is false — turn-start route preloads are
+            // promoted into the very same set, and on a session that never
+            // called tool_load they can be ALL of it. See
+            // pinned_set_provenance for the split.
+            "session_pinned_tool_count": .string("Tools holding a persisted session row: explicit tool_load calls PLUS turn-start route preloads promoted into the same set. This is the SAME number tool_load reports as session_active_count. See pinned_set_provenance for which is which and why it moves on its own."),
+            "available_tool_count": .string("Every model-visible tool in the catalog, loaded or not."),
+            "mcp_tool_count": .string("External MCP bridged tools, already counted inside active_tool_count."),
+        ])
         response["lazy_loading"] = .string("available tools omitted; use tool_catalog to discover and tool_load to activate")
         response["mcp_tool_count"] = .int(Int64(mcpTools.count))
         response["mcp_tools"] = .array(mcpTools.map { .string($0) })
@@ -211,7 +238,25 @@ extension SwiftToolDispatcher {
             "daemon_introspect": .string("alias_for_agent_introspect"),
             "recall_search": .string("alias_for_recall_memory"),
         ])
+        response["build"] = Self.buildStamp(identity: .current, pid: pid)
         return .object(response)
+    }
+
+    /// Which binary is answering this turn. Full detail only — the compact
+    /// payload stays free of build mass on ordinary turns.
+    ///
+    /// Reads `NativeAgentBuildIdentity`, the SAME type the local bridge's
+    /// `buildIdentity` payload reports, so an in-turn answer and an
+    /// out-of-band bridge read can never name different binaries.
+    /// `exactSourceRevision` is null on a dirty or unstamped build: absence is
+    /// the honest answer, never a bare `sourceRevision` promoted to proof.
+    static func buildStamp(identity: NativeAgentBuildIdentity, pid: Int32) -> JSONValue {
+        .object([
+            "version": .string(identity.version),
+            "exactSourceRevision": identity.exactSourceRevision.map(JSONValue.string) ?? .null,
+            "sourceDirty": .bool(identity.sourceDirty),
+            "pid": .int(Int64(pid)),
+        ])
     }
 
     /// The provider+model actually generating the current turn (live), or the

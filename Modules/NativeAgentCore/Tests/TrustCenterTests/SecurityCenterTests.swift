@@ -626,14 +626,20 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         #expect(envelope.capabilities.contains("browser_interaction"))
     }
 
-    let wait = await center.evaluateTool(
-        tool: "browser.chrome_wait",
-        input: [:],
-        origin: SecurityOriginContext(surface: "chat")
-    )
-    #expect(wait.signedToolKnown)
-    #expect(wait.risk == "low")
-    #expect(wait.capabilities.contains("safe_read"))
+    for tool in ["browser.chrome_wait", "browser.chrome_renew"] {
+        // Sweep item 10c: a renew touches the lease's expiry and no page
+        // state, so it is a signed low-risk read like wait — and it has to be
+        // a KNOWN builtin, or exposing the tool just moves the 60-second
+        // ceiling into the security gate.
+        let envelope = await center.evaluateTool(
+            tool: tool,
+            input: [:],
+            origin: SecurityOriginContext(surface: "chat")
+        )
+        #expect(envelope.signedToolKnown, "\(tool)")
+        #expect(envelope.risk == "low", "\(tool)")
+        #expect(envelope.capabilities.contains("safe_read"), "\(tool)")
+    }
 }
 
 @Test func SecurityCenter_healthStatusToolsAreLowRiskReadBuiltins() async throws {
@@ -674,6 +680,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
             origin: SecurityOriginContext(
                 surface: "telegram",
                 sessionId: "telegram:123",
+                chatId: "123",
                 isRemote: true
             )
         )
@@ -843,6 +850,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         origin: SecurityOriginContext(
             surface: "telegram",
             sessionId: "telegram:123",
+            chatId: "123",
             isRemote: true
         )
     )
@@ -1322,6 +1330,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
         origin: SecurityOriginContext(
             surface: "telegram",
             sessionId: "telegram:123",
+            chatId: "123",
             isRemote: true
         )
     )
@@ -1358,6 +1367,7 @@ private struct SecurityAuditAppendFailingPersistence: PersistenceCoreProtocol {
     let untrustedOrigin = SecurityOriginContext(
         surface: "telegram",
         sessionId: "telegram:999",
+        chatId: "999",
         isRemote: true
     )
 
@@ -1434,7 +1444,7 @@ private func makeTrustedTelegramRoot(
     let envelope = await center.evaluateTool(
         tool: "invoke_claude",
         input: ["text": .string("help me scope a small change")],
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", chatId: "123", isRemote: true)
     )
 
     #expect(envelope.originTrusted)
@@ -1484,7 +1494,7 @@ private func makeTrustedTelegramRoot(
         tool: "invoke_claude",
         input: ["text": .string("help me")],
         // 999 is NOT in the allowlist -> untrusted
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:999", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:999", chatId: "999", isRemote: true)
     )
 
     #expect(envelope.originTrusted == false)
@@ -1504,7 +1514,7 @@ private func makeTrustedTelegramRoot(
     let envelope = await center.evaluateTool(
         tool: "invoke_claude",
         input: ["text": .string("help me")],
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", chatId: "123", isRemote: true)
     )
 
     #expect(envelope.originTrusted)
@@ -1610,7 +1620,7 @@ private func makeTrustedTelegramRoot(
     let envelope = await center.evaluateTool(
         tool: "mac.shell",
         input: ["command": .string("whoami")],
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", chatId: "123", isRemote: true)
     )
 
     #expect(envelope.originTrusted)
@@ -1658,6 +1668,7 @@ private func makeTrustedTelegramRoot(
     let origin = SecurityOriginContext(
         surface: "telegram",
         sessionId: "telegram:123",
+        chatId: "123",
         isRemote: true
     )
 
@@ -1753,6 +1764,7 @@ private func makeTrustedTelegramRoot(
             origin: SecurityOriginContext(
                 surface: "telegram",
                 sessionId: "telegram:123",
+                chatId: "123",
                 isRemote: true
             )
         )
@@ -1790,6 +1802,7 @@ private func makeTrustedTelegramRoot(
         origin: SecurityOriginContext(
             surface: "telegram",
             sessionId: "telegram:999",
+            chatId: "999",
             isRemote: true
         )
     )
@@ -1857,7 +1870,7 @@ private func makeTrustedTelegramRoot(
     let decision = await center.evaluatePolicyDecision(
         tool: "mac.shell",
         input: ["command": .string("whoami")],
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", chatId: "123", isRemote: true)
     )
 
     #expect(decision.outcome == .allow)
@@ -1920,7 +1933,7 @@ private func makeTrustedTelegramRoot(
     let envelope = await center.evaluateTool(
         tool: "install_app",
         input: ["reason": .string("apply tested Swift build")],
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", chatId: "123", isRemote: true)
     )
 
     #expect(envelope.originTrusted)
@@ -2025,7 +2038,7 @@ private func makeTrustedTelegramRoot(
     let envelope = await center.evaluateTool(
         tool: "install_app",
         input: ["reason": .string("untrusted install attempt")],
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:999", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:999", chatId: "999", isRemote: true)
     )
 
     #expect(envelope.originTrusted == false)
@@ -2240,7 +2253,7 @@ private func makeTrustedTelegramRoot(
             "command": .string("whoami"),
             "command_signature": .string("fake-model-supplied-signature"),
         ],
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", chatId: "123", isRemote: true)
     )
 
     #expect(envelope.originTrusted)
@@ -2275,6 +2288,7 @@ private func makeTrustedTelegramRoot(
         origin: SecurityOriginContext(
             surface: "telegram",
             sessionId: "telegram:123",
+            chatId: "123",
             isRemote: true,
             commandSignatureVerified: true
         )
@@ -2299,7 +2313,7 @@ private func makeTrustedTelegramRoot(
     let envelope = await center.evaluateTool(
         tool: "mobile.notify",
         input: ["message": .string("ping")],
-        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", isRemote: true)
+        origin: SecurityOriginContext(surface: "telegram", sessionId: "telegram:123", chatId: "123", isRemote: true)
     )
 
     #expect(envelope.originTrusted)

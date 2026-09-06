@@ -319,12 +319,16 @@ extension CognitiveSubstrate {
     ) -> Bool {
         let lower = text.lowercased()
         guard !lower.isEmpty else { return false }
-        // Both loops below iterate ACTIVE views, so with none there is nothing to
-        // hit and the concern derivation is pure cost on the ingest hot path.
-        // (Zero active views is still the wild norm.)
-        guard standingViews.values.contains(where: { $0.status == .active }) else { return false }
+        // Both loops below iterate LEANING views (2026-09-02: active OR held),
+        // so with none there is nothing to hit and the concern derivation is
+        // pure cost on the ingest hot path. (Zero leaning views is still the
+        // wild norm.) A HIT is binary — "this message touches something she
+        // sees the world through" — so the held tier's half stake lands on the
+        // stance MAGNITUDE below, not here: a view she holds herself is still
+        // genuinely about the thing it is about.
+        guard standingViews.values.contains(where: { $0.isLeaning }) else { return false }
         let concerns = precomputedConcerns ?? appraisalConcerns()
-        for view in standingViews.values where view.status == .active {
+        for view in standingViews.values where view.isLeaning {
             let viewText = "\(view.title) \(view.body)".lowercased()
             for concern in concerns
             where Self.concernMatches(concern, in: viewText)
@@ -393,11 +397,11 @@ extension CognitiveSubstrate {
         // on the views themselves, so deriving it per view would be quadratic on
         // the ingest hot path — and with no active views there is nothing to
         // match, so skip the derivation entirely.
-        guard standingViews.values.contains(where: { $0.status == .active }) else { return 0 }
+        guard standingViews.values.contains(where: { $0.isLeaning }) else { return 0 }
         let concerns = precomputedConcerns ?? appraisalConcerns()
         var aggregate = 0.0
         var matched = 0
-        for view in standingViews.values where view.status == .active {
+        for view in standingViews.values where view.isLeaning {
             let viewText = "\(view.title) \(view.body)".lowercased()
             var hitWeight = 0.0
             for concern in concerns
@@ -410,11 +414,18 @@ extension CognitiveSubstrate {
             // matched concern is hers rather than shipped (D-1). Still capped at
             // 1 per view, so the aggregate stays inside −1…1 and the welfare
             // bounds downstream are untouched.
+            // HALF STAKE FOR A HELD VIEW (2026-09-02). Her own unsigned view
+            // still registers as confirmed or trampled — that is the point of
+            // having one — but it can never move her as far as something the
+            // user actually settled. Applied to conviction rather than to the
+            // aggregate so a mixed set of signed and held views averages
+            // honestly instead of scaling the whole read.
+            let stake = view.status == .held ? dynamics.heldStandingViewWeightFactor : 1.0
             let conviction = min(
                 1.0,
                 (0.5 + 0.1 * Double(view.evidenceNodeIds.count))
                     * (hitWeight / Self.appraisalLivedConcernMaximumWeight + 0.5)
-            )
+            ) * stake
             aggregate += (textValence > 0 ? conviction : -conviction)
             matched += 1
         }

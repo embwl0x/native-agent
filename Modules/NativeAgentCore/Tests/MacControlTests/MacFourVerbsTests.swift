@@ -346,6 +346,7 @@ private final class _FVObservation: MacAXEffectObservation, @unchecked Sendable 
 private final class _FVEffectSource: MacAXEffectObserverSource, @unchecked Sendable {
     private let lock = NSLock()
     private var installCount = 0
+    private var live: [@Sendable (MacAXEffectNotification) -> Void] = []
     private let script: [String]
 
     init(script: [String] = ["AXValueChanged", "AXTitleChanged"]) { self.script = script }
@@ -355,15 +356,66 @@ private final class _FVEffectSource: MacAXEffectObserverSource, @unchecked Senda
         kinds: [String],
         onNotification: @escaping @Sendable (MacAXEffectNotification) -> Void
     ) -> (any MacAXEffectObservation)? {
-        lock.lock(); installCount += 1; lock.unlock()
+        lock.lock()
+        installCount += 1
+        live.append(onNotification)
+        lock.unlock()
         for kind in script { onNotification(MacAXEffectNotification(kind: kind, at: Date())) }
         return _FVObservation(onStop: {})
+    }
+
+    /// fable51 item 31 — a live app that CHANGES fires notifications. `wait`
+    /// now ends on those, so a fixture that mutates its tree without emitting
+    /// one models an app that does not exist.
+    func emit(_ kind: String = "AXValueChanged") {
+        lock.lock(); let sinks = live; lock.unlock()
+        for sink in sinks { sink(MacAXEffectNotification(kind: kind, at: Date())) }
     }
 
     func installs() -> Int {
         lock.lock(); defer { lock.unlock() }
         return installCount
     }
+}
+
+/// An observer source that installs NOTHING. It is how the fallback path — the
+/// documented safety net for apps that publish no subscribable signal — is
+/// exercised without a window server.
+private final class _FVDeafEffectSource: MacAXEffectObserverSource, @unchecked Sendable {
+    func install(
+        pid: Int32,
+        kinds: [String],
+        onNotification: @escaping @Sendable (MacAXEffectNotification) -> Void
+    ) -> (any MacAXEffectObservation)? { nil }
+}
+
+/// The workspace-activation half, scripted. `fire()` is the app switch.
+private final class _FVActivationSource: MacAppActivationObserverSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var live: [@Sendable () -> Void] = []
+    private(set) var stops = 0
+
+    func install(onActivation: @escaping @Sendable () -> Void) -> (any MacAXEffectObservation)? {
+        lock.lock(); live.append(onActivation); lock.unlock()
+        return _FVObservation(onStop: { [weak self] in
+            guard let self else { return }
+            self.lock.lock(); self.stops += 1; self.lock.unlock()
+        })
+    }
+
+    func fire() {
+        lock.lock(); let sinks = live; lock.unlock()
+        for sink in sinks { sink() }
+    }
+
+    func stopCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return stops
+    }
+}
+
+private struct _FVSilentActivationSource: MacAppActivationObserverSource {
+    func install(onActivation: @escaping @Sendable () -> Void) -> (any MacAXEffectObservation)? { nil }
 }
 
 private final class _FVEventSink: MacEventSink, @unchecked Sendable {
@@ -587,11 +639,14 @@ private func _fvHarness(
     supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)? = nil,
     running: [String] = [],
     installed: Set<String> = [],
-    namedLocationRoots: [URL] = []
+    namedLocationRoots: [URL] = [],
+    effects: _FVEffectSource? = nil,
+    waitEffects: (any MacAXEffectObserverSource)? = nil,
+    waitActivation: (any MacAppActivationObserverSource)? = nil
 ) -> _FVHarness {
     let source = _FVLookSource(elements: elements ?? _fvElements(), rootID: rootID, focus: focus)
     let actSource = _FVActSource(actElements ?? _fvActElements())
-    let effects = _FVEffectSource()
+    let effects = effects ?? _FVEffectSource()
     let openTarget = _FVOpenTarget()
     let clock = _FVClock()
     let appControl = _FVAppControl()
@@ -616,7 +671,12 @@ private func _fvHarness(
             host: client,
             clock: clock,
             supplementalSource: supplementalSource,
-            namedLocationRoots: namedLocationRoots
+            namedLocationRoots: namedLocationRoots,
+            // fable51 item 31 — `wait` subscribes through these. Default to the
+            // same scripted effect source the client uses, so a fixture that
+            // fires a notification is seen by both the act loop and the wait.
+            effectObserverSource: waitEffects ?? effects,
+            appActivationSource: waitActivation ?? _FVSilentActivationSource()
         ),
         client: client,
         source: source,
@@ -1876,16 +1936,25 @@ func wait_timesOutHonestly_onAScreenThatNeverSettles() async {
     // so no two renders are ever equal.
     let counter = _FVCounter()
     let churning = _FVLookSource(elements: _fvElements(), rootID: 0)
+    let effects = _FVEffectSource(script: [])
     let client = SwiftNativeMacControl(
         accessibilitySource: churning,
         eventSink: InertAvailableMacEventSink(),
         accessibilityActSource: harness.actSource,
-        effectObserverSource: harness.effects,
+        effectObserverSource: effects,
         lookFrameStore: MacLookFrameStore()
     )
     let clock = _FVClock()
-    let verbs = MacFourVerbs(host: client, clock: clock)
-    // Rename a row before every poll.
+    let verbs = MacFourVerbs(
+        host: client,
+        clock: clock,
+        effectObserverSource: effects,
+        appActivationSource: _FVSilentActivationSource()
+    )
+    // Rename a row continuously AND fire the notification a real app would fire
+    // when it does. fable51 item 31: the wait ends on the signal now, so a
+    // fixture that mutates its tree in total silence models an app that does
+    // not exist — and would be reported (correctly) as settled.
     let churn = Task { @Sendable in
         while !Task.isCancelled {
             churning.mutate { elements in
@@ -1896,6 +1965,7 @@ func wait_timesOutHonestly_onAScreenThatNeverSettles() async {
                     children: []
                 )
             }
+            effects.emit()
             await Task.yield()
         }
     }
@@ -1907,6 +1977,116 @@ func wait_timesOutHonestly_onAScreenThatNeverSettles() async {
     #expect(reply.text.contains("never appeared"), "\(reply.text)")
     #expect(!reply.text.contains("Settled"), "a timeout must never be dressed up as a settle: \(reply.text)")
     #expect(clock.seconds() <= 4.0, "the budget is a cap: \(clock.seconds())")
+}
+
+// MARK: - 4b. wait as a SIGNAL, not a poll (fable51 item 31)
+
+@Test
+func wait_resolvesOnTheAXSignal_withoutASecondCaptureUntilSomethingHappened() async {
+    // No scripted notification: the observer installs and stays silent, so the
+    // ONLY reason the wait can look again is a signal it actually receives.
+    let effects = _FVEffectSource(script: [])
+    let harness = _fvHarness(effects: effects)
+    let source = harness.source
+
+    let changer = Task { @Sendable in
+        // Change the screen, then say so the way a real app does.
+        source.mutate { elements in
+            elements[30] = _FVElement(
+                attributes: MacAXAttributes(role: "AXStaticText", value: "upload complete"),
+                children: []
+            )
+        }
+        effects.emit("AXValueChanged")
+    }
+    let reply = await harness.verbs.wait(until: "upload complete", seconds: 10)
+    _ = await changer.value
+
+    #expect(reply.ok, "\(reply.text)")
+    #expect(reply.text.hasPrefix("\"upload complete\" appeared after "), "\(reply.text)")
+    // The baseline plus exactly one render caused by the signal. The old poll
+    // would have walked and captured the screen up to twenty times to see this.
+    #expect(source.lookCount() == 2, "one baseline + one signal render, not a poll: \(source.lookCount())")
+}
+
+@Test
+func wait_settlesOnSilence_withASingleCapture() async {
+    // A live subscription that never fires: silence IS the settle, and the
+    // render already in hand is the answer.
+    let harness = _fvHarness(effects: _FVEffectSource(script: []))
+    let reply = await harness.verbs.wait()
+
+    #expect(reply.ok, "\(reply.text)")
+    #expect(reply.text.hasPrefix("Settled after "), "\(reply.text)")
+    #expect(reply.text.contains("SCREEN"), "the settle still carries the screen: \(reply.text)")
+    #expect(harness.source.lookCount() == 1, "a quiet settle costs ONE capture: \(harness.source.lookCount())")
+    // It waited for the quiet window rather than answering instantly, and it
+    // did not burn the budget.
+    #expect(harness.clock.seconds() >= MacFourVerbs.settleQuietSeconds - 0.001)
+    #expect(harness.clock.seconds() < MacFourVerbs.defaultWaitSeconds)
+    #expect(MacFourVerbs.string(reply.detail["settled_by"]) == "quiet")
+}
+
+@Test
+func wait_endsOnAnAppSwitch_whichNoAXObserverOnOnePidCanSee() async {
+    // The AX observer is installed on the app that WAS in front; an activation
+    // happens in a different process entirely. Without the workspace
+    // subscription this wait is blind until the deadline.
+    let effects = _FVEffectSource(script: [])
+    let activation = _FVActivationSource()
+    let harness = _fvHarness(effects: effects, waitActivation: activation)
+    let source = harness.source
+
+    let switcher = Task { @Sendable in
+        source.setFrontmostApp(named: "Mail")
+        activation.fire()
+    }
+    let reply = await harness.verbs.wait(until: "Mail", seconds: 10)
+    _ = await switcher.value
+
+    #expect(reply.ok, "\(reply.text)")
+    #expect(reply.text.hasPrefix("\"Mail\" appeared after "), "\(reply.text)")
+    #expect(source.lookCount() == 2, "\(source.lookCount())")
+}
+
+@Test
+func wait_removesBothSubscriptionsOnEveryExit() async {
+    let activation = _FVActivationSource()
+    let harness = _fvHarness(effects: _FVEffectSource(script: []), waitActivation: activation)
+    _ = await harness.verbs.wait(seconds: 2)
+    // The settle path is the one that returns EARLY. An observer that survives
+    // it leaks for the life of the process.
+    #expect(activation.stopCount() == 1, "\(activation.stopCount())")
+}
+
+@Test
+func wait_fallsBackToACoarseReRender_whenNoObserverCouldBeInstalled() async {
+    // The documented SAFETY NET: with nothing subscribable, silence proves
+    // nothing, so a settle must be decided the old way — by comparing two
+    // renders — and never claimed from quiet.
+    let harness = _fvHarness(
+        waitEffects: _FVDeafEffectSource(),
+        waitActivation: _FVSilentActivationSource()
+    )
+    let reply = await harness.verbs.wait(seconds: 20)
+
+    #expect(reply.ok, "\(reply.text)")
+    #expect(reply.text.hasPrefix("Settled after "), "\(reply.text)")
+    #expect(MacFourVerbs.string(reply.detail["settled_by"]) == "compared",
+            "a settle with no subscription must be a comparison, not a claim: \(reply.detail)")
+    #expect(harness.source.lookCount() == 2, "\(harness.source.lookCount())")
+    // It waited the coarse cadence, not the quiet window.
+    #expect(harness.clock.seconds() >= MacFourVerbs.fallbackPollSeconds - 0.001)
+}
+
+@Test
+func wait_keepsItsVocabularyAndItsBudget() {
+    #expect(MacFourVerbs.maxWaitSeconds == 60)
+    #expect(MacFourVerbs.defaultWaitSeconds == 10)
+    // The quiet window carries the same meaning the old 0.5s poll encoded.
+    #expect(MacFourVerbs.settleQuietSeconds == 0.5)
+    #expect(MacFourVerbs.fallbackPollSeconds == 5.0)
+    #expect(MacFourVerbs.signalPollSeconds < MacFourVerbs.settleQuietSeconds)
 }
 
 @Test

@@ -13,8 +13,34 @@ extension NativeOAuthFlow {
         case available(email: String?, alreadyDeclined: Bool)
         case unavailable(reason: String)
     }
-    /// Disk-only sign-out: remove the provider's token file. Returns true if
-    /// a file was removed (or absent).
+    /// Remove one credential file under the SAME per-path lock the adapters'
+    /// token refresh takes. User, 2026-09-06: sign-out deleted the file with no
+    /// lock, so a refresh that had already compared the bytes wrote them back
+    /// afterwards and the user was silently signed back in.
+    ///
+    /// Returns false when the lock could not be taken or the file could not be
+    /// deleted. User, 2026-09-06: both failures were swallowed by `try?`, so a
+    /// sign-out that left the token on disk still reported success and the user
+    /// was told they were signed out while the credential was still usable.
+    private static func removeCredentialFile(at path: URL) -> Bool {
+        do {
+            return try CredentialFileLock.withLock(path) {
+                guard FileManager.default.fileExists(atPath: path.path) else { return true }
+                do {
+                    try FileManager.default.removeItem(at: path)
+                    return true
+                } catch {
+                    return false
+                }
+            }
+        } catch {
+            return false
+        }
+    }
+
+    /// Disk-only sign-out: remove the provider's token file. Returns true only
+    /// when every credential file this provider owns is gone (or was already
+    /// absent) — a lock or delete failure is reported, not swallowed.
     static func clearTokens(providerId: String, dataRoot: URL? = nil) -> Bool {
         let normalized = normalizedOAuthProviderId(providerId)
         switch providerId {
@@ -24,46 +50,94 @@ extension NativeOAuthFlow {
                 .appendingPathComponent("auth.json")
                 .standardizedFileURL
                 .path
-            for path in OpenAIOAuthDirectAdapter.authPathCandidates(dataRoot: PersistenceCore.defaultDataRoot()) {
+            // User, 2026-09-06: honour the root the caller passed. This walked
+            // the DEFAULT root's candidates, so a sign-out against an override
+            // root (an alternate install, a test root) deleted the wrong
+            // install's tokens and left the intended one signed in.
+            // User, 2026-09-06: and delete ONLY this root's app-owned file. The
+            // full candidate walk also returns the CODEX_HOME and
+            // NATIVE_AGENT_DATA_ROOT env paths, the repo checkout's,
+            // Application Support's and the default root's — so signing out of
+            // one install wiped every other install's ChatGPT token.
+            // `allowSharedFallbacks: false` is exactly `<root>/codex_home/
+            // auth.json`, which is where in-app sign-in writes
+            // (`openAIAppOwnedAuthPath`).
+            let root = dataRoot ?? PersistenceCore.defaultDataRoot()
+            var removed = true
+            for path in OpenAIOAuthDirectAdapter.authPathCandidates(
+                dataRoot: root,
+                allowSharedFallbacks: false
+            ) {
                 guard path.standardizedFileURL.path != sharedCodexAuth else { continue }
-                if FileManager.default.fileExists(atPath: path.path) {
-                    try? FileManager.default.removeItem(at: path)
-                }
+                if !removeCredentialFile(at: path) { removed = false }
             }
             // Sign-out must also revoke CLI-session adoption: the shared
             // ~/.codex file is deliberately never deleted (it belongs to the
             // CLI), so without this the very next status refresh would
             // silently re-adopt it and the user would stay signed in
             // (gpt-5.5 review 2026-08-06, blocking).
-            if OpenAIOAuthDirectAdapter.cliAdoptionConsent() == .allowed {
-                recordCodexCLISessionDecision(allow: false, source: "sign_out")
+            // User, 2026-09-06: revoke THIS root's consent record, not the
+            // default root's — the read and the write disagreed, so a
+            // sign-out against an override root left its adoption consent
+            // in place and re-adopted the CLI session on the next refresh.
+            if OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: root) == .allowed,
+               !recordCodexCLISessionDecision(allow: false, source: "sign_out", dataRoot: root) {
+                removed = false
             }
-            return true
+            return removed
         case "anthropic_oauth_direct":
-            let path = anthropicTokenPath(dataRoot: dataRoot)
-            if FileManager.default.fileExists(atPath: path.path) {
-                try? FileManager.default.removeItem(at: path)
-            }
-            return true
+            return removeCredentialFile(at: anthropicTokenPath(dataRoot: dataRoot))
         default:
             guard normalized == "xai_oauth_direct" else { return false }
-            let path = XAIOAuthDirectAdapter.tokenPath()
-            if FileManager.default.fileExists(atPath: path.path) {
-                try? FileManager.default.removeItem(at: path)
-            }
-            return true
+            // User, 2026-09-06: same root scoping as the ChatGPT branch above.
+            return removeCredentialFile(
+                at: XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot())
+            )
+        }
+    }
+
+    /// The credential file the badge reads for a provider under `dataRoot`.
+    /// User, 2026-09-06: the ChatGPT and xAI arms read the DEFAULT root's files
+    /// whatever root the caller passed, so a badge for an override root
+    /// reported the default install's state.
+    private static func statusCredentialPath(providerId: String, dataRoot: URL?) -> URL? {
+        switch normalizedOAuthProviderId(providerId) {
+        case "openai_oauth_direct":
+            return openAIStatusAuthPath(dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot())
+        case "anthropic_oauth_direct":
+            return anthropicTokenPath(dataRoot: dataRoot)
+        case "xai_oauth_direct":
+            return XAIOAuthDirectAdapter.tokenPath(
+                dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot())
+        default:
+            return nil
+        }
+    }
+
+    /// True when the persisted credential carries a non-empty refresh token —
+    /// the only thing that makes an expired access token recoverable without
+    /// the browser. User, 2026-09-06: the badge promised a refresh on the next
+    /// chat for every expired credential, including ones with nothing to
+    /// refresh with, so a dead sign-in looked like it would heal itself.
+    static func hasRefreshToken(providerId: String, dataRoot: URL? = nil) -> Bool {
+        guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot),
+              let data = try? Data(contentsOf: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        let candidates = [
+            obj["refresh_token"] as? String,
+            (obj["tokens"] as? [String: Any])?["refresh_token"] as? String,
+        ]
+        return candidates.contains {
+            ($0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
         }
     }
 
     /// Read the persisted `expires_at` for a provider, or nil if not
     /// signed in / no expiry persisted.
     static func expiresAt(providerId: String, dataRoot: URL? = nil) -> Date? {
-        let path: URL
-        switch normalizedOAuthProviderId(providerId) {
-        case "openai_oauth_direct":    path = openAIActiveAuthPath() ?? openAIAuthPath()
-        case "anthropic_oauth_direct": path = anthropicTokenPath(dataRoot: dataRoot)
-        case "xai_oauth_direct":       path = XAIOAuthDirectAdapter.tokenPath()
-        default: return nil
+        guard let path = statusCredentialPath(providerId: providerId, dataRoot: dataRoot) else {
+            return nil
         }
         guard let data = try? Data(contentsOf: path),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -101,7 +175,8 @@ extension NativeOAuthFlow {
         guard isSignedIn(providerId: providerId, dataRoot: dataRoot) else { return nil }
         let base = expiryStatusText(providerId: providerId, dataRoot: dataRoot)
         if normalizedOAuthProviderId(providerId) == "openai_oauth_direct",
-           let adoption = openAIAdoptedCLISessionDetail() {
+           let adoption = openAIAdoptedCLISessionDetail(
+            dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()) {
             return "\(base) — \(adoption)"
         }
         return base
@@ -112,6 +187,9 @@ extension NativeOAuthFlow {
         let now = Date()
         let remaining = exp.timeIntervalSince(now)
         if remaining <= 0 {
+            guard hasRefreshToken(providerId: providerId, dataRoot: dataRoot) else {
+                return "Expired — sign in again"
+            }
             return "Expired — refresh on next chat"
         }
         let totalSec = Int(remaining)
@@ -126,6 +204,12 @@ extension NativeOAuthFlow {
             label = "<1m"
         }
         if remaining <= 120 {
+            // User, 2026-09-06: a credential minutes from expiry with no refresh
+            // token cannot refresh on the next chat any more than an already
+            // expired one can — the same check the expired arm makes.
+            guard hasRefreshToken(providerId: providerId, dataRoot: dataRoot) else {
+                return "Signed in (expires in \(label) — sign in again)"
+            }
             return "Signed in (refresh on next chat)"
         }
         return "Signed in (expires in \(label))"
@@ -139,18 +223,19 @@ extension NativeOAuthFlow {
     /// The badge must name the source (and the account, when the token
     /// carries one) so the user can tell whose credentials are live.
     ///
-    /// The active path comes from the SAME resolver chat execution uses
-    /// (`preferredAuthPath`, via `openAIAuthPath()`), not the first-usable
-    /// candidate scan: `preferredAuthPath` honors `CODEX_HOME` /
-    /// `NATIVE_AGENT_DATA_ROOT` overrides unconditionally, so a badge built
-    /// from a different resolver could label a source execution never reads
-    /// (gpt-5.5 review 2026-08-06, blocking). Both sides resolve symlinks
-    /// before comparing.
+    /// The active path comes from the SAME resolver the rest of the badge uses
+    /// (`openAIStatusAuthPath`), never a wider scan, so the label can only ever
+    /// name a source this root's status was actually read from (gpt-5.5 review
+    /// 2026-08-06, blocking; root confinement User, 2026-09-06). Both sides
+    /// resolve symlinks before comparing.
     static func openAIAdoptedCLISessionDetail(
         activeAuthPath: URL? = nil,
-        sharedCLIHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome()
+        sharedCLIHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome(),
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> String? {
-        let path = activeAuthPath ?? openAIAuthPath()
+        guard let path = activeAuthPath
+            ?? openAIStatusAuthPath(dataRoot: dataRoot, sharedCLIHome: sharedCLIHome)
+        else { return nil }
         guard OpenAIOAuthDirectAdapter.hasUsableTokens(at: path) else { return nil }
         let sharedCLIAuth = sharedCLIHome
             .appendingPathComponent("auth.json")
@@ -185,7 +270,11 @@ extension NativeOAuthFlow {
     static func isSignedIn(providerId: String, dataRoot: URL? = nil) -> Bool {
         switch normalizedOAuthProviderId(providerId) {
         case "openai_oauth_direct":
-            guard let path = openAIActiveAuthPath(),
+            // User, 2026-09-06: same root confinement as `statusCredentialPath`
+            // — the badge said "Signed in" off a credential belonging to a
+            // different root than the one the screen is showing.
+            guard let path = openAIStatusAuthPath(
+                dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()),
                   let data = try? Data(contentsOf: path),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tokens = obj["tokens"] as? [String: Any],
@@ -196,7 +285,8 @@ extension NativeOAuthFlow {
         case "anthropic_oauth_direct":
             return anthropicOAuthCredentialState(dataRoot: dataRoot) == .ready
         case "xai_oauth_direct":
-            guard let data = try? Data(contentsOf: XAIOAuthDirectAdapter.tokenPath()),
+            guard let data = try? Data(contentsOf: XAIOAuthDirectAdapter.tokenPath(
+                      dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot())),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return false }
             if let s = obj["access_token"] as? String, !s.isEmpty { return true }
@@ -209,18 +299,55 @@ extension NativeOAuthFlow {
 
     // MARK: - Paths (shared with the read-side adapters)
 
-    static func openAIAuthPath() -> URL {
-        OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: PersistenceCore.defaultDataRoot())
+    static func openAIAuthPath(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> URL {
+        OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot)
     }
 
     /// App-owned ChatGPT auth WRITE target (`<dataRoot>/codex_home/auth.json`).
     /// In-app sign-in and re-auth always write here — never to the shared
     /// `~/.codex` session, which belongs to the Codex CLI.
-    static func openAIAppOwnedAuthPath() -> URL {
+    static func openAIAppOwnedAuthPath(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> URL {
         OpenAIOAuthDirectAdapter.preferredAuthPath(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            dataRoot: dataRoot,
             allowSharedFallbacks: false
         )
+    }
+
+    /// The ChatGPT credential a badge for `dataRoot` is allowed to read: that
+    /// root's own app-owned file, or — only when THAT root's consent record
+    /// allows it — the shared Codex CLI file. Nil when neither holds usable
+    /// tokens.
+    ///
+    /// User, 2026-09-06: the badge went through `preferredAuthPath`, which walks
+    /// every candidate on the machine (cwd repo, Application Support, the
+    /// default root) and returns the first usable one — so status for an
+    /// override root reported another root's sign-in, expiry and refreshability.
+    /// A root's status may never come from a different root's credential.
+    ///
+    /// `CODEX_HOME` stays a candidate for the DEFAULT root only: execution
+    /// there honours the process env unconditionally, while a client bound to
+    /// an override root rebinds `CODEX_HOME` to that root, so the process value
+    /// says nothing about it.
+    static func openAIStatusAuthPath(
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        sharedCLIHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome()
+    ) -> URL? {
+        var candidates: [URL] = []
+        if dataRoot.standardizedFileURL.path
+            == PersistenceCore.defaultDataRoot().standardizedFileURL.path,
+           let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
+            candidates.append(
+                URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)
+                    .appendingPathComponent("auth.json"))
+        }
+        candidates.append(openAIAppOwnedAuthPath(dataRoot: dataRoot))
+        if OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: dataRoot) == .allowed {
+            candidates.append(sharedCLIHome.appendingPathComponent("auth.json"))
+        }
+        return candidates.first { OpenAIOAuthDirectAdapter.hasUsableTokens(at: $0) }
     }
 
     /// The auth path chat execution will actually use, or nil when it holds
@@ -231,10 +358,11 @@ extension NativeOAuthFlow {
     /// never reads (gpt-5.5 review 2026-08-06). Injectable for tests only.
     static func openAIActiveAuthPath(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        userCodexHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome()
+        userCodexHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome(),
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> URL? {
         let path = OpenAIOAuthDirectAdapter.preferredAuthPath(
-            dataRoot: PersistenceCore.defaultDataRoot(),
+            dataRoot: dataRoot,
             environment: environment,
             userCodexHome: userCodexHome
         )
@@ -339,11 +467,19 @@ extension NativeOAuthFlow {
     /// accepts (the consent gate lives in the Core candidate walk). A prior
     /// decline keeps the offer visible but passive — declining stops the
     /// default adoption, not the capability.
+    ///
+    /// User, 2026-09-06: the consent record is per-root
+    /// (`<dataRoot>/providers/cli_session_adoption.json`), so the offer reads
+    /// the root the screen is showing — it read the DEFAULT root's record
+    /// whatever root was selected, and an override root's own decision was
+    /// invisible here.
     static func codexCLISessionOffer(
+        dataRoot: URL? = nil,
         sharedCLIHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome(),
-        consentState: OpenAIOAuthDirectAdapter.CLISessionAdoptionConsentState =
-            OpenAIOAuthDirectAdapter.cliAdoptionConsentState()
+        consentState: OpenAIOAuthDirectAdapter.CLISessionAdoptionConsentState? = nil
     ) -> CodexCLISessionOffer? {
+        let consentState = consentState
+            ?? OpenAIOAuthDirectAdapter.cliAdoptionConsentState(dataRoot: dataRoot)
         if case .corrupt(let reason) = consentState {
             return .unavailable(reason: reason)
         }
@@ -356,13 +492,42 @@ extension NativeOAuthFlow {
         )
     }
 
+    /// True when the shared Codex CLI session at `~/.codex/auth.json` is still
+    /// on disk for a ChatGPT / Codex provider row.
+    ///
+    /// User, 2026-09-06: removal must say so, and `isSignedIn` cannot answer the
+    /// question — `clearTokens` deliberately leaves that file alone (it belongs
+    /// to the CLI) and flips adoption consent to declined in the same breath,
+    /// so the very next status read reports "not signed in" and the sheet
+    /// claimed a removal that did not happen. Presence of the shared session is
+    /// the fact being disclosed, independent of whether the app will use it.
+    static func sharedCodexCLISessionRemains(
+        providerId: String,
+        sharedCLIHome: URL = OpenAIOAuthDirectAdapter.defaultUserCodexHome()
+    ) -> Bool {
+        let id = providerId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard id == "openai_oauth_direct" || id == "codex" else { return false }
+        return OpenAIOAuthDirectAdapter.hasUsableTokens(
+            at: sharedCLIHome.appendingPathComponent("auth.json")
+        )
+    }
+
     /// Record the user's decision from the Providers offer UI. Returns false
     /// when the write fails (the offer stays visible; nothing is adopted).
+    ///
+    /// User, 2026-09-06: the decision landed in the DEFAULT root's consent file
+    /// whatever root the screen was showing, so accepting the offer under an
+    /// override root granted adoption to a different install and left the
+    /// selected one still asking.
     @discardableResult
-    static func recordCodexCLISessionDecision(allow: Bool, source: String) -> Bool {
+    static func recordCodexCLISessionDecision(
+        allow: Bool,
+        source: String,
+        dataRoot: URL? = nil
+    ) -> Bool {
         do {
             try OpenAIOAuthDirectAdapter.recordCLIAdoptionConsent(
-                allow ? .allowed : .declined, source: source)
+                allow ? .allowed : .declined, source: source, dataRoot: dataRoot)
             return true
         } catch {
             print("[oauth] failed to record CLI adoption consent: \(error)")
@@ -372,7 +537,7 @@ extension NativeOAuthFlow {
 
     /// Called only after the Providers UI's destructive confirmation. Core
     /// byte-preserves and verifies the backup before removing the authority.
-    static func repairCodexCLISessionConsent() throws -> URL {
-        try OpenAIOAuthDirectAdapter.backupAndResetCorruptCLIAdoptionConsent()
+    static func repairCodexCLISessionConsent(dataRoot: URL? = nil) throws -> URL {
+        try OpenAIOAuthDirectAdapter.backupAndResetCorruptCLIAdoptionConsent(dataRoot: dataRoot)
     }
 }

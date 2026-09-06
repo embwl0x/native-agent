@@ -193,7 +193,14 @@ struct PairingView: View {
                     .padding(.horizontal, 32)
 
                 Button("Save Pairing Key") {
-                    saveICloudSecretFromPaste()
+                    // 2026-09-06: ask the device transport for the Mac's
+                    // published material first. On a Mac with no KVS
+                    // entitlement that record is the only thing this key can be
+                    // verified against.
+                    Task {
+                        await pairingStore.refreshPublishedPairingSecretForVerification()
+                        saveICloudSecretFromPaste()
+                    }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.regular)

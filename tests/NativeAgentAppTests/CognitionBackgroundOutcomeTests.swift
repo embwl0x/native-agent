@@ -141,12 +141,20 @@ struct CognitionBackgroundOutcomeTests {
             importance: 0.9
         ))
 
-        let loop: any LoopRunner = BackgroundLoopsAssembly.makeCognitionReflectionLoop(
+        // 2026-09-06: 7df7a4cd put an unresolved-load admission in front of
+        // `.spontaneous` reflection (CognitiveSubstrate+Reflection.swift:16),
+        // and the daily loop is deliberately `.spontaneous` so a quiet day
+        // spends nothing (BackgroundLoopsAssembly+Cognition.swift:37). On this
+        // freshly seeded substrate the load reads 0, so the loop wrapper now
+        // refuses before the provider is ever called and proves nothing about
+        // ignition. Drive the SAME entry point the loop wraps at the demand
+        // that is admitted — the pursuit-ignition path in runReflectionIfDue is
+        // identical for both demands, and it is that path this test pins.
+        let outcome = await runtime.runReflectionIfDue(
             llm: FailingCognitionLLM(),
-            intervalSeconds: 1,
-            runtime: runtime
+            reason: "scheduled cognitive reflection",
+            demand: .requested
         )
-        let outcome = await loop.tickOutcome()
 
         guard case .failed = outcome else {
             Issue.record("expected provider/persona reflection failure, got \(outcome)")

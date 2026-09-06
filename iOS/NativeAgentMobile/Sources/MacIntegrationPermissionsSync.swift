@@ -38,10 +38,38 @@ final class MacIntegrationPermissionsSync: ObservableObject {
     /// are stored; axis lookups fall back to `defaultValue(id:mode:)` via
     /// `get(id:mode:)`.
     @Published private(set) var permissions: [String: [String: Bool]] = [:]
+
+    /// What the phone can actually say about the Mac's permission matrix.
+    ///
+    /// Sweep 2026-09-01 item 36: `load()` used to treat "the Mac has never
+    /// published a projection" and "the Mac published a matrix" as the same
+    /// state — both left `projectionError` nil, and the view then rendered the
+    /// eleven hardcoded `defaultValue(id:mode:)` rows as if the Mac had
+    /// confirmed them. An unpaired or never-synced phone showed a complete,
+    /// plausible, entirely invented policy. The three cases are now distinct
+    /// and the view must say which one it is looking at.
+    enum ProjectionState: Equatable {
+        /// No projection has ever arrived. Nothing here is authority.
+        case awaitingMac
+        /// A well-formed projection from the Mac.
+        case published
+        /// A projection arrived but cannot be read; reads fail closed.
+        case malformed(String)
+    }
+
+    @Published private(set) var projectionState: ProjectionState = .awaitingMac
+
     /// Existing malformed KVS state is unavailable, never silently presented
     /// as the Mac's defaults. The view renders this instead of a plausible
     /// toggle matrix until the Mac republishes a complete projection.
-    @Published private(set) var projectionError: String?
+    var projectionError: String? {
+        if case let .malformed(message) = projectionState { return message }
+        return nil
+    }
+
+    /// True only when a readable matrix actually came from the Mac. The view
+    /// gates every live toggle on this; anything else is a labelled placeholder.
+    var hasMacProjection: Bool { projectionState == .published }
 
     init(
         projectionLoader: @escaping () -> [String: Any]? = {
@@ -73,8 +101,11 @@ final class MacIntegrationPermissionsSync: ObservableObject {
     /// silently replaced with believable defaults.
     private func load() {
         guard let raw = projectionLoader() else {
+            // Key absent from KVS: the Mac has never published. Say so — do
+            // not fall through to the default matrix and let the view render
+            // eleven confident toggles nobody on the Mac ever agreed to.
             permissions = [:]
-            projectionError = nil
+            projectionState = .awaitingMac
             return
         }
         var out: [String: [String: Bool]] = [:]
@@ -110,9 +141,11 @@ final class MacIntegrationPermissionsSync: ObservableObject {
         }
         permissions = out
         let malformedCount = malformedIDs.count
-        projectionError = malformedCount == 0
-            ? nil
-            : "Mac permission sync is unavailable: \(malformedCount) malformed \(malformedCount == 1 ? "row" : "rows") in projection (\(malformedIDs.sorted().joined(separator: ", ")))."
+        projectionState = malformedCount == 0
+            ? .published
+            : .malformed(
+                "Mac permission sync is unavailable: \(malformedCount) malformed \(malformedCount == 1 ? "row" : "rows") in projection (\(malformedIDs.sorted().joined(separator: ", ")))."
+            )
     }
 
     /// `NSUbiquitousKeyValueStore` carries property-list scalars as bridged
@@ -151,6 +184,10 @@ final class MacIntegrationPermissionsSync: ObservableObject {
     /// otherwise the default from `defaultValue(id:mode:)`. Callers that need
     /// the whole row should read `permissions[id]` directly and let the row
     /// view fall back per axis.
+    ///
+    /// When `projectionState` is `.awaitingMac` this returns the LOCAL default
+    /// and nothing more. It is a placeholder, not the Mac's answer — callers
+    /// must check `hasMacProjection` before presenting the result as policy.
     func get(id: String, mode: String) -> Bool {
         if projectionError != nil { return false }
         return permissions[id]?[mode] ?? defaultValue(id: id, mode: mode)

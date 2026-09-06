@@ -112,10 +112,10 @@ struct NativeAgentAppCoordinatorTests {
             NativeAgentNavigationDestination.route("sidebar:autoImprovement")
                 == .activity(.selfImprovement)
         )
-        #expect(
-            NativeAgentNavigationDestination.route("sidebar:journey")
-                == .activity(.journey)
-        )
+        // User authorized retiring the Native Experience surface, 2026-09-01:
+        // its deep link must now resolve to nothing rather than to a route
+        // that silently lands on a page that no longer exists.
+        #expect(NativeAgentNavigationDestination.route("sidebar:journey") == nil)
     }
 
     @Test("Desk is the primary work surface and retired routes converge on it")
@@ -134,20 +134,49 @@ struct NativeAgentAppCoordinatorTests {
         #expect(NativeAgentNavigationDestination.route("sidebar:desk") == .sidebar(.desk))
     }
 
-    @Test("Trust is primary, seated between Providers and Mac Integration")
-    func trustIsPrimaryBetweenProvidersAndMacIntegration() {
-        let primary = SidebarItem.primaryItems
-        #expect(primary.contains(.trust))
-        #expect(!SidebarItem.advancedItems.contains(.trust))
-        let providersIdx = primary.firstIndex(of: .providers)
-        let trustIdx = primary.firstIndex(of: .trust)
-        let macIdx = primary.firstIndex(of: .macIntegration)
+    // ui-simplify 2026-09-02 (Lane A): Trust, Providers, Mac Integration and
+    // Skills & Tools are SETUP, not places you work, so they left the rail and
+    // sit behind the one Advanced door in Settings. They are still reachable —
+    // by route, by ⌘K, and from that door — which is what this now pins. The
+    // classic shell keeps them primary, in their old order.
+    @Test("Trust and Providers are on the shell rail; Mac integration and Skills are tabs")
+    func trustIsSetupBehindAdvanced() {
+        // User, 2026-09-04: Advanced emptied onto the rail.
+        #expect(SidebarItem.shellPrimaryItems.contains(.trust))
+        #expect(SidebarItem.shellPrimaryItems.contains(.providers))
+        #expect(SidebarItem.shellAdvancedItems.contains(.macIntegration))
+        #expect(SidebarItem.shellAdvancedItems.contains(.skills))
+        #expect(SidebarItem.shellHome(for: .macIntegration)?.parent == .trust)
+        #expect(SidebarItem.shellHome(for: .skills)?.parent == .diagnostics)
+
+        let classic = SidebarItem.classicPrimaryItems
+        #expect(classic.contains(.trust))
+        #expect(!SidebarItem.classicAdvancedItems.contains(.trust))
+        let providersIdx = classic.firstIndex(of: .providers)
+        let trustIdx = classic.firstIndex(of: .trust)
+        let macIdx = classic.firstIndex(of: .macIntegration)
         #expect(providersIdx != nil && trustIdx != nil && macIdx != nil)
         if let providersIdx, let trustIdx, let macIdx {
             #expect(trustIdx == providersIdx + 1)
             #expect(macIdx == trustIdx + 1)
         }
         #expect(NativeAgentNavigationDestination.route("sidebar:trust") == .sidebar(.trust))
+    }
+
+    @Test("The shell rail is twelve places, Settings last, and Today routes to Activity")
+    func shellRailIsFivePlaces() {
+        #expect(SidebarItem.shellPrimaryItems == [
+            .chat, .activity, .memories, .personality, .providers, .trust, .connectors,
+            .diagnostics, .capabilities, .inboxPolicy, .desk, .settings,
+        ])
+        #expect(SidebarItem.inboxPolicy.shellRailTitle == "Notifications")
+        #expect(SidebarItem.activity.shellRailTitle == "Today")
+        #expect(SidebarItem.activity.displayName == "Activity")
+        // Lossless: nothing that was reachable stopped being reachable.
+        let reachable = Set(SidebarItem.shellPrimaryItems + SidebarItem.shellAdvancedItems)
+        for item in SidebarItem.classicPrimaryItems + SidebarItem.classicAdvancedItems {
+            #expect(reachable.contains(item))
+        }
     }
 
     @Test("Developer-surfaces gate partitions Advanced losslessly")
@@ -168,24 +197,46 @@ struct NativeAgentAppCoordinatorTests {
         let hidden = SidebarItem.visibleAdvancedItems(developerSurfacesEnabled: false)
         #expect(hidden == consumer)
         #expect(developer.allSatisfy { !hidden.contains($0) })
-        // A stranger cannot reach raw internals in one click.
-        #expect(!hidden.contains(.inspector))
-        #expect(!hidden.contains(.mcp))
-        #expect(!hidden.contains(.cognition))
+        // 2026-09-06: df974e5f "New shell shows every developer surface; the
+        // switch only gates the classic sidebar" — `developerItems` returns []
+        // outside the classic shell (SidebarModels.swift:182), so the named
+        // raw internals are only gated in classic. Pin the gate where it still
+        // exists rather than hard-coding one shell's membership.
+        if NativeAgentShellPreference.isClassic() {
+            // A stranger cannot reach raw internals in one click.
+            #expect(!hidden.contains(.inspector))
+            #expect(!hidden.contains(.mcp))
+            #expect(!hidden.contains(.cognition))
+        } else {
+            // User, 2026-09-04 (NativeAgentDesign.swift:386): developer surfaces
+            // are always on in the new shell, so nothing is hidden at all.
+            #expect(developer.isEmpty)
+            #expect(hidden == full)
+        }
 
         // Flag ON → the full authoritative set renders; nothing is dropped.
         let shown = SidebarItem.visibleAdvancedItems(developerSurfacesEnabled: true)
         #expect(shown == full)
         #expect(developer.allSatisfy { shown.contains($0) })
 
-        // The developer surfaces named by the audit are actually gated.
-        // B2.4/B2.6 integration: .cognition/.inspector are route-only
-        // Diagnostics segments — not sidebar rows in any bucket — and the
-        // Diagnostics row that fronts them is itself developer-gated.
-        #expect(!full.contains(.inspector))
-        #expect(!full.contains(.cognition))
-        #expect(SidebarItem.diagnostics.isDeveloperSurface)
-        #expect(SidebarItem.mcp.isDeveloperSurface)
+        // B2.4/B2.6 integration: .cognition/.inspector are never their own
+        // page — they render as Diagnostics content in both shells
+        // (ContentView.swift:353-354, SidebarItem.shellHome). That survived the
+        // rail rebuild; only their listing moved.
+        #expect(SidebarItem.shellHome(for: .inspector)?.parent == .diagnostics)
+        #expect(SidebarItem.shellHome(for: .cognition)?.parent == .diagnostics)
+        // 2026-09-06: ab1e2ace/0b0c083f put Diagnostics and MCP on the rail and
+        // df974e5f emptied the gate, so "the audit's raw internals are gated"
+        // is a classic-shell claim now; in the new shell they are listed as
+        // routes to their Diagnostics/Connectors tab instead.
+        if NativeAgentShellPreference.isClassic() {
+            #expect(!full.contains(.inspector))
+            #expect(!full.contains(.cognition))
+            #expect(SidebarItem.diagnostics.isDeveloperSurface)
+            #expect(SidebarItem.mcp.isDeveloperSurface)
+        } else {
+            #expect(SidebarItem.shellHome(for: .mcp)?.parent == .connectors)
+        }
         // Set-once consumer tabs stay ungated.
         #expect(!SidebarItem.personality.isDeveloperSurface)
         #expect(!SidebarItem.connectors.isDeveloperSurface)
@@ -204,7 +255,10 @@ struct NativeAgentAppCoordinatorTests {
 
     @Test("Skills and Tools share one sidebar destination with exact child routes")
     func skillsAndToolsShareOneSidebarDestination() {
-        #expect(SidebarItem.primaryItems.contains(.skills))
+        // 2026-09-02: Skills & Tools is setup, so it moved behind the Advanced
+        // door. Both halves of the shell still route to ONE destination.
+        #expect(SidebarItem.shellAdvancedItems.contains(.skills))
+        #expect(SidebarItem.classicPrimaryItems.contains(.skills))
         #expect(!SidebarItem.advancedItems.contains(.tools))
         #expect(SidebarItem.tools.normalized == .skills)
         #expect(SidebarItem.skills.displayName == "Skills & Tools")

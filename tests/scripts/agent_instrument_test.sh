@@ -355,7 +355,7 @@ mkdir -p "$ROOT/providers" "$ROOT/llm" "$ROOT/tools" "$ROOT/chat/archive" "$ROOT
 PLANTED_SECRET='sk-planted-DO-NOT-PRINT-3f9a'
 printf '{"chat": {"model": "claude-opus-5", "reasoningEffort": "high", "serviceTier": "default"}, "dream": {"model": "claude-x", "reasoningEffort": "medium", "serviceTier": "default"}}\n' \
   > "$ROOT/providers/surfaces.json"
-printf '{"chat": "anthropic", "dream": "ghostprovider", "desk": "anthropic", "cognition_cue": "anthropic", "old_surface": "anthropic"}\n' > "$ROOT/providers/active.json"
+printf '{"chat": "anthropic", "dream": "ghostprovider", "desk": "anthropic", "studio_wander": "anthropic", "cognition_cue": "anthropic", "old_surface": "anthropic"}\n' > "$ROOT/providers/active.json"
 printf '{"auth_mode": "api_key", "default_model": "claude-opus-5", "api_key": "%s"}\n' "$PLANTED_SECRET" \
   > "$ROOT/providers/anthropic.json"
 printf '{"auth_mode": "oauth", "default_model": "gpt-5.5", "access_token": "%s"}\n' "$PLANTED_SECRET" \
@@ -506,6 +506,21 @@ RC=$?
 check "exits 0 on a valid synthetic root (rc=$RC)" "$([ $RC -eq 0 ] && echo 0 || echo 1)"
 [ $RC -eq 0 ] || { sed -n '1,40p' "$TMP/stderr.txt"; }
 check "writes the --out report" "$([ -s "$REPORT" ] && echo 0 || echo 1)"
+# A changed model setting must not accuse calls made before the change.
+PIN_ROOT="$TMP/pin-epoch-root"
+cp -R "$ROOT" "$PIN_ROOT"
+printf '{"kind":"context.summary","ts":"%s","turnId":"sub-ms-admission","surface":"chat","payload":{"stageMs":{"contextFlow.attention.actorAdmission":0}}}\n' "$(inst 0)" >> "$PIN_ROOT/turn_traces/$(day 0).jsonl"
+printf '{"chat":{"model":"newly-selected-model"}}\n' > "$PIN_ROOT/providers/surfaces.json"
+touch -t 209901010000 "$PIN_ROOT/providers/surfaces.json" "$PIN_ROOT/providers/active.json"
+"$TOOL_BIN" --data-root "$PIN_ROOT" --days 7 --out "$TMP/new-pin.md" >/dev/null 2>&1
+grep -q 'never used their pinned model' "$TMP/new-pin.md"
+check "historical calls do not accuse a newly changed model pin" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+grep -q 'stageMs.contextFlow.attention.actorAdmission` is DARK' "$TMP/new-pin.md"
+check "sub-ms actor-free attention admission is not a broken-clock lead" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+touch -t 202001010000 "$PIN_ROOT/providers/surfaces.json" "$PIN_ROOT/providers/active.json"
+"$TOOL_BIN" --data-root "$PIN_ROOT" --days 7 --out "$TMP/old-pin.md" >/dev/null 2>&1
+grep -q 'never used their pinned model' "$TMP/old-pin.md"
+check "calls after a stable mismatched pin still raise drift" $?
 grep -q '^### Workflow run ledger' "$REPORT"
 check "workflow run ledger renders a real three-source section" $?
 grep -qF 'retired\_kind=1' "$REPORT"
@@ -1666,8 +1681,8 @@ echo "==> (s) wave-2 organs (SYS-09..15)"
 # ── SYS-09 providers/routing ──
 sysrow SYS-09 "$REPORT" | grep -q 'measured'
 check "SYS-09 (providers) is MEASURED on a root with pin + registry + trace" $?
-sysrow SYS-09 "$REPORT" | grep -q 'surface pins: \*\*2\*\* model-pinned / 5 surface(s)'
-check "SYS-09 includes canonical desk plus compatibility and orphan routing keys" $?
+sysrow SYS-09 "$REPORT" | grep -q 'surface pins: \*\*2\*\* model-pinned / 6 surface(s)'
+check "SYS-09 includes canonical desk and studio_wander plus compatibility and orphan routing keys" $?
 sysrow SYS-09 "$REPORT" | grep -q 'pins unresolvable: \*\*1\*\*'
 check "SYS-09 names the pin whose provider has no config file" $?
 sysrow SYS-09 "$REPORT" | grep -q 'pins on unknown surfaces: \*\*1\*\*'
@@ -2644,13 +2659,12 @@ mutate "walker marks everything covered" "$ROOT" \
   's|^        if !f.covered {$|        f.covered = true; f.coveredBy = ["forced"]; if !f.covered {|' \
   check_planted
 
-# M4 — ISSUE #1: disable BOTH sqlite unreadability guards (the copy-time
-# integrity gate and the after-the-fact query-failure condemnation), so a
+# M4 — disable snapshot failure, integrity and query-failure guards, so a
 # corrupt store falls through to `?? 0` exactly as it used to. The corrupt-store
 # assertion must then go RED.
 check_no_zero_nodes() { ! grep -q 'nodes: \*\*0\*\*' "$1"; }
 mutate "sqlite failures fall through to zero" "$CROOT" \
-  's@if let detail = integrityFailure {@if false, let detail = integrityFailure {@; s@let condemnOnQueryFailure = true@let condemnOnQueryFailure = false@' \
+  's@do { try copySQLiteOnce(src: src, dest: dest) }@do { try? copySQLiteOnce(src: src, dest: dest) }@; s@if let detail = integrityFailure {@if false, let detail = integrityFailure {@; s@let condemnOnQueryFailure = true@let condemnOnQueryFailure = false@' \
   check_no_zero_nodes
 
 # M5 — ISSUE #4: disable the malformed-line threshold guard. An all-garbage

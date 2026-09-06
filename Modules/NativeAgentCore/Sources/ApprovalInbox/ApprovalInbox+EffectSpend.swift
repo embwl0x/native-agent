@@ -75,7 +75,11 @@ extension SwiftNativeApprovalInbox {
         }
     }
 
-    func approvedEffectSpend(id: String) async -> JSONValue? {
+    /// Read-only probe for the durable spend marker. Public since 2026-09-06:
+    /// the dispatcher verifies a post-approval replay against it (an honest
+    /// replay is one the executor spent moments before dispatching). Never
+    /// mutates.
+    public func approvedEffectSpend(id: String) async -> JSONValue? {
         guard let spends = try? Self.loadEffectSpends(at: effectSpendPath) else { return nil }
         return spends[id.trimmingCharacters(in: .whitespacesAndNewlines)]
     }

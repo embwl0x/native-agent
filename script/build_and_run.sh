@@ -207,6 +207,23 @@ for spm_bundle in "$SPM_BIN_DIR_FOR_RES"/*.bundle; do
 done
 shopt -u nullglob
 
+# Large embedding model for release builds (2026-09-05). The bundled MiniLM is
+# the floor; a stronger model is too big for git, so a DMG ships it from
+# extras/embedding/ in the checkout (gitignored; embedding.json + the model +
+# vocab it names) into Contents/Resources/embedding/. The runtime prefers it
+# over MiniLM and re-embeds the store on first launch.
+EMBEDDING_MODEL_DIR="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
+# First build on a fresh checkout: fetch the model from the repository's model
+# release unless told not to. A failed fetch is not fatal; MiniLM remains.
+if [[ ! -f "$EMBEDDING_MODEL_DIR/embedding.json" && "${NATIVEAGENT_SKIP_EMBEDDING_FETCH:-0}" != "1" ]]; then
+  "$ROOT/script/fetch_embedding_model.sh" || echo "[embedding] fetch failed; building with the bundled MiniLM"
+fi
+if [[ -f "$EMBEDDING_MODEL_DIR/embedding.json" ]]; then
+  rm -rf "$BUNDLE/Contents/Resources/embedding"
+  cp -R "$EMBEDDING_MODEL_DIR" "$BUNDLE/Contents/Resources/embedding"
+  echo "[embedding] staged $(basename "$EMBEDDING_MODEL_DIR") ($(du -sh "$BUNDLE/Contents/Resources/embedding" | cut -f1))"
+fi
+
 assert_no_python_artifacts() {
   local bundle="$1" hit
   hit="$(find "$bundle/Contents/Resources" \

@@ -1,5 +1,6 @@
 import Foundation
 import BackgroundLoops
+import CognitiveSubstrate
 import NativeAgentCore
 import PersistenceCore
 
@@ -33,6 +34,8 @@ extension BackgroundLoopsAssembly {
         // above. This daily wake is deliberately only the slow integrity sweep
         // for a commit signal lost across a crash or material written outside
         // the live app process; it is no longer the reflection heartbeat.
+        // Item 41: the sweep is `.spontaneous` too — it wakes the ADMISSION,
+        // not a call. A quiet day still spends nothing when it fires.
         intervalSeconds: TimeInterval = 24 * 60 * 60,
         runtime: NativeCognitionRuntime = .shared
     ) -> some LoopRunner {
@@ -89,7 +92,8 @@ private struct CognitiveReflectionLoop: LoopRunner {
         // window and block the workshop for nothing).
         return await runtime.runReflectionIfDue(
             llm: llm,
-            reason: "scheduled budgeted cognitive reflection"
+            reason: "scheduled cognitive reflection",
+            demand: .spontaneous
         ).loopTickOutcome
     }
 }

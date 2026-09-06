@@ -63,8 +63,19 @@ private func lineageWrite(_ value: JSONValue, to path: URL) throws {
     #expect(try Data(contentsOf: sourcePath) == sourceBytes)
     let forkBytes = try Data(contentsOf: root.appendingPathComponent("chat/messages/\(fork.id).jsonl"))
     #expect(forkBytes.split(separator: 0x0A).count == 2)
+    // 2026-09-06: the fork used to be a byte-exact copy of the source prefix.
+    // 310e38ba ("Fork: stamp copied transcript rows with the new session id")
+    // restamps `sessionId` on every copied row — the old copy claimed to belong
+    // to the SOURCE session, so orphan recovery read the transcript as
+    // corruption and every reader that selects rows by sessionId matched none
+    // of them. Lineage stays on the index row (asserted above). So the pin is
+    // still exact, just against the restamped prefix: sessionId becomes the
+    // fork's id and NOTHING else about the copied rows may change.
     let expectedPrefix = try messages.prefix(2).reduce(into: Data()) { data, value in
-        data.append(try value.serializedData(pretty: false)); data.append(0x0A)
+        guard case .object(var object) = value else { return }
+        object["sessionId"] = .string(fork.id)
+        data.append(try JSONValue.object(object).serializedData(pretty: false))
+        data.append(0x0A)
     }
     #expect(forkBytes == expectedPrefix)
 

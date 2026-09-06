@@ -22,8 +22,12 @@ public struct DiskHygieneReport: Sendable, Equatable {
     /// first. Reported at the deepest offending level (a directory with an
     /// over-threshold child is not itself listed) so the card names the actual
     /// culprit rather than every ancestor of it. `sizeBytes` is the subtree
-    /// total, and protected stores are excluded — same rule the file tier and
-    /// the cleanup pass use.
+    /// total.
+    ///
+    /// Also carries any `residueRelativePrefixes` store that is present AT ANY
+    /// SIZE (sweep item 21, 2026-09-01). Residue is not "large", it is "should
+    /// not be here at all" — a store the runtime no longer uses, which is
+    /// exactly the shape a size threshold cannot see.
     public let largeDirectories: [DiskHygieneOffender]
     /// Total bytes of every regular file walked (bounded by `maxDepth`).
     public let totalBytes: Int64
@@ -69,8 +73,11 @@ public struct DiskHygieneReport: Sendable, Equatable {
 public enum DataRootDiskHygiene {
     /// A single file this large trips a notification (default 1 GB). Raised from
     /// 64 MB (2026-08-11, User: "push the tripwire closer to our 2gb limit") —
-    /// the old bound permanently flagged the 86.7 MB MiniLM embedder blob, a
-    /// wanted file nobody should delete, so the card was a daily false alarm.
+    /// the old bound permanently flagged the 86.7 MB MiniLM HuggingFace blob,
+    /// believed at the time to be a wanted file, so the card read as a daily
+    /// false alarm. (2026-09-01: that blob was residue after all — see
+    /// `residueRelativePrefixes`. The 1 GB bound stands on its own: it is a
+    /// runaway-single-file tripwire, not a residue detector.)
     public static let defaultSingleFileThreshold: Int64 = 1024 * 1024 * 1024
     /// Total `dataRoot` bytes this large trips a notification.
     ///
@@ -192,9 +199,15 @@ public enum DataRootDiskHygiene {
         offenders.sort { $0.sizeBytes > $1.sizeBytes }
         let directoryOffenders = directoryBytes
             .filter { rel, bytes in
-                bytes > directoryThreshold
-                    && !hasOffendingChild.contains(rel)
-                    && !isProtected(relativePath: rel)
+                (bytes > directoryThreshold && !hasOffendingChild.contains(rel))
+                    // Residue is reported whatever it weighs, and reported at
+                    // the residue root rather than at whichever descendant
+                    // happens to be fattest.
+                    || isResidue(relativePath: rel)
+            }
+            .filter { rel, _ in
+                // A residue store's own subtree is one finding, not one per level.
+                !isResidueDescendant(relativePath: rel)
             }
             .map { DiskHygieneOffender(relativePath: $0.key, sizeBytes: $0.value) }
             .sorted { $0.sizeBytes > $1.sizeBytes }
@@ -208,14 +221,20 @@ public enum DataRootDiskHygiene {
         )
     }
 
-    /// True when `relativePath` names, or sits under, a protected store. Case
-    /// folded because APFS is typically case-insensitive — the same reasoning
-    /// (and the same list) the cleanup pass uses.
-    static func isProtected(relativePath: String) -> Bool {
+    /// True when `relativePath` IS a residue store's root. Case folded because
+    /// APFS is typically case-insensitive, so `Extras/HF_Cache` addresses the
+    /// same directory as `extras/hf_cache`.
+    public static func isResidue(relativePath: String) -> Bool {
         let normalized = relativePath.lowercased()
-        return protectedRelativePrefixes.contains { prefix in
-            let p = prefix.lowercased()
-            return normalized == p || normalized.hasPrefix(p + "/")
+        return residueRelativePrefixes.contains { $0.lowercased() == normalized }
+    }
+
+    /// True when `relativePath` sits strictly UNDER a residue store's root — so
+    /// the branch is reported once, at the root, instead of once per level.
+    static func isResidueDescendant(relativePath: String) -> Bool {
+        let normalized = relativePath.lowercased()
+        return residueRelativePrefixes.contains {
+            normalized.hasPrefix($0.lowercased() + "/")
         }
     }
 
@@ -231,13 +250,23 @@ public enum DataRootDiskHygiene {
         return entryParts.dropFirst(rootParts.count).joined(separator: "/")
     }
 
-    // MARK: - Cleanup (user-initiated only)
+    // MARK: - Residue
 
-    /// Relative-path prefixes the cleanup pass refuses to touch even when a
-    /// file under them trips the size threshold. These are wanted permanent
-    /// stores — trashing the MiniLM embedder blob would only force a
-    /// re-download.
-    public static let protectedRelativePrefixes = ["extras/hf_cache"]
+    /// Stores that must NOT be here. Reported at any size, and freely
+    /// trashable by the cleanup pass.
+    ///
+    /// `extras/hf_cache` was the one PROTECTED prefix until 2026-09-01 (sweep
+    /// item 21). Its rationale — "trashing the MiniLM embedder blob would only
+    /// force a re-download" — stopped being true at the CoreML cutover: the
+    /// live embedder resolves `Bundle.module/minilm.mlpackage`
+    /// (`MemoryV2+Embedding.swift`, `CoreMLEmbeddingProvider.bundled`), and no
+    /// source path reads `extras/` at all. So 87 MB of HuggingFace cache sat
+    /// exempt from both the file tier and the directory tier on a false claim.
+    /// User deleted the directory; this entry is the tripwire for it coming
+    /// back — a re-downloaded cache is residue, not a wanted permanent store.
+    public static let residueRelativePrefixes = ["extras/hf_cache"]
+
+    // MARK: - Cleanup (user-initiated only)
 
     /// What happened to one requested path during a cleanup pass.
     public struct CleanupOutcome: Sendable, Equatable {
@@ -267,10 +296,12 @@ public enum DataRootDiskHygiene {
     /// Move the given dataRoot-relative files to the Trash (reversible — never a
     /// hard delete). ONLY ever called from an explicit user action (the inbox
     /// card's "Clean Up" button); no background loop invokes this. Guards:
-    /// a path that resolves outside `dataRoot`, a protected store, a missing
-    /// file, or anything that isn't a regular file is skipped with a reason,
-    /// never trashed. `trash` is injectable for tests; the default is
-    /// `FileManager.trashItem`.
+    /// a path that resolves outside `dataRoot`, a missing file, or anything
+    /// that isn't a regular file is skipped with a reason, never trashed.
+    /// There is no protected-store guard: the one prefix that ever had one
+    /// (`extras/hf_cache`) held it on a rationale the CoreML cutover made
+    /// false, and it is now listed as residue instead.
+    /// `trash` is injectable for tests; the default is `FileManager.trashItem`.
     public static func cleanup(
         dataRoot: URL,
         relativePaths: [String],
@@ -324,18 +355,6 @@ public enum DataRootDiskHygiene {
             guard resolvedParts.count > resolvedRootParts.count,
                   Array(resolvedParts.prefix(resolvedRootParts.count)) == resolvedRootParts else {
                 skip("outside the data directory")
-                continue
-            }
-            // Case-folded protected-prefix compare (gpt-5.5 review: APFS is
-            // typically case-insensitive, so `Extras/HF_Cache/…` addresses the
-            // protected store while dodging a case-sensitive prefix match).
-            let normalizedRel = parts.dropFirst(rootParts.count)
-                .joined(separator: "/").lowercased()
-            if protectedRelativePrefixes.contains(where: {
-                let p = $0.lowercased()
-                return normalizedRel == p || normalizedRel.hasPrefix(p + "/")
-            }) {
-                skip("protected store (model cache — would just re-download)")
                 continue
             }
             let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey])
@@ -453,8 +472,11 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
             totalThreshold: totalThreshold,
             directoryThreshold: directoryThreshold
         )
+        // A clean scan filed no card and changed nothing. It is a healthy
+        // observation, not work — reporting it `.completed` kept the dormancy
+        // clock fresh on a lane that has never had anything to do.
         guard report.tripped else {
-            return .completed(result: "disk clean (\(DataRootDiskHygiene.humanSize(report.totalBytes)))"
+            return .skipped(reason: "disk clean (\(DataRootDiskHygiene.humanSize(report.totalBytes)))"
                 + (report.truncated ? " [scan truncated at file budget]" : "")
                 + (report.depthTruncated ? " [depth-truncated: a store past maxDepth is unscanned]" : ""))
         }

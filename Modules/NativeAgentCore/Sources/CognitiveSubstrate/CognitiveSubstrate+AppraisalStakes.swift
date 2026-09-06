@@ -43,10 +43,58 @@ extension CognitiveSubstrate {
     ///
     /// These are `OrganismPredictionKind` raw values; the runtime carries the
     /// resolved path kind on the felt event's `subject.label`.
+    /// Item 5 (2026-09-02) adds the third entry, and it earns the allowlist for
+    /// the same reason the first two do: a horizon row is minted only from a
+    /// REAL dated source she is already carrying — a Desk item User parked until
+    /// a date, an approval she staged and he has not walked through, a peer she
+    /// delegated to, her own turn still hanging, the night's dream. A person or
+    /// a promise is on the other end of every one, by construction at the mint
+    /// site, which is exactly the property gate 1 tests for.
+    ///
+    /// It is unconditional (unlike the semantic entry below) because it cannot
+    /// be worn by accident: `OrganismHorizonRegister.resolutionPathLabel` is a
+    /// string this codebase stamps in exactly one place — the runtime's horizon
+    /// lane, composing an event it built from a ledger row it can see. It is
+    /// deliberately NOT an `OrganismPredictionKind` raw value, so the shared
+    /// felt-resolution composer (which labels events with the path kind) can
+    /// never produce it.
     static let stakeBearingResolutionPathKinds: Set<String> = [
         OrganismPredictionKind.approvalResolution.rawValue,
         OrganismPredictionKind.workflowAdvance.rawValue,
+        OrganismHorizonRegister.resolutionPathLabel,
     ]
+
+    /// Item 46 (2026-09-01), tightened by review fix 6.
+    ///
+    /// A `.semanticExpectation` resolution IS stake-bearing when the organism
+    /// minted it — the appraisal owner opens one only when a concern derived
+    /// from a User-approved active standing view is at stake. But `subject.label`
+    /// is just a string on an event, so putting the kind in the UNCONDITIONAL
+    /// allowlist above meant anything wearing that label walked past the
+    /// aboutness gate — precisely the denylist-shaped hole gate 1 exists to
+    /// close, reopened under a new name.
+    ///
+    /// So the semantic kind is CONDITIONALLY stake-bearing: admitted by gate 1
+    /// only when the event also carries the provenance the organism itself
+    /// stamps (the session and completion turn the resolved row was minted
+    /// under, via `OrganismResolutionFeltEvent.semanticScope`). Without it the
+    /// event falls through to gate 2 and must earn admission on aboutness like
+    /// any other, which is fail-closed.
+    static let conditionallyStakeBearingResolutionPathKinds: Set<String> = [
+        OrganismPredictionKind.semanticExpectation.rawValue,
+    ]
+
+    /// Does this felt event carry organism-stamped semantic provenance — the
+    /// session and completion turn the resolved row was minted under? Both
+    /// fields, both non-empty: a half-scoped event is a producer bug, not
+    /// evidence. Composed by the runtime from
+    /// `OrganismResolutionFeltEvent.semanticScope`.
+    static func carriesSemanticResolutionProvenance(_ event: CognitiveEvent) -> Bool {
+        OrganismSemanticExpectation.scope(
+            in: event.metadata,
+            key: OrganismSemanticExpectation.mintMetadataKey
+        ) != nil
+    }
 
     /// Prediction path kinds whose resolution is MACHINERY, not stake — the body
     /// noticing its own infrastructure work out. Kept as documentation of the
@@ -92,6 +140,12 @@ extension CognitiveSubstrate {
 
         let pathKind = (event.subject.label ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if Self.stakeBearingResolutionPathKinds.contains(pathKind) {
+            return true
+        }
+        // Review fix 6: the semantic kind passes gate 1 only WITH provenance.
+        // Unprovenanced, it keeps falling through to gate 2 below.
+        if Self.conditionallyStakeBearingResolutionPathKinds.contains(pathKind),
+           Self.carriesSemanticResolutionProvenance(event) {
             return true
         }
 

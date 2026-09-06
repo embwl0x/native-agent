@@ -35,6 +35,14 @@ public struct ConsolidationReport: Sendable, Equatable {
     public let pendingForReview: Int
     public let staleArchived: Int
     public let errors: [String]
+    /// Rows a RETIRED/WITHDRAWN/CORRECTION/SUPERSEDED record retired this pass
+    /// (lifecycle → corrected; the record itself stays active).
+    public let supersessionsApplied: Int
+    /// Retirement records whose top two candidates tied — skipped, not guessed.
+    public let supersessionsAmbiguous: Int
+    /// Already-archived rows the usage veto would now spare from the
+    /// mid-thought-fragment rule. Reported only; nothing is un-archived.
+    public let fragmentProtectedByUsage: Int
 
     public init(
         processed: Int,
@@ -42,7 +50,10 @@ public struct ConsolidationReport: Sendable, Equatable {
         duplicatesMerged: Int,
         pendingForReview: Int,
         staleArchived: Int,
-        errors: [String]
+        errors: [String],
+        supersessionsApplied: Int = 0,
+        supersessionsAmbiguous: Int = 0,
+        fragmentProtectedByUsage: Int = 0
     ) {
         self.processed = processed
         self.autoAccepted = autoAccepted
@@ -50,6 +61,9 @@ public struct ConsolidationReport: Sendable, Equatable {
         self.pendingForReview = pendingForReview
         self.staleArchived = staleArchived
         self.errors = errors
+        self.supersessionsApplied = supersessionsApplied
+        self.supersessionsAmbiguous = supersessionsAmbiguous
+        self.fragmentProtectedByUsage = fragmentProtectedByUsage
     }
 }
 
@@ -85,18 +99,26 @@ public actor MemoryConsolidator {
     /// (with the <dataRoot>/memory/probes/probe_set.json override).
     private let embedder: (any EmbeddingProvider)?
     private let probeSet: MemoryProbeSet?
+    /// The data root whose `trust/policy.json` owns this run's memory switches.
+    /// nil → derive it from the store path (the plain live-store case). The
+    /// gate MUST pass the real root: it points the consolidator at a candidate
+    /// COPY of the database under memory/consolidation/candidates/<runId>/, and
+    /// no policy is ever copied there (2026-09-06).
+    private let policyRoot: URL?
 
     public init(
         storage: MemoryStorage,
         now: @escaping @Sendable () -> Date = { Date() },
         embedder: (any EmbeddingProvider)? = nil,
-        probeSet: MemoryProbeSet? = nil
+        probeSet: MemoryProbeSet? = nil,
+        policyRoot: URL? = nil
     ) {
         self.storage = storage
         self.logger = Logger(subsystem: "com.nativeagent.app", category: "memory-consolidation")
         self.now = now
         self.embedder = embedder
         self.probeSet = probeSet
+        self.policyRoot = policyRoot
     }
 
     // MARK: - Gated entry points (U3 wave-2 item 7)
@@ -167,7 +189,13 @@ public actor MemoryConsolidator {
                     + "[\(scores.lostProbeIds.joined(separator: ", "))] vs live "
                     + "(live \(scores.live.summary), candidate \(scores.candidate.summary)); "
                     + "candidate discarded"
-                ]
+                ],
+                // The refusal changes WHY the plan will not be applied, not what
+                // the plan counted. Defaulting these to zero would report a run
+                // that superseded nothing, which is a different claim.
+                supersessionsApplied: plan.supersessionsApplied,
+                supersessionsAmbiguous: plan.supersessionsAmbiguous,
+                fragmentProtectedByUsage: plan.fragmentProtectedByUsage
             )
         case .staged(_, _, _, let plan):
             return plan
@@ -185,6 +213,24 @@ public actor MemoryConsolidator {
         var duplicatesMerged = 0
         var pendingForReview = 0
         var errors: [String] = []
+
+        // Settings ▸ "Keep consolidated memories without asking" and
+        // Settings ▸ "Memory hygiene". Read ONCE, fresh, at the start of the
+        // run so every step of this pass agrees on one policy generation; the
+        // next run re-reads, so a flip lands on the next run.
+        // The policy that owns THIS store: memory/memory.sqlite sits two levels
+        // under the data root (reviewer, 2026-09-05: a test or override root
+        // must not read the default root's policy). 2026-09-06: when the caller
+        // KNOWS the root — the consolidation gate, which runs this against a
+        // candidate copy under memory/consolidation/candidates/<runId>/ — that
+        // root wins. Deriving it from the candidate path looked for a
+        // trust/policy.json that is never copied there, so both switches
+        // silently fell back to true no matter what Settings said.
+        let derivedPolicyRoot = (await storage.path)
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let policyRoot = self.policyRoot ?? derivedPolicyRoot
+        let autoPromote = MemoryPolicyGate.autoPromoteConsolidatedEnabled(dataRoot: policyRoot)
+        let hygiene = MemoryPolicyGate.hygieneEnabled(dataRoot: policyRoot)
 
         let pending = try await storage.listProposals(status: "pending")
         // Cache active memories with embeddings once per run so we don't
@@ -206,7 +252,9 @@ public actor MemoryConsolidator {
 
                 // 2) Durable-memory quality gate. This catches low-value
                 // pending rows that predate stricter proposal-time filtering.
-                if let reason = MemoryCandidateQuality.rejectionReason(
+                // Settings ▸ "Memory hygiene": off leaves them pending for
+                // review instead of auto-rejecting them.
+                if hygiene, let reason = MemoryCandidateQuality.rejectionReason(
                     text: proposal.content,
                     source: proposal.source,
                     kind: MemoryRecallScoring.kind(of: proposal.metadata)
@@ -229,8 +277,11 @@ public actor MemoryConsolidator {
                 }
 
                 // 4) durability_score >= 0.85 → auto-accept.
+                // Settings ▸ "Keep consolidated memories without asking": off
+                // suppresses this branch, so a durable proposal falls through
+                // to (5) and waits for review instead of going straight in.
                 let durability = durabilityScore(proposal)
-                if let d = durability, d >= memoryConsolidationAutoAcceptThreshold {
+                if autoPromote, let d = durability, d >= memoryConsolidationAutoAcceptThreshold {
                     let accepted = try await storage.acceptProposal(id: proposal.id)
                     actives.append(accepted)
                     autoAccepted += 1
@@ -253,28 +304,59 @@ public actor MemoryConsolidator {
             errors.append("supersession: \(error.localizedDescription)")
         }
 
-        // 6) Active-memory quality/dedup hygiene.
-        var activeQualityArchived = 0
-        var activeDuplicatesArchived = 0
+        // 5b) Supersession lint: a retirement record retires what it names.
+        //     Before this, "RETIRED 2026-08-02: the 'Voice calibration FINAL'
+        //     memories … are WRONG" and the rows it retired were both
+        //     `confirmed`, equal weight, and she re-litigated them every turn.
+        //     Demotion only (lifecycle → corrected + superseded_by); the record
+        //     stays active, and nothing is archived or deleted.
+        var supersessionsApplied = 0
+        var supersessionsAmbiguous = 0
         do {
-            activeQualityArchived = try await archiveNonDurableActiveMemories()
+            let lint = try await MemorySupersessionLint.run(storage: storage, apply: true)
+            supersessionsApplied = lint.applied
+            supersessionsAmbiguous = lint.ambiguous
         } catch {
-            errors.append("active quality archive: \(error.localizedDescription)")
-        }
-        do {
-            activeDuplicatesArchived = try await archiveDuplicateActiveMemories()
-            duplicatesMerged += activeDuplicatesArchived
-        } catch {
-            errors.append("active duplicate archive: \(error.localizedDescription)")
+            errors.append("supersession lint: \(error.localizedDescription)")
         }
 
-        // 7) Stale eviction.
-        let staleArchived: Int
+        // 6) Active-memory quality/dedup hygiene, and 7) stale eviction.
+        // Settings ▸ "Memory hygiene": off skips the whole cleanup half —
+        // noisy-reflection archiving, duplicate archiving and decay — while
+        // consolidation itself (steps 1-5 above) runs unchanged.
+        var staleArchived = 0
+        if hygiene {
+            var activeQualityArchived = 0
+            do {
+                activeQualityArchived = try await archiveNonDurableActiveMemories()
+            } catch {
+                errors.append("active quality archive: \(error.localizedDescription)")
+            }
+            do {
+                duplicatesMerged += try await archiveDuplicateActiveMemories()
+            } catch {
+                errors.append("active duplicate archive: \(error.localizedDescription)")
+            }
+            do {
+                staleArchived = try await archiveStale() + activeQualityArchived
+            } catch {
+                errors.append("stale archive: \(error.localizedDescription)")
+                staleArchived = activeQualityArchived
+            }
+        }
+
+        // Already-archived rows the usage veto would now spare. Reported so the
+        // 2026-08-24 false positives (use_count 477 and 666, both archived as
+        // mid-thought fragments) are countable instead of anecdotal; un-archiving
+        // is a decision for a human, not a side effect of a hygiene pass.
+        var fragmentProtectedByUsage = 0
         do {
-            staleArchived = try await archiveStale() + activeQualityArchived
+            let archived = try await storage.listMemories(
+                persona: nil, status: "archived", limit: nil)
+            fragmentProtectedByUsage = MemoryFragmentUsageProtection
+                .archivedRowsNowProtected(archived, now: now())
         } catch {
-            errors.append("stale archive: \(error.localizedDescription)")
-            staleArchived = activeQualityArchived
+            errors.append("fragment protection scan: \(error.localizedDescription)")
         }
 
         let report = ConsolidationReport(
@@ -283,10 +365,13 @@ public actor MemoryConsolidator {
             duplicatesMerged: duplicatesMerged,
             pendingForReview: pendingForReview,
             staleArchived: staleArchived,
-            errors: errors
+            errors: errors,
+            supersessionsApplied: supersessionsApplied,
+            supersessionsAmbiguous: supersessionsAmbiguous,
+            fragmentProtectedByUsage: fragmentProtectedByUsage
         )
         logger.info(
-            "MemoryConsolidator: processed=\(processed, privacy: .public) autoAccepted=\(autoAccepted, privacy: .public) duplicatesMerged=\(duplicatesMerged, privacy: .public) pendingForReview=\(pendingForReview, privacy: .public) staleArchived=\(staleArchived, privacy: .public) errors=\(errors.count, privacy: .public)"
+            "MemoryConsolidator: processed=\(processed, privacy: .public) autoAccepted=\(autoAccepted, privacy: .public) duplicatesMerged=\(duplicatesMerged, privacy: .public) pendingForReview=\(pendingForReview, privacy: .public) staleArchived=\(staleArchived, privacy: .public) supersessions=\(supersessionsApplied, privacy: .public) supersessionsAmbiguous=\(supersessionsAmbiguous, privacy: .public) fragmentProtectedByUsage=\(fragmentProtectedByUsage, privacy: .public) errors=\(errors.count, privacy: .public)"
         )
         return report
     }
@@ -300,8 +385,17 @@ public actor MemoryConsolidator {
         guard let pe = proposal.embedding, !pe.isEmpty else { return nil }
         let qn = Self.l2norm(pe)
         guard qn > 0 else { return nil }
+        // User, 2026-09-06: a proposal may only merge into a memory in its OWN
+        // persona and disclosure scope, and only when both vectors come from
+        // the same stamped embedding epoch (see the notes on
+        // `disclosureScopeKey` and `comparableEpochs`).
+        let proposalScope = Self.disclosureScopeKey(
+            personaId: proposal.personaId, metadata: proposal.metadata)
         var best: (StoredMemory, Double)? = nil
         for m in actives {
+            guard Self.comparableEpochs(proposal.embeddingEpoch, m.embeddingEpoch) else { continue }
+            guard Self.disclosureScopeKey(
+                personaId: m.personaId, metadata: m.metadata) == proposalScope else { continue }
             guard let e = m.embedding, e.count == pe.count else { continue }
             let mn = Self.l2norm(e)
             guard mn > 0 else { continue }
@@ -363,13 +457,22 @@ public actor MemoryConsolidator {
     /// colliding). Archive only — supersession is demotion, not erasure.
     private func supersedeSingleValuedKinds() async throws {
         let actives = try await storage.listMemories(persona: nil, status: "active", limit: nil)
-        var byKind: [String: [StoredMemory]] = [:]
+        // User, 2026-09-06: group by (disclosure scope, kind), not kind alone.
+        // "Two values can't both be true" holds inside ONE persona and ONE
+        // disclosure scope; across them it is false — a public-surface "lives in
+        // Austin" and a private-lane row of the same kind are separate facts,
+        // and another persona's row is not this persona's fact at all. Keying
+        // on kind alone picked one global newest and archived every other
+        // scope's current row. Same key duplicate hygiene uses.
+        var byScopeAndKind: [String: [StoredMemory]] = [:]
         for m in actives {
             guard let kind = MemoryRecallScoring.kind(of: m.metadata),
                   memorySupersessionSingleValuedKinds.contains(kind) else { continue }
-            byKind[kind, default: []].append(m)
+            let key = Self.disclosureScopeKey(personaId: m.personaId, metadata: m.metadata)
+                + "|" + kind
+            byScopeAndKind[key, default: []].append(m)
         }
-        for (_, group) in byKind where group.count > 1 {
+        for (_, group) in byScopeAndKind where group.count > 1 {
             // Newest first by PARSED Date — the codebase writes both fractional
             // and plain ISO8601, and string-sorting mixes them wrongly within
             // the same second (gpt-5.5 wave1 finding 4). Unparseable → distant
@@ -382,6 +485,10 @@ public actor MemoryConsolidator {
             }
             guard let newest = sorted.first else { continue }
             for older in sorted.dropFirst() {
+                // User, 2026-09-06: cosine across two different (or unstamped)
+                // embedding epochs is a number, not a similarity — see
+                // `comparableEpochs`. No comparable vectors, no supersession.
+                guard Self.comparableEpochs(newest.embeddingEpoch, older.embeddingEpoch) else { continue }
                 guard Self.cosine(newest.embedding, older.embedding) >= memorySupersessionCosineFloor else { continue }
                 _ = try await storage.archiveSuperseded(id: older.id, by: newest.id)
             }
@@ -405,12 +512,24 @@ public actor MemoryConsolidator {
                 text: memory.content,
                 source: memory.source,
                 kind: MemoryRecallScoring.kind(of: memory.metadata)
-            ), try await archiveActiveMemory(
-                memory,
-                reason: "memory hygiene archived non-durable active memory: \(reason)",
-                duplicateOf: nil
             ) {
-                archived += 1
+                // Access outranks grammar. The 2026-08-24 pass archived a row
+                // she had reached for 477 times as a "mid-thought fragment";
+                // whatever the sentence looks like, that use count is the
+                // evidence it is durable. Scoped to this ONE rule — the other
+                // rejection reasons (transient state, tool transcript) are about
+                // what the row IS, not how it reads, and usage cannot redeem them.
+                if reason == MemoryCandidateQuality.midThoughtFragmentReason,
+                   MemoryFragmentUsageProtection.isProtected(memory, now: now()) {
+                    continue
+                }
+                if try await archiveActiveMemory(
+                    memory,
+                    reason: "memory hygiene archived non-durable active memory: \(reason)",
+                    duplicateOf: nil
+                ) {
+                    archived += 1
+                }
             }
         }
         return archived
@@ -421,8 +540,12 @@ public actor MemoryConsolidator {
         var archivedIDs = Set<String>()
         var archived = 0
 
-        for group in Dictionary(grouping: actives, by: { Self.normalizedContentKey($0.content) }).values
-            where group.count > 1 {
+        // User, 2026-09-06: group WITHIN a persona and disclosure scope, not
+        // across every row in the store (see `disclosureScopeKey`).
+        for group in Dictionary(grouping: actives, by: { memory in
+            Self.disclosureScopeKey(personaId: memory.personaId, metadata: memory.metadata)
+                + "|" + Self.normalizedContentKey(memory.content)
+        }).values where group.count > 1 {
             let keeper = Self.preferredKeeper(in: group)
             for memory in group where memory.id != keeper.id {
                 if try await archiveActiveMemory(
@@ -437,13 +560,30 @@ public actor MemoryConsolidator {
         }
 
         let remaining = actives.filter { !archivedIDs.contains($0.id) }
+        // Scope keys once per row, not once per pair: this loop is already
+        // O(n^2) over 384-dimensional cosines and must not grow a string build
+        // per comparison.
+        let scopeKeys = remaining.map {
+            Self.disclosureScopeKey(personaId: $0.personaId, metadata: $0.metadata)
+        }
         for i in remaining.indices {
             let left = remaining[i]
             guard !archivedIDs.contains(left.id) else { continue }
             for j in remaining.index(after: i)..<remaining.endIndex {
+                // User, 2026-09-06: `left` can be the row this loop archives
+                // (preferredKeeper picks either side). Re-check it here: the
+                // old shape checked `left` only once, BEFORE the inner loop, so
+                // an already-archived row went on acting as a live comparison
+                // partner and could be recorded as the keeper of a later
+                // "duplicate" — leaving the survivor pointing at a dead row.
+                guard !archivedIDs.contains(left.id) else { break }
                 let right = remaining[j]
                 guard !archivedIDs.contains(right.id) else { continue }
                 guard Self.sameKind(left, right) else { continue }
+                // Same persona + disclosure scope, and vectors from the same
+                // stamped epoch — otherwise this is not a comparison.
+                guard scopeKeys[i] == scopeKeys[j] else { continue }
+                guard Self.comparableEpochs(left.embeddingEpoch, right.embeddingEpoch) else { continue }
                 guard Self.cosine(left.embedding, right.embedding) >= memoryConsolidationActiveDuplicateThreshold else { continue }
                 guard Self.lexicalJaccard(left.content, right.content) >= memoryConsolidationActiveDuplicateJaccardFloor else { continue }
                 let keeper = Self.preferredKeeper(in: [left, right])
@@ -478,6 +618,61 @@ public actor MemoryConsolidator {
             patch: MemoryPatch(status: "archived", metadata: .object(meta))
         )
         return updated?.status == "archived"
+    }
+
+    /// User, 2026-09-06: consolidation must not merge across the boundaries the
+    /// read path enforces. Every hygiene pass lists with `persona: nil`, so a
+    /// key of normalised text alone put every persona's rows — and rows with
+    /// different privacy tiers and permitted surfaces — into one bucket. The
+    /// keeper then carried the WRONG disclosure for the rows it swallowed:
+    /// either a `local_private` fact survived as the `public_safe` twin (a leak
+    /// onto slack) or the reverse (a fact silently gone from a surface that was
+    /// allowed to see it). This key is the scope the disclosure policy would
+    /// compute, so rows only ever dedupe against rows that are readable in
+    /// exactly the same places.
+    ///
+    /// `status`/`lifecycle` are deliberately fixed here: scope is about WHERE a
+    /// row may be read, not whether it is currently recall-eligible.
+    private static func disclosureScopeKey(
+        personaId: String,
+        metadata: JSONValue?
+    ) -> String {
+        let persona = personaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let classification = MemoryRecordDisclosurePolicy.classify(
+            personaID: personaId,
+            status: "active",
+            lifecycle: nil,
+            tags: metadataTags(metadata),
+            metadata: metadata
+        ) else {
+            // Disclosable nowhere at all — one scope of its own, per persona.
+            return "\(persona)|undisclosable"
+        }
+        return "\(persona)|\(classification.privacy.rawValue)|"
+            + classification.permittedSurfaces.sorted().joined(separator: ",")
+    }
+
+    private static func metadataTags(_ metadata: JSONValue?) -> [String]? {
+        guard case .object(let object)? = metadata,
+              case .array(let values)? = object["tags"] else { return nil }
+        let tags = values.compactMap { value -> String? in
+            guard case .string(let tag) = value else { return nil }
+            return tag
+        }
+        return tags.isEmpty ? nil : tags
+    }
+
+    /// User, 2026-09-06: an embedding epoch names ONE immutable vector space.
+    /// Cosine between two vectors from different spaces — or from an unstamped
+    /// legacy row whose space is unknown — is an arbitrary number, and
+    /// consolidation was letting that number archive memories and merge
+    /// proposals. Recall already refuses rows outside the active epoch
+    /// (MemoryV2+Storage recall candidate scan); consolidation now refuses the
+    /// same comparisons — the pair is skipped, not rerouted. Only the exact-text
+    /// grouping, which never looks at a vector, still reaches such a row.
+    private static func comparableEpochs(_ left: String?, _ right: String?) -> Bool {
+        guard let left, let right, !left.isEmpty, !right.isEmpty else { return false }
+        return left == right
     }
 
     private static func sameKind(_ left: StoredMemory, _ right: StoredMemory) -> Bool {

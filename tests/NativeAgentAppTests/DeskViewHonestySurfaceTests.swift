@@ -17,7 +17,7 @@ import Testing
 //   desk.counters.tapToScroll               — dead control (counter → anchor)
 //   desk.counters.watching                  — dead control (same anchor rule)
 //   desk.counters.staleWatch                — the anchor half of the row
-//   desk.control.toolbar.palette            — dead control (paired ⌘K)
+//   desk.control.toolbar.palette            — dead control (paired ⌘⇧K)
 //   desk.reloader.singleActivation          — slowdown (two watchers, one view)
 //
 // Each test states the mutation that turns it red; all seven were run against a
@@ -177,30 +177,39 @@ func everyTriageCounterTargetHasARenderedAnchor() throws {
             "scrollTarget is no longer consumed by a ScrollViewReader")
 }
 
-// MARK: - ⌘K is a PAIRED affordance
+// MARK: - ⌘⇧K is a PAIRED affordance, and it must not be ⌘K
 
 /// The focusable bench swallows the toolbar button's `.keyboardShortcut`, so
-/// ⌘K only works because a SECOND handler lives in the body. Delete either and
-/// the palette stops opening from one of the two focus states, with no error.
+/// the Desk palette only works because a SECOND handler lives in the body.
+/// Delete either and the palette stops opening from one of the two focus
+/// states, with no error.
 ///
-/// Mutation proof: removing the `.keyboardShortcut("k", modifiers: .command)`
-/// (or the `onKeyPress` branch) fails this test.
-@Test("⌘K opens the palette from BOTH the toolbar shortcut and the in-body key handler")
+/// User, 2026-09-01: the chord is ⌘⇧K, not ⌘K. A bare ⌘K here silently
+/// shadowed the ONE global command palette for anyone standing on Desk —
+/// same keystroke, different sheet, no way to tell which you would get.
+///
+/// Mutation proof: removing either affordance, or dropping the shift
+/// requirement from either, fails this test.
+@Test("⌘⇧K opens the Desk palette from BOTH affordances and never steals bare ⌘K")
 func commandKPaletteHasBothAffordances() throws {
     let source = try deskViewSource()
 
-    #expect(source.contains("keyboardShortcut(\"k\", modifiers: .command)"),
-            "the toolbar ⌘K shortcut is gone — the palette is unreachable when focus is outside the bench")
+    #expect(source.contains("keyboardShortcut(\"k\", modifiers: [.command, .shift])"),
+            "the toolbar ⌘⇧K shortcut is gone — the palette is unreachable when focus is outside the bench")
+    #expect(!source.contains("keyboardShortcut(\"k\", modifiers: .command)"),
+            "Desk took bare ⌘K back — that chord belongs to the global command palette")
 
     guard let keyPress = source.range(of: "onKeyPress(keys: [KeyEquivalent(\"k\")]") else {
-        Issue.record("the in-body ⌘K handler is gone — the focused bench swallows the toolbar shortcut, so ⌘K is dead there")
+        Issue.record("the in-body Desk palette handler is gone — the focused bench swallows the toolbar shortcut, so ⌘⇧K is dead there")
         return
     }
-    let body = source[keyPress.upperBound...].prefix(600)
+    let body = source[keyPress.upperBound...].prefix(900)
     #expect(body.contains("press.modifiers.contains(.command)"),
             "the in-body k handler no longer requires the command modifier")
+    #expect(body.contains("press.modifiers.contains(.shift)"),
+            "the in-body k handler no longer requires shift — bare ⌘K on Desk would shadow the global palette again")
     #expect(body.contains("showingPalette = true"),
-            "the in-body ⌘K handler no longer opens the palette")
+            "the in-body ⌘⇧K handler no longer opens the palette")
 
     // Both affordances open the SAME sheet.
     #expect(AppSourceScraping.occurrences(of: "DeskCommandPaletteView(", in: source) == 1,

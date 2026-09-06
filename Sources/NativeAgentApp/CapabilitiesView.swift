@@ -1,6 +1,301 @@
 import Foundation
 import SwiftUI
 
+// MARK: - The Advanced page kit
+//
+// 2026-09-03 finish pass. Capabilities, Knowledge Graph and Dreams sit inside
+// `ShellPageFrame` (SetupView.swift:110), which already draws the back row, the
+// title and the sheet. These are the only surfaces the three pages add on top
+// of it: one card, one eyebrow, one empty state, one waiting line — everything
+// else is words on the sheet. Type comes from `ShellType`, colour from
+// `NativeAgentShell`, and nothing here paints a material.
+
+/// The one card the Advanced pages draw: a group of controls, or a list row.
+/// Today's fill and stroke at Today's radius, 16 of padding — the same card
+/// Setup's Advanced list uses for a route row.
+struct AdvancedCard<Content: View>: View {
+    var spacing: CGFloat = 12
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: spacing) {
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .fill(TodayPalette.cardFill)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+        )
+    }
+}
+
+/// A section head, spelled exactly like the Advanced list's: 13 semibold,
+/// uppercase, 0.6 of tracking, on the sheet rather than on a plate.
+struct AdvancedEyebrow: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.labelSemibold)
+            .textCase(.uppercase)
+            .kerning(0.6)
+            .foregroundStyle(NativeAgentShell.secondary)
+            .padding(.horizontal, 2)
+    }
+}
+
+/// An eyebrow and the card under it — what a panel becomes on these pages.
+struct AdvancedSection<Content: View>: View {
+    let title: String
+    var spacing: CGFloat = 12
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            AdvancedEyebrow(text: title)
+            AdvancedCard(spacing: spacing) { content }
+        }
+    }
+}
+
+/// What would fill this, said in the page's own left column. No plate, no
+/// glyph, no tinted button — an empty state is a sentence, not a poster.
+struct AdvancedEmptyState: View {
+    let title: String
+    var detail: String = ""
+    var actionTitle: String?
+    var actionIsDisabled = false
+    var action: (() -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(ShellType.bodySemibold)
+                .foregroundStyle(NativeAgentShell.text)
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .controlSize(.small)
+                    .disabled(actionIsDisabled)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 8)
+    }
+}
+
+/// A read that has not landed yet. One line, one small spinner — never a
+/// centred `ProgressView` claiming the whole pane.
+struct AdvancedWaitingLine: View {
+    let text: String
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text(text)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A status, said in the room's three state colours. `calm` when a thing is up,
+/// `trouble` when it is not, the teal ONLY where something waits on a person
+/// (house rule 1), and the quiet ink for everything that is merely a fact.
+enum AdvancedStatusWords {
+    static func color(_ status: String?) -> Color {
+        switch status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "pending", "awaiting_approval", "needs_approval":
+            return NativeAgentShell.needsYou
+        case "ok", "done", "passed", "succeeded", "active", "valid", "ready",
+             "scheduled", "granted", "installed", "approved", "trusted", "healthy":
+            return NativeAgentShell.calm
+        case "fail", "failed", "error", "timeout", "quarantined", "evidence_failed",
+             "denied", "revoked", "refused", "warn", "warning", "blocked",
+             "needs_setup", "interrupted", "disabled", "rolled_back", "stale":
+            return NativeAgentShell.trouble
+        default:
+            return NativeAgentShell.secondary
+        }
+    }
+
+    /// No slugs in front of a person: `needs_setup` is "Needs setup".
+    static func label(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let known = known[trimmed.lowercased()] { return known }
+        let spaced = trimmed
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+        guard let first = spaced.first, first.isLowercase else { return spaced }
+        return first.uppercased() + spaced.dropFirst()
+    }
+
+    private static let known: [String: String] = [
+        "ok": "OK",
+        "warn": "Warning",
+        "fail": "Failed",
+        "info": "Working",
+        "mcp": "MCP",
+    ]
+}
+
+/// One status word. The badge it replaces was a tinted capsule; on the sheet a
+/// coloured word says the same thing without a second plate.
+struct AdvancedStatusWord: View {
+    let status: String?
+    var text: String?
+
+    var body: some View {
+        Text(AdvancedStatusWords.label(text ?? status ?? ""))
+            .font(ShellType.caption)
+            .foregroundStyle(AdvancedStatusWords.color(status))
+            .lineLimit(1)
+    }
+}
+
+/// A fact beside a row — what the pill used to carry, without the pill.
+struct AdvancedMeta: View {
+    let text: String
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.caption)
+            .foregroundStyle(NativeAgentShell.tertiary)
+            .lineLimit(1)
+    }
+}
+
+/// A number and what it counts. Bare by construction: these sit INSIDE a card,
+/// and a card inside a card is the plate-on-plate the pass exists to remove.
+struct AdvancedStat: View {
+    let title: String
+    let value: String
+    var detail: String = ""
+    var status: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value)
+                .font(ShellType.bodySemibold)
+                .monospacedDigit()
+                .foregroundStyle(status.map(AdvancedStatusWords.color) ?? NativeAgentShell.text)
+                .lineLimit(1)
+            Text(title)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .lineLimit(1)
+            if !detail.isEmpty {
+                Text(AdvancedStatusWords.label(detail))
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .lineLimit(2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A tile that DOES sit on the sheet — the five counts at the top of
+/// Capabilities — so it wears the card itself.
+struct AdvancedSummaryTile: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        AdvancedCard(spacing: 2) {
+            Text(value)
+                .font(ShellType.title)
+                .monospacedDigit()
+                .foregroundStyle(NativeAgentShell.text)
+                .lineLimit(1)
+            Text(title)
+                .font(ShellType.label)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .lineLimit(1)
+        }
+    }
+}
+
+/// Type the shell has no token for: a code is a code, and 13 monospaced is the
+/// one exception the kit allows. Sized off `ShellType`, never a loose number.
+enum AdvancedType {
+    static let code = Font.system(size: ShellType.labelSize, design: .monospaced)
+    static let codeCaption = Font.system(size: ShellType.captionSize, design: .monospaced)
+}
+
+/// A bare fold: a chevron, the words, and one gesture on the whole row. No
+/// plate, and the motion goes through the shell's fold spring.
+struct AdvancedFold<Content: View>: View {
+    let title: String
+    var subtitle: String = ""
+    /// What the fold would otherwise hide — the one signal that survives a
+    /// collapse.
+    var attention: String?
+    @Binding var isExpanded: Bool
+    @ViewBuilder var content: Content
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                withAnimation(
+                    NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)
+                ) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(ShellType.labelSemibold)
+                        .foregroundStyle(NativeAgentShell.tertiary)
+                        .padding(.top, 2)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(ShellType.bodySemibold)
+                            .foregroundStyle(NativeAgentShell.text)
+                        if !subtitle.isEmpty {
+                            Text(subtitle)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    if let attention {
+                        AdvancedStatusWord(status: "warn", text: attention)
+                            .padding(.top, 2)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+
+            if isExpanded {
+                content
+                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
+            }
+        }
+    }
+}
+
 enum CapabilitiesDisclosurePreference {
     static let nextGenKey = "capabilitiesShowNextGen"
 
@@ -103,9 +398,10 @@ struct CapabilitiesStatusTextLine: View {
     let state: CapabilitiesStatusLinePresentation.State
 
     var body: some View {
-        Label(state.text, systemImage: state.status == "failed" ? "exclamationmark.triangle.fill" : "arrow.triangle.2.circlepath")
-            .font(NativeAgentFont.label)
-            .foregroundStyle(NativeAgentTheme.statusColor(state.status))
+        Text(state.text)
+            .font(ShellType.caption)
+            .foregroundStyle(AdvancedStatusWords.color(state.status))
+            .fixedSize(horizontal: false, vertical: true)
             .textSelection(.enabled)
             .accessibilityIdentifier("capabilities.statusText")
     }
@@ -329,9 +625,10 @@ struct CapabilityCatalogInstallOutcomeRow: View {
     let outcome: CapabilityCatalogInstallOutcome
 
     var body: some View {
-        Label(outcome.message, systemImage: outcome.systemImage)
-            .font(.caption)
-            .foregroundStyle(NativeAgentTheme.statusColor(outcome.status))
+        Text(outcome.message)
+            .font(ShellType.label)
+            .foregroundStyle(AdvancedStatusWords.color(outcome.status))
+            .fixedSize(horizontal: false, vertical: true)
             .accessibilityIdentifier("capabilities.catalog.install-outcome")
     }
 }
@@ -372,83 +669,85 @@ struct CapabilityProductionHardeningPanel: View {
     @State private var isCreatingExport = false
 
     var body: some View {
-        NativePanel(title: "Production Hardening", systemImage: "checkmark.seal") {
+        AdvancedSection(title: "Production hardening") {
             if let hardening = appModel.productionHardening {
                 HStack(spacing: 8) {
-                    StatusBadge(text: hardening.status.uppercased(), status: hardening.status)
+                    AdvancedStatusWord(status: hardening.status)
                     if let doctor = hardening.doctorStatus?.trimmingCharacters(in: .whitespacesAndNewlines),
                        !doctor.isEmpty {
-                        StatusBadge(text: "Doctor \(doctor)", status: doctor)
+                        AdvancedStatusWord(status: doctor, text: "Doctor \(doctor)")
                     }
                     Spacer()
-                    Button(isCreatingExport ? "Creating Export…" : "Export", systemImage: "square.and.arrow.up") {
+                    Button(isCreatingExport ? "Creating export…" : "Export") {
                         Task { await createExport(support: false) }
                     }
+                    .controlSize(.small)
                     .disabled(isCreatingExport)
                     .accessibilityIdentifier("capabilities.hardening.export")
-                    Button(isCreatingExport ? "Creating Bundle…" : "Support Bundle", systemImage: "shippingbox") {
+                    Button(isCreatingExport ? "Creating bundle…" : "Support bundle") {
                         Task { await createExport(support: true) }
                     }
+                    .controlSize(.small)
                     .disabled(isCreatingExport)
                     .accessibilityIdentifier("capabilities.hardening.support-bundle")
                 }
 
                 if let detail = hardening.detail?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !detail.isEmpty {
-                    Label(detail, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(NativeAgentTheme.statusColor(hardening.status))
+                    Text(detail)
+                        .font(ShellType.label)
+                        .foregroundStyle(AdvancedStatusWords.color(hardening.status))
+                        .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("capabilities.hardening.detail")
                 }
 
                 if let exportNotice {
-                    Label(
-                        exportNotice.detail,
-                        systemImage: exportNotice.status == "failed" ? "exclamationmark.triangle.fill" : "archivebox.fill"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(NativeAgentTheme.statusColor(exportNotice.status))
-                    .accessibilityIdentifier("capabilities.hardening.export-receipt")
+                    Text(exportNotice.detail)
+                        .font(ShellType.label)
+                        .foregroundStyle(AdvancedStatusWords.color(exportNotice.status))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("capabilities.hardening.export-receipt")
                 }
 
                 if let latest = appModel.productionExports.first {
                     CapabilityDetailRow(
                         title: (latest.kind ?? "export").capitalized,
                         detail: "\(latest.path) · \(latest.sizeBytes ?? 0) bytes",
-                        status: "ok",
-                        systemImage: "archivebox"
+                        status: "ok"
                     )
                 }
 
                 if let release = hardening.release {
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         if !release.status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            StatusBadge(text: "Release \(release.status.uppercased())", status: release.status)
+                            AdvancedStatusWord(
+                                status: release.status,
+                                text: "Release: \(AdvancedStatusWords.label(release.status))"
+                            )
                         }
                         if release.items.isEmpty {
-                            Label("Release checklist contains no recorded checks.", systemImage: "exclamationmark.triangle")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text("The release checklist has no recorded checks.")
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
                         } else {
                             ForEach(release.items.prefix(8)) { item in
                                 CapabilityDetailRow(
                                     title: item.title,
                                     detail: item.detail,
-                                    status: item.status,
-                                    systemImage: "checkmark.seal"
+                                    status: item.status
                                 )
                             }
                         }
                     }
                 } else {
-                    Label("This report did not include a release checklist.", systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text("This report did not include a release checklist.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             } else {
                 Text("Production summary has not loaded yet.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
             }
         }
         .accessibilityIdentifier("capabilities.production-hardening")
@@ -496,13 +795,14 @@ struct CapabilitiesView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 24) {
                 Picker("Workspace", selection: $mode) {
                     ForEach(CapabilityWorkspaceMode.allCases) { item in
                         Text(item.rawValue).tag(item)
                     }
                 }
                 .pickerStyle(.segmented)
+                .labelsHidden()
 
                 summaryGrid
 
@@ -523,7 +823,8 @@ struct CapabilitiesView: View {
                     )
                 )
             }
-            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.bottom, 32)
         }
         .navigationTitle("Capabilities")
         .task {
@@ -555,69 +856,50 @@ struct CapabilitiesView: View {
         )
         return VStack(alignment: .leading, spacing: 8) {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
-                MetricTile(title: "Capabilities", value: tiles.capabilities, systemImage: "shippingbox")
-                MetricTile(title: "Workflows", value: tiles.workflows, systemImage: "point.topleft.down.curvedto.point.bottomright.up")
-                MetricTile(title: "MCP", value: tiles.mcp, systemImage: "externaldrive.connected.to.line.below")
-                MetricTile(title: "Next Gen", value: tiles.nextGen, systemImage: "sparkles.rectangle.stack")
-                MetricTile(title: "Approvals", value: tiles.approvals, systemImage: "checkmark.shield")
+                AdvancedSummaryTile(title: "Capabilities", value: tiles.capabilities)
+                AdvancedSummaryTile(title: "Workflows", value: tiles.workflows)
+                AdvancedSummaryTile(title: "MCP servers", value: tiles.mcp)
+                AdvancedSummaryTile(title: "Next-gen phases", value: tiles.nextGen)
+                AdvancedSummaryTile(title: "Approvals", value: tiles.approvals)
             }
             if let notice = tiles.notice {
-                Label(notice, systemImage: "arrow.clockwise")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(notice)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
-    // 2026-07-22 page-tighten: collapsed-card wrapper — styling mirrors the
-    // Trust tab's Advanced disclosure and MacControlPermissionsView's
-    // Advanced Mac Control group for a consistent "more lives here" idiom.
-    // 2026-07-23 audit F5-L1: a collapsed card hides its inner attention
-    // state (e.g. an MCP session's lastError). When the underlying state
-    // carries an attention signal, render a warn StatusBadge on the header so
-    // the signal survives the collapse. Nil = no badge (identical to before).
+    // 2026-07-22 page-tighten: the two heaviest blocks fold away by default.
+    // 2026-07-23 audit F5-L1: a fold hides its inner attention state (e.g. an
+    // MCP session's lastError). When the underlying state carries an attention
+    // signal, the fold row says so, so the signal survives the collapse. Nil =
+    // nothing to say (identical to before).
+    // 2026-09-03 kit pass: the plate and the tinted badge are gone. A fold is a
+    // chevron, the words and one gesture (AdvancedFold); the attention signal is
+    // now a word in the room's trouble colour on the same row.
     private func collapsedCard<Content: View>(
         title: String,
         subtitle: String,
-        systemImage: String,
         isExpanded: Binding<Bool>,
         attentionBadge: String? = nil,
         accessibilityIdentifier: String? = nil,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        let inner = content()
-        return DisclosureGroup(isExpanded: isExpanded) {
-            inner
-                .padding(.top, 12)
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: systemImage)
-                    .foregroundStyle(.secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(NativeAgentFont.section)
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if let attentionBadge {
-                    StatusBadge(text: attentionBadge, status: "warn")
-                }
-            }
-            .togglesDisclosure(isExpanded)
-        }
-        .padding(NativeAgentSpacing.lg)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: NativeAgentRadius.panel, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        AdvancedFold(
+            title: title,
+            subtitle: subtitle,
+            attention: attentionBadge,
+            isExpanded: isExpanded
+        ) {
+            content()
         }
         .accessibilityIdentifier(accessibilityIdentifier ?? title)
     }
 
     private var overview: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 24) {
             // L3#7 (2026-08-11): the "Capability Foundry" panel is deleted.
             // E-1 already stripped its fake counters; what was left was a
             // status badge and 2-3 lane tiles over a subsystem that was never
@@ -626,9 +908,8 @@ struct CapabilitiesView: View {
             // the panel claimed a workshop that does not exist.
 
             collapsedCard(
-                title: "Next-Gen Runtime",
+                title: "Next-gen runtime",
                 subtitle: "Phase readiness, dry-run probes, and migration receipts.",
-                systemImage: "sparkles.rectangle.stack",
                 isExpanded: $showNextGen,
                 attentionBadge: nextGenReviewCount > 0 ? "\(nextGenReviewCount) to review" : nil,
                 accessibilityIdentifier: "capabilities.show-next-gen"
@@ -636,56 +917,56 @@ struct CapabilitiesView: View {
                 nextGenRuntime
             }
 
-            NativePanel(title: "Foundry Index", systemImage: "shippingbox") {
+            AdvancedSection(title: "Foundry index") {
                 switch CapabilitiesFoundryIndexPresentation.state(summary: appModel.capabilitySummary) {
                 case .populated(let summary):
-                    HStack(spacing: 8) {
-                        StatusBadge(text: "\(summary.summary.active) active", status: "ok")
-                        StatusBadge(text: "\(summary.summary.review) review", status: summary.summary.review > 0 ? "warn" : "ok")
-                        StatusBadge(text: "\(summary.summary.autoloaded) autoloaded", status: summary.summary.autoloaded == 0 ? "ok" : "warn")
+                    HStack(spacing: 12) {
+                        AdvancedStatusWord(status: "ok", text: "\(summary.summary.active) active")
+                        AdvancedStatusWord(
+                            status: summary.summary.review > 0 ? "warn" : "ok",
+                            text: "\(summary.summary.review) to review"
+                        )
+                        AdvancedStatusWord(
+                            status: summary.summary.autoloaded == 0 ? "ok" : "warn",
+                            text: "\(summary.summary.autoloaded) autoloaded"
+                        )
                         Spacer()
                     }
 
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         ForEach(Array(summary.records.prefix(14))) { capability in
                             CapabilityRow(capability: capability)
-                            if capability.id != summary.records.prefix(14).last?.id {
-                                Divider()
-                            }
                         }
                     }
                 case .empty:
-                    NativeEmptyState(
+                    AdvancedEmptyState(
                         title: "No indexed capabilities",
-                        detail: CapabilitiesFoundryIndexPresentation.emptyDetail,
-                        systemImage: "shippingbox"
+                        detail: CapabilitiesFoundryIndexPresentation.emptyDetail
                     )
                 case .unavailable:
-                    NativeEmptyState(
+                    AdvancedEmptyState(
                         title: "Foundry index unavailable",
-                        detail: CapabilitiesFoundryIndexPresentation.unavailableDetail,
-                        systemImage: "shippingbox"
+                        detail: CapabilitiesFoundryIndexPresentation.unavailableDetail
                     )
                 case .inconsistent(let reason):
-                    NativeEmptyState(
-                        title: "Foundry index needs refresh",
-                        detail: CapabilitiesFoundryIndexPresentation.inconsistentDetail(reason),
-                        systemImage: "exclamationmark.triangle"
+                    AdvancedEmptyState(
+                        title: "Foundry index needs a refresh",
+                        detail: CapabilitiesFoundryIndexPresentation.inconsistentDetail(reason)
                     )
                 }
             }
 
-            NativePanel(title: "Personal OS", systemImage: "rectangle.3.group.bubble.left") {
+            AdvancedSection(title: "Personal OS") {
                 if let personalOS = appModel.personalOS {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 10)], spacing: 10) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 16)], spacing: 16) {
                         ForEach(personalOS.spaces) { space in
-                            CapabilityMetricCard(title: space.name, value: "\(space.count)", detail: space.kind ?? "space", systemImage: "square.grid.2x2")
+                            AdvancedStat(title: space.name, value: "\(space.count)", detail: space.kind ?? "space")
                         }
                     }
                 } else {
                     Text("Personal OS summary has not loaded yet.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             }
         }
@@ -766,63 +1047,56 @@ struct CapabilitiesView: View {
     }
 
     private var nextGenRuntime: some View {
-        NativePanel(title: "Next-Gen Runtime", systemImage: "sparkles.rectangle.stack") {
+        AdvancedCard {
             if appModel.nextGenSummary == nil && nextGenLoadedPhases.isEmpty && appModel.latestNextGenReceipt == nil {
                 Text("Next-gen runtime summary has not loaded yet.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
             } else {
-                HStack(spacing: 8) {
-                    StatusBadge(text: (appModel.nextGenSummary?.readinessStatus ?? "ready").uppercased(), status: appModel.nextGenSummary?.readinessStatus ?? "ready")
+                HStack(spacing: 12) {
+                    AdvancedStatusWord(status: appModel.nextGenSummary?.readinessStatus ?? "ready")
                     if let current = appModel.nextGenSummary?.currentPhaseName ?? appModel.nextGenSummary?.currentPhaseId {
-                        InfoPill(text: current.withoutStaleNextGenPhaseCopy, systemImage: "flag.checkered")
+                        AdvancedMeta(current.withoutStaleNextGenPhaseCopy)
                     }
-                    InfoPill(text: "\(nextGenLoadedPhases.count) phases", systemImage: "square.stack.3d.up")
+                    AdvancedMeta("\(nextGenLoadedPhases.count) phases")
                     Spacer()
                 }
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 10)], spacing: 10) {
-                    NativeRuntimeTile(
-                        title: "Phase Readiness",
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 16)], spacing: 16) {
+                    AdvancedStat(
+                        title: "Phase readiness",
                         value: "\(nextGenReadyCount)/\(nextGenTotalCount)",
                         detail: appModel.nextGenSummary?.readiness ?? "ready phases",
-                        status: appModel.nextGenSummary?.readinessStatus ?? "ready",
-                        systemImage: "checklist.checked"
+                        status: appModel.nextGenSummary?.readinessStatus ?? "ready"
                     )
-                    NativeRuntimeTile(
+                    AdvancedStat(
                         title: "Receipts",
                         value: "\(appModel.nextGenSummary?.receiptCount ?? nextGenReceipts.count)",
                         detail: nextGenReceipts.first?.displayStatus ?? "none yet",
-                        status: nextGenReceipts.first?.displayStatus ?? "warn",
-                        systemImage: "receipt"
+                        status: nextGenReceipts.first?.displayStatus ?? "warn"
                     )
-                    NativeRuntimeTile(
-                        title: "Dry-Run Probes",
+                    AdvancedStat(
+                        title: "Dry-run probes",
                         value: "\(appModel.nextGenSummary?.actionCount ?? nextGenActions.count)",
                         detail: appModel.isRunningNextGenAction ? "running" : "available",
-                        status: appModel.isRunningNextGenAction ? "running" : "ready",
-                        systemImage: "play.circle"
+                        status: appModel.isRunningNextGenAction ? "running" : "ready"
                     )
                 }
 
                 if !nextGenLoadedPhases.isEmpty {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+                    LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(nextGenLoadedPhases) { phase in
                             NextGenPhaseRow(phase: phase, isRunning: appModel.isRunningNextGenAction) { actionId in
                                 Task { await appModel.runNextGenAction(id: actionId, dryRun: true) }
-                            }
-                            if phase.id != nextGenLoadedPhases.last?.id {
-                                Divider()
                             }
                         }
                     }
                 }
 
                 if !nextGenActions.isEmpty {
-                    Divider()
                     HStack(spacing: 8) {
                         ForEach(nextGenActions.prefix(4)) { action in
-                            Button(action.displayName, systemImage: "play.circle") {
+                            Button(action.displayName) {
                                 Task { await appModel.runNextGenAction(action, dryRun: true) }
                             }
                             .disabled(appModel.isRunningNextGenAction || action.dryRunAvailable == false)
@@ -833,8 +1107,7 @@ struct CapabilitiesView: View {
                 }
 
                 if !nextGenReceipts.isEmpty {
-                    Divider()
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 12) {
                         ForEach(nextGenReceipts.prefix(6)) { receipt in
                             // 2026-06-07 ui-taste-sweep #83: humanized title +
                             // subtitle replaces the raw kv-dump. rawPairs adds
@@ -844,7 +1117,6 @@ struct CapabilitiesView: View {
                                 title: h.title,
                                 detail: h.subtitle,
                                 status: receipt.displayStatus,
-                                systemImage: receipt.dryRun == true ? "testtube.2" : "receipt",
                                 rawPairs: h.rawPairs.isEmpty ? nil : h.rawPairs
                             )
                         }
@@ -856,108 +1128,110 @@ struct CapabilitiesView: View {
     }
 
     private var build: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 24) {
             // W3 (eval5): surface the "feature disabled / not implemented"
-            // envelope for Build-tab actions (workflow run, capability pack
-            // install, MCP warm/refresh) so users see why nothing happened
+            // envelope for Build-tab actions (capability pack install,
+            // MCP warm/refresh) so users see why nothing happened
             // instead of a fake success toast.
             if let disabled = appModel.disabledFeature, !disabled.isEmpty {
-                Label(disabled, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-                    .foregroundStyle(.orange)
+                Text(disabled)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             WorkflowBuilderPanel()
 
-            NativePanel(title: "Capability Catalog", systemImage: "square.grid.3x3") {
-                HStack {
-                    Button("Install Signed Demo Pack", systemImage: "checkmark.seal") {
+            AdvancedSection(title: "Capability catalog") {
+                HStack(spacing: 8) {
+                    Button("Install the signed demo pack") {
                         Task { await appModel.installDemoCapabilityPack() }
                     }
+                    .controlSize(.small)
                     .disabled(appModel.isInstallingDemoCapabilityPack)
                     .accessibilityIdentifier("capabilities.catalog.install-signed-demo")
-                    .accessibilityHint("Verifies the demo pack signature before any capability files are written. Evaluate Trust is informational and is not required to install.")
-                    Button("Check Updates", systemImage: "arrow.down.circle") {
+                    .accessibilityHint("Verifies the demo pack signature before any capability files are written. Evaluate trust is informational and is not required to install.")
+                    Button("Check for updates") {
                         Task { await appModel.checkCapabilityUpdates() }
                     }
+                    .controlSize(.small)
                     if let capability = appModel.capabilitySummary?.records.first {
-                        Button("Evaluate Trust", systemImage: "checkmark.shield") {
+                        Button("Evaluate trust") {
                             Task { await appModel.evaluateCapabilityTrust(capability) }
                         }
+                        .controlSize(.small)
                     }
                     Spacer()
-                    InfoPill(text: "\(appModel.capabilityPackInstalls.count) install(s)", systemImage: "clock.arrow.circlepath")
+                    AdvancedMeta("\(appModel.capabilityPackInstalls.count) installed")
                 }
 
                 if let outcome = appModel.capabilityCatalogInstallOutcome {
                     CapabilityCatalogInstallOutcomeRow(outcome: outcome)
                 }
 
-                HStack {
+                HStack(spacing: 8) {
                     TextField("Source name", text: $catalogSourceName)
                         .textFieldStyle(.roundedBorder)
+                        .font(ShellType.label)
                         .accessibilityIdentifier("capabilities.catalogSource.name")
                     TextField("Source URL or path", text: $catalogSourceURL)
                         .textFieldStyle(.roundedBorder)
+                        .font(ShellType.label)
                         .accessibilityIdentifier("capabilities.catalogSource.url")
-                    Button(appModel.capabilityCatalogSourceSaveInFlight ? "Saving Source…" : "Add Source", systemImage: "plus.circle") {
+                    Button(appModel.capabilityCatalogSourceSaveInFlight ? "Saving source…" : "Add source") {
                         addCatalogSource()
                     }
+                    .controlSize(.small)
                     .disabled(appModel.capabilityCatalogSourceSaveInFlight)
                     .accessibilityIdentifier("capabilities.catalogSource.add")
                 }
 
                 if let catalogSourceOutcome {
-                    Label(catalogSourceOutcome.detail, systemImage: catalogSourceOutcome.status == "failed" ? "exclamationmark.triangle.fill" : "tray.full.fill")
-                        .font(.caption)
-                        .foregroundStyle(NativeAgentTheme.statusColor(catalogSourceOutcome.status))
+                    Text(catalogSourceOutcome.detail)
+                        .font(ShellType.label)
+                        .foregroundStyle(AdvancedStatusWords.color(catalogSourceOutcome.status))
+                        .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("capabilities.catalogSource.outcome")
                 }
 
                 if !appModel.capabilityCatalogSources.isEmpty || appModel.capabilityTrust != nil || appModel.latestCapabilityUpdateCheck != nil {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
-                        CapabilityMetricCard(title: "Sources", value: "\(appModel.capabilityCatalogSources.count)", detail: appModel.capabilityCatalogSources.first?.status ?? "not checked", systemImage: "tray.full")
-                        CapabilityMetricCard(title: "Trusted", value: "\(appModel.capabilityTrust?.summary?.trusted ?? 0)", detail: "\(appModel.capabilityTrust?.summary?.review ?? 0) review", systemImage: "checkmark.shield")
-                        CapabilityMetricCard(title: "Updates", value: "\(appModel.latestCapabilityUpdateCheck?.updates.count ?? 0)", detail: appModel.latestCapabilityUpdateCheck?.status ?? "not checked", systemImage: "arrow.down.circle")
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 16) {
+                        AdvancedStat(title: "Sources", value: "\(appModel.capabilityCatalogSources.count)", detail: appModel.capabilityCatalogSources.first?.status ?? "not checked")
+                        AdvancedStat(title: "Trusted", value: "\(appModel.capabilityTrust?.summary?.trusted ?? 0)", detail: "\(appModel.capabilityTrust?.summary?.review ?? 0) to review")
+                        AdvancedStat(title: "Updates", value: "\(appModel.latestCapabilityUpdateCheck?.updates.count ?? 0)", detail: appModel.latestCapabilityUpdateCheck?.status ?? "not checked")
                     }
                 }
 
                 if let trust = appModel.latestCapabilityTrustEvaluation {
-                    CapabilityDetailRow(title: trust.name ?? trust.id, detail: trust.reasons.prefix(2).joined(separator: " "), status: trust.trustTier, systemImage: "checkmark.shield")
+                    CapabilityDetailRow(title: trust.name ?? trust.id, detail: trust.reasons.prefix(2).joined(separator: " "), status: trust.trustTier)
                 }
 
                 if appModel.capabilityCatalog.isEmpty {
-                    Text("No catalog items loaded.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    AdvancedEmptyState(
+                        title: "No catalog items",
+                        detail: "Adding a source, or installing a signed pack, fills this list."
+                    )
                 } else {
                     VStack(alignment: .leading, spacing: 12) {
                         ForEach(appModel.capabilityCatalog) { item in
                             CatalogRow(item: item)
-                            if item.id != appModel.capabilityCatalog.last?.id {
-                                Divider()
-                            }
                         }
                     }
                 }
 
                 if !appModel.capabilityPackInstalls.isEmpty {
-                    Divider()
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         ForEach(appModel.capabilityPackInstalls.prefix(4)) { install in
-                            HStack(alignment: .top, spacing: 10) {
+                            HStack(alignment: .top, spacing: 8) {
                                 CapabilityDetailRow(
                                     title: install.name ?? install.packId,
                                     detail: "\(install.version ?? "unknown") · \(install.signature?.prefix(12) ?? "unsigned")",
-                                    status: install.status,
-                                    systemImage: "shippingbox.and.arrow.backward"
+                                    status: install.status
                                 )
                                 Spacer()
-                                Button("Rollback", systemImage: "arrow.uturn.backward") {
+                                Button("Roll back") {
                                     Task { await appModel.rollbackCapabilityPack(install) }
                                 }
+                                .controlSize(.small)
                                 .disabled(install.status == "rolled_back")
                             }
                         }
@@ -966,9 +1240,8 @@ struct CapabilitiesView: View {
             }
 
             collapsedCard(
-                title: "MCP Builder",
-                subtitle: "Server warm/restart, tool calls, and consent — the full hub lives in the MCP tab.",
-                systemImage: "externaldrive.connected.to.line.below",
+                title: "MCP builder",
+                subtitle: "Server warm and restart, tool calls, and consent — the full hub lives in the MCP page.",
                 isExpanded: $showMCPBuilder,
                 attentionBadge: mcpBuilderPresentation.collapsedAttentionBadge
             ) {
@@ -991,112 +1264,108 @@ struct CapabilitiesView: View {
 
     private var mcpBuilderPanel: some View {
         let presentation = mcpBuilderPresentation
-        return VStack(alignment: .leading, spacing: 12) {
+        return AdvancedCard {
             HStack {
-                Button("Open MCP Hub", systemImage: "arrow.up.right.square") {
+                Button("Open the MCP page") {
                     NotificationCenter.default.post(name: .openCommandRouteRequest, object: "mcp")
                 }
                 .buttonStyle(.borderless)
                 Spacer()
             }
-            NativePanel(title: "MCP Builder", systemImage: "externaldrive.connected.to.line.below") {
-                TextField("MCP test query", text: $mcpQuery)
-                    .textFieldStyle(.roundedBorder)
-                if let detailNotice = presentation.detailNotice {
-                    Label(detailNotice, systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-                if let serverEmptyCopy = presentation.serverEmptyCopy {
-                    Text(serverEmptyCopy)
-                        .font(.callout)
-                        .foregroundStyle(presentation.servers == .unavailable ? .orange : .secondary)
-                } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(appModel.mcpServers) { server in
-                            VStack(alignment: .leading, spacing: 8) {
-                                MCPServerRow(server: server) {
-                                    Task { await appModel.loadMCPDetails(server) }
-                                }
-                                HStack {
-                                    Button("Warm", systemImage: "flame") {
-                                        Task { await appModel.warmMCPServer(server) }
-                                    }
-                                    Button("Restart", systemImage: "arrow.clockwise.circle") {
-                                        Task { await appModel.restartMCPServer(server) }
-                                    }
-                                    Button("Refresh Cache", systemImage: "externaldrive.badge.icloud") {
-                                        Task { await appModel.refreshMCPCache(server) }
-                                    }
-                                    if let session = appModel.mcpSessions.first(where: { $0.serverId == server.id }) {
-                                        InfoPill(text: session.status ?? "configured", systemImage: "bolt.horizontal")
-                                        if let error = session.lastError, !error.isEmpty {
-                                            Text(error)
-                                                .font(.caption)
-                                                .foregroundStyle(.orange)
-                                                .lineLimit(1)
-                                        }
-                                    }
-                                }
-                                .buttonStyle(.borderless)
+            TextField("MCP test query", text: $mcpQuery)
+                .textFieldStyle(.roundedBorder)
+                .font(ShellType.label)
+            if let detailNotice = presentation.detailNotice {
+                Text(detailNotice)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let serverEmptyCopy = presentation.serverEmptyCopy {
+                Text(serverEmptyCopy)
+                    .font(ShellType.label)
+                    .foregroundStyle(presentation.servers == .unavailable ? NativeAgentShell.trouble : NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(appModel.mcpServers) { server in
+                        VStack(alignment: .leading, spacing: 8) {
+                            MCPServerRow(server: server) {
+                                Task { await appModel.loadMCPDetails(server) }
                             }
-                            if server.id != appModel.mcpServers.last?.id {
-                                Divider()
+                            HStack(spacing: 8) {
+                                Button("Warm") {
+                                    Task { await appModel.warmMCPServer(server) }
+                                }
+                                Button("Restart") {
+                                    Task { await appModel.restartMCPServer(server) }
+                                }
+                                Button("Refresh the cache") {
+                                    Task { await appModel.refreshMCPCache(server) }
+                                }
+                                if let session = appModel.mcpSessions.first(where: { $0.serverId == server.id }) {
+                                    AdvancedStatusWord(status: session.status ?? "configured")
+                                    if let error = session.lastError, !error.isEmpty {
+                                        Text(error)
+                                            .font(ShellType.caption)
+                                            .foregroundStyle(NativeAgentShell.trouble)
+                                            .lineLimit(1)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+            }
+
+            if !appModel.mcpTools.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(appModel.mcpTools.prefix(6)) { tool in
+                        HStack(alignment: .top, spacing: 8) {
+                            CapabilityDetailRow(title: tool.name, detail: tool.description ?? "MCP tool", status: "ok")
+                            Spacer()
+                            if let server = appModel.selectedMCPServer {
+                                Button("Grant") {
+                                    Task { await appModel.grantMCPConsent(server: server, toolName: tool.name) }
+                                }
+                                .controlSize(.small)
+                                Button("Call") {
+                                    Task { await appModel.callMCPTool(server: server, tool: tool, query: mcpQuery) }
+                                }
+                                .controlSize(.small)
                             }
                         }
                     }
                 }
+            }
 
-                if !appModel.mcpTools.isEmpty {
-                    Divider()
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(appModel.mcpTools.prefix(6)) { tool in
-                            HStack(alignment: .top) {
-                                CapabilityDetailRow(title: tool.name, detail: tool.description ?? "MCP tool", status: "ok", systemImage: "hammer")
-                                Spacer()
-                                if let server = appModel.selectedMCPServer {
-                                    Button("Grant", systemImage: "checkmark.shield") {
-                                        Task { await appModel.grantMCPConsent(server: server, toolName: tool.name) }
-                                    }
-                                    Button("Call", systemImage: "play.circle") {
-                                        Task { await appModel.callMCPTool(server: server, tool: tool, query: mcpQuery) }
-                                    }
-                                }
+            if let call = appModel.latestMCPCall {
+                CapabilityDetailRow(
+                    title: call.toolName,
+                    detail: [call.serverId, call.resultPreview]
+                        .compactMap { $0 }
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " · "),
+                    status: call.evidenceStatus == "failed" ? "evidence_failed" : call.status
+                )
+            }
+
+            if !appModel.mcpConsent.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(appModel.mcpConsent.prefix(4)) { consent in
+                        HStack(alignment: .top, spacing: 8) {
+                            CapabilityDetailRow(
+                                title: consent.toolName ?? consent.id,
+                                detail: consent.argumentSummary ?? consent.serverId ?? "MCP consent",
+                                status: consent.status ?? "granted"
+                            )
+                            Spacer()
+                            Button("Revoke") {
+                                Task { await appModel.revokeMCPConsent(consent) }
                             }
-                        }
-                    }
-                }
-
-                if let call = appModel.latestMCPCall {
-                    Divider()
-                    CapabilityDetailRow(
-                        title: call.toolName,
-                        detail: [call.serverId, call.resultPreview]
-                            .compactMap { $0 }
-                            .filter { !$0.isEmpty }
-                            .joined(separator: " · "),
-                        status: call.evidenceStatus == "failed" ? "evidence_failed" : call.status,
-                        systemImage: "terminal"
-                    )
-                }
-
-                if !appModel.mcpConsent.isEmpty {
-                    Divider()
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(appModel.mcpConsent.prefix(4)) { consent in
-                            HStack(alignment: .top, spacing: 10) {
-                                CapabilityDetailRow(
-                                    title: consent.toolName ?? consent.id,
-                                    detail: consent.argumentSummary ?? consent.serverId ?? "MCP consent",
-                                    status: consent.status ?? "granted",
-                                    systemImage: "checkmark.shield"
-                                )
-                                Spacer()
-                                Button("Revoke", systemImage: "xmark.shield") {
-                                    Task { await appModel.revokeMCPConsent(consent) }
-                                }
-                                .disabled(consent.status == "revoked")
-                            }
+                            .controlSize(.small)
+                            .disabled(consent.status == "revoked")
                         }
                     }
                 }
@@ -1105,61 +1374,54 @@ struct CapabilitiesView: View {
     }
 
     private var operate: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            NativePanel(title: "Intent Router", systemImage: "arrow.triangle.branch") {
+        VStack(alignment: .leading, spacing: 24) {
+            AdvancedSection(title: "Intent router") {
                 TextField("Task to route", text: $routeText, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
+                    .font(ShellType.label)
                     .lineLimit(2...4)
-                Button("Plan Route", systemImage: "arrow.triangle.branch") {
+                Button("Plan a route") {
                     Task { await appModel.routeIntent(routeText) }
                 }
-                .buttonStyle(.borderedProminent)
                 .disabled(appModel.routePresentation.isPlanning)
 
                 switch appModel.routePresentation {
                 case .idle:
                     EmptyView()
                 case .planning:
-                    ProgressView("Planning route…")
-                        .controlSize(.small)
+                    AdvancedWaitingLine("Planning the route…")
                 case let .failed(message):
-                    Label(
-                        "Router did not produce a plan: \(message)",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+                    Text("The router did not produce a plan: \(message)")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
                 case let .plan(plan):
-                    Divider()
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            StatusBadge(text: plan.goalType.uppercased(), status: plan.risk)
-                            StatusBadge(text: plan.risk.uppercased(), status: plan.risk)
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 12) {
+                            AdvancedStatusWord(status: plan.risk, text: plan.goalType)
+                            AdvancedStatusWord(status: plan.risk)
                             if plan.requiresApproval {
-                                StatusBadge(text: "APPROVAL", status: "warn")
+                                AdvancedStatusWord(status: "pending", text: "Waiting on you")
                             }
                             Spacer()
                         }
                         ForEach(plan.nextActions, id: \.self) { action in
-                            Label(action, systemImage: "checkmark.circle")
-                                .font(.callout)
+                            Text(action)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.text)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        Text("Matched Capabilities")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                        AdvancedEyebrow(text: "Matched capabilities")
                         switch IntentRoutePresentation.plan(plan).capabilityMatchState {
                         case let .matches(capabilities):
                             ForEach(capabilities.prefix(5)) { capability in
                                 CapabilityRow(capability: capability, compact: true)
                             }
                         case .noMatches:
-                            Label(
-                                "The router completed, but no installed capability matched this task.",
-                                systemImage: "magnifyingglass"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            Text("The router finished, but no installed capability matched this task.")
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         case nil:
                             EmptyView()
                         }
@@ -1167,11 +1429,12 @@ struct CapabilitiesView: View {
                 }
             }
 
-            NativePanel(title: "Research Lab", systemImage: "magnifyingglass") {
+            AdvancedSection(title: "Research lab") {
                 TextField("Research objective", text: $researchObjective, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
+                    .font(ShellType.label)
                     .lineLimit(2...4)
-                Button("Run Research Lab", systemImage: "doc.text.magnifyingglass") {
+                Button("Run the research lab") {
                     Task { await runResearchLab() }
                 }
                 .disabled(isRunningResearchLab)
@@ -1182,66 +1445,57 @@ struct CapabilitiesView: View {
 
                 switch researchLabRunsState {
                 case .loading:
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Reading Research Lab receipts…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    AdvancedWaitingLine("Reading the research lab's receipts…")
                 case .empty:
-                    NativeEmptyState(
+                    AdvancedEmptyState(
                         title: "No research runs",
-                        detail: "The Research Lab receipt store has no completed or connector-blocked runs yet.",
-                        systemImage: "magnifyingglass"
+                        detail: "A run started here leaves its receipt in this list."
                     )
                 case .loaded(let runs):
                     researchLabRunRows(runs)
                 case .unavailable(let detail, let retained):
-                    Divider()
-                    Label("Research Lab receipts unavailable: \(detail)", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    Text("Research lab receipts are unavailable: \(detail)")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                     if !retained.isEmpty {
-                        Text("Showing last known receipts")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                        AdvancedEyebrow(text: "Last known receipts")
                         researchLabRunRows(retained)
                     }
                 }
             }
 
-            NativePanel(title: "Trace Timeline", systemImage: "waveform.path") {
+            AdvancedSection(title: "Trace timeline") {
                 let traceState = appModel.capabilityTraceTimeline
                 if case .sourceAbsent = traceState {
-                    Label("Trace history is not available yet. The durable trace feed has not been created.", systemImage: "tray")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    AdvancedEmptyState(
+                        title: "No trace history yet",
+                        detail: "The durable trace feed has not been created."
+                    )
                 } else if case .empty = traceState {
-                    Text("No traces yet. Route, run a workflow, or install a catalog item to create one.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    AdvancedEmptyState(
+                        title: "No traces yet",
+                        detail: "Routing a task, saving a workflow, or installing a catalog item writes the first one."
+                    )
                 } else if case .unavailable(let detail) = traceState {
-                    Label("Trace history is unavailable", systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
+                    Text("Trace history is unavailable")
+                        .font(ShellType.bodySemibold)
+                        .foregroundStyle(NativeAgentShell.trouble)
                     Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else {
                     if case .partial(_, let rejectedRows) = traceState {
-                        Label(
-                            "\(rejectedRows) malformed \(rejectedRows == 1 ? "trace" : "traces") withheld from this timeline.",
-                            systemImage: "exclamationmark.triangle"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                        Text("\(rejectedRows) malformed \(rejectedRows == 1 ? "trace" : "traces") withheld from this timeline.")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.trouble)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         ForEach(traceState.traces.prefix(14)) { trace in
-                            CapabilityDetailRow(title: trace.title, detail: trace.kind, status: trace.status ?? "ok", systemImage: "waveform.path")
-                            if trace.id != traceState.traces.prefix(14).last?.id {
-                                Divider()
-                            }
+                            CapabilityDetailRow(title: trace.title, detail: trace.kind, status: trace.status ?? "ok")
                         }
                     }
                 }
@@ -1272,31 +1526,29 @@ struct CapabilitiesView: View {
 
     @ViewBuilder
     private func researchLabMessageRow(_ message: CapabilitiesResearchLabPresentation.Message) -> some View {
-        Label(message.text, systemImage: message.systemImage)
-            .font(.caption.weight(.semibold))
+        Text(message.text)
+            .font(ShellType.labelSemibold)
             .foregroundStyle(researchLabColor(message.tone))
+            .fixedSize(horizontal: false, vertical: true)
         if let detail = message.detail {
             Text(detail)
-                .font(.caption2)
+                .font(ShellType.caption)
                 .foregroundStyle(researchLabColor(message.tone))
+                .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }
     }
 
     @ViewBuilder
     private func researchLabRunRows(_ runs: [ResearchLabRun]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
             ForEach(runs.prefix(4)) { run in
                 let message = CapabilitiesResearchLabPresentation.message(for: run)
                 CapabilityDetailRow(
                     title: run.objective,
                     detail: message.detail ?? message.text,
-                    status: run.status,
-                    systemImage: message.systemImage
+                    status: run.status
                 )
-                if run.id != runs.prefix(4).last?.id {
-                    Divider()
-                }
             }
         }
     }
@@ -1304,42 +1556,40 @@ struct CapabilitiesView: View {
     private func researchLabColor(_ tone: CapabilitiesResearchLabPresentation.Tone) -> Color {
         switch tone {
         case .neutral, .progress:
-            .secondary
+            NativeAgentShell.secondary
         case .success:
-            .green
-        case .warning:
-            .orange
-        case .failure:
-            .red
+            NativeAgentShell.calm
+        case .warning, .failure:
+            NativeAgentShell.trouble
         }
     }
 
     private var hardening: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            NativePanel(title: "Autonomy Kernel", systemImage: "lock.shield") {
+        VStack(alignment: .leading, spacing: 24) {
+            AdvancedSection(title: "Autonomy kernel") {
                 if let kernel = appModel.autonomyKernel {
-                    HStack(spacing: 8) {
-                        StatusBadge(text: kernel.status.uppercased(), status: kernel.status)
+                    HStack(spacing: 12) {
+                        AdvancedStatusWord(status: kernel.status)
                         if let mode = kernel.mode {
-                            InfoPill(text: mode, systemImage: "slider.horizontal.3")
+                            AdvancedMeta(AdvancedStatusWords.label(mode))
                         }
                         Spacer()
                     }
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         ForEach(kernel.guardrails) { guardrail in
-                            CapabilityDetailRow(title: guardrail.title, detail: guardrail.id, status: guardrail.status, systemImage: "checkmark.shield")
+                            CapabilityDetailRow(title: guardrail.title, detail: guardrail.id, status: guardrail.status)
                         }
                     }
                 } else {
                     Text("Kernel summary has not loaded yet.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             }
 
             CapabilitiesApprovalInboxPanel()
 
-            NativePanel(title: "Native macOS Power", systemImage: "macwindow") {
+            AdvancedSection(title: "Native macOS power") {
                 // 2026-07-21 audit fix (dead-surface honesty): the
                 // `nativePower.surfaces` list and the "App Intents" tile were
                 // removed — getNativePower() is a DAEMON-KILL P1 stub that
@@ -1378,80 +1628,77 @@ struct CapabilitiesView: View {
                     hasRefreshAttempt: refresh != nil,
                     readFailed: failedEndpoints.contains("native actions")
                 )
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 10)], spacing: 10) {
-                    NativeRuntimeTile(
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 16)], spacing: 16) {
+                    AdvancedStat(
                         title: "Notifications",
                         value: notificationTile.value,
                         detail: notificationTile.detail,
-                        status: notificationTile.status,
-                        systemImage: "bell.badge"
+                        status: notificationTile.status
                     )
-                    NativeRuntimeTile(
+                    AdvancedStat(
                         title: "Browser",
                         value: browserTile.value,
                         detail: browserTile.detail,
-                        status: browserTile.status,
-                        systemImage: "safari"
+                        status: browserTile.status
                     )
-                    NativeRuntimeTile(
-                        title: "Vector Memory",
+                    AdvancedStat(
+                        title: "Vector memory",
                         value: vectorTile.value,
                         detail: vectorTile.detail,
-                        status: vectorTile.status,
-                        systemImage: "point.3.connected.trianglepath.dotted"
+                        status: vectorTile.status
                     )
                 }
 
                 if nativeActionsState == .unavailable {
-                    Divider()
-                    Label("Native action registry is unavailable. Refresh Capabilities before relying on action availability.", systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    Text("The native action registry is unavailable. Refresh Capabilities before relying on what is listed here.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else if nativeActionsState == .loading {
-                    Divider()
                     Text("Native actions have not loaded yet.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 } else if appModel.nativeActions.isEmpty {
-                    Divider()
-                    Text("No native actions are currently registered.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text("No native actions are registered.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 } else {
-                    Divider()
                     if nativeActionsState == .stale {
-                        Label("Showing the last loaded native action registry.", systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
+                        Text("Showing the last loaded native action registry.")
+                            .font(ShellType.label)
+                            .foregroundStyle(NativeAgentShell.trouble)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         ForEach(appModel.nativeActions.prefix(6)) { action in
                             let actionPresentation = NativeMacPowerPanelPresentation.action(
                                 requiresApproval: action.requiresApproval,
                                 dryRunAvailable: action.dryRunAvailable,
                                 fullMacYoloAdmitted: nativeActionYoloAdmission[action.id] == true
                             )
-                            HStack(alignment: .top, spacing: 10) {
+                            HStack(alignment: .top, spacing: 8) {
                                 CapabilityDetailRow(
                                     title: action.name,
-                                    detail: action.kind ?? action.id,
-                                    status: action.risk ?? "ok",
-                                    systemImage: "command"
+                                    detail: AdvancedStatusWords.label(action.kind ?? action.id),
+                                    status: action.risk ?? "ok"
                                 )
                                 Spacer()
-                                Button("Dry Run", systemImage: "play.circle") {
+                                Button("Dry run") {
                                     Task { await appModel.runNativeAction(action, dryRun: true) }
                                 }
+                                .controlSize(.small)
                                 .disabled(!actionPresentation.canDryRun)
-                                Button("Run", systemImage: "bolt.circle") {
+                                Button("Run") {
                                     Task { await appModel.runNativeAction(action, dryRun: false) }
                                 }
+                                .controlSize(.small)
                                 .disabled(!actionPresentation.canRun)
                             }
                             if let blockedDetail = actionPresentation.blockedDetail {
-                                Label(blockedDetail, systemImage: "lock.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                Text(blockedDetail)
+                                    .font(ShellType.caption)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                     }
@@ -1463,41 +1710,43 @@ struct CapabilitiesView: View {
                 // latest, which silently narrowed visibility when the roll-up
                 // died. Canonical home is here, next to the actions themselves.
                 if !appModel.nativeActionReceipts.isEmpty {
-                    Divider()
-                    ForEach(appModel.nativeActionReceipts.prefix(4)) { receipt in
-                        CapabilityDetailRow(title: receipt.name ?? receipt.actionId, detail: receipt.createdAt ?? receipt.actionId, status: receipt.status, systemImage: "receipt")
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(appModel.nativeActionReceipts.prefix(4)) { receipt in
+                            CapabilityDetailRow(
+                                title: AdvancedStatusWords.label(receipt.name ?? receipt.actionId),
+                                detail: receipt.createdAt ?? AdvancedStatusWords.label(receipt.actionId),
+                                status: receipt.status
+                            )
+                        }
                     }
                 }
 
                 if let connectorRegistry = appModel.connectorActionRegistry {
-                    Divider()
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         HStack {
-                            Label("\(connectorRegistry.actions.count) connector action(s)", systemImage: "point.3.connected.trianglepath.dotted")
-                                .font(.subheadline.weight(.semibold))
+                            AdvancedEyebrow(text: "\(connectorRegistry.actions.count) connector actions")
                             Spacer()
                             if let latest = appModel.latestConnectorActionReceipt ?? connectorRegistry.latestReceipt {
-                                StatusBadge(text: latest.status.uppercased(), status: latest.status)
+                                AdvancedStatusWord(status: latest.status)
                             }
                         }
                         ForEach(connectorRegistry.actions.prefix(4)) { action in
-                            HStack {
+                            HStack(spacing: 8) {
                                 CapabilityDetailRow(
                                     title: action.name,
-                                    detail: "\(action.connectorId ?? "connector") · \(action.authState ?? "unknown")",
-                                    status: action.connectorStatus ?? (action.enabled == true ? "ok" : "warn"),
-                                    systemImage: "link"
+                                    detail: "\(AdvancedStatusWords.label(action.connectorId ?? "connector")) · \(AdvancedStatusWords.label(action.authState ?? "unknown"))",
+                                    status: action.connectorStatus ?? (action.enabled == true ? "ok" : "warn")
                                 )
                                 Spacer()
-                                Button("Dry Run", systemImage: "play.circle") {
+                                Button("Dry run") {
                                     Task { await appModel.runConnectorAction(action) }
                                 }
+                                .controlSize(.small)
                             }
                         }
                     }
                 }
 
-                Divider()
                 CapabilitiesRunGauntletAndBrowserActions()
             }
 
@@ -1531,36 +1780,39 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Button("Browser Dry Run", systemImage: "safari") {
+                Button("Browser dry run") {
                     Task {
                         isRunningBrowserDryRun = true
                         defer { isRunningBrowserDryRun = false }
                         await appModel.runBrowserDryRun()
                     }
                 }
+                .controlSize(.small)
                 .disabled(isRunningBrowserDryRun)
                 .accessibilityIdentifier("capabilities.browser-dry-run")
 
-                Button("Cancel Browser", systemImage: "stop.circle") {
+                Button("Cancel the browser run") {
                     Task { await appModel.cancelBrowserRun() }
                 }
+                .controlSize(.small)
                 .accessibilityIdentifier("capabilities.browser-cancel")
 
-                Button("Run Gauntlet", systemImage: "checkmark.shield") {
+                Button("Run the gauntlet") {
                     Task {
                         isRunningGauntlet = true
                         defer { isRunningGauntlet = false }
                         await appModel.runImprovementGauntlet()
                     }
                 }
+                .controlSize(.small)
                 .disabled(isRunningGauntlet)
                 .accessibilityIdentifier("capabilities.run-gauntlet")
 
                 Spacer()
                 if let latestGauntlet {
-                    StatusBadge(text: latestGauntlet.status.uppercased(), status: latestGauntlet.status)
+                    AdvancedStatusWord(status: latestGauntlet.status)
                 }
             }
 
@@ -1569,8 +1821,7 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 CapabilityDetailRow(
                     title: presentation.title,
                     detail: presentation.detail,
-                    status: presentation.status,
-                    systemImage: "safari"
+                    status: presentation.status
                 )
                 .accessibilityIdentifier("capabilities.browser-dry-run.outcome")
             }
@@ -1580,19 +1831,16 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 CapabilityDetailRow(
                     title: presentation.title,
                     detail: presentation.detail,
-                    status: presentation.status,
-                    systemImage: "checkmark.shield"
+                    status: presentation.status
                 )
                 .accessibilityIdentifier("capabilities.run-gauntlet.outcome")
 
                 if !presentation.failedCheckTitles.isEmpty {
-                    Label(
-                        "Failed: \(presentation.failedCheckTitles.joined(separator: ", "))",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .accessibilityIdentifier("capabilities.run-gauntlet.failures")
+                    Text("Failed: \(presentation.failedCheckTitles.joined(separator: ", "))")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("capabilities.run-gauntlet.failures")
                 }
             }
 
@@ -1601,8 +1849,9 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 || appModel.statusText.hasPrefix("Gauntlet:")
                 || appModel.statusText.hasPrefix("Gauntlet failed:") {
                 Text(appModel.statusText)
-                    .font(.caption)
-                    .foregroundStyle(appModel.statusText.contains("failed:") ? .orange : .secondary)
+                    .font(ShellType.caption)
+                    .foregroundStyle(appModel.statusText.contains("failed:") ? NativeAgentShell.trouble : NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("capabilities.run-actions.status")
             }
         }
@@ -1652,40 +1901,36 @@ struct CapabilitiesApprovalInboxPanel: View {
     }
 
     var body: some View {
-        NativePanel(title: "Approval Inbox", systemImage: "checkmark.shield") {
+        AdvancedSection(title: "Approval inbox") {
             switch readState {
             case .loading:
-                Label("Loading approval requests…", systemImage: "hourglass")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                AdvancedWaitingLine("Reading the approval requests…")
             case .empty:
-                Text("No approval requests yet.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                AdvancedEmptyState(
+                    title: "No approval requests",
+                    detail: "Anything the agent needs a yes for waits here."
+                )
             case .unavailable:
-                Label(
-                    "Approval inbox is unavailable. Refresh Capabilities before relying on an empty queue.",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .font(.callout)
-                .foregroundStyle(.orange)
-                .accessibilityIdentifier("capabilities.approvals.unavailable")
+                Text("The approval inbox is unavailable. Refresh Capabilities before relying on an empty queue.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("capabilities.approvals.unavailable")
             case .stale:
-                Label(
-                    "Showing the last loaded approval requests; the latest refresh failed.",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
+                Text("Showing the last loaded approval requests; the latest refresh failed.")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
                 approvalRows
             case .available:
                 approvalRows
             }
 
             if let outcome = appModel.capabilitiesApprovalInboxOutcome {
-                Label(outcome.visibleMessage, systemImage: outcomeIcon(outcome))
-                    .font(.caption)
+                Text(outcome.visibleMessage)
+                    .font(ShellType.label)
                     .foregroundStyle(outcomeColor(outcome))
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                     .accessibilityIdentifier("capabilities.approvals.outcome")
             }
@@ -1694,28 +1939,29 @@ struct CapabilitiesApprovalInboxPanel: View {
 
     @ViewBuilder
     private var approvalRows: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             ForEach(appModel.approvals.prefix(8)) { approval in
-                HStack(alignment: .top, spacing: 10) {
+                HStack(alignment: .top, spacing: 8) {
                     CapabilityDetailRow(
                         title: approval.title,
                         detail: approval.reason ?? approval.action,
-                        status: approval.status.lowercased() == "pending" ? approval.risk : approval.status,
-                        systemImage: "checkmark.shield"
+                        status: approval.status.lowercased() == "pending" ? approval.risk : approval.status
                     )
                     Spacer()
                     if approval.status.lowercased() == "pending" {
-                        Button("Approve", systemImage: "checkmark") {
+                        Button("Approve") {
                             Task { await appModel.resolveCapabilitiesApprovalInbox(approval, decision: "approved") }
                         }
+                        .controlSize(.small)
                         .disabled(appModel.isResolvingApproval(id: approval.id))
                         .accessibilityIdentifier("capabilities.approvals.approve.\(approval.id)")
                         .accessibilityHint(appModel.isResolvingApproval(id: approval.id)
                             ? "This approval is already being decided."
                             : "Approve this request once.")
-                        Button("Deny", systemImage: "xmark") {
+                        Button("Deny") {
                             Task { await appModel.resolveCapabilitiesApprovalInbox(approval, decision: "denied") }
                         }
+                        .controlSize(.small)
                         .disabled(appModel.isResolvingApproval(id: approval.id))
                         .accessibilityIdentifier("capabilities.approvals.deny.\(approval.id)")
                         .accessibilityHint(appModel.isResolvingApproval(id: approval.id)
@@ -1723,53 +1969,14 @@ struct CapabilitiesApprovalInboxPanel: View {
                             : "Deny this request once.")
                     }
                 }
-                if approval.id != appModel.approvals.prefix(8).last?.id {
-                    Divider()
-                }
             }
-        }
-    }
-
-    private func outcomeIcon(_ outcome: CapabilitiesApprovalInboxResolution) -> String {
-        switch CapabilitiesApprovalInboxPresentation.outcomeTone(outcome) {
-        case "success": "checkmark.circle.fill"
-        case "warning": "exclamationmark.triangle.fill"
-        default: "xmark.octagon.fill"
         }
     }
 
     private func outcomeColor(_ outcome: CapabilitiesApprovalInboxResolution) -> Color {
         switch CapabilitiesApprovalInboxPresentation.outcomeTone(outcome) {
-        case "success": .green
-        case "warning": .orange
-        default: .red
-        }
-    }
-}
-
-struct CapabilityMetricCard: View {
-    var title: String
-    var value: String
-    var detail: String
-    var systemImage: String
-
-    var body: some View {
-        NativePanel(title: nil, systemImage: nil) {
-            VStack(alignment: .leading, spacing: 5) {
-                Image(systemName: systemImage)
-                    .foregroundStyle(Color.accentColor)
-                Text(value)
-                    .font(.title3.monospacedDigit().weight(.semibold))
-                Text(title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(2)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(minHeight: 88)
+        case "success": NativeAgentShell.calm
+        default: NativeAgentShell.trouble
         }
     }
 }
@@ -1779,30 +1986,32 @@ struct CapabilityRow: View {
     var compact = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: compact ? 4 : 7) {
+        VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text((capability.name ?? capability.id).withoutStaleNextGenPhaseCopy)
-                    .font(compact ? .subheadline.weight(.semibold) : .headline)
+                    .font(compact ? ShellType.labelSemibold : ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                 Spacer()
-                StatusBadge(text: (capability.status ?? "ready").uppercased(), status: capability.status ?? "ok")
+                AdvancedStatusWord(status: capability.status ?? "ok", text: capability.status ?? "ready")
             }
-            HStack(spacing: 6) {
-                InfoPill(text: capability.kind, systemImage: "tag")
+            HStack(spacing: 8) {
+                AdvancedMeta(AdvancedStatusWords.label(capability.kind))
                 if let risk = capability.riskClass, !risk.isEmpty {
-                    InfoPill(text: risk, systemImage: "lock.shield")
+                    AdvancedMeta(AdvancedStatusWords.label(risk))
                 }
                 if let useCount = capability.useCount, useCount > 0 {
-                    InfoPill(text: "\(useCount) uses", systemImage: "clock.arrow.circlepath")
+                    AdvancedMeta("\(useCount) uses")
                 }
             }
             if !compact, let description = capability.description, !description.isEmpty {
                 Text(description.withoutStaleNextGenPhaseCopy)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
     }
 }
@@ -1813,24 +2022,24 @@ struct NextGenPhaseRow: View {
     var runProbe: (String) -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: 8) {
             CapabilityDetailRow(
                 title: phase.displayName,
                 detail: phase.displayDetail,
-                status: phase.displayStatus,
-                systemImage: phase.ready == true ? "checkmark.circle" : "circle.dashed"
+                status: phase.displayStatus
             )
             Spacer()
             // L3#6: a phase's primaryDryRunActionId comes from the catalog data
             // file and may name an id the read-only executor has no case for.
             // Render the probe only when an executor backs it.
             if let actionId = phase.primaryDryRunActionId, NativeClient.isNextGenActionBacked(actionId) {
-                Button("Probe", systemImage: "play.circle") {
+                Button("Probe") {
                     runProbe(actionId)
                 }
+                .controlSize(.small)
                 .disabled(isRunning)
             } else {
-                StatusBadge(text: "NO PROBE", status: "warn")
+                AdvancedStatusWord(status: "warn", text: "No probe")
             }
         }
     }
@@ -1842,87 +2051,81 @@ struct SkillMemoryGraphPanel: View {
     @State private var graphQuery = "memory workflow capability"
 
     var body: some View {
-        NativePanel(title: "Skill Memory Graph", systemImage: "point.3.filled.connected.trianglepath.dotted") {
+        AdvancedSection(title: "Skill memory graph") {
             if let graph = appModel.agentGraph {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
-                    CapabilityMetricCard(title: "Nodes", value: "\(graph.summary.nodes)", detail: "memories, runs, Desk tasks, capabilities", systemImage: "circle.grid.cross")
-                    CapabilityMetricCard(title: "Edges", value: "\(graph.summary.edges)", detail: "produced and used links", systemImage: "point.3.connected.trianglepath.dotted")
-                    CapabilityMetricCard(title: "Capabilities", value: "\(graph.summary.capabilities ?? 0)", detail: "indexed objects", systemImage: "shippingbox")
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 16) {
+                    AdvancedStat(title: "Nodes", value: "\(graph.summary.nodes)", detail: "memories, runs, Desk tasks, capabilities")
+                    AdvancedStat(title: "Edges", value: "\(graph.summary.edges)", detail: "produced and used links")
+                    AdvancedStat(title: "Capabilities", value: "\(graph.summary.capabilities ?? 0)", detail: "indexed objects")
                 }
 
                 if let error = appModel.graphLoadError {
-                    Label(
-                        "Graph refresh failed; retained data may be stale: \(error)",
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                    Text("The graph refresh failed; what is shown may be stale: \(error)")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
-                HStack {
+                HStack(spacing: 8) {
                     if let status = appModel.graphStatus {
-                        StatusBadge(text: status.status.uppercased(), status: status.status)
-                        InfoPill(text: "\(status.entityCount ?? appModel.graphEntities.count) entities", systemImage: "circle.grid.cross")
+                        AdvancedStatusWord(status: status.status)
+                        AdvancedMeta("\(status.entityCount ?? appModel.graphEntities.count) entities")
                     }
-                    TextField("Search graph", text: $graphQuery)
+                    TextField("Search the graph", text: $graphQuery)
                         .textFieldStyle(.roundedBorder)
-                    Button("Search", systemImage: "magnifyingglass") {
+                        .font(ShellType.label)
+                    Button("Search") {
                         Task { await appModel.searchGraph(graphQuery) }
                     }
-                    Button("Refresh", systemImage: "arrow.triangle.2.circlepath") {
+                    .controlSize(.small)
+                    Button("Refresh") {
                         Task { await appModel.refreshGraph() }
                     }
+                    .controlSize(.small)
                 }
 
                 if graph.nodes.isEmpty {
-                    Text("The checked graph is empty. New retained memories and linked capability activity will appear here when indexed.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    Text("The checked graph is empty. New retained memories and linked capability activity appear here once indexed.")
+                        .font(ShellType.label)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 if !appModel.graphSearchResults.isEmpty {
-                    Divider()
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 12) {
                         ForEach(appModel.graphSearchResults.prefix(8)) { result in
                             CapabilityDetailRow(
-                                title: result.node.label ?? result.id,
+                                title: result.node.label ?? AdvancedStatusWords.label(result.id),
                                 detail: result.explanation ?? "Score \(String(format: "%.2f", result.score))",
-                                status: result.node.status ?? "ok",
-                                systemImage: "point.3.connected.trianglepath.dotted"
+                                status: result.node.status ?? "ok"
                             )
                         }
                     }
                 }
 
                 if !appModel.graphEntities.isEmpty {
-                    Divider()
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 12) {
                         ForEach(appModel.graphEntities.prefix(5)) { entity in
                             CapabilityDetailRow(
                                 title: entity.name,
-                                detail: "\(entity.mentions ?? 0) mention(s) · confidence \(String(format: "%.2f", entity.confidence ?? 0))",
-                                status: entity.kind ?? "ok",
-                                systemImage: "circle.grid.cross"
+                                detail: "\(entity.mentions ?? 0) mentions · confidence \(String(format: "%.2f", entity.confidence ?? 0))",
+                                status: entity.kind ?? "ok"
                             )
                         }
                     }
                 }
             } else if let error = appModel.graphLoadError {
-                NativeEmptyState(
-                    title: "Skill Memory Graph unavailable",
+                AdvancedEmptyState(
+                    title: "Skill memory graph unavailable",
                     detail: "The graph could not be read: \(error)",
-                    systemImage: "exclamationmark.triangle",
-                    actionTitle: "Refresh Graph",
-                    actionImage: "arrow.clockwise",
+                    actionTitle: "Refresh the graph",
                     action: { Task { await appModel.refreshGraph() } }
                 )
             } else {
-                NativeEmptyState(
-                    title: "Skill Memory Graph not loaded",
+                AdvancedEmptyState(
+                    title: "Skill memory graph not loaded",
                     detail: "Refresh to read the current graph. This is not an empty-graph result.",
-                    systemImage: "clock",
-                    actionTitle: "Refresh Graph",
-                    actionImage: "arrow.clockwise",
+                    actionTitle: "Refresh the graph",
                     action: { Task { await appModel.refreshGraph() } }
                 )
             }
@@ -1930,135 +2133,57 @@ struct SkillMemoryGraphPanel: View {
     }
 }
 
+// The workflow RUN engine was retired 2026-09-01 (User authorized). This panel
+// keeps the registry half: it lists the saved workflow definitions and can
+// create a new one. There is no Run / Resume / Cancel / Rollback any more —
+// the live way to have work done is workshop/executions.
 struct WorkflowBuilderPanel: View {
     @Environment(AppModel.self) private var appModel
     @State private var workflowName = ""
-    @State private var workflowObjective = "Dry-run the selected workflow and record receipts."
     @State private var creatingWorkflow = false
     @State private var creationError: String?
-    @State private var lifecycleAction: WorkflowLifecycleAction?
-    @State private var lifecycleNotice: WorkflowLifecycleButtonPresentation.Notice?
 
     var body: some View {
-        NativePanel(title: "Workflow Builder", systemImage: "point.topleft.down.curvedto.point.bottomright.up") {
+        AdvancedSection(title: "Workflow builder") {
             TextField("New workflow name", text: $workflowName)
                 .textFieldStyle(.roundedBorder)
+                .font(ShellType.label)
                 .disabled(creatingWorkflow)
 
             HStack(spacing: 8) {
-                Button("Create Workflow", systemImage: "plus.circle") {
+                Button("Create a workflow") {
                     Task { await createWorkflow() }
                 }
+                .controlSize(.small)
                 .disabled(creatingWorkflow || workflowName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 if creatingWorkflow {
-                    ProgressView().controlSize(.small)
-                    Text("Saving and verifying…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    AdvancedWaitingLine("Saving and verifying…")
                 }
                 Spacer()
             }
 
-            Text("Creates a reviewable planning workflow. It will not run until you choose Run below.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("Saves a reviewable workflow definition to the registry. The workflow run engine was retired on 2026-09-01 — nothing here executes; hand work to a Workshop execution instead.")
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             if let creationError {
-                Label(creationError, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Text(creationError)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            Divider()
-            TextField("Workflow objective", text: $workflowObjective, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(2...4)
-
             if appModel.workflows.isEmpty {
-                Text("No workflows loaded. Create one or refresh Capabilities to confirm the current registry.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                AdvancedEmptyState(
+                    title: "No workflows",
+                    detail: "A workflow saved here shows up in this list. Refresh Capabilities to confirm the current registry."
+                )
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     ForEach(appModel.workflows) { workflow in
-                        WorkflowRow(workflow: workflow) {
-                            Task { await appModel.runWorkflow(workflow, objective: workflowObjective) }
-                        }
-                        if workflow.id != appModel.workflows.last?.id {
-                            Divider()
-                        }
-                    }
-                }
-            }
-
-            if let latest = appModel.workflowRuns.first {
-                let approvalDecision = latest.approvalId.flatMap { approvalID in
-                    appModel.approvals.first(where: { $0.id == approvalID })?.decision
-                }
-                let controls = latest.controlAvailability(approvalDecision: approvalDecision)
-                let resumeEligibility = WorkflowLifecycleButtonPresentation.eligibility(
-                    action: .resume,
-                    run: latest,
-                    approvalDecision: approvalDecision,
-                    isPerforming: lifecycleAction != nil
-                )
-                let cancelEligibility = WorkflowLifecycleButtonPresentation.eligibility(
-                    action: .cancel,
-                    run: latest,
-                    approvalDecision: approvalDecision,
-                    isPerforming: lifecycleAction != nil
-                )
-                let rollbackEligibility = WorkflowLifecycleButtonPresentation.eligibility(
-                    action: .rollback,
-                    run: latest,
-                    approvalDecision: approvalDecision,
-                    isPerforming: lifecycleAction != nil
-                )
-                Divider()
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack(alignment: .top, spacing: 10) {
-                        CapabilityDetailRow(
-                            title: latest.workflowName ?? latest.workflowId,
-                            detail: "\(latest.mode ?? "run") · \(latest.steps.count) step(s)",
-                            status: latest.status,
-                            systemImage: "play.rectangle"
-                        )
-                        Spacer()
-                        Button(lifecycleAction == .resume ? "Resuming…" : "Resume", systemImage: "play.fill") {
-                            Task { await performLifecycle(.resume, run: latest) }
-                        }
-                        .disabled(!resumeEligibility.isEligible)
-                        .help(resumeEligibility.detail)
-                        Button(lifecycleAction == .cancel ? "Canceling…" : "Cancel", systemImage: "xmark.circle") {
-                            Task { await performLifecycle(.cancel, run: latest) }
-                        }
-                        .disabled(!cancelEligibility.isEligible)
-                        .help(cancelEligibility.detail)
-                        Button(lifecycleAction == .rollback ? "Rolling Back…" : "Rollback", systemImage: "arrow.uturn.backward.circle") {
-                            Task { await performLifecycle(.rollback, run: latest) }
-                        }
-                        .disabled(!rollbackEligibility.isEligible)
-                        .help(rollbackEligibility.detail)
-                    }
-                    if let lifecycleNotice {
-                        Label(lifecycleNotice.detail, systemImage: lifecycleNotice.status == "failed" ? "exclamationmark.triangle.fill" : "checkmark.circle")
-                            .font(.caption)
-                            .foregroundStyle(NativeAgentTheme.statusColor(lifecycleNotice.status))
-                    } else if lifecycleAction != nil {
-                        Label("Updating workflow lifecycle…", systemImage: "hourglass")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if latest.status.lowercased() == "waiting_approval", !controls.resume.isEligible {
-                        Label(controls.resume.detail, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    } else if !controls.resume.isEligible,
-                              !controls.cancel.isEligible,
-                              !controls.rollback.isEligible {
-                        Label(controls.rollback.detail, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
+                        WorkflowRow(workflow: workflow)
                     }
                 }
             }
@@ -2077,67 +2202,35 @@ struct WorkflowBuilderPanel: View {
             creationError = "Could not create workflow: \(error.localizedDescription)"
         }
     }
-
-    @MainActor
-    private func performLifecycle(_ action: WorkflowLifecycleAction, run: WorkflowRun) async {
-        guard lifecycleAction == nil else { return }
-        lifecycleAction = action
-        lifecycleNotice = nil
-        defer { lifecycleAction = nil }
-
-        let outcome: WorkflowLifecycleActionOutcome
-        switch action {
-        case .resume:
-            outcome = await appModel.resumeWorkflowRun(run)
-        case .cancel:
-            outcome = await appModel.cancelWorkflowRun(run)
-        case .rollback:
-            outcome = await appModel.rollbackWorkflowRun(run)
-        }
-        lifecycleNotice = WorkflowLifecycleButtonPresentation.notice(for: action, outcome: outcome)
-    }
 }
 
 struct WorkflowRow: View {
     var workflow: WorkflowRecord
-    var run: () -> Void
 
     var body: some View {
-        let availability = workflow.executionAvailability
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
                 Text(workflow.name)
-                    .font(.headline)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
                 Spacer()
-                StatusBadge(text: (workflow.status ?? "active").uppercased(), status: workflow.status ?? "ok")
-                if availability.isRunnable {
-                    Button("Run", systemImage: "play.circle", action: run)
-                } else {
-                    StatusBadge(
-                        text: (workflow.status?.lowercased() == "template" ? "TEMPLATE" : "UNAVAILABLE"),
-                        status: "warn"
-                    )
-                    .help(availability.detail)
-                }
-            }
-            if !availability.isRunnable {
-                Label("Run unavailable — \(availability.detail)", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                AdvancedStatusWord(status: workflow.status ?? "ok", text: workflow.status ?? "active")
             }
             if let description = workflow.description, !description.isEmpty {
                 Text(description)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
             }
-            HStack(spacing: 6) {
-                InfoPill(text: "\(workflow.steps.count) steps", systemImage: "list.number")
+            HStack(spacing: 8) {
+                AdvancedMeta("\(workflow.steps.count) steps")
                 if let trigger = workflow.trigger, !trigger.isEmpty {
-                    InfoPill(text: trigger, systemImage: "bolt")
+                    AdvancedMeta(AdvancedStatusWords.label(trigger))
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
     }
 }
@@ -2146,35 +2239,36 @@ struct CatalogRow: View {
     var item: CapabilityCatalogItem
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: item.installed == true ? "checkmark.seal.fill" : "square.grid.3x3")
-                .foregroundStyle(NativeAgentTheme.statusColor(item.installed == true ? "ok" : "warn"))
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Text(item.name)
-                        .font(.headline)
-                    Spacer()
-                    StatusBadge(text: (item.status ?? "available").uppercased(), status: item.installed == true ? "ok" : "warn")
-                }
-                Text(item.description ?? "")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Text(item.name)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                Spacer()
+                AdvancedStatusWord(
+                    status: item.installed == true ? "ok" : "warn",
+                    text: item.status ?? "available"
+                )
+            }
+            if let description = item.description, !description.isEmpty {
+                Text(description)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
-                HStack(spacing: 6) {
-                    if let kind = item.kind {
-                        InfoPill(text: kind, systemImage: "tag")
-                    }
-                    if let risk = item.riskClass {
-                        InfoPill(text: risk, systemImage: "lock.shield")
-                    }
-                    Spacer()
-                    Text(item.installed == true ? "Installed by a verified pack" : "Catalog metadata")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 8) {
+                if let kind = item.kind {
+                    AdvancedMeta(AdvancedStatusWords.label(kind))
                 }
+                if let risk = item.riskClass {
+                    AdvancedMeta(AdvancedStatusWords.label(risk))
+                }
+                Spacer()
+                AdvancedMeta(item.installed == true ? "Installed by a verified pack" : "Catalog metadata")
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
     }
 }
@@ -2184,15 +2278,15 @@ struct MCPServerRow: View {
     var load: () -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: 8) {
             CapabilityDetailRow(
                 title: server.name,
-                detail: "\(server.transport ?? "stdio") · \(server.endpoint?.isEmpty == false ? server.endpoint! : server.command ?? "not configured") · \(server.toolCount ?? 0) tool(s)",
-                status: server.healthStatus ?? server.status ?? "warn",
-                systemImage: "externaldrive.connected.to.line.below"
+                detail: "\(server.transport ?? "stdio") · \(server.endpoint?.isEmpty == false ? server.endpoint! : server.command ?? "not configured") · \(server.toolCount ?? 0) tools",
+                status: server.healthStatus ?? server.status ?? "warn"
             )
             Spacer()
-            Button("Load", systemImage: "arrow.down.circle", action: load)
+            Button("Load", action: load)
+                .controlSize(.small)
         }
     }
 }
@@ -2201,64 +2295,76 @@ struct CapabilityDetailRow: View {
     var title: String
     var detail: String
     var status: String
-    var systemImage: String
+    /// 2026-09-03 kit pass: the row carries words, not a status-tinted glyph.
+    /// The parameter stays because ToolsView (outside this pass) still passes
+    /// one; nothing draws it.
+    var systemImage: String = ""
     // 2026-06-07 ui-taste-sweep #83: when caller has the raw key/value
-    // pairs (e.g. NextGenReceipt), pass them here. Row gets a DisclosureGroup
-    // labeled "Show details" that reveals each pair on its own line. Nil =
-    // legacy callers (no disclosure rendered, identical to old behavior).
+    // pairs (e.g. NextGenReceipt), pass them here. Row gets a fold labeled
+    // "Details" that reveals each pair on its own line. Nil = legacy callers
+    // (no fold rendered, identical to old behavior).
     var rawPairs: [(String, String)]? = nil
 
-    // SwiftUI's DisclosureGroup tracks expansion internally when not bound;
-    // we no longer need explicit @State now that the label is static.
+    @State private var showsPairs = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: systemImage)
-                .foregroundStyle(NativeAgentTheme.statusColor(status))
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(title.withoutStaleNextGenPhaseCopy)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                    Spacer()
-                    StatusBadge(text: status.uppercased(), status: status)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(title.withoutStaleNextGenPhaseCopy)
+                    .font(ShellType.bodySemibold)
+                    .foregroundStyle(NativeAgentShell.text)
+                    .lineLimit(1)
+                Spacer()
+                AdvancedStatusWord(status: status)
+            }
+            let trimmedDetail = detail.withoutStaleNextGenPhaseCopy
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedDetail.isEmpty {
+                Text(trimmedDetail)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .lineLimit(3)
+            }
+            if let pairs = rawPairs, !pairs.isEmpty {
+                Button {
+                    withAnimation(
+                        NativeAgentMotion.respecting(ShellFoldMotion.open, reduceMotion: reduceMotion)
+                    ) {
+                        showsPairs.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: showsPairs ? "chevron.down" : "chevron.right")
+                        Text("Details")
+                    }
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.tertiary)
+                    .contentShape(Rectangle())
                 }
-                let trimmedDetail = detail.withoutStaleNextGenPhaseCopy
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmedDetail.isEmpty {
-                    Text(trimmedDetail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                }
-                if let pairs = rawPairs, !pairs.isEmpty {
-                    DisclosureGroup {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(pairs.enumerated()), id: \.offset) { _, pair in
-                                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Text(pair.0)
-                                        .font(.caption2.monospaced().weight(.medium))
-                                        .foregroundStyle(.tertiary)
-                                    Text(pair.1.isEmpty ? "—" : pair.1)
-                                        .font(.caption2.monospaced())
-                                        .foregroundStyle(.secondary)
-                                        .textSelection(.enabled)
-                                }
+                .buttonStyle(.plain)
+                .accessibilityValue(showsPairs ? "Expanded" : "Collapsed")
+                .padding(.top, 2)
+
+                if showsPairs {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(pairs.enumerated()), id: \.offset) { _, pair in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(pair.0)
+                                    .font(AdvancedType.codeCaption)
+                                    .foregroundStyle(NativeAgentShell.tertiary)
+                                Text(pair.1.isEmpty ? "—" : pair.1)
+                                    .font(AdvancedType.codeCaption)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .textSelection(.enabled)
                             }
                         }
-                        .padding(.top, 2)
-                    } label: {
-                        // Stable label — SwiftUI's chevron carries the
-                        // expanded/collapsed affordance (gpt-5.5 polish note).
-                        Text("Details")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
                     }
-                    .accentColor(.secondary)
+                    .transition(ShellFoldMotion.transition(reduceMotion: reduceMotion))
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
     }
 }

@@ -54,8 +54,12 @@ struct B2UISweepFenceCTests {
         #expect(trust.contains("MacControlPermissionsView()"))
 
         // Reciprocal cross-links point each tab at the other's one home.
-        #expect(macIntegration.contains("live in the Trust tab under Mac Control."))
-        #expect(trust.contains("live in the Mac Integration tab."))
+        // 2026-09-06: f4ba3bd8 ("Advanced page kit") reworded both cross-links
+        // for the new shell — they are pages, not tabs, and the copy is now
+        // sentence-case (MacIntegrationView.swift:354, TrustCenterView.swift:225).
+        // The B2.5a pin is the reciprocity, not the old wording.
+        #expect(macIntegration.contains("live on the Trust page under Mac control."))
+        #expect(trust.contains("live on the Mac integration page."))
     }
 
     // MARK: - B2.6c Settings demotion
@@ -66,7 +70,12 @@ struct B2UISweepFenceCTests {
         // Persisted, collapsed-by-default Advanced disclosure.
         #expect(source.contains("@AppStorage(\"nativeagent.settingsShowAdvanced\") private var showAdvancedSettings = false"))
         // The two power-user blocks render ONLY when expanded.
-        #expect(source.contains("if showAdvancedSettings {"))
+        // 2026-09-06: e1f2e6ea ("the classic-only Advanced door hidden in the
+        // new shell") added the `classicShell` condition — the disclosure is
+        // the classic sidebar's door only; the new shell puts the same controls
+        // on the Settings page as cards (SetupFeatureRows.swift). Still gated,
+        // still collapsed by default.
+        #expect(source.contains("if showAdvancedSettings, classicShell {"))
         #expect(source.contains("EmbeddingsSettingsSection(attention: $embeddingsAttention)"))
         #expect(source.contains("SubconsciousSettingsSection(attention: $subconsciousAttention)"))
         // Error/partial state surfaces a warn badge while collapsed.

@@ -183,3 +183,35 @@ func dismissedLoopFailureCardStaysDismissedForSameErrorSignature() async throws 
     }
     #expect(status == .string("unread"))
 }
+
+// Residue is not ordinary growth (sweep item 21, 2026-09-01): a store listed in
+// `residueRelativePrefixes` is reported at ANY size, so a card line that reads
+// like every other branch line hides the one finding that means "this must not
+// be here". The label is what makes the two distinguishable in the card copy.
+@Test
+func diskHygieneCardLabelsResidueDirectoriesAsResidue() async throws {
+    let root = try hygieneActionTempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let residuePrefix = try #require(DataRootDiskHygiene.residueRelativePrefixes.first)
+    let report = DiskHygieneReport(
+        largeFiles: [],
+        totalBytes: 1_000,
+        totalOverBudget: false,
+        largeDirectories: [
+            DiskHygieneOffender(relativePath: residuePrefix, sizeBytes: 1_000),
+            DiskHygieneOffender(relativePath: "logs", sizeBytes: 9_000),
+        ]
+    )
+    #expect(await BackgroundLoopsAssembly.fileDiskHygieneNotice(dataRoot: root, report: report))
+
+    let card = try await diskCardRow(at: root)
+    guard case .string(let detail)? = card["detail"] else {
+        Issue.record("detail missing"); return
+    }
+    let residueLine = try #require(
+        detail.split(separator: "\n").first { $0.contains(residuePrefix) })
+    #expect(residueLine.contains("residue"))
+    let ordinaryLine = try #require(
+        detail.split(separator: "\n").first { $0.hasPrefix("▸ logs/") })
+    #expect(!ordinaryLine.contains("residue"))
+}

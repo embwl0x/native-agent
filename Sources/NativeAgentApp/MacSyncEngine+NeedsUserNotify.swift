@@ -36,7 +36,12 @@ actor NeedsUserEdgeNotifier {
     init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         sender: @escaping Sender = { title, body, userInfo in
-            _ = try await MacSyncEngine.shared.sendNotificationToPairedDevices(
+            // Item 26: the edge decision stays here (the level lives here); the
+            // CHANNEL decision belongs to the router. Owner-waiting by
+            // definition — this notifier exists because Agent needs User.
+            _ = try await AttentionRouter.shared.route(
+                eventId: userInfo["dedupKey"] ?? "needs_user",
+                importance: .ownerWaiting,
                 title: title,
                 body: body,
                 userInfo: userInfo

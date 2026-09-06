@@ -12,7 +12,7 @@
    {
     "tier": "test",
     "strength": "reports-only",
-    "ref": "tests/NativeAgentAppTests/TotalSurfaceContractEvalTests.swift \u2014 STRUCTURAL FLOOR ONLY: frozen 640-ID campaign after the authorized substrate.runReplay retirement; validates every remaining row retains an observation/assertion contract, a valid tier/cost, a resolvable production owner, UI/CLI primitives, but does not claim the proposed behavior executed"
+    "ref": "tests/NativeAgentAppTests/TotalSurfaceContractEvalTests.swift \u2014 STRUCTURAL FLOOR ONLY: frozen 633-ID campaign after the authorized substrate.runReplay retirement, the 2026-09-01 Native Experience / Spotlight-overlay retirement, and the 2026-09-01 workflow run-engine retirement; validates every remaining row retains an observation/assertion contract, a valid tier/cost, a resolvable production owner, UI/CLI primitives, but does not claim the proposed behavior executed"
    },
    {
     "tier": "smoke",
@@ -78,7 +78,7 @@
    {
     "tier": "test",
     "strength": "reports-only",
-    "ref": "Independently reviewed executed behavior: AppRuntimesBehaviorWave2EvalTests, AppChatToolDispatcherTests, AutonomyGuardBridgeCharacterizationTests, NativeContextFlowRuntimeTests, NativeContextFlowRuntimeLifecycleTests, ContextFlowFallbackReaderTests, FluidContextToolDispatchTests, CoreCLISubprocessTests, NativeDiagnosticObserverTests, IOSBehaviorWave3EvalTests, organism doctor process fixtures, and existing signed inbound iOS bridge behavior suites; frozen list contains only exact runtime, store, process, permission, backpressure, and failure-state contracts"
+    "ref": "Independently reviewed executed behavior: AppRuntimesBehaviorWave2EvalTests, AppChatToolDispatcherTests, AutonomyGuardBridgeCharacterizationTests, NativeContextFlowRuntimeTests, NativeContextFlowRuntimeLifecycleTests, ContextFlowFallbackReaderTests, FluidContextToolDispatchTests, CoreCLISubprocessTests, IOSBehaviorWave3EvalTests, organism doctor process fixtures, and existing signed inbound iOS bridge behavior suites; frozen list contains only exact runtime, store, process, permission, backpressure, and failure-state contracts"
    }
   ]
  },
@@ -89,7 +89,7 @@
    {
     "tier": "test",
     "strength": "reports-only",
-    "ref": "Independently reviewed executed behavior: CoreCLISubprocessTests, ChatOrchestrationTurnEngineTests, SessionHistoryTests, TelegramTurnControlsTests, SubstrateAffectFieldWave7EvalTests, CoreMacControlWave7OutcomeTests, OrganismObservatoryMountedEvalTests, NativeContextFlowRuntimeTests, and canonical agent-instrument fixtures; frozen list contains only real subprocess, turn assembly, mounted control, durable store, runtime reconciliation, and production trace-schema contracts"
+    "ref": "Independently reviewed executed behavior: CoreCLISubprocessTests, ChatOrchestrationTurnEngineTests, SessionHistoryTests, TelegramTurnControlsTests, SubstrateAffectFieldWave7EvalTests, OrganismObservatoryMountedEvalTests, NativeContextFlowRuntimeTests, and canonical agent-instrument fixtures; frozen list contains only real subprocess, turn assembly, mounted control, durable store, runtime reconciliation, and production trace-schema contracts"
    }
   ]
  },

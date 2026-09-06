@@ -195,12 +195,16 @@ public func makeGatedToolDispatchClient(
     trust: (any AutonomyResolver)? = nil,
     verifiedSessionId: String? = nil,
     approvedReplay: ApprovedChatToolReplay? = nil,
-    injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil
+    injectionApprovalVerifier: (any InjectionApprovalVerifying)? = nil,
+    approvedReplayVerifier: (any ApprovedReplayVerifying)? = nil
 ) -> any ToolDispatchClient {
     let resolvedTrust: any AutonomyResolver = trust ?? SwiftNativeTrustCenter(dataRoot: dataRoot)
     let gate = AutonomyGate(trust: resolvedTrust, approvalFiler: approvalFiler)
     let fileAccessGated = FileAccessGatedDispatcher(inner: tools, fileAccess: fileAccess)
-    return AutonomyGatedDispatcher(
+    // 2026-09-06: canonicalize the dotted alias OUTSIDE the gates, so the
+    // fileAccess blocklist and the Trust Center both judge the name that will
+    // actually execute (`save.skill` used to reach `save_skill` un-gated).
+    return CanonicalToolNameDispatcher(inner: AutonomyGatedDispatcher(
         inner: fileAccessGated,
         gate: gate,
         approvalFiler: approvalFiler,
@@ -214,8 +218,14 @@ public func makeGatedToolDispatchClient(
         // root. Callers may override for a hermetic inbox; nobody has to
         // remember to pass one for production to be safe.
         injectionApprovalVerifier: injectionApprovalVerifier
-            ?? ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot)
-    )
+            ?? ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot),
+        // 2026-09-06 — and every NON-injection replay is checked against the
+        // same inbox: the record must exist, be approved for this tool and
+        // body, have been spent by the executor just now, and it is good for
+        // exactly one dispatch.
+        approvedReplayVerifier: approvedReplayVerifier
+            ?? ApprovalInboxApprovedReplayVerifier(dataRoot: dataRoot)
+    ))
 }
 
 private func makeDefaultChatOrchestrationClient(
@@ -317,12 +327,31 @@ private func makeDefaultChatOrchestrationClient(
     let llm: any LLMClient & StreamingLLMClient
     if usesCanonicalBody {
         let telemetryRoot: URL? = credentialRoot == nil ? nil : dataRoot
-        let codexEnvironment = credentialRoot.map { root in
-            ProcessInfo.processInfo.environment.merging([
-                "CODEX_HOME": root.appendingPathComponent("codex_home", isDirectory: true).path,
-                "NATIVE_AGENT_DATA_ROOT": root.path,
+        // User, 2026-09-06: readiness ("codex is signed in") is decided from the
+        // app's OWN credential resolution
+        // (`OpenAIOAuthDirectAdapter.preferredAuthPath`), but the child got no
+        // CODEX_HOME unless a `credentialRoot` was injected — so on the default
+        // root the CLI went and used whatever `~/.codex` or ambient CODEX_HOME
+        // it found, which is a different account from the one the badge
+        // validated (and the one the app deliberately gates behind CLI-adoption
+        // consent). Whenever the app has resolved a usable credential, the
+        // child is pointed at exactly that location.
+        // The merge sits on `augmentedProcessEnvironment` because an injected
+        // environment REPLACES the adapter's PATH repair, and a GUI-launched
+        // app's PATH cannot find `codex`.
+        let codexEnvironment: [String: String]? = {
+            if let root = credentialRoot {
+                return CodexAdapter.augmentedProcessEnvironment().merging([
+                    "CODEX_HOME": root.appendingPathComponent("codex_home", isDirectory: true).path,
+                    "NATIVE_AGENT_DATA_ROOT": root.path,
+                ]) { _, bound in bound }
+            }
+            let resolved = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot)
+            guard OpenAIOAuthDirectAdapter.hasUsableTokens(at: resolved) else { return nil }
+            return CodexAdapter.augmentedProcessEnvironment().merging([
+                "CODEX_HOME": resolved.deletingLastPathComponent().path,
             ]) { _, bound in bound }
-        }
+        }()
         llm = SwiftNativeLLMClient(
             router: router,
             // Codex child processes read CODEX_HOME / NATIVE_AGENT_DATA_ROOT; bind
@@ -513,7 +542,15 @@ func makeChatTurnTraceBus(dataRoot: URL) -> TurnTraceBus {
 /// Bridges AdaptiveMemoryPromoter.shared into the chat client's
 /// MemoryPromoting hook. The shared promoter is auto-configured at app
 /// launch with SwiftNativeMemoryV2.shared as its backing store.
-private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting {
+private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting, MomentReviewQueueReporting {
+    /// The per-turn "moments waiting" nudge asks its promoter for a count and
+    /// stays silent when the promoter cannot answer. This adapter is the one
+    /// production injects (not `SharedAdaptiveMemoryPromoter`), so without
+    /// this conformance the nudge never rendered live (2026-09-02).
+    func pendingMomentCount() async -> Int {
+        await AdaptiveMemoryPromoter.shared.pendingMomentCount()
+    }
+
     func observeTurn(userMessage: String, assistantMessage: String, sessionId: String) async {
         _ = await observeTurnWithTelemetry(
             userMessage: userMessage,
@@ -527,11 +564,51 @@ private struct AdaptiveMemoryPromoterAdapter: MemoryPromotionTelemetryReporting 
         assistantMessage: String,
         sessionId: String
     ) async -> MemoryPromotionTelemetry {
-        let staged = await AdaptiveMemoryPromoter.shared.observeTurn(
+        await observeTurnWithTelemetry(
             userMessage: userMessage,
             assistantMessage: assistantMessage,
+            toolEvidence: [],
             sessionId: sessionId
         )
-        return MemoryPromotionTelemetry(stagedProposalCount: staged.count)
+    }
+
+    /// Sweep item 35: this is the PRODUCTION seat of the promoter. Without the
+    /// evidence overload here, the projection would be computed every turn and
+    /// dropped by the protocol's default — a wired-looking dead nerve.
+    func observeTurnWithTelemetry(
+        userMessage: String,
+        assistantMessage: String,
+        toolEvidence: [String],
+        sessionId: String
+    ) async -> MemoryPromotionTelemetry {
+        let observation = await AdaptiveMemoryPromoter.shared.observeTurnWithReport(
+            userMessage: userMessage,
+            assistantMessage: assistantMessage,
+            toolEvidence: toolEvidence,
+            sessionId: sessionId
+        )
+        let staged = observation.proposals
+        // Sweep item 38, the procedural lane: the SAME evidence, read for a
+        // different question. The promoter above asks "did this turn state a
+        // durable fact"; this asks "has she now done this exact thing enough
+        // times that it is craft". It fires on the repetition landing, never
+        // on a schedule, and mints at most one approval card — nothing it does
+        // reaches a prompt. It runs in the same post-reply side channel as the
+        // promoter above (the reply is already sent), and swallows its own
+        // failures for the same reason: a ledger write is never worth a turn.
+        await ProceduralLane.shared.observeTurn(
+            userMessage: userMessage,
+            toolEvidence: toolEvidence,
+            sessionId: sessionId
+        )
+        var telemetry = MemoryPromotionTelemetry(
+            stagedProposalCount: staged.count,
+            semanticStatus: observation.extraction.semanticStatus,
+            semanticCandidateCount: observation.extraction.semanticCandidateCount,
+            candidateCount: observation.extraction.candidates.count
+                + observation.toolEvidenceCandidateCount
+        )
+        telemetry.momentOutcome = observation.momentOutcome
+        return telemetry
     }
 }

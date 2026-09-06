@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
+import Connectors
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 #endif
@@ -19,6 +20,10 @@ import CloudKit
 enum ConnectorUIState: Equatable {
     case live
     case ready
+    /// Credential present, but no successful connector call has proven it
+    /// inside the decay window (`ConnectorHealthDecay`). Never green — a
+    /// sign-in that once completed is not evidence the integration works now.
+    case unverified
     case planned
     case needsAuth
     case comingSoon
@@ -30,6 +35,11 @@ enum ConnectorUIState: Equatable {
 
         if auth == "coming_soon" || health == "coming_soon" {
             return .comingSoon
+        }
+        // Decay wins over the auth claim: a row can be `connected`/`configured`
+        // and still be unproven, and that must not read as live.
+        if health == ConnectorHealthDecay.unverifiedHealth {
+            return .unverified
         }
         if auth == "connected" || auth == "configured" || health == "ok" {
             return .live
@@ -52,14 +62,16 @@ enum ConnectorUIState: Equatable {
         return .unknown
     }
 
+    /// Only two things on this page are tinted: something working (calm) and
+    /// something that needs attention (trouble). Everything else is quiet.
     var statusColor: Color {
         switch self {
         case .live, .ready:
-            return .green
-        case .planned:
-            return .blue
-        case .needsAuth, .comingSoon, .unknown:
-            return .secondary
+            return NativeAgentShell.calm
+        case .unverified:
+            return NativeAgentShell.trouble
+        case .planned, .needsAuth, .comingSoon, .unknown:
+            return NativeAgentShell.secondary
         }
     }
 }
@@ -88,18 +100,21 @@ struct ConnectorRowActionPolicy: Equatable {
         }
         if id == "telegram" {
             return Self(
-                primaryTitle: state == .live ? "Manage" : "Configure",
+                primaryTitle: (state == .live || state == .unverified) ? "Manage" : "Configure",
                 primaryAction: .openTelegramSettings,
                 showsEnabledMutation: false
             )
         }
         let verifiedWizard = ConnectorWizardSetupRoute.resolve(provider: id) != .unavailable
         if verifiedWizard,
-           state == .needsAuth || state == .planned || state == .live || state == .comingSoon {
+           state == .needsAuth || state == .planned || state == .live
+            || state == .unverified || state == .comingSoon {
+            // An unverified row still holds a credential, so its route is
+            // Reconnect (re-prove it), not Connect (start from nothing).
             return Self(
                 primaryTitle: (state == .needsAuth || state == .comingSoon) ? "Connect" : "Reconnect",
                 primaryAction: .openWizard(provider: id),
-                showsEnabledMutation: state == .live
+                showsEnabledMutation: state == .live || state == .unverified
             )
         }
 
@@ -231,137 +246,132 @@ struct ConnectorsView: View {
     @State private var isAddingWorkspace = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            List {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
                 if let connectorStatusMessage {
-                    Section {
-                        Text(connectorStatusMessage.text)
-                            .font(.caption)
-                            .foregroundStyle(statusColor(for: connectorStatusMessage.tone))
+                    ConnectorsNote(
+                        text: connectorStatusMessage.text,
+                        color: statusColor(for: connectorStatusMessage.tone)
+                    )
+                }
+
+                ConnectorsSection(label: "Accounts") {
+                    if registryRowsForDisplay.isEmpty {
+                        ConnectorsCard {
+                            ConnectorsNote(
+                                text: "The accounts the agent can read and write will be listed here. Refresh to load them.",
+                                color: NativeAgentShell.secondary
+                            )
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(registryRowsForDisplay) { connector in
+                                connectorRow(connector)
+                            }
+                        }
                     }
                 }
 
-                Section("Registry") {
-                    ForEach(registryRowsForDisplay) { connector in
-                        let uiState = connectorUIState(connector)
-                        let actionPolicy = connectorActionPolicy(connector)
-                        let renderedStatusText = statusText(for: connector, uiState: uiState)
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text(connector.name)
-                                    .font(.headline)
-                                Spacer()
-                                Text(renderedStatusText)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(uiState.statusColor)
-                            }
-                            Text(connector.description)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            if let runtimeStatus = connector.runtimeStatus,
-                               !runtimeStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                let runtimeLabel: String = if let detail = connector.runtimeDetail {
-                                    "Socket Mode: \(runtimeStatus) · \(detail)"
-                                } else {
-                                    "Socket Mode: \(runtimeStatus)"
+                ConnectorsSection(label: "Folders the agent may open") {
+                    if appModel.workspaces.isEmpty {
+                        ConnectorsCard {
+                            ConnectorsNote(
+                                text: "No folder is shared yet. Add one below and the agent can read the files in it.",
+                                color: NativeAgentShell.secondary
+                            )
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(appModel.workspaces) { workspace in
+                                ConnectorsCard {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(workspace.name)
+                                            .font(ShellType.bodySemibold)
+                                            .foregroundStyle(NativeAgentShell.text)
+                                        Text(workspace.path)
+                                            .font(ShellType.label)
+                                            .foregroundStyle(NativeAgentShell.secondary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Text(workspace.permissions.joined(separator: ", "))
+                                            .font(ShellType.caption)
+                                            .foregroundStyle(NativeAgentShell.tertiary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                let runtimeConnected = runtimeStatus == "connected"
-                                Label(
-                                    runtimeLabel,
-                                    systemImage: runtimeConnected ? "dot.radiowaves.left.and.right" : "exclamationmark.triangle"
+                            }
+                        }
+                    }
+                }
+
+                ConnectorsSection(label: "Share a folder") {
+                    ConnectorsCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ConnectorsField(title: "Name") {
+                                TextField("", text: $workspaceName)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(ShellType.label)
+                            }
+                            ConnectorsField(title: "Folder") {
+                                TextField("", text: $workspacePath)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(ShellType.label)
+                            }
+                            Toggle("Let the agent write to it", isOn: $workspaceWritable)
+                                .font(ShellType.label)
+                            Button(isAddingWorkspace ? "Adding…" : "Share this folder") {
+                                Task { await addWorkspace() }
+                            }
+                            .buttonStyle(.bordered)
+                            .font(ShellType.labelMedium)
+                            .disabled(isAddingWorkspace || cleanWorkspaceName.isEmpty || cleanWorkspacePath.isEmpty)
+                        }
+                    }
+                }
+
+                ConnectorsSection(label: "Search the shared folders") {
+                    ConnectorsCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack(spacing: 8) {
+                                TextField("", text: $workspaceQuery)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(ShellType.label)
+                                Button("Search") {
+                                    Task { await appModel.searchWorkspace(workspaceQuery) }
+                                }
+                                .buttonStyle(.bordered)
+                                .font(ShellType.labelMedium)
+                                .disabled(workspaceQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            }
+                            let searchPresentation = WorkspaceSearchPresentation.make(results: appModel.workspaceSearchResults)
+                            if searchPresentation.visible.isEmpty {
+                                ConnectorsNote(
+                                    text: "Matching files from the shared folders will be listed here.",
+                                    color: NativeAgentShell.secondary
                                 )
-                                .font(.caption)
-                                .foregroundStyle(runtimeConnected ? Color.secondary : Color.orange)
-                            }
-                            HStack {
-                                Label(connector.kind, systemImage: "tag")
-                                Label(connector.riskClass ?? "standard", systemImage: "exclamationmark.shield")
-                                Label(connector.enabled ? "Enabled" : "Disabled", systemImage: connector.enabled ? "checkmark.circle" : "circle")
-                                Spacer()
-                                if let primaryTitle = actionPolicy.primaryTitle {
-                                    Button(primaryTitle) {
-                                        handleConnectorAction(actionPolicy.primaryAction)
-                                    }
-                                    .font(.caption)
-                                    .buttonStyle(.bordered)
-                                    .disabled(actionPolicy.primaryAction == nil)
+                            } else {
+                                ForEach(searchPresentation.visible) { result in
+                                    Text("\(result.workspaceName ?? "Folder") · \(result.relativePath)")
+                                        .font(ShellType.label)
+                                        .foregroundStyle(NativeAgentShell.text)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                        .textSelection(.enabled)
                                 }
-                                if actionPolicy.showsEnabledMutation {
-                                    Button(connector.enabled ? "Disable" : "Enable", systemImage: connector.enabled ? "pause.circle" : "play.circle") {
-                                        Task {
-                                            let outcome = await appModel.updateConnector(connector, enabled: !connector.enabled)
-                                            connectorStatusMessage = ConnectorsStatusMessagePresentation.connectorUpdate(
-                                                connectorName: connector.name,
-                                                enabled: !connector.enabled,
-                                                outcome: outcome
-                                            )
-                                        }
-                                    }
+                                if searchPresentation.remainingCount > 0 {
+                                    ConnectorsNote(
+                                        text: "\(searchPresentation.remainingCount) more matches. Narrow the search to see them.",
+                                        color: NativeAgentShell.secondary
+                                    )
                                 }
                             }
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-
-                Section("File Workspaces") {
-                    ForEach(appModel.workspaces) { workspace in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(workspace.name)
-                                .font(.subheadline.weight(.semibold))
-                            Text(workspace.path)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Text(workspace.permissions.joined(separator: ", "))
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
                         }
                     }
                 }
             }
-
-            GroupBox("Add Workspace") {
-                VStack(alignment: .leading, spacing: 8) {
-                    TextField("Name", text: $workspaceName)
-                    TextField("Path", text: $workspacePath)
-                    Toggle("Allow writes", isOn: $workspaceWritable)
-                    Button(isAddingWorkspace ? "Adding…" : "Add Workspace", systemImage: isAddingWorkspace ? "hourglass" : "folder.badge.plus") {
-                        Task { await addWorkspace() }
-                    }
-                    .disabled(isAddingWorkspace || cleanWorkspaceName.isEmpty || cleanWorkspacePath.isEmpty)
-                }
-            }
-
-            GroupBox("Workspace Search") {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        TextField("Search", text: $workspaceQuery)
-                        Button("Search", systemImage: "magnifyingglass") {
-                            Task { await appModel.searchWorkspace(workspaceQuery) }
-                        }
-                        .disabled(workspaceQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-                    let searchPresentation = WorkspaceSearchPresentation.make(results: appModel.workspaceSearchResults)
-                    ForEach(searchPresentation.visible) { result in
-                        Text("\(result.workspaceName ?? "Workspace") · \(result.relativePath)")
-                            .font(.caption)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .textSelection(.enabled)
-                    }
-                    if searchPresentation.remainingCount > 0 {
-                        Text("\(searchPresentation.remainingCount) more matches — refine your search to narrow the list.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.bottom, 32)
         }
-        .padding()
         .navigationTitle("Connectors")
         .toolbar {
             Button("Refresh", systemImage: "arrow.clockwise") {
@@ -385,6 +395,75 @@ struct ConnectorsView: View {
                 }
                 .environment(appModel)
             }
+        }
+    }
+
+    /// One account: what it is called, how it stands, what it is for, and the
+    /// one or two things you can do to it.
+    @ViewBuilder
+    private func connectorRow(_ connector: ConnectorRecord) -> some View {
+        let uiState = connectorUIState(connector)
+        let actionPolicy = connectorActionPolicy(connector)
+        let renderedStatusText = Self.statusText(for: connector, uiState: uiState)
+        ConnectorsCard {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(connector.name)
+                        .font(ShellType.bodySemibold)
+                        .foregroundStyle(NativeAgentShell.text)
+                    Spacer(minLength: 8)
+                    Text(renderedStatusText)
+                        .font(ShellType.captionSemibold)
+                        .foregroundStyle(uiState.statusColor)
+                }
+                Text(connector.description)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let runtimeStatus = connector.runtimeStatus,
+                   !runtimeStatus.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let runtimeLabel: String = if let detail = connector.runtimeDetail {
+                        "Live connection: \(runtimeStatus) · \(detail)"
+                    } else {
+                        "Live connection: \(runtimeStatus)"
+                    }
+                    let runtimeConnected = runtimeStatus == "connected"
+                    Text(runtimeLabel)
+                        .font(ShellType.caption)
+                        .foregroundStyle(runtimeConnected ? NativeAgentShell.secondary : NativeAgentShell.trouble)
+                }
+                HStack(spacing: 12) {
+                    Text(connector.kind)
+                    Text(connector.riskClass ?? "standard")
+                    Text(connector.enabled ? "On" : "Off")
+                    Spacer(minLength: 8)
+                    if let primaryTitle = actionPolicy.primaryTitle {
+                        Button(primaryTitle) {
+                            handleConnectorAction(actionPolicy.primaryAction)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(actionPolicy.primaryAction == nil)
+                    }
+                    if actionPolicy.showsEnabledMutation {
+                        Button(connector.enabled ? "Turn off" : "Turn on") {
+                            Task {
+                                let outcome = await appModel.updateConnector(connector, enabled: !connector.enabled)
+                                connectorStatusMessage = ConnectorsStatusMessagePresentation.connectorUpdate(
+                                    connectorName: connector.name,
+                                    enabled: !connector.enabled,
+                                    outcome: outcome
+                                )
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.tertiary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -436,17 +515,29 @@ struct ConnectorsView: View {
         switch connectorUIState(connector) {
         case .live: return 0
         case .ready: return 1
-        case .planned: return 2
-        case .needsAuth: return 3
-        case .comingSoon: return 4
-        case .unknown: return 5
+        case .unverified: return 2
+        case .planned: return 3
+        case .needsAuth: return 4
+        case .comingSoon: return 5
+        case .unknown: return 6
         }
     }
 
-    private func statusText(for connector: ConnectorRecord, uiState: ConnectorUIState) -> String {
+    /// Pure projection of a record + its resolved state into the row's status
+    /// copy. `nonisolated` so the rendering rule is assertable without a view.
+    nonisolated static func statusText(
+        for connector: ConnectorRecord,
+        uiState: ConnectorUIState
+    ) -> String {
         let health = connector.healthStatus?.trimmingCharacters(in: .whitespacesAndNewlines)
         let auth = connector.authState?.trimmingCharacters(in: .whitespacesAndNewlines)
         switch uiState {
+        case .unverified:
+            // "configured, unverified" — a credential is on file and nothing
+            // has proven it. Anything else decayed from a proven state.
+            return auth?.lowercased() == ConnectorHealthDecay.configuredAuth
+                ? "configured, unverified"
+                : ConnectorHealthDecay.unverifiedHealth
         case .planned:
             if let health, !health.isEmpty {
                 return "planned / \(health)"
@@ -487,9 +578,75 @@ struct ConnectorsView: View {
 
     private func statusColor(for tone: ConnectorsStatusMessagePresentation.Tone) -> Color {
         switch tone {
-        case .progress: return .secondary
-        case .success: return NativeAgentTheme.ok
-        case .failure: return NativeAgentTheme.warn
+        case .progress: return NativeAgentShell.secondary
+        case .success: return NativeAgentShell.calm
+        case .failure: return NativeAgentShell.trouble
+        }
+    }
+}
+
+// MARK: - Page kit
+//
+// The page's own small vocabulary: an eyebrow over a run, the card a row or a
+// group of controls sits in, and the two quiet line shapes.
+
+private struct ConnectorsSection<Content: View>: View {
+    let label: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(label)
+                .font(ShellType.labelSemibold)
+                .textCase(.uppercase)
+                .kerning(0.6)
+                .foregroundStyle(NativeAgentShell.secondary)
+            content
+        }
+    }
+}
+
+private struct ConnectorsCard<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .fill(TodayPalette.cardFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: TodayMetrics.cardRadius, style: .continuous)
+                    .strokeBorder(TodayPalette.cardStroke, lineWidth: 1)
+            )
+    }
+}
+
+private struct ConnectorsNote: View {
+    let text: String
+    var color: Color = NativeAgentShell.secondary
+
+    var body: some View {
+        Text(text)
+            .font(ShellType.caption)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+    }
+}
+
+private struct ConnectorsField<Control: View>: View {
+    let title: String
+    @ViewBuilder var control: Control
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(ShellType.labelMedium)
+                .foregroundStyle(NativeAgentShell.secondary)
+            control
         }
     }
 }

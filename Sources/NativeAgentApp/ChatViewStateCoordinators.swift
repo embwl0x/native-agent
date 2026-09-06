@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import SwiftUI
@@ -97,8 +98,19 @@ final class ChatScrollCoordinator {
     var bottomSpacerVisible = false
 
     private var serial = 0
+    /// True only while the request holding the CURRENT serial is pending.
+    /// Every serial bump supersedes that request, so every bump also clears
+    /// the latch: a superseded block returns on the serial guard before it
+    /// reaches its own `scheduled = false`, and a latch left standing behind
+    /// it turned off ordinary auto-follow for the life of the view
+    /// (2026-09-06).
     private var scheduled = false
     private var lastScrollAt = Date.distantPast
+    /// Bumped every time the reader scrolls away from the bottom. A scroll
+    /// scheduled before that gesture is stale, `force` or not — the old code
+    /// let a forced repair fire seconds later and yank the viewport out from
+    /// under someone reading upward (2026-09-06).
+    private var disarmCount = 0
 
     func markViewDisappeared() {
         serial &+= 1
@@ -111,6 +123,7 @@ final class ChatScrollCoordinator {
 
     func disarmFollow() {
         autoFollow = false
+        disarmCount &+= 1
     }
 
     func setBottomSpacerVisible(_ visible: Bool) {
@@ -136,17 +149,57 @@ final class ChatScrollCoordinator {
         let elapsed = Date().timeIntervalSince(lastScrollAt)
         let effectiveDelay = force ? delay : max(delay, max(0, minInterval - elapsed))
         let expectedSerial = serial
+        let expectedDisarm = disarmCount
         scheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + effectiveDelay) {
             guard expectedSerial == self.serial else { return }
             self.scheduled = false
+            guard expectedDisarm == self.disarmCount else { return }
             guard force || self.autoFollow else { return }
             self.lastScrollAt = Date()
             if animated {
-                withAnimation(.easeOut(duration: 0.16)) {
+                // No SwiftUI Environment here, so Reduce Motion is read from
+                // the system: for that reader the follow is an instant jump.
+                withAnimation(
+                    NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                        ? nil : .easeOut(duration: 0.16)
+                ) {
                     proxy.scrollTo(bottomAnchor, anchor: .bottom)
                 }
             } else {
+                proxy.scrollTo(bottomAnchor, anchor: .bottom)
+            }
+        }
+    }
+
+    /// One event, several settles. Opening a long thread needs more than one
+    /// scroll — the LazyVStack lays out after the first, and images push the
+    /// bottom down after that — but each of those used to be a separate
+    /// forced call, and a forced call bumps the serial, so every earlier rung
+    /// of the ladder was cancelled by the next and only the last one ran
+    /// (2026-09-06). Scheduling them together shares one serial, so they all
+    /// fire; a reader who scrolls up cancels the whole ladder.
+    func scrollToBottomSettles(
+        _ proxy: ScrollViewProxy,
+        bottomAnchor: String,
+        delays: [TimeInterval]
+    ) {
+        guard !delays.isEmpty else { return }
+        serial &+= 1
+        // The ladder takes over from whatever was pending, so it takes the
+        // latch too. Without this an ordinary scroll scheduled alongside the
+        // ladder (session load does exactly that) was superseded and never got
+        // to clear `scheduled`, and every later non-forced follow returned on
+        // a latch nothing would ever release (2026-09-06).
+        scheduled = false
+        let expectedSerial = serial
+        let expectedDisarm = disarmCount
+        for delay in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard expectedSerial == self.serial,
+                      expectedDisarm == self.disarmCount
+                else { return }
+                self.lastScrollAt = Date()
                 proxy.scrollTo(bottomAnchor, anchor: .bottom)
             }
         }
